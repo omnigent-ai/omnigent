@@ -67,6 +67,7 @@ import type { ScheduledTaskRun } from "@/lib/scheduledTasksApi";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
+const RUN_HIGHLIGHT_WAIT_MS = 120_000;
 
 export function TaskDetailPage() {
   const { taskId = "" } = useParams<{ taskId: string }>();
@@ -88,7 +89,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const [awaitingRunRow, setAwaitingRunRow] = useState(false);
   const preFireNewestIdRef = useRef<string | null>(null);
   const awaitingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingRunHighlightRef = useRef(false);
+  const pendingRunHighlightUntilRef = useRef<number | null>(null);
   const [highlightedRunId, setHighlightedRunId] = useState<string | null>(null);
 
   const { data: task, isLoading, isError, error, refetch } = useScheduledTask(taskId);
@@ -99,6 +100,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
     isError: runsError,
     isFetchedAfterMount: runsFetchedAfterMount,
   } = useScheduledTaskRuns(taskId, taskId !== "", awaitingRunRow);
+  const runHistoryReady = runs != null && runsFetchedAfterMount && !runsLoading && !runsError;
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -118,11 +120,15 @@ function TaskDetail({ taskId }: { taskId: string }) {
 
   // Clear the flag when a new run row appears (newestId changed from snapshot).
   useEffect(() => {
-    if (!awaitingRunRow && !pendingRunHighlightRef.current) return;
+    const highlightUntil = pendingRunHighlightUntilRef.current;
+    if (highlightUntil != null && Date.now() >= highlightUntil) {
+      pendingRunHighlightUntilRef.current = null;
+    }
+    if (!awaitingRunRow && pendingRunHighlightUntilRef.current == null) return;
     const newestId = runs?.[0]?.id ?? null;
     if (newestId != null && newestId !== preFireNewestIdRef.current) {
-      if (pendingRunHighlightRef.current) {
-        pendingRunHighlightRef.current = false;
+      if (pendingRunHighlightUntilRef.current != null) {
+        pendingRunHighlightUntilRef.current = null;
         setHighlightedRunId(newestId);
       }
       clearAwaitingRunRow();
@@ -291,6 +297,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   function handleRunNow() {
+    if (!runHistoryReady) return;
+    pendingRunHighlightUntilRef.current = null;
     // Snapshot the pre-fire newest run id so the awaiting effect knows what
     // "a new row appeared" means.
     preFireNewestIdRef.current = runs?.[0]?.id ?? null;
@@ -298,7 +306,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
       onSuccess: () => {
         showToast("Run triggered, it will start shortly");
         // Keep tracking the new row even after the button's loading timeout.
-        pendingRunHighlightRef.current = true;
+        pendingRunHighlightUntilRef.current = Date.now() + RUN_HIGHLIGHT_WAIT_MS;
         // Keep the button in loading state until the new run row appears, and —
         // because the row is written a few seconds AFTER this 202 — keep the run
         // history polling across that gap so the row is picked up at all.
@@ -310,6 +318,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
         awaitingTimerRef.current = setTimeout(clearAwaitingRunRow, 20_000);
       },
       onError: (err) => {
+        pendingRunHighlightUntilRef.current = null;
         clearAwaitingRunRow();
         // A 409 (CONFLICT) means a run for this task is already in flight — the
         // run is fine. Show a truthful, non-alarming message.
@@ -362,7 +371,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
           </Button>
           <Button
             data-testid="task-detail-run-now"
-            disabled={busy || awaitingRunRow}
+            disabled={busy || awaitingRunRow || !runHistoryReady}
             onClick={handleRunNow}
           >
             {runNowMutation.isPending || awaitingRunRow ? (
@@ -680,38 +689,29 @@ function RunRow({
     failure ? "items-start" : "items-center",
   );
 
-  // Clickable when the run has a conversation to open. A real <Link> (anchor)
-  // is focusable and Enter/Space-activatable for free; the hover highlight +
-  // pointer cursor signal clickability without any explicit link text.
-  if (run.conversationId) {
-    return (
-      <li data-testid="task-detail-run" data-run-status={run.status} data-run-unread={unread}>
+  // Keep the animation on the stable row when a queued run gains a session link.
+  return (
+    <li
+      data-testid="task-detail-run"
+      data-run-status={run.status}
+      data-run-unread={run.status === "succeeded" ? unread : undefined}
+      className={cn("rounded-lg", highlighted && "animate-message-highlight")}
+      style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
+    >
+      {run.conversationId ? (
         <Link
           to={`/c/${run.conversationId}`}
           data-testid="run-open"
           className={cn(
             commonClassName,
             "cursor-pointer transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none",
-            highlighted && "animate-message-highlight",
           )}
-          style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
         >
           {body}
         </Link>
-      </li>
-    );
-  }
-
-  // No conversation → not clickable, no hover highlight, not focusable.
-  return (
-    <li
-      data-testid="task-detail-run"
-      data-run-status={run.status}
-      data-run-unread={run.status === "succeeded" ? unread : undefined}
-      className={cn(commonClassName, highlighted && "animate-message-highlight")}
-      style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
-    >
-      {body}
+      ) : (
+        <div className={commonClassName}>{body}</div>
+      )}
     </li>
   );
 }

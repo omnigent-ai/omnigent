@@ -441,6 +441,35 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
+  it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
+    "waits for a fresh history baseline before Run now: %j",
+    (state) => {
+      setTask(task());
+      setRuns([], state);
+      runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
+        opts?.onSuccess?.(),
+      );
+      const { rerender, container } = renderPage();
+      const button = screen.getByTestId("task-detail-run-now");
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+      expect(runNowMutate).not.toHaveBeenCalled();
+
+      const oldRun = run({ id: "old" });
+      setRuns([oldRun]);
+      rerender(pageTree());
+      expect(button).not.toBeDisabled();
+      expect(container.querySelector(".animate-message-highlight")).toBeNull();
+      fireEvent.click(button);
+      setRuns([run({ id: "new" }), oldRun]);
+      rerender(pageTree());
+      expect(screen.getAllByTestId("task-detail-run")[0]).toHaveClass("animate-message-highlight");
+      expect(screen.getAllByTestId("task-detail-run")[1]).not.toHaveClass(
+        "animate-message-highlight",
+      );
+    },
+  );
+
   it("Run now confirms the run was triggered and will start shortly on success", () => {
     runNowMutate.mockImplementation(
       (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
@@ -599,11 +628,14 @@ describe("header actions", () => {
         expect(highlighted()).toHaveLength(1);
         expect(screen.getAllByTestId("task-detail-run")[0]).toContainElement(highlighted()[0]);
         expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
+        const highlightedRow = highlighted()[0];
 
         act(() => vi.advanceTimersByTime(1_500));
-        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        setRuns([{ ...newRun, status: "succeeded", conversationId: "c_new" }, oldRun]);
         rerender(pageTree());
         expect(highlighted()).toHaveLength(1);
+        expect(highlighted()[0]).toBe(highlightedRow);
+        expect(within(highlightedRow).getByTestId("run-open")).toHaveAttribute("href", "/c/c_new");
         act(() => vi.advanceTimersByTime(1_500));
         expect(highlighted()).toHaveLength(0);
         setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
@@ -617,6 +649,36 @@ describe("header actions", () => {
         setRuns([run({ id: "other_task_run" })]);
         rerender(pageTree());
         expect(highlighted()).toHaveLength(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["expired", "failed retry"])(
+    "does not highlight unrelated runs after %s tracking",
+    (reason) => {
+      vi.useFakeTimers();
+      try {
+        setTask(task());
+        setRuns([]);
+        runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: () => void }) =>
+          opts?.onSuccess?.(),
+        );
+        const { rerender, container } = renderPage();
+        const button = screen.getByTestId("task-detail-run-now");
+        fireEvent.click(button);
+        act(() => vi.advanceTimersByTime(reason === "expired" ? 120_000 : 30_000));
+        if (reason === "failed retry") {
+          runNowMutate.mockImplementation(
+            (_id: string, opts?: { onError?: (error: Error) => void }) =>
+              opts?.onError?.(new Error("failed")),
+          );
+          fireEvent.click(button);
+        }
+        setRuns([run({ id: "unrelated" })]);
+        rerender(pageTree());
+        expect(container.querySelector(".animate-message-highlight")).toBeNull();
       } finally {
         vi.useRealTimers();
       }
