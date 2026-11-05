@@ -16123,7 +16123,7 @@ def test_btw_overlay_present_matches_settled_multiturn_and_generating(
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        f"    ←/→ to switch · x to clear history · {close_hint}",
+        f"    {history_hint} · x to clear history · {close_hint}",
     )
     assert claude_native_bridge._btw_overlay_present(settled) is True
     assert claude_native_bridge._btw_overlay_present(multiturn) is True
