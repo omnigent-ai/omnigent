@@ -27,7 +27,7 @@
   --input: #e4e4e7;
   --ring: #11171c;
   --brand-accent: #df3c85;
-  --sidebar: #fdfafa;
+  --sidebar: #fafafa;
   --sidebar-foreground: #27272a;
   --sidebar-primary: #2272b4;
   --sidebar-primary-foreground: #ffffff;
@@ -37,7 +37,7 @@
   --sidebar-ring: #2272b4;
   --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
   --sidebar-active-foreground: var(--primary);
-  --sidebar-background: linear-gradient(90deg, #fffefe, #fcf6fa);
+  --sidebar-background: var(--sidebar);
   --shell-background: var(--background);
 }
 

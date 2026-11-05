@@ -77,6 +77,7 @@ import {
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
+  XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
@@ -2068,6 +2069,7 @@ interface LandingDraft {
 
 let landingDraft: LandingDraft | null = null;
 let landingDraftRevision = 0;
+const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed";
 
 function writeLandingDraft(draft: LandingDraft | null): void {
   landingDraft = draft;
@@ -2222,6 +2224,13 @@ export function NewChatLandingScreen() {
   const hasNoSessions =
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
+  const [importPromptDismissed, setImportPromptDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(LANDING_IMPORT_DISMISSED_STORAGE_KEY) === "true";
+    } catch {
+      return false;
+    }
+  });
 
   // Filter and order selectable agents by deployment curation.
   const info = useServerInfo();
@@ -7591,8 +7600,8 @@ export function NewChatLandingScreen() {
             </p>
           )}
         </div>
-        {hasNoSessions ? (
-          <div className="mt-5 flex flex-col items-center gap-2">
+        {hasNoSessions && !importPromptDismissed ? (
+          <div className="mt-5 flex items-center justify-center gap-2">
             <Button
               variant="outline"
               className="mobile-touch-target mobile-app:h-auto"
@@ -7600,6 +7609,23 @@ export function NewChatLandingScreen() {
               data-testid="landing-import-sessions"
             >
               Import your recent sessions
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className="mobile-touch-target text-muted-foreground"
+              aria-label="Dismiss import suggestion"
+              onClick={() => {
+                setImportPromptDismissed(true);
+                try {
+                  localStorage.setItem(LANDING_IMPORT_DISMISSED_STORAGE_KEY, "true");
+                } catch {
+                  // Dismissal still works when browser storage is unavailable.
+                }
+              }}
+            >
+              <XIcon className="size-4" aria-hidden="true" />
             </Button>
           </div>
         ) : null}

@@ -238,7 +238,9 @@ Failed sends restore text and supported attachments unless the cell has a newer 
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
-sessions** on the empty landing. Choose a machine, harness, and recent count
+sessions** on the empty landing. The X beside the landing button dismisses the
+suggestion and keeps it hidden after reload in this browser; Settings → Import
+sessions remains available. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list,
 except Codex threads archived in Codex, which land in Archived, so the list can
@@ -954,7 +956,9 @@ plain `uv run pytest`, which starts a private server for the test.
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.
   Component coverage checks compact large batches, failure expansion, retry
-  after navigation, and collapsed headings.
+  after navigation, and collapsed headings. `web/src/shell/NewChatDialog.test.tsx`
+  covers the landing import link and dismissal, including persistence after
+  remount and unavailable storage.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`

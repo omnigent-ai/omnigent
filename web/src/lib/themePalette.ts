@@ -248,10 +248,9 @@ export const PALETTES: readonly PaletteMeta[] = [
         buttonBorder: "#d6d6d6",
         ring: "#11171c",
         brandAccent: "#df3c85",
-        sidebar: "#fdfafa",
+        sidebar: "#fafafa",
         sidebarPrimary: "#2272b4",
         sidebarRing: "#2272b4",
-        sidebarBackground: "linear-gradient(90deg, #fffefe, #fcf6fa)",
         shellBackground: "var(--background)",
       }),
       dark: paletteTokens({

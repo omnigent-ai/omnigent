@@ -5503,6 +5503,49 @@ describe("NewChatLandingScreen", () => {
     expect(notices.nextElementSibling).toBe(importActions);
   });
 
+  it("opens import settings from the empty landing", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    renderLanding();
+
+    fireEvent.click(screen.getByRole("button", { name: "Import your recent sessions" }));
+
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/settings/import");
+  });
+
+  it("dismisses the import suggestion beside its button and keeps it dismissed after remount", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    const landing = renderLanding();
+    const importButton = screen.getByRole("button", { name: "Import your recent sessions" });
+    const dismissButton = screen.getByRole("button", { name: "Dismiss import suggestion" });
+    expect(importButton.nextElementSibling).toBe(dismissButton);
+    expect(dismissButton).toHaveAttribute("data-variant", "ghost");
+
+    fireEvent.click(dismissButton);
+
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Dismiss import suggestion" })).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-input")).toBeVisible();
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(/^\/$/);
+
+    landing.unmount();
+    renderLanding();
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
+  });
+
+  it("dismisses the import suggestion when storage writes fail", async () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    renderLanding();
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Storage unavailable", "QuotaExceededError");
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss import suggestion" }));
+    });
+
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
+  });
+
   it("keeps the footer anchored to the composer when a harness notice appears", () => {
     useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
     renderLanding();

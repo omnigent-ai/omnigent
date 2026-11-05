@@ -62,6 +62,30 @@ Use `just` for common tasks; run `just --list` for grouped recipes.
 - `just lint` / `just lint-all` — run pre-commit; `just hooks` — install the git hooks
 - `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
 
+### Local development database
+
+- Always use the shared `~/.omnigent/chat.db` when starting or reusing a local
+  Omnigent development backend, unless the user explicitly requests isolated data.
+- Reuse a healthy backend using that database when available. Otherwise pass
+  `--database-uri "sqlite:///$HOME/.omnigent/chat.db"` explicitly to
+  `uv run --no-sync omnigent server`; do not let worktree-specific state or the
+  default `omnidev` pod select a separate database.
+- For `server --background`, set
+  `OMNIGENT_DATABASE_URI="sqlite:///$HOME/.omnigent/chat.db"` in the environment;
+  the background launcher does not forward the `--database-uri` option.
+- Point the frontend and host at the same backend, and verify the backend's
+  resolved database URI before reporting that the development servers are ready.
+- Automated tests retain their isolated databases.
+
+### Local code verification only
+
+- Verify changes with local code tests, type checks, and linters only.
+- Do not perform browser verification, including manual browser interaction,
+  Playwright/browser E2E runs, screenshots, or recordings, unless the user
+  explicitly requests browser verification for the current task.
+- Use unit, component, or non-browser integration tests for changed behavior.
+  This preference takes precedence over browser-drive guidance in feature maps.
+
 ## Pull requests
 
 When you open a pull request, fill in the repo's PR template at
@@ -115,8 +139,8 @@ human, such as concrete manual behavior checks, rather than only listing unit
 test commands. Don't leave the user guessing how to confirm the work — tell
 them exactly what to do.
 
-To drive the app yourself and prove a user-facing change on every entry point a
-user can reach, start with `feature-map/README.md`, then read the relevant maps and linked skills.
+Use `feature-map/README.md` and the relevant maps as references for user-facing
+behavior, following the local-code-only verification preference above.
 
 ## Deprecating features
 

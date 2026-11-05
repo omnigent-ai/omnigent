@@ -712,11 +712,11 @@
 /* Edge treatment is mode-specific but palette-independent. */
 html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-right: none;
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 .dark .conversations-sidebar {
   border-right: 1px solid var(--sidebar-edge-border);
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 
 .dark .workspace-panel-motion {
