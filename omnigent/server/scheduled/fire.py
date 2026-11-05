@@ -180,6 +180,7 @@ _STAGED_LAUNCH_ERRORS = _LaunchErrorCodes("sandbox_create_failed", "runner_start
 SANDBOX_REGISTRATION_TIMEOUT_S = 12 * 60
 # How long an abandoned launch gets to stop before its sandbox is torn down.
 _ABANDONED_LAUNCH_SETTLE_S = 30.0
+_REGISTRATION_HINT_TIMEOUT_S = 1.0
 
 # ``launch_start(conv, task, host_id, error_codes)`` — start provisioning a sandbox
 # in the background once the managed fire's prompt is saved. ``host_id`` is the
@@ -2328,18 +2329,36 @@ class _ClaimedRunRecorder:
                 self._deps, conv.id, error, _STAGED_LAUNCH_ERRORS.after_binding
             )
 
-    async def _fail_saved_prompt(self, conversation_id: str, reason: str) -> None:
+    async def _fail_saved_prompt(
+        self, conversation_id: str, reason: str | Callable[[], Awaitable[str]]
+    ) -> str:
         if self._deps.startup_inputs is not None:
-            await self._deps.startup_inputs.record_launch_failure(conversation_id, reason)
+            return await self._deps.startup_inputs.record_launch_failure(conversation_id, reason)
+        return await reason() if callable(reason) else reason
 
     async def _abandon_unregistered_sandbox(
         self, conversation_id: str, launch_task: asyncio.Task[None]
     ) -> None:
         """Fail a sandbox that never registered: its prompt, its launch, then the sandbox."""
         reason = f"the sandbox did not register within {self._registration_timeout_s:g} seconds"
-        # Fail the prompt first, so a host that binds during cleanup delivers nothing,
-        # and the cancelled launch finds no pending prompt to fail with its own reason.
-        await self._fail_saved_prompt(conversation_id, reason)
+        # Use the active provider's recovery guidance before cancellation releases it.
+        tracker = self._deps.managed_launches
+        launch = tracker.get(conversation_id) if tracker is not None else None
+        hint_callback = launch.host_online_failure_hint if launch is not None else None
+
+        async def failure_reason() -> str:
+            if hint_callback is not None:
+                try:
+                    async with asyncio.timeout(_REGISTRATION_HINT_TIMEOUT_S):
+                        hint = await asyncio.to_thread(hint_callback)
+                    if hint:
+                        return f"{reason} — {hint}"
+                except Exception:
+                    _logger.warning("Could not build the sandbox registration hint", exc_info=True)
+            return reason
+
+        # Fence queued inputs before diagnostics yield; late registration cannot deliver them.
+        reason = await self._fail_saved_prompt(conversation_id, failure_reason)
         launch_task.cancel()
         await asyncio.wait({launch_task}, timeout=_ABANDONED_LAUNCH_SETTLE_S)
         await _terminate_run_sandbox(self._deps, self._lease.run.host_id)

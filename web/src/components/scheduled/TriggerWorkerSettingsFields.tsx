@@ -3,13 +3,8 @@ import { Label } from "./Label";
 import { ModelEffortFields } from "./ModelEffortFields";
 import type { TriggerWorkerSettings } from "./triggerTemplates";
 import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { ScheduleSelect as Select } from "./ScheduleSelect";
+import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 export function TriggerWorkerSettingsFields({
   value,
