@@ -135,6 +135,10 @@ describe("triggerFieldsComplete", () => {
   it.each<[string, Partial<TriggerFields>, boolean]>([
     ["scope and instructions, no conditions", { conditions: [] }, true],
     ["blank scope", { scope: "  " }, false],
+    ["equals matches one scope", { scopeOperator: "is", scope: "ES" }, true],
+    ["equals rejects lists", { scopeOperator: "is", scope: "ES, OPS" }, false],
+    ["in accepts one scope", { scopeOperator: "in", scope: "ES" }, true],
+    ["in accepts multiple scopes", { scopeOperator: "in", scope: "ES, OPS" }, true],
     // Commas alone parse to no entries, which would drop GitHub's repo filter.
     ["comma-only scope", { scope: " , ," }, false],
     ["a condition with no value", { conditions: [{ ...LABEL_OMNIGENT, value: " " }] }, false],
@@ -163,6 +167,12 @@ describe("splitJqlOrderBy", () => {
 });
 
 describe("compileJiraJql", () => {
+  it.each(["is", "in"] as const)("compiles an explicit %s scope operator", (scopeOperator) => {
+    expect(compileJiraJql(fields({ scopeOperator, scope: "ES", conditions: [] }))).toBe(
+      scopeOperator === "is" ? 'project = "ES"' : 'project in ("ES")',
+    );
+  });
+
   const jql = (scope: string, ...conditions: TriggerCondition[]) =>
     compileJiraJql(fields({ scope, conditions }));
 
@@ -371,6 +381,27 @@ describe("renderTriggerPrompt", () => {
     expect(sorted).not.toContain("ORDER BY created DESC");
   });
 
+  it.each([true, false])("puts Slack links in the worker result with linkBack=%s", (linkBack) => {
+    const prompt = renderTriggerPrompt(
+      "slack",
+      fields({ event: "posted", scope: "#support", linkBack }),
+      CTX,
+    );
+    const [manager, worker] = prompt.split("Instructions for each session:\n");
+    expect(manager).not.toContain("Link-back pending:");
+    expect(manager).not.toContain('Reply "Omnigent session:');
+    expect(worker).toContain(
+      "Reply in the source thread when you have a useful result or a blocker",
+    );
+    expect(worker).toContain("Do not send an acknowledgement or a separate session-link message");
+    expect(worker).toContain(
+      linkBack ? "Include your own session link at the bottom" : "Do not add a session link",
+    );
+    const parts = splitTriggerPrompt(prompt);
+    expect(parts.userPrompt).toBe(fields().instructions);
+    expect(combineTriggerPrompt(parts.userPrompt, parts.systemPrompt)).toBe(prompt);
+  });
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
@@ -539,7 +570,7 @@ describe("renderTriggerPrompt", () => {
     );
     expect(filtered).toContain("Only messages that are about bug reports count.");
     expect(filtered).toContain('title "Slack <channel> <message ts>"');
-    expect(filtered).toContain("in the thread of each message");
+    expect(filtered).toContain("Reply in the source thread when you have a useful result");
 
     const unfiltered = renderTriggerPrompt(
       "slack",
