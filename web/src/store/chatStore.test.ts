@@ -7931,19 +7931,52 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         ]);
       });
 
-      it("clears an undelivered message once another client's retry delivers it", () => {
-        useChatStore.setState({
-          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
-          pendingUserMessages: [],
-        });
+      const deliver = (clearedPendingId: string | null) =>
         handleSessionEvent({
           type: "session_input_consumed",
           itemId: "item_first",
           itemType: "message",
           data: { role: "user", content: [lost] },
-          clearedPendingId: "pending_first",
+          clearedPendingId,
         });
+
+      it("keeps a message another client delivered from coming back with an older read", async () => {
+        const beforeDelivery = deferred();
+        const afterDelivery = deferred();
+        fetchMock
+          .mockImplementationOnce(() => beforeDelivery.response)
+          .mockImplementationOnce(() => afterDelivery.response);
+        useChatStore.setState({
+          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+          pendingUserMessages: [],
+        });
+
+        failLaunch();
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+        deliver("pending_first");
         expect(useChatStore.getState().failedInputs).toEqual([]);
+        await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+        beforeDelivery.answer(snapshot("failed", [], [failedEntry]));
+        await tick();
+        expect(useChatStore.getState().failedInputs).toEqual([]);
+        afterDelivery.answer(snapshot("ready", [], []));
+        await tick();
+        await tick();
+
+        expect(useChatStore.getState().failedInputs).toEqual([]);
+      });
+
+      it("clears a delivered message whose receipt doesn't name it", async () => {
+        // A non-native delivery's receipt carries no pending id.
+        fetchMock.mockResolvedValueOnce(snapshot("ready", [], []));
+        useChatStore.setState({
+          failedInputs: [{ pendingId: "pending_first", content: [lost] }],
+          pendingUserMessages: [],
+        });
+
+        deliver(null);
+
+        await vi.waitFor(() => expect(useChatStore.getState().failedInputs).toEqual([]));
       });
     });
 

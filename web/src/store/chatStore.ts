@@ -4916,17 +4916,18 @@ let startupReadCount = 0;
 const startupReads = new Map<string, number>();
 
 /**
- * Re-read a session after its sandbox launch failed, so the messages it never
- * delivered show as undelivered instead of vanishing with their bubbles.
+ * Re-read a session's undelivered startup messages after its launch failed or
+ * one of them was delivered, so they show (or stop showing) as undelivered.
  *
  * A launch can report "failed" before the server has marked its saved inputs
- * failed, then again once it has; each report starts a fresh read rather than
- * joining one in flight, and only the newest applies. The snapshot also ends
- * the startup state a failed launch leaves behind.
+ * failed, then again once it has, and a delivery can land while a read is out;
+ * each starts a fresh read rather than joining one in flight, and only the
+ * newest applies. The snapshot also ends the startup state a failed launch
+ * leaves behind.
  *
- * @param id - Conversation/session id whose launch failed.
+ * @param id - Conversation/session id to re-read.
  */
-async function refreshAfterFailedLaunch(id: string): Promise<void> {
+async function refreshFailedInputs(id: string): Promise<void> {
   startupReadCount += 1;
   const read = startupReadCount;
   startupReads.set(id, read);
@@ -8241,7 +8242,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
-      if (event.stage === "failed") void refreshAfterFailedLaunch(event.conversationId);
+      if (event.stage === "failed") void refreshFailedInputs(event.conversationId);
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {
@@ -8755,14 +8756,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
-      const deliveredId = event.clearedPendingId;
-      if (deliveredId) {
-        // Delivered by a retry from another client, so it is no longer undelivered.
-        applyToConversation((s) =>
-          s.failedInputs.some((input) => input.pendingId === deliveredId)
-            ? { failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId) }
-            : {},
-        );
+      // A retry from another client delivered an undelivered message. Clear it now
+      // when the receipt names it (native ones do), and re-read either way: that
+      // read also supersedes one in flight from before the delivery.
+      if (
+        sourceConversationId &&
+        (setterForState(sourceConversationId)?.failedInputs.length ?? 0) > 0
+      ) {
+        const deliveredId = event.clearedPendingId;
+        if (deliveredId) {
+          applyToConversation((s) => ({
+            failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId),
+          }));
+        }
+        void refreshFailedInputs(sourceConversationId);
       }
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
