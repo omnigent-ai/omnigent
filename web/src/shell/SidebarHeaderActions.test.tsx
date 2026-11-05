@@ -49,3 +49,34 @@ describe("SidebarHeaderActions shortcut hints", () => {
     ).toEqual(keys);
   });
 });
+
+describe("SidebarHeaderActions history navigation", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** Labels of the cluster's controls in DOM order. */
+  function renderClusterLabels() {
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <SidebarHeaderActions expanded onToggle={vi.fn()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+    const cluster = screen.getByTestId("sidebar-header-actions");
+    return Array.from(cluster.querySelectorAll("[aria-label]"), (control) =>
+      control.getAttribute("aria-label"),
+    );
+  }
+
+  it("leads with Back and Forward", () => {
+    vi.stubGlobal("navigation", new EventTarget());
+    // On macOS the title-bar copy pulls the toggle in front of them (index.css).
+    expect(renderClusterLabels()).toEqual([
+      "Back",
+      "Forward",
+      "Search",
+      "Settings",
+      "Close sidebar",
+    ]);
+  });
+});
