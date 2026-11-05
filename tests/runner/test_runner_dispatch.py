@@ -2714,6 +2714,118 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
 
 
+@pytest.mark.parametrize(
+    "original,calls,statuses,read_cap,baseline",
+    [
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="edit-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="write-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
+                ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
+                ("sys_os_edit", {"oldText": "uno", "newText": "one"}),
+            ],
+            ["modified"],
+            None,
+            "one\ntwo\n",
+            id="partially-reverted",
+        ),
+        pytest.param(
+            b"one\r\ntwo\r\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            ["modified"],
+            None,
+            "one\r\ntwo\r\n",
+            id="line-endings-changed",
+        ),
+        pytest.param(
+            b"\x89PNG\r\n\x1a\n\x00\xff",
+            [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
+            ["modified"],
+            None,
+            None,
+            id="binary-original",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            ["modified"],
+            4,
+            None,
+            id="original-beyond-read-cap",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_os_env_change_restoring_the_original_leaves_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
+    calls: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+    read_cap: int | None,
+    baseline: str | None,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    if read_cap is not None:
+        monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", read_cap)
+    (tmp_path / "file.txt").write_bytes(original)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    for step, (tool_name, args) in enumerate(calls, start=1):
+        result = await _execute_os_env_tool(
+            tool_name,
+            {"path": "file.txt", **args},
+            agent_spec=spec,
+            conversation_id="conv_revert",
+            filesystem_registry=filesystem_registry,
+        )
+        assert "error" not in json.loads(result)
+        if step < len(calls):
+            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+
+    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+    assert [entry["status"] for entry in listed] == statuses
+    assert filesystem_registry.get_baseline("file.txt") == baseline
+
+
 @pytest.mark.asyncio
 async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
     monkeypatch: pytest.MonkeyPatch,
