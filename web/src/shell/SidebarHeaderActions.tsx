@@ -19,7 +19,7 @@ const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
  * md+, in the persistent title-bar strip. There it must survive the
  * sidebar collapsing — the sidebar goes `md:w-0 md:overflow-hidden` and turns
  * `inert`, so a cluster living inside it would be clipped and unclickable, and
- * while peeking the card floats at `inset-2` and drags the cluster off the
+ * while peeking the floating card's offset drags the cluster off the
  * traffic lights' centre line. Hoisting it out of the sidebar is what keeps the
  * three icons in one fixed place across open, collapsed, and peeking.
  *
