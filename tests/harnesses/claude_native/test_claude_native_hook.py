@@ -3285,11 +3285,12 @@ def test_reattach_auth_lapse_retry_stops_at_deadline(
 
     assert resp is None
     if answer_window_s is None:
-        assert clock["t"] == pytest.approx(
+        budget = (
             claude_native_hook._PERMISSION_TIMEOUT_S
             - claude_native_hook._PERMISSION_DEADLINE_MARGIN_S
         )
-        assert "retry budget exhausted" in capsys.readouterr().err
+        assert clock["t"] == pytest.approx(budget)
+        assert f"retry budget exhausted ({budget:.0f}s)" in capsys.readouterr().err
     else:
         assert clock["t"] == pytest.approx(floor + 290.0 + answer_window_s)
         assert "within the answer window" in capsys.readouterr().err

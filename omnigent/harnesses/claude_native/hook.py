@@ -813,12 +813,13 @@ def _post_hook_with_reattach(
     one hook re-POSTing once per proxy timeout for up to a day, which also
     keeps the card alive until the server recovers.
 
-    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling bounds the total wait on
-    every path, matching the day-long human-answer window. It ends
-    :data:`_PERMISSION_DEADLINE_MARGIN_S` early: no request or backoff starts
-    past it, and each request phase is clipped to the time left. The margin
-    absorbs a final connect ahead of a full-length read, so the hook returns
-    before Claude's own hook timeout kills it.
+    The absolute :data:`_PERMISSION_TIMEOUT_S` ceiling, matching the day-long
+    human-answer window, ends retries on every path. It falls
+    :data:`_PERMISSION_DEADLINE_MARGIN_S` short: no request or backoff starts
+    past it, and each request's connect and read timeouts are clipped to the
+    time left. The margin leaves room for that last connect and read before
+    Claude's own hook timeout; it does not bound a slow token renewal or a
+    response that keeps trickling data.
 
     :param url: Absolute hook endpoint URL, e.g.
         ``"http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request"``.
@@ -886,7 +887,8 @@ def _post_hook_with_reattach(
             if remaining_s <= 0.0:
                 print(
                     f"omnigent {hook_label} hook: retry budget exhausted "
-                    f"({_PERMISSION_TIMEOUT_S:.0f}s) — failing ask",
+                    f"({_PERMISSION_TIMEOUT_S - _PERMISSION_DEADLINE_MARGIN_S:.0f}s) "
+                    "— failing ask",
                     file=sys.stderr,
                 )
                 return None
