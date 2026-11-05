@@ -42,7 +42,7 @@ import {
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
-  settleOpenSessionRowArchived,
+  settleOpenSessionRow,
   unmarkRecentlyCreated,
 } from "@/lib/sessionListCache";
 import { createListReconcileScheduler } from "@/lib/listReconcileScheduler";
@@ -175,10 +175,9 @@ function applyItemsToCache(
     return changed ? { ...previous, conversations } : previous;
   });
   // The open session's fetched sidebar row sits outside every list, so a remote
-  // archive or unarchive reaches it only here.
-  for (const item of itemsById.values()) {
-    if (typeof item.archived === "boolean")
-      settleOpenSessionRowArchived(queryClient, item.id, item.archived);
+  // archive, unarchive or rename reaches it only here.
+  for (const { id, archived, title, updated_at } of itemsById.values()) {
+    settleOpenSessionRow(queryClient, id, { archived, title, updated_at });
   }
   return {
     // Sub-agent children are watched for their tree views, but no session list

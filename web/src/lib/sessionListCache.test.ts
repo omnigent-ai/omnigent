@@ -13,7 +13,7 @@ import {
   overlayArchivedIntoCaches,
   overlayTitleIntoCaches,
   removeIdsFromPages,
-  settleOpenSessionRowArchived,
+  settleOpenSessionRow,
 } from "./sessionListCache";
 
 function conv(id: string, overrides: Partial<Conversation> = {}): Conversation {
@@ -617,25 +617,28 @@ describe("insertNewRowsIntoPages", () => {
   });
 });
 
-describe("settleOpenSessionRowArchived", () => {
+describe("settleOpenSessionRow", () => {
   const key = ["conversation-backfill", "a"];
 
   it("skips a session with no fetched row", () => {
     const client = new QueryClient();
     const isFetching = vi.spyOn(client, "isFetching");
 
-    settleOpenSessionRowArchived(client, "a", true);
+    settleOpenSessionRow(client, "a", { archived: true });
 
     expect(client.getQueryState(key)).toBeUndefined();
     expect(isFetching).not.toHaveBeenCalled();
   });
 
-  it("patches only the archive flag, keeping the owner", () => {
+  it("patches only the given fields, keeping the owner", () => {
     const client = new QueryClient();
     client.setQueryData(key, conv("a", { owner: "teammate", archived: false }));
 
-    settleOpenSessionRowArchived(client, "a", true);
+    settleOpenSessionRow(client, "a", { archived: true });
+    settleOpenSessionRow(client, "a", { title: "Renamed", updated_at: 5 });
 
-    expect(client.getQueryData(key)).toEqual(conv("a", { owner: "teammate", archived: true }));
+    expect(client.getQueryData(key)).toEqual(
+      conv("a", { owner: "teammate", archived: true, title: "Renamed", updated_at: 5 }),
+    );
   });
 });

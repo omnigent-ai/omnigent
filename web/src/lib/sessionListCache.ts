@@ -614,18 +614,18 @@ export function overlayArchivedIntoCaches(
 }
 
 /**
- * Settle a known archive flag on the open session's fetched sidebar row,
- * keeping its owner. A detail request in flight may have been served before the
- * flag changed, so it is cancelled and restarted rather than left to land.
+ * Settle server-known fields on the open session's fetched sidebar row, keeping
+ * its owner. A detail request in flight may have been served before they
+ * changed, so it is cancelled and restarted rather than left to land.
  *
  * @param queryClient - The app QueryClient.
- * @param id - The session whose archive flag is known.
- * @param archived - The flag from the server.
+ * @param id - The session whose fields are known.
+ * @param fields - The server's archive flag, title and update time; omitted ones are kept.
  */
-export function settleOpenSessionRowArchived(
+export function settleOpenSessionRow(
   queryClient: QueryClient,
   id: string,
-  archived: boolean,
+  fields: Pick<SessionListWireItem, "archived" | "title" | "updated_at">,
 ): void {
   const queryKey = ["conversation-backfill", id];
   if (queryClient.getQueryState(queryKey) === undefined) return;
@@ -633,9 +633,20 @@ export function settleOpenSessionRowArchived(
   // invalidateQueries only joins a first fetch (no data yet), so cancel explicitly.
   if (fetching) void queryClient.cancelQueries({ queryKey, exact: true });
   const row = queryClient.getQueryData<Conversation | null>(queryKey);
-  if (row && (row.archived ?? false) !== archived) {
-    const settledRow: Conversation = { ...row, archived };
-    queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
+  if (row) {
+    const settledRow: Conversation = {
+      ...row,
+      archived: fields.archived ?? row.archived,
+      title: fields.title === undefined ? row.title : fields.title,
+      updated_at: fields.updated_at ?? row.updated_at,
+    };
+    if (
+      (settledRow.archived ?? false) !== (row.archived ?? false) ||
+      settledRow.title !== row.title ||
+      settledRow.updated_at !== row.updated_at
+    ) {
+      queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
+    }
   }
   if (fetching) void queryClient.invalidateQueries({ queryKey, exact: true });
 }

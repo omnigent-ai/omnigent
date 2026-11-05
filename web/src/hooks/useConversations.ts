@@ -47,7 +47,7 @@ import {
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
-  settleOpenSessionRowArchived,
+  settleOpenSessionRow,
   unmarkRecentlyCreated,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -1069,7 +1069,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
-      settleOpenSessionRowArchived(queryClient, updated.id, archived);
+      settleOpenSessionRow(queryClient, updated.id, { archived });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
@@ -1443,7 +1443,7 @@ export function useBulkArchiveConversations() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, ids);
       }
-      for (const id of ids) settleOpenSessionRowArchived(queryClient, id, archived);
+      for (const id of ids) settleOpenSessionRow(queryClient, id, { archived });
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike

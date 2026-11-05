@@ -690,6 +690,34 @@ describe("SessionUpdatesProvider open-session row", () => {
     },
   );
 
+  it("applies a remote rename to the fetched row, keeping its owner", () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    client.setQueryData<Conversation>(key, {
+      ...conv("conv_old"),
+      archived: true,
+      owner: "teammate",
+    });
+    renderProvider(client, ["/c/conv_old"]);
+
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          { ...conv("conv_old"), archived: true, owner: null, title: "Renamed", updated_at: 99 },
+        ],
+      }),
+    );
+
+    expect(client.getQueryData<Conversation>(key)).toMatchObject({
+      title: "Renamed",
+      updated_at: 99,
+      archived: true,
+      owner: "teammate",
+    });
+  });
+
   it("leaves an unchanged fetched row as it is", () => {
     const client = new QueryClient();
     seedConversations(client, ["conv_a"]);
@@ -697,15 +725,18 @@ describe("SessionUpdatesProvider open-session row", () => {
     const row: Conversation = { ...conv("conv_old"), archived: true };
     client.setQueryData<Conversation>(key, row);
     renderProvider(client, ["/c/conv_old"]);
+    const writes = vi.fn();
+    const unsubscribe = client.getQueryCache().subscribe((event) => {
+      if (event.type === "updated" && event.query.queryKey[0] === "conversation-backfill") writes();
+    });
 
     act(() =>
-      frameHandler()({
-        type: "changed",
-        items: [{ ...conv("conv_old"), archived: true, title: "Renamed" }],
-      }),
+      frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
     );
 
     expect(client.getQueryData<Conversation>(key)).toBe(row);
+    expect(writes).not.toHaveBeenCalled();
+    unsubscribe();
   });
 
   it("drops a remotely removed session's fetched row", () => {
