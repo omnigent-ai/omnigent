@@ -12,7 +12,6 @@ from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT
 @pytest.fixture(scope="module")
 def automations_v2_server(
     built_spa: None,
-    request: pytest.FixtureRequest,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[str]:
     """Run a server with ``OMNIGENT_FEATURES=automations_v2`` and yield its URL.
@@ -27,7 +26,7 @@ def automations_v2_server(
         server_dir,
         env={
             "OMNIGENT_CONFIG": str(config_path),
-            "OMNIGENT_FEATURES": getattr(request, "param", "automations_v2"),
+            "OMNIGENT_FEATURES": "automations_v2",
             "OMNIGENT_WEB_UI_DIST": str(_BUILD_OUTPUT),
             "PYTHONPATH": server_pythonpath(_REPO_ROOT),
         },

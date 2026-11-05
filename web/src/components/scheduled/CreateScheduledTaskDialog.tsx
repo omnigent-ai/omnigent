@@ -533,6 +533,10 @@ export function CreateScheduledTaskDialog({
           // or each in its own sandbox.
           placement: sandboxMode ? "managed" : "same_host",
           sessionLink,
+          pollingIntervalMinutes:
+            schedule.preset === "custom" && schedule.customFreq === "minutely"
+              ? schedule.interval
+              : 60,
           model: supportsModel && pickedModel !== "" ? pickedModel : undefined,
           effort: supportsModel && pickedEffort !== "" ? pickedEffort : undefined,
         })

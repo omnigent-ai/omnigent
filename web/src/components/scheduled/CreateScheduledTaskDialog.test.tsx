@@ -2685,7 +2685,10 @@ describe("CreateScheduledTaskDialog trigger template", () => {
       expect(screen.getByTestId("task-trigger-cadence")).toHaveTextContent(
         minutes === 60 ? "Hourly" : `Every ${minutes} minutes`,
       );
-      await submittedPrompt();
+      const prompt = await submittedPrompt();
+      expect(prompt).toContain(
+        `On the first run, use ${minutes > 60 ? `${minutes} minutes` : "one hour"} ago and nothing pending.`,
+      );
       expect(mutateAsync.mock.calls[0][0]).toMatchObject({
         rrule: minutes === 60 ? "FREQ=HOURLY;BYMINUTE=0" : `FREQ=MINUTELY;INTERVAL=${minutes}`,
         sessionMode: "continue",

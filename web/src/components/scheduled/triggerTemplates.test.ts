@@ -337,8 +337,18 @@ describe("isTriggerPrompt", () => {
 });
 
 describe("renderTriggerPrompt", () => {
+  it("covers a four-hour polling interval on the first run", () => {
+    const prompt = renderTriggerPrompt("jira", fields(), {
+      ...CTX,
+      pollingIntervalMinutes: 240,
+    });
+    expect(prompt).toContain("On the first run, use 240 minutes ago and nothing pending.");
+    expect(prompt).toContain("Then search from 5 minutes before the check time");
+  });
+
   it("renders the Jira manager prompt with the JQL, placement, dedupe title and link", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
+    expect(prompt).toContain("On the first run, use one hour ago and nothing pending.");
 
     // Only creation fires: an older ticket that's edited or starts matching later doesn't.
     expect(prompt).toContain(

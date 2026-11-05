@@ -71,12 +71,15 @@ to customize.
   show polling cadence instead of schedule controls, Run now, or next-run times.
   New templates use `automation_trigger_poll_minutes` from the server (10–240 minutes,
   default 10), otherwise hourly when the requested cadence is unsupported; saved
-  schedules are preserved. Both row-menu and detail-page editing keep schedule
+  schedules are preserved. The initial search covers at least one polling interval
+  or one hour, whichever is longer, plus the indexing overlap. Both row-menu and detail-page editing keep schedule
   controls hidden, including while customizing the system prompt. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.
   Edit as prompt → New session each run restores the
   scheduling controls, even when the prompt retains its template signature.
+  Replacing the template’s opening sentence also restores regular scheduling
+  controls after saving and reopening.
 - `schedule`: the shared modal supports ten-minute connected-host schedules in
   either session mode and continued-sandbox schedules; new sandbox sessions stay hourly.
 - `capabilities`: Jira, Slack, GitHub, and Linear templates require session continuity
