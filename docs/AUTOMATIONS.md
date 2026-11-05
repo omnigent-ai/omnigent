@@ -87,7 +87,7 @@ prompt, host and permission settings in that request. This also applies when
 the call inherits defaults. Direct changes you make in the UI or REST API keep
 their existing authorization rules.
 
-**New automation** starts with **Trigger type: Schedule**. Choose **Jira**, **Slack**, **GitHub**, or **Linear** in the same form to set up matching-item triggers; gallery templates preselect their integration. Switching types keeps each draft until the dialog closes, including schedule settings and custom prompt edits. Integration choices require the same server capabilities as the template gallery. Existing automations keep their current editor.
+**New automation** starts with **Trigger type: Schedule**. Choose **Jira**, **Slack**, **GitHub**, or **Linear** in the same form to set up matching-item triggers; gallery templates preselect their integration. Choosing a type for the first time carries over your instructions. Switching back restores that type's draft until the dialog closes, including schedule settings and custom prompt edits. Integration choices require the same server capabilities as the template gallery. Existing automations keep their current editor.
 
 New automations default to the **Omnigent Automation** project, which is created or reused when you save. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
 

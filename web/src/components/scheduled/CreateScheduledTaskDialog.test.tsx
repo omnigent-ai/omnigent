@@ -2682,14 +2682,19 @@ describe("automation trigger type", () => {
     await choose("Every week", "schedule-preset-trigger");
     await choose("Jira");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Team work");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue(
+      "Prepare the weekly report.",
+    );
     type("task-trigger-scope", "ES");
     type("task-trigger-instructions", "Triage the ticket.");
     fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
     type("task-trigger-condition-0-value", "bug");
     await choose("Slack");
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");
     expect(screen.queryByTestId("task-trigger-condition-0-value")).not.toBeInTheDocument();
     type("task-trigger-scope", "support");
+    type("task-trigger-instructions", "Summarize the message.");
     await choose("Jira");
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("ES");
     expect(screen.getByTestId("task-trigger-instructions")).toHaveValue("Triage the ticket.");

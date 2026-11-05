@@ -631,13 +631,17 @@ export function CreateScheduledTaskDialog({
       next === "schedule" ? (initialName ?? "") : TRIGGER_TEMPLATES[next].name;
     const customName = name.trim() !== "" && name !== previousDefaultName;
     const draft = typeDrafts.current[next];
+    const nextPrompt = trigger !== null ? triggerFields.instructions : prompt;
     setTriggerType(next);
     setName(draft?.name ?? (customName ? name : nextDefaultName));
-    setPrompt(draft?.prompt ?? (trigger !== null ? triggerFields.instructions : prompt));
+    setPrompt(draft?.prompt ?? nextPrompt);
     setSystemPrompt(draft?.systemPrompt ?? null);
     setTrigger(draft ? draft.trigger : next === "schedule" ? null : next);
     setTriggerFields(
-      draft?.triggerFields ?? emptyTriggerFields(next === "schedule" ? "jira" : next),
+      draft?.triggerFields ?? {
+        ...emptyTriggerFields(next === "schedule" ? "jira" : next),
+        instructions: nextPrompt,
+      },
     );
     setSchedule(
       draft?.schedule ?? (next === "schedule" ? DEFAULT_SCHEDULE_MODEL : defaultTriggerSchedule),

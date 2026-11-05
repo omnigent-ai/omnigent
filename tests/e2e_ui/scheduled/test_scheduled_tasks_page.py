@@ -1065,7 +1065,11 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
         page.get_by_test_id("new-task-button").click()
         expect(page.get_by_label("Trigger type", exact=True)).to_have_text("Schedule")
         expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+        page.get_by_test_id("task-prompt-input").fill("Triage the incoming item.")
         _pick_select_option(page, "task-trigger-type", "Slack")
+        expect(page.get_by_test_id("task-trigger-instructions")).to_have_value(
+            "Triage the incoming item."
+        )
         page.get_by_test_id("task-trigger-scope").fill("support")
         _pick_select_option(page, "task-trigger-type", "Schedule")
         expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
