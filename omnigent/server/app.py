@@ -348,6 +348,8 @@ class ServerInfoResponse(BaseModel):
     # which clients treat as unsupported.
     session_title_instructions: bool = False
     admin_view: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.

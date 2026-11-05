@@ -50,7 +50,7 @@ export function LocalReviewComment({
                 setEditing(true);
               }}
             >
-              <PencilIcon data-icon-size="compact" className="size-3" />
+              <PencilIcon className="size-4" />
             </Button>
             <Button
               type="button"
@@ -61,7 +61,7 @@ export function LocalReviewComment({
               disabled={pending}
               onClick={() => remove.mutate(comment.id)}
             >
-              <Trash2Icon data-icon-size="compact" className="size-3" />
+              <Trash2Icon className="size-4" />
             </Button>
           </div>
         )}

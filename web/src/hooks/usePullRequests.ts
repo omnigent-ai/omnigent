@@ -1,5 +1,6 @@
 import { createComment, type Comment } from "./useComments";
 import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 // Serves every git provider. Runtime names (query keys, routes, test ids) keep
 // the `github` prefix because they are stable wire ids.
 //
@@ -1517,6 +1518,8 @@ export function usePullRequestReviewThreadComposer(
   headSha: string,
   baseSha: string,
 ) {
+  const serverInfo = useServerInfo();
+  const localSupported = serverInfo !== "loading" && serverInfo.comment_anchor_metadata === true;
   const queryClient = useQueryClient();
   const key = ["github-new-review-thread", conversationId, prUrl, path];
   const { draft, updateDraft } = usePullRequestCommentDraft(key);
@@ -1590,7 +1593,9 @@ export function usePullRequestReviewThreadComposer(
         queryKey: ["github-review-threads", target.conversationId, target.prUrl],
       });
     },
-    onError: (error: Error, target) =>
+    onError: (error: Error, target) => {
+      if (target.local)
+        void queryClient.invalidateQueries({ queryKey: ["comments", target.conversationId] });
       queryClient.setQueryData<PullRequestCommentDraft>(
         target.key,
         (current) =>
@@ -1599,7 +1604,8 @@ export function usePullRequestReviewThreadComposer(
             pending: false,
             error: target.local ? error.message : commentPostingError(error),
           },
-      ),
+      );
+    },
   });
   return {
     draft,
@@ -1629,6 +1635,10 @@ export function usePullRequestReviewThreadComposer(
         return;
       if (current.anchor.head_sha !== headSha || current.anchor.base_sha !== baseSha) {
         updateDraft({ error: "The pull request changed. Reselect the lines before posting." });
+        return;
+      }
+      if (current.destination === "local" && !localSupported) {
+        updateDraft({ error: "Agent comments require a newer server. Your draft is saved." });
         return;
       }
       updateDraft({ pending: true, error: null });

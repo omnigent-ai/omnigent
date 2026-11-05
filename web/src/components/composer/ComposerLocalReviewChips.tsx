@@ -29,7 +29,7 @@ function LocalReviewChip({ comment }: { comment: Comment }) {
         <HoverCardTrigger asChild>
           <button
             type="button"
-            className="flex min-w-0 items-center gap-1 hover:text-foreground"
+            className="flex min-w-0 cursor-pointer items-center gap-1 hover:text-foreground"
             aria-label={`Open local review comment ${label}`}
             onClick={() => {
               requestLocalReviewNavigation(comment);
@@ -48,7 +48,7 @@ function LocalReviewChip({ comment }: { comment: Comment }) {
             })
           }
           disabled={remove.isPending}
-          className="ml-0.5 shrink-0 rounded-full hover:text-foreground disabled:opacity-50"
+          className="ml-0.5 shrink-0 cursor-pointer rounded-full hover:text-foreground disabled:cursor-default disabled:opacity-50"
           aria-label={`Delete local review comment ${label}`}
           title="Delete comment"
         >

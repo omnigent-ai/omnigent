@@ -6517,6 +6517,11 @@
             "title": "Codex Nonblocking Decline",
             "type": "boolean"
           },
+          "comment_anchor_metadata": {
+            "default": true,
+            "title": "Comment Anchor Metadata",
+            "type": "boolean"
+          },
           "databricks_features": {
             "title": "Databricks Features",
             "type": "boolean"
