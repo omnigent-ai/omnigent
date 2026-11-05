@@ -1629,6 +1629,8 @@ async def test_output_limit_requires_compatible_completed_source(
         )
     await _forward_output_limit_event(client, codex, state, tmp_path, "turn/completed", params)
     assert codex.requests == []
+    if fence == "capability":
+        assert "Ask it to continue" in client.posts[-1][1]["data"]["output"]
 
 
 @pytest.mark.parametrize(
@@ -1696,6 +1698,15 @@ async def test_output_limit_ack_never_proves_delivery_or_replays(
     assert first.automatic_input_outcome == "uncertain"
     assert first.automatic_input_turn_id is None
     assert any(body["data"].get("item_type") == "error" for _, body in client.posts)
+    guidance = [
+        body["data"]["item_data"]["message"]
+        for _, body in client.posts
+        if body["data"].get("item_type") == "error"
+    ]
+    assert all(
+        "unconfirmed" in message and "Inspect the terminal" in message for message in guidance
+    )
+    assert all("Ask it to continue" not in message for message in guidance)
     await _forward_output_limit_event(
         client,
         codex,
@@ -2169,6 +2180,16 @@ async def test_output_limit_unknown_receipt_status_does_not_prove_native_complet
     assert owner.active_turn_id is None
     assert [method for method, _ in codex.requests] == ["turn/start", "thread/read"]
     assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
+    guidance = [
+        body["data"]["item_data"]["message"]
+        for _, body in client.posts
+        if body["data"].get("item_type") == "error"
+    ]
+    assert guidance
+    assert all(
+        "unconfirmed" in message and "Inspect the terminal" in message for message in guidance
+    )
+    assert all("Ask it to continue" not in message for message in guidance)
     assert not any(body["type"] == "external_session_status" for _, body in client.posts)
 
 
@@ -2245,3 +2266,4 @@ async def test_output_limit_deadline_before_send_settles_uncertainty(
     assert read_bridge_state(tmp_path).automatic_input_outcome == "uncertain"
     assert read_bridge_state(tmp_path).active_turn_id is None
     assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
+    assert any("Ask it to continue" in json.dumps(body) for _, body in client.posts)

@@ -3240,7 +3240,13 @@ async def _replay_resume_response(
                 and not _is_recovered_output_limit_source(bridge_dir, turn_id)
                 and (source_error := _terminal_error_from_turn({"turn": turn})) is not None
             ):
-                await _present_output_limit_error(client, session_id, turn_id, source_error)
+                await _present_output_limit_error(
+                    client,
+                    session_id,
+                    turn_id,
+                    source_error,
+                    automatic_input_uncertain=True,
+                )
             for item in items:
                 if not isinstance(item, dict):
                     continue
@@ -4263,9 +4269,19 @@ def _is_completed_automatic_input_source(bridge_dir: Path | None, turn_id: str |
 
 
 async def _present_output_limit_error(
-    client: httpx.AsyncClient, session_id: str, turn_id: str, error: _CodexTerminalError
+    client: httpx.AsyncClient,
+    session_id: str,
+    turn_id: str,
+    error: _CodexTerminalError,
+    *,
+    automatic_input_uncertain: bool = False,
 ) -> None:
     """Persist the source's error without changing another native turn's lifecycle."""
+    hint = (
+        "Automatic continuation is unconfirmed. Inspect the terminal before sending more input."
+        if automatic_input_uncertain
+        else _CODEX_OUTPUT_LIMIT_HINT
+    )
     await _post_external_item(
         client,
         session_id,
@@ -4273,7 +4289,7 @@ async def _present_output_limit_error(
         item_data={
             "source": "execution",
             "code": "codex_turn_error",
-            "message": f"{error.message}\n\n{_CODEX_OUTPUT_LIMIT_HINT}",
+            "message": f"{error.message}\n\n{hint}",
         },
         response_id=_response_id(_params_with_turn_id({}, turn_id)),
         source_id=f"codex-output-limit:{turn_id}",
@@ -4533,7 +4549,13 @@ async def _auto_continue_after_output_limit(
                 settle_codex_automatic_input(bridge_dir, expected=claimed, outcome="uncertain")
             except OSError:
                 _logger.warning("Could not persist uncertain Codex delivery", exc_info=True)
-        await _present_output_limit_error(client, session_id, turn_id, error)
+        await _present_output_limit_error(
+            client,
+            session_id,
+            turn_id,
+            error,
+            automatic_input_uncertain=True,
+        )
         return True
     continued_turn_id, native_status = receipt
     try:
@@ -4555,7 +4577,13 @@ async def _auto_continue_after_output_limit(
         _logger.warning("Could not save the Codex continuation receipt", exc_info=True)
         adopted = None
     if adopted is None:
-        await _present_output_limit_error(client, session_id, turn_id, error)
+        await _present_output_limit_error(
+            client,
+            session_id,
+            turn_id,
+            error,
+            automatic_input_uncertain=True,
+        )
         current = read_bridge_state(bridge_dir)
         if _same_native_owner(current, claimed) and current is not None:
             # The exact receipt still identifies this input even when adoption failed.
@@ -4606,7 +4634,13 @@ async def _auto_continue_after_output_limit(
             )
         except OSError:
             _logger.warning("Could not settle the completed Codex continuation", exc_info=True)
-            await _present_output_limit_error(client, session_id, turn_id, error)
+            await _present_output_limit_error(
+                client,
+                session_id,
+                turn_id,
+                error,
+                automatic_input_uncertain=True,
+            )
             return True
         if settled is None:
             return True
@@ -4747,7 +4781,13 @@ async def _maybe_handle_turn_event(
                     assert turn_id is not None
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
                     forwarder_state.presented_output_limit_error_turns.add(turn_id)
-                    await _present_output_limit_error(client, session_id, turn_id, error)
+                    await _present_output_limit_error(
+                        client,
+                        session_id,
+                        turn_id,
+                        error,
+                        automatic_input_uncertain=True,
+                    )
                     return True
                 if (
                     bridge_dir is not None
@@ -5227,7 +5267,13 @@ async def _handle_terminal_turn_boundary_inner(
         and terminal_turn_id is not None
         and not _is_recovered_output_limit_source(bridge_dir, terminal_turn_id)
     ):
-        await _present_output_limit_error(client, session_id, terminal_turn_id, candidate_error)
+        await _present_output_limit_error(
+            client,
+            session_id,
+            terminal_turn_id,
+            candidate_error,
+            automatic_input_uncertain=True,
+        )
     # Safety net: if a compaction was reported in progress but Codex never
     # emitted a completion signal we recognize (e.g. a protocol-spelling
     # drift), force the spinner closed at the turn boundary so it can't hang.
