@@ -291,10 +291,15 @@ def _run_to_response(
     }
 
 
-async def _validate_rrule_or_400(rrule: str) -> None:
+async def _validate_rrule_or_400(rrule: str, session_mode: str, execution_target: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        await asyncio.to_thread(validate_rrule, rrule)
+        await asyncio.to_thread(
+            validate_rrule,
+            rrule,
+            session_mode=session_mode,
+            execution_target=execution_target,
+        )
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -593,7 +598,7 @@ def create_scheduled_tasks_router(
             conversation_store=conversation_store,
             permission_store=permission_store,
         )
-        await _validate_rrule_or_400(body.rrule)
+        await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_scheduled_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -866,6 +871,7 @@ def create_scheduled_tasks_router(
         history and in the LIST endpoint's ``last_run_status``. Legacy timers
         return ``409`` when a fire for this task is already in flight. Both return
         ``503`` when the scheduler subsystem is not running.
+        The database scheduler also returns ``run_id`` to identify the queued run.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
@@ -877,9 +883,10 @@ def create_scheduled_tasks_router(
                     "scheduled task scheduler is not running",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            if await scheduler.run_now(task) is None:
+            run = await scheduler.run_now(task)
+            if run is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-            return {"triggered": True, "id": task.id}
+            return {"triggered": True, "id": task.id, "run_id": run.id}
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
         if run_now is None:
             raise OmnigentError(
@@ -921,14 +928,19 @@ def create_scheduled_tasks_router(
         if legacy_workspace:
             # Legacy directory pins already run with the provider default.
             existing = replace(existing, workspace=None)
-        if body.rrule is not None:
-            await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
         if fields.get("session_mode") is None:
             fields.pop("session_mode", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
+        target_execution = fields.get("execution_target") or existing.execution_target
+        if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
+            await _validate_rrule_or_400(
+                body.rrule if body.rrule is not None else existing.rrule,
+                target_session_mode,
+                target_execution,
+            )
         if target_session_mode == "new":
             if fields.get("session_id") is not None:
                 raise OmnigentError(_SESSION_ID_WITHOUT_CONTINUE_MSG, code=ErrorCode.INVALID_INPUT)
@@ -970,7 +982,6 @@ def create_scheduled_tasks_router(
                     agent=agent,
                     agent_cache=agent_cache,
                 )
-        target_execution = fields.get("execution_target") or existing.execution_target
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
             # Target-dependent validation retains the schema's original 422 response.
@@ -1065,7 +1076,7 @@ def create_scheduled_tasks_router(
         try:
             if fields.get("project_id") is not None:
                 fields["project_id"] = await _owned_project_id(project_owner, fields["project_id"])
-            updated = store.update(scheduled_task_id, **fields)
+            updated = store.update(scheduled_task_id, expected_schedule=existing, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         except Exception as exc:

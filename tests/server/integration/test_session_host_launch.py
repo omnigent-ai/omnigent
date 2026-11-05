@@ -1179,7 +1179,7 @@ async def _offline_native_host_session(client: httpx.AsyncClient, app: FastAPI) 
 
 
 @pytest.mark.parametrize("has_runner_binding", [True, False])
-async def test_offline_host_gets_real_grace_before_native_failure(
+async def test_offline_host_skips_runner_grace_before_refusing_native_send(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
@@ -1187,17 +1187,20 @@ async def test_offline_host_gets_real_grace_before_native_failure(
     caplog: pytest.LogCaptureFixture,
     has_runner_binding: bool,
 ) -> None:
-    """An absent host is waited for even when no runner ID was ever assigned."""
+    """An absent host gets reconnect grace without a redundant runner wait."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
 
     session_id = await _offline_native_host_session(client, app)
     if not has_runner_binding:
         SqlAlchemyConversationStore(db_uri).clear_runner_id(session_id)
     set_runner_client(None)
-    grace_s = 0.15
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", grace_s)
+    reconnect_grace_s = 0.15
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", reconnect_grace_s)
+    wait_for_runner = AsyncMock(side_effect=AssertionError("entered runner connect grace"))
+    monkeypatch.setattr(routes_events, "_wait_for_runner_client", wait_for_runner)
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
 
     started = time.monotonic()
@@ -1208,35 +1211,41 @@ async def test_offline_host_gets_real_grace_before_native_failure(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    assert time.monotonic() - started >= grace_s
-    assert response.status_code == 202, response.text
+    assert time.monotonic() - started >= reconnect_grace_s
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == {
+        "code": "runner_unavailable",
+        "message": _host_offline_message(),
+    }
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    errors = [item for item in items if item["type"] == "error"]
-    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
-    # The host never came back, so the failure names it rather than a runner start.
-    assert errors[0]["message"] == _host_offline_message()
-    assert len([item for item in items if item.get("role") == "user"]) == 1
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
     messages = [record.getMessage() for record in caplog.records]
     assert any("to reconnect for session" in message for message in messages)
     assert not any("to spawn a runner for session" in message for message in messages)
+    wait_for_runner.assert_not_awaited()
     [wait_event] = [
         record
         for record in caplog.records
         if record.__dict__.get("event_name") == "runner_client_wait"
     ]
-    assert wait_event.attributes["outcome"] == "host_offline"
+    assert wait_event.attributes["outcome"] == "host_offline_refused"
+    assert wait_event.attributes["attempts"] == 0
 
 
-async def test_side_chat_send_names_its_source_host_offline(
+@pytest.mark.parametrize("inherited_kind", ["side_chat", "sub_agent"])
+async def test_inherited_session_send_refuses_when_routing_host_is_offline(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inherited_kind: str,
 ) -> None:
-    """A side chat whose source's host is offline fails with the host-offline cause.
+    """A host-less derived session refuses against its ancestor's offline host.
 
-    The side chat has no host of its own; it runs on its source's runner, so
-    the source's offline host is why no runner could start.
+    Side chats and sub-agents have no direct host binding. Their routing host
+    still owns the shared runner, so its absence must not become a failed turn.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
@@ -1245,31 +1254,46 @@ async def test_side_chat_send_names_its_source_host_offline(
     store = SqlAlchemyConversationStore(db_uri)
     source = store.get_conversation(source_id)
     assert source is not None and source.runner_id is not None
-    side_chat = store.create_conversation(
-        agent_id=source.agent_id,
-        runner_id=source.runner_id,
-        labels={
-            **(source.labels or {}),
-            "omnigent.side_chat": "1",
-            "omnigent.side_chat.source_id": source_id,
-        },
-    )
+    if inherited_kind == "side_chat":
+        derived = store.create_conversation(
+            agent_id=source.agent_id,
+            runner_id=source.runner_id,
+            labels={
+                **(source.labels or {}),
+                "omnigent.side_chat": "1",
+                "omnigent.side_chat.source_id": source_id,
+            },
+        )
+    else:
+        derived = store.create_conversation(
+            agent_id=source.agent_id,
+            runner_id=source.runner_id,
+            parent_conversation_id=source_id,
+            kind="sub_agent",
+        )
     set_runner_client(None)
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
     monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
 
     response = await client.post(
-        f"/v1/sessions/{side_chat.id}/events",
+        f"/v1/sessions/{derived.id}/events",
         json={
             "type": "message",
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
-    assert response.status_code == 202, response.text
-    items = (await client.get(f"/v1/sessions/{side_chat.id}/items")).json()["data"]
-    errors = [item for item in items if item["type"] == "error"]
-    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
-    assert errors[0]["message"] == _host_offline_message()
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == {
+        "code": "runner_unavailable",
+        "message": _host_offline_message(),
+    }
+    items = (await client.get(f"/v1/sessions/{derived.id}/items")).json()["data"]
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{derived.id}")).json()["status"] != "failed"
+    wait_event = _runner_client_wait_events(caplog)[-1]
+    assert wait_event.attributes["host_id"] == _HOST_ID
+    assert wait_event.attributes["outcome"] == "host_offline_refused"
 
 
 async def test_offline_host_send_held_by_client_records_nothing(
@@ -1352,6 +1376,80 @@ async def test_host_reconnect_on_another_replica_redirects_without_failing_input
     assert response.json()["error"]["code"] == "wrong_replica"
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     assert not [item for item in items if item["type"] in {"message", "error"}]
+
+
+async def test_host_and_runner_reconnect_during_offline_lookup_reuses_original(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale offline read cannot rotate work that reconnected during it."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    session_id = await _offline_native_host_session(client, app)
+    store = SqlAlchemyConversationStore(db_uri)
+    original = store.get_conversation(session_id)
+    assert original is not None and original.runner_id is not None
+    original_runner_id = original.runner_id
+    set_runner_client(None)
+    classified_offline = asyncio.Event()
+    release_classification = asyncio.Event()
+    classify = routes_events._session_offline_host_id
+
+    async def stale_offline_result(*args: Any, **kwargs: Any) -> str | None:
+        result = await classify(*args, **kwargs)
+        classified_offline.set()
+        await release_classification.wait()
+        return result
+
+    monkeypatch.setattr(routes_events, "_session_offline_host_id", stale_offline_result)
+    requests: list[httpx.Request] = []
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(accept), base_url="http://runner"
+    ) as runner:
+        wait_for_runner = AsyncMock(return_value=runner)
+        monkeypatch.setattr(
+            routes_events,
+            "_wait_for_host_bound_runner_client",
+            wait_for_runner,
+        )
+        monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+        pending = asyncio.create_task(_post_hello(client, session_id))
+        try:
+            await asyncio.wait_for(classified_offline.wait(), timeout=budget(5.0))
+            reconnected = await _connect_host(app)
+            app.state.tunnel_registry.register(
+                original_runner_id,
+                _NoopRunnerWS(),
+                _runner_hello(),
+            )
+            release_classification.set()
+            response = await asyncio.wait_for(pending, timeout=budget(5.0))
+        finally:
+            release_classification.set()
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+
+    assert response.status_code == 202, response.text
+    wait_for_runner.assert_awaited_once()
+    assert wait_for_runner.await_args.kwargs["runner_id"] == original_runner_id
+    assert wait_for_runner.await_args.kwargs["host_conn"] is app.state.host_registry.get(_HOST_ID)
+    assert store.get_conversation(session_id).runner_id == original_runner_id
+    assert not await _expect_no_launch(reconnected, budget_s=budget(0.2))
+    forwarded = [
+        request
+        for request in requests
+        if request.method == "POST" and request.url.path.endswith("/events")
+    ]
+    assert len(forwarded) == 1
 
 
 async def test_concurrent_sends_after_host_reconnect_share_one_launch(
@@ -2386,14 +2484,14 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
     ]
 
 
-async def test_native_message_relaunch_host_lost_after_launch_reports_host_offline(
+async def test_native_message_relaunch_host_lost_after_launch_refuses_unconsumed_send(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A host that drops right after the launch frame fails the send as offline, promptly."""
+    """A host lost before acknowledging launch leaves the send unconsumed."""
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import helpers as sessions_helpers
     from omnigent.server.routes.sessions import routes_events
@@ -2414,15 +2512,18 @@ async def test_native_message_relaunch_host_lost_after_launch_reports_host_offli
             _ = await responder
     elapsed = time.monotonic() - started
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 503, response.text
+    assert response.json()["error"] == {
+        "code": "runner_unavailable",
+        "message": _host_offline_message(),
+    }
     assert elapsed < 0.4 + budget(5.0)
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    errors = [item for item in items if item["type"] == "error"]
-    assert [item["code"] for item in errors] == ["runner_failed_to_start"]
-    assert errors[0]["message"] == _host_offline_message()
+    assert [item for item in items if item["type"] in ("error", "message")] == []
+    assert (await client.get(f"/v1/sessions/{session_id}")).json()["status"] != "failed"
     assert [e.attributes["outcome"] for e in _runner_client_wait_events(caplog)] == [
         "never_connected",
-        "host_offline",
+        "host_offline_refused",
     ]
 
 

@@ -4,7 +4,7 @@
 // `--desktop-ui-font-size`. index.css maps that value directly into Tailwind's
 // typography tokens while keeping the root rem grid fixed at 16px, so text
 // changes without resizing icons, controls, or spacing. With no saved choice,
-// CSS supplies a 13px desktop default and a 14px mobile default.
+// CSS supplies a 13px desktop default and a 15px mobile default.
 //
 // Font family works the analogous way with `--ui-font-family`. Note it can't
 // reuse `--font-sans`: Tailwind v4's `@theme inline` block inlines the literal
@@ -24,13 +24,12 @@ import { getStyleRoot } from "./host";
 const STORAGE_KEY = "omnigent:ui-font-size";
 
 export const UI_FONT_SIZE_DEFAULT = 13;
-export const UI_FONT_SIZE_MOBILE_DEFAULT = 14;
+export const UI_FONT_SIZE_MOBILE_DEFAULT = 15;
 export const UI_FONT_SIZE_MIN = 11;
 export const UI_FONT_SIZE_MAX = 18;
 export const UI_FONT_SIZE_STEP = 1;
 // Legacy syntax keeps matchMedia compatible with the SPA's Safari 15 target.
 export const UI_FONT_SIZE_MOBILE_QUERY = "not all and (min-width: 48rem)";
-export const MESSAGE_FONT_SIZE_MOBILE_QUERY = `${UI_FONT_SIZE_MOBILE_QUERY}, (pointer: coarse)`;
 
 /** Clamp an arbitrary number into the supported px range. */
 export function clampUiFontSizePx(px: number): number {
@@ -69,7 +68,7 @@ function readStoredUiFontSizePx(): number | null {
  * Read the persisted UI font size in px.
  *
  * Returns the viewport default when nothing valid is stored: 13px on desktop
- * and 14px on mobile. A stored value applies directly on either viewport.
+ * and 15px on mobile. A stored value applies directly on either viewport.
  */
 export function readUiFontSizePx(): number {
   return readStoredUiFontSizePx() ?? defaultUiFontSizePx();
@@ -85,21 +84,6 @@ function readUiFontSizeOverridePx(): number | null {
 /** An applied choice can be newer than storage when a write fails. */
 export function readAppliedUiFontSizePx(): number {
   return readUiFontSizeOverridePx() ?? defaultUiFontSizePx();
-}
-
-/** Read conversation size, or preview a choice before storage succeeds. */
-export function readMessageFontSizePx(
-  selected: number | null = readUiFontSizeOverridePx(),
-): number {
-  const size = selected === null ? null : clampUiFontSizePx(selected);
-  if (
-    typeof window !== "undefined" &&
-    typeof window.matchMedia === "function" &&
-    window.matchMedia(MESSAGE_FONT_SIZE_MOBILE_QUERY).matches
-  ) {
-    return (size ?? UI_FONT_SIZE_MOBILE_DEFAULT) + 2;
-  }
-  return size ?? defaultUiFontSizePx();
 }
 
 /**
@@ -124,7 +108,6 @@ export function applyDesktopUiFontSize(px: number): void {
   if (!root) return;
   const size = clampUiFontSizePx(px);
   root.style.setProperty("--desktop-ui-font-size", `${size}px`);
-  root.style.setProperty("--mobile-message-font-size", `${size + 2}px`);
 }
 
 /** Apply a saved choice, or let CSS choose the viewport-specific default. */
@@ -134,7 +117,6 @@ export function applyStoredUiFontSize(): void {
   const stored = readStoredUiFontSizePx();
   if (stored === null) {
     root.style.removeProperty("--desktop-ui-font-size");
-    root.style.removeProperty("--mobile-message-font-size");
   } else {
     applyDesktopUiFontSize(stored);
   }
