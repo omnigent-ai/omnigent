@@ -2540,7 +2540,9 @@ class ClaimedRunExecutor:
         async with contextlib.AsyncExitStack() as stack:
             if task is not None:
                 try:
-                    await self._enter_owner_identity(stack, task)
+                    # The owner-identity hook sees the run it acts for, as it does in fire().
+                    with scheduled_run_scope(run_log_context(task, run)):
+                        await self._enter_owner_identity(stack, task)
                 except FireIdentityRevoked:
                     # Nothing can be inspected or cleaned up as the owner any more;
                     # an abandoned sandbox is left to the provider's lifetime cap.
