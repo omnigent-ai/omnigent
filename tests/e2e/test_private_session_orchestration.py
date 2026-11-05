@@ -16,6 +16,7 @@ from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
+from tests.e2e._private_session_orchestration_diagnostics import capture_private_worker_failure
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -25,7 +26,7 @@ _REPO = Path(__file__).resolve().parents[2]
 @pytest.mark.parametrize("harness", ["openai-agents", "codex-native"])
 @pytest.mark.parametrize("orchestration_enabled", [True, False], ids=["default", "kill-switch"])
 def test_private_manager_launch_send_read_and_sharing(
-    tmp_path, isolated_mock_llm_server_url, harness, orchestration_enabled
+    tmp_path, isolated_mock_llm_server_url, harness, orchestration_enabled, using_mock_llm
 ):
     if harness == "codex-native" and any(shutil.which(cmd) is None for cmd in ("codex", "tmux")):
         pytest.skip("requires Codex and tmux")
@@ -254,7 +255,25 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
                 send(manager, "MANAGER_SEND")
                 wait_text(manager, "MANAGER_SENT")
-                wait_text(worker, "WORKER_RESULT")
+
+                def diagnostic_items():
+                    response = client.get(
+                        f"/v1/sessions/{worker}/items",
+                        params={"limit": 100, "order": "asc"},
+                        timeout=2,
+                    )
+                    response.raise_for_status()
+                    return response.json()
+
+                with capture_private_worker_failure(
+                    enabled=using_mock_llm and harness == "codex-native" and orchestration_enabled,
+                    home=stack.runner_home,
+                    artifact=stack.root / "worker-diagnostics" / "runner.log",
+                    worker=worker,
+                    read_requests=lambda: get_mock_requests(mock),
+                    read_items=diagnostic_items,
+                ):
+                    wait_text(worker, "WORKER_RESULT")
                 assert "WORKER_RESULT" not in json.dumps(items(manager)), (
                     "No automatic reply forwarding"
                 )
