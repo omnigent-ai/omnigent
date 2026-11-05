@@ -123,7 +123,7 @@ async function deleteComment(sessionId: string, commentId: string): Promise<void
     `/v1/sessions/${encodeURIComponent(sessionId)}/comments/${encodeURIComponent(commentId)}`,
     { method: "DELETE" },
   );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok && res.status !== 404) throw new Error(`${res.status} ${res.statusText}`);
 }
 
 /** POST /v1/sessions/{id}/comments */
