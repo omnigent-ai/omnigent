@@ -441,6 +441,29 @@ describe("BlockRenderer dispatch", () => {
     );
   });
 
+  it("resolves a settled streamed reply's footnotes in streaming mode", () => {
+    // Streamdown keeps a message with footnotes in one block, so they need no static switch.
+    const { container } = render(
+      <TestProviders queryClient={new QueryClient()} fileViewerContext={FILE_VIEWER_NOOP}>
+        <BlockRenderer
+          items={[
+            {
+              kind: "text",
+              itemId: "t1",
+              text: "Claim.[^1]\n\n[^1]: A note.",
+              final: true,
+              streamKey: "text#0",
+            },
+          ]}
+          sessionStatus="idle"
+        />
+      </TestProviders>,
+    );
+
+    expect(container.querySelector("[data-footnote-ref]")).toHaveTextContent("1");
+    expect(container.querySelector("[data-footnotes]")).toHaveTextContent("A note.");
+  });
+
   it.each([
     ["a definition", "See [a][docs].\n\n[docs]: https://example.com", true],
     ["no space after the colon", "[docs]:/docs", true],
