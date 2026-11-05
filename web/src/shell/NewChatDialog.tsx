@@ -5317,6 +5317,11 @@ export function NewChatLandingScreen() {
               },
             ]
           : [{ label: "Host", value: "None" }];
+  const hostChipStatus =
+    sandboxSelected || connectingThisMachine || connectingArca ? undefined : selectedHost?.status;
+  const hostChipLabel = hostChipStatus
+    ? `Host: ${hostLabel}, ${hostChipStatus === "online" ? "Online" : "Offline"}`
+    : `Host: ${hostLabel}`;
   const worktreeControlAvailable =
     !sandboxSelected &&
     workspaceIsGit &&
@@ -7004,11 +7009,7 @@ export function NewChatLandingScreen() {
                       >
                         <DropdownMenuTrigger asChild>
                           <ComposerHostTrigger
-                            label={
-                              sandboxSelected
-                                ? `Host: ${hostLabel}`
-                                : `Host: ${hostLabel}, ${selectedHost?.status === "online" ? "Online" : "Offline"}`
-                            }
+                            label={hostChipLabel}
                             status={
                               sandboxSelected ? undefined : (selectedHost?.status ?? "offline")
                             }
@@ -7339,7 +7340,7 @@ export function NewChatLandingScreen() {
                         autoHarnessActive={smartRoutingHarnessSelected}
                         onSelectAutoHarness={handleSelectSmartRoutingHarness}
                         contentClassName={COMPOSER_HARNESS_MENU_SIZE}
-                        triggerClassName="text-[13px] leading-5"
+                        triggerClassName="text-ui leading-5"
                       />
                     </div>
                     <ComposerMicButton

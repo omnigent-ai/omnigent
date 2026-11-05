@@ -579,7 +579,7 @@ export function WorkingIndicator() {
         <MessageContent>
           <div className="flex items-center gap-1.5 py-0.5">
             <BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />
-            <Shimmer className="text-sm font-mono" duration={1.5}>
+            <Shimmer className="text-sm" duration={1.5}>
               {label}
             </Shimmer>
           </div>
@@ -633,7 +633,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
   return (
     <Message from="assistant" data-testid="compacting-indicator">
       <MessageContent>
-        <div className="flex items-center gap-2 text-sm font-mono">
+        <div className="flex items-center gap-2 text-sm">
           <Shimmer as="span" duration={1.5}>
             Compacting conversation…
           </Shimmer>
@@ -1073,7 +1073,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           )}
           {ts && (
             <span
-              className="shrink-0 select-none whitespace-nowrap text-[11px] leading-4 text-foreground/56"
+              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
@@ -1084,6 +1084,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <MessageAction
                 tooltip="Copy"
                 size="icon-xxs"
+                className="[@media(pointer:coarse)]:size-8"
                 onClick={handleCopy}
                 componentId="chat.message.copy_user"
               >
@@ -1093,6 +1094,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             <MessageAction
               tooltip={isLinkCopied ? "Copied!" : "Copy link"}
               size="icon-xxs"
+              className="[@media(pointer:coarse)]:size-8"
               data-testid="copy-message-link"
               disabled={bubble.pending}
               onClick={handleCopyLink}
@@ -1234,6 +1236,21 @@ function AssistantBubble({
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
   // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
   const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
+  // Keep a simple trailing notice after the footer so it ends the visible row.
+  const detachTrailingNotices =
+    !foldOnly &&
+    bubble.lifecycle !== "cancelled" &&
+    !!markdownText &&
+    bubble.items.at(-1)?.kind === "subagent_activity" &&
+    bubble.items.every((item) => item.kind === "text" || item.kind === "subagent_activity");
+  const trailingNoticeStart = detachTrailingNotices
+    ? bubble.items.findLastIndex((item) => item.kind === "text") + 1
+    : bubble.items.length;
+  const mainItems =
+    trailingNoticeStart === bubble.items.length
+      ? bubble.items
+      : bubble.items.slice(0, trailingNoticeStart);
+  const trailingNotices = bubble.items.slice(trailingNoticeStart);
 
   return (
     <>
@@ -1258,7 +1275,7 @@ function AssistantBubble({
           )}
         >
           <BlockRenderer
-            items={bubble.items}
+            items={mainItems}
             sessionStatus={sessionStatus}
             turnLifecycle={bubble.lifecycle}
             workedForS={bubble.workedForS}
@@ -1285,7 +1302,7 @@ function AssistantBubble({
         {!foldOnly && !errorOnly && (
           <div
             className={cn(
-              "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
+              "flex mobile-app:flex-wrap items-center gap-3 mobile-app:py-0",
               actionsPersistent
                 ? "opacity-100"
                 : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
@@ -1296,6 +1313,7 @@ function AssistantBubble({
                 <MessageAction
                   tooltip="Copy"
                   size="icon-xxs"
+                  className="[@media(pointer:coarse)]:size-8"
                   onClick={handleCopy}
                   componentId="chat.message.copy_assistant"
                 >
@@ -1336,13 +1354,21 @@ function AssistantBubble({
             </MessageActions>
             {ts && (
               <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
+                className="select-none text-sm leading-4 text-foreground/56"
                 data-testid="message-timestamp"
               >
                 {ts}
               </span>
             )}
           </div>
+        )}
+        {trailingNotices.map((notice, index) =>
+          notice.kind === "subagent_activity" ? (
+            <SubagentActivityMessage
+              key={notice.itemId ?? `subagent-activity-${index}`}
+              data={notice.data}
+            />
+          ) : null,
         )}
       </Message>
 

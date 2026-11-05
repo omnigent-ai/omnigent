@@ -131,7 +131,7 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # The assistant response is the final message, so its actions use their
     # fully visible hover color at rest.
     expect(assistant_row).to_have_css("opacity", "1")
-    assert round(assistant_row.bounding_box()["height"]) == 24
+    assert round(assistant_row.bounding_box()["height"]) == 16
 
     assistant_bubble.hover()
     expect(assistant_row).to_have_css("opacity", "1")

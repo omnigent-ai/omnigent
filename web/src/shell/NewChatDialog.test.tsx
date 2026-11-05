@@ -3264,7 +3264,11 @@ describe("Run on this machine (desktop host enrollment)", () => {
     await clickRunOnThisMachine();
 
     const chip = screen.getByTestId("new-chat-landing-host-chip");
-    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…, Offline"));
+    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…"));
+    expect(within(chip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(chip.className).toContain("after:animate-pulse");
     expect(chip.className).toContain("after:content-['Connecting…']");
 
@@ -4384,7 +4388,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-lg",
       "px-2",
       "py-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "md:min-h-7",
     );
@@ -4880,7 +4884,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
       "truncate",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-medium",
       "text-foreground",
@@ -4922,7 +4926,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-normal",
       "text-muted-foreground",
@@ -6691,6 +6695,12 @@ describe("NewChatLandingScreen", () => {
     // The chip reads the empty state…
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     expect(hostChip).toHaveAccessibleName(expect.stringContaining("No host selected"));
+    expect(hostChip).not.toHaveAccessibleName(expect.stringContaining("Offline"));
+    expect(hostChip).toBeEnabled();
+    expect(within(hostChip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(hostChip.querySelector(".bg-success")).toBeNull();
     expect(hostChip.querySelector(".lucide-laptop")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });

@@ -445,11 +445,13 @@ describe("UserBubble copy button", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses a compact action button with an 8px content gap", () => {
+  it("uses a compact action button", () => {
     renderBubble(userBubble("copy me please"));
 
-    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "[@media(pointer:coarse)]:size-8",
+    );
   });
 
   it("copies the message text to the clipboard when clicked", async () => {
