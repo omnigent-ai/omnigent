@@ -139,7 +139,7 @@ For a `continue` task with a `session_id`, steps 2 to 4 are replaced: the sessio
 
 Firing is fire-and-forget: the guard steps run synchronously so a dead fire costs nothing, then session creation and launch move to a background task and the scheduler re-arms immediately. A failure in that background work is logged and never crashes the scheduler.
 
-The transcript hides the tagged unattended-run context appended by the scheduler. The agent still receives it, and stored messages retain it. Older untagged messages are displayed unchanged.
+The transcript hides only the exact tagged unattended-run note appended by the scheduler. The agent still receives it, and stored messages retain it. Modified notes, other text inside the tags, and older untagged messages remain visible and copyable.
 
 ## Run history
 

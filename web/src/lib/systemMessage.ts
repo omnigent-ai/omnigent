@@ -269,15 +269,14 @@ export function taskNotificationMarkerContent(
   return null;
 }
 
-/** Hide only the trailing framework note; the stored message still reaches the agent. */
+// Must match UNATTENDED_RUN_NOTE in server/scheduled/fire.py. The browser contract
+// uses the server's note to catch drift; unknown or modified notes stay visible.
+export const AUTOMATION_CONTEXT_NOTE =
+  "<omnigent-automation-context>\nNote: an Omnigent automation sent this message, and no one is watching this run. No one can answer questions, approve requests or give input, so work toward the goal above on your own. Don't ask questions, wait for confirmation or stop to request permission. When something is unclear, make a reasonable assumption only if it is easy to reverse and within the user's authorization. Record each assumption, its basis and how easily it can be changed. For decisions that are hard to reverse, involve significant trade-offs or would likely surprise the user, record the options and your recommendation, and defer the affected work. Continue independent work that does not depend on those decisions. If an action is denied or requires unavailable approval, skip that action and explain the blocker. Continue independent work and permitted alternatives. Do not change permission settings to get past the restriction. Lead your final reply with unresolved decisions and assumptions, prioritizing those the user is most likely to want to change, then summarize what you did and anything you couldn't do.\n</omnigent-automation-context>";
+
+/** Hide only the canonical suffix; arbitrary text inside matching tags stays visible. */
 export function stripAutomationContext(text: string): string {
-  const start = text.lastIndexOf(
-    "\n\n<omnigent-automation-context>\nNote: an Omnigent automation sent this message,",
-  );
-  if (start < 0) return text;
-  const closingTag = "\n</omnigent-automation-context>";
-  const end = text.indexOf(closingTag, start);
-  return end >= 0 && text.slice(end + closingTag.length).trim() === ""
-    ? text.slice(0, start)
-    : text;
+  const suffix = `\n\n${AUTOMATION_CONTEXT_NOTE}`;
+  const trimmed = text.trimEnd();
+  return trimmed.endsWith(suffix) ? trimmed.slice(0, -suffix.length) : text;
 }
