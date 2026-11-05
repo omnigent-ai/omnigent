@@ -51,6 +51,7 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 
 const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
@@ -223,7 +224,7 @@ const PENDING_ACTION_TITLE = "Available when the session starts";
 function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
   if (isMobile) {
     return (
-      <Button
+      <MobileHeaderButton
         type="button"
         variant="ghost"
         size="icon"
@@ -233,7 +234,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         className="text-muted-foreground md:hidden max-md:size-11"
       >
         <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-      </Button>
+      </MobileHeaderButton>
     );
   }
 
@@ -555,11 +556,10 @@ export function ChatHeader({
   return (
     <header
       className={cn(
-        // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
-        // the 32px controls. Session pages add a fading glass backdrop over
-        // scrolling conversation content.
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
-        conversationId && "session-header-glass",
+        // Desktop sessions fade scrolling content behind the header.
+        // Mobile keeps only the individual glass button surfaces.
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        conversationId && !isMobile && "session-header-glass",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -618,6 +618,7 @@ export function ChatHeader({
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
+            compact={isMobile}
             className="pr-1"
           />
         )}
@@ -693,7 +694,7 @@ export function ChatHeader({
             // HeaderConversationMenu).
             <DropdownMenu modal={!isMobile}>
               <DropdownMenuTrigger asChild>
-                <Button
+                <MobileHeaderButton
                   type="button"
                   variant="ghost"
                   size="icon"
@@ -702,7 +703,7 @@ export function ChatHeader({
                   className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11"
                 >
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-                </Button>
+                </MobileHeaderButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"

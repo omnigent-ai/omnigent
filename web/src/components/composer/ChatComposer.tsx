@@ -10,6 +10,7 @@ import {
 } from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
@@ -69,6 +70,7 @@ export interface ComposerKeyIntent {
 }
 
 interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "children"> {
+  appearance?: "default" | "glass";
   keyboard: {
     submitWithModEnter: boolean;
     preventsKeyboardSubmit: boolean;
@@ -96,7 +98,7 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
 }
 
 export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
-  { className, input, keyboard, slots, actions, ...props },
+  { appearance = "default", className, input, keyboard, slots, actions, ...props },
   ref,
 ) {
   const actionRowRef = useRef<HTMLDivElement>(null);
@@ -109,11 +111,15 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
       ref={ref}
       data-composer-card
       className={cn(
-        "composer-reference-surface relative flex w-full flex-col rounded-2xl border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)] md:min-h-[105px]",
+        "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
+        appearance === "glass"
+          ? "isolate rounded-[20px] border-0 bg-transparent"
+          : "composer-reference-surface border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
         className,
       )}
       {...props}
     >
+      {appearance === "glass" && <OmniGlassSurface borderRadius={20} className="-z-10" />}
       {slots?.beforeInput}
       <ComposerInputArea
         className={slots?.inputPrefix ? "max-h-[320px] overflow-y-auto" : undefined}

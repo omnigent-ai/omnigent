@@ -71,6 +71,7 @@ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
+import { MobileHeaderButton } from "./MobileHeaderButton";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
@@ -395,7 +396,7 @@ export function HeaderConversationMenu({
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size={isMobile ? "icon" : "icon-xs"}
@@ -404,7 +405,7 @@ export function HeaderConversationMenu({
             className="mobile-touch-target shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
-          </Button>
+          </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}

@@ -284,15 +284,19 @@ describe("ChatHeader — workspace pane alignment", () => {
 
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
+    expect(header).toHaveClass("h-[76px]", "px-4", "py-4", "md:h-12", "md:py-3");
   });
 
-  it("adds the glass backdrop only on session pages", () => {
+  it.each([false, true])("adds the backdrop only on desktop sessions (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
     const landing = renderHeader({ sidebarOpen: true });
     expect(landing.container.querySelector("header")).not.toHaveClass("session-header-glass");
     landing.unmount();
 
     const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
-    expect(session.container.querySelector("header")).toHaveClass("session-header-glass");
+    expect(
+      session.container.querySelector("header")!.classList.contains("session-header-glass"),
+    ).toBe(!mobile);
   });
 });
 
@@ -422,12 +426,18 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.queryByRole("navigation", { name: "Conversation" })).toBeNull();
   });
 
-  it("shows a plain title (no folder, no link) for an unfiled top-level session", () => {
+  it.each([false, true])("shows the top-level title only on desktop (mobile=%s)", (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
     renderHeader({
       sidebarOpen: true,
       conversationId: "conv-1",
       conversationTitle: "Fix the login bug",
     });
+    if (mobile) {
+      expect(screen.queryByText("Fix the login bug")).toBeNull();
+      expect(screen.queryByRole("navigation", { name: "Conversation" })).toBeNull();
+      return;
+    }
     const title = screen.getByText("Fix the login bug");
     expect(title).toBeInTheDocument();
     // Top-level has nowhere to climb, so the title is not a link.
@@ -448,22 +458,32 @@ describe("ChatHeader — conversation breadcrumb", () => {
     expect(screen.getByText("Fix the login bug")).toBeInTheDocument();
   });
 
-  it("appends the sub-agent identity and links the title back to the parent", () => {
-    renderHeader({
-      sidebarOpen: true,
-      conversationId: "child-9",
-      isChildSession: true,
-      conversationTitle: "Fix the login bug",
-      titleLinkTo: "/c/parent-123",
-      boundAgent: { id: "a1", name: "check-account-eligibility" },
-    });
-    // The title is the way back out — it links to the parent session route.
-    const back = screen.getByRole("link", { name: "Back to parent session" });
-    expect(back).toHaveAttribute("href", "/c/parent-123");
-    expect(back).toHaveTextContent("Fix the login bug");
-    // The sub-agent's bound-agent name is appended on the right.
-    expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
-  });
+  it.each([false, true])(
+    "keeps parent navigation without mobile session titles (mobile=%s)",
+    (mobile) => {
+      isMobileMock.mockReturnValue(mobile);
+      renderHeader({
+        sidebarOpen: true,
+        conversationId: "child-9",
+        isChildSession: true,
+        conversationTitle: "Fix the login bug",
+        titleLinkTo: "/c/parent-123",
+        boundAgent: { id: "a1", name: "check-account-eligibility" },
+      });
+      // The title is the way back out — it links to the parent session route.
+      const back = screen.getByRole("link", { name: "Back to parent session" });
+      expect(back).toHaveAttribute("href", "/c/parent-123");
+      if (mobile) {
+        expect(back).toHaveTextContent("Back");
+        expect(screen.queryByText("Fix the login bug")).toBeNull();
+        expect(screen.queryByText("check-account-eligibility")).toBeNull();
+        return;
+      }
+      expect(back).toHaveTextContent("Fix the login bug");
+      // The sub-agent's bound-agent name is appended on the right.
+      expect(screen.getByText("check-account-eligibility")).toBeInTheDocument();
+    },
+  );
 
   it("names the session's own sub-agent, not the parent bundle's agent row", () => {
     // A `sys_session_send` child is bound to its PARENT bundle's agent row,
@@ -689,26 +709,54 @@ describe("ChatHeader — Chat/Terminal switcher wiring", () => {
 });
 
 describe("ChatHeader — floating mobile controls", () => {
-  it("keeps the mobile control clusters free of circular glass containers", () => {
+  it("adds glass to the mobile sidebar and fallback menu buttons without covering the title", () => {
     isMobileMock.mockReturnValue(true);
-    renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
+    const onOpenSidebar = vi.fn();
+    renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true, onOpenSidebar });
 
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
+    const menu = screen.getByRole("button", { name: "Session actions" });
     const cluster = screen.getByRole("button", { name: "Share session" }).parentElement;
-    for (const surface of [toggle, cluster]) {
-      expect(surface).not.toHaveClass(
-        "max-md:rounded-full",
-        "max-md:bg-background/70",
-        "max-md:shadow-[0_6px_20px_-4px_rgb(0_0_0/0.18)]",
-        "max-md:backdrop-blur-xl",
+    for (const button of [toggle, menu]) {
+      const surface = button.querySelector<HTMLElement>(".glass-surface")!;
+      expect(surface.parentElement).toHaveAttribute("aria-hidden", "true");
+      expect(surface).toHaveClass("glass-surface--fallback");
+      expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
+      expect(surface.querySelector(".glass-surface__sheen")).not.toBeNull();
+      expect(surface.style.getPropertyValue("--glass-frost")).toBe("0");
+      expect(surface).toHaveStyle({ background: "hsl(0 0% 100% / 0%)" });
+      expect(surface.style.backdropFilter).toBe(
+        "blur(6px) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(1.04)",
       );
+      expect(surface.querySelector('feDisplacementMap[result="dispRed"]')).toHaveAttribute(
+        "scale",
+        "-270",
+      );
+      expect(surface.style.boxShadow).toContain("inset 0 0 2px 1px rgba(212, 212, 216, 0.08)");
+      expect(surface.style.boxShadow).toContain("0 2px 6px 1px rgba(17, 17, 26, 0.08)");
+      expect(surface.querySelector('feGaussianBlur[in="output"]')).toHaveAttribute(
+        "stdDeviation",
+        "4.4",
+      );
+      expect(surface).toHaveStyle({ borderRadius: "22px" });
+      expect(button).toHaveClass(
+        "size-11",
+        "rounded-full",
+        "bg-transparent",
+        "p-0",
+        "shadow-none",
+        "active:transform-none!",
+        "[--icon-container-default:20px]",
+      );
+      expect(button).toHaveAttribute("data-size", "icon");
     }
-    // Nothing to show on the landing composer, so the empty cluster stays hidden.
+    expect(cluster).not.toHaveClass("glass-surface");
     expect(cluster).toHaveClass("max-md:empty:hidden");
+    fireEvent.click(toggle);
+    expect(onOpenSidebar).toHaveBeenCalledWith(false);
   });
 
-  it("keeps the two clusters the same size around a lone control", () => {
-    // Removing the visible containers must not shrink either touch target.
+  it("gives the sidebar and owner-managed actions matching glass surfaces and touch targets", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: false,
@@ -728,8 +776,42 @@ describe("ChatHeader — floating mobile controls", () => {
     const toggle = screen.getByRole("button", { name: "Open sidebar" });
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(trigger.parentElement).not.toHaveClass("max-md:px-1", "max-md:py-1");
-    expect(trigger).toHaveClass("size-10");
-    expect(toggle).toHaveClass("size-6", "max-md:size-11");
+    for (const button of [toggle, trigger]) {
+      expect(button).toHaveClass("size-11", "max-md:size-11", "rounded-full");
+      expect(button).toHaveAttribute("data-size", "icon");
+      expect(button).toHaveClass(
+        "p-0",
+        "shadow-none",
+        "hover:bg-transparent",
+        "aria-expanded:bg-transparent",
+        "active:transform-none!",
+      );
+      expect(button.querySelector(".glass-surface")).not.toBeNull();
+    }
+    const sidebarSurface = toggle.querySelector<HTMLElement>(".glass-surface")!;
+    const menuSurface = trigger.querySelector<HTMLElement>(".glass-surface")!;
+    expect(menuSurface.className).toBe(sidebarSurface.className);
+    for (const property of [
+      "width",
+      "height",
+      "border-radius",
+      "box-shadow",
+      "backdrop-filter",
+      "--glass-frost",
+      "--glass-saturation",
+    ]) {
+      expect(menuSurface.style.getPropertyValue(property)).toBe(
+        sidebarSurface.style.getPropertyValue(property),
+      );
+    }
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+  });
+
+  it("keeps the desktop header free of mobile glass surfaces", () => {
+    const view = renderHeader({ sidebarOpen: false, conversationId: "conv-1", canShare: true });
+    expect(view.container.querySelector(".glass-surface")).toBeNull();
+    expect(screen.getByRole("button", { name: "Open sidebar" })).toHaveClass("size-6");
   });
 
   it("folds the Chat/Terminal switch into the header kebab on mobile", () => {
@@ -751,7 +833,7 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(screen.getByTestId("view-mode-menu-terminal")).toBeInTheDocument();
   });
 
-  it("does not add a circular container to the mobile kebab", () => {
+  it("keeps the fallback mobile kebab circular", () => {
     isMobileMock.mockReturnValue(true);
     renderHeader({
       sidebarOpen: true,
@@ -760,7 +842,7 @@ describe("ChatHeader — floating mobile controls", () => {
       hasHeaderMenu: true,
     });
 
-    expect(screen.getByTestId("session-actions-menu")).not.toHaveClass("max-md:rounded-full");
+    expect(screen.getByTestId("session-actions-menu")).toHaveClass("rounded-full");
   });
 
   it("keeps the fallback menu legible over scrolling content", () => {
@@ -858,7 +940,7 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(trigger.closest("nav.conversation-breadcrumb")).toBeNull();
     // Rightmost control in the header's action cluster.
     expect(trigger.parentElement?.lastElementChild).toBe(trigger);
-    expect(screen.getByText(conversation.title as string)).toBeInTheDocument();
+    expect(screen.queryByText(conversation.title as string)).toBeNull();
   });
 
   it("keeps the mobile Share / Agent info analytics on the owner-managed path", () => {

@@ -22,8 +22,24 @@ test LOC; fewer lines alone do not establish adequate coverage.
 
 - Add a unit test for non-trivial functions, methods, and exported APIs. Add
   coverage when changed behavior needs it.
-- Run the relevant tests before submitting. Document unrelated pre-existing
-  failures in the PR description.
+- For behavior changes, run only directly relevant tests before submitting.
+  Follow the proportional-verification rules below for styling changes.
+  Document unrelated pre-existing failures in the PR description.
+
+## Stay focused and keep verification proportional
+
+- Complete the requested change directly. Do not add unsolicited cleanup,
+  unrelated refactors, documentation edits, audits, or adjacent behavior work.
+- For small, reversible UI styling changes (colors, opacity, blur, radius,
+  spacing, and shadows), do not automatically add or run tests, type checks,
+  builds, linters, browser checks, or other proactive verification.
+- For behavior changes that need verification, use the smallest directly
+  relevant local check. Do not expand into broad suites, viewport/scroll
+  investigations, or unrelated regression checks without a concrete need.
+- Do not repeat checks for successive styling tweaks after the shared
+  implementation has already been validated.
+- Follow explicit requests to stop or skip checks immediately. Required commit
+  and push hooks still run when committing or pushing; never bypass them.
 
 ## Dependency changes
 

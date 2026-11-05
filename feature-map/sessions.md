@@ -281,7 +281,15 @@ actions (mark as read or unread, archive, unarchive, delete).
 pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
-actions.
+actions. On phones, the sidebar and session-actions buttons have matching
+44px circular glass surfaces with 20px icons, using the same button padding,
+interaction styles, and React Bits GlassSurface settings (refraction disabled,
+opacity 1.0, blur 6, displacement 4.4, distortion scale -270, border width 0.12),
+a transparent background, no sheen, a milky gray inset edge at 8% opacity,
+and a soft drop shadow at 8% opacity with 1px spread. The fallback backdrop also uses 6px blur.
+Both sit 16px from the top and sides.
+The mobile header omits the session title and fading backdrop,
+retaining a Back link for child sessions.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.

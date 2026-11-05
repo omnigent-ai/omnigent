@@ -223,7 +223,7 @@
    * that already clears the header also clears the switcher — its size is
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
-  --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
+  --omnigent-header-height: 3.5rem; /* Default content clearance. */
   --omnigent-safe-top: max(
     env(safe-area-inset-top, 0px),
     var(--omnigent-android-safe-area-top, 0px)
@@ -755,6 +755,16 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
+@media (width < 48rem) {
+  [data-chat-surface] .session-chat-transcript {
+    margin-bottom: calc(-1 * var(--session-composer-height, 0px));
+  }
+
+  [data-chat-surface] .chat-conversation-content {
+    padding-bottom: calc(var(--session-composer-height, 0px) + 1.5rem);
+  }
+}
+
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
  * Keep it below the overlaid glass header after programmatic navigation. */
 .turn-fold-row {
@@ -1236,7 +1246,7 @@ html[data-electron-mac] .breadcrumb-folder {
 
   [data-ios-native] .chat-composer-form,
   [data-android-native] .chat-composer-form {
-    padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
+    padding-bottom: max(16px, var(--omnigent-safe-bottom));
   }
 }
 
@@ -1398,6 +1408,7 @@ html[data-electron-mac] .breadcrumb-folder {
   :root {
     --desktop-ui-font-size: 14px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
+    --omnigent-header-height: 76px;
     --ui-ramp-anchor: var(--mobile-ui-font-size);
     --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
     --text-ui: var(--mobile-ui-font-size);
