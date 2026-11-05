@@ -9972,6 +9972,16 @@
             ],
             "title": "Model Override"
           },
+          "runner_wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupRunnerWait"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "scheduled_run": {
             "anyOf": [
               {
@@ -9999,6 +10009,33 @@
           }
         },
         "title": "StartupInputOptions",
+        "type": "object"
+      },
+      "StartupRunnerWait": {
+        "description": "One accepted input's runner and absolute startup deadline, retained across restarts.",
+        "properties": {
+          "connected": {
+            "default": false,
+            "title": "Connected",
+            "type": "boolean"
+          },
+          "deadline": {
+            "exclusiveMinimum": 0.0,
+            "format": "double",
+            "title": "Deadline",
+            "type": "number"
+          },
+          "runner_id": {
+            "minLength": 1,
+            "title": "Runner Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "runner_id",
+          "deadline"
+        ],
+        "title": "StartupRunnerWait",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {
