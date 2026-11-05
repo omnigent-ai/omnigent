@@ -80,7 +80,7 @@ _exiting = False
 def stop_claude_launch_probes() -> None:
     """Kill the launches probes still wait on, and start no more; call when exiting."""
     global _exiting
-    # Probe threads are daemons, so exit kills the launches they still wait on.
+    # Daemon probe threads die at exit without reaping their launches, so kill them here.
     with _launches_lock:
         _exiting = True
         launches = list(_running_launches)

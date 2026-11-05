@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import plugin_discovery
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
@@ -735,16 +737,23 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
         )
         late = await c.post(late_url, json=review)
 
-        # A failed launch is asked again once its backoff ends.
+        # A failed launch's list is reused briefly, then rebuilt when the launch is asked again.
+        runner_now = [time.monotonic()]
         monkeypatch.setattr(
-            "omnigent.runner.app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS", 0.0
+            "omnigent.runner.app.time",
+            SimpleNamespace(monotonic=lambda clock=runner_now: clock[0], time=time.time),
         )
         fail.touch()
         configure_claude_launch(config_home, launches, script, args=("--", "failing"))
         failed = await c.post(failed_url, json=review)
         backing_off = await c.post(failed_url, json=review)
+        later = home / ".claude" / "skills" / "later" / "SKILL.md"
+        later.parent.mkdir()
+        later.write_text(_skill_md("later", "Installed after the list was cached."))
+        reused = await c.post(failed_url, json=review)
         fail.unlink()
         now[0] += plugin_discovery.FAILED_LAUNCH_BACKOFF_S
+        runner_now[0] += runner_app._INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
         retried = await c.post(failed_url, json=review)
 
     assert listed.status_code == 200, listed.text
@@ -755,6 +764,8 @@ async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
     assert late.status_code == 200, late.text
     assert failed.status_code == 404, failed.text
     assert backing_off.status_code == 404, backing_off.text
+    assert reused.status_code == 404, reused.text
+    assert reused.json()["available"] == ["local"]
     assert retried.status_code == 200, retried.text
     assert len(launches.read_text().splitlines()) == 4
 
