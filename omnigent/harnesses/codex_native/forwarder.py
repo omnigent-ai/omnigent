@@ -2548,15 +2548,8 @@ async def _drive_side_chat_requests(
     fork's ``thread/started`` then registers the rail child through the normal
     event path.
 
-    A request is removed only after it has been handled (:func:`peek` +
-    :func:`discard`), never on read, so a fork failure or a not-yet-ready parent
-    thread can't silently swallow a ``/side`` question:
-
-    * Parent thread not ready yet: leave every request in place and retry next
-      cycle, rather than consuming into the void.
-    * Fork/turn failure: isolate per request (one bad question can't drop its
-      siblings), post a visible notice so the loss is never silent, then discard
-      the request so the same failure isn't retried forever.
+    Requests are claimed before native RPCs. Success removes the claim;
+    failure retains the original question for inspection without automatic replay.
 
     :param codex_client: The forwarder's long-lived app-server client.
     :param ap_client: HTTP client for Omnigent event posts (failure notices).
@@ -2570,27 +2563,44 @@ async def _drive_side_chat_requests(
             # Only claim once the parent thread exists — a request read before
             # then can't fork, and consuming it would lose the question (#3).
             if parent_thread_id is not None:
-                for request in side_chat.peek_side_chat_requests(bridge_dir):
+                requests = await asyncio.to_thread(side_chat.peek_side_chat_requests, bridge_dir)
+                for pending in requests:
+                    request = await asyncio.to_thread(side_chat.claim_side_chat_request, pending)
+                    if request is None:
+                        continue
                     try:
+                        if request.owner is None:
+                            raise side_chat.SideChatInputNotDelivered(
+                                "The saved side request has no parent identity; send it again."
+                            )
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
                             bridge_dir=bridge_dir,
+                            parent_state=request.owner,
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:  # one bad request must not drop the rest.
+                    except Exception as error:  # One refusal must not discard other inputs.
+                        await asyncio.to_thread(
+                            side_chat.fail_side_chat_request,
+                            request,
+                            str(error),
+                            undelivered=isinstance(error, side_chat.SideChatInputNotDelivered),
+                        )
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
                         await _post_side_chat_failed_notice(
-                            ap_client, target.session_id, request.path.stem
+                            ap_client,
+                            request.owner.session_id
+                            if request.owner is not None
+                            else target.session_id,
+                            request.path.stem,
                         )
-                    # Remove whether it forked or failed: a forked request is
-                    # done, and a failed one has surfaced a notice — keeping it
-                    # would retry the same failure forever.
-                    side_chat.discard_side_chat_request(request.path)
+                    else:
+                        await asyncio.to_thread(side_chat.discard_side_chat_request, request.path)
         except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)

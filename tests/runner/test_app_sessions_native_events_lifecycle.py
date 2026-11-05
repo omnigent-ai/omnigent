@@ -5622,8 +5622,9 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
     [(False, False), (False, True), (True, False)],
     ids=["follow-up", "inherited-default", "side-command"],
 )
+@pytest.mark.parametrize("large", [False, True])
 async def test_events_codex_side_chat_preserves_indentation(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: bool, inherited: bool, large: bool
 ) -> None:
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.harnesses.codex_native import side_chat
@@ -5667,7 +5668,8 @@ async def test_events_codex_side_chat_preserves_indentation(
         codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
     )
     app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
-    question = "  - First\n  - Second"
+    fake_client.supports_user_message_ids = True
+    question = "  - First\n  - Second" + ("\nα long side input " * 60_000 + "end" if large else "")
     payload: dict[str, Any] = {
         "type": "message",
         "content": [
@@ -5695,17 +5697,20 @@ async def test_events_codex_side_chat_preserves_indentation(
         ]
         assert fake_client.requests == []
     else:
-        assert [call for call in fake_client.requests if call[0] != "model/list"] == [
-            (
-                "turn/start",
-                {
-                    "threadId": "thread_side",
-                    "input": [{"type": "text", "text": question}],
-                    "model": "gpt-6-sol",
-                    **({"effort": "max"} if not inherited else {}),
-                },
+        from omnigent.inner.native_attachments import restore_spilled_text
+
+        turns = [params for method, params in fake_client.requests if method == "turn/start"]
+        assert len(turns) == 2
+        for params in turns:
+            assert params["threadId"] == "thread_side"
+            wire_text = "\n\n".join(item["text"] for item in params["input"])
+            assert (
+                restore_spilled_text(wire_text, bridge_dir, params.get("clientUserMessageId"))
+                == question
             )
-        ] * 2
+            assert len(wire_text) < 900_000
+            assert params["model"] == "gpt-6-sol"
+            assert params.get("effort") == (None if inherited else "max")
         assert sum(method == "model/list" for method, _ in fake_client.requests) == (
             0 if inherited else 1
         )
@@ -5774,6 +5779,15 @@ async def test_events_rotated_codex_side_chat_uses_the_launch_directory(
             "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
         )
         assert created.status_code == 201, created.text
+        codex_native_bridge.write_bridge_state(
+            expected_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=conv_id,
+                thread_id="thread_parent",
+                socket_path="ws://127.0.0.1:43210",
+                codex_home=str(tmp_path / "codex-home"),
+            ),
+        )
         lookups_before = len(label_calls)
         spawns_before = list(pm.get_client_calls)
         response = await client.post(

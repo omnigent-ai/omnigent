@@ -7020,7 +7020,7 @@ def create_runner_app(
                             "detail": "side chat message had no text",
                         },
                     )
-            _side_state = await _codex_native_bridge_state_for_session(
+            _side_state, _side_bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
                 conversation_id, action="side chat turn"
             )
             if _side_state is None:
@@ -7046,6 +7046,8 @@ def create_runner_app(
                         str(_side_thread_id),
                         _side_text,
                         transport=_side_state.socket_path,
+                        bridge_dir=_side_bridge_dir,
+                        parent_state=_side_state,
                         model=body.get("model_override"),
                         effort=body.get("reasoning_effort"),
                         reset_effort="reasoning_effort" in body
@@ -7071,6 +7073,11 @@ def create_runner_app(
                         else "codex_side_chat_rejected",
                         "detail": _rpc_message,
                     },
+                )
+            except side_chat.SideChatInputNotDelivered as exc:
+                return JSONResponse(
+                    status_code=409,
+                    content={"error": "codex_side_chat_input_undelivered", "detail": str(exc)},
                 )
             except side_chat.SideChatEffortUnavailable:
                 return JSONResponse(
@@ -7116,10 +7123,34 @@ def create_runner_app(
                 _side_question is not None
                 and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
             ):
-                _side_chat.request_side_chat(
-                    await _codex_native_bridge_dir_for_session(conversation_id),
-                    _side_question,
+                parent_state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
+                    conversation_id, action="side chat request"
                 )
+                if parent_state is None:
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "error": "codex_side_chat_no_bridge",
+                            "detail": (
+                                "The Codex parent is still starting; retry when it is ready."
+                            ),
+                        },
+                    )
+                try:
+                    await asyncio.to_thread(
+                        _side_chat.request_side_chat,
+                        bridge_dir,
+                        _side_question,
+                        parent_state=parent_state,
+                    )
+                except _side_chat.SideChatInputNotDelivered as exc:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "error": "codex_side_chat_input_undelivered",
+                            "detail": str(exc),
+                        },
+                    )
                 _logger.info(
                     "Codex /side recorded without starting a turn: conv=%s",
                     conversation_id,
