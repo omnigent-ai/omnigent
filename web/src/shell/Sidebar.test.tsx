@@ -415,70 +415,20 @@ describe("Sidebar scroll divider", () => {
 });
 
 describe("Sidebar session list", () => {
-  it.each([null, 1, 2, 3, 4])(
-    "marks shared sessions regardless of permission level %s",
-    (level) => {
-      mockConversations([
-        conv("shared_session", "Claude Code", {
-          owner: "other@example.com",
-          permission_level: level,
-        }),
-        conv("private_session", "Claude Code"),
-      ]);
-      renderSidebar();
-      selectSessionFilter("all");
-
-      const sharedRow = screen.getByText("shared_session").closest("li")!;
-      const indicator = within(sharedRow).getByRole("img", { name: "Shared session" });
-      expect(indicator).toHaveAttribute("title", "Shared with you");
-      expect(indicator).toHaveClass("w-6", "justify-center");
-      expect(indicator).toHaveClass("absolute", "right-1");
-      expect(
-        within(screen.getByText("private_session").closest("li")!).queryByRole("img"),
-      ).toBeNull();
-    },
-  );
-
-  it("keeps the session state rightmost when a shared icon is also present", () => {
+  it("does not mark sessions shared with the viewer, in the list or under Pinned", () => {
     mockConversations([
-      conv("shared_running", "Claude Code", {
-        owner: "other@example.com",
-        status: "running",
-      }),
+      conv("shared_running", "Claude Code", { owner: "other@example.com", status: "running" }),
+      conv("shared_pin", "Claude Code", { owner: "other@example.com", permission_level: 2 }),
     ]);
-    renderSidebar();
-    selectSessionFilter("all");
-
-    const row = screen.getByText("shared_running").closest("li")!;
-    expect(within(row).getByRole("img", { name: "Shared session" })).toHaveClass("right-8");
-    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
-  });
-
-  it("does not mark the viewer's own sessions or sessions without ownership metadata", () => {
-    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
-    try {
-      mockConversations([
-        conv("owned_session", "Claude Code", { owner: "viewer@example.com" }),
-        conv("null_owner", "Claude Code", { owner: null }),
-        conv("missing_owner", "Claude Code"),
-      ]);
-      renderSidebar();
-      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
-    } finally {
-      viewer.mockRestore();
-    }
-  });
-
-  it("keeps the shared indicator on pinned sessions across filters", () => {
-    mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
     seedPins(["shared_pin"]);
     renderSidebar();
 
-    for (const filter of ["mine", "shared", "all", "archived"] as const) {
+    for (const filter of ["all", "shared"] as const) {
       selectSessionFilter(filter);
-      const pinned = screen.getByText("Pinned").closest("section")!;
-      expect(within(pinned).getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
     }
+    const row = screen.getByText("shared_running").closest("li")!;
+    expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
 
   it("uses the interface text token for the empty session-list state", () => {
@@ -579,7 +529,8 @@ describe("Sidebar session list", () => {
     selectSessionFilter(view);
 
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    if (view === "archived") expect(screen.queryByText("filed-session")).toBeNull();
+    // Archived swaps folders to archived members; Shared hides Projects.
+    if (view !== "all") expect(screen.queryByText("filed-session")).toBeNull();
     else expect(screen.getByText("filed-session")).toBe(filed);
     expect(screen.getByTestId("session-filter")).toBe(filter);
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
@@ -592,7 +543,7 @@ describe("Sidebar session list", () => {
     }
     selectSessionFilter("mine");
     expect(screen.getByText("pinned-session")).toBe(pinned);
-    if (view === "archived") expect(screen.getByText("filed-session")).toBeInTheDocument();
+    if (view !== "all") expect(screen.getByText("filed-session")).toBeInTheDocument();
     else expect(screen.getByText("filed-session")).toBe(filed);
   });
 
@@ -839,7 +790,7 @@ describe("Sidebar session list", () => {
   });
 
   it("drops a persisted Shared filter on a single-user server", () => {
-    // "Shared sessions" isn't in the menu on a loopback-only server, so honoring
+    // "Shared with me" isn't in the menu on a loopback-only server, so honoring
     // a value stored against a multi-user one would scope the list to a slice
     // the viewer has no option to leave.
     localStorage.setItem("omnigent:session-filter", "shared");
@@ -1921,7 +1872,7 @@ describe("Sidebar sections", () => {
     expect(screen.getByText("conv_mine_acl")).toBeInTheDocument();
     expect(screen.queryByText("conv_shared")).toBeNull();
 
-    // "Shared sessions": only the shared one, owned ones hidden.
+    // "Shared with me": only the shared one, owned ones hidden.
     showSharedTab();
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
     expect(screen.queryByText("conv_mine_legacy")).toBeNull();
@@ -2011,7 +1962,7 @@ describe("Sidebar tabs", () => {
     expect(within(minePinned).getByText("conv_mine")).toBeInTheDocument();
     expect(within(minePinned).getByText("conv_shared")).toBeInTheDocument();
 
-    // "Shared sessions": both pins still show under Pinned even though
+    // "Shared with me": both pins still show under Pinned even though
     // conv_mine is owned by the viewer.
     showSharedTab();
     const sharedPinned = screen.getByText("Pinned").closest("section")!;
@@ -2026,25 +1977,20 @@ describe("Sidebar tabs", () => {
     expect(within(archivedPinned).getByText("conv_shared")).toBeInTheDocument();
   });
 
-  it("keeps the Projects section and its folders on the Shared tab", () => {
-    // Projects are ownership-agnostic like pins: the Projects group and its
-    // folders always render, unaffected by the filter, so a filed session
-    // stays in its folder on the Shared tab rather than the folder vanishing.
+  it("hides the Projects section on the Shared tab", () => {
+    // Folders only hold the viewer's own sessions, so they have nothing to show
+    // among sessions shared with the viewer.
     projectsMock.push("Alpha");
     mockConversations([
       conv("conv_mine", "Claude Code", { labels: { omni_project: "Alpha" } }),
       conv("conv_shared", "Claude Code", { owner: "other@example.com" }),
     ]);
     renderSidebar();
-
-    // My sessions tab carries the Projects group.
     expect(screen.getByText("Projects")).toBeInTheDocument();
 
-    // Shared tab: the Projects group still renders with its Alpha folder, and
-    // the shared session shows in Sessions.
     showSharedTab();
-    expect(screen.getByText("Projects")).toBeInTheDocument();
-    expect(screen.getByText("Alpha")).toBeInTheDocument();
+    expect(screen.queryByText("Projects")).toBeNull();
+    expect(screen.queryByText("Alpha")).toBeNull();
     expect(screen.getByText("conv_shared")).toBeInTheDocument();
   });
 
@@ -3572,7 +3518,7 @@ describe("Sidebar view options", () => {
         expect(within(groupSection(title!)).getByText(id!)).toBeInTheDocument();
       }
       expect(screen.queryByRole("button", { name: "Projects" })).toBeNull();
-      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Pi" })).toBeNull();
     },
   );
@@ -3663,7 +3609,7 @@ describe("Sidebar view options", () => {
     renderGroupingSidebar();
     selectSessionFilter("all");
 
-    expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
     const titles = grouping === "status" ? ["Working", "Done"] : ["Updated today", "Earlier"];
     expect(groupHeaders()).toEqual(titles);
     expect(within(groupSection(titles[1])).getByText("conv_shared")).toBeInTheDocument();
@@ -4374,7 +4320,7 @@ describe("sidebar_grouping_ui release flag", () => {
           .getAllByRole("link", { name: /^conv_/ })
           .map((link) => link.textContent),
       ).toEqual(["conv_mine", "conv_shared"]);
-      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
       expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
       expect(screen.queryByTestId("session-row-meta")).toBeNull();
       expect(screen.queryByTestId("session-row-updated")).toBeNull();
@@ -4512,7 +4458,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     selectSessionFilter("all");
-    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
     const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
     expect(within(shared).getByText("conv_shared")).toBeInTheDocument();
     expect(within(sessions).queryByText("conv_shared")).toBeNull();
@@ -4522,11 +4468,11 @@ describe("sidebar_grouping_ui release flag", () => {
     );
 
     selectSessionFilter("mine");
-    expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Shared with me" })).toBeNull();
 
     // The Shared filter shows that section alone.
     showSharedTab();
-    expect(screen.getByRole("button", { name: "Shared" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Shared with me" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
     expect(screen.queryByText("conv_mine")).toBeNull();
   });
@@ -4542,7 +4488,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     showSharedTab();
-    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
     expect(within(shared).getByRole("status")).toHaveTextContent("Loading…");
   });
 
@@ -4551,10 +4497,11 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
     showSharedTab();
 
-    // Shared carries New session when Sessions isn't shown; Select stays on Projects.
-    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
+    // Shared carries the list controls (and the filter) while Projects is hidden.
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
     expect(within(shared).getByTestId("sessions-new-session")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Select sessions" }));
+    expect(within(shared).getByTestId("session-filter")).toBeInTheDocument();
+    fireEvent.click(within(shared).getByRole("button", { name: "Select sessions" }));
     fireEvent.click(screen.getByRole("link", { name: /conv_shared/ }));
     expect(screen.getByText("1 selected")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
@@ -4590,7 +4537,7 @@ describe("sidebar_grouping_ui release flag", () => {
     // mustn't stall pagination; collapsing Shared as well does.
     fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Shared" }));
+    fireEvent.click(screen.getByRole("button", { name: "Shared with me" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
   });
 
@@ -4674,7 +4621,7 @@ describe("sidebar_grouping_ui release flag", () => {
     renderGroupingSidebar();
 
     selectSessionFilter("all");
-    const shared = screen.getByRole("button", { name: "Shared" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
     expect(within(shared).getByText("conv_shared_alpha")).toBeInTheDocument();
     expect(screen.queryByText("conv_owned")).toBeNull(); // in the collapsed Alpha folder
   });
@@ -4696,7 +4643,7 @@ it.each(["default", "updated", "shared"])(
       renderGroupingSidebar();
       if (view === "shared") showSharedTab();
       const title =
-        view === "updated" ? "Updated today" : view === "shared" ? "Shared" : "Sessions";
+        view === "updated" ? "Updated today" : view === "shared" ? "Shared with me" : "Sessions";
       const status = screen.getByTestId("sidebar-import-progress");
       expect(screen.getByRole("heading", { name: new RegExp(title) })).toContainElement(status);
       expect(status).toHaveTextContent("Importing (35)");
