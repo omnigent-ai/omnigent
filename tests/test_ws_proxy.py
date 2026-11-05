@@ -13,6 +13,7 @@ import threading
 import time
 import types
 from contextlib import asynccontextmanager
+from http import HTTPStatus
 
 import pytest
 from websockets.asyncio.client import connect
@@ -510,3 +511,35 @@ async def test_connect_tunnel_wss(tmp_path, certified_host):
                     await connect(url, sock=sock, ssl=client_ctx, open_timeout=5)
     assert authorities == [f"{_TLS_HOST}:{port}"]
     assert seen_sni == [_TLS_HOST]
+
+
+async def test_proxied_tunnel_does_not_follow_redirects():
+    """A redirect cannot reuse the proxied socket, so its target is never dialed."""
+    redirect_target_hits = []
+
+    async def record_hit(_reader, writer):
+        redirect_target_hits.append(True)
+        writer.close()
+
+    async with await asyncio.start_server(record_hit, "127.0.0.1", 0) as redirect_target:
+        target_port = redirect_target.sockets[0].getsockname()[1]
+
+        def redirect(connection, _request):
+            response = connection.respond(HTTPStatus.FOUND, "")
+            response.headers["Location"] = f"ws://127.0.0.1:{target_port}/t"
+            return response
+
+        async def unused_handler(_ws):
+            pass
+
+        async with serve(unused_handler, "127.0.0.1", 0, process_request=redirect) as server:
+            port = server.sockets[0].getsockname()[1]
+            url = f"ws://{_TLS_HOST}:{port}/t"
+            async with _forwarding_proxy(port) as (proxy_port, authorities):
+                sock = await open_proxy_connect_socket(
+                    f"http://127.0.0.1:{proxy_port}", url, timeout=5
+                )
+                with pytest.raises(ValueError, match="preexisting socket"):
+                    await connect(url, sock=sock, open_timeout=5)
+    assert authorities == [f"{_TLS_HOST}:{port}"]
+    assert redirect_target_hits == []
