@@ -966,7 +966,11 @@ function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSna
   for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
   for (const [id, row] of snapshot.backfill) {
-    if (row !== undefined) queryClient.setQueryData(["conversation-backfill", id], row);
+    const key = ["conversation-backfill", id];
+    // A delete or leave that landed meanwhile removed the entry; keep it gone.
+    if (row !== undefined && queryClient.getQueryState(key) !== undefined) {
+      queryClient.setQueryData(key, row);
+    }
   }
 }
 
@@ -989,7 +993,10 @@ async function paintConversationsArchived(
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
-    ...ids.map((id) => queryClient.cancelQueries({ queryKey: ["conversation-backfill", id] })),
+    // Cancelling a first fetch would leave the row empty with nothing to refetch it.
+    ...ids
+      .filter((id) => queryClient.getQueryData(["conversation-backfill", id]) !== undefined)
+      .map((id) => queryClient.cancelQueries({ queryKey: ["conversation-backfill", id] })),
   ]);
   const marked = archived ? markSessionsArchiving(ids) : undefined;
   if (!archived) unmarkSessionsArchiving(ids);

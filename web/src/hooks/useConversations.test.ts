@@ -3691,6 +3691,74 @@ describe("useArchiveConversation", () => {
     expect(queryClient.getQueryData<Conversation>(backfillKey)?.archived).toBe(false);
   });
 
+  it("does not restore an open-session row a delete removed while unarchiving failed", async () => {
+    let settleArchive = (_res: Response) => {};
+    fetchMock.mockImplementationOnce(
+      () =>
+        new Promise<Response>((resolve) => {
+          settleArchive = resolve;
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const backfillKey = ["conversation-backfill", "conv_a"];
+    queryClient.setQueryData(backfillKey, {
+      id: "conv_a",
+      object: "conversation" as const,
+      title: "A",
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      archived: true,
+    });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    queryClient.removeQueries({ queryKey: backfillKey });
+    settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(queryClient.getQueryState(backfillKey)).toBeUndefined();
+  });
+
+  it("lets the first fetch of an open-session row land during an archive", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", archived: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const backfillKey = ["conversation-backfill", "conv_a"];
+    const fetchedRow = {
+      id: "conv_a",
+      object: "conversation" as const,
+      title: "A",
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      archived: false,
+    };
+    let settleFetch = (_row: typeof fetchedRow) => {};
+    const firstFetch = queryClient.fetchQuery({
+      queryKey: backfillKey,
+      queryFn: () =>
+        new Promise<typeof fetchedRow>((resolve) => {
+          settleFetch = resolve;
+        }),
+    });
+    void firstFetch.catch(() => undefined);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    settleFetch(fetchedRow);
+    await firstFetch.catch(() => undefined);
+
+    expect(queryClient.getQueryData<Conversation>(backfillKey)?.id).toBe("conv_a");
+  });
+
   it("does not restore a row with a concurrent delete in flight", async () => {
     let settleArchive = (_res: Response) => {};
     fetchMock.mockImplementationOnce(
