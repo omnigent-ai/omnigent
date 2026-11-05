@@ -429,6 +429,29 @@ WORKDIR /root
 # sandbox create` runs so a bare `docker run` behaves the same way.
 CMD ["sleep", "infinity"]
 
+# ── OpenShell host venv builder ─────────────────────────
+# The host venv, built in place under /sandbox: console-script shebangs embed
+# the venv's absolute path, so /opt/venv cannot simply be copied there.
+FROM builder AS openshell-venv-builder
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+RUN python -m venv /sandbox/.venv \
+ && uv pip install --python /sandbox/.venv/bin/python --no-cache-dir \
+      --index-url ${PYPI_INDEX_URL} -e . \
+ && /sandbox/.venv/bin/pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /sandbox/.venv/lib/python*/site-packages
+
+# ── OpenShell host runtime (`--target host-openshell`) ──
+# OpenShell's Kubernetes driver copies the image's /sandbox into a PVC mounted
+# over /sandbox, as UID 10001 without group 0, and Landlock leaves only /sandbox
+# and /tmp writable. So the venv lives there, and any UID must read /sandbox.
+FROM host AS host-openshell
+RUN rm -rf /opt/venv && chmod 755 /sandbox
+COPY --from=openshell-venv-builder --chown=sandbox:sandbox /sandbox/.venv /sandbox/.venv
+ENV VIRTUAL_ENV=/sandbox/.venv \
+    PATH="/sandbox/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+RUN echo 'export PATH="/sandbox/.venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+WORKDIR /sandbox
+
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
 

@@ -15,7 +15,7 @@ data:
       # sandbox network namespace).
       server_url: https://omnigent.example.com
       openshell:
-        # Derived host image carrying your policy (deploy/openshell/README.md).
+        # host-openshell image with your policy baked in (deploy/openshell/README.md).
         # image: registry.example.com/omnigent-host-openshell:latest
 
         # SERVER env var NAMES whose values are injected into sandboxes at

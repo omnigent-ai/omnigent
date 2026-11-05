@@ -135,6 +135,22 @@ docker push docker.io/<you>/omnigent-host:latest
 
 Then point Omnigent at it with `OMNIGENT_OPENSHELL_HOST_IMAGE`.
 
+### Kubernetes driver
+
+OpenShell's Kubernetes driver needs the `host-openshell` target instead. That
+driver runs every sandbox container as UID 10001 without group 0. Its
+`workspace-init` container copies the image's `/sandbox` into a workspace volume
+that then mounts over `/sandbox`, and Landlock leaves only `/sandbox` and `/tmp`
+writable. The `host-openshell` target builds its venv at `/sandbox/.venv` and
+lets any user read `/sandbox`, so the copied venv runs and accepts the launcher's
+wheel installs. CI does not publish this target, so build it from a checkout:
+
+```bash
+docker build -f deploy/docker/Dockerfile --target host-openshell \
+  --platform linux/amd64 \
+  -t docker.io/<you>/omnigent-host-openshell:latest .
+```
+
 > [!NOTE]
 > **Air-gapped?** Pre-load the host image (and OpenShell's supervisor image) into
 > the registry or host the gateway pulls from — the first launch from an uncached
@@ -257,6 +273,8 @@ FROM ghcr.io/omnigent-ai/omnigent-host:latest
 COPY policy.yaml /etc/openshell/policy.yaml
 ```
 
+On the Kubernetes driver, derive it from your `host-openshell` build instead.
+
 A managed host needs egress to:
 
 - **the server URL** (`server_url`) — the host and runner dial it back over a
@@ -268,17 +286,16 @@ A managed host needs egress to:
   `*.blob.core.windows.net` (the openai-agents harness downloads the `tiktoken`
   encoding).
 
-The filesystem policy must also grant `/opt/venv` read-write: the host runs from
-that venv and the launcher installs wheels into it. On the Kubernetes driver,
-Landlock otherwise blocks `/opt` and the host cannot start. A minimal
-`policy.yaml` looks like:
+A minimal `policy.yaml` looks like this. With the `host` image, also add
+`/opt/venv` to `read_write`: the host runs from that venv and the launcher
+installs wheels into it. The `host-openshell` venv is already under `/sandbox`.
 
 ```yaml
 version: 1
 filesystem_policy:
   include_workdir: true
   read_only: [/usr, /lib, /lib64, /proc, /dev/urandom, /etc, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null, /dev/pts, /opt/venv]
+  read_write: [/sandbox, /tmp, /dev/null, /dev/pts]
 landlock:
   compatibility: best_effort
 process:

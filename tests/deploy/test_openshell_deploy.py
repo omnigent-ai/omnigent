@@ -58,6 +58,30 @@ def test_host_image_venv_is_writable_by_openshell_sandbox_user() -> None:
     assert ownership_grants and max(ownership_grants) >= max(venv_writes)
 
 
+def test_host_openshell_image_runs_from_the_seeded_sandbox_home() -> None:
+    """The Kubernetes driver copies /sandbox into a PVC as UID 10001; Landlock denies /opt."""
+    builder = _stage_instructions("openshell-venv-builder")
+    image = _stage_instructions("host-openshell")
+    env_lines = " ".join(line for line in image if line.startswith("ENV "))
+    environment = dict(re.findall(r"\b(PATH|VIRTUAL_ENV)=\"?([^\s\"]+)", env_lines))
+
+    assert any(line.startswith("RUN python -m venv /sandbox/.venv ") for line in builder)
+    assert any(
+        re.match(r"COPY --from=openshell-venv-builder --chown=sandbox\S* /sandbox/\.venv ", line)
+        for line in image
+    )
+    assert environment["VIRTUAL_ENV"] == "/sandbox/.venv"
+    assert environment["PATH"].split(":")[0] == "/sandbox/.venv/bin"
+    assert "/opt/venv" not in environment["PATH"]
+    # Launcher execs use `bash -lc`, whose /etc/profile resets PATH before profile.d.
+    assert any(
+        "/sandbox/.venv/bin" in line and "/etc/profile.d/omnigent-venv.sh" in line
+        for line in image
+    )
+    # useradd -m leaves /sandbox 0700, so UID 10001 could not copy it.
+    assert any(re.search(r"\bchmod (755|a\+rx|a\+rX) /sandbox\b", line) for line in image)
+
+
 def _server_sdk_config_home(container: dict) -> str:
     runtime = _stage_instructions("runtime")
     users = [line.split()[1] for line in runtime if line.startswith("USER ")]

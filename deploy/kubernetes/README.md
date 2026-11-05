@@ -180,8 +180,9 @@ CRD when the gateway uses a Kubernetes compute driver.
 
 1. **Edit the server config** — in `overlays/openshell/server-config.yaml`, set
    `sandbox.server_url` to the URL sandboxes dial back to, and
-   `sandbox.openshell.image` to a host image that bakes in your sandbox policy
-   (see [Network egress policy](../openshell/README.md#network-egress-policy)):
+   `sandbox.openshell.image` to a `host-openshell` image with your sandbox policy
+   baked in (see [Kubernetes driver](../openshell/README.md#kubernetes-driver) and
+   [Network egress policy](../openshell/README.md#network-egress-policy)):
 
    ```yaml
    sandbox:
