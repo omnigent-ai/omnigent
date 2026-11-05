@@ -2815,7 +2815,9 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-condition-0-value", "error");
     type("task-trigger-instructions", "Reproduce it.");
     fireEvent.click(
-      screen.getByRole("checkbox", { name: "Reply in the thread with the session link" }),
+      screen.getByRole("checkbox", {
+        name: "Include the session link with the result in the thread",
+      }),
     );
 
     const prompt = await submittedPrompt();
