@@ -12,7 +12,7 @@ from alembic import op
 from omnigent.db.db_models import Uuid16
 
 revision: str = "f1c7a9e2b406"
-down_revision: str | None = "d0a1f879a01d"
+down_revision: str | None = "e5b2c8d4f1a7"
 branch_labels: tuple[str, ...] | None = None
 depends_on: tuple[str, ...] | None = None
 
