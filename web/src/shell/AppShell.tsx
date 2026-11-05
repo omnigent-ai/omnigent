@@ -2031,9 +2031,9 @@ function AppShellImpl() {
       revealRightPanel,
     ],
   );
-  // Sub-agent tabs opened on desktop must stay reachable from a phone's
-  // drawer even when this harness can't start side chats.
-  const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
+  // Side-chat and sub-agent tabs opened elsewhere must stay reachable from a
+  // phone's drawer even where this viewer or harness can't start side chats.
+  const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2728,7 +2728,7 @@ function AppShellImpl() {
                       githubPanelOpen,
                       contentSearchPanelOpen,
                       sideChatsPanelOpen,
-                      showSideChats: showSideChats || hasSubagentTabs,
+                      showSideChats: showSideChats || hasSideChatTabs,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2844,7 +2844,7 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
-                    onHasSubagentTabsChange={setHasSubagentTabs}
+                    onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
                   />
                 )}

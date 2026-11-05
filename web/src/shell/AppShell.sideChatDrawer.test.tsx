@@ -95,6 +95,8 @@ import { AppShell } from "./AppShell";
 import { isMobileViewport } from "./Sidebar";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import { useConversations } from "@/hooks/useConversations";
+import { useSession } from "@/hooks/useSession";
+import type { Session } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { subagentTabId } from "@/lib/subagentTabs";
@@ -164,6 +166,11 @@ function renderShell(path = "/c/conv_ws") {
     </QueryClientProvider>,
   );
 }
+
+const openActionsMenu = () =>
+  fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }), {
+    button: 0,
+  });
 
 describe("mobile side-chats drawer", () => {
   const initialStoreState = useChatStore.getState();
@@ -244,15 +251,56 @@ describe("mobile side-chats drawer", () => {
   });
 });
 
+describe("phone menu for a viewer who can't start side chats", () => {
+  const initialStoreState = useChatStore.getState();
+  beforeEach(() => {
+    useChatStore.setState({ ...initialStoreState, sessionHarness: "openai-agents" });
+    // An editor's own side chat from before side chats became owner-only.
+    const session: Session = {
+      id: "conv_ws",
+      agentId: "agent",
+      agentName: null,
+      runnerId: null,
+      status: "idle",
+      createdAt: 0,
+      title: null,
+      labels: {},
+      items: [],
+      pendingElicitations: [],
+      permissionLevel: 2,
+      parentSessionId: null,
+      subAgentName: null,
+      kind: "default",
+      sideChatAllowed: false,
+    };
+    vi.mocked(useSession).mockReturnValue({ session, isLoading: false, error: null });
+  });
+  afterEach(() => {
+    useChatStore.setState(initialStoreState);
+    vi.mocked(useSession).mockReturnValue({ session: null, isLoading: false, error: null });
+  });
+
+  it("keeps a restored side chat reachable without offering a new one", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["conv_side_a"],
+      selectedSideChatId: "conv_side_a",
+    });
+    renderShell();
+
+    openActionsMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
+
+    const drawer = screen.getByTestId("side-chats-panel-drawer");
+    expect(drawer).toHaveAttribute("data-state", "open");
+    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a");
+    expect(within(drawer).queryByRole("button", { name: "New side chat" })).toBeNull();
+  });
+});
+
 describe("phone menu with a harness that can't start side chats", () => {
   const initialStoreState = useChatStore.getState();
   beforeEach(() => useChatStore.setState({ ...initialStoreState, sessionHarness: null }));
   afterEach(() => useChatStore.setState(initialStoreState));
-
-  const openActionsMenu = () =>
-    fireEvent.pointerDown(screen.getByRole("button", { name: "Session actions" }), {
-      button: 0,
-    });
 
   it("offers Side chats for sub-agent tabs restored from storage", () => {
     writeSessionWorkspaceState("conv_ws", {

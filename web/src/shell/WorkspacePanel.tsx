@@ -796,8 +796,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
-  /** Reports whether a sub-agent tab is open, so a phone can reach the drawer. */
-  onHasSubagentTabsChange?: (hasSubagentTabs: boolean) => void;
+  /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
+  onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
   subagentPanelOpener?: SubagentPanelOpener;
 }
@@ -871,7 +871,7 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
-  onHasSubagentTabsChange,
+  onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
@@ -900,11 +900,12 @@ function WorkspacePanelImpl({
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
-  const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
+  // Open tabs stay reachable even where this viewer can't start a side chat.
+  const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
-    onHasSubagentTabsChange?.(hasSubagentTabs);
-    return () => onHasSubagentTabsChange?.(false);
-  }, [hasSubagentTabs, onHasSubagentTabsChange]);
+    onHasSideChatTabsChange?.(hasSideChatTabs);
+    return () => onHasSideChatTabsChange?.(false);
+  }, [hasSideChatTabs, onHasSideChatTabsChange]);
   const activeHarness = useChatStore((s) => s.sessionHarness);
   const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
