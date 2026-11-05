@@ -30,6 +30,7 @@ import * as identity from "@/lib/identity";
 import * as sandboxModelsHook from "@/hooks/useSandboxModelOptions";
 import * as hostsHook from "@/hooks/useHosts";
 import * as scheduledHooks from "@/hooks/useScheduledTasks";
+import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -52,6 +53,10 @@ vi.mock("@/hooks/useHostWorktrees", () => ({
   },
 }));
 vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+vi.mock("@/lib/mcpRegistry", () => ({
+  registryRequest: vi.fn(),
+  authorizeRegistryService: vi.fn(),
+}));
 // useHostModelOptions is consumed by the ModelEffortFields sub-form (model
 // dropdown source). Returning no data makes it fall back to the static Claude
 // alias list, which is what a no-host-pinned scheduled task uses anyway.
@@ -268,6 +273,7 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -3661,5 +3667,103 @@ describe("automation random worktree", () => {
     expect(updateMutateAsync.mock.calls[0][0].input.baseBranch).toBe(
       baseBranch === null ? "HEAD" : null,
     );
+  });
+});
+
+describe("CreateScheduledTaskDialog MCP services", () => {
+  const github: RegistryService = {
+    id: "github",
+    title: "GitHub",
+    description: "",
+    auth: "oauth",
+    connected: true,
+    tools: [],
+    connect_provider: "oauth",
+  };
+  const linear: RegistryService = { ...github, id: "linear", title: "Linear", connected: false };
+
+  function renderWithRegistry(ui: React.ReactElement) {
+    return render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+          scheduled_task_harness_settings: true,
+          enabled_connections: ["mcp"],
+        }}
+      >
+        {ui}
+      </CapabilitiesProvider>,
+    );
+  }
+
+  beforeEach(() => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [github, linear] });
+  });
+
+  it("is hidden when the server offers no MCP registry", () => {
+    renderDialog();
+    expect(screen.queryByTestId("task-mcp-services-field")).not.toBeInTheDocument();
+    expect(registryRequest).not.toHaveBeenCalled();
+  });
+
+  it("saves the services a new automation starts with", async () => {
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Nightly" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "Triage" } });
+    const hostTrigger = screen.getByTestId("task-host-trigger");
+    fireEvent.pointerDown(hostTrigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostTrigger);
+    fireEvent.click(screen.getByRole("option", { name: /laptop/ }));
+
+    fireEvent.click(await screen.findByRole("switch", { name: "GitHub" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].mcpServices).toEqual(["github"]);
+  });
+
+  it("starts a new automation from the services last picked for a new chat", async () => {
+    localStorage.setItem("omnigent:last-mcp-services", JSON.stringify(["github"]));
+    renderWithRegistry(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />);
+    expect(await screen.findByRole("switch", { name: "GitHub" })).toBeChecked();
+  });
+
+  it("blocks saving until every selected service is signed in", async () => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["linear"] })}
+      />,
+    );
+    expect(await screen.findByTestId("task-mcp-services-blocked")).toHaveTextContent(
+      "Sign in to each selected MCP service",
+    );
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("switch", { name: "Linear" }));
+    expect(screen.queryByTestId("task-mcp-services-blocked")).not.toBeInTheDocument();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it.each([
+    ["unchanged", false, undefined],
+    ["turned off", true, []],
+  ])("sends the services on edit only when they change (%s)", async (_, turnOff, expected) => {
+    renderWithRegistry(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ mcpServices: ["github"] })}
+      />,
+    );
+    const toggle = await screen.findByRole("switch", { name: "GitHub" });
+    expect(toggle).toBeChecked();
+    if (turnOff) fireEvent.click(toggle);
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.mcpServices).toEqual(expected);
   });
 });
