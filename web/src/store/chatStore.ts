@@ -4857,6 +4857,18 @@ async function refreshSessionBinding(id: string): Promise<void> {
   setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
+async function resolveHostForBind(id: string): Promise<void> {
+  try {
+    // Prefer the registered resolver: it walks a hostless sub-agent child up
+    // to its host-bound ancestor. Without one, the bare snapshot still seeds
+    // a top-level session's own host.
+    await (resolveSessionHost(id) ?? getSessionSlim(id));
+  } catch {
+    // Best-effort: a failed resolve (bad id, transient) falls through to the
+    // unkeyed open; the snapshot fetch surfaces the real error.
+  }
+}
+
 /**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
@@ -4881,6 +4893,9 @@ async function bindStream(
   const controller = new AbortController();
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
+  // Resolve the host (see below) while the stream slot is acquired.
+  const hostResolved =
+    isHostRoutingEnabled() && getSessionHost(id) === null ? resolveHostForBind(id) : null;
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
@@ -4905,16 +4920,8 @@ async function bindStream(
   // snapshot key correctly. Best-effort: a failed resolve falls through to the
   // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
-  if (isHostRoutingEnabled() && getSessionHost(id) === null) {
-    try {
-      // Prefer the registered resolver: it walks a hostless sub-agent child up
-      // to its host-bound ancestor. Without one, the bare snapshot still seeds
-      // a top-level session's own host.
-      await (resolveSessionHost(id) ?? getSessionSlim(id));
-    } catch {
-      // Best-effort: a failed resolve (bad id, transient) falls through to the
-      // unkeyed open; the snapshot fetch surfaces the real error.
-    }
+  if (hostResolved !== null) {
+    await hostResolved;
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.

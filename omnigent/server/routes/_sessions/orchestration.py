@@ -786,9 +786,14 @@ async def _best_effort_stop(
 
     if own_status == "running" or has_background_tasks:
         await _stop(session_id)
-    for descendant_id in descendant_ids:
-        if _session_status_cache.get(descendant_id) in ("running", "waiting"):
-            await _stop(descendant_id)
+    # Each descendant stop is an independent runner round-trip.
+    await asyncio.gather(
+        *(
+            _stop(descendant_id)
+            for descendant_id in descendant_ids
+            if _session_status_cache.get(descendant_id) in ("running", "waiting")
+        )
+    )
     return descendant_ids
 
 
