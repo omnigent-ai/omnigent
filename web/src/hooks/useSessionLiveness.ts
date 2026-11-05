@@ -5,10 +5,11 @@
 // "is the runner asleep vs. is the host down vs. is this not host-bound"
 // inline at every render site.
 
-import { useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { Conversation } from "@/hooks/useConversations";
-import type { Session } from "@/lib/types";
+import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
+import type { SandboxStatus, Session } from "@/lib/types";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 
 /**
@@ -225,6 +226,103 @@ export function useSessionLiveness(
   if (prev.current !== null && livenessEqual(prev.current, raw)) return prev.current;
   prev.current = raw;
   return raw;
+}
+
+/** Monotonic ms for connecting deadlines, so wall-clock jumps neither stretch nor cut them. */
+function monotonicNowMs(): number {
+  return performance.now();
+}
+
+interface HostConnectingAttempt {
+  sessionId: string | undefined;
+  launchedAt: number | null;
+  turnActive: boolean;
+  /** A new launch or turn began; the next visible attempt gets a fresh window. */
+  restartPending: boolean;
+  /** The pending restart came from a host-switch launch, not only a turn. */
+  launchPending: boolean;
+  /** Only a turn started the current attempt, so that turn ending ends it. */
+  turnOwned: boolean;
+  /** Monotonic ms when the current attempt ends; `null` when there is none. */
+  deadline: number | null;
+}
+
+/**
+ * Whether the composer host chip should say the open session is connecting.
+ *
+ * An attempt starts when this view first observes `starting` liveness or an
+ * in-flight sandbox launch, and again on each new client launch marker (a host
+ * switch's `launchedAt`, or a turn starting). It lasts {@link STARTING_GRACE_S}
+ * of monotonic time from that observation, ended by a timer even if nothing
+ * else re-renders, so a host that never comes up falls back to its offline
+ * status and Reconnect. The runner coming online, a launch stopped on a
+ * failure or user action, or a session switch ends it early, as does the
+ * end of the turn that alone started it while no sandbox launch is in flight.
+ * Otherwise it holds to its bound, since liveness's own grace reads skewable
+ * server time.
+ */
+export function useSessionHostConnecting(
+  sessionId: string | undefined,
+  liveness: SessionLiveness,
+  sandboxStatus: SandboxStatus | null,
+  markers: { launchedAt?: number | null; turnActive?: boolean },
+): boolean {
+  const launchedAt = markers.launchedAt ?? null;
+  const turnActive = markers.turnActive === true;
+  const stopped = isSandboxLaunchStopped(sandboxStatus);
+  const attemptVisible = !stopped && (sandboxStatus !== null || liveness.kind === "starting");
+  const attemptRef = useRef<HostConnectingAttempt | null>(null);
+  if (attemptRef.current === null || attemptRef.current.sessionId !== sessionId) {
+    attemptRef.current = {
+      sessionId,
+      launchedAt,
+      turnActive,
+      restartPending: false,
+      launchPending: false,
+      turnOwned: false,
+      deadline: null,
+    };
+  }
+  const attempt = attemptRef.current;
+  const newLaunch = launchedAt !== null && launchedAt !== attempt.launchedAt;
+  const newTurn = turnActive && !attempt.turnActive;
+  const turnEnded = !turnActive && attempt.turnActive;
+  if (newLaunch || newTurn) attempt.restartPending = true;
+  if (newLaunch) attempt.launchPending = true;
+  attempt.launchedAt = launchedAt;
+  attempt.turnActive = turnActive;
+  const now = monotonicNowMs();
+  if (stopped || liveness.kind === "online") {
+    attempt.deadline = null;
+    attempt.restartPending = false;
+    attempt.launchPending = false;
+  } else if (turnEnded && attempt.turnOwned && sandboxStatus === null && !attempt.launchPending) {
+    // A cancelled or failed send stops its relaunch; expire rather than clear,
+    // so only a new launch or turn reopens the window. A launch that lands in
+    // the same update as the turn's end is independent and keeps its window.
+    if (attempt.deadline !== null) attempt.deadline = Math.min(attempt.deadline, now);
+    attempt.restartPending = false;
+    attempt.launchPending = false;
+  } else if (attemptVisible && (attempt.deadline === null || attempt.restartPending)) {
+    // A turn sent during another live attempt (cold boot or host switch) doesn't own it.
+    const independentAttemptLive =
+      attempt.deadline !== null && now < attempt.deadline && !attempt.turnOwned;
+    attempt.turnOwned = attempt.restartPending && !attempt.launchPending && !independentAttemptLive;
+    attempt.deadline = now + STARTING_GRACE_S * 1000;
+    attempt.restartPending = false;
+    attempt.launchPending = false;
+  }
+  const deadline = attempt.deadline;
+  // Re-render at the deadline; an early fire re-arms only for the monotonic remainder.
+  const [expiryCheck, setExpiryCheck] = useState(0);
+  useEffect(() => {
+    if (deadline === null) return;
+    const remainingMs = deadline - monotonicNowMs();
+    if (remainingMs <= 0) return;
+    const timer = setTimeout(() => setExpiryCheck((check) => check + 1), remainingMs);
+    return () => clearTimeout(timer);
+  }, [deadline, expiryCheck]);
+  return deadline !== null && monotonicNowMs() < deadline;
 }
 
 /** Structural equality for the small `SessionLiveness` union. */

@@ -1,13 +1,15 @@
-import { renderHook } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   STARTING_GRACE_S,
   type LivenessRow,
+  type SessionLiveness,
   livenessRowFromSession,
+  useSessionHostConnecting,
   useSessionLiveness,
 } from "./useSessionLiveness";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import type { Session } from "@/lib/types";
+import type { SandboxStatus, Session } from "@/lib/types";
 
 // Drive the two split signals directly so the test pins the derivation
 // truth table, not the provider plumbing (covered by its own test).
@@ -375,5 +377,159 @@ describe("useSessionLiveness — derivation truth table", () => {
       const row = livenessRowFromSession(session({ hostId: "h1", permissionLevel: null }));
       expect(derive(false, false, row)).toEqual({ kind: "host_offline", isOwner: true });
     });
+  });
+});
+
+describe("useSessionHostConnecting", () => {
+  const starting: SessionLiveness = { kind: "starting" };
+  const online: SessionLiveness = { kind: "online" };
+  interface Markers {
+    launchedAt?: number | null;
+    turnActive?: boolean;
+  }
+
+  beforeEach(() => {
+    // `performance` is the monotonic clock; `setSystemTime` moves only the wall clock.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date", "performance"] });
+    vi.setSystemTime(new Date("2026-11-03T12:00:00Z"));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  function renderConnecting(initial: { liveness: SessionLiveness; markers: Markers }) {
+    return renderHook(
+      ({ liveness, markers }) => useSessionHostConnecting(SID, liveness, null, markers),
+      { initialProps: initial },
+    );
+  }
+  const advance = (ms: number) => act(() => vi.advanceTimersByTime(ms));
+  const GRACE_MS = STARTING_GRACE_S * 1000;
+
+  it("gives a second launch marker during continuous starting a fresh full window", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { launchedAt: Date.now() },
+    });
+    advance(30_000);
+    const secondLaunch = { launchedAt: Date.now() };
+    rerender({ liveness: starting, markers: secondLaunch });
+    // Past the first launch's deadline, inside the second's.
+    advance(GRACE_MS - 1);
+    rerender({ liveness: starting, markers: { ...secondLaunch } });
+    expect(result.current).toBe(true);
+    advance(1);
+    expect(result.current).toBe(false);
+  });
+
+  it("keeps the deadline across ordinary re-renders", () => {
+    const markers = { launchedAt: Date.now() };
+    const { result, rerender } = renderConnecting({ liveness: starting, markers });
+    advance(GRACE_MS - 1);
+    rerender({ liveness: starting, markers: { ...markers } });
+    expect(result.current).toBe(true);
+    advance(1);
+    rerender({ liveness: starting, markers: { ...markers } });
+    expect(result.current).toBe(false);
+  });
+
+  it("opens a new window for a launch after the first one expired", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(GRACE_MS);
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { launchedAt: Date.now() } });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS);
+    expect(result.current).toBe(false);
+  });
+
+  it("opens a window for a relaunch after an earlier turn completed", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { turnActive: true },
+    });
+    advance(GRACE_MS);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+  });
+
+  it("starts over once the runner has been online", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(GRACE_MS);
+    rerender({ liveness: online, markers: {} });
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(true);
+  });
+
+  it("measures the window in elapsed time, not wall-clock time", () => {
+    const { result, rerender } = renderConnecting({ liveness: starting, markers: {} });
+    advance(10_000);
+    vi.setSystemTime(Date.now() - 10 * 60_000);
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS - 10_000);
+    expect(result.current).toBe(false);
+    vi.setSystemTime(Date.now() + 60 * 60_000);
+    rerender({ liveness: starting, markers: {} });
+    expect(result.current).toBe(false);
+  });
+
+  it("never reports a stopped launch as connecting", () => {
+    for (const stage of ["failed", "action_required"] as const) {
+      const { result, unmount } = renderHook(() =>
+        useSessionHostConnecting(SID, starting, { stage }, {}),
+      );
+      expect(result.current).toBe(false);
+      unmount();
+    }
+  });
+  it("ends a send's attempt when that turn ends, and only a new marker reopens it", () => {
+    const { result, rerender } = renderConnecting({
+      liveness: { kind: "runner_asleep" },
+      markers: { turnActive: false },
+    });
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+    advance(5_000);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(false);
+    rerender({ liveness: starting, markers: { turnActive: true } });
+    expect(result.current).toBe(true);
+  });
+
+  it("keeps connecting through a cancelled send while a sandbox launch is in flight", () => {
+    const provisioning = { stage: "provisioning" } as const;
+    const { result, rerender } = renderHook(
+      ({ liveness, sandbox, turnActive }) =>
+        useSessionHostConnecting(SID, liveness, sandbox, { turnActive }),
+      {
+        initialProps: {
+          liveness: { kind: "host_asleep" } as SessionLiveness,
+          sandbox: null as SandboxStatus | null,
+          turnActive: false,
+        },
+      },
+    );
+    // The send owns the attempt, then wakes a sandbox whose launch outlives the turn.
+    rerender({ liveness: starting, sandbox: null, turnActive: true });
+    rerender({ liveness: starting, sandbox: provisioning, turnActive: true });
+    advance(5_000);
+    rerender({ liveness: { kind: "host_asleep" }, sandbox: provisioning, turnActive: false });
+    expect(result.current).toBe(true);
+  });
+
+  it("keeps a cold boot connecting when the first send fails", () => {
+    // Mounted mid-send on a fresh session: the boot, not the turn, owns the attempt.
+    const { result, rerender } = renderConnecting({
+      liveness: starting,
+      markers: { turnActive: true },
+    });
+    advance(5_000);
+    rerender({ liveness: starting, markers: { turnActive: false } });
+    expect(result.current).toBe(true);
+    advance(GRACE_MS - 5_000);
+    expect(result.current).toBe(false);
   });
 });

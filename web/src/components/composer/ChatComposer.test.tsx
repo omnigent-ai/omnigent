@@ -5,8 +5,10 @@ import {
   ChatComposer,
   ComposerTextarea,
   ComposerSendButton,
+  COMPOSER_COLLAPSED_LABEL_CLASS,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
+import { ComposerHostTrigger } from "./ComposerControls";
 
 describe("ChatComposer", () => {
   function renderEditor(initial: string, submitWithModEnter = false) {
@@ -463,6 +465,29 @@ describe("ChatComposer label collapse", () => {
     rerender({ leading: <span>Manual</span>, trailing: <span>Fable 5.1 (1M context) xHigh</span> });
     await waitFor(() => expect(row).toHaveAttribute("data-labels", "collapsed"));
     rerender({ leading: <span>Manual</span>, trailing: <span>Sonnet 5</span> });
+    await waitFor(() => expect(row).not.toHaveAttribute("data-labels"));
+  });
+
+  it("collapses the host chip's Connecting label with the other labels", async () => {
+    const leading = (statusText?: string) => (
+      <>
+        <ComposerHostTrigger label="Host mac-laptop" status="starting" statusText={statusText} />
+        <span className={COMPOSER_COLLAPSED_LABEL_CLASS}>Manual</span>
+      </>
+    );
+    const { row, layout, rerender } = renderMeasuredComposer({
+      leading: leading(),
+      trailing: <span>Sonnet 5</span>,
+    });
+    layout.rowWidth = 200;
+    fireResize();
+    expect(row).not.toHaveAttribute("data-labels");
+
+    rerender({ leading: leading("Connecting…"), trailing: <span>Sonnet 5</span> });
+    await waitFor(() => expect(row).toHaveAttribute("data-labels", "collapsed"));
+    expect(screen.getByText("Connecting…")).toHaveClass(COMPOSER_COLLAPSED_LABEL_CLASS);
+
+    rerender({ leading: leading(), trailing: <span>Sonnet 5</span> });
     await waitFor(() => expect(row).not.toHaveAttribute("data-labels"));
   });
 });

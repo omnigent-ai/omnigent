@@ -13,7 +13,7 @@ import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 import type * as UseAgentsModule from "@/hooks/useAgents";
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useChatStore } from "@/store/chatStore";
 
@@ -383,6 +383,43 @@ describe("Composer status line (branch + context ring)", () => {
     const badge = screen.getByTestId("composer-host-select");
     expect(badge.tagName).toBe("BUTTON");
     expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
+    fireEvent.keyDown(badge, { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
+    expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows the session's bounded connecting state on the host chip and its menu", () => {
+    bindHost("mac-laptop");
+    const { rerender } = renderComposer({ runnerStarting: true, hostConnecting: true });
+
+    const trigger = screen.getByTestId("composer-host-select");
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, connecting");
+    expect(within(trigger).getByText("Connecting…")).toBeInTheDocument();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    const menu = screen.getByTestId("composer-host-menu");
+    expect(within(menu).getByText("Connecting to this host…")).toBeInTheDocument();
+    fireEvent.keyDown(menu, { key: "Escape" });
+
+    rerender(
+      <TooltipProvider>
+        <Composer {...composerProps({ runnerOnline: true })} />
+      </TooltipProvider>,
+    );
+    expect(trigger).toHaveAccessibleName("Host mac-laptop, online");
+    expect(within(trigger).queryByText("Connecting…")).toBeNull();
+  });
+
+  it("leaves an offline host reconnectable when only raw runner startup is reported", () => {
+    // `runnerStarting` also covers stopped sandbox stages and unbounded relaunches,
+    // so it must not hide Reconnect by itself.
+    bindHost("mac-laptop");
+    useSessionHostOnlineMock.mockReturnValue(false);
+    const onShowReconnectHelp = vi.fn();
+    renderComposer({ runnerStarting: true, onShowReconnectHelp });
+
+    const badge = screen.getByTestId("composer-host-select");
+    expect(badge).toHaveAccessibleName("Host mac-laptop, offline");
+    expect(within(badge).queryByText("Connecting…")).toBeNull();
     fireEvent.keyDown(badge, { key: "ArrowDown" });
     fireEvent.click(screen.getByRole("menuitem", { name: "Reconnect host" }));
     expect(onShowReconnectHelp).toHaveBeenCalledTimes(1);
