@@ -371,7 +371,7 @@ describe("prompt-first automation setup", () => {
     });
   });
 
-  it.each(["COUNT=4", "UNTIL=20991231T235959Z"])(
+  it.each(["COUNT=4", "UNTIL=20991231T235959Z", "UNTIL=20200101T235959Z"])(
     "keeps Advanced collapsed while editing time with %s",
     (ending) => {
       render(
@@ -388,9 +388,15 @@ describe("prompt-first automation setup", () => {
       expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
       expect(advanced).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-      fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:30" } });
+      fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:00" } });
       expect(advanced).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:30" } });
+      const expired = ending === "UNTIL=20200101T235959Z";
+      expect(advanced).toHaveAttribute("aria-expanded", String(expired));
+      expect(screen.getByTestId("create-scheduled-task-submit").hasAttribute("disabled")).toBe(
+        expired,
+      );
     },
   );
 
@@ -1430,14 +1436,18 @@ describe("CreateScheduledTaskDialog submit", () => {
     await userEvent.click(time);
     expect(screen.queryByRole("button", { name: "Apply" })).not.toBeInTheDocument();
     expect(screen.queryByTestId("schedule-time-picker")).not.toBeInTheDocument();
-    for (const value of ["", "25:99"]) {
-      fireEvent.change(time, { target: { value } });
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    if (frequency === "Daily") {
+      for (const value of ["", "25:99"]) {
+        fireEvent.change(time, { target: { value } });
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+      }
+      for (const value of ["00:00", "23:59"]) {
+        fireEvent.change(time, { target: { value } });
+        expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+      }
     }
-    for (const value of ["00:00", "23:59", "17:07"]) {
-      fireEvent.change(time, { target: { value } });
-      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
-    }
+    fireEvent.change(time, { target: { value: "17:07" } });
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.blur(time);
     expect(time).toHaveValue("05:07 PM");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));

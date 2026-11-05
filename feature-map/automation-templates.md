@@ -77,7 +77,7 @@ to customize.
   controls hidden, including while customizing the system prompt. Unsupported
   polling offers an explicit Use server default action without exposing schedule
   fields or changing session mode.
-  Edit as prompt → New session each run restores the
+  Edit as prompt → turn **Start each run in a new session** on to restore the
   scheduling controls, even when the prompt retains its template signature.
   Replacing the template’s opening sentence also restores regular scheduling
   controls after saving and reopening.
@@ -158,8 +158,8 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
   to continuation while preserving ten minutes. In either edit entry point, also
-  select a sandbox with Continue in the same session: ten minutes is valid;
-  selecting New session each run blocks saving until the interval reaches sixty.
+  select a sandbox and turn **Start each run in a new session** off: ten minutes is valid;
+  turning it on blocks saving until the interval reaches sixty.
   Repeat through the row menu and detail page. Without sub-hour support, the
   editor keeps the hourly minimum and displays saved minute rules without rewriting them.
 - `web/src/pages/TasksPage.test.tsx` covers populated and empty lists, search and
@@ -179,9 +179,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   It does not verify actual sandbox execution.
 - In the creation modal, choose a connected host and Git repository, enable
   Random worktree, save, and reopen Edit to confirm it stayed enabled. Run twice
-  with New session each run and check that the sessions have distinct worktree
-  paths. Disable the option and run again: the new session uses the selected
-  directory. With Continue in the same session, later runs reuse its worktree.
+  with **Start each run in a new session** on and check that the sessions have distinct
+  worktree paths. Disable the option and run again: the new session uses the selected
+  directory. With **Start each run in a new session** off, later runs reuse its worktree.
 - In any integration template, fill in the scope and session instructions, then
   expand Preview prompt. Toggle the link checkbox below the trigger and check
   that only the comment or reply step changes; sessions still start either way.
@@ -194,7 +194,7 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
-- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+- In create and edit setup, expand Advanced, then select Claude Code, Codex, Pi, and a permission-only
   harness such as Cursor. Check that only supported settings appear, model changes
   clear unsupported effort choices, and saved selections survive reopening. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.

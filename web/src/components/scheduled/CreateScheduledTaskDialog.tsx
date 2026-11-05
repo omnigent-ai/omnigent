@@ -603,6 +603,11 @@ export function CreateScheduledTaskDialog({
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
   const pollingBlockedReason =
     editingWorkerSettings && reusesExistingSession ? null : harnessSettings.blockedReason;
+  const recurrenceValid =
+    validateSchedule(
+      { ...schedule, end: undefined },
+      { sessionMode, subhourSupported, executionTarget },
+    ) === null;
   // Collapsed fields must not hide an error that blocks submit.
   const endingInvalid =
     validateSchedule({ ...DEFAULT_SCHEDULE_MODEL, end: schedule.end }, { allowPastEnd }) !== null ||
@@ -611,7 +616,7 @@ export function CreateScheduledTaskDialog({
     workspaceWithoutHost ||
     Boolean(pollingBlockedReason) ||
     (workerSettings !== null && Boolean(workerHarnessSettings.blockedReason)) ||
-    (!triggerMode && endingInvalid);
+    (!triggerMode && recurrenceValid && endingInvalid);
   useEffect(() => {
     if (open && advancedError) setAdvancedOpen(true);
   }, [open, advancedError]);
