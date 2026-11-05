@@ -14,7 +14,6 @@ import pytest
 
 from omnigent.runtime import session_stream
 from omnigent.server import presence, shutdown_state
-from omnigent.server.routes._sessions import helpers as session_helpers
 from omnigent.server.routes.sessions import _stream_live_events
 
 pytestmark = pytest.mark.asyncio
@@ -96,26 +95,6 @@ async def test_server_shutdown_ends_stream_without_done_for_browser_reconnect() 
     session_stream.shutdown_all()
     assert [frame async for frame in gen] == []
     assert SESSION_ID not in session_stream._subscribers
-
-
-async def test_stream_past_max_age_ends_without_done_for_reconnect(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A stream past its max age closes without ``[DONE]`` so clients reconnect."""
-    monkeypatch.setattr(session_helpers, "_SESSION_STREAM_MAX_AGE_S", 0.0)
-
-    gen = _stream_live_events(
-        _ConnectedRequest(),  # type: ignore[arg-type]
-        SESSION_ID,
-    )
-    frames = await asyncio.wait_for(_collect(gen), timeout=2.0)
-
-    assert len(frames) == 1 and "session.heartbeat" in frames[0], frames
-    assert SESSION_ID not in session_stream._subscribers
-
-
-async def _collect(gen: Any) -> list[str]:
-    return [frame async for frame in gen]
 
 
 async def test_normal_completion_emits_done_and_cleans_up(

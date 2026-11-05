@@ -561,12 +561,6 @@ _RACE_TASK_REAP_TIMEOUT_S = 5.0
 _SESSION_STREAM_HEARTBEAT_INTERVAL_S = 15.0
 
 
-# Close a session stream before the Databricks front door's 300s cap, which
-# can drop it without the client seeing a close. Checked on each event, so
-# the stream ends within one heartbeat interval after this age.
-_SESSION_STREAM_MAX_AGE_S = 270.0
-
-
 _SNAPSHOT_RUNNER_TIMEOUT_S = 2.0
 
 
@@ -1255,7 +1249,6 @@ __all__ = [
     "_RUNNER_SESSION_INIT_TIMEOUT_S",
     "_SERVER_STREAM_EVENT_ADAPTER",
     "_SESSION_STREAM_HEARTBEAT_INTERVAL_S",
-    "_SESSION_STREAM_MAX_AGE_S",
     "_SESSION_UPDATES_HEARTBEAT_INTERVAL_S",
     "_SESSION_UPDATES_MAX_WATCHED",
     "_SESSION_UPDATES_RESCAN_INTERVAL_S",

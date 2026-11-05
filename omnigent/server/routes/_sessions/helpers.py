@@ -224,7 +224,6 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _RUNNER_FORWARD_TIMEOUT,
     _SERVER_STREAM_EVENT_ADAPTER,
     _SESSION_STREAM_HEARTBEAT_INTERVAL_S,
-    _SESSION_STREAM_MAX_AGE_S,
     _SHARED_DISCOVERY_KEY,
     _SLASH_COMMAND_TYPE,
     _STOP_RUNNER_RESULT_TIMEOUT_S,
@@ -9941,10 +9940,9 @@ async def _stream_live_events(
     reconcile pre-subscribe state via the snapshot endpoint
     (``GET /v1/sessions/{id}``) and dedupe by item id.
 
-    An intentional session close emits ``[DONE]``. Server shutdown,
-    subscriber overflow and reaching :data:`_SESSION_STREAM_MAX_AGE_S`
-    instead end without it so clients reconnect and reconcile from the
-    persisted snapshot.
+    An intentional session close emits ``[DONE]``. Server shutdown and
+    subscriber overflow instead end without it so clients reconnect and
+    reconcile from the persisted snapshot after the server returns.
 
     ``finally`` is cleanup-only (presence deregistration): yielding
     from ``finally`` during client ``aclose`` / ``GeneratorExit``
@@ -10005,8 +10003,6 @@ async def _stream_live_events(
     # learns the full list (self included) from the snapshot-on-connect
     # presence event — full-state events make that ordering race benign.
     presence_token: str | None = None
-    opened_at = time.monotonic()
-    reached_max_age = False
     if viewer_user_id is not None:
         if presence_root_id is None:
             raise ValueError("presence_root_id is required when viewer_user_id is set")
@@ -10040,9 +10036,6 @@ async def _stream_live_events(
                     )
                 validated = _SERVER_STREAM_EVENT_ADAPTER.validate_python(event)
                 yield _format_sse(event_type, validated.model_dump())
-                if time.monotonic() - opened_at >= _SESSION_STREAM_MAX_AGE_S:
-                    reached_max_age = True
-                    break
     except session_stream.SubscriberOverflowError:
         _logger.warning(
             "session stream subscriber overflowed for %s; closing for snapshot reconnect",
@@ -10052,7 +10045,7 @@ async def _stream_live_events(
     else:
         # Server restart is a transport drop, not a permanent session close.
         # Never yield from finally: aclose / GeneratorExit cannot accept a yield.
-        if not reached_max_age and not shutdown_state.server_shutting_down():
+        if not shutdown_state.server_shutting_down():
             yield "data: [DONE]\n\n"
     finally:
         # The non-None checks besides presence_token's are type
