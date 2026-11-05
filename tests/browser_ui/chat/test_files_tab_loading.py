@@ -24,11 +24,8 @@ def test_files_tab_says_loading_until_the_workspace_answers(
     chat_session_contract: ChatSessionContract,
     answer: str,
 ) -> None:
-    """The Files tab waits for the workspace environment without reading as empty.
-
-    Its lists only load once the environment answers, so the tab said "No files in
-    workspace" until then, and kept saying it if the environment failed.
-    """
+    """The Files tab says it's loading until the environment answers, then shows the
+    files or the failure, never an empty workspace."""
     chat = chat_session_contract
     environment_url = (
         f"{chat.contract.base_url}/v1/sessions/{chat.session_id}/resources/environments/default"

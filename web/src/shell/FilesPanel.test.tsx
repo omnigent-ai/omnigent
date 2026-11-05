@@ -455,12 +455,20 @@ describe("FilesPanel before the workspace environment answers", () => {
     expect(screen.getByText("Failed to load: environment unavailable")).toBeInTheDocument();
   });
 
-  it("keeps a list's own state once the environment has loaded", () => {
-    const list = { data: undefined, isLoading: true, isError: false, error: null };
-    const refetchFailed = { data: {}, isLoading: false, isError: true, error: new Error("x") };
-
-    expect(fileListStatus(list, refetchFailed)).toEqual({
-      isLoading: true,
+  it.each([
+    [
+      "the environment has loaded",
+      { data: undefined, isLoading: true, isError: false, error: null },
+      { data: {}, isLoading: false, isError: true, error: new Error("refetch failed") },
+    ],
+    [
+      "the list has data",
+      { data: { data: [] }, isLoading: false, isError: false, error: null },
+      { data: undefined, isLoading: false, isError: true, error: new Error("unavailable") },
+    ],
+  ])("keeps a list's own state once %s", (_case, list, environmentStatus) => {
+    expect(fileListStatus(list, environmentStatus)).toEqual({
+      isLoading: list.isLoading,
       isError: false,
       error: null,
     });
