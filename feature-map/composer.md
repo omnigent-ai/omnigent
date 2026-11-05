@@ -22,6 +22,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
   A new link replaces a parked draft; subsequent edits survive navigation.
+  **Copy message to new session** opens it with a one-time `?handoff=` token
+  instead, naming an in-memory copy of the message's text and attachments. That
+  copy replaces the whole parked draft, even with no text or no attachments; the
+  token leaves the URL and is released once the composer takes it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -120,6 +124,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   selection and launch wait for success. States: connected, pending, cancelled,
   failed, popup blocked, Databricks workspace prompt, bearer token needed.
 - `slash-menu`: typing `/` opens commands and skills with keyboard navigation.
+  Rows show a one-line description. When the pointer or keyboard highlight rests
+  on a cut-off row for 400 ms, a scrollable tooltip shows the full text;
+  PageUp/PageDown page through a tall one while the composer keeps focus. The
+  tooltip fits within the viewport width, and on touch screens the highlight
+  doesn't open it.
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
@@ -132,8 +141,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
-  to the active harness, and a host lookup failure leaves known agent entries
-  visible. It is absent before a session starts and from side chat. When the
+  to the active harness; a claude-sdk session on a host lists its Claude servers,
+  only the organization-managed ones when its agent sets `skills: none` (or, with a
+  status saying why, while the session-agent request is loading or after it
+  fails). A host lookup failure leaves known agent entries visible. It is absent before a session starts and from side chat. When the
   server has the MCP registry on, each registry service row also shows its
   account state. States: connected; sign-in required, with an inline **Sign in**
   that runs the popup sign-in and flips the row to connected, or a **Sign in
@@ -145,8 +156,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   reports it (via `~/.omnigent/mcp-auth-status.json`, see
   `docs/MCP_AUTH_STATUS.md`); its **Sign
   in** opens the reported URL in a new tab and the panel re-reads the host
-  inventory every few seconds until the row is connected. Custom agent servers
-  carry no account state.
+  inventory every few seconds until the row is connected. In a claude-sdk
+  session, the next turn after the row turns connected reaches that server
+  without starting a new session. Custom agent servers carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -182,7 +194,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
   A message sent mid-turn to a native session says the agent will read it
-  after its current step until it does.
+  after its current step in the timestamp row. It appears on desktop hover or
+  focus and stays visible with truncation on touch, without adding row height.
 - `host-offline-hold`: a message sent to a native session whose host is offline
   waits in the queue as "Waiting for host", ahead of other queued messages, and
   sends once the host reconnects; no failed turn is recorded.
@@ -205,7 +218,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
-  each message once.
+  each message once. If the sandbox never comes up, each saved message stays in
+  the transcript marked **Not delivered**, live and after reload. **Copy message
+  to new session** opens New Chat with its text and attachments.
 - `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
   missing or expired dbcert preserves the draft and shows a yellow refresh
   banner instead of provisioning. Skip continues the current launch without
@@ -351,6 +366,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in-session composer, then close the browser. Reopen after startup and check
   that all three reached the agent in order. Ordinary busy-session queueing
   resumes after the first input is delivered.
+- For a managed sandbox that fails to start (e.g. an Arclet whose host never
+  comes online), send a prompt with an attachment and wait for the failure. Check
+  the prompt stays marked **Not delivered**, also after reload. **Copy message to
+  new session** opens New Chat with the text and attachment.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session; an unreadable
   plugin catalog shows the same warning and Retry here.
@@ -604,6 +623,10 @@ Other connection providers alone do not enable the managed MCP picker.
   No running agent is needed.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
@@ -615,8 +638,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Native host entries must match the active harness; a host error is shown
   without hiding MCPs declared by the bound session agent. While the host loads,
   its loading status stays visible alongside agent entries; a session without a
-  known host shows unavailable status rather than an empty inventory. Click
-  **Go to Settings** and confirm the session’s harness and host are selected.
+  known host shows unavailable status rather than an empty inventory (a claude-sdk session
+  without a host lists only its agent's servers). In a
+  claude-sdk session on a host with Claude MCP servers, expect them listed, and
+  only the managed ones when the agent sets `skills: none`. Click
+  **Go to Settings** and confirm the session’s harness and host are selected
+  (Claude’s page for a claude-sdk session). For the post-sign-in journey, start
+  a claude-sdk session while a Claude server needs sign-in, finish the sign-in
+  outside Omnigent, then send another message and expect the agent to use that
+  server's tool. Covered by
+  `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
+  and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
@@ -708,6 +740,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
+  `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
+  verifies phone and tablet touch visibility without hover.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -760,10 +794,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_managed_startup_followups.py::test_startup_followups_survive_browser_close`
   sends three messages during provisioning with both harness types, closes the
   browser, and verifies ordered input delivery and a fresh-browser reload.
+  `tests/e2e_ui/start_session/test_managed_initial_attachment.py::test_failed_launch_hands_the_message_and_attachment_to_a_new_session`
+  fails the launch, checks **Not delivered** live and after reload, and copies the
+  message and attachment to New Chat.
   These tests use real servers, host, runner and browser; only
   cloud allocation and model output are local substitutes. Backend coverage in
   `tests/server/integration/test_managed_startup_inputs.py` checks native
-  transcript ownership, bundle uploads, recovery, access revocation and deletion.
+  transcript ownership, bundle uploads, recovery, access revocation and deletion,
+  plus failed inputs in the snapshot.
 - **`arclet-dbcert`, desktop new-session composer (own environment):**
   `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
   native bridge, CLI process, and local server with a fake dbcert executable and

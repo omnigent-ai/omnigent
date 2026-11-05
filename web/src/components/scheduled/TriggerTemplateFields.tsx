@@ -121,17 +121,46 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
-            <span className="text-muted-foreground">{template.scopeLabel}</span>
-            <span className={cn(CHIP, "flex items-center")}>equals</span>
+            <span className="text-muted-foreground">where {template.scopeLabel}</span>
+            <Select
+              value={fields.scopeOperator ?? "in"}
+              onValueChange={(operator) =>
+                onChange({ ...fields, scopeOperator: operator as "is" | "in" })
+              }
+              onOpenChange={onSelectOpenChange}
+            >
+              <SelectTrigger
+                size="sm"
+                className={CHIP}
+                aria-label="Scope operator"
+                data-testid="task-trigger-scope-operator"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value="is">equals</SelectItem>
+                <SelectItem value="in">in</SelectItem>
+              </SelectContent>
+            </Select>
             <Input
               value={fields.scope}
-              placeholder={template.scopePlaceholder}
+              placeholder={
+                fields.scopeOperator === "is"
+                  ? template.scopePlaceholder.split(",")[0]
+                  : template.scopePlaceholder
+              }
               aria-label={template.scopeLabel}
               data-testid="task-trigger-scope"
               className={cn(CHIP, "min-w-28 flex-1 placeholder:text-primary/50")}
               onChange={(e) => onChange({ ...fields, scope: e.target.value })}
             />
           </div>
+
+          {fields.scopeOperator === "is" && fields.scope.includes(",") && (
+            <p className="pl-6 text-sm text-destructive" role="alert">
+              Equals matches one value. Choose in to match a comma-separated list.
+            </p>
+          )}
 
           {fields.conditions.map((condition, index) => {
             const field =
