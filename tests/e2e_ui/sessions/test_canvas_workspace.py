@@ -280,7 +280,7 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     page.goto(f"{base_url}/c/{first}")
     menu = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(menu).to_be_visible()
-    ordinary_icon = menu.locator("svg").inner_html()
+    ordinary_icon = menu.locator("svg.lucide").inner_html()
     ordinary_bounds = menu.bounding_box()
     assert ordinary_bounds is not None
 
@@ -298,7 +298,7 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     expect(first_card).to_be_visible()
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).not_to_be_visible()
     expect(menu).to_be_visible()
-    assert menu.locator("svg").inner_html() == ordinary_icon
+    assert menu.locator("svg.lucide").inner_html() == ordinary_icon
     board_bounds = menu.bounding_box()
     assert board_bounds is not None
     for key in ("x", "y", "width", "height"):
@@ -311,7 +311,7 @@ def test_canvas_deep_link_and_mobile_return_keep_the_project(
     first_card.click()
     expect(page.get_by_role("button", name="Back to canvas", exact=True)).to_be_visible()
     expect(menu).to_be_visible()
-    assert menu.locator("svg").inner_html() == ordinary_icon
+    assert menu.locator("svg.lucide").inner_html() == ordinary_icon
     conversation_bounds = menu.bounding_box()
     assert conversation_bounds is not None
     for key in ("x", "y", "width", "height"):

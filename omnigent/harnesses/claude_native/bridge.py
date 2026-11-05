@@ -4629,61 +4629,25 @@ def _paste_and_submit(
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
-    paste_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-        ) as paste_file:
-            paste_path = paste_file.name
-            paste_file.write(_paste_payload_bytes(text + "\n"))
-        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
-        _run_tmux(
+    draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+        bridge_dir, socket_path, tmux_target, text=text, needle=needle
+    )
+    if not draft_seen and _composer_box(pane) is None:
+        # The composer frame is not mounted (a resumed TUI still replaying its
+        # transcript). An Enter now would submit nothing yet report success, so
+        # wait for the composer, clear what the first paste left, and paste once more.
+        delivery_diagnostics.set_stage("waiting_for_composer")
+        _wait_for_claude_prompt_ready(
             socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            "omnigent-paste",
-            "-t",
             tmux_target,
+            timeout_s=_TMUX_READY_TIMEOUT_S,
+            bridge_dir=bridge_dir,
+            extend_for_slow_boot=False,
         )
-        delivery_diagnostics.record_details(paste_sent=True)
-    finally:
-        if paste_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    delivery_diagnostics.set_stage("waiting_for_draft")
-    draft_seen = False
-    pane = ""
-    polls = 0
-    empty_captures = 0
-    paste_wait_started = time.monotonic()
-    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        polls += 1
-        empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+        draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+            bridge_dir, socket_path, tmux_target, text=text, needle=needle
+        )
     delivery_diagnostics.record_draft(
         pane=pane,
         needle=needle,
@@ -4744,6 +4708,78 @@ def _paste_and_submit(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _paste_and_await_draft(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    text: str,
+    needle: str,
+) -> tuple[bool, str, int, int, float]:
+    """
+    Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
+
+    :param bridge_dir: Bridge directory whose temp paste file is written here.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :param text: Exact text to paste.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
+    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
+    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
+    # client→server command at ~16KB, so per-byte hex argv blew up with
+    # "command too long" on large payloads (a PR diff in a sub-agent
+    # dispatch). ``load-buffer`` streams the file without that cap, and
+    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
+    # interior newlines (mapped to CR below) stay data instead of becoming
+    # per-line submits. See anthropics/claude-code#52126.
+    paste_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            paste_file.write(_paste_payload_bytes(text + "\n"))
+        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            "omnigent-paste",
+            "-t",
+            tmux_target,
+        )
+        delivery_diagnostics.record_details(paste_sent=True)
+    finally:
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+    # Wait until the TUI has visibly committed the paste into its input box
+    # before submitting. An Enter that races a paste burst becomes a newline
+    # inside the draft instead of a submit. Best-effort: a draft that never
+    # becomes identifiable falls through after the timeout.
+    delivery_diagnostics.set_stage("waiting_for_draft")
+    draft_seen = False
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    wait_started = time.monotonic()
+    deadline = wait_started + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        if _draft_in_input_box(pane, needle):
+            draft_seen = True
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return draft_seen, pane, polls, empty_captures, wait_started
 
 
 def _verify_submit_accepted(
