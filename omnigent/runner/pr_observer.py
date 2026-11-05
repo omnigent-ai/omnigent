@@ -60,15 +60,15 @@ def _failed(result: object) -> bool:
     )
 
 
-def _substitution_end(command: str, start: int) -> int | None:
-    """Return the index just past the ``)`` closing the ``$(`` at *start*, or ``None``.
+def _group_end(command: str, start: int, *, arithmetic: bool) -> int | None:
+    """Return the index just past the ``)`` closing the ``(`` at *start*, or ``None``.
 
-    A here-document inside gives up, since its body may hold unbalanced parentheses.
+    Outside arithmetic, comments are skipped and a here-document gives up, since
+    its body may hold unbalanced parentheses.
     """
-    arithmetic = command.startswith("$((", start)
     depth = 0
     quote: str | None = None
-    index = start + 1
+    index = start
     while index < len(command):
         char = command[index]
         if quote == "'":
@@ -81,6 +81,11 @@ def _substitution_end(command: str, start: int) -> int | None:
                 quote = None
         elif char in "'\"":
             quote = char
+        elif not arithmetic and char == "#" and command[index - 1] in " \t\n;&|(":
+            index = command.find("\n", index)
+            if index == -1:
+                return None
+            continue
         elif char == "(":
             depth += 1
         elif char == ")":
@@ -93,16 +98,26 @@ def _substitution_end(command: str, start: int) -> int | None:
     return None
 
 
-def _heredoc_delimiter(command: str, start: int) -> tuple[str, bool] | None:
-    """Read the delimiter word after a ``<<`` and whether ``<<-`` strips leading tabs."""
+@dataclass(frozen=True)
+class _Heredoc:
+    delimiter: str
+    strip_tabs: bool
+    # A quoted delimiter keeps the body literal, so backslash-newline doesn't join lines.
+    quoted: bool
+
+
+def _heredoc_delimiter(command: str, start: int) -> _Heredoc | None:
+    """Read the delimiter word after a ``<<``, or ``None`` when there is none."""
     strip_tabs = command.startswith("-", start)
     index = start + strip_tabs
-    while index < len(command) and command[index] in " \t":
-        index += 1
     word: list[str] = []
     quote: str | None = None
+    quoted = False
     while index < len(command):
         char = command[index]
+        if quote != "'" and command.startswith("\\\n", index):
+            index += 2
+            continue
         if quote is not None:
             if char == quote:
                 quote = None
@@ -110,28 +125,38 @@ def _heredoc_delimiter(command: str, start: int) -> tuple[str, bool] | None:
                 word.append(char)
         elif char in "'\"":
             quote = char
+            quoted = True
         elif char == "\\" and index + 1 < len(command):
             index += 1
             word.append(command[index])
+            quoted = True
+        elif char in " \t" and not word and not quoted:
+            pass
         elif char in " \t\r\n;&|<>()":
             break
         else:
             word.append(char)
         index += 1
-    return ("".join(word), strip_tabs) if word else None
+    return _Heredoc("".join(word), strip_tabs, quoted) if word else None
 
 
-def _heredoc_body_end(command: str, start: int, delimiter: str, strip_tabs: bool) -> int:
+def _heredoc_body_end(command: str, start: int, heredoc: _Heredoc) -> int:
     """Return the index just past the delimiter line closing a body that starts at *start*."""
     index = start
     while index < len(command):
-        end = command.find("\n", index)
-        line = command[index:] if end == -1 else command[index:end]
-        if (line.lstrip("\t") if strip_tabs else line) == delimiter:
-            return len(command) if end == -1 else end + 1
-        if end == -1:
-            break
-        index = end + 1
+        parts: list[str] = []
+        while True:
+            end = command.find("\n", index)
+            physical = command[index:] if end == -1 else command[index:end]
+            index = len(command) if end == -1 else end + 1
+            trailing = len(physical) - len(physical.rstrip("\\"))
+            if heredoc.quoted or end == -1 or trailing % 2 == 0:
+                parts.append(physical)
+                break
+            parts.append(physical[:-1])
+        line = "".join(parts)
+        if (line.lstrip("\t") if heredoc.strip_tabs else line) == heredoc.delimiter:
+            return index
     return len(command)
 
 
@@ -144,7 +169,7 @@ def _prepare_shell_text(command: str) -> tuple[str, bool]:
     result: list[str] = []
     quote: str | None = None
     redirected = False
-    heredocs: list[tuple[str, bool]] = []
+    heredocs: list[_Heredoc] = []
     index = 0
     while index < len(command):
         char = command[index]
@@ -163,10 +188,21 @@ def _prepare_shell_text(command: str) -> tuple[str, bool]:
             index = end
             continue
         if quote is None and command.startswith("$(", index):
-            end = _substitution_end(command, index)
+            end = _group_end(command, index + 1, arithmetic=command.startswith("$((", index))
             if end is not None:
                 # Escaping every symbol keeps the substitution's text as one shlex word.
                 result.extend(c if c.isalnum() else "\\" + c for c in command[index:end])
+                index = end
+                continue
+        if (
+            quote is None
+            and command.startswith("((", index)
+            and (index == 0 or command[index - 1] in " \t\n;&|(")
+        ):
+            # An arithmetic command's ``<<`` is a shift, not a here-document.
+            end = _group_end(command, index, arithmetic=True)
+            if end is not None:
+                result.append(command[index:end])
                 index = end
                 continue
         if quote is None and command.startswith("<<<", index):
@@ -184,8 +220,8 @@ def _prepare_shell_text(command: str) -> tuple[str, bool]:
         if quote is None and char == "\n" and heredocs:
             result.append(char)
             index += 1
-            for delimiter, strip_tabs in heredocs:
-                index = _heredoc_body_end(command, index, delimiter, strip_tabs)
+            for heredoc in heredocs:
+                index = _heredoc_body_end(command, index, heredoc)
             heredocs.clear()
             continue
         if quote is None and char in "<>":

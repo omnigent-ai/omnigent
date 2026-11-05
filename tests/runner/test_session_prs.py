@@ -797,6 +797,41 @@ _CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"
             False,
             id="heredoc-body-is-not-run",
         ),
+        pytest.param(
+            f'TOKEN=$(printf token # ) ; gh pr create\n)\nprintf "%s\\n" {A}',
+            {"stdout": A},
+            [],
+            False,
+            id="comment-inside-substitution",
+        ),
+        pytest.param(
+            f"cat <<EOF\nwe're not done\\\nEOF\ngh pr create\n{A}\nEOF",
+            {"stdout": A},
+            [],
+            False,
+            id="unquoted-heredoc-joins-continued-line",
+        ),
+        pytest.param(
+            "cat <<'EOF'\nwe're not done\\\nEOF\ngh pr create",
+            {"stdout": A},
+            [A],
+            True,
+            id="quoted-heredoc-keeps-continued-line",
+        ),
+        pytest.param(
+            "(( count = 8 << 1 ))\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="arithmetic-shift",
+        ),
+        pytest.param(
+            "cat <<\\\nEOF\nbody\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-heredoc-delimiter",
+        ),
     ],
 )
 def test_create_beside_substitution_and_heredoc(
