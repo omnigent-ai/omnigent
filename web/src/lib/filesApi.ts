@@ -59,5 +59,7 @@ export async function downloadSessionFile(
   );
   if (!res.ok) throw await apiErrorFromResponse(res);
   const blob = await res.blob();
-  return new File([blob], filename, { type: blob.type });
+  // Its bytes, not the Blob itself: a File from another implementation (e.g. a test
+  // DOM's) doesn't recognize the fetch Blob and stores "[object Blob]".
+  return new File([await blob.arrayBuffer()], filename, { type: blob.type });
 }
