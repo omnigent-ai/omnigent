@@ -7,12 +7,13 @@ import hashlib
 import uuid
 from collections.abc import Iterator
 from contextvars import ContextVar
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Column,
     Float,
     Index,
     Integer,
@@ -652,6 +653,23 @@ def _on_sqlite_family(
     return dialect.name in ("sqlite", "cloudflare_d1")
 
 
+def _on_non_sqlite_family(
+    ddl: BaseDDLElement,
+    target: SchemaItem | str,
+    bind: Connection | None,
+    tables: list[Table] | None = None,
+    state: Any | None = None,
+    *,
+    dialect: Dialect,
+    compiler: DDLCompiler | None = None,
+    checkfirst: bool = False,
+) -> bool:
+    """Use the native octet-length expression outside SQLite and D1."""
+    return not _on_sqlite_family(
+        ddl, target, bind, tables, state, dialect=dialect, compiler=compiler, checkfirst=checkfirst
+    )
+
+
 class SqlConversationMetadata(OmnigentBase):
     """
     SQLAlchemy model for the ``omnigent_conversation_metadata`` table.
@@ -1184,6 +1202,25 @@ class SqlComment(OmnigentBase):
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
+
+
+# Unmapped schema columns participate in metadata-driven bootstrap without changing ORM queries.
+_comment_table = cast("Table", SqlComment.__table__)
+_comment_table.append_column(
+    Column("anchor_metadata", CompressedText(max_stored_bytes=16_383), nullable=True)
+)
+_comment_table.append_constraint(
+    CheckConstraint(
+        "anchor_metadata IS NULL OR length(CAST(anchor_metadata AS BLOB)) <= 16383",
+        name="ck_comments_anchor_metadata_bytes",
+    ).ddl_if(callable_=_on_sqlite_family)
+)
+_comment_table.append_constraint(
+    CheckConstraint(
+        "anchor_metadata IS NULL OR octet_length(anchor_metadata) <= 16383",
+        name="ck_comments_anchor_metadata_bytes",
+    ).ddl_if(callable_=_on_non_sqlite_family)
+)
 
 
 def policy_name_cksum(name: str) -> bytes:
