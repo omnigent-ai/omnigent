@@ -8132,7 +8132,7 @@ def test_runner_reassignment_and_its_rollback_reset_the_background_flag(
         token="launch-token",
         provider="modal",
         sandbox_id="sandbox",
-        token_expires_at=2**31,
+        token_expires_at=2_000_000_000,
     )
     store.create_conversation(
         runner_id="runner_b", host_id=host_id, workspace="/repo", git_branch="main"
@@ -9649,7 +9649,7 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
             token="launch-token",
             provider="modal",
             sandbox_id="sandbox",
-            token_expires_at=2**31,
+            token_expires_at=2_000_000_000,
         )
         conversation_store.set_host_id(conversation.id, host_id, "/previous")
     if accepted:
