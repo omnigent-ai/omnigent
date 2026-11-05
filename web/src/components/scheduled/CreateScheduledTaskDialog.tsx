@@ -60,6 +60,7 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
+import { UNATTENDED_DISALLOWED_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -105,6 +106,15 @@ interface AutomationTypeDraft {
   schedule: ScheduleModel;
   timezone: string;
   sessionMode: ScheduledTaskSessionMode;
+}
+
+/**
+ * The saved mode to prefill when editing. A task saved before automations
+ * stopped accepting approval-skipping modes reverts to the harness default, so
+ * the next save sends null instead of a mode the server refuses.
+ */
+function editablePermissionMode(mode: string | null | undefined): string {
+  return mode && !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(mode) ? mode : "";
 }
 
 export function CreateScheduledTaskDialog({
@@ -231,7 +241,7 @@ export function CreateScheduledTaskDialog({
     setPickedEffort(
       backToOriginal && originalTargetSelected ? (editingTask?.reasoningEffort ?? "") : "",
     );
-    setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
+    setPickedPermission(backToOriginal ? editablePermissionMode(editingTask?.permissionMode) : "");
   }
 
   // ── Nested dropdown dismiss guard ─────────────────────────────────────────
@@ -393,7 +403,7 @@ export function CreateScheduledTaskDialog({
         // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
-        setPickedPermission(editingTask.permissionMode ?? "");
+        setPickedPermission(editablePermissionMode(editingTask.permissionMode));
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");

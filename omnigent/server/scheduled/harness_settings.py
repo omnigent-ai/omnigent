@@ -18,12 +18,8 @@ _logger = logging.getLogger(__name__)
 
 UNATTENDED_PERMISSION_MODE_MESSAGE = (
     "Automations run unattended, so they cannot use permission mode {mode!r}; "
-    "choose Auto or a mode that asks for approval"
+    "choose a mode that asks for approval or uses the auto classifier"
 )
-
-# SDK harnesses read their permission stance from the agent spec. Claude SDK
-# runs with ``bypassPermissions`` when the spec sets nothing.
-_SDK_DEFAULT_PERMISSION_MODES: dict[str, str] = {"claude-sdk": "bypassPermissions"}
 
 
 def unattended_permission_mode_allowed(mode: str | None) -> bool:
@@ -68,16 +64,14 @@ async def scheduled_agent_default_permission_mode(agent: Any, agent_cache: Any) 
     """The mode a run with no task override launches with, or ``None`` for the harness default.
 
     Native harnesses start in their CLI's own default. SDK harnesses take
-    ``executor.config.permission_mode`` from the spec, falling back to the
-    harness's built-in default.
+    ``executor.config.permission_mode`` from the spec; without one they run in
+    ``auto``. ``None`` also when the agent cannot be loaded.
     """
     harness, executor = await _scheduled_agent_executor(agent, agent_cache)
     if harness is None or executor is None or is_native_harness(harness):
         return None
     configured = executor.config.get("permission_mode")
-    if configured is not None:
-        return str(configured)
-    return _SDK_DEFAULT_PERMISSION_MODES.get(harness)
+    return None if configured is None else str(configured)
 
 
 async def validate_scheduled_agent_default_permission(*, agent: Any, agent_cache: Any) -> None:

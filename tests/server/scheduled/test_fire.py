@@ -1177,7 +1177,7 @@ async def test_non_native_host_bound_task_stamps_repl_terminal_label() -> None:
         store,
         conversation_store=conv_store,
         agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
-        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode="auto"),
+        agent_cache=FakeAgentCache(harness="claude-sdk"),
     )
 
     async def _launch(conv: Any, task: Any) -> None:
@@ -3724,12 +3724,9 @@ async def test_saved_unattended_disallowed_mode_fails_without_session(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("spec_mode", "fires"),
-    [(None, False), ("bypassPermissions", False), ("auto", True), ("default", True)],
-)
+@pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
 async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
-    """Claude SDK runs in bypassPermissions unless the spec sets a mode."""
+    """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     launch = AsyncMock()

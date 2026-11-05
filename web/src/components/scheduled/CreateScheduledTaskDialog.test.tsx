@@ -342,6 +342,28 @@ describe("prompt-first automation setup", () => {
     });
   });
 
+  it("clears a saved approval-skipping mode when editing only the instructions", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          permissionMode: "bypassPermissions",
+        })}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Also summarize CI failures" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      prompt: "Also summarize CI failures",
+      permissionMode: null,
+    });
+  });
+
   it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
     render(
       <CreateScheduledTaskDialog
@@ -918,7 +940,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         onOpenChange={vi.fn()}
         editingTask={scheduledTask({
           agentId: "ag_claude_native",
-          permissionMode: "bypassPermissions",
+          permissionMode: "acceptEdits",
         })}
       />,
     );
@@ -928,7 +950,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
-    expect(input.permissionMode).toBe("bypassPermissions");
+    expect(input.permissionMode).toBe("acceptEdits");
   });
 
   it.each(["Every day", "Every hour", "Custom schedule"])(
@@ -4048,6 +4070,27 @@ describe("automation harness settings", () => {
     expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
+  });
+
+  it("clears Antigravity's saved skip mode, which has no picker, on edit", async () => {
+    mockHarness("antigravity-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
+      />,
+    );
+    expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Review again" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      prompt: "Review again",
+      permissionMode: null,
+    });
   });
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {

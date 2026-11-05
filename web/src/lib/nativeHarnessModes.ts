@@ -234,7 +234,6 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
   args: [],
 };
 
-/** Create-time permission choices shared by New Chat and automations. */
 /**
  * Modes automations cannot use: a scheduled run has nobody to answer a prompt,
  * so it needs an approval gate. Mirrors UNATTENDED_DISALLOWED_PERMISSION_MODES
@@ -250,6 +249,7 @@ export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new S
   "dangerous",
 ]);
 
+/** Create-time permission choices shared by New Chat and automations. */
 export function nativePermissionOptions(harness: string | null | undefined) {
   switch (harness) {
     case "claude-native":

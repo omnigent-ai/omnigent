@@ -988,7 +988,8 @@ async def continued_session_problem(
     if session_mode is not None:
         return (
             f"the session is in permission mode {session_mode!r}, which automations cannot "
-            "use; switch the session to Auto",
+            "use; switch the session to a mode that asks for approval or uses the auto "
+            "classifier",
             UNATTENDED_PERMISSION_ERROR_CODE,
         )
     # A pin the task changed since would otherwise be ignored silently: the
