@@ -1874,12 +1874,23 @@ describe("CreateScheduledTaskDialog project", () => {
     return mutateAsync.mock.calls[0][0];
   }
 
-  it("sends no project when none is picked", async () => {
+  it("files new automations in the default project at save time", async () => {
+    resolveOrCreateProjectId.mockResolvedValueOnce("proj_automation");
     renderWithProjects();
     fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_automation" });
+    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Omnigent Automation");
+  });
+
+  it("allows opting out of the default project", async () => {
+    renderWithProjects();
+    fillRequired();
+    openProjectMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Remove from/ }));
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
-    const arg = await submitCreate();
-    expect(arg).not.toHaveProperty("projectId");
+    expect(await submitCreate()).not.toHaveProperty("projectId");
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
   });
 
