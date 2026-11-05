@@ -3220,6 +3220,34 @@ describe("useMoveToProject", () => {
     expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Legacy" }]);
   });
 
+  it("does not restore an open-session row a remote removal cleared while a move failed", async () => {
+    let settlePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        settlePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    const openRowKey = ["conversation-backfill", "conv_move"];
+    queryClient.setQueryData(openRowKey, conversation({ id: "conv_move", project_id: "p_old" }));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "" });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    queryClient.setQueryData(openRowKey, null);
+    settlePatch(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(queryClient.getQueryData(openRowKey)).toBeNull();
+  });
+
   it("unfiles optimistically without needing the projects cache", async () => {
     // "" needs no name→id resolution, so the held-open PATCH is the only call.
     let resolvePatch: (value: Response) => void = () => {};
@@ -3672,28 +3700,41 @@ describe("useArchiveConversation", () => {
     expect(queryClient.getQueryData<Conversation>(openRowKey)?.archived).toBe(false);
   });
 
-  it("does not restore an open-session row a delete removed while unarchiving failed", async () => {
-    let settleArchive = (_res: Response) => {};
-    fetchMock.mockImplementationOnce(
-      () =>
-        new Promise<Response>((resolve) => {
-          settleArchive = resolve;
-        }),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+  it.each([
+    {
+      removal: "a local delete",
+      remove: (queryClient: QueryClient) => queryClient.removeQueries({ queryKey: openRowKey }),
+    },
+    {
+      // The session-updates stream leaves the removed row null.
+      removal: "a remote removal",
+      remove: (queryClient: QueryClient) => queryClient.setQueryData(openRowKey, null),
+    },
+  ])(
+    "does not restore an open-session row $removal cleared while unarchiving failed",
+    async ({ remove }) => {
+      let settleArchive = (_res: Response) => {};
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            settleArchive = resolve;
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useArchiveConversation(), { wrapper });
 
-    result.current.mutate({ id: "conv_a", archived: false });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    queryClient.removeQueries({ queryKey: openRowKey });
-    settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
-    await waitFor(() => expect(result.current.isError).toBe(true));
+      result.current.mutate({ id: "conv_a", archived: false });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      remove(queryClient);
+      settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
 
-    expect(queryClient.getQueryState(openRowKey)).toBeUndefined();
-  });
+      expect(queryClient.getQueryData(openRowKey) ?? null).toBeNull();
+    },
+  );
 
   it.each(
     [true, false].flatMap((archived) => [

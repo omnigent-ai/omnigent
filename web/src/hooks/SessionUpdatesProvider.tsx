@@ -174,15 +174,10 @@ function applyItemsToCache(
     return changed ? { ...previous, conversations } : previous;
   });
   // The open session's fetched sidebar row sits outside every list, so a remote
-  // archive or unarchive reaches it only here. Only `archived` is taken, keeping its owner.
+  // archive or unarchive reaches it only here.
   for (const item of itemsById.values()) {
-    if (typeof item.archived !== "boolean") continue;
-    const backfillKey = ["conversation-backfill", item.id];
-    const row = queryClient.getQueryData<Conversation | null>(backfillKey);
-    if (row && (row.archived ?? false) !== item.archived) {
-      const patchedRow: Conversation = { ...row, archived: item.archived };
-      queryClient.setQueryData<Conversation | null>(backfillKey, patchedRow);
-    }
+    if (typeof item.archived === "boolean")
+      settleStreamedArchive(queryClient, item.id, item.archived);
   }
   return {
     // Sub-agent children are watched for their tree views, but no session list
@@ -192,6 +187,40 @@ function applyItemsToCache(
       .map((item) => item.id),
     needsRefetch,
   };
+}
+
+// Open-session rows whose first fetch a streamed archive change is already waiting on.
+const settlingFirstFetches = new Set<string>();
+
+/**
+ * Apply a streamed archive flag to the open session's fetched sidebar row. Only
+ * `archived` is taken, keeping the row's owner. A detail request in flight may
+ * have been served before the change, so, as the local archive path does, it is
+ * replaced by a fresh one instead of landing the older flag.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - The streamed session.
+ * @param archived - Its streamed archive flag.
+ */
+function settleStreamedArchive(queryClient: QueryClient, id: string, archived: boolean): void {
+  const key = ["conversation-backfill", id];
+  const row = queryClient.getQueryData<Conversation | null>(key);
+  const fetching = queryClient.isFetching({ queryKey: key, exact: true }) > 0;
+  if (row) {
+    if ((row.archived ?? false) === archived) return;
+    if (fetching) void queryClient.cancelQueries({ queryKey: key, exact: true });
+    const patchedRow: Conversation = { ...row, archived };
+    queryClient.setQueryData<Conversation | null>(key, patchedRow);
+    if (fetching) void queryClient.invalidateQueries({ queryKey: key, exact: true });
+    return;
+  }
+  // A first fetch can't be cancelled without leaving the row empty, so refetch once it lands.
+  if (row !== undefined || !fetching || settlingFirstFetches.has(id)) return;
+  settlingFirstFetches.add(id);
+  void queryClient
+    .refetchQueries({ queryKey: key, exact: true })
+    .then(() => queryClient.invalidateQueries({ queryKey: key, exact: true }))
+    .finally(() => settlingFirstFetches.delete(id));
 }
 
 /**

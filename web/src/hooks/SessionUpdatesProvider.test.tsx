@@ -740,6 +740,71 @@ describe("SessionUpdatesProvider open-session row", () => {
 
     expect(client.getQueryData(key)).toBeNull();
   });
+
+  it.each([true, false])(
+    "keeps a streamed archive change (archived: %s) and the owner over a late refetch",
+    async (archived) => {
+      const client = new QueryClient();
+      seedConversations(client, ["conv_a"]);
+      const key = ["conversation-backfill", "conv_old"];
+      client.setQueryData<Conversation>(key, {
+        ...conv("conv_old"),
+        owner: "teammate",
+        archived: !archived,
+      });
+      let answer: (row: Conversation) => void = () => undefined;
+      // Served before the change: it still carries the old flag.
+      const refetching = client.fetchQuery<Conversation | null>({
+        queryKey: key,
+        queryFn: () =>
+          new Promise<Conversation>((resolve) => {
+            answer = resolve;
+          }),
+      });
+      renderProvider(client, ["/c/conv_old"]);
+
+      act(() =>
+        frameHandler()({
+          type: "changed",
+          items: [{ ...conv("conv_old"), owner: null, archived }],
+        }),
+      );
+      answer({ ...conv("conv_old"), archived: !archived });
+      await refetching.catch(() => undefined);
+
+      expect(client.getQueryData<Conversation>(key)).toMatchObject({ archived, owner: "teammate" });
+    },
+  );
+
+  it("refetches, once, a first fetch that a streamed archive change may postdate", async () => {
+    const client = new QueryClient();
+    seedConversations(client, ["conv_a"]);
+    const key = ["conversation-backfill", "conv_old"];
+    const answers: ((row: Conversation) => void)[] = [];
+    // The sidebar's open-session query, still on its first fetch.
+    const observer = new QueryObserver<Conversation | null>(client, {
+      queryKey: key,
+      queryFn: () =>
+        new Promise<Conversation>((resolve) => {
+          answers.push(resolve);
+        }),
+    });
+    const unsubscribe = observer.subscribe(() => undefined);
+    renderProvider(client, ["/c/conv_old"]);
+
+    for (let frame = 0; frame < 2; frame++) {
+      act(() =>
+        frameHandler()({ type: "changed", items: [{ ...conv("conv_old"), archived: true }] }),
+      );
+    }
+    answers[0]({ ...conv("conv_old"), archived: false });
+    await waitFor(() => expect(answers).toHaveLength(2));
+    answers[1]({ ...conv("conv_old"), archived: true });
+
+    await waitFor(() => expect(client.getQueryData<Conversation>(key)?.archived).toBe(true));
+    expect(answers).toHaveLength(2);
+    unsubscribe();
+  });
 });
 
 describe("SessionUpdatesProvider list invalidation", () => {

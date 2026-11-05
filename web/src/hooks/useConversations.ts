@@ -977,12 +977,26 @@ function snapshotArchiveLists(
 function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
   for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
-  for (const [id, row] of snapshot.backfill) {
-    const key = ["conversation-backfill", id];
-    // A delete or leave that landed meanwhile removed the entry; keep it gone.
-    if (row !== undefined && queryClient.getQueryState(key) !== undefined) {
-      queryClient.setQueryData(key, row);
-    }
+  for (const [id, row] of snapshot.backfill) restoreOpenSessionRow(queryClient, id, row);
+}
+
+/**
+ * Put back a fetched open-session row that a failed write overlaid. A removal
+ * that landed meanwhile sticks: a local delete or leave drops the entry, and a
+ * remote one (`SessionUpdatesProvider`) leaves it `null`.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Session whose `["conversation-backfill", id]` row to restore.
+ * @param row - The row snapshotted before the write.
+ */
+function restoreOpenSessionRow(
+  queryClient: QueryClient,
+  id: string,
+  row: Conversation | null | undefined,
+): void {
+  const key = ["conversation-backfill", id];
+  if (row && queryClient.getQueryData<Conversation | null>(key)) {
+    queryClient.setQueryData<Conversation | null>(key, row);
   }
 }
 
@@ -2541,9 +2555,7 @@ export function useMoveToProject() {
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
       }
-      if (previous.backfill !== undefined) {
-        queryClient.setQueryData(["conversation-backfill", id], previous.backfill);
-      }
+      restoreOpenSessionRow(queryClient, id, previous.backfill);
     },
     onSuccess: (updated, { project }) => {
       markConversationSeen(updated.id, updated.updated_at);
