@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from omnigent.tools.base import ToolContext
+from omnigent.tools.builtins import upload_file
 from omnigent.tools.builtins.upload_file import UploadFileTool
 
 
@@ -197,3 +200,97 @@ def test_upload_file_rejects_non_string_path(tool_ctx: ToolContext, path: object
     result = tool.invoke(json.dumps({"path": path}), tool_ctx)
     assert "Error" in result
     assert "non-empty string" in result
+
+
+@pytest.mark.posix_only
+def test_upload_file_refuses_directory_swapped_for_symlink_after_check(
+    workspace: Path,
+    tool_ctx: ToolContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A directory swapped for an escaping symlink after the containment check
+    is refused before anything reaches the artifact store.
+    """
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "deep.txt").write_text("host secret")
+    created: list[dict[str, Any]] = []
+    stored: list[bytes] = []
+
+    def _create(**fields: Any) -> SimpleNamespace:
+        created.append(fields)
+        return SimpleNamespace(id="file_1")
+
+    monkeypatch.setattr("omnigent.runtime.get_file_store", lambda: SimpleNamespace(create=_create))
+    monkeypatch.setattr(
+        "omnigent.runtime.get_artifact_store",
+        lambda: SimpleNamespace(put=lambda _key, data: stored.append(data)),
+    )
+    real_safe_resolve = upload_file.safe_resolve
+
+    def _check_then_swap(path: str, root: Path) -> Path:
+        resolved = real_safe_resolve(path, root)
+        (workspace / "output").rename(workspace / "output.orig")
+        (workspace / "output").symlink_to(outside)
+        return resolved
+
+    monkeypatch.setattr(upload_file, "safe_resolve", _check_then_swap)
+
+    result = UploadFileTool().invoke('{"path": "output/deep.txt"}', tool_ctx)
+
+    assert result.startswith("Error"), result
+    assert created == [], "upload_file created a file record for the swapped symlink path"
+    assert stored == [], "upload_file stored a file read through the swapped symlink"
+
+
+@pytest.mark.posix_only
+@pytest.mark.parametrize("swapped", ["output", "output/deep.txt"])
+def test_safe_open_refuses_path_swapped_for_symlink_after_check(
+    workspace: Path,
+    tmp_path: Path,
+    swapped: str,
+) -> None:
+    """
+    ``safe_open`` refuses a directory or file that became an escaping
+    symlink after ``safe_resolve`` accepted the path.
+
+    :param swapped: Workspace-relative entry replaced by the symlink.
+    """
+    outside = tmp_path / "outside"
+    (outside / "output").mkdir(parents=True)
+    (outside / "output" / "deep.txt").write_text("host secret")
+    resolved = upload_file.safe_resolve("output/deep.txt", workspace)
+    (workspace / swapped).rename(workspace / "moved")
+    (workspace / swapped).symlink_to(outside / swapped)
+
+    with pytest.raises(OSError):
+        upload_file.safe_open(resolved, workspace)
+
+
+@pytest.mark.posix_only
+@pytest.mark.skipif(
+    not hasattr(os, "O_PATH") or os.geteuid() == 0,
+    reason="needs a search-only directory open and a user that file permissions apply to",
+)
+def test_safe_open_reads_file_beneath_search_only_directory(workspace: Path) -> None:
+    """A file under a directory with search but not read permission still opens."""
+    resolved = upload_file.safe_resolve("output/deep.txt", workspace)
+    (workspace / "output").chmod(0o111)
+    try:
+        with upload_file.safe_open(resolved, workspace) as handle:
+            assert handle.read() == b"deep file content"
+    finally:
+        (workspace / "output").chmod(0o755)
+
+
+@pytest.mark.posix_only
+@pytest.mark.timeout(10)
+def test_safe_open_refuses_fifo_without_blocking(workspace: Path) -> None:
+    """A FIFO is refused as not a regular file instead of blocking the open."""
+    os.mkfifo(workspace / "pipe")
+    resolved = upload_file.safe_resolve("pipe", workspace)
+
+    with pytest.raises(ValueError, match="Not a regular file"):
+        upload_file.safe_open(resolved, workspace)

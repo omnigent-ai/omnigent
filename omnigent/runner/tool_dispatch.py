@@ -118,7 +118,7 @@ from omnigent.tools.builtins.timer import (
 )
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
-from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.tools.builtins.upload_file import UploadFileTool, safe_open, safe_resolve
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -7856,7 +7856,7 @@ async def _execute_file_tool(
             return f"Error: sys_upload_file failed: {exc}"
         filename = resolved.name
         try:
-            with open(resolved, "rb") as f:
+            with safe_open(resolved, workspace) as f:
                 content = f.read()
             resp = await server_client.post(
                 files_path,
