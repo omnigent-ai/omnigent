@@ -423,10 +423,13 @@ describe("Sidebar session list", () => {
     seedPins(["shared_pin"]);
     renderSidebar();
 
-    for (const filter of ["all", "shared"] as const) {
+    for (const filter of ["all", "shared", "mine", "archived"] as const) {
       selectSessionFilter(filter);
+      const pinned = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinned).getByText("shared_pin")).toBeInTheDocument();
       expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
     }
+    selectSessionFilter("all");
     const row = screen.getByText("shared_running").closest("li")!;
     expect(within(row).getByTestId("session-state-badge").parentElement).toHaveClass("right-1");
   });
@@ -496,7 +499,7 @@ describe("Sidebar session list", () => {
     ["all", "error"],
     ["archived", "loading"],
     ["archived", "error"],
-  ] as const)("keeps pins and expanded projects mounted during %s %s", (view, state) => {
+  ] as const)("keeps pins mounted and restores expanded projects after %s %s", (view, state) => {
     projectsMock.push("Work");
     mockConversations([
       conv("pinned-session", "Claude Code"),
