@@ -8528,11 +8528,8 @@ async function lookUpFailedStartupInputs(
 }
 
 /**
- * Settle startup after a failure reported while it was pending. A failed launch
- * ends it and hands its messages back; a failed delivery leaves the startup label
- * pending, and later messages still wait behind it. Startup also ends when the
- * snapshot can't be read in time, so it can't stay open indefinitely, and the
- * messages are read anyway: only a failed launch has any to hand back.
+ * Settle startup after a reported failure and hand back undelivered messages;
+ * a launch still pending stays pending.
  *
  * @param conversationId - The session that reported the failure.
  */

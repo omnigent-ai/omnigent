@@ -3720,8 +3720,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       const content = [{ type: "input_text" as const, text: "saved on server" }];
       seedPendingInputs("conv_real", [{ pending_id: "pending_bob", content, created_by: "bob" }]);
       const othersBubble: PendingUserMessage = { tempId: "pending_bob", content, author: "bob" };
+      // The viewer's identical follow-up no receipt named yet; text matches the oldest first.
+      const followUp: PendingUserMessage = { tempId: "pend_follow_up", content, posted: true };
       useChatStore.setState((state) => ({
-        pendingUserMessages: [othersBubble, ...state.pendingUserMessages],
+        pendingUserMessages: [othersBubble, ...state.pendingUserMessages, followUp],
       }));
 
       failManagedLaunch("conv_real", "saved on server");
@@ -3741,7 +3743,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
         recovered: true,
       });
       // A non-native failure clears every bubble; a native one keeps the others'.
-      expect(state.pendingUserMessages).toEqual(native ? [othersBubble] : []);
+      expect(state.pendingUserMessages).toEqual(native ? [othersBubble, followUp] : []);
       expect(state.startupPending).toBe(false);
       const posts = fetchMock.mock.calls.filter(
         ([u, init]) => String(u).endsWith("/events") && init?.method === "POST",

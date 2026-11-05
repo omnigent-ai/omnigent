@@ -1191,6 +1191,12 @@ async def test_failed_launch_returns_each_sender_their_own_inputs_until_they_res
     assert await read_all("bob") == (["from bob"], 1)
     startup.conversations.set_runner_id(session_id, uuid4().hex)
     assert await read_all("bob") == ([], 1)
+    # A retry delivers only the inputs no accepted send replaced.
+    assert await startup.retry(session_id)
+    pending = startup.conversations.list_pending_inputs(session_id)
+    assert [(item.id, item.status) for item in pending] == [
+        (stable_ids["from bob"], "in_progress")
+    ]
 
 
 async def test_discarding_replaced_inputs_reads_a_single_page() -> None:
