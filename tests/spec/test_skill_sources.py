@@ -1109,6 +1109,33 @@ def test_claude_native_lists_plugins_the_configured_launch_loads(
     assert Path(launch["cwd"]).resolve() == home.resolve()
 
 
+def test_launch_plugin_records_need_a_source_and_an_absolute_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only a sourced record naming an existing absolute directory is kept, first one first."""
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (tmp_path / "file").write_text("")
+    # A relative path that would name a directory here must still be skipped.
+    monkeypatch.chdir(tmp_path)
+    records = [
+        "dev@inline",
+        {"path": str(first)},
+        {"source": "", "path": str(first)},
+        {"source": 3, "path": str(first)},
+        {"source": "no-path@inline", "path": None},
+        {"source": "relative@inline", "path": "first"},
+        {"source": "missing@inline", "path": str(tmp_path / "missing")},
+        {"source": "file@inline", "path": str(tmp_path / "file")},
+        {"source": "dev@inline", "path": str(first)},
+        {"source": "dev@inline", "path": str(second)},
+    ]
+
+    assert plugin_discovery._plugin_dirs(records) == {"dev@inline": first}
+    assert plugin_discovery._plugin_dirs(None) == {}
+
+
 @pytest.mark.posix_only
 def test_claude_launch_is_probed_only_for_a_customized_native_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
