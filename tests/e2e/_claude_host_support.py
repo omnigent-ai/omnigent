@@ -136,7 +136,16 @@ def _prompt_item_id(client: httpx.Client, *, session_id: str, fragment: str) -> 
 
 
 def _recall_code_words(client: httpx.Client, *, session_id: str, expected: str) -> str:
-    """Ask for every planted code word and return the reply naming *expected*."""
+    """Ask for every planted code word and return the newer reply naming *expected*.
+
+    An earlier reply, such as a planting ACK, can name *expected* too, so only
+    items after the newest one before the question count.
+    """
+    newest = client.get(
+        f"/v1/sessions/{session_id}/items", params={"limit": 1, "order": "desc"}, timeout=30.0
+    )
+    newest.raise_for_status()
+    boundary = next((str(item["id"]) for item in newest.json()["data"]), None)
     _send_user_message(
         client,
         session_id=session_id,
@@ -146,7 +155,7 @@ def _recall_code_words(client: httpx.Client, *, session_id: str, expected: str) 
         ),
     )
     return _poll_for_assistant_marker(
-        client, session_id=session_id, marker=expected, timeout=180.0
+        client, session_id=session_id, marker=expected, timeout=180.0, after=boundary
     )
 
 
