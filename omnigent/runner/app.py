@@ -7966,11 +7966,11 @@ def create_runner_app(
         generation = launch_plugins_generation()
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            expires_at, cached_skills, waited, cached_generation = cached
+            expires_at, cached_skills, answers_waiting, cached_generation = cached
             if (
                 time.monotonic() < expires_at
                 and cached_generation == generation
-                and (waited or not wait_for_launch_plugins)
+                and (answers_waiting or not wait_for_launch_plugins)
             ):
                 return cached_skills
         entry = await _resolve_session_spec_entry(session_id)
@@ -8011,7 +8011,8 @@ def create_runner_app(
         _session_skills_cache[session_id] = (
             time.monotonic() + ttl,
             skills,
-            wait_for_launch_plugins,
+            # Waiting changes only a list that a still-loading source left incomplete.
+            wait_for_launch_plugins or not problems,
             generation,
         )
         return skills

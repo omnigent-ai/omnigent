@@ -20,6 +20,7 @@ from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.server.routes._sessions.helpers import _resolve_skill_meta_text_via_runner
+from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import SkillSpec
 from tests._helpers.claude_launch import configure_claude_launch
 from tests._helpers.live_server import serve_app_in_thread
@@ -454,29 +455,39 @@ async def test_resolve_session_skill_non_string_arguments_returns_400(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_session_skills_cached_per_session(tmp_path: Path) -> None:
+async def test_session_skills_cached_per_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
     The merged skills are cached per session: a second ``POST /skills/resolve``
     reuses the cache and does not re-run spec resolution / the host-skill
-    filesystem walk.
+    filesystem walk. A missing name reuses it too when no source was still loading.
     """
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     bundled = [SkillSpec(name="grill-me", description="d", content="c")]
     resolver_calls: list[str] = []
     app = _make_app(bundle, bundled, "none", resolver_calls=resolver_calls)
+    walks: list[tuple[Path, ...]] = []
+
+    def counted_walk(
+        spec: Any, roots: tuple[Path, ...], *args: Any, **kwargs: Any
+    ) -> list[SkillSpec]:
+        walks.append(roots)
+        return resolve_session_skills(spec, roots, *args, **kwargs)
+
+    monkeypatch.setattr("omnigent.runner.app.resolve_session_skills", counted_walk)
 
     async for c in _client(app):
         first = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
         second = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "grill-me"})
+        missing = await c.post("/v1/sessions/conv_cache/skills/resolve", json={"name": "unknown"})
 
     assert first.status_code == 200
     assert second.status_code == 200
-    # Exactly one spec resolution (and thus one host-skill filesystem
-    # walk) across both requests: the first populates the per-session
-    # cache, the second hits it. Two entries here would mean the cache
-    # was not consulted (a walk per request); zero would mean discovery
-    # never ran at all.
+    assert missing.status_code == 404, missing.text
+    # The first request populates the per-session cache; the later ones, even the miss, hit it.
+    assert len(walks) == 1, walks
     assert resolver_calls == ["ag_x"]
 
 
