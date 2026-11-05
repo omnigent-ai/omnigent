@@ -1,4 +1,4 @@
-import { requestComposerInsertion } from "@/lib/composerInsertions";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
 import { create } from "zustand";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -5807,20 +5807,59 @@ describe("Composer reply quotes", () => {
     },
   );
 
-  it("appends a local review without sending, replacing a draft, or duplicating it", () => {
+  it("attaches local review context without sending, replacing a draft, or duplicating it", () => {
     const props = composerProps();
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(<Composer {...props} ref={ref} />);
     act(() => ref.current?.appendReplyQuote("Existing quote"));
     fireEvent.change(textarea(), { target: { value: "My instructions" } });
-    act(() => requestComposerInsertion("other-session", "Other review"));
+    const comment = {
+      id: "123",
+      conversation_id: "conv_test",
+      path: "src/example.ts",
+      start_index: 0,
+      end_index: 0,
+      body: "Preserve the public API.",
+      status: "draft" as const,
+      created_at: 1,
+      updated_at: 1,
+      anchor_content: null,
+      created_by: null,
+      anchor_metadata: {
+        pr_url: "https://github.com/acme/repo/pull/1",
+        side: "RIGHT" as const,
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    act(() => requestLocalReviewContext({ ...comment, conversation_id: "other-session" }));
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    expect(
+      screen.getByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toBeInTheDocument();
     expect(textarea()).toHaveValue("My instructions");
-    act(() => requestComposerInsertion("conv_test", "Please address [Comment 123]"));
-    expect(textarea()).toHaveValue("My instructions\n\nPlease address [Comment 123]");
     expect(screen.getByTestId("composer-reply-quote")).toHaveTextContent("Existing quote");
     expect(props.onSend).not.toHaveBeenCalled();
-    act(() => requestComposerInsertion("conv_test", "Please address [Comment 123]"));
-    expect(textarea()).toHaveValue("My instructions\n\nPlease address [Comment 123]");
+    act(() => requestLocalReviewContext(comment));
+    expect(
+      screen.getAllByLabelText("Open local review comment src/example.ts:12 (new)"),
+    ).toHaveLength(1);
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("[Comment 123]");
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toContain("Preserve the public API.");
+    const [sentText, , sentReply] = vi.mocked(props.onSend).mock.calls[0]!;
+    expect(serializeReplyDraft(sentReply!)).toBe(sentText);
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    fireEvent.click(screen.getByLabelText("Remove local review comment src/example.ts:12 (new)"));
+    expect(screen.queryByLabelText(/Open local review comment/)).not.toBeInTheDocument();
+    act(() => requestLocalReviewContext(comment));
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(props.onSend).mock.calls[1]?.[0]).toContain("[Comment 123]");
   });
 
   it("keeps mention markers in the structured payload used to restore a failed send", () => {

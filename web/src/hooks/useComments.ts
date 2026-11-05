@@ -1,4 +1,5 @@
 import type { LocalReviewAnchor } from "@/lib/localReviewComments";
+import { removeLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 // TanStack Query hooks for the comments API:
@@ -125,7 +126,8 @@ export function useDeleteComment(sessionId: string) {
       );
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
-    onSuccess: () => {
+    onSuccess: (_, commentId) => {
+      removeLocalReviewContext(sessionId, commentId);
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });
@@ -150,7 +152,8 @@ export function useUpdateComment(sessionId: string) {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
       return (await res.json()) as Comment;
     },
-    onSuccess: () => {
+    onSuccess: (comment) => {
+      updateLocalReviewContext(comment);
       void queryClient.invalidateQueries({
         queryKey: ["comments", sessionId],
       });

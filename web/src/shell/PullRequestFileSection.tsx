@@ -464,26 +464,6 @@ export function PullRequestFileSection({
           Your draft is saved. Commenting is currently unavailable.
         </p>
       )}
-      <div className="flex gap-2 px-3 pb-2" role="group" aria-label="Comment destination">
-        <Button
-          size="sm"
-          variant={local ? "default" : "outline"}
-          aria-pressed={local}
-          disabled={!canCommentLocally || composer.draft.pending}
-          onClick={() => composer.setDestination("local")}
-        >
-          Local comment
-        </Button>
-        <Button
-          size="sm"
-          variant={!local ? "default" : "outline"}
-          aria-pressed={!local}
-          disabled={!threadContext.canCreate || composer.draft.pending}
-          onClick={() => composer.setDestination("github")}
-        >
-          GitHub
-        </Button>
-      </div>
       <PullRequestCommentForm
         {...composer}
         account={threadContext.account}
@@ -491,6 +471,38 @@ export function PullRequestFileSection({
         newThread
         local={local}
         disabled={composer.stale || (local ? !canCommentLocally : !threadContext.canCreate)}
+        destinationControl={
+          <div
+            className="inline-flex shrink-0 rounded-md bg-muted p-0.5"
+            role="group"
+            aria-label="Comment destination"
+          >
+            <button
+              type="button"
+              className={cn(
+                "rounded px-2.5 py-1 text-ui transition-colors",
+                local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+              )}
+              aria-pressed={local}
+              disabled={!canCommentLocally || composer.draft.pending}
+              onClick={() => composer.setDestination("local")}
+            >
+              Agent
+            </button>
+            <button
+              type="button"
+              className={cn(
+                "rounded px-2.5 py-1 text-ui transition-colors",
+                !local ? "bg-background text-foreground shadow-sm" : "text-muted-foreground",
+              )}
+              aria-pressed={!local}
+              disabled={!threadContext.canCreate || composer.draft.pending}
+              onClick={() => composer.setDestination("github")}
+            >
+              GitHub
+            </button>
+          </div>
+        }
       />
     </section>
   );

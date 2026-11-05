@@ -16,7 +16,6 @@ import {
   PanelLeftCloseIcon,
   PanelLeftOpenIcon,
   Rows2Icon,
-  MessageSquareIcon,
 } from "lucide-react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { toast } from "sonner";
@@ -40,8 +39,7 @@ import {
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { requestComposerInsertion } from "@/lib/composerInsertions";
-import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import { consumeLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
@@ -59,7 +57,6 @@ import { PullRequestPathFilter } from "./PullRequestPathFilter";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
 import { LocalReviewComment } from "./LocalReviewComment";
-import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import {
   buildSearchCorpus,
   filterChangedPaths,
@@ -452,7 +449,6 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
-  const mobilePanel = useMobilePanelHeaderTarget();
   const sessionComments = useComments(selected ? conversationId : undefined);
   const selectedPrUrl = data.selected_pr_url ?? pr.url;
   const localComments = useMemo(
@@ -462,12 +458,68 @@ export function PullRequestChangesTab({
       ),
     [sessionComments.data, selectedPrUrl],
   );
-  const openLocalComments = localComments.filter((comment) => comment.status === "draft");
   useEffect(() => {
     if (selected) markCommentsSeen(localComments.map((comment) => comment.id));
   }, [selected, localComments]);
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find } = view;
+  const { revealedPaths, reveal, clearReveal, find, setPathFilter, setHideViewed } = view;
+  const navigationTarget = useLocalReviewNavigation(conversationId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (
+      !selected ||
+      !navigationTarget ||
+      navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
+    )
+      return;
+    if (
+      sessionComments.isSuccess &&
+      !sessionComments.isFetching &&
+      !localComments.some((comment) => comment.id === navigationTarget.id)
+    ) {
+      toast.error("This review comment is no longer available.");
+      consumeLocalReviewNavigation(conversationId);
+      return;
+    }
+    setPathFilter("");
+    setHideViewed(false);
+    reveal(navigationTarget.path);
+    const container = scrollRef.current;
+    if (!container) return;
+    // Wait through query loading and lazy diff rendering, within this panel only.
+    let frame = 0;
+    const focusComment = () => {
+      const element = container.querySelector<HTMLElement>(
+        `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
+      );
+      if (!element || !element.getClientRects().length) return;
+      element.scrollIntoView({ block: "center" });
+      element.focus({ preventScroll: true });
+      observer.disconnect();
+      consumeLocalReviewNavigation(conversationId);
+    };
+    const observer = new MutationObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(focusComment);
+    });
+    observer.observe(container, { childList: true, subtree: true, attributes: true });
+    frame = requestAnimationFrame(focusComment);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [
+    conversationId,
+    navigationTarget,
+    reveal,
+    selected,
+    selectedPrUrl,
+    setHideViewed,
+    setPathFilter,
+    localComments,
+    sessionComments.isSuccess,
+    sessionComments.isFetching,
+  ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
@@ -702,7 +754,6 @@ export function PullRequestChangesTab({
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
   // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
 
@@ -1175,10 +1226,7 @@ export function PullRequestChangesTab({
         <div
           ref={scrollRef}
           onScroll={onScroll}
-          className={cn(
-            "github-diff-stack min-w-0 flex-1 overflow-y-auto",
-            openLocalComments.length > 0 && "pb-20",
-          )}
+          className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
         >
           {changes.error || prDiff.error || parseError ? (
             <PanelMessage>
@@ -1230,7 +1278,11 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={collapsedPaths.has(file.path)}
                 forceExpanded={revealedPaths.has(file.path)}
-                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                forceMount={
+                  pendingReveal?.path === file.path ||
+                  activeFilePath === file.path ||
+                  navigationTarget?.path === file.path
+                }
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
@@ -1266,7 +1318,7 @@ export function PullRequestChangesTab({
             </div>
           )}
           {localComments
-            .filter((comment) => !files.some((file) => file.path === comment.path))
+            .filter((comment) => !canShowFiles || !files.some((file) => file.path === comment.path))
             .map((comment) => (
               <div key={comment.id} className="px-3">
                 <p className="text-xs">{comment.path}</p>
@@ -1286,20 +1338,6 @@ export function PullRequestChangesTab({
             Retry
           </button>
         </p>
-      )}
-      {canEdit && openLocalComments.length > 0 && (
-        <Button
-          className="absolute bottom-4 right-4 z-20 rounded-full shadow-lg"
-          aria-label={`Add ${openLocalComments.length} local comments to chat`}
-          onClick={() => {
-            requestComposerInsertion(conversationId, formatLocalReviewComments(openLocalComments));
-            mobilePanel?.close();
-            toast.success("Local review added to your chat draft");
-          }}
-        >
-          <MessageSquareIcon className="size-4" aria-hidden />
-          Add to chat · {openLocalComments.length}
-        </Button>
       )}
     </TabsContent>
   );

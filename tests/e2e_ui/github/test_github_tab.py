@@ -648,7 +648,7 @@ def test_post_top_level_pr_comment(
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
     tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     textbox = panel.get_by_role("textbox", name="New PR comment")
-    post_button = panel.get_by_role("button", name="Post comment", exact=True)
+    post_button = panel.get_by_role("button", name="Submit", exact=True)
     expect(textbox).to_be_in_viewport()
     expect(post_button).to_be_in_viewport()
     feed = panel.get_by_role("region", name="PR comments", exact=True)
@@ -692,7 +692,7 @@ def test_post_top_level_pr_comment(
     panel.get_by_role("tab", name="Preview", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
     page.screenshot(path=str(tmp_path / f"comment-{entry}-preview.png"))
-    panel.get_by_role("button", name="Post comment", exact=True).click()
+    panel.get_by_role("button", name="Submit", exact=True).click()
     expect(tabs.get_by_role("tab", name="Comments 31", exact=True)).to_be_visible()
     feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
@@ -1093,7 +1093,7 @@ def test_reply_to_inline_review_conversation(
     expect(draft.get_by_text("Separate conversation.", exact=True)).to_be_visible()
     draft.scroll_into_view_if_needed()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-new-comment.png"))
-    draft.get_by_role("button", name="Post comment", exact=True).click()
+    draft.get_by_role("button", name="Submit", exact=True).click()
     created = file.locator('[data-review-thread="new-thread-1"]')
     expect(created.get_by_text("Separate conversation.", exact=True)).to_be_visible()
     expect(conversation.locator("li")).to_have_count(2)
@@ -1122,7 +1122,7 @@ def test_reply_to_inline_review_conversation(
     expect(draft.get_by_text("New conversation · Old lines 1–2", exact=True)).to_be_visible()
     expect(plus).to_have_count(0)
     draft.get_by_role("textbox", name="New review comment").fill("Consider these lines together.")
-    draft.get_by_role("button", name="Post comment", exact=True).click()
+    draft.get_by_role("button", name="Submit", exact=True).click()
     ranged = file.locator('[data-review-thread="new-thread-2"]')
     expect(ranged.get_by_text("Consider these lines together.", exact=True)).to_be_visible()
     assert (
@@ -1141,8 +1141,8 @@ def test_reply_to_inline_review_conversation(
                 "side": side,
                 "line": 2,
                 "start_line": start,
-                "head_sha": "head",
-                "base_sha": "base",
+                "head_sha": "a" * 40,
+                "base_sha": "b" * 40,
             },
         }
         for body, side, start in [
@@ -1162,14 +1162,14 @@ def test_reply_to_inline_review_conversation(
             f'[data-code][data-{side}] [data-column-number="2"] [data-line-number-content]'
         ).click()
         plus.click()
-        draft.get_by_role("button", name="Local comment", exact=True).click()
+        draft.get_by_role("button", name="Agent", exact=True).click()
         draft.get_by_role("textbox", name="New review comment").fill(body)
         tabs.get_by_role("tab", name="Summary", exact=True).click()
         tabs.get_by_role("tab", name="Changes", exact=False).click()
-        expect(draft.get_by_role("button", name="Local comment", exact=True)).to_have_attribute(
+        expect(draft.get_by_role("button", name="Agent", exact=True)).to_have_attribute(
             "aria-pressed", "true"
         )
-        draft.get_by_role("button", name="Save local comment", exact=True).click()
+        draft.get_by_role("button", name="Submit", exact=True).click()
         expect(
             file.get_by_role("region", name="Local review comment").filter(has_text=body)
         ).to_be_visible()
@@ -1179,23 +1179,25 @@ def test_reply_to_inline_review_conversation(
     local_comments = response.json()
     assert len(local_comments) == 2
     assert {comment["anchor_metadata"]["side"] for comment in local_comments} == {"LEFT", "RIGHT"}
-    batch = panel.get_by_role("button", name="Add 2 local comments to chat", exact=True)
-    expect(batch).to_be_in_viewport()
     page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review.png"))
-    batch.click()
+    tabs.get_by_role("tab", name="Summary", exact=True).click()
     if mobile:
-        expect(panel).to_have_attribute("data-state", "closed")
-    expect(main_composer).to_be_visible()
-    expect(main_composer).to_have_value(
-        re.compile(
-            r"^Please keep the public API stable\.\n\nPlease address these local review comments:"
-        )
+        panel.get_by_role("button", name="Close", exact=True).click()
+    expect(page.get_by_role("button", name=re.compile("Open local review comment"))).to_have_count(
+        2
     )
-    draft_text = main_composer.input_value()
-    for comment in local_comments:
-        assert f"[Comment {comment['id']}]" in draft_text
-        assert comment["body"] in draft_text
+    expect(main_composer).to_have_value("Please keep the public API stable.")
     page.screenshot(path=str(tmp_path / f"inline-{entry}-local-review-in-chat.png"))
+    chip = page.get_by_role(
+        "button", name="Open local review comment src/app/main.py:2 (old)", exact=True
+    )
+    chip.hover()
+    expect(page.get_by_text("Keep the original guard.", exact=True).last).to_be_visible()
+    chip.click()
+    old_comment = next(c for c in local_comments if c["anchor_metadata"]["side"] == "LEFT")
+    target = panel.locator(f'[data-local-review-comment="{old_comment["id"]}"]')
+    expect(target).to_be_focused()
+    expect(target).to_be_in_viewport()
 
 
 # Two additions match "added": the first on line 2, the second on line 4.
