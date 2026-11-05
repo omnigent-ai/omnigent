@@ -11,13 +11,17 @@ Events are injected via :func:`_inject`, which calls :meth:`record_change` on
 the registry so tests exercise the same code path as real tool calls.
 """
 
+import itertools
 import logging
 import os
+import shutil
 import subprocess
 import threading
+from collections import Counter
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -1558,6 +1562,171 @@ def test_multi_repo_parent_preserves_head_changes_and_recovers_without_hooks(
     assert reader.get_baseline("unborn/new.txt") is None
 
 
+def test_nested_worktree_changes_follow_git_after_a_shell_rename(tmp_path: Path) -> None:
+    project = tmp_path / "code" / "project"
+    (project / "src").mkdir(parents=True)
+    _init_git_with_commit(project, "src/old_name.py", "def greet():\n    return 'hi'\n")
+    _trusted_test_git(
+        ["worktree", "add", "-b", "feature", "../project-wt"], project, 5
+    ).check_returncode()
+    worktree = tmp_path / "code" / "project-wt"
+    old, new = "code/project-wt/src/old_name.py", "code/project-wt/src/new_name.py"
+    registry = create_filesystem_registry(tmp_path)
+    assert isinstance(registry, MultiRepositoryFilesystemRegistry)
+    calls: list[Path] = []
+
+    def run_git(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        calls.append(cwd)
+        return _trusted_test_git(argv, cwd, timeout)
+
+    reader = registry.with_git_runner(run_git)
+    (worktree / "src" / "old_name.py").write_text("def greet():\n    return 'hello world'\n")
+    registry.record_change(old, "modified", "session")
+
+    # The agent renames the file from its shell, which records nothing.
+    _trusted_test_git(["mv", "src/old_name.py", "src/new_name.py"], worktree, 5).check_returncode()
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        (new, "modified", "code/project-wt")
+    ]
+    assert set(calls) == {worktree}
+    stale = reader.get_changed_file("session", old)
+    assert stale is not None
+    assert (stale["status"], stale["repository_root"]) == ("deleted", "code/project-wt")
+
+    _trusted_test_git(["commit", "-am", "rename"], worktree, 5).check_returncode()
+    assert reader.list_changed_files("session", limit=100) == []
+    (worktree / "src" / "new_name.py").write_text("next edit\n")
+    assert not registry.needs_snapshot(new)
+    cold = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(_trusted_test_git)
+    record = cold.get_changed_file("session", new)
+    assert record is not None and record["repository_root"] == "code/project-wt"
+    assert cold.get_baseline(new) == "def greet():\n    return 'hello world'\n"
+
+
+def test_nested_repository_discovery_probes_each_ancestor_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "deep" / "tree" / "repo"
+    repo.mkdir(parents=True)
+    _init_git_with_commit(repo, "README.md", "readme\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    for index in range(20):
+        for path in (f"deep/tree/repo/pkg/{index}/f.py", f"deep/tree/loose/{index}/f.py"):
+            (tmp_path / path).parent.mkdir(parents=True)
+            (tmp_path / path).write_text("new\n")
+            registry.record_change(path, "created", "session")
+    probes: Counter[Path] = Counter()
+    exists = Path.exists
+
+    def counting_exists(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if self.name == ".git":
+            probes[self.parent.relative_to(tmp_path)] += 1
+        return exists(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "exists", counting_exists)
+    changes = registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == sorted(
+        [(f"deep/tree/repo/pkg/{i}/f.py", "deep/tree/repo") for i in range(20)]
+        + [(f"deep/tree/loose/{i}/f.py", None) for i in range(20)]
+    )
+    assert probes[Path("deep/tree")] == 1
+    assert {count for path, count in probes.items() if len(path.parts) > 1} == {1}
+
+
+def test_nested_discovery_skips_repositories_reached_through_symlinked_directories(
+    tmp_path: Path,
+) -> None:
+    workspace, outside = tmp_path / "workspace", tmp_path / "outside"
+    (workspace / "group" / "repo").mkdir(parents=True)
+    (workspace / "group" / "repo" / "file.txt").write_text("edited\n")
+    _init_fake_git_repo(outside / "repo")
+    registry = MultiRepositoryFilesystemRegistry(workspace)
+    registry.record_change("group/repo/file.txt", "modified", "session")
+    shutil.rmtree(workspace / "group")
+    (workspace / "group").symlink_to(outside, target_is_directory=True)
+
+    reader = registry.with_git_runner(lambda *_args: pytest.fail("ran Git outside the workspace"))
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        ("group/repo/file.txt", "modified", None)
+    ]
+
+
+def test_directories_with_invalid_git_entries_keep_recorded_changes(tmp_path: Path) -> None:
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    paths = [
+        "binary/w.txt",
+        "group/binary/z.txt",
+        "group/vendor/x.txt",
+        "notes.txt",
+        "vendor/y.txt",
+    ]
+    for path in paths:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, "modified", "session")
+    (tmp_path / "group" / "vendor" / ".git").mkdir()
+    (tmp_path / "vendor" / ".git").mkdir()
+    (tmp_path / "group" / "binary" / ".git").write_bytes(b"\xff")
+    (tmp_path / "binary" / ".git").write_bytes(b"\xff")
+    reader = registry.with_git_runner(lambda *_args: pytest.fail("ran Git outside a repository"))
+    changes = reader.list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        (path, None) for path in paths
+    ]
+    for path in ("group/binary/z.txt", "group/vendor/x.txt"):
+        record = reader.get_changed_file("session", path)
+        assert record is not None and "repository_root" not in record
+
+
+@pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0, reason="root bypasses permission checks"
+)
+def test_unsearchable_folders_keep_recorded_changes(tmp_path: Path) -> None:
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    paths = ["locked/x.txt", "loose/locked/sub/y.txt", "notes.txt"]
+    for path in paths:
+        (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, "modified", "session")
+    locked = [tmp_path / "locked", tmp_path / "loose" / "locked"]
+    for directory in locked:
+        directory.chmod(0o600)
+    try:
+        reader = registry.with_git_runner(
+            lambda *_args: pytest.fail("ran Git outside a repository")
+        )
+        changes = reader.list_changed_files("session", limit=100)
+        records = [reader.get_changed_file("session", path) for path in paths[:2]]
+    finally:
+        for directory in locked:
+            directory.chmod(0o700)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        (path, None) for path in paths
+    ]
+    assert all(record is not None and "repository_root" not in record for record in records)
+
+
+def test_overlapping_repositories_list_each_path_under_its_nearest_repository(
+    tmp_path: Path,
+) -> None:
+    outer = tmp_path / "outer"
+    (outer / "inner").mkdir(parents=True)
+    _init_git_with_commit(outer, "inner/file.txt", "original\n")
+    _init_git_with_commit(outer / "inner", "file.txt", "original\n")
+    (outer / "inner" / "file.txt").write_text("edited\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    registry.record_change("outer/inner/file.txt", "modified", "session")
+    reader = registry.with_git_runner(_trusted_test_git)
+    changes = reader.list_changed_files("session", limit=100)
+    assert [(r["path"], r["status"], r.get("repository_root")) for r in changes] == [
+        ("outer/inner/file.txt", "modified", "outer/inner")
+    ]
+    record = reader.get_changed_file("session", "outer/inner/file.txt")
+    assert record is not None and record["repository_root"] == "outer/inner"
+
+
 @pytest.mark.parametrize("repository_count", [1, 4, 8])
 def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repository_count: int
@@ -1588,7 +1757,7 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     calls.clear()
     cold = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(run_git)
     monkeypatch.setattr(
-        cold, "_repository_roots", lambda: pytest.fail("scoped read scanned siblings")
+        cold, "_repository_roots", lambda _session: pytest.fail("scoped read scanned siblings")
     )
     record = cold.get_changed_file("session", "repo-0/same.txt")
     assert record is not None and record["repository_root"] == "repo-0"
@@ -1596,15 +1765,19 @@ def test_multi_repo_git_command_bounds_and_cold_scoped_read(
     assert calls == [("status", tmp_path / "repo-0"), ("show", tmp_path / "repo-0")]
 
 
-@pytest.mark.parametrize("boundary", ["repositories", "entries", "time"])
+@pytest.mark.parametrize("boundary", ["repositories", "nested_repositories", "entries", "time"])
 def test_multi_repo_discovery_bounds_fail_without_partial_results(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, boundary: str
 ) -> None:
-    for index in range(33):
-        (tmp_path / str(index) / ".git").mkdir(parents=True)
     reader = MultiRepositoryFilesystemRegistry(tmp_path).with_git_runner(
         lambda *_args: pytest.fail("discovery must finish before running Git")
     )
+    for index in range(33):
+        if boundary == "nested_repositories":
+            _init_fake_git_repo(tmp_path / "group" / str(index))
+            reader.record_change(f"group/{index}/file.txt", "modified", "session")
+        else:
+            _init_fake_git_repo(tmp_path / str(index))
     with monkeypatch.context() as patches:
         patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: 0)
         if boundary == "entries":
@@ -1620,6 +1793,41 @@ def test_multi_repo_discovery_bounds_fail_without_partial_results(
             )
         with pytest.raises(GitStatusUnavailable, match=r"discovery limit|32 repositories"):
             reader.list_changed_files("session", limit=100)
+
+
+def test_nested_discovery_deadline_keeps_recorded_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    outer, top = tmp_path / "group" / "outer", tmp_path / "top"
+    (outer / "inner").mkdir(parents=True)
+    (top / "src").mkdir(parents=True)
+    _init_git_with_commit(outer, ".gitignore", "inner/\n")
+    _init_git_with_commit(outer / "inner", "file.txt", "original\n")
+    _init_git_with_commit(top, "src/file.txt", "original\n")
+    registry = MultiRepositoryFilesystemRegistry(tmp_path)
+    for path, status in (
+        ("group/outer/new.txt", "created"),
+        ("group/outer/inner/file.txt", "modified"),
+        ("top/src/file.txt", "modified"),
+    ):
+        (tmp_path / path).write_text("edited\n")
+        registry.record_change(path, status, "session")
+    _trusted_test_git(["commit", "-am", "edit"], top, 5).check_returncode()
+    reader = registry.with_git_runner(_trusted_test_git)
+    # The deadline passes after the outer repository is found, before its ignored child.
+    clock = itertools.chain([0, 0, 0, 0], itertools.repeat(0.251))
+    with monkeypatch.context() as patches:
+        patches.setattr("omnigent.runtime.filesystem_registry.time.monotonic", lambda: next(clock))
+        changes = reader.list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        ("group/outer/inner/file.txt", None),
+        ("group/outer/new.txt", "group/outer"),
+    ]
+    changes = registry.with_git_runner(_trusted_test_git).list_changed_files("session", limit=100)
+    assert sorted((r["path"], r.get("repository_root")) for r in changes) == [
+        ("group/outer/inner/file.txt", "group/outer/inner"),
+        ("group/outer/new.txt", "group/outer"),
+    ]
 
 
 def test_large_parent_preserves_loose_files_and_discovers_late_repositories(
@@ -1670,7 +1878,8 @@ def test_multi_repo_baseline_failures_are_not_missing_originals(
 
 
 def test_multi_repo_requires_runner_and_surfaces_failed_repository(tmp_path: Path) -> None:
-    (tmp_path / "broken" / ".git").mkdir(parents=True)
+    _init_fake_git_repo(tmp_path / "broken")
+    (tmp_path / "broken" / ".git" / "HEAD").write_text("not a ref\n", encoding="utf-8")
     registry = MultiRepositoryFilesystemRegistry(tmp_path)
     with pytest.raises(GitStatusUnavailable, match="session runner"):
         registry.list_changed_files("session", limit=100)
