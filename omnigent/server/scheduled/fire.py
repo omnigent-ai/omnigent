@@ -66,6 +66,7 @@ import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -128,6 +129,21 @@ if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedLaunch, ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _PromptSendProgress:
+    """Whether a continued run's dispatch has begun sending its prompt."""
+
+    started: bool = False
+
+
+# Set by a continued run around its dispatch; ``_send_prompt`` marks it just
+# before sending. A shared object rather than a flag, so a mark made in a
+# child task is still seen.
+_PROMPT_SEND_PROGRESS: ContextVar[_PromptSendProgress | None] = ContextVar(
+    "scheduled_prompt_send_progress", default=None
+)
 
 # How long to wait for a freshly launched runner to connect before giving up on
 # dispatching the prompt this fire. The session + grant are already persisted, so
@@ -867,6 +883,10 @@ async def _continue_session(
             error_code="continued_session_budget_conflict",
         )
         return
+    previous_run = conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+    progress = _PromptSendProgress()
+    progress_token = _PROMPT_SEND_PROGRESS.set(progress)
+    stamped = False
     try:
         # Stamped before the prompt goes in, so what the agent records about this
         # run is attributed to it on any replica, even after a restart.
@@ -875,6 +895,7 @@ async def _continue_session(
             session_id,
             {SCHEDULED_TASK_RUN_LABEL_KEY: recorder.run_id},
         )
+        stamped = True
         # The dispatch derives the agent revision from these labels, so a session
         # the automation just started serving rebuilds its tools for this turn.
         conv.labels[SCHEDULED_TASK_RUN_LABEL_KEY] = recorder.run_id
@@ -886,6 +907,8 @@ async def _continue_session(
             session_id,
             task.id,
         )
+        if stamped and not progress.started:
+            await _restore_run_label(deps, session_id, recorder.run_id, previous_run)
         await recorder.finish(
             "failed",
             conversation_id=session_id,
@@ -893,8 +916,34 @@ async def _continue_session(
             error_code="launch_failed",
         )
         return
+    finally:
+        _PROMPT_SEND_PROGRESS.reset(progress_token)
     await recorder.finish("succeeded", conversation_id=session_id)
     _logger.info("scheduled fire: task %s continued session %s", task.id, session_id)
+
+
+async def _restore_run_label(
+    deps: FireDeps, session_id: str, run_id: str, previous_run: str | None
+) -> None:
+    """Give attribution back to the session's previous run after a prompt that never went in.
+
+    An earlier run may still be working in the session, and what it records
+    belongs to it. Conditional on the label still naming *run_id*, so a later
+    run's stamp is never overwritten.
+    """
+    try:
+        await asyncio.to_thread(
+            deps.conversation_store.replace_label_if,
+            session_id,
+            SCHEDULED_TASK_RUN_LABEL_KEY,
+            expected=run_id,
+            value=previous_run,
+        )
+    except Exception:
+        # The run fails either way; a kept label only misattributes until the next run.
+        _logger.exception(
+            "scheduled fire: could not restore the previous run label on session %s", session_id
+        )
 
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
@@ -2050,6 +2099,10 @@ async def _send_prompt(
     with fire_stage("prompt_prepare", session_id=conv.id):
         agent_revision = await _agent_revision(deps, conv)
     with fire_stage("prompt_send", session_id=conv.id):
+        progress = _PROMPT_SEND_PROGRESS.get()
+        if progress is not None:
+            # From here a failure may come after the runner took the prompt.
+            progress.started = True
         dispatch_id = uuid.uuid4().hex
         log_delivery(
             "scheduled_run_prompt_dispatch_started", session_id=conv.id, dispatch_id=dispatch_id

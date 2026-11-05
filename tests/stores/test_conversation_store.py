@@ -95,6 +95,21 @@ def test_fork_drops_import_provenance_labels(
     assert IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY not in fork.labels
 
 
+@pytest.mark.parametrize("value", ["new", None])
+def test_replace_label_if_changes_only_the_expected_value(
+    conversation_store: SqlAlchemyConversationStore, value: str | None
+) -> None:
+    """A writer undoing its own label never overwrites a later writer's."""
+    source = conversation_store.create_conversation()
+    conversation_store.set_labels(source.id, {"k": "mine"})
+
+    assert not conversation_store.replace_label_if(source.id, "k", expected="theirs", value=value)
+    assert conversation_store.get_conversation(source.id).labels["k"] == "mine"
+    assert conversation_store.replace_label_if(source.id, "k", expected="mine", value=value)
+    assert conversation_store.get_conversation(source.id).labels.get("k") == value
+    assert not conversation_store.replace_label_if(source.id, "absent", expected="x", value="y")
+
+
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

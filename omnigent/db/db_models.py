@@ -1750,11 +1750,11 @@ class SqlSessionObjective(OmnigentBase):
 
     __tablename__ = "session_objectives"
 
+    # A new table takes no database defaults; writes always name the workspace.
     workspace_id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         nullable=False,
-        server_default="0",
         default=current_workspace_id,
     )
     # conversation_id leads id so a session's objectives stay contiguous for
@@ -1804,12 +1804,14 @@ class SqlSessionObjective(OmnigentBase):
             "id",
         ),
         # An automation run's objectives in order, for its run history entry
-        # and for finding the run's latest objective.
+        # and for finding the run's latest objective. conversation_id completes
+        # the primary key, so every entry is unique.
         Index(
             "ix_session_objectives_run_created",
             "workspace_id",
             "scheduled_task_run_id",
             "created_at",
             "id",
+            "conversation_id",
         ),
     )

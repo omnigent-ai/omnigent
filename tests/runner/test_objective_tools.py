@@ -66,9 +66,7 @@ def test_the_tools_register_only_when_the_group_is_on(
     assert _NAMES & _registered(spec) == expected
     relayed = {schema["name"] for schema in build_native_relay_tool_schemas(spec)}
     assert _NAMES & relayed == expected
-
-
-def test_the_tools_are_dispatched_by_the_runner_and_relayed() -> None:
+    # The runner dispatches them itself and the native relay may carry them.
     assert _NAMES <= _ALL_LOCAL_TOOLS
     assert _NAMES <= _NATIVE_RELAY_BUILTIN_TOOLS
 

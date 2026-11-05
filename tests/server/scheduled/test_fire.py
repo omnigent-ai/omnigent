@@ -3439,6 +3439,78 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     ]
 
 
+@pytest.mark.parametrize("failure", ["before_send", "while_sending", "after_a_later_stamp"])
+async def test_a_continued_dispatch_that_fails_keeps_the_label_honest(
+    db_uri: str, failure: str
+) -> None:
+    """A prompt that never went in gives attribution back to the run still working.
+
+    Run A is still working in the session when run B's dispatch fails. If B's
+    prompt was never sent, what A records afterwards must land on A, so the
+    label goes back to A. Once sending began the prompt may have gone in, so B
+    keeps it; and a later run's stamp is never overwritten.
+    """
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.session_objective_store import SessionObjectiveStore
+
+    real = SqlAlchemyConversationStore(db_uri)
+    session_id = real.create_conversation().id
+    run_a, run_c = "a" * 32, "c" * 32
+    real.set_labels(session_id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_a})
+    objectives = SessionObjectiveStore(db_uri)
+    earlier = objectives.record_objective(session_id, "Triage", scheduled_task_run_id=run_a)
+
+    class _Conversations(_ExistingConversationStore):
+        """The continued session's checks read the fake; its labels live in the database."""
+
+        def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+            conv = super().get_conversation(conversation_id)
+            if conv is not None:
+                conv.labels = dict(real.get_conversation(conversation_id).labels)
+            return conv
+
+        def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
+            real.set_labels(conversation_id, labels)
+
+        def replace_label_if(self, conversation_id: str, key: str, **kwargs: Any) -> bool:
+            return real.replace_label_if(conversation_id, key, **kwargs)
+
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(session_mode="continue", session_id=session_id)}
+    )
+
+    async def _launch(conv: Any, task: Any) -> None:
+        if failure == "while_sending":
+            progress = fire_mod._PROMPT_SEND_PROGRESS.get()
+            assert progress is not None
+            progress.started = True
+        elif failure == "after_a_later_stamp":
+            real.set_labels(conv.id, {SCHEDULED_TASK_RUN_LABEL_KEY: run_c})
+        raise RuntimeError("runner never came up")
+
+    await build_on_fire(
+        _deps(store, conversation_store=_Conversations(_continued_session(id=session_id))),
+        launch_dispatch=_launch,
+    )(0, "task_1")
+    await _drain()
+
+    [run_b] = store.runs
+    assert (run_b["status"], run_b["error_code"]) == ("failed", "launch_failed")
+    label = real.get_conversation(session_id).labels[SCHEDULED_TASK_RUN_LABEL_KEY]
+    assert (
+        label
+        == {"before_send": run_a, "while_sending": run_b["run_id"], "after_a_later_stamp": run_c}[
+            failure
+        ]
+    )
+    # A, still working, records its outcome the way the objectives API does.
+    resolved = objectives.record_outcome(
+        session_id, success=True, emoji="✅", text="Triaged", scheduled_task_run_id=label
+    )
+    assert (resolved.id == earlier.id) is (failure == "before_send")
+
+
 @pytest.mark.parametrize(
     ("enabled", "source_length"), [(False, 5), (True, 5), (True, 256), (True, 257)]
 )

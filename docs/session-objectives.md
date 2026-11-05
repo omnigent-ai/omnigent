@@ -42,7 +42,12 @@ creation, and a continued session just before the prompt goes in. Objectives
 and outcomes recorded afterwards carry that run's ID. The label is stored with
 the session, so attribution holds across server restarts and replicas, and a
 continued session's earlier runs keep their own outcomes. If the label cannot
-be written, the run fails with `launch_failed` and no prompt is sent.
+be written, the run fails with `launch_failed` and no prompt is sent. If a
+continued run fails before its prompt is sent (for example, its runner can't be
+reached), the label goes back to the previous run, which may still be working
+in the session; once sending has begun, the prompt may have gone in, so the
+label stays. The label is only put back while it still names the failed run,
+so a later run's stamp is never undone.
 
 Attribution follows the session's latest run: if a continued session gets the
 next run's prompt while still working on the previous one, what it records from
@@ -97,7 +102,8 @@ cannot record for another session (403).
 ## Storage
 
 Objectives are rows of `session_objectives`, keyed by workspace, session and
-objective ID, and deleted with their session. `outcome_success` is a typed
+objective ID. Deleting a session deletes its objectives and its descendants',
+at most 500 rows per transaction. `outcome_success` is a typed
 column. The objective and outcome words can repeat task content, so they are
 stored in `objective_payload` and `outcome_payload`, envelopes private to
 `SessionObjectiveStore` (`{"plaintext": {...}}`, with `ciphertext` reserved for

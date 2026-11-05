@@ -253,11 +253,36 @@ def test_an_envelope_this_build_cannot_read_is_reported(
         store.list_objectives(SESSION)
 
 
-def test_deleting_a_session_deletes_its_objectives(
-    store: SessionObjectiveStore, conversations: SqlAlchemyConversationStore
+def test_deleting_a_session_deletes_its_subtrees_objectives_in_bounded_batches(
+    store: SessionObjectiveStore,
+    conversations: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    store.record_objective(SESSION, "Goal")
+    """A session and its descendants lose their objectives, a few rows per transaction."""
+    from omnigent.stores.conversation_store import sqlalchemy_store as conversation_sql
+
+    monkeypatch.setattr(conversation_sql, "_OBJECTIVE_DELETE_BATCH", 2)
+    monkeypatch.setattr(conversation_sql, "_OBJECTIVE_DELETE_SESSIONS", 1)
+    child = conversations.create_conversation(kind="sub_agent", parent_conversation_id=SESSION)
+    for i in range(5):
+        store.record_objective(SESSION, f"Goal {i}")
+    for i in range(3):
+        store.record_objective(child.id, f"Child goal {i}")
     store.record_objective(OTHER, "Other goal")
+    batches: list[int] = []
+    original = SqlAlchemyConversationStore._delete_objective_batch
+
+    def counted(self: SqlAlchemyConversationStore, ids: list[str]) -> int:
+        deleted = original(self, ids)
+        batches.append(deleted)
+        return deleted
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "_delete_objective_batch", counted)
+
     assert asyncio.run(conversations.delete_conversation(SESSION))
+
     assert store.list_objectives(SESSION).data == []
+    assert store.list_objectives(child.id).data == []
     assert [o.objective for o in store.list_objectives(OTHER).data] == ["Other goal"]
+    assert sum(batches) == 8
+    assert max(batches) <= 2

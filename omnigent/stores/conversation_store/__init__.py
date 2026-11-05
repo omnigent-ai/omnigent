@@ -1311,6 +1311,36 @@ class ConversationStore(ABC):
         """
         ...
 
+    def replace_label_if(
+        self,
+        conversation_id: str,
+        key: str,
+        *,
+        expected: str,
+        value: str | None,
+    ) -> bool:
+        """
+        Change one label only while it still holds *expected*.
+
+        Lets a writer undo its own label without clobbering a later writer's.
+        This default reads then writes, which is enough for stores without
+        concurrent writers; SQL stores override it with one conditional write.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key, e.g. ``"omnigent.scheduled_task_run"``.
+        :param expected: The value the label must still hold.
+        :param value: The new value, or ``None`` to delete the label.
+        :returns: Whether the label held *expected* and was changed.
+        """
+        conversation = self.get_conversation(conversation_id)
+        if conversation is None or conversation.labels.get(key) != expected:
+            return False
+        if value is None:
+            self.delete_label(conversation_id, key)
+        else:
+            self.set_labels(conversation_id, {key: value})
+        return True
+
     @abstractmethod
     def list_projects(
         self,
