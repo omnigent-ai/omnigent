@@ -1,13 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { readSessionWorkspaceState, saveSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import {
+  MAX_OPEN_TABS,
+  readSessionWorkspaceState,
+  saveSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
 import { newPendingSideChatId } from "@/lib/sideChat";
-import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
+import { setSessionParent } from "@/lib/sessionHost";
+import { subagentTabId, subagentSessionIdFromTab } from "@/lib/subagentTabs";
 
 interface SideChatTabsState {
   /** Open side-chat child conversation ids, in open order. */
   tabs: string[];
   /** Open sub-agent tabs (`subagentTabId` values), in open order. */
   subagentTabs: string[];
+  /** Side chats closed on this device, excluded from automatic discovery. */
+  closed: string[];
   /** The selected tab of either kind, or null when another rail view is active. */
   selected: string | null;
 }
@@ -26,25 +33,12 @@ function readSideChatTabsState(conversationId: string): SideChatTabsState {
   return {
     tabs,
     subagentTabs,
+    closed: saved.closedSideChats ?? [],
     selected: tabs.includes(selected) || subagentTabs.includes(selected) ? selected : null,
   };
 }
 
-/**
- * Per-session side-chat tabs for the Workspace rail — a browser-local list of
- * child conversation ids, mirroring {@link useBrowserTabs}. The references live
- * in `sessionWorkspaceState` (localStorage), never on the server, so they are
- * per-device and per-browser: they persist across app restarts and reloads but
- * do not follow the user to another device.
- *
- * Opening (`open`) just records an already-created child id as a tab — the
- * child itself is created by the server (Codex's native ephemeral fork, or the
- * generic `POST /v1/sessions/{id}/side-chat`) and surfaced here once its
- * `session_created` event arrives. Sub-agent tabs (`subagentTabId` ids) are
- * kept in their own list and listed after the side chats.
- *
- * @param conversationId The parent (main) conversation whose rail owns these tabs.
- */
+/** Per-session side-chat and sub-agent tabs, with browser-local selection and closure. */
 export function useSideChats(conversationId: string) {
   const [state, setState] = useState(() => readSideChatTabsState(conversationId));
   // Changes a failed storage write couldn't save. Each update replays them on
@@ -69,6 +63,7 @@ export function useSideChats(conversationId: string) {
       );
       const saved = saveSessionWorkspaceState(conversationId, {
         openSideChats: next.tabs,
+        closedSideChats: next.closed.length > 0 ? next.closed : undefined,
         // Omitted when empty, so a session without sub-agent tabs is stored as before.
         openSubagentTabs: next.subagentTabs.length > 0 ? next.subagentTabs : undefined,
         selectedSideChatId: next.selected,
@@ -108,10 +103,36 @@ export function useSideChats(conversationId: string) {
         return {
           ...current,
           [key]: list.includes(childId) ? list : [...list, childId],
+          closed: current.closed.filter(
+            (id) => id !== (subagentSessionIdFromTab(childId) ?? childId),
+          ),
           selected: childId,
         };
       }),
     [update],
+  );
+
+  /** Add discovered chats without switching panels or reviving locally closed tabs. */
+  const restore = useCallback(
+    (childIds: string[]) => {
+      for (const id of childIds) setSessionParent(id, conversationId);
+      update((current) => {
+        const added = childIds
+          .filter(
+            (id) =>
+              !current.tabs.includes(id) &&
+              !current.closed.includes(id) &&
+              !current.subagentTabs.includes(subagentTabId(id)),
+          )
+          .slice(0, Math.max(0, MAX_OPEN_TABS - current.tabs.length));
+        return {
+          ...current,
+          tabs: [...current.tabs, ...added],
+          selected: current.selected ?? added[0] ?? null,
+        };
+      });
+    },
+    [conversationId, update],
   );
 
   /** Replace a tab's id in place, preserving its position and selection. Used
@@ -149,6 +170,9 @@ export function useSideChats(conversationId: string) {
             ? (remaining[Math.max(0, index - 1)] ?? null)
             : current.selected;
         return {
+          closed: !childId.startsWith("pending:")
+            ? [...new Set([...current.closed, subagentSessionIdFromTab(childId) ?? childId])]
+            : current.closed,
           tabs: current.tabs.filter((id) => id !== childId),
           subagentTabs: current.subagentTabs.filter((id) => id !== childId),
           selected,
@@ -165,6 +189,7 @@ export function useSideChats(conversationId: string) {
     open,
     openPending,
     rekey,
+    restore,
     close,
     select,
   };
