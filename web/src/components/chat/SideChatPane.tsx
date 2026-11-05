@@ -1042,6 +1042,7 @@ function SideChatComposer({
         </TooltipProvider>
       )}
       <ChatComposer
+        hasContent={!pending && files.length > 0}
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
           ref: tailTextareaRef,

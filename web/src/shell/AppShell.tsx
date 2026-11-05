@@ -121,6 +121,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
@@ -230,7 +231,9 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 export function AppShell() {
   return (
     <GridSessionsProvider>
-      <AppShellImpl />
+      <MobileHeaderControlsProvider>
+        <AppShellImpl />
+      </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
 }
@@ -2693,6 +2696,7 @@ function AppShellImpl() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
                     createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}

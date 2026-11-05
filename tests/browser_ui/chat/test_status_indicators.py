@@ -107,9 +107,14 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
     assert notice.evaluate(opacity) >= 0.39
     footer = notice.locator("..")
-    pending_timestamp = footer.get_by_test_id("message-timestamp")
-    notice_box = notice.bounding_box()
-    timestamp_box = pending_timestamp.bounding_box()
+    # Read both boxes in one frame while the pending bubble animates into place.
+    notice_box, timestamp_box = footer.evaluate(
+        """footer => {
+          const bounds = testId => footer.querySelector(`[data-testid="${testId}"]`)
+            ?.getBoundingClientRect().toJSON();
+          return [bounds('message-awaiting-agent'), bounds('message-timestamp')];
+        }"""
+    )
     assert notice_box is not None and timestamp_box is not None
     assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1

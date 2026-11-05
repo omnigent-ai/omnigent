@@ -372,11 +372,12 @@ function TranscriptImpl({
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
-            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            !isMobileViewport &&
+              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -467,7 +468,13 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          <ConversationScrollButton
+            className={
+              isMobileViewport
+                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                : undefined
+            }
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}

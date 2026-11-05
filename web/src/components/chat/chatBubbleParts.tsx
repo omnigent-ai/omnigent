@@ -8,9 +8,11 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
+  type MouseEvent as ReactMouseEvent,
 } from "react";
 import {
   ArrowUpIcon,
@@ -829,6 +831,44 @@ function useCopyMessageLink(messageId: string | null): {
   return { isLinkCopied, handleCopyLink };
 }
 
+function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesktop = false) {
+  const isMobile = useIsMobileViewport();
+  const actionsId = useId();
+  const [actionsRevealed, setActionsRevealed] = useState<boolean | null>(null);
+  const actionsVisible = isMobile ? (actionsRevealed ?? persistentOnMobile) : persistentOnDesktop;
+  const toggleVisibility = () => setActionsRevealed((visible) => !(visible ?? persistentOnMobile));
+
+  return {
+    actionsId,
+    visibilityToggle: isMobile ? (
+      <button
+        type="button"
+        aria-controls={actionsId}
+        aria-expanded={actionsVisible}
+        onClick={toggleVisibility}
+        className="sr-only focus:not-sr-only focus:rounded focus:p-1 focus:outline-2 focus:outline-ring"
+      >
+        {actionsVisible ? "Hide message actions" : "Show message actions"}
+      </button>
+    ) : null,
+    toggleActions: isMobile
+      ? (event: ReactMouseEvent<HTMLDivElement>) => {
+          if (
+            event.target instanceof Element &&
+            event.target.closest("a, button, input, textarea, select, [role=button]")
+          )
+            return;
+          toggleVisibility();
+        }
+      : undefined,
+    visibilityClassName: actionsVisible
+      ? "opacity-100"
+      : isMobile
+        ? "invisible opacity-0"
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+  };
+}
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -854,6 +894,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
   const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility(awaitingAgent, awaitingAgent && !text);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -880,6 +922,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
       data-user-message-id={bubble.itemId}
       data-message-id={bubble.itemId}
       className={cn("max-w-[640px]", bubble.pending && "animate-user-message-enter")}
+      onClick={toggleActions}
     >
       <div className="ml-auto flex w-fit max-w-full flex-col items-end">
         {/* Keep the avatar beside the attachments and text as one aligned message. */}
@@ -1050,16 +1093,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
         )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
-            steering message has no enabled footer control to focus (Copy is
-            absent and Copy link is disabled while pending), so keep its
-            explanation visible for keyboard users. */}
+        {visibilityToggle}
         <div
+          id={actionsId}
           className={cn(
             "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
-            awaitingAgent && !text
-              ? "opacity-100"
-              : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+            visibilityClassName,
           )}
         >
           {awaitingAgent && (
@@ -1121,6 +1160,8 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility(isLastAssistant, actionsPersistent);
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
@@ -1260,6 +1301,7 @@ function AssistantBubble({
         data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
+        onClick={toggleActions}
         className={cn(
           "mobile-app:gap-0",
           spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
@@ -1300,67 +1342,69 @@ function AssistantBubble({
         )}
         {/* Skip fold-only and error-only bubbles. Order: actions, then timestamp. */}
         {!foldOnly && !errorOnly && (
-          <div
-            className={cn(
-              "flex mobile-app:flex-wrap items-center gap-3 mobile-app:py-0",
-              actionsPersistent
-                ? "opacity-100"
-                : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
-            )}
-          >
-            <MessageActions>
-              {markdownText && (
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  className="[@media(pointer:coarse)]:size-8"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_assistant"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
+          <>
+            {visibilityToggle}
+            <div
+              id={actionsId}
+              className={cn(
+                "flex mobile-app:flex-wrap items-center gap-3 mobile-app:py-0",
+                visibilityClassName,
               )}
-              {/* Fork from this response: clone the session with history
+            >
+              <MessageActions>
+                {markdownText && (
+                  <MessageAction
+                    tooltip="Copy"
+                    size="icon-xxs"
+                    className="[@media(pointer:coarse)]:size-8"
+                    onClick={handleCopy}
+                    componentId="chat.message.copy_assistant"
+                  >
+                    {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                  </MessageAction>
+                )}
+                {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
-                  <MessageAction
-                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
-                    label="Fork from here"
-                    disabled={!!forkDialog.disabledReason}
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() =>
-                      forkDialog.openForkDialog({
-                        sourceSessionId: scopedConversationId ?? undefined,
-                        upToResponseId: bubble.responseId,
-                      })
-                    }
-                    componentId="chat.message.fork"
-                  >
-                    <SplitIcon size={14} />
-                  </MessageAction>
-                </DisabledActionTooltip>
+                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                  <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                    <MessageAction
+                      tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                      label="Fork from here"
+                      disabled={!!forkDialog.disabledReason}
+                      size="icon-xxs"
+                      data-testid="fork-from-response"
+                      onClick={() =>
+                        forkDialog.openForkDialog({
+                          sourceSessionId: scopedConversationId ?? undefined,
+                          upToResponseId: bubble.responseId,
+                        })
+                      }
+                      componentId="chat.message.fork"
+                    >
+                      <SplitIcon size={14} />
+                    </MessageAction>
+                  </DisabledActionTooltip>
+                )}
+                <MessageAction
+                  tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                  size="icon-xxs"
+                  data-testid="copy-message-link"
+                  onClick={handleCopyLink}
+                >
+                  {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+                </MessageAction>
+              </MessageActions>
+              {ts && (
+                <span
+                  className="select-none text-sm leading-4 text-foreground/56"
+                  data-testid="message-timestamp"
+                >
+                  {ts}
+                </span>
               )}
-              <MessageAction
-                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-                size="icon-xxs"
-                data-testid="copy-message-link"
-                onClick={handleCopyLink}
-              >
-                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-              </MessageAction>
-            </MessageActions>
-            {ts && (
-              <span
-                className="select-none text-sm leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-          </div>
+            </div>
+          </>
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (

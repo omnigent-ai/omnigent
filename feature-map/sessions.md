@@ -246,7 +246,9 @@ Failed sends restore text and supported attachments unless the cell has a newer 
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
-sessions** on the empty landing. Choose a machine, harness, and recent count
+sessions** on the empty landing. The X beside the landing button dismisses the
+suggestion and keeps it hidden after reload in this browser; Settings → Import
+sessions remains available. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list,
 except Codex threads archived in Codex, which land in Archived, so the list can
@@ -287,7 +289,15 @@ actions (mark as read or unread, archive, unarchive, delete).
 pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
-actions.
+actions. On phones, the sidebar toggle has a circular glass surface; host,
+harness/model, background tasks, and session actions share the top-right glass
+group. Buttons are 44px tall with 20px icons. These surfaces use the shared
+React Bits glass treatment with a transparent fill, diffused backdrop, subtle
+rim, and soft shadow. Menus and the sidebar use the more strongly blurred menu
+variant. Browsers without backdrop filtering receive a solid theme surface.
+The header controls sit 16px from the top and sides.
+The mobile header omits the session title and fading backdrop,
+retaining a Back link for child sessions.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
@@ -978,7 +988,9 @@ plain `uv run pytest`, which starts a private server for the test.
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.
   Component coverage checks compact large batches, failure expansion, retry
-  after navigation, and collapsed headings.
+  after navigation, and collapsed headings. `web/src/shell/NewChatDialog.test.tsx`
+  covers the landing import link and dismissal, including persistence after
+  remount and unavailable storage.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`

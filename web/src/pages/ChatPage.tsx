@@ -219,6 +219,7 @@ import {
   subscribeSessionHostChanges,
 } from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
+import { MobileHeaderControlPortal } from "@/shell/MobileHeaderControlsSlot";
 import {
   type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
@@ -270,7 +271,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
-import { ComposerAgentIcon, NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
@@ -3551,15 +3553,41 @@ function ComposerImpl(
     clearRegistrySignInError();
   }, [showMcpServers, clearRegistrySignInError]);
 
+  // Mobile reserves the overlay height in the transcript's trailing padding.
+  const composerFormRef = useRef<HTMLFormElement>(null);
+  const measureComposerOverlayRef = useRef<(() => boolean) | null>(null);
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
-  // Growth stays in the flex column so the transcript viewport ends where the
-  // composer begins instead of letting the card cover visible output.
   // The onGrowth pin re-locks the transcript bottom in the same task as the
   // height change, before any paint — see the prop doc on ComposerProps.
   const onGrowthRef = useRef(onViewportShrinkPinScroll);
   useLayoutEffect(() => {
     onGrowthRef.current = onViewportShrinkPinScroll;
   });
+  useLayoutEffect(() => {
+    if (!isMobile) return;
+    const form = composerFormRef.current;
+    const surface = form?.closest<HTMLElement>("[data-chat-surface]");
+    if (!form || !surface) return;
+    let previousHeight = -1;
+    const measure = () => {
+      const height = form.getBoundingClientRect().height;
+      if (height === previousHeight) return false;
+      previousHeight = height;
+      surface.style.setProperty("--session-composer-height", `${height}px`);
+      return true;
+    };
+    measure();
+    measureComposerOverlayRef.current = measure;
+    const observer = new ResizeObserver(() => {
+      if (measure()) onGrowthRef.current?.();
+    });
+    observer.observe(form);
+    return () => {
+      observer.disconnect();
+      measureComposerOverlayRef.current = null;
+      surface.style.removeProperty("--session-composer-height");
+    };
+  }, [isMobile]);
   // The hook measures on every keystroke, but growth only changes at line
   // wraps: skip the spacer re-measure and transcript pin while the box rests
   // at an unchanged height.
@@ -3567,6 +3595,7 @@ function ComposerImpl(
   const onGrowth = useCallback((px: number) => {
     if (lastGrowthPxRef.current === px) return;
     lastGrowthPxRef.current = px;
+    measureComposerOverlayRef.current?.();
     onGrowthRef.current?.();
   }, []);
   useAutoGrowTextarea(tailTextareaRef, draft.text, draft.quotes.length ? Infinity : 10, onGrowth);
@@ -3958,8 +3987,12 @@ function ComposerImpl(
 
   return (
     <form
+      ref={composerFormRef}
       onSubmit={handleSubmit}
-      className="chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]"
+      className={cn(
+        "chat-composer-form relative px-6 pb-[max(20px,env(safe-area-inset-bottom))]",
+        isMobile && "z-20 px-4 pb-[max(16px,env(safe-area-inset-bottom))]",
+      )}
     >
       {/* Hidden file input for the attach button */}
       <input
@@ -4016,49 +4049,59 @@ function ComposerImpl(
             SubagentComposerTray). Truthy (not just non-null) so an empty
             label never peeks a nameless tray. */}
         {subAgentLabel ? <SubagentComposerTray label={subAgentLabel} /> : null}
-        <ComposerWorkspaceBar
-          data-testid="composer-workspace-controls"
-          className={cn(
-            hasQueuedComposerMessages &&
-              "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
-          )}
-        >
-          <ComposerWorkspaceStatus
-            workspacePath={composerWorkspace ?? null}
-            worktreePath={composerGit.worktreePath}
-            isWorktree={composerGit.isWorktree}
-            branch={composerGit.branch}
-            branchState={composerGit.branchState}
-            creationBranch={composerGit.creationBranch}
-            showWorktree={composerGit.isWorktree === true}
-          />
-          <ComposerPrLink
-            state={composerGit.githubState}
-            prCount={composerGit.prCount}
-            prNumber={composerGit.prNumber}
-            prNumberPrefix={composerGit.prNumberPrefix}
-            prs={composerGit.prs}
-            prStatus={composerGit.prStatus}
-            onOpen={openComposerGithubTab}
-            conversationId={composerSessionId ?? undefined}
-          />
-          <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
-            <div
-              data-testid="composer-task-indicators"
-              className="flex items-center gap-0 empty:hidden"
-            >
-              <BackgroundTaskIndicator />
-              <SubagentTaskIndicator conversationId={conversationId} />
-              {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
-            </div>
-            <ComposerContextRing
-              contextWindow={composerContextWindow}
-              tokensUsed={composerTokensUsed}
+        {!isMobile && (
+          <ComposerWorkspaceBar
+            data-testid="composer-workspace-controls"
+            className={cn(
+              hasQueuedComposerMessages &&
+                "rounded-t-none border-t-0 border-border/50 before:pointer-events-none before:absolute before:inset-x-4 before:top-0 before:h-px before:bg-border/50 before:content-['']",
+            )}
+          >
+            <ComposerWorkspaceStatus
+              workspacePath={composerWorkspace ?? null}
+              worktreePath={composerGit.worktreePath}
+              isWorktree={composerGit.isWorktree}
+              branch={composerGit.branch}
+              branchState={composerGit.branchState}
+              creationBranch={composerGit.creationBranch}
+              showWorktree={composerGit.isWorktree === true}
             />
-          </div>
-        </ComposerWorkspaceBar>
+            <ComposerPrLink
+              state={composerGit.githubState}
+              prCount={composerGit.prCount}
+              prNumber={composerGit.prNumber}
+              prNumberPrefix={composerGit.prNumberPrefix}
+              prs={composerGit.prs}
+              prStatus={composerGit.prStatus}
+              onOpen={openComposerGithubTab}
+              conversationId={composerSessionId ?? undefined}
+            />
+            <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+              <div
+                data-testid="composer-task-indicators"
+                className="flex items-center gap-0 empty:hidden"
+              >
+                <BackgroundTaskIndicator />
+                <SubagentTaskIndicator conversationId={conversationId} />
+                {goal && <GoalStatusPill goal={goal} onOpen={() => setGoalDialogOpen(true)} />}
+              </div>
+              <ComposerContextRing
+                contextWindow={composerContextWindow}
+                tokensUsed={composerTokensUsed}
+              />
+            </div>
+          </ComposerWorkspaceBar>
+        )}
       </div>
       <ChatComposer
+        appearance={isMobile ? "glass" : "default"}
+        hasContent={
+          files.length > 0 ||
+          mentionedItems.length > 0 ||
+          attachmentError !== null ||
+          commandError !== null ||
+          Boolean(btwSidechat)
+        }
         keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
         ref={bindComposerCard}
         className={cn(
@@ -4231,7 +4274,7 @@ function ComposerImpl(
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground"
+              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground max-md:px-4 max-md:pt-4 max-md:pb-2"
             >
               {(() => {
                 const split = splitSlashCommand(value, slashCommandNames);
@@ -4315,13 +4358,20 @@ function ComposerImpl(
                 }
               />
               {!subAgentLabel && composerSessionId && (
-                <HostBadge
-                  sessionId={composerSessionId}
-                  appearance="composer"
-                  readOnly={isReadOnly}
-                  onReconnect={onShowReconnectHelp}
-                  starting={sandboxStarting}
-                />
+                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                  <HostBadge
+                    sessionId={composerSessionId}
+                    appearance={isMobile ? "header" : "composer"}
+                    readOnly={isReadOnly}
+                    onReconnect={onShowReconnectHelp}
+                    starting={sandboxStarting}
+                  />
+                </MobileHeaderControlPortal>
+              )}
+              {isMobile && (
+                <MobileHeaderControlPortal sessionId={composerSessionId}>
+                  <BackgroundTaskIndicator className="h-11 rounded-full bg-transparent [--icon-container-default:20px] [&_svg]:p-0" />
+                </MobileHeaderControlPortal>
               )}
               {(showClaudePermissionMode || showCodexApprovalMode) && (
                 <ComposerPermissionPicker
@@ -4344,40 +4394,43 @@ function ComposerImpl(
           ),
           trailing: (
             <>
-              <div className="flex min-w-0 items-center rounded-lg">
-                <SessionHarnessPicker
-                  busy={configBusy}
-                  busyRef={configBusyRef}
-                  setBusy={setConfigBusy}
-                  agentName={
-                    subAgentName ??
-                    agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                    agents?.[0]?.name ??
-                    null
-                  }
-                  harnessLabel={harnessLabel}
-                  showModels={showModels}
-                  showEffort={showEffort}
-                  effortLevels={effortLevels}
-                  modelPickerKind={modelPickerKind}
-                  supportsModelReset={supportsModelReset}
-                  codexModelOptions={codexModelOptions}
-                  inferenceConfigured={inferenceConfigured}
-                  inferenceError={inferenceError}
-                  modelsFromLaunchPreview={modelsFromLaunchPreview}
-                  modelLabelOptions={modelLabelOptions}
-                  modelLabelHostId={composerSession?.hostId}
-                  costRoutingEligible={costRoutingEligible}
-                  modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
-                  // Config changes persist server-side and apply on the next
-                  // wake/turn (the runner forward is best-effort), so the gear
-                  // stays live wherever a message could be sent — including
-                  // asleep/starting/unknown. Only read-only viewers and sessions
-                  // no message can wake (unreachable) get an inert gear.
-                  disabled={isReadOnly || unreachable}
-                  openNonce={pickerOpenNonce}
-                />
-              </div>
+              <MobileHeaderControlPortal sessionId={composerSessionId}>
+                <div className="flex min-w-0 items-center rounded-lg">
+                  <SessionHarnessPicker
+                    appearance={isMobile ? "header" : "composer"}
+                    busy={configBusy}
+                    busyRef={configBusyRef}
+                    setBusy={setConfigBusy}
+                    agentName={
+                      subAgentName ??
+                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
+                      agents?.[0]?.name ??
+                      null
+                    }
+                    harnessLabel={harnessLabel}
+                    showModels={showModels}
+                    showEffort={showEffort}
+                    effortLevels={effortLevels}
+                    modelPickerKind={modelPickerKind}
+                    supportsModelReset={supportsModelReset}
+                    codexModelOptions={codexModelOptions}
+                    inferenceConfigured={inferenceConfigured}
+                    inferenceError={inferenceError}
+                    modelsFromLaunchPreview={modelsFromLaunchPreview}
+                    modelLabelOptions={modelLabelOptions}
+                    modelLabelHostId={composerSession?.hostId}
+                    costRoutingEligible={costRoutingEligible}
+                    modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
+                    // Config changes persist server-side and apply on the next
+                    // wake/turn (the runner forward is best-effort), so the gear
+                    // stays live wherever a message could be sent — including
+                    // asleep/starting/unknown. Only read-only viewers and sessions
+                    // no message can wake (unreachable) get an inert gear.
+                    disabled={isReadOnly || unreachable}
+                    openNonce={pickerOpenNonce}
+                  />
+                </div>
+              </MobileHeaderControlPortal>
               <ComposerMicButton
                 className="size-8 md:size-7"
                 enableHotkey
@@ -4822,6 +4875,7 @@ function hasSessionConfig({
 }
 
 function SessionHarnessPicker({
+  appearance = "composer",
   busy,
   busyRef,
   setBusy,
@@ -4843,6 +4897,7 @@ function SessionHarnessPicker({
   disabled,
   openNonce = 0,
 }: {
+  appearance?: "composer" | "header";
   busy: boolean;
   busyRef: { current: boolean };
   setBusy: (busy: boolean) => void;
@@ -5255,6 +5310,7 @@ function SessionHarnessPicker({
   );
   return (
     <HarnessPicker
+      contentSide={appearance === "header" ? "bottom" : "top"}
       cyclePreview={
         preview === "models"
           ? cycleModelSection
@@ -5272,10 +5328,16 @@ function SessionHarnessPicker({
         if (!next) setConfigOpen(false);
       }}
       trigger={{
+        appearance,
         label: "Configure session",
         model: label,
         effort: effortLabel ?? undefined,
-        icon: <ComposerAgentIcon agent={iconAgent} />,
+        icon: (
+          <ComposerAgentIcon
+            agent={iconAgent}
+            className={appearance === "header" ? "size-5" : undefined}
+          />
+        ),
         disabled: busy || !configurable,
         "aria-disabled": disabled || busy || !configurable,
         className: disabled ? "cursor-default opacity-50" : undefined,
