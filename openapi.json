@@ -6118,6 +6118,12 @@
             "title": "Archive Worktree Cleanup",
             "type": "boolean"
           },
+          "automation_trigger_poll_minutes": {
+            "default": 10,
+            "format": "int64",
+            "title": "Automation Trigger Poll Minutes",
+            "type": "integer"
+          },
           "automations_enabled": {
             "default": false,
             "title": "Automations Enabled",
