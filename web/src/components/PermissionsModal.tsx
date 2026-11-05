@@ -50,11 +50,9 @@ import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
 import { getShareableSessionLink } from "@/lib/shareLink";
-import { workspaceSharingBlocked } from "@/lib/permissionsApi";
+import { PUBLIC_USER_ID, workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
-
-const PUBLIC_USER = "__public__";
 
 /** Numeric permission level → display label for fixed (non-editable) rows. */
 const LEVEL_LABELS: Record<number, string> = {
@@ -123,8 +121,8 @@ export function PermissionsModal({
   const hasWorkspace = !!session?.workspace;
   const workspaceShared = session?.shareWorkspaceFiles ?? false;
 
-  const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
-  const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
+  const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER_ID);
+  const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER_ID);
   const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
 
   function handleGrant(e: FormEvent) {
@@ -162,9 +160,9 @@ export function PermissionsModal({
     if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
     setError(null);
     if (level > 0) {
-      grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
+      grant.mutate({ userId: PUBLIC_USER_ID, level }, { onError: (err) => setError(err.message) });
     } else {
-      revoke.mutate(PUBLIC_USER, {
+      revoke.mutate(PUBLIC_USER_ID, {
         onError: (err) => setError(err.message),
       });
     }

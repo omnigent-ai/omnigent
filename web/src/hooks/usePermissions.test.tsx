@@ -15,16 +15,24 @@ vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTest
 // and the loading-is-permissive invariant directly, without standing
 // up a QueryClient or re-testing the resolution order.
 
-import { renderHook } from "@testing-library/react";
+import { act, renderHook } from "@testing-library/react";
 import type { Conversation } from "./useConversations";
 import type { Session } from "@/lib/types";
+import type * as PermissionsApi from "@/lib/permissionsApi";
 
 vi.mock("./useConversations", () => ({ useConversations: vi.fn() }));
 vi.mock("./useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof PermissionsApi>()),
+  grantPermission: vi.fn(async () => ({})),
+  revokePermission: vi.fn(async () => undefined),
+}));
 
+import type { ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useConversations } from "./useConversations";
 import { useSession } from "./useSession";
-import { useCanEdit } from "./usePermissions";
+import { useCanEdit, useGrantPermission, useRevokePermission } from "./usePermissions";
 
 const useConversationsMock = vi.mocked(useConversations);
 const useSessionMock = vi.mocked(useSession);
@@ -131,5 +139,51 @@ describe("useCanEdit — safe defaults", () => {
     // sidebar settles. derivePermissionLevel returns null → permissive.
     setHooks({ session: null, sessionLoading: false, conversations: undefined });
     expect(renderHook(() => useCanEdit("conv_1")).result.current).toBe(true);
+  });
+});
+
+describe("share mutations — sidebar shared flag", () => {
+  const listKey = ["conversations", "", false];
+
+  function setup() {
+    const qc = new QueryClient();
+    qc.setQueryData(listKey, {
+      pages: [{ data: [{ ...makeConv(4), owner: "owner@example.com" }] }],
+      pageParams: [null],
+    });
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    const sharedFlag = () =>
+      qc.getQueryData<{ pages: { data: Conversation[] }[] }>(listKey)!.pages[0].data[0]
+        .shared_with_others;
+    return { qc, wrapper, sharedFlag };
+  }
+
+  it.each([
+    ["a user", "friend@example.com", true],
+    ["the public link", "__public__", undefined],
+  ])("sets the flag after granting %s", async (_label, userId, expected) => {
+    const { wrapper, sharedFlag } = setup();
+    const { result } = renderHook(() => useGrantPermission("conv_1"), { wrapper });
+    await act(() => result.current.mutateAsync({ userId, level: 1 }));
+    expect(sharedFlag()).toBe(expected);
+  });
+
+  it.each([
+    ["the last user grantee", ["friend@example.com", "__public__"], false],
+    ["one of two user grantees", ["friend@example.com", "other@example.com"], true],
+  ])("recomputes the flag after revoking %s", async (_label, grantees, expected) => {
+    const { qc, wrapper, sharedFlag } = setup();
+    qc.setQueryData(
+      ["permissions", "conv_1"],
+      [
+        { user_id: "owner@example.com", conversation_id: "conv_1", level: 4 },
+        ...grantees.map((user_id) => ({ user_id, conversation_id: "conv_1", level: 1 })),
+      ],
+    );
+    const { result } = renderHook(() => useRevokePermission("conv_1"), { wrapper });
+    await act(() => result.current.mutateAsync("friend@example.com"));
+    expect(sharedFlag()).toBe(expected);
   });
 });

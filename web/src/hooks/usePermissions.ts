@@ -7,6 +7,8 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useMemo } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  LEVEL_OWNER,
+  PUBLIC_USER_ID,
   type Permission,
   derivePermissionLevel,
   getSessionOwner,
@@ -14,6 +16,7 @@ import {
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
+import { overlayListItemIntoCaches } from "@/lib/sessionListCache";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useSession } from "./useSession";
 
@@ -53,24 +56,43 @@ export function useSessionOwner(sessionId: string | null) {
   });
 }
 
-/** Grant or update a permission. Invalidates the permissions list on success. */
+/**
+ * Grant or update a permission. Invalidates the permissions list and, for a
+ * named user, marks the sidebar row shared (the updates stream confirms it).
+ */
 export function useGrantPermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: ({ userId, level }: { userId: string; level: number }) =>
       grantPermission(sessionId, userId, level),
-    onSuccess: () => {
+    onSuccess: (_data, { userId }) => {
+      if (userId !== PUBLIC_USER_ID) {
+        overlayListItemIntoCaches(qc, { id: sessionId, shared_with_others: true });
+      }
       void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
     },
   });
 }
 
-/** Revoke a permission. Invalidates the permissions list on success. */
+/**
+ * Revoke a permission. Invalidates the permissions list on success and, when
+ * the grant list is cached, recomputes the sidebar row's shared flag from the
+ * remaining named non-owner grants.
+ */
 export function useRevokePermission(sessionId: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (userId: string) => revokePermission(sessionId, userId),
-    onSuccess: () => {
+    onSuccess: (_data, userId) => {
+      const grants = qc.getQueryData<Permission[]>(permissionsKey(sessionId));
+      if (grants) {
+        overlayListItemIntoCaches(qc, {
+          id: sessionId,
+          shared_with_others: grants.some(
+            (g) => g.user_id !== userId && g.user_id !== PUBLIC_USER_ID && g.level < LEVEL_OWNER,
+          ),
+        });
+      }
       void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
     },
   });

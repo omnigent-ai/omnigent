@@ -14,6 +14,9 @@ import { authenticatedFetch } from "./identity";
  */
 export const LEVEL_OWNER = 4;
 
+/** Grantee id for public (anyone-with-the-link) access; mirrors ``RESERVED_USER_PUBLIC``. */
+export const PUBLIC_USER_ID = "__public__";
+
 export function workspaceSharingBlocked(workspace: string | null | undefined): boolean {
   if (!workspace?.startsWith("/")) return false;
 

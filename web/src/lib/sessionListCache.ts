@@ -515,31 +515,11 @@ export function overlayTitleIntoCaches(
   title: string | null,
   updatedAt?: number,
 ): void {
-  const wire: SessionListWireItem = {
+  overlayListItemIntoCaches(queryClient, {
     id,
     title,
     ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}),
-  };
-  const itemsById = new Map([[id, wire]]);
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["conversations"],
-  })) {
-    const { data: next } = mergeItemsIntoPages(
-      data,
-      itemsById,
-      filtersFromConversationQueryKey(key),
-    );
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
-  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-    queryKey: ["project-sessions"],
-  })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
-    if (next !== data) queryClient.setQueryData(key, next);
-  }
-  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
-  );
+  });
   queryClient.setQueryData<Session>(["session", id], (old) => (old ? { ...old, title } : old));
 }
 
@@ -567,7 +547,21 @@ export function overlayArchivedIntoCaches(
   id: string,
   archived: boolean,
 ): void {
-  const itemsById = new Map<string, SessionListWireItem>([[id, { id, archived }]]);
+  overlayListItemIntoCaches(queryClient, { id, archived });
+}
+
+/**
+ * Overlay a partial row onto every cached session list (and the backfill row)
+ * that holds it, so a local mutation repaints the sidebar without a refetch.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param wire - The changed fields, keyed by session `id`.
+ */
+export function overlayListItemIntoCaches(
+  queryClient: QueryClient,
+  wire: SessionListWireItem,
+): void {
+  const itemsById = new Map([[wire.id, wire]]);
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   })) {
@@ -584,7 +578,7 @@ export function overlayArchivedIntoCaches(
     const { data: next } = mergeItemsIntoPages(data, itemsById, filtersFromProjectQueryKey(key));
     if (next !== data) queryClient.setQueryData(key, next);
   }
-  queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
-    old ? { ...old, archived } : old,
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", wire.id], (old) =>
+    old ? { ...old, ...wire } : old,
   );
 }

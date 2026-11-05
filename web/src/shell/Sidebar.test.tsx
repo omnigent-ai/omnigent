@@ -469,6 +469,38 @@ describe("Sidebar session list", () => {
     }
   });
 
+  it("marks the viewer's own sessions only when the server says they're shared", () => {
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+    try {
+      mockConversations([
+        conv("owned_shared", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: true,
+        }),
+        conv("owned_private", "Claude Code", {
+          owner: "viewer@example.com",
+          shared_with_others: false,
+        }),
+        // An older server omits the field: treated as not shared.
+        conv("owned_unknown", "Claude Code", { owner: "viewer@example.com" }),
+      ]);
+      renderSidebar();
+      selectSessionFilter("all");
+
+      const sharedRow = screen.getByText("owned_shared").closest("li")!;
+      expect(within(sharedRow).getByRole("img", { name: "Shared session" })).toHaveAttribute(
+        "title",
+        "Shared with others",
+      );
+      for (const id of ["owned_private", "owned_unknown"]) {
+        const row = screen.getByText(id).closest("li")!;
+        expect(within(row).queryByRole("img", { name: "Shared session" })).toBeNull();
+      }
+    } finally {
+      viewer.mockRestore();
+    }
+  });
+
   it("keeps the shared indicator on pinned sessions across filters", () => {
     mockConversations([conv("shared_pin", "Claude Code", { owner: "other@example.com" })]);
     seedPins(["shared_pin"]);

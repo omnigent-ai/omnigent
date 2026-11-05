@@ -7731,6 +7731,18 @@
             "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
             "title": "Search Snippet"
           },
+          "shared_with_others": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the requesting user owns this session and has granted access to another user (the public link alone doesn't count). `None` when the requester isn't the owner or permissions are disabled, so the grant list never leaks to non-owners.",
+            "title": "Shared With Others"
+          },
           "status": {
             "description": "Derived session lifecycle status.",
             "enum": [
