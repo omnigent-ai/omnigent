@@ -241,7 +241,8 @@ def _refresh(probe: _LaunchProbe, cfg: Mapping[str, object]) -> None:
         # The exception's text includes the launch's arguments, which can carry credentials.
         _log.warning("The configured Claude launch %s", failure)
     except LaunchPluginsFailed as exc:
-        _log.warning("The configured Claude launch %s: %s", failure, exc)
+        failure = str(exc)
+        _log.warning("The configured Claude launch %s", failure)
     except (subprocess.SubprocessError, *CONFIG_READ_ERRORS) as exc:
         _log.warning("The configured Claude launch %s: %s", failure, describe_config_error(exc))
     finally:

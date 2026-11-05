@@ -1155,8 +1155,8 @@ def test_claude_launch_customization_triggers(
         (
             "sys.stderr.write(f'{sys.argv} failed\\n')\nsys.exit(3)\n",
             10.0,
-            "did not report its plugins",
-            "did not report its plugins: exited 3 without an init event",
+            "exited 3 without an init event",
+            "exited 3 without an init event",
         ),
         ("time.sleep(30)\n", 0.5, "timed out after 0.5s", "timed out after 0.5s"),
     ],
@@ -1451,7 +1451,7 @@ def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
     )
     missing = [
         "Claude plugins added by the configured launch are missing: the launch "
-        "did not report its plugins; see the host log for details."
+        "exited 3 without an init event; see the host log for details."
     ]
 
     def catalog() -> tuple[int, list[str]]:

@@ -544,15 +544,16 @@ def test_skill_reads_wait_for_a_claude_launch_until_its_deadline(
             plugin_discovery.claude_launch_plugin_dirs(wait=False)
         poll_until(lambda: len(entered) == 2 or None, timeout_s=10, interval_s=0.05)
         now[0] += plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S
+        within = f"did not answer within {plugin_discovery.LAUNCH_PLUGINS_DEADLINE_S:g}s"
         stalled = (
             "Claude plugins added by the configured launch are missing: the launch "
-            "did not answer within 12s; see the host log for details."
+            f"{within}; see the host log for details."
         )
         assert session_skills() == (["local"], [stalled])
         with pytest.raises(LookupError):
             read_skill_content("claude-native", "dev:review")
         assert entered == ["gated", "hung"]
-        assert caplog.text.count("did not answer within 12s") == 1
+        assert caplog.text.count(within) == 1
         generation = plugin_discovery.launch_plugins_generation()
     finally:
         resolve.set()
