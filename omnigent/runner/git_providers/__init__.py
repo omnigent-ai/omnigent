@@ -164,6 +164,10 @@ class ReviewThreadsFacet(Protocol):
         self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
     ) -> dict[str, Any]: ...
 
+    def review_changed_files(
+        self, root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    ) -> dict[str, Any]: ...
+
     def review_threads(
         self, root: str, reference: PullRequestRef, *, after: str, head_sha: str, base_sha: str
     ) -> dict[str, Any]: ...
