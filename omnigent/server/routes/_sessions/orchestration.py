@@ -19,6 +19,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from typing import Any, Literal, cast
 
+import cachetools
 import httpx
 from fastapi import (
     HTTPException,
@@ -29,7 +30,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -78,6 +79,7 @@ from omnigent.native.failure_telemetry import (
     provider_error_context_from_text,
 )
 from omnigent.native.input_diagnostics import (
+    TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
     input_attributes,
     log_input_event,
     with_input_attributes,
@@ -3593,6 +3595,213 @@ async def _settle_undelivered_native_input(
             match_method="input_stable_id",
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+
+
+# Web inputs already sent a second time after their terminal died undelivered,
+# keyed ``"<session_id>:<input_stable_id>"``; each input is re-sent at most once.
+_resent_native_inputs: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=3600.0, timer=time.monotonic)
+)
+# Sessions whose failed turn is being re-sent: the runner's failed edge for that
+# turn is dropped so the session does not report a failure the re-send recovers.
+_resending_native_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+# Stable ids currently being re-sent. Stop cancels only these, not later work.
+_active_native_input_resends: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
+# custom-lint: disable-next=workspace-scoped-cache -- task objects
+_resend_tasks: set[asyncio.Task[None]] = set()
+
+# Set at app startup: submits a server-owned message through the session event route.
+NativeInputResender = Callable[[str, SessionEventInput, str | None, bool], Awaitable[object]]
+_native_input_resender: NativeInputResender | None = None
+
+
+def _native_input_resend_was_stopped(session_id: str, stable_id: str | None) -> bool:
+    """Whether Stop landed while this exact input was being recovered."""
+    return (
+        stable_id is not None
+        and stable_id in _active_native_input_resends.get(session_id, set())
+        and session_id in _interrupt_fenced_sessions
+    )
+
+
+def set_native_input_resender(resender: NativeInputResender | None) -> None:
+    """
+    Register how the relay sends an undelivered web message again.
+
+    :param resender: Called with ``(session_id, body, created_by,
+        background_titles_enabled)`` and runs the normal message route, which
+        relaunches the terminal; ``None`` clears it.
+    :returns: None.
+    """
+    global _native_input_resender
+    _native_input_resender = resender
+
+
+async def _claim_native_input_resend(
+    conversation_store: ConversationStore,
+    session_id: str,
+    event: Mapping[str, Any],
+    runner_id: str | None,
+) -> pending_inputs.DrainedInput | None:
+    """
+    Take a failed turn's queued message back to send it once more.
+
+    Only a turn whose terminal died before any of the message was typed
+    qualifies (see :data:`pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE`),
+    and only once per input. A Stop, an already failed session or a sub-agent
+    turn keeps today's failure.
+
+    :returns: The drained entry to re-send, or ``None`` to fail the turn.
+    """
+    raw_stable_id = event.get("input_stable_id")
+    if (
+        not isinstance(raw_stable_id, str)
+        or not _failed_event_undelivered(event)
+        or _native_input_reason_code(event) != TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+    ):
+        return None
+    resend_key = f"{session_id}:{raw_stable_id}"
+    pending_id = pending_inputs.pending_id_for_stable_id(session_id, raw_stable_id)
+    refusal: str | None = None
+    if _native_input_resender is None:
+        refusal = "no_resender"
+    elif _resent_native_inputs.get(resend_key):
+        refusal = "already_resent"
+    elif session_id in _interrupt_fenced_sessions or (
+        runner_id is not None and _intentional_stop_sessions.get(session_id) == runner_id
+    ):
+        refusal = "stopped"
+    elif _session_status_cache.get(session_id) == "failed":
+        refusal = "session_failed"
+    elif pending_id is None:
+        refusal = "not_queued"
+    else:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None or conv.parent_conversation_id is not None:
+            refusal = "sub_agent"
+    drained = (
+        pending_inputs.resolve(session_id, pending_id)
+        if refusal is None and pending_id is not None
+        else None
+    )
+    if drained is not None and drained.interrupted:
+        pending_inputs.restore(session_id, drained)
+        drained, refusal = None, "stopped"
+    if drained is None:
+        _logger.info(
+            "Relay: not re-sending the undelivered native message for session=%s: %s",
+            session_id,
+            refusal or "not_queued",
+            extra={"session_id": session_id},
+        )
+        return None
+    _resent_native_inputs[resend_key] = True
+    _active_native_input_resends.setdefault(session_id, set()).add(raw_stable_id)
+    return drained
+
+
+async def _resend_native_input(
+    conversation_store: ConversationStore,
+    session_id: str,
+    drained: pending_inputs.DrainedInput,
+    failed_event: Mapping[str, Any],
+    response_id: str | None,
+) -> None:
+    """
+    Send a reclaimed message through the message route, or report its failure.
+
+    The route relaunches the terminal (Claude resumes its conversation) and
+    queues the message under its original stable id, so the web bubble stays.
+    If the send cannot start, the original failure is recorded as it would have
+    been without the re-send. If the route accepts the send but its terminal
+    cannot start, that route's own failure stands.
+    """
+    resender = _native_input_resender
+    log_input_event(
+        _logger,
+        "native_input_resend_started",
+        session_id=session_id,
+        attributes=pending_inputs.delivery_attributes(drained),
+    )
+    try:
+        if resender is None:
+            raise RuntimeError("no native input resender is registered")
+        result = await resender(
+            session_id,
+            SessionEventInput(
+                type="message",
+                data={"role": "user", "content": drained.content, "stable_id": drained.stable_id},
+            ),
+            drained.created_by,
+            drained.background_titles_enabled,
+        )
+        if not getattr(result, "accepted", True):
+            if _native_input_resend_was_stopped(session_id, drained.stable_id):
+                drained.interrupted = True
+                pending_inputs.restore(session_id, drained)
+                return
+            raise RuntimeError("native input resend was not accepted")
+    except Exception:  # noqa: BLE001 — fall back to the failure the re-send replaced
+        _logger.exception(
+            "Relay: could not re-send the undelivered native message for session=%s",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        if drained.stable_id is not None and (
+            pending_inputs.pending_id_for_stable_id(session_id, drained.stable_id) is None
+        ):
+            pending_inputs.restore(session_id, drained)
+        await _settle_undelivered_native_input(
+            conversation_store,
+            session_id,
+            response_id,
+            drained.stable_id,
+            reason_code=TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+        )
+        error_item = _error_item_from_sse(dict(failed_event), response_id=response_id)
+        if error_item is not None:
+            await _relay_persist_error_once(conversation_store, session_id, error_item)
+        raw_response = failed_event.get("response")
+        raw_error = (
+            raw_response.get("error") if isinstance(raw_response, dict) else None
+        ) or failed_event.get("error")
+        status_error = (
+            ErrorDetail.model_validate(raw_error) if isinstance(raw_error, dict) else None
+        )
+        await _persist_session_status_error_labels(
+            session_id,
+            status_error,
+            conversation_store,
+        )
+        _publish_status(
+            session_id,
+            "failed",
+            status_error,
+            response_id=response_id,
+            failure_origin="native_input_resend_failed",
+        )
+    finally:
+        if drained.stable_id is not None:
+            active = _active_native_input_resends.get(session_id)
+            if active is not None:
+                active.discard(drained.stable_id)
+                if not active:
+                    _active_native_input_resends.pop(session_id, None)
+
+
+def _spawn_native_input_resend(
+    conversation_store: ConversationStore,
+    session_id: str,
+    drained: pending_inputs.DrainedInput,
+    failed_event: Mapping[str, Any],
+    response_id: str | None,
+) -> None:
+    """Run :func:`_resend_native_input` outside the relay loop that reads its events."""
+    task = asyncio.create_task(
+        _resend_native_input(conversation_store, session_id, drained, failed_event, response_id)
+    )
+    _resend_tasks.add(task)
+    task.add_done_callback(_resend_tasks.discard)
 
 
 def _restore_drained_inputs(
@@ -8263,6 +8472,8 @@ async def _dispatch_session_event_to_runner_impl(
             conversation_store, session_id
         ):
             return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
+        if _native_input_resend_was_stopped(session_id, web_stable_id):
+            return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
         pending_id: str | None = (
             pending_inputs.record(
                 session_id,
@@ -8402,6 +8613,10 @@ async def _dispatch_session_event_to_runner_impl(
         # dropping the first message). model_override alone is applied only
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
+        if _native_input_resend_was_stopped(session_id, web_stable_id):
+            if pending_id is not None:
+                pending_inputs.mark_interrupted(session_id, [pending_id])
+            return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, accepted=False)
         forwarded = False
         try:
             if pending_id is not None:
@@ -9312,6 +9527,37 @@ async def _relay_runner_stream_once(
                         continue
 
                     _record_native_input_lifecycle(session_id, event)
+
+                    if evt_type == "response.failed":
+                        resend_input = await _claim_native_input_resend(
+                            conversation_store, session_id, event, runner_id
+                        )
+                        if resend_input is not None:
+                            # Nothing reached the terminal: send the message again
+                            # instead of recording this turn's failure.
+                            _resending_native_sessions.add(session_id)
+                            _spawn_native_input_resend(
+                                conversation_store,
+                                session_id,
+                                resend_input,
+                                event,
+                                current_response_id,
+                            )
+                            current_response_id = None
+                            continue
+                    elif evt_type == "session.status" and session_id in _resending_native_sessions:
+                        raw_status_error = event.get("error")
+                        if event.get("status") == "running":
+                            _resending_native_sessions.discard(session_id)
+                        elif (
+                            event.get("status") == "failed"
+                            and isinstance(raw_status_error, dict)
+                            and raw_status_error.get("code")
+                            == TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+                        ):
+                            # The failed turn's own status edge; the re-send replaces it.
+                            _resending_native_sessions.discard(session_id)
+                            continue
 
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"

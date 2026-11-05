@@ -72,7 +72,10 @@ from omnigent.harness_plugins import (
 )
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
-from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.input_diagnostics import (
+    TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+    input_attributes,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -1539,6 +1542,10 @@ def create_runner_app(
     _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
+    # Sessions whose last turn ended because Claude's terminal died before the
+    # message was typed; the server sends that message again, so the terminal's
+    # exit is not reported as the session failing.
+    _turns_ended_before_delivery: set[str] = set()
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -2131,6 +2138,46 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        if event.terminal_name == "claude" and (
+            event.session_id in _live_response_id
+            or event.session_id in _turns_ended_before_delivery
+        ):
+            # Claude's live turn may still report that its message was never
+            # typed; the server then sends it again, so wait for that turn.
+            task = asyncio.create_task(
+                _fail_after_turn_settles(event, error, diagnosis),
+                name=f"required-terminal-exit:{event.session_id}",
+            )
+            task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(task)
+            return
+        _fail_turn_for_terminal_exit(event, error, diagnosis)
+
+    async def _fail_after_turn_settles(
+        event: TerminalExitEvent, error: dict[str, str], diagnosis: FailureDiagnosis | None
+    ) -> None:
+        """Fail the session for a Claude terminal exit unless its turn ended undelivered."""
+        deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+        while event.session_id in _live_response_id and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+        if event.session_id not in _turns_ended_before_delivery:
+            _fail_turn_for_terminal_exit(event, error, diagnosis)
+            return
+        _turns_ended_before_delivery.discard(event.session_id)
+        _logger.info(
+            "required terminal %s exited before its message was typed; the server "
+            "sends it again: session=%s",
+            event.terminal_name,
+            event.session_id,
+            extra={"session_id": event.session_id},
+        )
+        _native_interrupt_runner.clear_pending_interrupt(event.session_id)
+        _release_required_terminal_session(event.session_id)
+
+    def _fail_turn_for_terminal_exit(
+        event: TerminalExitEvent, error: dict[str, str], diagnosis: FailureDiagnosis | None
+    ) -> None:
+        """Report a required terminal's exit as the session's turn failure."""
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
         exit_log["attributes"] = {
             **{
@@ -2320,7 +2367,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001 - legacy model fallback is best-effort
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -4185,6 +4232,8 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _turn_pending_ids.pop(conv_id, None)
+        if error is not None and error.get("code") == TERMINAL_EXITED_BEFORE_DELIVERY_CODE:
+            _turns_ended_before_delivery.add(conv_id)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
         # `response.compaction.completed` produced no compaction (nothing to
@@ -4381,7 +4430,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - interrupt delivery remains best-effort
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -5317,7 +5366,7 @@ def create_runner_app(
                                     registry.seed_snapshot(
                                         change.path, original, session_id=_captured_session_id
                                     )
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - preserve change recording on recovery failure
                             _logger.warning(
                                 "native original recovery failed for session=%s path=%r",
                                 _captured_session_id,
@@ -5331,7 +5380,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - keep file-change recovery best-effort
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -6137,6 +6186,7 @@ def create_runner_app(
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
         _clean_terminal_exit_responses.pop(conv_id, None)
+        _turns_ended_before_delivery.discard(conv_id)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -8409,7 +8459,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:
+            except Exception:  # noqa: BLE001 - reconnect continues after resync failure
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,
