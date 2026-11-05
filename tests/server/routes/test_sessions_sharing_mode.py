@@ -595,6 +595,7 @@ async def test_restricted_blocks_home_or_root_session_even_read(
         )
         assert resp.status_code == 403, resp.text
         assert "cannot be shared" in resp.text.lower()
+        assert "fork the session into a project folder" in resp.text.lower()
 
 
 async def test_restricted_allows_read_on_normal_session(db_uri: str, tmp_path: Path) -> None:

@@ -28,6 +28,8 @@ export interface ForkDialogContextValue {
     sourceSessionId?: string;
     upToResponseId?: string;
     workspaceRecovery?: boolean;
+    /** Fork out of an unshareable home/root directory into a picked folder. */
+    pickShareableDirectory?: boolean;
   }) => void;
 }
 

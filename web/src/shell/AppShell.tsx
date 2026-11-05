@@ -592,6 +592,7 @@ function AppShellImpl() {
   // opens fresh or closes, so a later Clone doesn't silently truncate.
   const [forkUpToResponseId, setForkUpToResponseId] = useState<string | null>(null);
   const [forkWorkspaceRecovery, setForkWorkspaceRecovery] = useState(false);
+  const [forkPickShareableDirectory, setForkPickShareableDirectory] = useState(false);
   // Agent tools & policies dialog — the mobile counterpart of the desktop
   // AgentInfoButton popover, opened from the header's three-dot menu.
   const [agentInfoOpen, setAgentInfoOpen] = useState(false);
@@ -2519,6 +2520,7 @@ function AppShellImpl() {
         setForkHostSessionId(sourceSessionId ? (serverConversationId ?? null) : null);
         setForkUpToResponseId(opts?.upToResponseId ?? null);
         setForkWorkspaceRecovery(opts?.workspaceRecovery ?? false);
+        setForkPickShareableDirectory(opts?.pickShareableDirectory ?? false);
         setForkOpen(true);
       },
     }),
@@ -2947,13 +2949,19 @@ function AppShellImpl() {
               workspace={activeSession?.workspace ?? activeConv?.workspace}
               open={shareOpen}
               onOpenChange={setShareOpen}
+              onForkIntoAnotherFolder={
+                canClone
+                  ? () => forkDialogContextValue.openForkDialog({ pickShareableDirectory: true })
+                  : undefined
+              }
+              forkDisabledReason={forkDisabledReason}
             />
           )}
           {effectiveForkSourceSessionId && forkSourceReady && (
             <ForkSessionDialog
               // Remount per source so source-derived form defaults reset when
               // a side-chat bubble opens the app-wide dialog.
-              key={`fork-session-dialog-${effectiveForkSourceSessionId}-${forkWorkspaceRecovery}`}
+              key={`fork-session-dialog-${effectiveForkSourceSessionId}-${forkWorkspaceRecovery}-${forkPickShareableDirectory}`}
               sourceSessionId={effectiveForkSourceSessionId}
               sourceTitle={forkSourceSession?.title}
               sourceWorkspace={
@@ -2971,6 +2979,7 @@ function AppShellImpl() {
               sourceGitBranch={forkSourceSession?.gitBranch}
               upToResponseId={forkUpToResponseId}
               workspaceRecovery={forkWorkspaceRecovery}
+              pickShareableDirectory={forkPickShareableDirectory}
               open={forkOpen}
               onOpenChange={(open) => {
                 setForkOpen(open);
@@ -2979,6 +2988,7 @@ function AppShellImpl() {
                 if (!open) {
                   setForkUpToResponseId(null);
                   setForkWorkspaceRecovery(false);
+                  setForkPickShareableDirectory(false);
                 }
               }}
             />

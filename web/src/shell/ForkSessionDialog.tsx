@@ -92,6 +92,7 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { workspaceSharingBlocked } from "@/lib/permissionsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
@@ -146,6 +147,9 @@ const FORK_FIELD_IDS: Record<ForkField, string> = {
   sandboxRepo: "fork-session-sandbox-repo-input",
   sandboxProfile: "fork-session-sandbox-profile",
 };
+
+const UNSHAREABLE_DIRECTORY_MESSAGE =
+  "Home and root directories can't be shared on this server. Pick a project folder.";
 
 function ForkFieldError({ message }: { message: string | null }) {
   if (message === null) return null;
@@ -790,6 +794,7 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  pickShareableDirectory = false,
   visible,
   onClose,
 }: {
@@ -800,6 +805,8 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  /** Fork out of an unshareable home/root directory: require a different folder. */
+  pickShareableDirectory?: boolean;
   visible: boolean;
   onClose: () => void;
 }) {
@@ -1123,7 +1130,15 @@ function SupportedForkSessionForm({
   // as its ORIGINAL repo + the source branch in the worktree field (the pair
   // its workspace was created from), not the raw worktree path.
   useEffect(() => {
-    if (workspaceRecovery || !onSourceHost || dirSeededRef.current || !sourceWorkspace) return;
+    if (
+      workspaceRecovery ||
+      pickShareableDirectory ||
+      !onSourceHost ||
+      dirSeededRef.current ||
+      !sourceWorkspace
+    ) {
+      return;
+    }
     dirSeededRef.current = true;
     if (sourceRepo !== null && sourceBranch !== null) {
       setWorkspace(sourceRepo);
@@ -1131,7 +1146,14 @@ function SupportedForkSessionForm({
     } else {
       setWorkspace(sourceWorkspace);
     }
-  }, [workspaceRecovery, onSourceHost, sourceWorkspace, sourceRepo, sourceBranch]);
+  }, [
+    workspaceRecovery,
+    pickShareableDirectory,
+    onSourceHost,
+    sourceWorkspace,
+    sourceRepo,
+    sourceBranch,
+  ]);
 
   // Repository the SOURCE ran in, when it was itself a sandbox session.
   // Recorded by the server on the managed create and copied onto the fork.
@@ -1263,6 +1285,7 @@ function SupportedForkSessionForm({
   // Directory the clone will actually start in — feeds the conflict check,
   // the reuse-dir tooltip, the pre-flight, and the launch itself.
   const effectiveWorkspace = usingSourceWorktree ? (sourceWorkspaceNorm ?? "") : workspaceTrimmed;
+  const unshareableDirectory = !sandboxSelected && workspaceSharingBlocked(effectiveWorkspace);
   // The picked host must still be ONLINE, not merely selected: hosts refetch
   // periodically, so a previously-picked host can go offline while selected.
   // Gating on online-ness keeps the button greyed (and avoids a launchRunner
@@ -1383,6 +1406,9 @@ function SupportedForkSessionForm({
               : "Enter an absolute path, like /home/you/project or ~/project.",
       };
     }
+    if (pickShareableDirectory && unshareableDirectory) {
+      return { field: "directory", message: UNSHAREABLE_DIRECTORY_MESSAGE };
+    }
     return null;
   })();
   const canSubmit = submitBlocker === null && !sandboxBranchesPending;
@@ -1433,7 +1459,7 @@ function SupportedForkSessionForm({
   // On a DIFFERENT host than the source nothing prefills the directory, so it
   // must be picked: show it at the top level instead of inside Advanced. On
   // the source host it stays under Advanced (the prefill needs no input).
-  const directoryAtTop = workspaceRecovery || onDifferentHost;
+  const directoryAtTop = workspaceRecovery || pickShareableDirectory || onDifferentHost;
 
   // Mismatched-directory warning: the transcript's file references were
   // grounded in the source's directory ON the source's host. A different
@@ -1452,12 +1478,15 @@ function SupportedForkSessionForm({
         // the same lineage as its worktree — not a mismatch.
         (sourceRepo === null || workspaceTrimmed !== sourceRepo)));
 
-  // Default state: a coding clone on the source host still pointed at the
-  // source's directory. Drives the "reuses the original's working directory"
-  // indicator, which explains the default without forcing Advanced open. On a
-  // different host this is false (the mismatch warning takes over instead).
+  // A coding clone on the source host still pointed at the source's directory;
+  // drives the "reuses the original" hint. False on another host (mismatch
+  // warning instead) and in modes that must leave the source's folder.
   const usingSourceDir =
-    !workspaceRecovery && onSourceHost && workspaceTrimmed !== "" && !showMismatchWarning;
+    !workspaceRecovery &&
+    !pickShareableDirectory &&
+    onSourceHost &&
+    workspaceTrimmed !== "" &&
+    !showMismatchWarning;
 
   function commitWorkspacePath(path: string): void {
     setWorkspace(path);
@@ -1657,6 +1686,18 @@ function SupportedForkSessionForm({
                 The original session ran on a different host, so pick a directory on this one.
               </p>
             )}
+          {pickShareableDirectory && fieldError("directory") === null && (
+            <p
+              className={
+                unshareableDirectory ? "text-sm text-destructive" : "text-sm text-muted-foreground"
+              }
+              data-testid="fork-session-shareable-dir-hint"
+            >
+              {unshareableDirectory
+                ? UNSHAREABLE_DIRECTORY_MESSAGE
+                : "Pick a project folder, not your home folder or /."}
+            </p>
+          )}
           <WorkspacePathField
             hostId={selectedHostId}
             value={workspace}
@@ -2199,6 +2240,8 @@ function SupportedForkSessionForm({
  * @param upToResponseId - Truncation point for a "fork from here" opened
  *   from a message's actions: the fork copies history only up to and
  *   including this response. `null` / omitted clones the full history.
+ * @param pickShareableDirectory - Opened from the Share dialog's blocked-folder
+ *   banner: asks for a new directory and rejects a home or root directory.
  * @param open - Whether the dialog is visible.
  * @param onOpenChange - Visibility setter (Radix-controlled).
  */
@@ -2210,6 +2253,7 @@ export function ForkSessionDialog({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  pickShareableDirectory = false,
   open,
   onOpenChange,
 }: {
@@ -2220,6 +2264,7 @@ export function ForkSessionDialog({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  pickShareableDirectory?: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -2233,6 +2278,21 @@ export function ForkSessionDialog({
   }${
     sourceWorkspace ? ", then starts it on the host and directory you pick" : ""
   }. Comments aren't copied, and changes in the clone won't affect the original.`;
+  // Mode precedence: recovery, then shareable-folder, then a plain clone.
+  let title = truncated ? "Fork from this response" : "Clone session";
+  let description = cloneDescription;
+  let descriptionVisible = false;
+  if (workspaceRecovery) {
+    title = "Continue in another directory";
+    description =
+      "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.";
+    descriptionVisible = true;
+  } else if (pickShareableDirectory) {
+    title = "Fork into a different folder";
+    description =
+      "This server can't share a session that runs in a home or root directory. The fork keeps this conversation's history and starts in the folder you pick. Share the fork once it opens.";
+    descriptionVisible = true;
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -2242,11 +2302,7 @@ export function ForkSessionDialog({
       >
         <DialogHeader>
           <DialogTitle className="flex items-center gap-1.5">
-            {workspaceRecovery
-              ? "Continue in another directory"
-              : truncated
-                ? "Fork from this response"
-                : "Clone session"}
+            {title}
             <Tooltip>
               <TooltipTrigger asChild>
                 <button
@@ -2266,10 +2322,8 @@ export function ForkSessionDialog({
               <TooltipContent>{cloneDescription}</TooltipContent>
             </Tooltip>
           </DialogTitle>
-          <DialogDescription className={workspaceRecovery ? undefined : "sr-only"}>
-            {workspaceRecovery
-              ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
-              : cloneDescription}
+          <DialogDescription className={descriptionVisible ? undefined : "sr-only"}>
+            {description}
           </DialogDescription>
         </DialogHeader>
         <ForkSessionForm
@@ -2280,6 +2334,7 @@ export function ForkSessionDialog({
           sourceGitBranch={sourceGitBranch}
           upToResponseId={upToResponseId}
           workspaceRecovery={workspaceRecovery}
+          pickShareableDirectory={pickShareableDirectory}
           visible={open}
           onClose={() => onOpenChange(false)}
         />

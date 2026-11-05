@@ -88,7 +88,7 @@ export const PublicReadOnly: Story = {
 };
 
 export const RestrictedHomeDirectory: Story = {
-  args: { workspace: "/home/alice" },
+  args: { workspace: "/home/alice", onForkIntoAnotherFolder: () => undefined },
   decorators: [
     modalEnvironment({
       mode: "restricted_read_only",

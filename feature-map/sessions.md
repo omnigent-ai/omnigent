@@ -83,6 +83,11 @@ the header menu), and each place is a separate entry point.
   Closing the dialog mid-clone keeps the clone running: a toast reports it
   (with **Open** on success), and reopening the dialog shows it again.
   Dismissing that toast stops tracking the clone, so a new one can start.
+- `fork-shareable-folder`: when restricted sharing blocks a home or root
+  workspace, the Share dialog (header or sidebar row) shows a banner with
+  **Fork into a different folder**. It opens the fork dialog with an empty
+  directory field that refuses home and root folders; the fork keeps the
+  history, and you then share it from its own Share dialog.
 - `fork-custom-agent`: switch to one of your custom agents (installed, imported,
   or discovered from an existing session), as well as to a built-in agent; the
   fork uses the chosen agent.
@@ -309,6 +314,14 @@ preselected. Search connected GitHub repositories or paste a repository URL,
 choose a branch for each, and remove any repositories the clone does not need.
 Removing every repository starts an empty sandbox. The phone header's Fork
 action offers the same choices.
+
+**Fork into a shareable folder:** on a server with
+`OMNIGENT_SHARING_MODE=restricted_read_only`, open a session whose workspace is
+a home or root folder and choose Share from the header or the sidebar row menu.
+The banner names the folder; **Fork into a different folder** closes Share and
+opens the fork dialog with an empty directory field. A home or root path turns
+the hint red and blocks submit. Pick a project folder, submit, then share the
+fork from its own header Share.
 
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers

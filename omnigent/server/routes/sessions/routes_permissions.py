@@ -134,7 +134,9 @@ def register_permissions_routes(
             if _conv is not None and workspace_sharing_blocked(_conv.workspace):
                 raise OmnigentError(
                     "This session's working directory (a home or root directory) "
-                    "cannot be shared on this Omnigent server.",
+                    "cannot be shared on this Omnigent server. Fork the session into "
+                    "a project folder and share the fork instead; the fork keeps the "
+                    "conversation history.",
                     code=ErrorCode.FORBIDDEN,
                 )
         if (
