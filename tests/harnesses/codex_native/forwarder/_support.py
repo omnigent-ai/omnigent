@@ -142,6 +142,8 @@ async def _deliver_to_parent(
     bridge_dir: Path,
     state: fwd._CodexForwarderState,
     event: dict[str, Any],
+    *,
+    codex_client: Any = None,
 ) -> None:
     """
     Deliver one Codex notification to the parent session ``conv_x``.
@@ -150,6 +152,8 @@ async def _deliver_to_parent(
     :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
     :param state: Forwarder state for the connection under test.
     :param event: Codex notification envelope for thread ``thread_123``.
+    :param codex_client: App-server stub for requests the event triggers, e.g.
+        a terminal listing after a turn ends. ``None`` when none is needed.
     :returns: None.
     """
     await fwd._handle_event(
@@ -160,5 +164,63 @@ async def _deliver_to_parent(
         usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
         elicitation_tracker=fwd._CodexElicitationTaskTracker(),
         expected_thread_id="thread_123",
+        codex_client=codex_client,
         forwarder_state=state,
     )
+
+
+def _status_post(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """
+    Return the recorded post for one ``external_session_status`` edge.
+
+    :param data: Expected status data, e.g. ``{"status": "idle"}``.
+    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
+    """
+    return ("/v1/sessions/conv_x/events", {"type": "external_session_status", "data": data})
+
+
+def _background_work_post(running: bool) -> tuple[str, dict[str, Any]]:
+    """
+    Return the recorded post for one ``external_background_work`` event.
+
+    :param running: Flag value, e.g. ``True``.
+    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
+    """
+    return (
+        "/v1/sessions/conv_x/events",
+        {"type": "external_background_work", "data": {"running": running}},
+    )
+
+
+def _turn_started(turn_id: str) -> dict[str, Any]:
+    """
+    Build a Codex ``turn/started`` envelope for the parent thread.
+
+    :param turn_id: Turn that began, e.g. ``"turn_2"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "turn/started",
+        "params": {"threadId": "thread_123", "turn": {"id": turn_id, "items": []}},
+    }
+
+
+def _turn_completed(turn_id: str, status: str) -> dict[str, Any]:
+    """
+    Build a Codex ``turn/completed`` envelope for the parent thread.
+
+    :param turn_id: Turn that ended, e.g. ``"turn_1"``.
+    :param status: Turn status, e.g. ``"completed"`` or ``"failed"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turn": {
+                "id": turn_id,
+                "status": status,
+                "items": [{"type": "agentMessage", "id": "item_1", "text": "done"}],
+            },
+        },
+    }
