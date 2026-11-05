@@ -13,31 +13,12 @@ from typing import Any
 import httpx
 
 from tests._helpers.polling import poll_until
+from tests._helpers.session import send_user_text as _send_user_message
 from tests.e2e.test_host_claude_native_e2e import (
     _assistant_text,
     _poll_for_assistant_marker,
     _spawn_host_daemon,
 )
-
-
-def _send_user_message(client: httpx.Client, *, session_id: str, text: str) -> None:
-    """
-    Inject a user message into a claude-native session.
-
-    :param client: HTTP client pointed at the test server.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :param text: The message body to type into Claude's terminal.
-    :returns: None.
-    """
-    resp = client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        },
-        timeout=30.0,
-    )
-    resp.raise_for_status()
 
 
 def _builtin_agent_id(client: httpx.Client, name: str) -> str:
