@@ -69,7 +69,8 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { SideChatPicker } from "./SideChatPicker";
+import { useQuery } from "@tanstack/react-query";
+import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
@@ -964,6 +965,26 @@ function WorkspacePanelImpl({
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
   const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
+  const discoverSideChats = !pending && supportsSideChat(sideChatHarness, canStartSideChat);
+  const { data: savedSideChats } = useQuery({
+    queryKey: ["conversation", conversationId, "side_chats"],
+    queryFn: async ({ signal }): Promise<{ id: string }[]> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/side_chats?limit=20`,
+        { signal },
+      );
+      if (response.status === 404) return [];
+      if (!response.ok) throw new Error("Could not load side chats");
+      return (await response.json()).data;
+    },
+    enabled: discoverSideChats,
+  });
+  const restoreSideChats = sideChats.restore;
+  useEffect(() => {
+    if (savedSideChats && discoverSideChats) {
+      restoreSideChats(savedSideChats.map((chat) => chat.id));
+    }
+  }, [savedSideChats, discoverSideChats, restoreSideChats]);
   const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
         useChatStore.getState().requestSideChatFocus(sideChats.openPending());
@@ -1228,17 +1249,6 @@ function WorkspacePanelImpl({
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
-  const sideChatPicker = supportsSideChat(sideChatHarness, canStartSideChat) && !pending && (
-    <SideChatPicker
-      key={conversationId}
-      conversationId={conversationId}
-      onOpen={(childId) => {
-        sideChats.open(childId);
-        onRightRailTabChange("sidechat");
-        onReveal?.();
-      }}
-    />
-  );
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
       conversationId={conversationId}
@@ -1742,7 +1752,6 @@ function WorkspacePanelImpl({
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
             {showOpenTabs && newTabMenu("end")}
-            {sideChatPicker}
             {panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
@@ -1982,7 +1991,6 @@ function WorkspacePanelImpl({
                 </div>
               );
             })}
-            {sideChatPicker}
             {onNewSideChat && (
               <Button
                 type="button"

@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -1487,6 +1488,71 @@ describe("WorkspacePanel browser tab", () => {
 });
 
 describe("WorkspacePanel restored side chats", () => {
+  it.each([false, true])("automatically adds saved side-chat tabs (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      sideChatAllowed: true,
+    });
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ data: [{ id: "remote-side" }], has_more: true, last_id: "remote-side" }),
+        ),
+      );
+    try {
+      const view = renderWorkspace({ queryClient, mobileSideChatsOpen: mobile });
+      const container = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      const tab = await within(container).findByRole("tab", { name: "Side chat 1" });
+      expect(screen.queryByRole("button", { name: "Browse side chats" })).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledWith(
+        "/v1/sessions/conv_ws/side_chats?limit=20",
+        expect.anything(),
+      );
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      expect(view.onReveal).not.toHaveBeenCalled();
+      fireEvent.click(tab);
+      if (!mobile) view.rerender({ rightRailTab: "sidechat" });
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("remote-side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
+      expect(fetch.mock.calls.filter(([url]) => String(url).includes("/side_chats"))).toHaveLength(
+        1,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
+  it.each([404, 500])("keeps local tabs when discovery returns %s", async (status) => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["local-side"],
+      selectedSideChatId: "local-side",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], { id: "conv_ws", sideChatAllowed: true });
+    vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(new Response("{}", { status }));
+    try {
+      renderWorkspace({ queryClient, rightRailTab: "sidechat" });
+      await waitFor(() =>
+        expect(
+          queryClient.isFetching({ queryKey: ["conversation", "conv_ws", "side_chats"] }),
+        ).toBe(0),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("local-side");
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual(["local-side"]);
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
   it("restores the selected Codex child without overriding the pane's permissions", () => {
     const before = useChatStore.getState();
     useChatStore.setState({ sessionHarness: "codex-native" });

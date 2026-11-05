@@ -488,7 +488,7 @@ def test_side_chat_model_settings_before_and_after_first_message(
     contract.json(path, patch, method="PATCH")
     contract.json(f"{path}/events", message, method="POST")
     contract.json(f"{path}/agent", chat._agent())
-    for resource in ("items", "child_sessions", "resources/terminals"):
+    for resource in ("items", "child_sessions", "side_chats", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")
     contract.route(f"**{path}/stream*", chat.route_stream)
