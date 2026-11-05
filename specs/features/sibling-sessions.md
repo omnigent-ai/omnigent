@@ -138,6 +138,9 @@ attempts cannot replace the winner. Failed recovery detaches a generation only
 if its credential, heartbeat and offline status still match; a late successful
 connection is preserved. Pending teardown retries run even when optional
 age-based offline reaping is disabled.
+Before provisioning, recovery finishes recorded sandbox terminations. A cleanup
+failure returns a retryable error without allocating new compute, keeping the
+existing pending-termination slot available for a failed replacement.
 
 Managed-sandbox worktrees remain until sandbox teardown, including when optional
 worktree cleanup is requested, so concurrent admissions cannot lose files.

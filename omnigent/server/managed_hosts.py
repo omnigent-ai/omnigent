@@ -4111,16 +4111,24 @@ async def _relaunch_managed_host(
     entry = config.recorded(host.sandbox_provider)
     await _select_launch_profile(launcher, entry, host.user_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
-    # The old generation is normally already dead (that is why we are
-    # here), but terminate defensively so a transient tunnel outage
-    # can never leave two live sandboxes claiming one host identity.
-    if host.sandbox_id is not None:
-        await _terminate_sandbox_best_effort(
+    # ponytail: one pending cleanup slot; drain recorded generations before replacing them.
+    for sandbox_id in dict.fromkeys((host.terminating_sandbox_id, host.sandbox_id)):
+        if sandbox_id is None:
+            continue
+        if not await _terminate_sandbox_best_effort(
             launcher,
-            host.sandbox_id,
+            sandbox_id,
             host_id=host.host_id,
             provider=host.sandbox_provider,
-        )
+        ):
+            raise HTTPException(
+                status_code=502,
+                detail="Previous managed sandbox cleanup failed; retry recovery",
+            )
+        if sandbox_id == host.terminating_sandbox_id:
+            await asyncio.to_thread(
+                host_store.mark_sandbox_terminated, host.host_id, sandbox_id=sandbox_id
+            )
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)

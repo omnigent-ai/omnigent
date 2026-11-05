@@ -3230,7 +3230,9 @@ class _ReusedIdFakeLauncher(FakeSandboxLauncher):
         return name
 
 
-async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str) -> None:
+async def test_relaunch_rejects_pending_reused_id_then_allows_retry(
+    db_uri: str, monkeypatch
+) -> None:
     host_store = HostStore(db_uri)
 
     def _register(invocation: HostStartInvocation) -> None:
@@ -3253,12 +3255,19 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     )
     pending = host_store.get_host(active.host_id)
     assert pending is not None
+    terminate = fake.terminate
+
+    def unavailable(sandbox_id):
+        raise RuntimeError("provider cleanup unavailable")
+
+    monkeypatch.setattr(fake, "terminate", unavailable)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=pending, host_store=host_store)
 
-    assert exc.value.status_code == 409
-    assert "host lifecycle" in exc.value.detail
+    assert exc.value.status_code == 502
+    assert "cleanup failed" in exc.value.detail
+    assert len(fake.provisioned_names) == 1
     assert len(fake.host_starts) == 1
     assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
@@ -3266,6 +3275,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     assert still_pending.sandbox_id is None
     assert still_pending.terminating_sandbox_id == active.name
 
+    monkeypatch.setattr(fake, "terminate", terminate)
     reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
     assert await reaper.sweep_once() == 1
     assert fake.terminated == [active.name]
@@ -3336,15 +3346,19 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
 
 
 @pytest.mark.parametrize(
-    "connected_then_failed,cleanup_error",
-    [(False, None), (True, None)]
+    "connected_then_failed,cleanup_error,pending_cleanup",
+    [(False, None, None), (True, None, None), (True, None, "ready"), (True, None, "blocked")]
     + [
-        (True, method)
+        (True, method, None)
         for method in ("get_host", "detach_stale_managed_sandbox", "mark_sandbox_terminated")
     ],
 )
 async def test_relaunch_failure_keeps_host_row_and_revokes_token(
-    db_uri: str, monkeypatch, connected_then_failed: bool, cleanup_error: str | None
+    db_uri: str,
+    monkeypatch,
+    connected_then_failed: bool,
+    cleanup_error: str | None,
+    pending_cleanup,
 ) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
@@ -3385,6 +3399,20 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     gen1 = host_store.get_host(first.host_id)
     assert gen1 is not None
+    if pending_cleanup:
+        host_store.set_offline(gen1.host_id)
+        gen1 = host_store.get_host(gen1.host_id)
+        assert host_store.detach_stale_managed_sandbox(
+            gen1.host_id, sandbox_id=gen1.sandbox_id, expected_updated_at=gen1.updated_at
+        )
+        gen1 = host_store.get_host(gen1.host_id)
+    terminate = fake.terminate
+    if pending_cleanup == "blocked":
+
+        def fail_termination(sandbox_id):
+            raise RuntimeError("provider cleanup unavailable")
+
+        monkeypatch.setattr(fake, "terminate", fail_termination)
 
     fail_launch = True
     fake.fail_on_host_start = not connected_then_failed
@@ -3392,6 +3420,13 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(
         await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
 
     assert exc.value.status_code == 502
+    if pending_cleanup == "blocked":
+        assert "cleanup failed" in exc.value.detail
+        assert len(fake.provisioned_names) == 1
+        assert host_store.get_host(first.host_id).terminating_sandbox_id == "sb-fake-1"
+        monkeypatch.setattr(fake, "terminate", terminate)
+        with pytest.raises(HTTPException) as exc:
+            await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
     if connected_then_failed:
         assert "Host disconnected during startup" in exc.value.detail
     host = host_store.get_host(first.host_id)
