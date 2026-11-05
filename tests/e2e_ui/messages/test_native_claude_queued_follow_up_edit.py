@@ -1,5 +1,6 @@
 """Editing a queued follow-up keeps the GUI chat and the Claude Code TUI in sync."""
 
+import json
 import shutil
 import subprocess
 import uuid
@@ -10,10 +11,16 @@ import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.polling import poll_until
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, reset_mock_llm, set_fallback_mock_llm
 
-from .test_message_render_parity import _USER, _ensure_chat_view
-from .test_native_claude_render_parity import _CLAUDE_MOCK_MODEL, _pane_text, _tmux_advert
+from .test_message_render_parity import _USER, _WORKING, _ensure_chat_view
+from .test_native_claude_render_parity import (
+    _CLAUDE_MOCK_MODEL,
+    _pane_text,
+    _queued_input_texts,
+    _tmux_advert,
+)
 
 _QUEUED_HINT = "Press up to edit queued messages"
 
@@ -80,7 +87,7 @@ def _queue_gui_follow_up(
 
 
 def _expect_claude_answers_only_the_edit(
-    page: Page, mock_llm_server_url: str, tokens: dict[str, str]
+    page: Page, base_url: str, session_id: str, mock_llm_server_url: str, tokens: dict[str, str]
 ) -> None:
     reply = page.get_by_text(f"reply {tokens['edited']}")
 
@@ -90,6 +97,16 @@ def _expect_claude_answers_only_the_edit(
         return reply.count() > 0
 
     poll_until(answered, timeout_s=90)
+    # Let the queue drain so a later answer to the original would still be caught.
+    expect(page.locator(_WORKING)).to_have_count(0, timeout=60_000)
+    poll_until(
+        lambda: (
+            not _queued_input_texts(base_url, session_id)
+            and _QUEUED_HINT not in _pane_text(base_url, session_id)
+        ),
+        timeout_s=30,
+    )
+    assert tokens["original"] not in json.dumps(get_mock_requests(mock_llm_server_url))
     expect(page.get_by_text(f"reply {tokens['original']}")).to_have_count(0)
     expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1)
     expect(page.locator(_USER, has_text=tokens["original"])).to_have_count(0)
@@ -129,7 +146,7 @@ def test_tui_edit_of_queued_follow_up_updates_the_gui_bubble(
 
     expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1, timeout=20_000)
     expect(page.locator(_USER, has_text=tokens["original"])).to_have_count(0)
-    _expect_claude_answers_only_the_edit(page, mock_llm_server_url, tokens)
+    _expect_claude_answers_only_the_edit(page, base_url, session_id, mock_llm_server_url, tokens)
 
 
 @pytest.mark.nightly
@@ -157,4 +174,4 @@ def test_gui_arrow_up_edit_of_queued_follow_up_replaces_it_in_the_tui(
     expect(page.locator(_USER, has_text="Then summarize")).to_have_count(1, timeout=20_000)
     expect(page.locator(_USER, has_text=tokens["edited"])).to_have_count(1)
     assert tokens["original"] not in _squashed(_pane_text(base_url, session_id))
-    _expect_claude_answers_only_the_edit(page, mock_llm_server_url, tokens)
+    _expect_claude_answers_only_the_edit(page, base_url, session_id, mock_llm_server_url, tokens)

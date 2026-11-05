@@ -1257,6 +1257,7 @@ def build_native_controls(
                 bridge_dir,
                 original=original,
                 replacement=replacement,
+                deadline=deadline.at,
             )
         except ClaudeQueuedMessageMissing:
             return JSONResponse(status_code=409, content={"error": "queued_message_missing"})

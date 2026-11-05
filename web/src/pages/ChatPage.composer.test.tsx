@@ -6783,6 +6783,7 @@ describe("Composer — editing Claude Code's queued messages", () => {
       sessionStatus: "running",
       sessionHarness: "claude-native",
       queuedMessages: [],
+      queuedInputEdits: {},
       pendingUserMessages: [
         {
           tempId: "tmp_1",
@@ -6829,28 +6830,38 @@ describe("Composer — editing Claude Code's queued messages", () => {
     fireEvent.keyDown(textarea(), { key: "Enter" });
   }
 
-  it.each([
-    [["message", "queued_message_edit"], QUEUED_TEXT],
-    [["message"], "Earlier prompt"],
-  ])("Up with server events %j recalls %j", (sessionEventTypes, recalled) => {
+  const editApplied = (text: string) =>
+    handleSessionEvent({
+      type: "session_input_edited",
+      pendingId: "pending_1",
+      content: [{ type: "input_text", text }],
+      mergedPendingIds: [],
+    });
+
+  it("Up edits the queued message and keeps the edit in prompt history", () => {
     appendPromptHistoryEntry("Earlier prompt", CONV);
-    const { editQueuedMessage, onSend } = renderComposer(sessionEventTypes);
+    const { editQueuedMessage, onSend } = renderComposer();
+
+    recallAndSubmit(EDITED_TEXT);
+
+    expect(editQueuedMessage).toHaveBeenCalledExactlyOnceWith("pending_1", EDITED_TEXT);
+    expect(onSend).not.toHaveBeenCalled();
+    act(() => useChatStore.setState({ pendingUserMessages: [] }));
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue(EDITED_TEXT);
+  });
+
+  it("Up recalls prompt history when the server can't edit queued messages", () => {
+    appendPromptHistoryEntry("Earlier prompt", CONV);
+    const { editQueuedMessage, onSend } = renderComposer(["message"]);
 
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
-    expect(textarea()).toHaveValue(recalled);
-    fireEvent.change(textarea(), { target: { value: `${recalled} edited` } });
+    expect(textarea()).toHaveValue("Earlier prompt");
+    fireEvent.change(textarea(), { target: { value: "Earlier prompt edited" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
 
-    if (recalled === QUEUED_TEXT) {
-      expect(editQueuedMessage).toHaveBeenCalledExactlyOnceWith(
-        "pending_1",
-        `${QUEUED_TEXT} edited`,
-      );
-      expect(onSend).not.toHaveBeenCalled();
-    } else {
-      expect(editQueuedMessage).not.toHaveBeenCalled();
-      expect(onSend).toHaveBeenCalledExactlyOnceWith("Earlier prompt edited", undefined);
-    }
+    expect(editQueuedMessage).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("Earlier prompt edited", undefined);
   });
 
   it.each([
@@ -6877,6 +6888,66 @@ describe("Composer — editing Claude Code's queued messages", () => {
       ["pending_1", EDITED_TEXT],
     ]);
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("treats an edit Claude Code applied before its request failed as done", async () => {
+    const toastError = vi.spyOn(toast, "error");
+    const { onSend } = renderComposer();
+    let request: Promise<void> | undefined;
+    act(() =>
+      useChatStore.setState({
+        editQueuedMessage: (pendingId, text) =>
+          (request = initial.editQueuedMessage(pendingId, text)),
+      }),
+    );
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      editApplied(EDITED_TEXT);
+      return new Response(
+        JSON.stringify({ error: { code: "runner_unavailable", message: "It may still apply." } }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    recallAndSubmit(EDITED_TEXT);
+    await act(() => request?.catch(() => {}));
+
+    expect(fetchSpy).toHaveBeenCalledOnce();
+    expect(toastError).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("");
+    expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual([
+      { type: "input_text", text: EDITED_TEXT },
+    ]);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("clears a restored edit once Claude Code applies it", async () => {
+    const toastSuccess = vi.spyOn(toast, "success");
+    const { editQueuedMessage, onSend } = renderComposer();
+    editQueuedMessage.mockRejectedValueOnce(new TypeError("Failed to fetch"));
+
+    recallAndSubmit(EDITED_TEXT);
+    await waitFor(() => expect(textarea()).toHaveValue(EDITED_TEXT));
+    act(() => editApplied(EDITED_TEXT));
+
+    expect(textarea()).toHaveValue("");
+    expect(toastSuccess).toHaveBeenCalledExactlyOnceWith("Claude Code applied your edit.");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(editQueuedMessage).toHaveBeenCalledOnce();
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("sends a new message after a slash menu's Escape clears the recalled text", () => {
+    const { editQueuedMessage, onSend } = renderComposer();
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    fireEvent.change(textarea(), { target: { value: "/" } });
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(textarea()).toHaveValue("");
+
+    fireEvent.change(textarea(), { target: { value: "A new question" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+
+    expect(editQueuedMessage).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("A new question", undefined);
   });
 
   it("keeps a draft typed while an edit was failing and does not claim to restore the edit", async () => {

@@ -2802,7 +2802,10 @@ class _QueuedPromptPane:
         self.on_up: Callable[[], None] = lambda: None
         # Holds Up's pop records back until the composer is next cleared.
         self.late_pop = False
+        # The clear that publishes late pop records then leaves the composer full.
+        self.late_clear_refused = False
         self._late_records: list[str] = []
+        self.resizes = 0
         transcript.write_text(_queue_record("popAll", "an earlier edit") + "\n", encoding="utf-8")
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2821,7 +2824,15 @@ class _QueuedPromptPane:
         monkeypatch.setattr(
             claude_native_bridge, "_wait_for_claude_prompt_ready", lambda *_args, **_kwargs: None
         )
+        monkeypatch.setattr(
+            claude_native_bridge, "_usable_composer_height", self._usable_composer_height
+        )
         monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
+
+    @contextmanager
+    def _usable_composer_height(self, *_args: object) -> Iterator[bool]:
+        self.resizes += 1
+        yield True
 
     def _run_tmux(self, socket_path: str, *args: str) -> None:
         del socket_path
@@ -2847,9 +2858,11 @@ class _QueuedPromptPane:
 
     def _clear_composer(self, *_args: object, **_kwargs: object) -> None:
         claude_native_bridge._check_injection_cancelled()
+        late_records, self._late_records = self._late_records, []
+        self._append(late_records)
+        if late_records and self.late_clear_refused:
+            raise claude_native_bridge.ClaudeComposerNotCleared("The popped prompts fill the box.")
         self.composer = ""
-        self._append(self._late_records)
-        self._late_records = []
 
     def _append(self, records: list[str]) -> None:
         with self.transcript.open("a", encoding="utf-8") as transcript:
@@ -2900,11 +2913,13 @@ def test_edit_queued_user_message_requeues_every_prompt_with_the_edit_in_place(
     assert pane.submitted == ["First", "Then summarize the logs", "Last"]
 
 
+@pytest.mark.parametrize("late_clear_refused", [False, True], ids=["cleared", "clear-refused"])
 def test_edit_queued_user_message_requeues_prompts_whose_pop_records_were_late(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, late_clear_refused: bool
 ) -> None:
     bridge_dir, pane = _queued_prompt_pane(tmp_path, monkeypatch, ["First", "Then summarize"])
     pane.late_pop = True
+    pane.late_clear_refused = late_clear_refused
 
     claude_native_bridge.edit_queued_user_message(
         bridge_dir, original="Then summarize", replacement="Then summarize the logs"
@@ -2936,24 +2951,33 @@ def test_edit_queued_user_message_requeues_the_prompts_unchanged_without_a_singl
 
 
 @pytest.mark.parametrize(
-    ("prompt_pending", "occupied_by", "refusal"),
+    ("prompt_pending", "occupied_by", "prompt_ready", "refusal"),
     [
-        (True, None, claude_native_bridge.ClaudeUserPromptPending),
-        (False, "shell mode", claude_native_bridge.ClaudeInputBoxOccupied),
+        (True, None, True, claude_native_bridge.ClaudeUserPromptPending),
+        (False, "shell mode", True, claude_native_bridge.ClaudeInputBoxOccupied),
+        (False, "the prompt-history search", True, claude_native_bridge.ClaudeInputBoxOccupied),
+        (False, None, False, RuntimeError),
     ],
-    ids=["question-pending", "shell-mode"],
+    ids=["question-pending", "shell-mode", "history-search", "prompt-not-ready"],
 )
 def test_edit_queued_user_message_refuses_before_any_key_while_the_pane_is_busy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     prompt_pending: bool,
     occupied_by: str | None,
+    prompt_ready: bool,
     refusal: type[RuntimeError],
 ) -> None:
     bridge_dir, pane = _queued_prompt_pane(tmp_path, monkeypatch, ["Then summarize"])
     pane.composer = "a draft typed in the terminal"
     pane.prompt_pending = prompt_pending
     pane.occupied_by = occupied_by
+    if not prompt_ready:
+
+        def _not_ready(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("Claude Code's prompt never became ready.")
+
+        monkeypatch.setattr(claude_native_bridge, "_wait_for_claude_prompt_ready", _not_ready)
 
     with pytest.raises(refusal):
         claude_native_bridge.edit_queued_user_message(
@@ -2981,6 +3005,8 @@ def test_edit_queued_user_message_requeues_through_a_brief_refusal_and_cancellat
             bridge_dir, original="Then summarize", replacement="Then summarize the logs"
         )
 
+    assert pane.up_presses == 1
+    assert pane.resizes == 1
     assert pane.queued == ["First", "Then summarize the logs"]
 
 
@@ -3009,6 +3035,48 @@ def test_edit_queued_user_message_reports_the_prompts_it_could_not_requeue(
     assert pane.queued == ["First"]
     assert raised.value.unsent == ["Then summarize the logs", "Last"]
     assert '"Then summarize the logs"; "Last"' in str(raised.value)
+
+
+def test_edit_queued_user_message_refuses_before_up_without_time_to_requeue(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir, pane = _queued_prompt_pane(tmp_path, monkeypatch, ["Then summarize"])
+    deadline = claude_native_bridge._QUEUED_EDIT_MIN_BUDGET_S - 1.0
+
+    with pytest.raises(claude_native_bridge.ClaudeInjectionCancelled):
+        claude_native_bridge.edit_queued_user_message(
+            bridge_dir,
+            original="Then summarize",
+            replacement="Then summarize the logs",
+            deadline=deadline,
+        )
+
+    assert pane.up_presses == 0
+    assert pane.queued == ["Then summarize"]
+
+
+def test_edit_queued_user_message_stops_waiting_out_a_question_at_the_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bridge_dir, pane = _queued_prompt_pane(tmp_path, monkeypatch, ["First", "Then summarize"])
+    pane.refusals["Then summarize the logs"] = [
+        claude_native_bridge.ClaudeUserPromptPending("Answer it first.", nothing_typed=True)
+    ] * 1000
+    deadline = claude_native_bridge._QUEUED_EDIT_MIN_BUDGET_S
+    assert deadline < claude_native_bridge._QUEUE_RESUBMIT_HOLD_S
+
+    with pytest.raises(claude_native_bridge.ClaudeQueuedEditIncomplete) as raised:
+        claude_native_bridge.edit_queued_user_message(
+            bridge_dir,
+            original="Then summarize",
+            replacement="Then summarize the logs",
+            deadline=deadline,
+        )
+
+    assert raised.value.unsent == ["Then summarize the logs"]
+    assert claude_native_bridge.time.monotonic() <= (
+        deadline + claude_native_bridge._CLAUDE_READY_POLL_INTERVAL_S
+    )
 
 
 def test_edit_queued_user_message_clears_the_recalled_prompt_without_a_queue(

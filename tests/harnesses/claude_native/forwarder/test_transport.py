@@ -932,6 +932,60 @@ async def test_forwarder_posts_queue_operations_before_the_items_after_them(
 
 
 @pytest.mark.asyncio
+async def test_forwarder_stops_posting_queue_operations_to_a_server_without_them(
+    tmp_path: Path,
+) -> None:
+    """An older server's unknown-event rejection does not hold up later transcript regions."""
+
+    def _user(uuid: str, text: str) -> dict[str, Any]:
+        return {"type": "user", "uuid": uuid, "message": {"role": "user", "content": text}}
+
+    transcript_path = tmp_path / "session.jsonl"
+    state = _transcript_state(
+        transcript_path, _ENQUEUE_RECORD, _user("user-msg-3", "Then summarize the logs")
+    )
+    posted: list[str] = []
+
+    def _handle_request(request: httpx.Request) -> httpx.Response:
+        event_type = json.loads(request.content.decode("utf-8"))["type"]
+        posted.append(event_type)
+        if event_type == "external_queue_operations":
+            message = "Unknown event type: 'external_queue_operations'. Expected one of: message."
+            return httpx.Response(
+                400, json={"error": {"code": "invalid_input", "message": message}}
+            )
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_handle_request), base_url="http://test"
+    ) as client:
+        dedupe = forwarder._ForwardDedupeState()
+        retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+        for later_records in (
+            (),
+            (_ENQUEUE_RECORD | {"content": "And list them"}, _user("user-msg-4", "And list them")),
+        ):
+            with transcript_path.open("a", encoding="utf-8") as transcript:
+                transcript.writelines(json.dumps(record) + "\n" for record in later_records)
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_abc",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=retry_tracker,
+                dedupe=dedupe,
+            )
+
+    assert [event for event in posted if event != "external_session_status"] == [
+        "external_queue_operations",
+        "external_conversation_item",
+        "external_conversation_item",
+    ]
+    assert state.byte_offset == transcript_path.stat().st_size
+
+
+@pytest.mark.asyncio
 async def test_forwarder_waits_out_the_backoff_before_reposting_queue_operations(
     tmp_path: Path,
 ) -> None:

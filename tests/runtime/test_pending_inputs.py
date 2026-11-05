@@ -1218,12 +1218,16 @@ def test_a_later_up_press_forgets_prompts_left_from_an_earlier_one() -> None:
     assert edit == pending_inputs.QueueEdit(second, [_text_block("second!")])
 
 
-def test_terminal_edit_keeps_the_queued_messages_attachments() -> None:
+@pytest.mark.parametrize("marker", ["", "[Attached: /tmp/x.png]\n\n"], ids=["bare", "marked"])
+def test_terminal_edit_keeps_the_queued_messages_attachments(marker: str) -> None:
     image = {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
     pending_inputs.record("conv", [image, _text_block("describe")])
 
     [edit] = pending_inputs.apply_queue_operations(
-        "conv", _queue_ops(("popAll", "describe", "t1"), ("enqueue", "describe it", "t2"))
+        "conv",
+        _queue_ops(
+            ("popAll", f"{marker}describe", "t1"), ("enqueue", f"{marker}describe it", "t2")
+        ),
     )
 
     assert edit.content == [image, _text_block("describe it")]

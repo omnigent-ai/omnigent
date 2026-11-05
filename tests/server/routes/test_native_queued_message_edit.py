@@ -251,52 +251,43 @@ async def test_unconfirmed_web_edit_still_applies_to_its_own_message(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("harness", "pending", "content", "error_code"),
+    ("harness", "queue", "content", "error_code", "refusal"),
     [
-        ("codex-native", True, "edited", ErrorCode.INVALID_INPUT),
-        ("claude-native", True, "  ", ErrorCode.INVALID_INPUT),
-        ("claude-native", True, ["edited"], ErrorCode.INVALID_INPUT),
-        ("claude-native", False, "edited", ErrorCode.CONFLICT),
+        ("codex-native", "queued", "edited", ErrorCode.INVALID_INPUT, "Claude Code sessions"),
+        ("claude-native", "queued", "  ", ErrorCode.INVALID_INPUT, "non-empty data.content"),
+        ("claude-native", "queued", ["edited"], ErrorCode.INVALID_INPUT, "non-empty data.content"),
+        ("claude-native", "consumed", "edited", ErrorCode.CONFLICT, "no longer queued"),
+        ("claude-native", "queued-twice", "edited", ErrorCode.CONFLICT, "same text"),
     ],
-    ids=["other-harness", "blank-text", "non-string-text", "already-consumed"],
+    ids=["other-harness", "blank-text", "non-string-text", "already-consumed", "same-text"],
 )
 async def test_web_edit_is_refused_before_reaching_the_runner(
     monkeypatch: pytest.MonkeyPatch,
     published: list[dict[str, Any]],
     harness: str,
-    pending: bool,
+    queue: str,
     content: object,
     error_code: ErrorCode,
+    refusal: str,
 ) -> None:
     forwarded = _route_to_runner(monkeypatch, harness=harness, runner_status=200)
     pending_id = pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "original"}])
-    if not pending:
+    if queue == "consumed":
         pending_inputs.resolve_matching_text(_SESSION_ID, "original")
+    elif queue == "queued-twice":
+        pending_id = pending_inputs.record(
+            _SESSION_ID, [{"type": "input_text", "text": "original"}]
+        )
+    texts = _pending_texts()
 
     with pytest.raises(OmnigentError) as raised:
         await _edit(pending_id, content)
 
     assert raised.value.code == error_code
+    assert refusal in raised.value.message
     assert forwarded == []
     assert published == []
-
-
-@pytest.mark.asyncio
-async def test_web_edit_is_refused_while_another_queued_message_has_the_same_text(
-    monkeypatch: pytest.MonkeyPatch, published: list[dict[str, Any]]
-) -> None:
-    forwarded = _route_to_runner(monkeypatch, harness="claude-native", runner_status=200)
-    pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "Then summarize"}])
-    later = pending_inputs.record(_SESSION_ID, [{"type": "input_text", "text": "Then summarize"}])
-
-    with pytest.raises(OmnigentError) as raised:
-        await _edit(later, "Then summarize the logs")
-
-    assert raised.value.code == ErrorCode.CONFLICT
-    assert "same text" in raised.value.message
-    assert forwarded == []
-    assert _pending_texts() == ["Then summarize", "Then summarize"]
-    assert published == []
+    assert _pending_texts() == texts
 
 
 @pytest.mark.parametrize(

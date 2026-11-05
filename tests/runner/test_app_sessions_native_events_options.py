@@ -567,9 +567,11 @@ async def test_events_queued_message_edit_drives_the_claude_native_pane(
 ) -> None:
     """The runner edits a queued Claude Code prompt and reports why an edit failed."""
     edits: list[tuple[Path, str, str]] = []
+    deadlines: list[tuple[float, float | None]] = []
 
-    def _fake_edit(bridge_dir: Path, *, original: str, replacement: str) -> None:
+    def _fake_edit(bridge_dir: Path, *, original: str, replacement: str, deadline: float) -> None:
         edits.append((bridge_dir, original, replacement))
+        deadlines.append((deadline, _injection_deadline()))
         if pane_error is not None:
             raise pane_error
 
@@ -599,6 +601,8 @@ async def test_events_queued_message_edit_drives_the_claude_native_pane(
         else []
     )
     assert edits == expected_edits
+    # The edit has the same time left as the deadline that stops its keys.
+    assert all(passed == bound for passed, bound in deadlines)
 
 
 @pytest.mark.asyncio

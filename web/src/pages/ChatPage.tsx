@@ -14,6 +14,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type SetStateAction,
   forwardRef,
   memo,
   useCallback,
@@ -99,6 +100,7 @@ import {
   isPendingInput,
   isStaleTempConvId,
   isTempConvId,
+  queuedEditConfirmed,
   type ChatState,
   type PendingInitialPrompt,
   type PendingUserMessage,
@@ -2389,16 +2391,33 @@ function ComposerImpl(
   const {
     draft,
     value,
-    setValue,
+    setValue: setDraftValue,
     fullText,
     storedReplyDraft,
     activeTextId,
     focusText,
     editText,
-    replaceText,
+    replaceText: replaceDraftText,
     appendQuote,
     removeQuote,
   } = useReplyDraft();
+  // Pending id of the queued Claude Code message ArrowUp recalled for editing.
+  // Typing and dictation keep editing it; setting the draft any other way ends the edit.
+  const editingQueuedIdRef = useRef<string | null>(null);
+  const setValue = useCallback(
+    (next: SetStateAction<string>) => {
+      editingQueuedIdRef.current = null;
+      setDraftValue(next);
+    },
+    [setDraftValue],
+  );
+  const replaceText = useCallback(
+    (text: string, saved?: StoredReplyDraft) => {
+      editingQueuedIdRef.current = null;
+      replaceDraftText(text, saved);
+    },
+    [replaceDraftText],
+  );
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
@@ -2474,7 +2493,7 @@ function ComposerImpl(
   }, []);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(value, setDraftValue, textareaRef);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -3061,7 +3080,7 @@ function ComposerImpl(
     mentionEntries,
     text: value,
     setText: (next) => {
-      setValue(next);
+      setDraftValue(next);
       dirtyRef.current = true;
     },
     textareaRef,
@@ -3573,13 +3592,24 @@ function ComposerImpl(
   // Allow continued navigation through recalled entries with quote cards.
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
-  // Pending id of the queued Claude Code message ArrowUp recalled for editing.
-  const editingQueuedIdRef = useRef<string | null>(null);
+  // An edit put back after its request failed, retracted if Claude Code applies it anyway.
+  const restoredQueuedEditRef = useRef<{ pendingId: string; text: string } | null>(null);
   // Sessions whose runner predates queued edits, so Up browses history there.
   const queuedEditUnsupportedRef = useRef(new Set<string>());
   useEffect(() => {
     editingQueuedIdRef.current = null;
+    restoredQueuedEditRef.current = null;
   }, [conversationId]);
+  const queuedInputEdits = useChatStore((s) => s.queuedInputEdits);
+  useEffect(() => {
+    const restored = restoredQueuedEditRef.current;
+    if (restored === null) return;
+    if (!queuedEditConfirmed({ queuedInputEdits }, restored.pendingId, restored.text)) return;
+    restoredQueuedEditRef.current = null;
+    if (valueRef.current !== restored.text || filesRef.current.length > 0) return;
+    replaceText("");
+    toast.success("Claude Code applied your edit.");
+  }, [queuedInputEdits, replaceText]);
 
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
@@ -3670,6 +3700,7 @@ function ComposerImpl(
     // Commands run as usual, and text for a message Claude has taken sends anew.
     const editingQueuedId = editingQueuedIdRef.current;
     editingQueuedIdRef.current = null;
+    restoredQueuedEditRef.current = null;
     const queuedEditId =
       editingQueuedId !== null &&
       trimmed &&
@@ -3697,6 +3728,7 @@ function ComposerImpl(
     if (queuedEditId !== null) {
       const edited = fullText.trimEnd();
       const editedIn = conversationId;
+      appendEntry(edited);
       dirtyRef.current = true;
       setValue("");
       setCommandError(null);
@@ -3711,6 +3743,7 @@ function ComposerImpl(
         toast.error(restored ? `${reason} Your edit is back in the composer.` : reason);
         if (!restored) return;
         replaceText(edited);
+        restoredQueuedEditRef.current = { pendingId: queuedEditId, text: edited };
         // Enter retries the edit only after a failure that may pass.
         if (!refusal || (error.status >= 500 && !unsupported)) {
           editingQueuedIdRef.current = queuedEditId;
@@ -3990,14 +4023,12 @@ function ComposerImpl(
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
           e.preventDefault();
-          editingQueuedIdRef.current = null;
           applyRecall(ta, recalled);
         }
       } else if (e.key === "ArrowDown" && ta.selectionEnd === ta.value.length) {
         const recalled = recallNext();
         if (recalled !== null) {
           e.preventDefault();
-          editingQueuedIdRef.current = null;
           applyRecall(ta, recalled);
         }
       }
@@ -4452,7 +4483,7 @@ function ComposerImpl(
                   voiceSnapshotRef.current = value;
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  setDraftValue(voiceSnapshotRef.current);
                 }}
                 onTranscript={(text) => {
                   dictation.appendFinal(text);

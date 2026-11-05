@@ -7093,13 +7093,13 @@ describe("chatStore — queued native message edits", () => {
     expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(text("Then summarize"));
   });
 
-  it("editQueuedMessage keeps the text an edit event delivered while the request was failing", async () => {
+  it("editQueuedMessage treats an edit confirmed while its request was failing as applied", async () => {
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
         handleSessionEvent({
           type: "session_input_edited",
           pendingId: "pending_1",
-          content: [{ type: "input_text", text: "Then summarize the logs" }],
+          content: [{ type: "input_text", text: "Then  summarize the logs" }],
           mergedPendingIds: [],
         });
         return mockResponse(
@@ -7112,12 +7112,44 @@ describe("chatStore — queued native message edits", () => {
 
     await expect(
       useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
-    ).rejects.toMatchObject({ status: 503 });
+    ).resolves.toBeUndefined();
 
     expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(
-      text("Then summarize the logs"),
+      text("Then  summarize the logs"),
     );
   });
+
+  it.each([
+    ["applies an edit", [], [text("Then summarize the logs")]],
+    ["drops a merge", ["pending_new"], []],
+  ])(
+    "a send's acknowledgement %s that named its pending id first",
+    async (_name, mergedPendingIds, expected) => {
+      useChatStore.setState({ pendingUserMessages: [], abortController: new AbortController() });
+      let resolvePost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_abc/events") && init?.method === "POST") {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_new" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("Then summarize", "agent_xyz");
+      await vi.waitFor(() => expect(resolvePost).not.toBeNull());
+
+      handleSessionEvent({
+        type: "session_input_edited",
+        pendingId: mergedPendingIds.length ? "pending_old" : "pending_new",
+        content: [{ type: "input_text", text: "Then summarize the logs" }],
+        mergedPendingIds,
+      });
+      resolvePost!();
+      await sending;
+
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.content)).toEqual(expected);
+    },
+  );
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {

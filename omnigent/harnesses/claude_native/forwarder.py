@@ -723,26 +723,38 @@ class _SubagentStatusCapability:
             f"/v1/sessions/{session_id}/events",
             json={"type": "subagent.status", "data": {"idle": True}},
         )
-        if resp.status_code == 400:
-            try:
-                payload = resp.json()
-            except ValueError:
-                payload = None
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if (
-                isinstance(error, dict)
-                and error.get("code") == "invalid_input"
-                and isinstance(error.get("message"), str)
-                and error["message"].startswith("Unknown event type: 'subagent.status'.")
-            ):
-                if self.supported:
-                    _logger.info(
-                        "Omnigent server does not accept subagent.status; "
-                        "skipping idle observations until the forwarder restarts"
-                    )
-                self.supported = False
-                return
+        if _rejects_unknown_event_type(resp, "subagent.status"):
+            if self.supported:
+                _logger.info(
+                    "Omnigent server does not accept subagent.status; "
+                    "skipping idle observations until the forwarder restarts"
+                )
+            self.supported = False
+            return
         resp.raise_for_status()
+
+
+def _rejects_unknown_event_type(resp: httpx.Response, event_type: str) -> bool:
+    """
+    Whether an older server rejected ``event_type`` because it doesn't know it.
+
+    :param resp: Response to the session-events post.
+    :param event_type: Posted event type, e.g. ``"subagent.status"``.
+    :returns: ``True`` for the server's unknown-event-type rejection.
+    """
+    if resp.status_code != 400:
+        return False
+    try:
+        payload = resp.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == "invalid_input"
+        and isinstance(error.get("message"), str)
+        and error["message"].startswith(f"Unknown event type: {event_type!r}.")
+    )
 
 
 class _SubagentStateCheckpoint:
@@ -914,6 +926,8 @@ class _ForwardDedupeState:
     # survive retries, including a switch back to the last posted mode.
     observed_permission_mode: str | None = None
     permission_mode_change_pending: bool = False
+    # Set once the server rejects queue records as an unknown event type.
+    queue_operations_unsupported: bool = False
     # Mode the server rejected as unsupported, skipped until the pane shows
     # another mode or the retry deadline passes, so a mixed-version
     # deployment is not re-posted every poll.
@@ -5224,6 +5238,7 @@ async def _forward_available_items(
         operations=result.queue_operations,
         retry_tracker=retry_tracker,
         retry_key=f"queue:{state.byte_offset or 0}:{result.queue_operations[0].timestamp}",
+        dedupe=dedupe,
     ):
         return state
     items = result.items
@@ -6412,21 +6427,26 @@ async def _post_external_queue_operations(
     operations: tuple[ClaudeQueueOperation, ...],
     retry_tracker: _PostRetryTracker,
     retry_key: str,
+    dedupe: _ForwardDedupeState,
 ) -> bool:
     """
     Report Claude's prompt-queue records so edited queued bubbles follow the pane.
 
     The server skips records it already applied, so a transcript region the
-    forwarder re-reads after a failed post is safe to report again.
+    forwarder re-reads after a failed post is safe to report again. A server
+    that doesn't know the event is not sent queue records again.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
     :param operations: Queue records in transcript order.
     :param retry_tracker: Backoff tracker shared with the transcript item posts.
     :param retry_key: Key for this transcript region, e.g. ``"queue:1024:2026-…Z"``.
+    :param dedupe: Per-session forwarder state; records an unsupported server.
     :returns: ``False`` while this region should be retried on a later poll;
         ``True`` once posted or given up on.
     """
+    if dedupe.queue_operations_unsupported:
+        return True
     if retry_tracker.retry_delay_s(retry_key) is not None:
         return False
     try:
@@ -6446,6 +6466,14 @@ async def _post_external_queue_operations(
                 },
             },
         )
+        if _rejects_unknown_event_type(resp, "external_queue_operations"):
+            _logger.info(
+                "Omnigent server does not accept external_queue_operations; "
+                "queued bubbles won't follow edits made in the terminal"
+            )
+            dedupe.queue_operations_unsupported = True
+            retry_tracker.clear(retry_key)
+            return True
         resp.raise_for_status()
     except httpx.HTTPError as exc:
         decision = retry_tracker.record_failure(

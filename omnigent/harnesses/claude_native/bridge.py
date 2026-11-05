@@ -375,8 +375,10 @@ _PASTE_COMMIT_TIMEOUT_S = 5.0
 _QUEUE_POP_TIMEOUT_S = 3.0
 _QUEUE_POP_SETTLE_S = 0.3
 # How long popped prompts wait out a question or an uncleared draft before an
-# edit gives up queueing them again; sized to fit the runner's control budget.
+# edit gives up queueing them again; never past the caller's deadline.
 _QUEUE_RESUBMIT_HOLD_S = 8.0
+# Time an edit must have left before Up to read the pops and queue a few prompts again.
+_QUEUED_EDIT_MIN_BUDGET_S = 6.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -4646,7 +4648,9 @@ def inject_user_message(
 
 
 @_serialize_bridge_injection
-def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: str) -> None:
+def edit_queued_user_message(
+    bridge_dir: Path, *, original: str, replacement: str, deadline: float | None = None
+) -> None:
     """
     Replace a prompt waiting in Claude Code's queue with edited text.
 
@@ -4657,11 +4661,15 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
 
     A refusal before Up leaves the queue untouched. Once Up has emptied it,
     the resubmission ignores the caller's cancellation, since stopping would
-    drop the popped prompts.
+    drop the popped prompts; only waiting out a question stops at *deadline*.
 
     :param bridge_dir: Bridge directory path.
     :param original: The queued text to replace, e.g. ``"Then summarize"``.
     :param replacement: The edited text, e.g. ``"Then summarize the logs"``.
+    :param deadline: ``time.monotonic()`` value by which the caller needs the
+        outcome, e.g. the runner's control deadline; ``None`` for no limit.
+    :raises ClaudeInjectionCancelled: If less than
+        :data:`_QUEUED_EDIT_MIN_BUDGET_S` was left before Up; nothing was typed.
     :raises ClaudeQueuedMessageMissing: If no queued prompt matches
         ``original``; any prompts Up popped were submitted again unchanged.
     :raises ClaudeQueuedMessageAmbiguous: If several queued prompts match
@@ -4704,22 +4712,38 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
         offset = transcript.stat().st_size
     except OSError as exc:
         raise ClaudeQueuedMessageMissing("Claude Code's transcript is unreadable.") from exc
+    if deadline is not None and deadline - time.monotonic() < _QUEUED_EDIT_MIN_BUDGET_S:
+        raise ClaudeInjectionCancelled(
+            "Claude Code took too long to get ready, so the message was not edited."
+        )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Up")
     cancel_token = _INJECTION_CANCEL_EVENT.set(None)
     try:
         popped = _popped_queue_prompts(transcript, offset)
         if not popped:
             # With nothing queued, Up recalled a history prompt into the composer instead.
-            _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-            # Pop records written late mean the clear discarded queued prompts.
+            clear_failure: RuntimeError | None = None
+            try:
+                _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+            except RuntimeError as exc:
+                clear_failure = exc
+            # Pop records written late mean the composer held queued prompts.
             popped = _popped_queue_prompts(transcript, offset)
+            if not popped and clear_failure is not None:
+                # Up popped nothing, so retrying the whole edit loses no prompt.
+                raise clear_failure
             if not popped:
                 raise ClaudeQueuedMessageMissing("Claude Code has no queued message to edit.")
         target = " ".join(original.split())
         matches = [index for index, text in enumerate(popped) if " ".join(text.split()) == target]
         if len(matches) == 1:
             popped[matches[0]] = replacement
-        unsent = _resubmit_popped_prompts(bridge_dir, socket_path, tmux_target, popped)
+        hold_until = time.monotonic() + _QUEUE_RESUBMIT_HOLD_S
+        if deadline is not None:
+            hold_until = min(hold_until, deadline)
+        unsent = _resubmit_popped_prompts(
+            bridge_dir, socket_path, tmux_target, popped, hold_until=hold_until
+        )
     finally:
         _INJECTION_CANCEL_EVENT.reset(cancel_token)
     if unsent:
@@ -4740,41 +4764,56 @@ def edit_queued_user_message(bridge_dir: Path, *, original: str, replacement: st
 
 
 def _resubmit_popped_prompts(
-    bridge_dir: Path, socket_path: str, tmux_target: str, prompts: list[str]
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    prompts: list[str],
+    *,
+    hold_until: float,
 ) -> list[str]:
     """
     Queue the prompts Up moved into the composer again, in order.
 
     A question or an uncleared draft only delays a prompt, so those refusals
-    are retried for :data:`_QUEUE_RESUBMIT_HOLD_S`; any other failure stops.
+    are retried until *hold_until*; any other failure stops. An uncleared
+    draft also gives a short pane room for the rest of the resubmission.
 
     :param bridge_dir: Bridge directory path.
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param prompts: The prompts to submit, e.g. ``["First", "Then summarize the logs"]``.
+    :param hold_until: ``time.monotonic()`` value after which a delayed prompt
+        is reported unsent.
     :returns: The prompts that were not queued again, in order; empty on success.
     """
-    hold_until = time.monotonic() + _QUEUE_RESUBMIT_HOLD_S
-    for index, text in enumerate(prompts):
-        while True:
-            try:
-                _paste_and_submit(
-                    bridge_dir,
-                    socket_path,
-                    tmux_target,
-                    text=_escape_unsupported_slash_command(text),
-                    needle=_submit_needle(text),
-                )
-                break
-            except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
-                held = not isinstance(exc, ClaudeUserPromptPending) or exc.nothing_typed
-                if not held or time.monotonic() >= hold_until:
+    with contextlib.ExitStack() as resize:
+        resize_tried = False
+        for index, text in enumerate(prompts):
+            while True:
+                try:
+                    _paste_and_submit(
+                        bridge_dir,
+                        socket_path,
+                        tmux_target,
+                        text=_escape_unsupported_slash_command(text),
+                        needle=_submit_needle(text),
+                    )
+                    break
+                except (ClaudeUserPromptPending, ClaudeComposerNotCleared) as exc:
+                    held = not isinstance(exc, ClaudeUserPromptPending) or exc.nothing_typed
+                    if not held or time.monotonic() >= hold_until:
+                        _logger.warning(
+                            "claude-native: could not requeue a popped prompt: %s", exc
+                        )
+                        return prompts[index:]
+                    if isinstance(exc, ClaudeComposerNotCleared) and not resize_tried:
+                        resize_tried = True
+                        with contextlib.suppress(RuntimeError, OSError):
+                            resize.enter_context(_usable_composer_height(socket_path, tmux_target))
+                    time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                except (RuntimeError, OSError) as exc:
                     _logger.warning("claude-native: could not requeue a popped prompt: %s", exc)
                     return prompts[index:]
-                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-            except RuntimeError as exc:
-                _logger.warning("claude-native: could not requeue a popped prompt: %s", exc)
-                return prompts[index:]
     return []
 
 

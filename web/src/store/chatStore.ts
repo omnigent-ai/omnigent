@@ -731,6 +731,12 @@ export interface ConversationState {
     pendingId?: string;
     contentKey?: string;
   }[];
+  /**
+   * Latest content a `session_input_edited` event gave each queued input, by
+   * pending id; `null` once merged into another. A send's acknowledgement
+   * applies an edit that named its pending id first.
+   */
+  queuedInputEdits: Record<string, MessageContentBlock[] | null>;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -2152,6 +2158,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
+  queuedInputEdits: {},
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2934,15 +2941,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId
-              ? {
-                  ...p,
-                  posted: true,
-                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
-                }
-              : p,
-          ),
+          pendingUserMessages: s.pendingUserMessages.flatMap((p) => {
+            if (p.tempId !== tempId) return [p];
+            const edit = postResult.pendingId
+              ? s.queuedInputEdits[postResult.pendingId]
+              : undefined;
+            if (edit === null) return [];
+            return [
+              {
+                ...p,
+                posted: true,
+                ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                ...(edit ? { content: edit } : {}),
+              },
+            ];
+          }),
           settledShellInputs: s.settledShellInputs.map((entry) =>
             entry.tempId === tempId && postResult.pendingId
               ? { ...entry, pendingId: postResult.pendingId }
@@ -3609,6 +3622,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: { pending_id: pendingId, content: text },
       });
     } catch (error) {
+      // An edit event already confirmed this text, so only the response was lost.
+      const state = setterForState(conversationId);
+      if (state !== null && queuedEditConfirmed(state, pendingId, text)) return;
       setterFor(conversationId)((s) => {
         // Keep newer text that a session.input.edited event wrote meanwhile.
         const current = s.pendingUserMessages.find((p) => isPendingInput(p, pendingId));
@@ -7466,6 +7482,26 @@ export function isPendingInput(message: PendingUserMessage, pendingId: string): 
   return message.pendingId === pendingId || message.tempId === pendingId;
 }
 
+/**
+ * Whether the latest edit event gave queued input `pendingId` the text `text`,
+ * ignoring whitespace runs as Claude Code's queue matching does.
+ *
+ * @param state - The conversation's state, read for its `queuedInputEdits`.
+ * @param pendingId - The server pending id, e.g. `"pending_1"`.
+ * @param text - The edited text, e.g. `"Then summarize the logs"`.
+ */
+export function queuedEditConfirmed(
+  state: Pick<ConversationState, "queuedInputEdits">,
+  pendingId: string,
+  text: string,
+): boolean {
+  const content = state.queuedInputEdits[pendingId];
+  return (
+    content != null &&
+    messageContentText(content) === messageContentText([{ type: "input_text", text }])
+  );
+}
+
 function withPendingContent(
   messages: PendingUserMessage[],
   pendingId: string,
@@ -8712,8 +8748,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             : s.pendingUserMessages.filter(
                 (p) => !event.mergedPendingIds.some((id) => isPendingInput(p, id)),
               );
-        const pendingUserMessages = withPendingContent(kept, event.pendingId, content);
-        return pendingUserMessages === s.pendingUserMessages ? {} : { pendingUserMessages };
+        const queuedInputEdits = { ...s.queuedInputEdits, [event.pendingId]: content };
+        for (const id of event.mergedPendingIds) queuedInputEdits[id] = null;
+        return {
+          pendingUserMessages: withPendingContent(kept, event.pendingId, content),
+          queuedInputEdits,
+        };
       });
       return;
     }
