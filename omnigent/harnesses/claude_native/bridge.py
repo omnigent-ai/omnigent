@@ -82,6 +82,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     SubmitBoundary,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    read_fresh_submit_records,
 )
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
@@ -3245,6 +3246,17 @@ def read_transcript_path(bridge_dir: Path) -> Path | None:
     if not isinstance(raw, str) or not raw:
         return None
     return Path(raw)
+
+
+def capture_model_switch_boundary(bridge_dir: Path) -> SubmitBoundary | None:
+    """Pin the native transcript before injecting a model command."""
+    transcript_path = read_transcript_path(bridge_dir)
+    native_session_id = read_claude_session_id(bridge_dir)
+    if transcript_path is None or native_session_id is None:
+        return None
+    boundary = capture_submit_boundary(transcript_path, native_session_id)
+    # A missing baseline cannot distinguish fresh records from a recreated history.
+    return boundary if boundary is not None and boundary.file_id is not None else None
 
 
 def read_claude_session_id(bridge_dir: Path) -> str | None:
@@ -10081,6 +10093,41 @@ def _parse_slash_command_record(content: str) -> _SlashCommandPayload | None:
     stdout_match = _COMMAND_STDOUT_RE.search(content)
     output = stdout_match.group(1) if stdout_match else None
     return _SlashCommandPayload(name=name, arguments=arguments, output=output)
+
+
+def model_switch_acknowledged(boundary: SubmitBoundary, model_arg: str) -> bool:
+    """Recognize this command's fresh echo followed by Claude's success stdout."""
+    command_seen = False
+    for entry in read_fresh_submit_records(boundary):
+        if (
+            entry.get("sessionId") != boundary.native_session_id
+            or entry.get("isSidechain") is True
+        ):
+            continue
+        content = entry.get("content")
+        if not isinstance(content, str):
+            message = entry.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, str):
+            continue
+        if _is_slash_command_echo(content):
+            payload = _parse_slash_command_record(content)
+            command_seen = (
+                payload is not None and payload.name == "model" and payload.arguments == model_arg
+            )
+        if not command_seen:
+            continue
+        stdout_match = _COMMAND_STDOUT_RE.search(content)
+        if stdout_match is None:
+            continue
+        if any(
+            line.strip().startswith("Set model to ")
+            and line.strip().removeprefix("Set model to ").strip()
+            for line in stdout_match.group(1).splitlines()
+        ):
+            return True
+        command_seen = False
+    return False
 
 
 def _is_slash_command_echo(content: str) -> bool:

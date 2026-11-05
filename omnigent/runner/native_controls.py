@@ -1336,6 +1336,7 @@ def build_native_controls(
         conv_id: str,
         bridge_dir: Path,
         expected: set[str],
+        unmarked_expected: set[str],
     ) -> None:
         """Answer a ``/model`` confirm dialog that pops after the active turn.
 
@@ -1353,12 +1354,19 @@ def build_native_controls(
             confirm_dialog_if_open,
             read_claude_status_model,
         )
+        from omnigent.models.claude_model_vocabulary import normalized_model_id
 
         deadline = time.monotonic() + _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S
         while time.monotonic() < deadline:
             try:
                 current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-                if current and current in expected:
+                if current and (
+                    current in expected
+                    or (
+                        not current.lower().endswith("[1m]")
+                        and normalized_model_id(current) in unmarked_expected
+                    )
+                ):
                     return
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
@@ -1387,8 +1395,10 @@ def build_native_controls(
             ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
+            capture_model_switch_boundary,
             confirm_dialog_if_open,
             inject_slash_command,
+            model_switch_acknowledged,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1519,6 +1529,7 @@ def build_native_controls(
         if wait_error is not None:
             return _model_failed(wait_error)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
+        model_switch_boundary = await asyncio.to_thread(capture_model_switch_boundary, bridge_dir)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1539,13 +1550,16 @@ def build_native_controls(
         # Claude Code's statusLine names a 1M model without its ``[1m]`` marker,
         # so once the marker reached the pane, the unmarked name confirms it.
         unmarked_expected: set[str] = set()
+        long_context_requested = any(
+            value.lower().endswith("[1m]")
+            for value in (selected_model, resolved_model or "", model_arg)
+        )
+        if bound_model:
+            if long_context_requested and model_arg.lower().endswith("[1m]"):
+                unmarked_expected = {normalized_model_id(value) for value in expected}
         if not bound_model:
             # A repeated alias pick keeps the same model; its launch pin proves
             # the exact generation even when the options cache is cold.
-            long_context_requested = any(
-                value.lower().endswith("[1m]")
-                for value in (selected_model, resolved_model or "", model_arg)
-            )
             pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
             # A translation that dropped the marker leaves the pane on the plain
             # model, which must not confirm a 1M pick.
@@ -1599,7 +1613,12 @@ def build_native_controls(
         except ClaudeInjectionCancelled as exc:
             # The budget can lapse in the dialog watch after ``/model`` was submitted;
             # a pane that already switched must not be rolled back. Read only, no keys.
-            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
+            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)) or (
+                model_switch_boundary is not None
+                and await asyncio.to_thread(
+                    model_switch_acknowledged, model_switch_boundary, model_arg
+                )
+            ):
                 return Response(status_code=204)
             return _model_failed(exc)
         except (RuntimeError, ValueError, OSError) as exc:
@@ -1616,6 +1635,10 @@ def build_native_controls(
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
+                return Response(status_code=204)
+            if model_switch_boundary is not None and await asyncio.to_thread(
+                model_switch_acknowledged, model_switch_boundary, model_arg
+            ):
                 return Response(status_code=204)
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a
@@ -1649,7 +1672,7 @@ def build_native_controls(
             # the late dialog, and let the forwarder's report settle the
             # picker when the switch actually lands.
             watcher = asyncio.create_task(
-                _watch_late_model_dialog(conv_id, bridge_dir, expected),
+                _watch_late_model_dialog(conv_id, bridge_dir, expected, unmarked_expected),
                 name=f"claude-model-dialog-{conv_id}",
             )
             _model_dialog_watchers.add(watcher)

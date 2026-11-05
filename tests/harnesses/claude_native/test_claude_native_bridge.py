@@ -3497,6 +3497,138 @@ def test_read_transcript_items_since_surfaces_top_level_slash_command_echo(
     assert byte_result.items == items
 
 
+def _append_model_switch_record(
+    transcript_path: Path,
+    content: str,
+    *,
+    session_id: str = "native-1",
+    role_user: bool = False,
+) -> None:
+    record: dict[str, Any] = {"sessionId": session_id, "uuid": f"record-{time.time_ns()}"}
+    if role_user:
+        record.update({"type": "user", "message": {"role": "user", "content": content}})
+    else:
+        record.update({"type": "system", "subtype": "local_command", "content": content})
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+def _capture_model_switch_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transcript_path: Path,
+) -> Any:
+    monkeypatch.setattr(claude_native_bridge, "read_transcript_path", lambda _: transcript_path)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_session_id", lambda _: "native-1")
+    boundary = claude_native_bridge.capture_model_switch_boundary(tmp_path)
+    assert boundary is not None
+    return boundary
+
+
+@pytest.mark.parametrize("role_user", [False, True], ids=["local-command", "role-user"])
+def test_model_switch_acknowledgement_requires_a_fresh_matching_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    role_user: bool,
+) -> None:
+    """Only this submission's echo plus Claude's success stdout confirms a switch."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    echo = "<command-name>/model</command-name><command-args>opus[1m]</command-args>"
+    success = (
+        "<local-command-stdout>Set model to Opus 5 and saved as your default for new sessions"
+        "</local-command-stdout>"
+    )
+    _append_model_switch_record(transcript_path, echo + success, role_user=role_user)
+    boundary = _capture_model_switch_boundary(tmp_path, monkeypatch, transcript_path)
+
+    assert not claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]")
+    _append_model_switch_record(transcript_path, echo, role_user=role_user)
+    assert not claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]")
+    _append_model_switch_record(transcript_path, success, role_user=role_user)
+    assert claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]")
+
+
+def test_model_switch_acknowledgement_accepts_one_combined_fresh_record(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude may persist the command echo and its success in one record."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    boundary = _capture_model_switch_boundary(tmp_path, monkeypatch, transcript_path)
+    _append_model_switch_record(
+        transcript_path,
+        "<command-name>/model</command-name><command-args>opus[1m]</command-args>"
+        "<local-command-stdout>Set model to Opus 5</local-command-stdout>",
+    )
+
+    assert claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]")
+
+
+def test_model_switch_boundary_does_not_trust_a_recreated_transcript(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file missing at the baseline cannot prove which records are fresh."""
+    transcript_path = tmp_path / "missing.jsonl"
+    monkeypatch.setattr(claude_native_bridge, "read_transcript_path", lambda _: transcript_path)
+    monkeypatch.setattr(claude_native_bridge, "read_claude_session_id", lambda _: "native-1")
+
+    assert claude_native_bridge.capture_model_switch_boundary(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    ("records", "session_id"),
+    [
+        ([], "native-1"),
+        (
+            [
+                "<command-name>/model</command-name><command-args>sonnet</command-args>",
+                "<local-command-stdout>Set model to Opus 5</local-command-stdout>",
+            ],
+            "native-1",
+        ),
+        (
+            [
+                "<command-name>/model</command-name><command-args>opus[1m]</command-args>",
+                "<local-command-stdout>Model not found</local-command-stdout>",
+            ],
+            "native-1",
+        ),
+        (
+            [
+                "<local-command-stdout>Set model to Opus 5</local-command-stdout>",
+                "<command-name>/model</command-name><command-args>opus[1m]</command-args>",
+            ],
+            "native-1",
+        ),
+        (
+            [
+                "<command-name>/model</command-name><command-args>opus[1m]</command-args>",
+                "<local-command-stdout>Set model to Opus 5</local-command-stdout>",
+            ],
+            "native-2",
+        ),
+    ],
+    ids=["no-new-record", "wrong-model", "refusal", "ack-before-echo", "wrong-session"],
+)
+def test_model_switch_acknowledgement_rejects_unowned_or_failed_results(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[str],
+    session_id: str,
+) -> None:
+    """Stale, foreign, reordered, and refused command output cannot confirm."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.touch()
+    boundary = _capture_model_switch_boundary(tmp_path, monkeypatch, transcript_path)
+    for content in records:
+        _append_model_switch_record(transcript_path, content, session_id=session_id)
+
+    assert not claude_native_bridge.model_switch_acknowledged(boundary, "opus[1m]")
+
+
 @pytest.mark.parametrize(
     "record",
     [

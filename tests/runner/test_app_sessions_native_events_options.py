@@ -1896,6 +1896,8 @@ async def _post_model_change_with_status_sequence(
     pane_idle_after_polls: int | None = None,
     model_env: dict[str, str] | None = None,
     expected_command: str | None = None,
+    acknowledgements: list[bool] | None = None,
+    injection_error: Exception | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
@@ -1920,8 +1922,29 @@ async def _post_model_change_with_status_sequence(
     ) -> None:
         del bridge_dir, timeout_s, auto_confirm, confirm_hint, ready_timeout_s
         commands.append(command)
+        if injection_error is not None:
+            raise injection_error
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    if acknowledgements is not None:
+        acknowledgement_script = list(acknowledgements)
+        boundary = object()
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "capture_model_switch_boundary",
+            lambda _bridge_dir: boundary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "model_switch_acknowledged",
+            lambda _boundary, _model_arg: (
+                acknowledgement_script.pop(0)
+                if len(acknowledgement_script) > 1
+                else acknowledgement_script[0]
+            ),
+            raising=False,
+        )
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
@@ -2132,6 +2155,104 @@ async def test_events_model_change_confirms_a_typed_1m_pick_by_its_unmarked_name
     assert resp.status_code == 204, resp.text
 
 
+def _bound_model_config(selected: str) -> dict[str, object]:
+    return {
+        "providers": {"gateway": {"kind": "gateway"}},
+        "inference": {
+            "harnesses": {
+                "claude-native": {
+                    "provider": "gateway",
+                    "default_model": selected,
+                    "model_allowlist": [selected],
+                }
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "status_values",
+    [
+        ["system.ai.claude-fable-5-5"],
+        [None, "system.ai.claude-fable-5-5"],
+        ["system.ai.claude-fable-5-5[1m]"],
+    ],
+    ids=["already-on-the-model", "status-not-written-yet", "marked-status"],
+)
+async def test_events_bound_1m_switch_confirms_by_its_status_name(
+    monkeypatch: pytest.MonkeyPatch,
+    status_values: list[str | None],
+) -> None:
+    """A bound 1M pick accepts the same status spellings as an unbound pick."""
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "system.ai.claude-fable-5-5[1m]"
+    with inference_config_scope(_bound_model_config(selected)):
+        resp = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            status_values,
+            model=selected,
+            model_env={},
+        )
+    assert resp.status_code == 204, resp.text
+
+
+async def test_events_bound_1m_switch_rejects_an_unmarked_different_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Removing the context marker must not erase the model generation check."""
+    from omnigent.inference_config import inference_config_scope
+
+    selected = "system.ai.claude-fable-5-5[1m]"
+    with inference_config_scope(_bound_model_config(selected)):
+        resp = await _post_model_change_with_status_sequence(
+            monkeypatch,
+            ["system.ai.claude-fable-4-8"],
+            model=selected,
+            model_env={},
+        )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+
+
+async def test_events_model_change_confirms_a_fresh_claude_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude's own success stdout confirms while its statusLine is stale."""
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledgements=[True],
+    )
+    assert resp.status_code == 204, resp.text
+
+
+async def test_events_model_change_acknowledgement_survives_injection_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A command acknowledged before its budget lapse is not rolled back."""
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledgements=[True],
+        injection_error=claude_native_bridge.ClaudeInjectionCancelled(),
+    )
+    assert resp.status_code == 204, resp.text
+
+
+async def test_events_model_change_without_a_fresh_acknowledgement_stays_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale status plus no new native success remains a loud failure."""
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6"],
+        acknowledgements=[False],
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["error"] == "claude_native_model_unconfirmed"
+
+
 @pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
 @pytest.mark.parametrize("marker", ["[1m]", "[1M]"])
 async def test_events_model_change_does_not_confirm_plain_pin_for_marked_selection(
@@ -2178,19 +2299,7 @@ async def test_bound_claude_switch_preserves_private_model_id(
     from omnigent.inference_config import inference_config_scope
 
     selected = "private/model-b[large]"
-    config = {
-        "providers": {"gateway": {"kind": "gateway"}},
-        "inference": {
-            "harnesses": {
-                "claude-native": {
-                    "provider": "gateway",
-                    "default_model": selected,
-                    "model_allowlist": [selected],
-                }
-            }
-        },
-    }
-    with inference_config_scope(config):
+    with inference_config_scope(_bound_model_config(selected)):
         response = await _post_model_change_with_status_sequence(
             monkeypatch,
             ["private/model-a", selected],
@@ -2205,19 +2314,7 @@ async def test_bound_claude_switch_does_not_fold_private_model_id(
     from omnigent.inference_config import inference_config_scope
 
     selected = "private/claude-opus-4-7"
-    config = {
-        "providers": {"gateway": {"kind": "gateway"}},
-        "inference": {
-            "harnesses": {
-                "claude-native": {
-                    "provider": "gateway",
-                    "default_model": selected,
-                    "model_allowlist": [selected],
-                }
-            }
-        },
-    }
-    with inference_config_scope(config):
+    with inference_config_scope(_bound_model_config(selected)):
         response = await _post_model_change_with_status_sequence(
             monkeypatch,
             ["claude-opus-4-7"],
