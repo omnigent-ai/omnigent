@@ -28,6 +28,11 @@ function listPages(rows: Conversation[]) {
   };
 }
 
+// Sidebar list caches: the Archived view, and the Mine and Shared scopes.
+const ARCHIVED_LIST_KEY = ["conversations", "", true];
+const MINE_LIST_KEY = ["conversations", "", false, null, "mine"];
+const SHARED_LIST_KEY = ["conversations", "", false, null, "shared"];
+
 const fetchMock = vi.fn();
 
 beforeEach(() => {
@@ -50,14 +55,17 @@ function newQueryClient() {
 }
 
 describe("findCachedListRow", () => {
-  it("finds a row in a search cache or a project folder cache", () => {
+  it("finds a row in a sidebar list cache or a project folder cache", () => {
     const queryClient = newQueryClient();
-    const searchRow = conversation("conv_search", { owner: "me" });
+    const listRow = conversation("conv_list", { owner: "me" });
     const folderRow = conversation("conv_folder", { owner: "me" });
-    queryClient.setQueryData(["conversations", "search", "deploy"], listPages([searchRow]));
+    queryClient.setQueryData(ARCHIVED_LIST_KEY, {
+      pages: [listPages([]).pages[0], listPages([listRow]).pages[0]],
+      pageParams: [],
+    });
     queryClient.setQueryData(["project-sessions", "Customer X"], listPages([folderRow]));
 
-    expect(findCachedListRow(queryClient, "conv_search")).toBe(searchRow);
+    expect(findCachedListRow(queryClient, "conv_list")).toBe(listRow);
     expect(findCachedListRow(queryClient, "conv_folder")).toBe(folderRow);
     expect(findCachedListRow(queryClient, "conv_missing")).toBeUndefined();
   });
@@ -107,26 +115,38 @@ describe("fetchConversationById", () => {
 });
 
 describe("useOpenSessionRow", () => {
-  it("reuses the row from the search results the session was opened from", async () => {
-    const queryClient = newQueryClient();
-    const searchRow = conversation("conv_archived", { archived: true, owner: "me" });
-    queryClient.setQueryData(["conversations", "search", "old"], listPages([searchRow]));
+  it.each([
+    { viewer: "owned", owner: "me", permissionLevel: null, listKey: ARCHIVED_LIST_KEY },
+    { viewer: "shared", owner: "teammate", permissionLevel: 1, listKey: SHARED_LIST_KEY },
+  ])(
+    "reuses a cached $viewer list row without fetching",
+    async ({ owner, permissionLevel, listKey }) => {
+      const queryClient = newQueryClient();
+      const listRow = conversation("conv_listed", {
+        archived: true,
+        owner,
+        permission_level: permissionLevel,
+      });
+      queryClient.setQueryData(listKey, listPages([listRow]));
 
-    const { result } = renderOpenSessionRow(queryClient, "conv_archived");
+      const { result } = renderOpenSessionRow(queryClient, "conv_listed");
 
-    await waitFor(() => expect(result.current).toEqual(searchRow));
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
+      await waitFor(() => expect(result.current).toEqual(listRow));
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("follows status updates to the cached list row", async () => {
     const queryClient = newQueryClient();
-    const searchKey = ["conversations", "search", "old"];
-    queryClient.setQueryData(searchKey, listPages([conversation("conv_live", { owner: "me" })]));
+    queryClient.setQueryData(
+      MINE_LIST_KEY,
+      listPages([conversation("conv_live", { owner: "me" })]),
+    );
     const { result } = renderOpenSessionRow(queryClient, "conv_live");
     await waitFor(() => expect(result.current?.status).toBe("idle"));
 
     const running = conversation("conv_live", { owner: "me", status: "running" });
-    act(() => queryClient.setQueryData(searchKey, listPages([running])));
+    act(() => queryClient.setQueryData(MINE_LIST_KEY, listPages([running])));
 
     expect(result.current?.status).toBe("running");
     expect(fetchMock).not.toHaveBeenCalled();
@@ -154,16 +174,6 @@ describe("useOpenSessionRow", () => {
       expect(queryClient.getQueryData(["conversation-backfill", "conv_shared"])).toBeTruthy(),
     );
     expect(result.current).toBeNull();
-  });
-
-  it("keeps a shared search row, which carries its owner", async () => {
-    const queryClient = newQueryClient();
-    const sharedRow = conversation("conv_shared", { owner: "teammate", permission_level: 1 });
-    queryClient.setQueryData(["conversations", "search", "x"], listPages([sharedRow]));
-
-    const { result } = renderOpenSessionRow(queryClient, "conv_shared");
-
-    await waitFor(() => expect(result.current).toEqual(sharedRow));
   });
 
   it("lists a remembered shared row after its search cache is gone, and keeps its owner on refetch", async () => {

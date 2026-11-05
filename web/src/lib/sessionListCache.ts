@@ -250,19 +250,25 @@ function changedFieldsNeedRefetch(changed: Set<string>): boolean {
   return changed.has("labels");
 }
 
+/** Query-key namespaces whose pages hold sidebar list rows. */
+export const LIST_ROW_QUERY_ROOTS = ["conversations", "project-sessions"] as const;
+
 /**
  * A cached copy of one session's row from a list response: any
- * `["conversations", ...]` variant (including search results) or a project
- * folder's `["project-sessions", ...]` pages.
+ * `["conversations", ...]` variant or a project folder's
+ * `["project-sessions", ...]` pages.
  *
  * @param queryClient - The app QueryClient.
  * @param id - Conversation id to find.
  */
 export function findCachedListRow(queryClient: QueryClient, id: string): Conversation | undefined {
-  for (const queryKey of [["conversations"], ["project-sessions"]]) {
-    for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey })) {
-      const row = data?.pages.flatMap((page) => page.data).find((c) => c.id === id);
-      if (row) return row;
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    const caches = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [root] });
+    for (const [, data] of caches) {
+      for (const page of data?.pages ?? []) {
+        const row = page.data.find((c) => c.id === id);
+        if (row) return row;
+      }
     }
   }
   return undefined;

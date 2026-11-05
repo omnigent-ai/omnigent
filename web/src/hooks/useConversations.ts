@@ -989,6 +989,7 @@ async function paintConversationsArchived(
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+    ...ids.map((id) => queryClient.cancelQueries({ queryKey: ["conversation-backfill", id] })),
   ]);
   const marked = archived ? markSessionsArchiving(ids) : undefined;
   if (!archived) unmarkSessionsArchiving(ids);

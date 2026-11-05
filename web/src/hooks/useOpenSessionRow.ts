@@ -6,7 +6,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
-import { findCachedListRow } from "@/lib/sessionListCache";
+import { findCachedListRow, LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 
 /**
  * Fetch a single session as a sidebar-shaped ``Conversation`` object.
@@ -64,9 +64,9 @@ export function rememberOpenSessionRow(queryClient: QueryClient, row: Conversati
 }
 
 /**
- * The open session's row, read live from any list cache (such as the search it
- * was opened from), else the row kept by ``rememberOpenSessionRow``, else
- * fetched. Rename, pin, move, archive and status changes patch that
+ * The open session's row, read live from a sidebar list cache (another scope,
+ * the Archived view, a project folder), else the row ``rememberOpenSessionRow``
+ * kept from palette search results, else fetched. Rename, pin, move, archive and status changes patch that
  * ``["conversation-backfill", id]`` copy.
  *
  * @param id - Top-level session to reveal, or ``null`` to disable.
@@ -78,7 +78,12 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
   // List rows keep receiving status and attention updates, so a cached one wins.
   const subscribe = useCallback(
     (onChange: () => void) =>
-      id === null ? () => undefined : queryClient.getQueryCache().subscribe(onChange),
+      id === null
+        ? () => undefined
+        : queryClient.getQueryCache().subscribe((event) => {
+            const root = event.query.queryKey[0];
+            if (LIST_ROW_QUERY_ROOTS.some((listRoot) => listRoot === root)) onChange();
+          }),
     [queryClient, id],
   );
   const listRow = useSyncExternalStore(subscribe, () =>
