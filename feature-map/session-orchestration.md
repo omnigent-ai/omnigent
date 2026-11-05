@@ -67,9 +67,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   `/tasks?view=templates`. Suggestions appear below saved automations or the
   empty-state message with All selected and search cleared. The old
   `/tasks/templates` URL redirects to the Templates tab.
-  Pick a template, fill in the trigger builder, and save: the hourly automation's kept session starts one worker per new match
+  Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
-  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
 ## Driving it with the repro environment
 
