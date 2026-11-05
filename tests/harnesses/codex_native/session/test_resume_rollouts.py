@@ -1345,7 +1345,11 @@ def test_rollout_records_bound_aggregate_completed_arguments(compacted: bool) ->
         )
     ]
     if compacted:
-        items = [{"type": "compaction", "compacted_messages": items[:40]}, *items[40:]]
+        items = [
+            *items[:40],
+            {"type": "compaction", "compacted_messages": items[:40]},
+            *items[40:],
+        ]
     items.append(_user_message('Keep my current input exactly: 界\\"', "codex_turn_2"))
     original = deepcopy(items)
     records = codex_native._codex_rollout_records_from_session_items(
@@ -1416,11 +1420,11 @@ def test_rollout_byte_measurement_preserves_surrogate_content(text: str) -> None
 
 
 @pytest.mark.parametrize("compacted", [False, True])
-@pytest.mark.parametrize("pending_type", ["function_call", "function_call_output"])
-def test_rollout_byte_budget_preserves_source_pending_status(
-    monkeypatch: pytest.MonkeyPatch, compacted: bool, pending_type: str
+@pytest.mark.parametrize("ambiguity", ["pending_call", "pending_output", "earlier_output"])
+def test_rollout_byte_budget_preserves_source_ambiguity(
+    monkeypatch: pytest.MonkeyPatch, compacted: bool, ambiguity: str
 ) -> None:
-    """Conversion must not lose an explicit source status before budget eligibility."""
+    """Conversion must not hide source status or duplicates from budget eligibility."""
     arguments = json.dumps({"cmd": "x" * 500})
     history = [
         item
@@ -1430,7 +1434,10 @@ def test_rollout_byte_budget_preserves_source_pending_status(
             _tool_output(f"call_{index}"),
         )
     ]
-    history[0 if pending_type == "function_call" else 1]["status"] = "in_progress"
+    if ambiguity == "earlier_output":
+        history.insert(0, _tool_output("call_0"))
+    else:
+        history[0 if ambiguity == "pending_call" else 1]["status"] = "in_progress"
     original = deepcopy(history)
     monkeypatch.setattr(codex_native, "_MAX_REPLAYED_HISTORY_BYTES", 1_500)
     records = codex_native._codex_rollout_records_from_session_items(

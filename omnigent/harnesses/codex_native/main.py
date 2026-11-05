@@ -2763,21 +2763,26 @@ def _bound_codex_replay_argument_bytes(
     outputs: Counter[str] = Counter()
     output_positions: dict[str, int] = {}
     ambiguous: set[str] = set()
+    # Count the replayed source window, since conversion can drop duplicate outputs as orphans.
+    source_counts: Counter[tuple[object, str]] = Counter()
     for source_item in source_items:
         compacted_messages = source_item.get("compacted_messages")
-        source_group = (
-            compacted_messages
-            if source_item.get("type") == "compaction" and isinstance(compacted_messages, list)
-            else [source_item]
+        is_snapshot = source_item.get("type") == "compaction" and isinstance(
+            compacted_messages, list
         )
-        for item in source_group:
-            if (
-                isinstance(item, dict)
-                and isinstance(call_id := item.get("call_id"), str)
-                and "status" in item
-                and item["status"] != "completed"
-            ):
+        if is_snapshot and compacted_messages:
+            source_counts.clear()
+        for item in compacted_messages if is_snapshot else [source_item]:
+            if not isinstance(item, dict) or not isinstance(call_id := item.get("call_id"), str):
+                continue
+            if "status" in item and item["status"] != "completed":
                 ambiguous.add(call_id)
+            source_counts[item.get("type"), call_id] += 1
+    ambiguous.update(
+        call_id
+        for (item_type, call_id), count in source_counts.items()
+        if count > 1 and item_type in ("function_call", "function_call_output")
+    )
     for index, item in enumerate(history):
         if not isinstance(item, dict):
             continue
