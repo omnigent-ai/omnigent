@@ -28,15 +28,14 @@ def upgrade() -> None:
             "OR length(CAST(anchor_metadata AS BLOB)) <= 16383)"
         )
         return
-    op.add_column(
-        "comments",
-        sa.Column("anchor_metadata", CompressedText(max_stored_bytes=16_383), nullable=True),
-    )
-    op.create_check_constraint(
-        _ANCHOR_BYTES_CHECK,
-        "comments",
-        "anchor_metadata IS NULL OR octet_length(anchor_metadata) <= 16383",
-    )
+    with op.batch_alter_table("comments") as batch_op:
+        batch_op.add_column(
+            sa.Column("anchor_metadata", CompressedText(max_stored_bytes=16_383), nullable=True),
+        )
+        batch_op.create_check_constraint(
+            _ANCHOR_BYTES_CHECK,
+            "anchor_metadata IS NULL OR octet_length(anchor_metadata) <= 16383",
+        )
 
 
 def downgrade() -> None:
