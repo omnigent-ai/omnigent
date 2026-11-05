@@ -11,6 +11,7 @@ import json
 import logging
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1725,21 +1726,40 @@ async def test_output_limit_reconnect_uses_one_fixed_budget_and_one_send(
     monkeypatch: pytest.MonkeyPatch,
     receipt_after_reconnect: bool,
 ) -> None:
-    monkeypatch.setattr(fwd, "_OUTPUT_LIMIT_CONTINUE_TIMEOUT_SECONDS", 0.05)
     client, codex, state = _RecordingClient(), _ContinuingCodexClient(), fwd._CodexForwarderState()
     _seed_active_turn(tmp_path, "turn_a")
     normal = codex.request
+    guards: list[asyncio.Timeout] = []
+    rpc_guard: asyncio.Timeout | None = None
+    deadline: float | None = None
+    persisted_deadline: float | None = None
+
+    def timeout(delay: float | None) -> asyncio.Timeout:
+        guard = asyncio.timeout(delay)
+        guards.append(guard)
+        return guard
+
+    monkeypatch.setattr(fwd, "asyncio", SimpleNamespace(**{**vars(asyncio), "timeout": timeout}))
 
     async def request(method: str, params: dict) -> dict:
+        nonlocal rpc_guard, deadline, persisted_deadline
         if method == "turn/start":
+            rpc_guard = guards[-1]
+            deadline = rpc_guard.when()
+            assert deadline is not None
+            persisted_deadline = read_bridge_state(tmp_path).automatic_input_deadline
             await normal(method, params)
-            await asyncio.sleep(0.03)
             raise ConnectionError("ack lost")
+        assert guards[-1] is rpc_guard
+        assert rpc_guard is not None and rpc_guard.when() == deadline
         return await normal(method, params)
 
     async def connect() -> None:
+        assert guards[-1] is rpc_guard
+        assert rpc_guard is not None and rpc_guard.when() == deadline
         if not receipt_after_reconnect:
-            await asyncio.sleep(0.04)
+            rpc_guard.reschedule(asyncio.get_running_loop().time())
+            await asyncio.Event().wait()
 
     monkeypatch.setattr(codex, "request", request)
     monkeypatch.setattr(codex, "connect", connect)
@@ -1748,6 +1768,8 @@ async def test_output_limit_reconnect_uses_one_fixed_budget_and_one_send(
     )
     assert [method for method, _ in codex.requests].count("turn/start") == 1
     owner = read_bridge_state(tmp_path)
+    assert owner.automatic_input_deadline == persisted_deadline
+    assert rpc_guard is not None and rpc_guard.expired() is not receipt_after_reconnect
     assert owner.automatic_input_outcome == (
         "accepted" if receipt_after_reconnect else "uncertain"
     )
