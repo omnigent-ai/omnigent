@@ -1194,6 +1194,7 @@ describe("browserViewRegistry — navigation trail", () => {
   it("records main-frame starts and redirect hops since the last explicit navigation", () => {
     const { registry, emit } = makeEventCapturingRegistry();
     registry.openOrNavigate("conv_1", "https://docs.google.com/document/d/1");
+    const opened = registry.get("conv_1").navigationGeneration;
     emit("did-redirect-navigation", mainFrame("https://accounts.google.com/ServiceLogin"));
     emit("did-start-navigation", {
       url: "https://ads.example/frame",
@@ -1211,9 +1212,12 @@ describe("browserViewRegistry — navigation trail", () => {
       "https://accounts.google.com/ServiceLogin",
       "https://access.workspace.google.com/remediate",
     ]);
+    // Only the two main-frame hops count as navigations.
+    assert.equal(registry.get("conv_1").navigationGeneration, opened + 2);
 
     registry.openOrNavigate("conv_1", "https://example.com/");
     assert.deepEqual(registry.get("conv_1").navigationTrail, ["https://example.com/"]);
+    assert.equal(registry.get("conv_1").navigationGeneration, opened + 3);
   });
 
   it("accepts the deprecated positional navigation arguments", () => {

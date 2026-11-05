@@ -666,9 +666,13 @@ function registerBrowserIpc({
     return { ok: true };
   });
 
-  function viewStillShows(viewRegistry, conversationId, entry, url) {
+  function viewUnchanged(viewRegistry, conversationId, entry, { url, generation }) {
     try {
-      return viewRegistry.get(conversationId) === entry && entry.view.webContents.getURL() === url;
+      return (
+        viewRegistry.get(conversationId) === entry &&
+        entry.navigationGeneration === generation &&
+        entry.view.webContents.getURL() === url
+      );
     } catch {
       return false;
     }
@@ -682,6 +686,7 @@ function registerBrowserIpc({
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    const generation = entry.navigationGeneration;
     let currentUrl;
     let candidates;
     try {
@@ -696,9 +701,16 @@ function registerBrowserIpc({
     }
     let url;
     let refusal = "This tab has no web page to open.";
+    // The policy depends only on scheme and host, so check each host once.
+    const verdictsByHost = new Map();
     for (const candidate of candidates) {
+      const { protocol, hostname } = new URL(candidate);
+      const host = `${protocol}//${hostname}`;
+      if (!verdictsByHost.has(host)) {
+        verdictsByHost.set(host, g.registry.checkSystemBrowserUrl(args.conversationId, candidate));
+      }
       // oxlint-disable-next-line no-await-in-loop -- stop at the first allowed candidate
-      const verdict = await g.registry.checkSystemBrowserUrl(args.conversationId, candidate);
+      const verdict = await verdictsByHost.get(host);
       if (verdict.ok) {
         url = candidate;
         break;
@@ -707,17 +719,15 @@ function registerBrowserIpc({
     }
     if (!url) return { ok: false, error: refusal };
     // The policy check can wait on DNS; don't open a page the tab has left.
-    if (!viewStillShows(g.registry, args.conversationId, entry, currentUrl)) {
+    if (!viewUnchanged(g.registry, args.conversationId, entry, { url: currentUrl, generation })) {
       return { ok: false, error: "The page changed. Try again." };
     }
     try {
       await openExternal(url);
       return { ok: true, url };
     } catch (e) {
-      return {
-        ok: false,
-        error: `Couldn't open your browser: ${e && e.message ? e.message : String(e)}`,
-      };
+      console.warn("[browser] openExternal failed:", e);
+      return { ok: false, error: "Couldn't open your browser." };
     }
   });
 

@@ -1150,7 +1150,7 @@ describe("browserIpc — open in system browser", () => {
     assert.deepEqual(opened, ["https://docs.google.com/document/d/1"]);
   });
 
-  it("skips candidates the view's policy refuses and reports the refusal", async () => {
+  it("skips hosts the view's policy refuses, checking each host once", async () => {
     const DOC = "https://docs.google.com/document/d/1";
     const NEWER_DOC = "https://docs.google.com/document/d/2";
     const ctx = setupHandoff({
@@ -1161,33 +1161,49 @@ describe("browserIpc — open in system browser", () => {
     const checked = [];
     ctx.registry.checkSystemBrowserUrl = async (_conversationId, candidate) => {
       checked.push(candidate);
-      return candidate === NEWER_DOC ? { ok: false, error: "navigation blocked" } : { ok: true };
+      return new URL(candidate).hostname === "docs.google.com"
+        ? { ok: false, error: "navigation blocked" }
+        : { ok: true };
     };
-    assert.deepEqual(await ctx.invoke(), { ok: true, url: DOC });
-    assert.deepEqual(checked, [NEWER_DOC, DOC]);
+    assert.deepEqual(await ctx.invoke(), { ok: true, url: BLOCKED });
+    assert.deepEqual(checked, [NEWER_DOC, BLOCKED]);
 
     ctx.registry.checkSystemBrowserUrl = async () => ({ ok: false, error: "navigation blocked" });
     assert.deepEqual(await ctx.invoke(), { ok: false, error: "navigation blocked" });
-    assert.deepEqual(ctx.opened, [DOC]);
+    assert.deepEqual(ctx.opened, [BLOCKED]);
   });
 
   it("opens nothing when the tab moves on or closes during the policy check", async () => {
     const ctx = setupHandoff({ url: "https://example.com/page" });
-    const wc = ctx.registry.get("conv_1").view.webContents;
+    const entry = ctx.registry.get("conv_1");
+    const wc = entry.view.webContents;
+    const changed = { ok: false, error: "The page changed. Try again." };
     ctx.registry.checkSystemBrowserUrl = async () => {
       wc.getURL = () => "https://example.com/next";
       return { ok: true };
     };
-    assert.deepEqual(await ctx.invoke(), { ok: false, error: "The page changed. Try again." });
+    assert.deepEqual(await ctx.invoke(), changed);
 
+    // A navigation that hasn't committed leaves the URL as it was.
     wc.getURL = () => "https://example.com/page";
+    let allow;
+    ctx.registry.checkSystemBrowserUrl = () =>
+      new Promise((resolve) => {
+        allow = resolve;
+      });
+    const pending = ctx.invoke();
+    await new Promise(setImmediate);
+    entry.navigationGeneration = (entry.navigationGeneration ?? 0) + 1;
+    allow({ ok: true });
+    assert.deepEqual(await pending, changed);
+
     ctx.registry.checkSystemBrowserUrl = async () => {
       wc.getURL = () => {
         throw new Error("Object has been destroyed");
       };
       return { ok: true };
     };
-    assert.deepEqual(await ctx.invoke(), { ok: false, error: "The page changed. Try again." });
+    assert.deepEqual(await ctx.invoke(), changed);
     assert.deepEqual(ctx.opened, []);
   });
 
@@ -1207,7 +1223,7 @@ describe("browserIpc — open in system browser", () => {
     });
     assert.deepEqual(await invoke(), {
       ok: false,
-      error: "Couldn't open your browser: no handler",
+      error: "Couldn't open your browser.",
     });
   });
 });

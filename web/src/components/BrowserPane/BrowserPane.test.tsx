@@ -92,22 +92,26 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(screen.queryByText(/the agent will open pages here too/)).toBeNull();
   });
 
-  it("restores a tab's URL and navigation state from its existing native view", async () => {
+  it("restores a tab's URL, navigation state and block notice from its native view", async () => {
+    const blockedTabUrl = "https://access.workspace.google.com/remediate?tab=two";
     const bridge = installBridge({
       browserHasView: vi.fn().mockResolvedValue({
         exists: true,
-        url: "https://example.com/tab-two",
+        url: blockedTabUrl,
         canGoBack: true,
         canGoForward: false,
+        googleAccessBlocked: true,
       }),
+      browserOpenInSystemBrowser: vi.fn(),
     });
     render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
     await waitFor(() =>
-      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
-        "https://example.com/tab-two",
-      ),
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(blockedTabUrl),
     );
     expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Your organization only allows approved browsers",
+    );
     await waitFor(() =>
       expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two"),
     );
@@ -569,11 +573,6 @@ describe("BrowserPane system-browser handoff", () => {
     return { bridge, fireUrl: () => fireUrl };
   }
 
-  it("hides the toolbar button on a shell without the bridge method", async () => {
-    await renderWithView("conv_old", { browserOpenInSystemBrowser: undefined });
-    expect(screen.queryByRole("button", { name: "Open in browser" })).toBeNull();
-  });
-
   it("disables the toolbar button until a page is open", () => {
     installBridge({ browserOpenInSystemBrowser: vi.fn() });
     render(<BrowserPane conversationId="conv_empty" />);
@@ -637,17 +636,6 @@ describe("BrowserPane system-browser handoff", () => {
     await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
   });
 
-  it("restores the notice for a retained view already on the block page", async () => {
-    await renderWithView("conv_retained", {
-      browserHasView: vi
-        .fn()
-        .mockResolvedValue({ exists: true, url: blockedUrl, googleAccessBlocked: true }),
-    });
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "Your organization only allows approved browsers",
-    );
-  });
-
   it("keeps a live url event over a slower remount snapshot", async () => {
     let finishProbe: (result: Record<string, unknown>) => void = () => {};
     let fireUrl: ((p: { conversationId: string; url: string }) => void) | undefined;
@@ -687,6 +675,7 @@ describe("BrowserPane system-browser handoff", () => {
       expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(blockedUrl),
     );
     expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open in browser" })).toBeNull();
   });
 });
 

@@ -185,6 +185,9 @@ function createBrowserViewRegistry({
       // Main-frame URLs, including redirect hops, since the last explicit
       // navigation; the system-browser handoff reads it.
       navigationTrail: [],
+      // Bumped on each main-frame navigation so a pending handoff can tell
+      // the tab moved on even when its committed URL didn't change.
+      navigationGeneration: 0,
       // Enables navigation guards; renderer IPC always sets it.
       navigationPolicyEnforced: false,
       agentContext: null,
@@ -235,6 +238,7 @@ function createBrowserViewRegistry({
     if (!wc || typeof wc.on !== "function") return;
     const record = (details, url, isInPlace, isMainFrame) => {
       if (!(details?.isMainFrame ?? isMainFrame) || (details?.isSameDocument ?? isInPlace)) return;
+      entry.navigationGeneration += 1;
       recordNavigation(entry.navigationTrail, details?.url ?? url);
     };
     wc.on("did-start-navigation", record);
@@ -597,6 +601,7 @@ function createBrowserViewRegistry({
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
         entry.lastRequestedUrl = url;
+        entry.navigationGeneration += 1;
         entry.navigationTrail = [];
         recordNavigation(entry.navigationTrail, url);
         try {
