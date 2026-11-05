@@ -147,12 +147,8 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Toggle workspace sidebar", keys: rightSidebarToggleShortcutKeys(false) },
       { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
       { label: "Select a workspace tab", keys: workspaceTabShortcutKeys("1…4") },
-      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      {
-        label: "Open a new shell",
-        keys: [...NEW_TERMINAL_KEYS],
-        alternateKeys: [MOD_KEY, ALT_KEY, "T"],
-      },
+      { label: "Open a new browser tab", keys: [...NEW_BROWSER_TAB_KEYS] },
+      { label: "Open a new shell", keys: [...NEW_TERMINAL_KEYS] },
     ],
   },
   {
@@ -254,8 +250,6 @@ function shortcutGroupsFor(
               {
                 label: "New line in message",
                 keys: composerNewLineShortcutKeys(submitWithModEnter),
-                // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
-                alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
               },
               ...chatItems,
             ],
@@ -277,7 +271,8 @@ function shortcutGroupsFor(
         items: group.items
           .filter(
             (item) =>
-              (browser || item.label !== "Open a new browser tab") &&
+              // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
+              ((browser && desktopCommands) || item.label !== "Open a new browser tab") &&
               (contentSearch || item.label !== "Search workspace contents"),
           )
           .map((item) => {
@@ -290,10 +285,6 @@ function shortcutGroupsFor(
             }
             if (item.label === "Toggle workspace sidebar") {
               return { ...item, keys: rightSidebarToggleShortcutKeys(native) };
-            }
-            // The desktop menu's New Browser Tab owns ⌘T; ⌘⌥B still works.
-            if (desktopCommands && item.label === "Open a new browser tab") {
-              return { ...item, keys: [...NEW_BROWSER_TAB_KEYS], alternateKeys: item.keys };
             }
             return item;
           })

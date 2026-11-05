@@ -578,7 +578,7 @@ composer is read-only (for example a Read grant) gets neither **Reply** nor
 **Ask in side chat** when selecting parent text.
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
-⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
+⌘/Ctrl+T. Agent browser requests and chat links with in-app opening enabled
 create or select a closable Browser soft tab automatically.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
