@@ -595,7 +595,7 @@ def test_workspace_client_tags_user_agent(monkeypatch: pytest.MonkeyPatch) -> No
         def __init__(self, **kwargs: Any) -> None:
             captured["init"] = kwargs
 
-        def with_user_agent_extra(self, key: str, value: str) -> "_Cfg":
+        def with_user_agent_extra(self, key: str, value: str) -> _Cfg:
             captured["extra"].append((key, value))
             return self
 
