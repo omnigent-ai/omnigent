@@ -170,6 +170,48 @@ def test_bare_idle_clears_the_live_working_indicator(
     expect(working).to_be_hidden(timeout=10_000)
 
 
+# Pauses the indicator's animations and steps them through 3.4s, recording what moves.
+_STEP_WORKING_ANIMATIONS = """(indicator) => {
+  const starfish = indicator.querySelector(".otto-working");
+  const eye = starfish.querySelector(".otto-eye");
+  const label = indicator.querySelector(".text-shimmer");
+  const animations = indicator.getAnimations({ subtree: true });
+  for (const animation of animations) animation.pause();
+  const frames = [];
+  for (let time = 0; time <= 3400; time += 100) {
+    for (const animation of animations) animation.currentTime = time;
+    const row = starfish.parentElement.getBoundingClientRect();
+    frames.push({
+      starfishTop: starfish.getBoundingClientRect().top - row.top,
+      eyeHeight: eye.getBoundingClientRect().height,
+      labelShimmer: getComputedStyle(label).backgroundPosition,
+    });
+  }
+  return frames;
+}"""
+
+
+def test_working_starfish_holds_still_while_it_blinks_and_the_label_shimmers(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Only the starfish's eyes and the label animate while Working shows."""
+    chat = chat_session_contract
+    page.goto(chat.url)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
+    chat.wait_for_stream()
+    working = page.get_by_test_id("working-indicator")
+
+    chat.emit_busy("browser-turn")
+    expect(working).to_be_visible(timeout=10_000)
+
+    frames = working.evaluate(_STEP_WORKING_ANIMATIONS)
+    tops = sorted({frame["starfishTop"] for frame in frames})
+    assert len(tops) == 1, f"the starfish moved between offsets {tops}"
+    assert len({frame["eyeHeight"] for frame in frames}) > 1, "the eyes stopped blinking"
+    assert len({frame["labelShimmer"] for frame in frames}) > 1, "the label stopped shimmering"
+
+
 def test_blocked_reason_reaches_the_live_working_indicator(
     page: Page,
     chat_session_contract: ChatSessionContract,
