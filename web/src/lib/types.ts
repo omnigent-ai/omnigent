@@ -33,6 +33,12 @@ export interface RememberScope {
   host?: string;
 }
 
+/** The untruncated file-edit tool call an approval gates, for rendering as a diff. */
+export interface FileEditRequest {
+  toolName: string;
+  toolInput: Record<string, unknown>;
+}
+
 /** Persistence scopes advertised by Codex for MCP tool approvals. */
 export type CodexPersistMode = "session" | "always";
 
