@@ -15,7 +15,6 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
-  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -49,7 +48,11 @@ import {
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
 import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
-import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import {
+  isSystemUserContent,
+  parseSystemMessage,
+  stripAutomationContext,
+} from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
@@ -110,10 +113,12 @@ function sliceByCodePoint(str: string, limit: number): string {
 export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
-  return content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("")
+  return stripAutomationContext(
+    content
+      .filter(isTextBlock)
+      .map((c) => c.text)
+      .join(""),
+  )
     .replace(ATTACHED_RE, "")
     .trimEnd();
 }
@@ -761,6 +766,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -954,27 +960,36 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </div>
         </div>
-        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
-        {bubble.pending && bubble.awaitingAgent && (
-          <div
-            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
-            data-testid="message-awaiting-agent"
-          >
-            <ClockIcon size={12} aria-hidden />
-            The agent will read this after its current step
-          </div>
-        )}
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40">
+        {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
+            steering message has no enabled footer control to focus (Copy is
+            absent and Copy link is disabled while pending), so keep its
+            explanation visible for keyboard users. */}
+        <div
+          className={cn(
+            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
+            awaitingAgent && !text
+              ? "opacity-100"
+              : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+          )}
+        >
+          {awaitingAgent && (
+            <span
+              className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
+              data-testid="message-awaiting-agent"
+              title="The agent will read this after its current step"
+            >
+              The agent will read this after its current step
+            </span>
+          )}
           {ts && (
             <span
-              className="select-none text-sm leading-4 text-foreground/56"
+              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
               data-testid="message-timestamp"
             >
               {ts}
             </span>
           )}
-          <MessageActions>
+          <MessageActions className="shrink-0">
             {text && (
               <MessageAction
                 tooltip="Copy"

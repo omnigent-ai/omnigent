@@ -1122,3 +1122,26 @@ def test_failed_edit_rows_show_their_error(
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
     declined.click()
     expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()
+
+
+def test_automation_context_is_hidden_from_transcript(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item(
+                "automation-task",
+                "user",
+                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                response_id="automation-turn",
+            )
+        ]
+    )
+    page.goto(chat.url)
+    user = page.locator('[data-role="user"]')
+    expect(user).to_contain_text("Summarize today's changes.")
+    expect(user).not_to_contain_text("no one is watching")
+    expect(user).not_to_contain_text("omnigent-automation-context")
