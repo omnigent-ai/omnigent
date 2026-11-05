@@ -8567,6 +8567,59 @@ async def test_sys_session_create_config_path_refuses_unsendable_overrides(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "effort", "sent"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param(None, "low", "low", id="unclassified-harness-passes"),
+    ],
+)
+async def test_sys_session_create_config_path_checks_effort_against_the_bundle_harness(
+    tmp_path: Path, harness: str | None, effort: str, sent: str | None
+) -> None:
+    """
+    A config_path effort the bundled child's harness cannot use fails before
+    any upload instead of being stored and dropped at every turn; an alias
+    folds to the harness's value, and an unclassified harness passes through.
+
+    :param harness: The local config's harness, or ``None`` for none set.
+    :param effort: The requested effort.
+    :param sent: The effort the metadata carries, or ``None`` when refused.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = "name: helper\nprompt: help\n"
+    if harness is not None:
+        config += f"executor:\n  harness: {harness}\n"
+    (tmp_path / "helper.yaml").write_text(config)
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": effort}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    if sent is None:
+        assert "invalid 'reasoning_effort'" in output
+        assert creates == []
+        return
+    assert len(creates) == 1, output
+    assert _parse_multipart_create(creates[0])["metadata"]["reasoning_effort"] == sent
+
+
+@pytest.mark.asyncio
 async def test_sys_session_create_config_path_escape_rejected(
     tmp_path: Path,
 ) -> None:

@@ -3799,6 +3799,42 @@ async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -
     )
 
 
+def _config_path_effort_for_harness(bundle_bytes: bytes, effort: str) -> str:
+    """
+    Check a config_path ``reasoning_effort`` against the bundled child's harness.
+
+    A known harness with no effort plumbing, or an effort outside its
+    vocabulary, is refused instead of stored and dropped at every turn;
+    aliases fold to the harness's canonical value. A harness the registry
+    cannot classify (e.g. the runtime default) passes through, and launch
+    filters it. The check lives at the tool boundary, not the multipart
+    endpoint, so direct HTTP creates keep their shared-vocabulary rules.
+
+    :param bundle_bytes: The gzipped bundle about to be uploaded.
+    :param effort: The requested effort, e.g. ``"high"``.
+    :returns: The effort to send, e.g. ``"xhigh"`` for ``"ultra"`` on codex.
+    :raises ValueError: If the bundle's harness cannot use the effort.
+    """
+    from omnigent.models.model_catalog import spec_harness
+    from omnigent.spec import load
+    from omnigent.util.reasoning_effort import efforts_for_harness
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = load(
+                bundle_bytes,
+                dest=Path(tmpdir) / "agent",
+                expand_env=False,
+                enforce_handler_allowlist=True,
+            )
+    except Exception:  # noqa: BLE001 — the server reports an invalid bundle itself.
+        return effort
+    harness = spec_harness(spec)
+    if efforts_for_harness(harness) is None:
+        return effort
+    return validate_effort_for_harness(effort, harness)
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: _JsonObject,
@@ -3851,6 +3887,14 @@ async def _upload_config_bundle(
         "parent_session_id": conversation_id,
         **_session_create_fields(args),
     }
+    effort = metadata.get("reasoning_effort")
+    if isinstance(effort, str):
+        try:
+            metadata["reasoning_effort"] = await asyncio.to_thread(
+                _config_path_effort_for_harness, bundle_bytes, effort
+            )
+        except ValueError as exc:
+            return json.dumps({"error": f"sys_session_create invalid 'reasoning_effort': {exc}"})
     if "model_override" in metadata:
         unsupported = await _bundle_model_override_unsupported(server_client)
         if unsupported is not None:

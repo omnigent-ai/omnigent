@@ -429,30 +429,28 @@ async def test_bundle_create_rejects_malformed_model_override(
 
 
 @pytest.mark.parametrize(
-    ("harness", "effort", "stored"),
+    ("harness", "effort"),
     [
-        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
-        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
-        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param("claude-sdk", "minimal", id="outside-harness-vocabulary"),
+        pytest.param("cursor", "low", id="no-effort-support"),
     ],
 )
-async def test_bundle_create_checks_effort_against_the_bundle_harness(
-    client: httpx.AsyncClient, harness: str, effort: str, stored: str | None
+async def test_bundle_create_keeps_the_shared_effort_vocabulary(
+    client: httpx.AsyncClient, harness: str, effort: str
 ) -> None:
-    """An effort the bundle's harness cannot use 400s instead of being dropped at each turn.
+    """The multipart endpoint keeps accepting any shared-vocabulary effort.
+
+    Harness support is filtered when a turn executes, as before; only the
+    ``config_path`` tool checks it against the bundle before uploading, so
+    direct HTTP and SDK creates keep their existing contract.
 
     :param harness: The uploaded bundle's harness.
-    :param effort: The requested effort.
-    :param stored: The effort the row keeps, or ``None`` when the create must 400.
+    :param effort: The requested effort, valid in the shared vocabulary.
     """
     resp = await _post_bundle_create(client, {"reasoning_effort": effort}, harness=harness)
-    if stored is None:
-        assert resp.status_code == 400, resp.text
-        assert "invalid reasoning_effort" in resp.text
-        return
     assert resp.status_code == 201, resp.text
     get = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
-    assert get.json()["reasoning_effort"] == stored
+    assert get.json()["reasoning_effort"] == effort
 
 
 async def test_bundled_child_runner_notify_seeds_the_requested_model(
