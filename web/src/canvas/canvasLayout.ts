@@ -60,8 +60,10 @@ export function gridPosition(index: number, columns: number): CanvasPosition {
 }
 
 /**
- * Keep every saved position for a live session and lay the rest out on a
- * near-square grid, newest first, skipping cells a saved card already fills.
+ * Keep saved positions for live sessions and lay the rest out on a near-square
+ * grid, newest first, skipping cells a saved card already fills. A card moved
+ * from another canvas can arrive on a spot already taken, so only the first card
+ * keeps an exact spot.
  */
 export function mergeSessionPositions(
   sessions: readonly Conversation[],
@@ -73,9 +75,13 @@ export function mergeSessionPositions(
   const liveIds = new Set(ordered.map((session) => session.id));
   const positions: CanvasPositions = {};
   const occupied = new Set<string>();
+  const exactSpots = new Set<string>();
   for (const [id, position] of Object.entries(saved)) {
     if (!liveIds.has(id) || !Number.isFinite(position.x) || !Number.isFinite(position.y)) continue;
     const normalized = { x: Math.round(position.x), y: Math.round(position.y) };
+    const exactSpot = `${normalized.x}:${normalized.y}`;
+    if (exactSpots.has(exactSpot)) continue;
+    exactSpots.add(exactSpot);
     positions[id] = normalized;
     occupied.add(cellKey(normalized));
   }

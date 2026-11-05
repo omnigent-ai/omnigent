@@ -85,6 +85,7 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.session_orchestration import require_project_read_access
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
@@ -125,6 +126,9 @@ def register_agent_routes(
         user_id = _require_user(request, auth_provider)
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        await asyncio.to_thread(
+            require_project_read_access, request, user_id, conversation_store, session_id
         )
         conv = access.conversation
         if conv is None:
@@ -227,6 +231,9 @@ def register_agent_routes(
             user_id = _require_user(request, auth_provider)
             access = await _require_access_and_level(
                 user_id, session_id, LEVEL_READ, permission_store, conversation_store
+            )
+            await asyncio.to_thread(
+                require_project_read_access, request, user_id, conversation_store, session_id
             )
             conv = access.conversation
         if conv is None:

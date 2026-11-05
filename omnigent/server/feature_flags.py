@@ -109,7 +109,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     ),
     FeatureDefinition(
         feature=Feature.CANVAS,
-        description="Web Canvas page: sessions as draggable cards grouped by project",
+        description="Web Canvas page and project boundary for agent session tools",
         owner="web",
         review_by_release="0.15.0",
     ),

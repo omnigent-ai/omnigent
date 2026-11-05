@@ -59,7 +59,12 @@ from omnigent.server.scheduled.harness_settings import (
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.telemetry import log_task_created
-from omnigent.server.session_orchestration import require_owned_session
+from omnigent.server.session_orchestration import (
+    OUTSIDE_PROJECT_MESSAGE,
+    agent_task_project_id,
+    require_owned_session,
+    scheduled_task_in_project,
+)
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
@@ -569,6 +574,26 @@ def create_scheduled_tasks_router(
             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
         return task
 
+    async def _task_in_agent_project(request: Request, task: ScheduledTask) -> bool:
+        """Say whether a calling agent's project boundary admits *task*."""
+        return await asyncio.to_thread(
+            scheduled_task_in_project,
+            request,
+            _project_owner(_owner(request)),
+            conversation_store,
+            project_id=task.project_id,
+            session_id=task.session_id,
+        )
+
+    async def _require_visible(
+        request: Request, scheduled_task_id: str, owner: str | None
+    ) -> ScheduledTask:
+        """Load an owned task, hiding one outside a calling agent's project."""
+        task = _require_owned(scheduled_task_id, owner)
+        if not await _task_in_agent_project(request, task):
+            raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+        return task
+
     async def _require_continuable(request: Request, task: ScheduledTask) -> Conversation:
         """Return a picked session *task* can continue; reject it otherwise, hiding one
         the owner cannot see."""
@@ -622,6 +647,20 @@ def create_scheduled_tasks_router(
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         project_owner = _project_owner(owner)
+        requested_project_id = (
+            body.project_id
+            if body.project_id is not None
+            else await asyncio.to_thread(agent_task_project_id, request, conversation_store)
+        )
+        if not await asyncio.to_thread(
+            scheduled_task_in_project,
+            request,
+            project_owner,
+            conversation_store,
+            project_id=requested_project_id,
+            session_id=body.session_id,
+        ):
+            raise OmnigentError(OUTSIDE_PROJECT_MESSAGE, code=ErrorCode.FORBIDDEN)
         # Known before the task exists, since a sandbox session must run on the
         # sandbox host derived from it.
         task_id = uuid.uuid4().hex
@@ -655,8 +694,8 @@ def create_scheduled_tasks_router(
             bound = await _bind_agent(agent, owner_id)
         project_id: str | None = None
         try:
-            if body.project_id is not None:
-                project_id = await _owned_project_id(project_owner, body.project_id)
+            if requested_project_id is not None:
+                project_id = await _owned_project_id(project_owner, requested_project_id)
             task = store.create(
                 scheduled_task_id=task_id,
                 name=body.name,
@@ -720,7 +759,11 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+        tasks = [
+            task
+            for task in store.list(owner_user_id=owner_id)
+            if _owns_task(task, owner_id) and await _task_in_agent_project(request, task)
+        ]
         task_ids = [t.id for t in tasks]
         running = store.list_running_runs_for_tasks(task_ids)
         # Force-fail stale orphans FIRST so the completion badge below reports a
@@ -778,7 +821,7 @@ def create_scheduled_tasks_router(
         """Fetch one of the caller's scheduled tasks."""
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        task = _require_owned(scheduled_task_id, owner_id)
+        task = await _require_visible(request, scheduled_task_id, owner_id)
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks([task.id])
@@ -903,7 +946,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        task = _require_owned(scheduled_task_id, owner_id)
+        task = await _require_visible(request, scheduled_task_id, owner_id)
         if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
             scheduler = _scheduler(request)
             if scheduler is None:
@@ -947,7 +990,7 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        existing = _require_owned(scheduled_task_id, owner_id)
+        existing = await _require_visible(request, scheduled_task_id, owner_id)
         legacy_workspace = (
             existing.execution_target == "managed_sandbox"
             and existing.workspace is not None
@@ -959,6 +1002,15 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if not await asyncio.to_thread(
+            scheduled_task_in_project,
+            request,
+            _project_owner(owner),
+            conversation_store,
+            project_id=fields.get("project_id", existing.project_id),
+            session_id=fields.get("session_id", existing.session_id),
+        ):
+            raise OmnigentError(OUTSIDE_PROJECT_MESSAGE, code=ErrorCode.FORBIDDEN)
         if fields.get("session_mode") is None:
             fields.pop("session_mode", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
@@ -1141,7 +1193,7 @@ def create_scheduled_tasks_router(
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
-        _require_owned(scheduled_task_id, owner_id)
+        await _require_visible(request, scheduled_task_id, owner_id)
         await asyncio.to_thread(store.delete, scheduled_task_id)
         scheduler = _scheduler(request)
         if scheduler is not None and not getattr(

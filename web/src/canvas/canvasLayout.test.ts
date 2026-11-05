@@ -34,6 +34,24 @@ function session(
 }
 
 describe("mergeSessionPositions", () => {
+  it("moves a card off a spot another card already holds exactly", () => {
+    const rows = [session("kept", 1), session("moved", 2)];
+    const result = mergeSessionPositions(rows, {
+      kept: { x: 0, y: 0 },
+      moved: { x: 0, y: 0 },
+    });
+
+    expect(result.kept).toEqual({ x: 0, y: 0 });
+    expect(result.moved).not.toEqual({ x: 0, y: 0 });
+  });
+
+  it("keeps cards a person placed close together", () => {
+    const rows = [session("first", 1), session("second", 2)];
+    const saved = { first: { x: 0, y: 0 }, second: { x: 24, y: 24 } };
+
+    expect(mergeSessionPositions(rows, saved)).toEqual(saved);
+  });
+
   it("seeds a deterministic non-overlapping grid ordered by recency", () => {
     const sessions = [session("old", 1), session("new", 3), session("middle", 2)];
     const first = mergeSessionPositions(sessions, {});
