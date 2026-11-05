@@ -3832,11 +3832,23 @@ describe("Sidebar view options", () => {
     mockConversations([
       conv("conv_running", "Codex", { status: "running" }),
       conv("conv_idle", "Codex", { status: "idle" }),
+      conv("conv_parent", "Codex", {
+        status: "idle",
+        updated_at: 30,
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      }),
+      conv("conv_peer", "Codex", {
+        status: "failed",
+        updated_at: 1,
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      }),
     ]);
     renderGroupingSidebar();
     expect(screen.queryByText("Projects")).toBeNull();
     expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
-    expect(groupHeaders()).toEqual(["Working", "Done"]);
+    expect(groupHeaders()).toEqual(["Needs attention", "Working", "Done"]);
+    expect(within(groupSection("Needs attention")).getByText("conv_parent")).toBeInTheDocument();
+    expect(within(groupSection("Needs attention")).getByText("conv_peer")).toBeInTheDocument();
 
     openViewSubmenu("session-grouping-menu");
     expect(screen.getByRole("menuitemradio", { name: "Status" })).toHaveAttribute(

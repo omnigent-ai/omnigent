@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
   bareConversationId,
@@ -881,6 +882,27 @@ describe("Custom order", () => {
       "history-active",
       "history-tie",
       "history",
+    ]);
+  });
+
+  it("keeps a family's custom slot through new members and representative promotion", () => {
+    const family = { id: "origin", representative_id: "a", pinned: false };
+    const a = { ...row("a", 1), family };
+    const b = { ...row("b", 200), family };
+    const x = row("x", 2);
+    const order = { base: "updated" as const, since: 100, ids: ["x", "origin"] };
+    const ordered = (rows: Conversation[]) =>
+      ids(
+        orderSessionFamilies(
+          sortConversations(rows, null, null, "updated_at", customSortOrder(order)),
+        ),
+      );
+    expect(ordered([a, b, x])).toEqual(["x", "a", "b"]);
+    const promoted = { ...b, family: { ...family, representative_id: "b" } };
+    expect(ordered([promoted, x])).toEqual(["x", "b"]);
+    expect(moveCustomOrder(order, [promoted, x], "b", "x", null, null)?.ids).toEqual([
+      "origin",
+      "x",
     ]);
   });
 

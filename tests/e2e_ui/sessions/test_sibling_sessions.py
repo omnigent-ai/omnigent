@@ -270,6 +270,18 @@ async def _drive(rig: ManagedReplicas) -> None:
                         lambda row: row.get("family", {}).get("pinned") is True,
                     )
                     await page.screenshot(path=str(evidence / "family-pinned.png"))
+                    member_row = page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
+                    await member_row.hover()
+                    await member_row.get_by_role("button", name="Unpin conversation").click()
+                    await _poll(
+                        client,
+                        f"{rig.a}/v1/sessions/{fresh_id}",
+                        lambda row: (
+                            not row.get("labels", {}).get("omnigent.pinned")
+                            and row.get("family", {}).get("pinned") is True
+                        ),
+                    )
+                    await page.screenshot(path=str(evidence / "individual-unpinned.png"))
                     await page.locator(f'li[data-sidebar-session-id="{sibling_id}"]').first.hover()
                     await (
                         page.locator(f'li[data-sidebar-session-id="{sibling_id}"]')
@@ -280,12 +292,6 @@ async def _drive(rig: ManagedReplicas) -> None:
                         client,
                         f"{rig.a}/v1/sessions/{sibling_id}",
                         lambda row: row.get("family", {}).get("pinned") is False,
-                    )
-                    await page.locator(f'li[data-sidebar-session-id="{fresh_id}"]').first.hover()
-                    await (
-                        page.locator(f'li[data-sidebar-session-id="{fresh_id}"]')
-                        .first.get_by_test_id("quick-pin-conversation")
-                        .click()
                     )
                     # Project moves are family-wide.
                     await menu(sibling_id)

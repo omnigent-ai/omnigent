@@ -32,6 +32,8 @@ The first seven items transcribe the whiteboard with the subsequent clarificatio
    an individual shortcut. Family pins survive promotion and include future
    members; unpinning the family preserves individual pins.
 4. An indented member cannot move independently or detach from its family.
+   Custom ordering moves the whole family and preserves its position when the
+   representative changes. Status grouping uses the highest-priority member status.
 5. Ordinary **Fork** creates a standalone session and can reuse the source's
    ephemeral host. Neither an existing sibling nor an existing standalone
    session can join another family. Membership is assigned only during creation.
