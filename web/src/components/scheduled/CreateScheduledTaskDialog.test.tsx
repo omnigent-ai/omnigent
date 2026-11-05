@@ -371,7 +371,7 @@ describe("prompt-first automation setup", () => {
     });
   });
 
-  it.each(["COUNT=4", "UNTIL=20991231T235959Z", "UNTIL=20200101T235959Z"])(
+  it.each(["COUNT=4", "UNTIL=20991231T235959Z"])(
     "keeps Advanced collapsed while editing time with %s",
     (ending) => {
       render(
@@ -392,11 +392,8 @@ describe("prompt-first automation setup", () => {
       expect(advanced).toHaveAttribute("aria-expanded", "false");
       expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
       fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:30" } });
-      const expired = ending === "UNTIL=20200101T235959Z";
-      expect(advanced).toHaveAttribute("aria-expanded", String(expired));
-      expect(screen.getByTestId("create-scheduled-task-submit").hasAttribute("disabled")).toBe(
-        expired,
-      );
+      expect(advanced).toHaveAttribute("aria-expanded", "false");
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     },
   );
 
@@ -411,22 +408,24 @@ describe("prompt-first automation setup", () => {
       />,
       { expandAdvanced: false },
     );
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "false",
-    );
+    const advanced = screen.getByRole("button", { name: "Advanced" });
+    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:" } });
+    expect(screen.getByTestId("schedule-error")).toHaveTextContent("Enter a valid time");
+    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    fireEvent.change(screen.getByLabelText("Time"), { target: { value: "9:00" } });
+    expect(advanced).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
     fireEvent.change(screen.getByLabelText("Time"), { target: { value: "10:00" } });
-    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
-      "aria-expanded",
-      "true",
-    );
+    expect(advanced).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByLabelText("End date")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.click(advanced);
     expect(screen.queryByLabelText("End date")).not.toBeInTheDocument();
     expect(screen.getByRole("alert")).toHaveTextContent("Expand Advanced to fix settings");
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
-    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+    fireEvent.click(advanced);
     expect(screen.getByLabelText("End date")).toBeVisible();
   });
 
