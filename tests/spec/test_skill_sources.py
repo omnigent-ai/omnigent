@@ -14,6 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from omnigent.claude_launcher import ClaudeLauncher
 from omnigent.harnesses.claude_native import plugin_discovery
@@ -1149,14 +1150,15 @@ def test_claude_launch_customization_triggers(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize(
-    ("script", "timeout_s", "summary"),
+    ("script", "timeout_s", "summary", "logged"),
     [
         (
             "sys.stderr.write(f'{sys.argv} failed\\n')\nsys.exit(3)\n",
             10.0,
             "did not report its plugins",
+            "did not report its plugins: exited 3 without an init event",
         ),
-        ("time.sleep(30)\n", 0.5, "timed out after 0.5s"),
+        ("time.sleep(30)\n", 0.5, "timed out after 0.5s", "timed out after 0.5s"),
     ],
     ids=["no-init", "timeout"],
 )
@@ -1167,6 +1169,7 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
     script: str,
     timeout_s: float,
     summary: str,
+    logged: str,
 ) -> None:
     home = _claude_home_with_plugin(
         tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
@@ -1192,7 +1195,7 @@ def test_claude_launch_probe_failure_warns_and_keeps_installed_plugins(
         "Claude plugins added by the configured launch are missing: the launch "
         f"{summary}; see the host log for details."
     ]
-    assert summary in caplog.text
+    assert logged in caplog.text
     assert "synthetic-launch-secret" not in caplog.text
 
 
@@ -1209,9 +1212,9 @@ _LAUNCH_UNRESOLVED = (
 @pytest.mark.parametrize(
     ("scope", "config_text", "launcher", "warning"),
     [
-        ("global", "harness: [\n", "", _CONFIG_UNREADABLE),
+        ("global", "harness: *synthetic-config-secret\n", "", _CONFIG_UNREADABLE),
         ("global", None, "", _CONFIG_UNREADABLE),
-        ("global", "harness: [\n", "wrapper", _LAUNCH_UNRESOLVED),
+        ("global", "harness: !synthetic-config-secret x\n", "wrapper", _LAUNCH_UNRESOLVED),
         ("global", "- claude\n", "", _CONFIG_UNREADABLE),
         ("global", "- claude\n", "wrapper", _LAUNCH_UNRESOLVED),
         ("global", b"harness: \x81\n", "", _CONFIG_UNREADABLE),
@@ -1232,6 +1235,7 @@ _LAUNCH_UNRESOLVED = (
 def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     scope: str,
     config_text: str | bytes | None,
     launcher: str,
@@ -1263,6 +1267,28 @@ def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
 
     assert "sp:installed" in {s.name for s in skills}
     assert warnings == [warning]
+    # YAML errors can quote a config value, such as an unquoted credential read as an alias.
+    assert caplog.records
+    assert "synthetic-config-secret" not in caplog.text
+
+
+def test_config_error_description_says_where_without_quoting_values(tmp_path: Path) -> None:
+    config = tmp_path / "config.yaml"
+    config.write_text("harness: *synthetic-config-secret\n")
+    with pytest.raises(yaml.YAMLError) as yaml_error, config.open() as stream:
+        yaml.safe_load(stream)
+    with pytest.raises(OSError) as os_error:
+        (tmp_path / "missing").read_text()
+
+    assert plugin_discovery.describe_config_error(yaml_error.value) == (
+        f"ComposerError in {config}, line 1, column 10"
+    )
+    assert plugin_discovery.describe_config_error(os_error.value) == (
+        f"FileNotFoundError: No such file or directory: {tmp_path / 'missing'}"
+    )
+    assert plugin_discovery.describe_config_error(TypeError("synthetic-config-secret")) == (
+        "TypeError"
+    )
 
 
 @pytest.mark.posix_only

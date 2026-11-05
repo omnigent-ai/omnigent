@@ -31,6 +31,17 @@ _PROBE_SETTINGS = json.dumps({"disableAllHooks": True})
 CONFIG_READ_ERRORS = (OSError, AttributeError, TypeError, ValueError, yaml.YAMLError)
 
 
+def describe_config_error(exc: BaseException) -> str:
+    """Say what failed and where, without the message, which can quote a config value."""
+    name = type(exc).__name__
+    mark = exc.problem_mark if isinstance(exc, yaml.MarkedYAMLError) else None
+    if mark is not None:
+        return f"{name} in {mark.name}, line {mark.line + 1}, column {mark.column + 1}"
+    if isinstance(exc, OSError) and exc.filename is not None:
+        return f"{name}: {exc.strerror}: {exc.filename}"
+    return name
+
+
 class LaunchPluginsPending(Exception):
     """The launch has not reported its plugins yet; a background probe is asking it."""
 
@@ -222,8 +233,10 @@ def _refresh(probe: _LaunchProbe) -> None:
         failure = f"timed out after {exc.timeout:g}s"
         # The exception's text includes the launch's arguments, which can carry credentials.
         _log.warning("The configured Claude launch %s", failure)
-    except (subprocess.SubprocessError, *CONFIG_READ_ERRORS) as exc:
+    except LaunchPluginsFailed as exc:
         _log.warning("The configured Claude launch %s: %s", failure, exc)
+    except (subprocess.SubprocessError, *CONFIG_READ_ERRORS) as exc:
+        _log.warning("The configured Claude launch %s: %s", failure, describe_config_error(exc))
     finally:
         with _probes_lock:
             probe.executable, probe.executable_identity = executable, executable_identity
@@ -282,4 +295,4 @@ def _probe_plugin_dirs(
             and event.get("subtype") == "init"
         ):
             return _plugin_dirs(event.get("plugins"))
-    raise ValueError(f"exited {process.returncode} without an init event")
+    raise LaunchPluginsFailed(f"exited {process.returncode} without an init event")

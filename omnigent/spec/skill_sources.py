@@ -786,6 +786,7 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
         LaunchPluginsPending,
         claude_launch_is_customized,
         claude_launch_plugin_dirs,
+        describe_config_error,
     )
 
     if not ctx.is_native:
@@ -793,7 +794,10 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
     try:
         customized = claude_launch_is_customized()
     except CONFIG_READ_ERRORS as exc:
-        _log.warning("Could not read the Omnigent config to find the Claude launch: %s", exc)
+        _log.warning(
+            "Could not read the Omnigent config to find the Claude launch: %s",
+            describe_config_error(exc),
+        )
         if ctx.warnings is not None:
             ctx.warnings.append(
                 "Claude plugins added by a configured launch may be missing: the Omnigent "
@@ -813,7 +817,9 @@ def _claude_launch_plugin_paths(ctx: SkillSourceContext) -> dict[str, Path]:
         if isinstance(exc, LaunchPluginsFailed):
             summary = str(exc)
         else:
-            _log.warning("Could not resolve the configured Claude launch: %s", exc)
+            _log.warning(
+                "Could not resolve the configured Claude launch: %s", describe_config_error(exc)
+            )
             summary = "did not report its plugins"
         note = (
             f"Claude plugins added by the configured launch are missing: the launch "
