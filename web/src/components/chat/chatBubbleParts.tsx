@@ -761,6 +761,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
   const ts = formatBubbleTimestamp(bubble.createdAtS);
+  const awaitingAgent = Boolean(bubble.pending && bubble.awaitingAgent);
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(
     bubble.pending ? null : bubble.itemId,
   );
@@ -939,9 +940,19 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
-        {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
-        <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40">
-          {bubble.pending && bubble.awaitingAgent && (
+        {/* 40%-visible on touch, hover/focus-reveal on desktop. A text-less
+            steering message has no enabled footer control to focus (Copy is
+            absent and Copy link is disabled while pending), so keep its
+            explanation visible for keyboard users. */}
+        <div
+          className={cn(
+            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
+            awaitingAgent && !text
+              ? "opacity-100"
+              : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 [@media(pointer:coarse)]:opacity-40",
+          )}
+        >
+          {awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
               data-testid="message-awaiting-agent"

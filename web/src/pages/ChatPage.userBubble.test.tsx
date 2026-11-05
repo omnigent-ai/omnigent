@@ -320,6 +320,27 @@ describe("UserBubble awaiting-agent marker", () => {
     expect(explanation.querySelector("svg")).toBeNull();
   });
 
+  it("keeps an attachment-only explanation visible without a focusable footer control", () => {
+    const [pending] = buildPendingBubbles(
+      [
+        {
+          tempId: "pend_attachment",
+          content: [{ type: "input_file", file_id: "file_1", filename: "notes.txt" }],
+          sentMidTurn: true,
+        },
+      ],
+      null,
+    );
+    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+    const explanation = screen.getByTestId("message-awaiting-agent");
+    const footer = explanation.parentElement;
+    expect(screen.queryByRole("button", { name: "Copy" })).toBeNull();
+    expect(screen.getByTestId("copy-message-link")).toBeDisabled();
+    expect(footer).toHaveClass("opacity-100");
+    expect(footer).not.toHaveClass("md:opacity-0");
+  });
+
   it("stays hidden for a send that started a turn and for committed history", () => {
     const [pending] = buildPendingBubbles([{ tempId: "pend_2", content }], null);
     const { rerender } = renderBubble(pending!);

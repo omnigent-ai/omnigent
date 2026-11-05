@@ -115,6 +115,43 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
 
 
+def test_attachment_only_steering_explanation_stays_visible_on_desktop(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A text-less steer has no focusable footer control, so it must not hide."""
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.update_session(labels={"omnigent.wrapper": "codex-native-ui"})
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/codex_goal", {"goal": None})
+    chat.reject_uploads = False
+    page.set_viewport_size({"width": 1280, "height": 900})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    chat.emit_busy("current")
+    expect(page.get_by_test_id("working-indicator")).to_be_visible()
+    page.evaluate("localStorage.setItem('omnigent:always-steer', 'true')")
+    chat.event_ack = {"queued": True, "pending_id": "steer"}
+    page.locator('form.chat-composer-form input[type="file"]').set_input_files(
+        [{"name": "notes.txt", "mimeType": "text/plain", "buffer": b"Notes"}]
+    )
+    send = page.get_by_role("button", name="Send", exact=True)
+    expect(send).to_be_enabled()
+    send.click()
+    notice = page.get_by_test_id("message-awaiting-agent")
+    expect(notice).to_be_visible()
+    footer = notice.locator("..")
+    expect(footer.get_by_role("button", name="Copy", exact=True)).to_have_count(0)
+    expect(footer.get_by_test_id("copy-message-link")).to_be_disabled()
+    page.mouse.move(0, 0)
+    opacity = """element => {
+      let value = 1;
+      for (let node = element; node; node = node.parentElement)
+        value *= Number(getComputedStyle(node).opacity);
+      return value;
+    }"""
+    page.wait_for_function(f"element => ({opacity})(element) >= 0.99", arg=notice.element_handle())
+
+
 def test_bare_idle_clears_the_live_working_indicator(
     page: Page,
     chat_session_contract: ChatSessionContract,
