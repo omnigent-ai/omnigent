@@ -841,6 +841,13 @@
   padding: 0;
 }
 
+/* Keep glass readable when the browser cannot diffuse the content behind it. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .omni-glass-surface {
+    --omni-glass-background: var(--card-solid);
+  }
+}
+
 /* Mobile icon controls change the glyph's opacity while the surface stays still. */
 @media (width < 48rem) {
   [data-slot="button"][data-size^="icon"],
@@ -853,6 +860,11 @@
     border-color: var(--mobile-icon-button-border) !important;
     outline: none !important;
     box-shadow: none !important;
+
+    &:focus-visible {
+      outline: 2px solid var(--ring) !important;
+      outline-offset: 2px;
+    }
 
     &[data-variant="default"] {
       --mobile-icon-button-background: var(--primary-cta);

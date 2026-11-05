@@ -45,6 +45,10 @@ import { ApiError } from "@/lib/sessionsApi";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPreferences";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+import {
+  MobileHeaderControlsProvider,
+  MobileHeaderControlsSlot,
+} from "@/shell/MobileHeaderControlsSlot";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -585,6 +589,64 @@ describe("Composer growth layout", () => {
       "[&::-webkit-scrollbar]:hidden",
     );
     expect(ta.parentElement).toHaveClass("overflow-hidden");
+  });
+
+  it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    let height = 48;
+    const getRect = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this instanceof HTMLFormElement
+        ? { ...getRect.call(this), height }
+        : getRect.call(this);
+    });
+    let notifyResize = () => {};
+    const disconnect = vi.fn();
+    const OriginalObserver = ResizeObserver;
+    vi.stubGlobal(
+      "ResizeObserver",
+      class extends OriginalObserver {
+        constructor(callback: ResizeObserverCallback) {
+          super(callback);
+          this.observe = (element) => {
+            if (element instanceof HTMLFormElement) {
+              notifyResize = () => callback([], this);
+              this.disconnect = disconnect;
+            }
+          };
+        }
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    const onGrowth = vi.fn();
+    const view = render(
+      <div data-chat-surface data-testid="chat-surface">
+        <Composer {...composerProps({ onViewportShrinkPinScroll: onGrowth })} />
+      </div>,
+    );
+    const surface = screen.getByTestId("chat-surface");
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("48px");
+    onGrowth.mockClear();
+    act(notifyResize);
+    expect(onGrowth).not.toHaveBeenCalled();
+    height = 112;
+    act(notifyResize);
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("112px");
+    expect(onGrowth).toHaveBeenCalledOnce();
+    act(notifyResize);
+    expect(onGrowth).toHaveBeenCalledOnce();
+    view.unmount();
+    expect(disconnect).toHaveBeenCalledOnce();
+    expect(surface.style.getPropertyValue("--session-composer-height")).toBe("");
   });
 });
 
@@ -3447,32 +3509,51 @@ describe("Composer background tasks", () => {
     clearSessionDrafts();
   });
 
-  it("shows a running monitor in the workspace bar after foreground work ends", () => {
-    useChatStore.setState({
-      backgroundTaskCount: 1,
-      backgroundTasks: [
-        {
-          id: "monitor-ci",
-          type: "shell",
-          status: "running",
-          description: "Watch PR checks",
-          command: "gh pr checks 123 --watch",
-        },
-      ],
-    });
-    renderWithTooltips(<Composer {...composerProps()} />);
+  it.each([false, true])(
+    "keeps a running monitor reachable after foreground work ends (mobile=%s)",
+    (mobile) => {
+      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+        ...mediaQuery,
+        media: query,
+        matches: mobile && query === "(max-width: 767.98px)",
+      }));
+      onTestFinished(() => matchMedia.mockRestore());
+      useChatStore.setState({
+        backgroundTaskCount: 1,
+        backgroundTasks: [
+          {
+            id: "monitor-ci",
+            type: "shell",
+            status: "running",
+            description: "Watch PR checks",
+            command: "gh pr checks 123 --watch",
+          },
+        ],
+      });
+      renderWithTooltips(
+        <MobileHeaderControlsProvider>
+          <MobileHeaderControlsSlot sessionId="conv_background_tasks" />
+          <Composer {...composerProps()} />
+        </MobileHeaderControlsProvider>,
+      );
 
-    const workspace = screen.getByTestId("composer-workspace-controls");
-    const trigger = within(workspace).getByRole("button", {
-      name: "1 background task still running",
-    });
-    expect(trigger).toHaveTextContent("1");
-    expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
-    fireEvent.click(trigger);
-    const dialog = screen.getByRole("dialog", { name: "1 background task" });
-    expect(dialog).toHaveTextContent("Watch PR checks");
-    expect(dialog).toHaveTextContent("gh pr checks 123 --watch");
-  });
+      const controls = screen.getByTestId(
+        mobile ? "mobile-header-controls-slot" : "composer-workspace-controls",
+      );
+      const trigger = within(controls).getByRole("button", {
+        name: "1 background task still running",
+      });
+      expect(screen.getAllByTestId("background-task-pill")).toHaveLength(1);
+      if (mobile) expect(screen.queryByTestId("composer-workspace-controls")).toBeNull();
+      expect(trigger).toHaveTextContent("1");
+      expect(screen.queryByTestId("subagent-task-pill")).toBeNull();
+      fireEvent.click(trigger);
+      const dialog = screen.getByRole("dialog", { name: "1 background task" });
+      expect(dialog).toHaveTextContent("Watch PR checks");
+      expect(dialog).toHaveTextContent("gh pr checks 123 --watch");
+    },
+  );
 
   it("shows live task counts and removes the control when all tasks finish", () => {
     renderWithTooltips(<Composer {...composerProps()} />);

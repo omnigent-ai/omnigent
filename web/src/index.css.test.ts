@@ -47,6 +47,14 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("shared glass fallback", () => {
+  it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
+    expect(indexCssSource).toMatch(
+      /@supports not \(\(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\)\s*\{\s*\.omni-glass-surface\s*\{\s*--omni-glass-background: var\(--card-solid\);/,
+    );
+  });
+});
+
 describe("composer picker single highlight", () => {
   const rules = cssBlocks
     .map(([block]) => block)

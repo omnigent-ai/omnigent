@@ -48,9 +48,9 @@ export function OmniGlassSurface({
         distortionScale={-270}
         refraction={false}
         opacity={0.45}
-        className="border border-black/[0.08] dark:border-0 [&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
+        className="omni-glass-surface border border-black/[0.08] dark:border-0 [&>.glass-surface\_\_sheen]:opacity-0 dark:[&>.glass-surface\_\_rim]:opacity-25 dark:[&>.glass-surface\_\_rim]:p-px!"
         style={{
-          background: surface.background,
+          background: `var(--omni-glass-background, ${surface.background})`,
           WebkitBackdropFilter: backdropFilter,
           backdropFilter,
           boxShadow: [

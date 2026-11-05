@@ -281,13 +281,13 @@ actions (mark as read or unread, archive, unarchive, delete).
 pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
-actions. On phones, the sidebar and session-actions buttons have matching
-44px circular glass surfaces with 20px icons, using the same button padding,
-interaction styles, and React Bits GlassSurface settings (refraction disabled,
-opacity 1.0, blur 6, displacement 4.4, distortion scale -270, border width 0.12),
-a transparent background, no sheen, a milky gray inset edge at 8% opacity,
-and a soft drop shadow at 8% opacity with 1px spread. The fallback backdrop also uses 6px blur.
-Both sit 16px from the top and sides.
+actions. On phones, the sidebar toggle has a circular glass surface; host,
+harness/model, background tasks, and session actions share the top-right glass
+group. Buttons are 44px tall with 20px icons. These surfaces use the shared
+React Bits glass treatment with a transparent fill, diffused backdrop, subtle
+rim, and soft shadow. Menus and the sidebar use the more strongly blurred menu
+variant. Browsers without backdrop filtering receive a solid theme surface.
+The header controls sit 16px from the top and sides.
 The mobile header omits the session title and fading backdrop,
 retaining a Back link for child sessions.
 

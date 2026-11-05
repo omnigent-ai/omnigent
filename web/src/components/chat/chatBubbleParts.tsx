@@ -8,6 +8,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
@@ -740,10 +741,24 @@ function useCopyMessageLink(messageId: string | null): {
 
 function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesktop = false) {
   const isMobile = useIsMobileViewport();
+  const actionsId = useId();
   const [actionsRevealed, setActionsRevealed] = useState<boolean | null>(null);
   const actionsVisible = isMobile ? (actionsRevealed ?? persistentOnMobile) : persistentOnDesktop;
+  const toggleVisibility = () => setActionsRevealed((visible) => !(visible ?? persistentOnMobile));
 
   return {
+    actionsId,
+    visibilityToggle: isMobile ? (
+      <button
+        type="button"
+        aria-controls={actionsId}
+        aria-expanded={actionsVisible}
+        onClick={toggleVisibility}
+        className="sr-only focus:not-sr-only focus:rounded focus:p-1 focus:outline-2 focus:outline-ring"
+      >
+        {actionsVisible ? "Hide message actions" : "Show message actions"}
+      </button>
+    ) : null,
     toggleActions: isMobile
       ? (event: ReactMouseEvent<HTMLDivElement>) => {
           if (
@@ -751,7 +766,7 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
             event.target.closest("a, button, input, textarea, select, [role=button]")
           )
             return;
-          setActionsRevealed((visible) => !(visible ?? persistentOnMobile));
+          toggleVisibility();
         }
       : undefined,
     visibilityClassName: actionsVisible
@@ -763,7 +778,8 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
 }
 
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
-  const { toggleActions, visibilityClassName } = useMessageActionVisibility();
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility();
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
   const sessionId = useScopedConversationId();
@@ -991,7 +1007,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             The agent will read this after its current step
           </div>
         )}
+        {visibilityToggle}
         <div
+          id={actionsId}
           className={cn(
             "flex mobile-app:flex-wrap items-center justify-end gap-3 py-1 mobile-app:py-0",
             visibilityClassName,
@@ -1045,10 +1063,8 @@ function AssistantBubble({
   actionsPersistent?: boolean;
   recoveryDisabled?: boolean;
 }) {
-  const { toggleActions, visibilityClassName } = useMessageActionVisibility(
-    isLastAssistant,
-    actionsPersistent,
-  );
+  const { toggleActions, visibilityClassName, visibilityToggle, actionsId } =
+    useMessageActionVisibility(isLastAssistant, actionsPersistent);
   // The walker only emits an assistant bubble when at least one assistant-side
   // block exists. The "Working…" shimmer for the empty-items / streaming gap
   // is rendered at the page level, not inside this component.
@@ -1214,64 +1230,68 @@ function AssistantBubble({
         )}
         {/* Skip fold-only and error-only bubbles. Order: actions, then timestamp. */}
         {!foldOnly && !errorOnly && (
-          <div
-            className={cn(
-              "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
-              visibilityClassName,
-            )}
-          >
-            <MessageActions>
-              {markdownText && (
-                <MessageAction
-                  tooltip="Copy"
-                  size="icon-xxs"
-                  onClick={handleCopy}
-                  componentId="chat.message.copy_assistant"
-                >
-                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
-                </MessageAction>
+          <>
+            {visibilityToggle}
+            <div
+              id={actionsId}
+              className={cn(
+                "flex mobile-app:flex-wrap items-center gap-3 py-1 mobile-app:py-0",
+                visibilityClassName,
               )}
-              {/* Fork from this response: clone the session with history
+            >
+              <MessageActions>
+                {markdownText && (
+                  <MessageAction
+                    tooltip="Copy"
+                    size="icon-xxs"
+                    onClick={handleCopy}
+                    componentId="chat.message.copy_assistant"
+                  >
+                    {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                  </MessageAction>
+                )}
+                {/* Fork from this response: clone the session with history
                     truncated after this turn. Hidden while streaming and when
                     the session can't be forked. */}
-              {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
-                <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
-                  <MessageAction
-                    tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
-                    label="Fork from here"
-                    disabled={!!forkDialog.disabledReason}
-                    size="icon-xxs"
-                    data-testid="fork-from-response"
-                    onClick={() =>
-                      forkDialog.openForkDialog({
-                        sourceSessionId: scopedConversationId ?? undefined,
-                        upToResponseId: bubble.responseId,
-                      })
-                    }
-                    componentId="chat.message.fork"
-                  >
-                    <SplitIcon size={14} />
-                  </MessageAction>
-                </DisabledActionTooltip>
+                {forkDialog?.canFork && bubble.lifecycle !== "streaming" && (
+                  <DisabledActionTooltip reason={forkDialog.disabledReason} label="Fork from here">
+                    <MessageAction
+                      tooltip={forkDialog.disabledReason ? undefined : "Fork from here"}
+                      label="Fork from here"
+                      disabled={!!forkDialog.disabledReason}
+                      size="icon-xxs"
+                      data-testid="fork-from-response"
+                      onClick={() =>
+                        forkDialog.openForkDialog({
+                          sourceSessionId: scopedConversationId ?? undefined,
+                          upToResponseId: bubble.responseId,
+                        })
+                      }
+                      componentId="chat.message.fork"
+                    >
+                      <SplitIcon size={14} />
+                    </MessageAction>
+                  </DisabledActionTooltip>
+                )}
+                <MessageAction
+                  tooltip={isLinkCopied ? "Copied!" : "Copy link"}
+                  size="icon-xxs"
+                  data-testid="copy-message-link"
+                  onClick={handleCopyLink}
+                >
+                  {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
+                </MessageAction>
+              </MessageActions>
+              {ts && (
+                <span
+                  className="select-none text-[11px] leading-4 text-foreground/56"
+                  data-testid="message-timestamp"
+                >
+                  {ts}
+                </span>
               )}
-              <MessageAction
-                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-                size="icon-xxs"
-                data-testid="copy-message-link"
-                onClick={handleCopyLink}
-              >
-                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-              </MessageAction>
-            </MessageActions>
-            {ts && (
-              <span
-                className="select-none text-[11px] leading-4 text-foreground/56"
-                data-testid="message-timestamp"
-              >
-                {ts}
-              </span>
-            )}
-          </div>
+            </div>
+          </>
         )}
       </Message>
 

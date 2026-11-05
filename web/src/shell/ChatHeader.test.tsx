@@ -729,9 +729,9 @@ describe("ChatHeader — floating mobile controls", () => {
       expect(surface).toHaveClass("[&>.glass-surface\\_\\_sheen]:opacity-0");
       expect(surface.querySelector(".glass-surface__sheen")).not.toBeNull();
       expect(surface.style.getPropertyValue("--glass-frost")).toBe("0");
-      expect(surface).toHaveStyle({ background: "hsl(0 0% 100% / 0%)" });
+      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
       expect(surface.style.backdropFilter).toBe(
-        "blur(6px) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(1.04)",
+        "blur(var(--omni-glass-blur, 8px)) saturate(calc(var(--glass-saturation, 1) * 1.4)) brightness(var(--omni-glass-brightness, 1.04))",
       );
       expect(surface.querySelector('feDisplacementMap[result="dispRed"]')).toHaveAttribute(
         "scale",

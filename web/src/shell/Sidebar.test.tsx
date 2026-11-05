@@ -3298,22 +3298,25 @@ describe("Sidebar move-to-project action", () => {
 });
 
 describe("Sidebar mobile overlay background", () => {
-  it("keeps the opaque bg-card-solid override for the mobile full-screen overlay", () => {
-    mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+  it("uses shared glass with an overridable background for the mobile overlay", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations(THREE_TYPE_CONVERSATIONS);
+      renderSidebar();
 
-    const aside = screen.getByRole("complementary", { name: "Conversations" });
-    // On mobile the sidebar is a fixed full-screen overlay ON TOP of the
-    // chat. Its desktop look uses the translucent glass --card (60% alpha
-    // in dark mode) + backdrop blur, but WebKit/Safari drops the blur as
-    // soon as a Radix popper (the row kebab menu) opens — and never
-    // repaints it — so the chat bled through the overlay. The fix pins an
-    // opaque background below the md breakpoint. If this assertion fails,
-    // the override was removed and the Safari mobile bleed-through is back.
-    expect(aside.className).toContain("max-md:bg-card-solid");
-    // Desktop keeps the glass treatment: base bg-card must stay alongside
-    // the mobile override (removing it would kill the desktop frosted look).
-    expect(aside.className).toMatch(/(^| )bg-card( |$)/);
+      const aside = screen.getByRole("complementary", { name: "Conversations" });
+      const surface = aside.querySelector<HTMLElement>(".omni-glass-surface")!;
+      expect(surface).not.toBeNull();
+      expect(surface.style.background).toBe("var(--omni-glass-background, hsl(0 0% 100% / 0%))");
+      expect(surface.style.backdropFilter).toContain("32px");
+    } finally {
+      matchMedia.mockRestore();
+    }
   });
 });
 
