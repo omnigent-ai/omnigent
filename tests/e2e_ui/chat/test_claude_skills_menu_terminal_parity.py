@@ -15,11 +15,12 @@ import shutil
 import subprocess
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
 from omnigent.spec.skill_sources import CLAUDE_LAUNCH_PLUGINS_LOADING
@@ -315,7 +316,9 @@ def _expect_menu_lists(page: Page, client: httpx.Client, session_id: str, name: 
             return True
         if loading.is_visible():
             # A catalog fetched before the launch answered says so; Retry fetches it again.
-            loading.get_by_role("button", name="Retry").click(timeout=5_000)
+            # The note can go as a refetch answers, so a missed click waits for the next poll.
+            with suppress(PlaywrightError):
+                loading.get_by_role("button", name="Retry").click(timeout=5_000)
         return False
 
     try:
