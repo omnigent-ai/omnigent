@@ -26,7 +26,6 @@ import {
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
-import { PresenceAvatars } from "@/components/PresenceAvatars";
 import {
   Dialog,
   DialogContent,
@@ -39,7 +38,6 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuSub,
   DropdownMenuSubContent,
@@ -71,9 +69,12 @@ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
+import { MobileHeaderButton } from "./MobileHeaderButton";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 interface HeaderConversationMenuProps {
   conversation: Conversation;
+  workingDirectory?: string | null;
   currentProject: string | null;
   canShare: boolean;
   canFork: boolean;
@@ -96,6 +97,7 @@ interface HeaderConversationMenuProps {
 
 export function HeaderConversationMenu({
   conversation,
+  workingDirectory = conversation.workspace,
   currentProject,
   canShare,
   canFork,
@@ -395,7 +397,7 @@ export function HeaderConversationMenu({
         }}
       >
         <DropdownMenuTrigger asChild>
-          <Button
+          <MobileHeaderButton
             type="button"
             variant="ghost"
             size={isMobile ? "icon" : "icon-xs"}
@@ -404,24 +406,19 @@ export function HeaderConversationMenu({
             className="mobile-touch-target shrink-0 border-none text-muted-foreground hover:text-foreground max-md:size-11"
           >
             <EllipsisIcon className={isMobile ? "size-5" : "size-3.5"} />
-          </Button>
+          </MobileHeaderButton>
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
+          collisionPadding={isMobile ? 16 : undefined}
           className={cn(
             "min-w-56",
             MOBILE_GLASS_SURFACE,
-            isMobile && "max-w-[min(20rem,calc(100vw-1rem))]",
+            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
           )}
         >
           {isMobile && !projectPickerOpen && (
-            <>
-              <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                <span className="min-w-0 flex-1 truncate">{label}</span>
-                <PresenceAvatars />
-              </DropdownMenuLabel>
-              <DropdownMenuSeparator />
-            </>
+            <SessionMenuHeader title={label} workingDirectory={workingDirectory} />
           )}
           {projectPickerOpen ? (
             <>

@@ -192,6 +192,7 @@ def cross_harness_rig(
         "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
+        "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
         "OMNIGENT_SKIP_WEB_UI": "true",
         "OMNIGENT_CODEX_PATH": str(shutil.which("codex")),
         "OMNIGENT_CLAUDE_PATH": str(shutil.which("claude")),

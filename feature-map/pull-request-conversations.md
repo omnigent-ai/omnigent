@@ -45,7 +45,7 @@ together in Comments.
 
 - `rail`: Open a session, expand Workspace, choose Pull Requests, then open Changes.
 - `composer-desktop`: Click the desktop composer's PR link, then open Changes.
-- `composer-mobile`: Tap the composer's PR link, then open Changes in the drawer.
+- `session-mobile`: Open the session-actions menu, choose Pull Requests, then open Changes in the drawer.
 - `canvas`: Open a conversation beside Canvas, click its composer PR link,
   then open Changes.
 

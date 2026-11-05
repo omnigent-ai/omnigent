@@ -75,7 +75,6 @@ import {
   SquareCheckIcon,
   Trash2Icon,
   UserRoundIcon,
-  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -117,6 +116,7 @@ import {
 import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
+import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import {
   Dialog,
   DialogContent,
@@ -219,7 +219,7 @@ import { useSidebarSwipeToClose } from "@/hooks/useSidebarSwipeToClose";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
 import { usePinnedSessionHotkeys } from "@/hooks/usePinnedSessionHotkeys";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -454,7 +454,7 @@ type SidebarTab = SessionFilter;
 const SIDEBAR_FILTERS: { value: SidebarTab; label: string }[] = [
   { value: "all", label: "All sessions" },
   { value: "mine", label: "My sessions" },
-  { value: "shared", label: "Shared sessions" },
+  { value: "shared", label: "Shared with me" },
   { value: "archived", label: "Archived sessions" },
 ];
 
@@ -1056,7 +1056,7 @@ function SidebarImpl({
           tabIndex={effectiveOpen ? 0 : -1}
           aria-hidden={!effectiveOpen}
           className={cn(
-            "fixed inset-0 z-[45] bg-black/25 transition-[opacity,visibility] duration-200 ease-out md:hidden",
+            "fixed inset-0 z-[45] bg-transparent transition-[opacity,visibility] duration-200 ease-out md:hidden dark:bg-black/25",
             // invisible: the macOS shell makes any rendered button a no-drag title-bar region.
             effectiveOpen ? "opacity-100" : "pointer-events-none invisible opacity-0",
           )}
@@ -1084,22 +1084,17 @@ function SidebarImpl({
           peekCloseTimer.current = setTimeout(tryClose, 200);
         }}
         className={cn(
-          // Base: bg + flex column. No transition — expand/collapse snaps
+          // Base: flex column. No transition — expand/collapse snaps
           // instantly (animating the width also lagged drag-to-resize).
           // conversations-sidebar only matters under the macOS Electron
           // shell, where it pushes the card below the traffic lights
           // (see the [data-electron-mac] rules in index.css).
-          "conversations-sidebar flex flex-col bg-card md:select-none",
+          "conversations-sidebar flex flex-col md:bg-card md:select-none",
           nativeSidebarSurface ? "omnigent-native-sidebar-surface" : "omnigent-sidebar-panel",
+          !isElectronShell() && !nativeSidebarSurface && (open || peek) && "md:pl-1",
           // Mobile (default): a fixed drawer that slides in via translate-x
           // and stops short of the right edge, leaving a tappable strip of the
           // chat behind it. The floating-card treatment below is desktop-only.
-          // bg-card-solid (opaque): the overlay sits on top of the chat, and
-          // WebKit drops the glass rule's backdrop-filter once a Radix popper
-          // opens (and never repaints it), letting the chat bleed through the
-          // 60%-alpha glass --card. Desktop keeps the translucent bg-card —
-          // there the sidebar pushes content aside, so nothing sits behind it.
-          "max-md:bg-card-solid",
           // `max-md:right-14` is the ChatGPT-style peek strip: the drawer covers
           // most of the phone but stops short of the right edge so the chat stays
           // visible (and tappable through the scrim) behind it.
@@ -1154,6 +1149,13 @@ function SidebarImpl({
         data-collapsed={!effectiveOpen || undefined}
         data-floating={peek ? "true" : "false"}
       >
+        {mobileLayout && effectiveOpen && (
+          <OmniGlassSurface
+            variant="menu"
+            borderRadius={0}
+            className="sidebar-glass-surface -z-10"
+          />
+        )}
         {/* Right-edge resize handle (desktop only), mirroring the right rail's
           left-edge handle. Hidden on mobile, where the sidebar is a
           full-screen overlay with no resize affordance; the parent's ``inert``
@@ -1175,10 +1177,8 @@ function SidebarImpl({
           brand mark is dropped and the actions slide left to sit beside the
           window controls (see the [data-electron-mac] rules in index.css).
           Inert in a browser and on other platforms, which keep the row below. */}
-            {/* h-14 below md matches the mobile chat header height so the
-            Search bubble shares a centerline with the overflow bubble in the
-            chat strip beside the open drawer. */}
-            <div className="sidebar-header-row flex h-14 shrink-0 items-center justify-between pr-3 pl-4 md:h-12">
+            {/* Mobile Search shares the floating chat controls' 16px edge inset. */}
+            <div className="sidebar-header-row flex shrink-0 items-center justify-between p-4 md:h-12 md:py-0 md:pr-3">
               {/* Brand mark doubles as the "home" affordance: clicking it
             returns to `/`, the new-session composer. Without this there
             is no way back to the landing composer once you're inside a
@@ -1443,7 +1443,7 @@ function SidebarImpl({
           drawer keeps once the collapse toggle is gone. */}
               <SidebarSettingsButton
                 testId="sidebar-settings-float"
-                className="absolute right-3 bottom-3 md:hidden"
+                className="absolute right-4 bottom-4 md:hidden"
               />
             </div>
 
@@ -1678,6 +1678,7 @@ function ProjectFolder({
       ref={setNodeRef}
       className={cn(
         "relative rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        expanded && "mb-2",
         // Subtle background tint on drag-over — no border, no shadow.
         isOver && DROP_TARGET_HIGHLIGHT,
       )}
@@ -2153,9 +2154,8 @@ function ConversationList({
     const pinned = orderByPinnedTimestamp(notArchived.filter((c) => pinnedSet.has(c.id)));
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
 
-    // Folders use live members on All / My / Shared and archives on Archived.
-    // Filing is owner-only so legacy label collisions cannot file shared rows.
-    // Pins precede live folders; grouped views omit folders.
+    // Folders use live members on All / My and archives on Archived. Filing is
+    // owner-only, so Shared and grouped views omit folders; pins precede them.
     const folderCandidates = activeTab === "archived" ? tabScoped : notArchived;
     const filedIds = new Set<string>();
     const projectGroups: {
@@ -2163,7 +2163,7 @@ function ConversationList({
       name: string;
       icon?: string | null;
       conversations: Conversation[];
-    }[] = (grouped ? [] : projects).map(({ id, name, icon }) => {
+    }[] = (grouped || activeTab === "shared" ? [] : projects).map(({ id, name, icon }) => {
       // Dual-read membership: a session belongs to this folder if it has
       // the first-class id OR the legacy omni_project label of this name,
       // and (filing being owner-only) the viewer owns it.
@@ -2307,7 +2307,8 @@ function ConversationList({
   const sessionsSelecting = selectionMode && selectionScope === "sessions";
   // With sidebar_grouping_ui on, the default grouping's one "Select sessions" (on
   // the Projects header) selects project folders, Shared and Sessions together.
-  const unifiedSelection = groupingUi && !grouped;
+  // The Shared filter hides Projects, so its list owns selection alone.
+  const unifiedSelection = groupingUi && !grouped && activeTab !== "shared";
   const projectsSelecting =
     selectionMode && (selectionScope === "projects" || (unifiedSelection && sessionsSelecting));
 
@@ -2682,7 +2683,7 @@ function ConversationList({
     const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
       !projectsCollapsed && expandedProjects.includes(group.name) ? folderVisibleRows(group) : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
-    // Projects / Sessions walk covers both tabs (Projects is empty on shared).
+    // Projects / Sessions walk covers every tab (Projects is empty on Shared).
     return [
       ...visible("Pinned", sections.pinned),
       ...sections.projectGroups.flatMap(projectVisible),
@@ -3010,10 +3011,10 @@ function ConversationList({
                       </PinOrderContext.Provider>
                     </PinDropZone>
                   )}
-                  {/* Projects: one collapsible folder per project, unaffected by the filter so
-              "New project" stays reachable. With sidebar_grouping_ui on it holds the one
-              filter menu; grouped views hide it and the first group takes its place. */}
-                  {!grouped && (
+                  {/* Projects: one collapsible folder per project. With sidebar_grouping_ui on
+              it holds the one filter menu; Shared and grouped views hide it, and the
+              first list section takes its place. */}
+                  {!grouped && !showShared && (
                     <SectionGroup
                       title="Projects"
                       collapsed={effectiveCollapsedSections.includes("Projects")}
@@ -3132,7 +3133,7 @@ function ConversationList({
                     filter it's the only list, so it takes the list controls. */}
                   {(sections.shared.length > 0 || sharedListOnly) && (
                     <ConversationSection
-                      title="Shared"
+                      title="Shared with me"
                       conversations={sections.shared}
                       emptyMessage={
                         sharedListOnly && !sessionStatus ? SIDEBAR_FILTER_EMPTY.shared : undefined
@@ -3142,6 +3143,7 @@ function ConversationList({
                       onToggleCollapsed={() => effectiveToggleSectionCollapsed("Shared")}
                       afterHeader={sharedListOnly ? sessionsBulkBar : undefined}
                       headerAction={sharedListOnly ? sessionsHeaderActions : undefined}
+                      persistentHeaderAction={sharedListOnly ? sessionsFilterMenu : undefined}
                       headerStatus={sharedListOnly ? importStatus : undefined}
                       {...sessionRowProps}
                     />
@@ -3209,8 +3211,6 @@ function ConversationList({
                       )}
                     </ChatsDropZone>
                   )}
-                  {/* Folders show archived members on Archived and live members on
-                      the other filters; pins always show live sessions. */}
                   {/* Infinite-scroll sentinel. A new page can land in any list section,
               so it hides only when all of them are collapsed (a loader under a
               collapsed group reads orphaned). */}
@@ -4947,6 +4947,17 @@ function SessionTooltipContent({
 // Browsers pair clicks within ~500ms; the margin absorbs event-loop delay.
 const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 
+// Whether the row lies entirely inside its nearest scrolling ancestor (or the viewport).
+function isRowFullyVisible(row: HTMLElement): boolean {
+  let scroller = row.parentElement;
+  while (scroller && !/auto|scroll/.test(getComputedStyle(scroller).overflowY)) {
+    scroller = scroller.parentElement;
+  }
+  const bounds = scroller?.getBoundingClientRect() ?? { top: 0, bottom: window.innerHeight };
+  const rect = row.getBoundingClientRect();
+  return rect.top >= bounds.top && rect.bottom <= bounds.bottom;
+}
+
 function ConversationRowImpl({
   conversation,
   isActive,
@@ -5001,13 +5012,14 @@ function ConversationRowImpl({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
-  // When this row becomes the active conversation (e.g. a freshly created
-  // session navigated to via `/c/:id`), scroll it toward the center of the
-  // sidebar so it's comfortably in view rather than pinned to an edge.
+  // When this row becomes active (e.g. a new session navigated to via `/c/:id`),
+  // center it if it is offscreen. A row already fully visible stays put, so
+  // clicking it does not slide the list.
   const rowRef = useRef<HTMLLIElement>(null);
   useEffect(() => {
-    if (!isActive) return;
-    rowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const row = rowRef.current;
+    if (!isActive || !row || isRowFullyVisible(row)) return;
+    row.scrollIntoView({ behavior: "smooth", block: "center" });
   }, [isActive]);
   const queryClient = useQueryClient();
   const rename = useRenameConversation();
@@ -5164,12 +5176,11 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
-  const showSharedIndicator = !isOwner;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
-  const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
+  const hasTrailingIndicator = hasSessionIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5431,18 +5442,12 @@ function ConversationRowImpl({
         // rest, before hover reveals the controls.
         !selectionMode &&
           (sessionState?.kind === "awaiting"
-            ? showSharedIndicator
-              ? "pr-36"
-              : "pr-29"
+            ? "pr-29"
             : showUpdated
-              ? showSharedIndicator
-                ? "pr-18"
-                : "pr-11"
-              : hasSessionIndicator && showSharedIndicator
-                ? "pr-14"
-                : hasTrailingIndicator
-                  ? "pr-8"
-                  : "pr-2"),
+              ? "pr-11"
+              : hasTrailingIndicator
+                ? "pr-8"
+                : "pr-2"),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5683,20 +5688,6 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
-      {!selectionMode && showSharedIndicator && (
-        <span
-          role="img"
-          aria-label="Shared session"
-          title="Shared with you"
-          className={cn(
-            "-translate-y-1/2 pointer-events-none absolute inline-flex h-5 w-6 shrink-0 items-center justify-center text-muted-foreground transition-opacity md:group-hover:opacity-0 md:group-has-[:focus-visible]:opacity-0 md:group-has-[[aria-expanded=true]]:opacity-0",
-            overlayTop,
-            hasSessionIndicator ? "right-8" : showUpdated ? "right-11" : "right-1",
-          )}
-        >
-          <UsersIcon className="size-3.5" aria-hidden="true" />
-        </span>
-      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -69,6 +70,16 @@ def test_composer_details_wrap_without_clipping(
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
+    if viewport_width < 768:
+        expect(controls).to_have_count(0)
+        page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
+        if has_binding:
+            directory = page.get_by_label(f"Working directory: {_WORKSPACE}", exact=True)
+            expect(directory).to_have_text("checkout")
+            expect(directory).to_have_attribute("title", _WORKSPACE)
+        else:
+            expect(page.locator('[aria-label^="Working directory:"]')).to_have_count(0)
+        return
     expect(controls).to_be_visible(timeout=30_000)
     expect(controls.get_by_role("button")).to_have_count(0)
     workspace = controls.get_by_test_id("composer-workspace-dir")
@@ -158,6 +169,24 @@ def test_composer_workspace_labels_use_available_width(
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
+    if viewport_width < 768:
+        expect(controls).to_have_count(0)
+        page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
+        menu = page.get_by_role("menu")
+        directory = menu.get_by_label(f"Working directory: /workspace/{name}", exact=True)
+        expect(directory).to_have_text(name)
+        expect(directory).to_have_attribute("title", f"/workspace/{name}")
+        menu_box, label_box = menu.bounding_box(), directory.bounding_box()
+        assert menu_box is not None and label_box is not None
+        assert menu_box["x"] >= 16
+        assert menu_box["x"] + menu_box["width"] <= viewport_width - 16
+        assert label_box["x"] >= menu_box["x"]
+        assert label_box["x"] + label_box["width"] <= menu_box["x"] + menu_box["width"]
+        label = directory.locator("span")
+        assert label.evaluate(
+            "el => el.clientWidth > 0 && getComputedStyle(el).textOverflow === 'ellipsis'"
+        )
+        return
     expect(controls).to_be_visible(timeout=30_000)
     expect(controls.get_by_role("button")).to_have_count(0)
     controls.screenshot(path=tmp_path / f"labels-{viewport_width}-{font_size}.png")
