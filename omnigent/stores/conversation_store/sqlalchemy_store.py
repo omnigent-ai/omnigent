@@ -754,6 +754,15 @@ def _fetch_search_snippets(
     return out
 
 
+def _pending_inputs_query(conversation_id: str) -> Select[tuple[SqlConversationItem]]:
+    """Select a conversation's pending input rows in the current workspace."""
+    return select(SqlConversationItem).where(
+        SqlConversationItem.workspace_id == current_workspace_id(),
+        SqlConversationItem.conversation_id == conversation_id,
+        SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+    )
+
+
 def _to_item(row: SqlConversationItem, data_json: str) -> ConversationItem:
     """
     Convert a :class:`SqlConversationItem` ORM row to a
@@ -2261,11 +2270,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # The cursor is the last returned position. The response-id index bounds
         # the read to the conversation's pending rows (append caps them at
         # MAX_PENDING_INPUTS), so ordering them by position stays small.
-        query = select(SqlConversationItem).where(
-            SqlConversationItem.workspace_id == current_workspace_id(),
-            SqlConversationItem.conversation_id == conversation_id,
-            SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
-        )
+        query = _pending_inputs_query(conversation_id)
         if after is not None:
             query = query.where(SqlConversationItem.position > after)
         with self._conv_session("list_pending_inputs") as session:
@@ -2278,9 +2283,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         more = len(rows) > limit
         rows = rows[:limit]
-        decoded = self._decode_item_data_batch([row.data for row in rows])
-        items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
-        return items, rows[-1].position if more else None
+        return self._items_from_rows(rows), rows[-1].position if more else None
 
     def list_pending_inputs_by_id(
         self,
@@ -2290,22 +2293,21 @@ class SqlAlchemyConversationStore(ConversationStore):
         limit: int = MAX_PENDING_INPUTS,
     ) -> tuple[list[tuple[ConversationItem, int]], str | None]:
         # The response-id index ends in id, so each page seeks and reads limit + 1 rows.
-        query = select(SqlConversationItem).where(
-            SqlConversationItem.workspace_id == current_workspace_id(),
-            SqlConversationItem.conversation_id == conversation_id,
-            SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
-        )
+        query = _pending_inputs_query(conversation_id)
         if after is not None:
             query = query.where(SqlConversationItem.id > after)
         with self._conv_session("page_pending_inputs_by_id") as session:
             rows = list(session.scalars(query.order_by(SqlConversationItem.id).limit(limit + 1)))
         more = len(rows) > limit
         rows = rows[:limit]
+        items = self._items_from_rows(rows)
+        positioned = [(item, row.position) for item, row in zip(items, rows, strict=True)]
+        return positioned, rows[-1].id if more else None
+
+    def _items_from_rows(self, rows: list[SqlConversationItem]) -> list[ConversationItem]:
+        """Decode a page of item rows into entities, in row order."""
         decoded = self._decode_item_data_batch([row.data for row in rows])
-        items = [
-            (_to_item(row, data), row.position) for row, data in zip(rows, decoded, strict=True)
-        ]
-        return items, rows[-1].id if more else None
+        return [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
 
     def transition_pending_input(
         self,
