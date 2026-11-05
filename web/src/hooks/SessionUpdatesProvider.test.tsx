@@ -577,9 +577,10 @@ describe("SessionUpdatesProvider list invalidation", () => {
       vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => renamed }),
     );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const listFetch = vi.fn(async () => laggingList);
     const stopList = new QueryObserver(client, {
       queryKey: ["conversations", "", false],
-      queryFn: async () => laggingList,
+      queryFn: listFetch,
       initialData: laggingList,
       staleTime: Infinity,
     }).subscribe(() => {});
@@ -603,11 +604,13 @@ describe("SessionUpdatesProvider list invalidation", () => {
           .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
           ?.pages[0].data.find((row) => row.id === "conv_a")?.title;
       expect(titleOf()).toBe("New name");
+      listFetch.mockClear();
       act(() => handler({ type: "changed", items: [renamed] }));
       await act(async () => {
         await vi.advanceTimersByTimeAsync(5_000);
       });
 
+      expect(listFetch).toHaveBeenCalled();
       expect(titleOf()).toBe("New name");
     } finally {
       stopList();

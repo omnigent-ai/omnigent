@@ -405,6 +405,10 @@ export function isSessionArchiving(id: string): boolean {
 interface PendingRename {
   title: string | null;
   replaced: Set<string | null>;
+  /** Titles from superseded renames that failed; never kept or restored. */
+  failed: Set<string | null>;
+  /** Server `updated_at` of the confirmed rename; newer rows are not lagging. */
+  updatedAt?: number;
   timer?: ReturnType<typeof setTimeout>;
 }
 
@@ -417,10 +421,17 @@ function markSessionRenaming(
 ): PendingRename {
   const earlier = pendingRenames.get(id);
   if (earlier?.timer !== undefined) clearTimeout(earlier.timer);
-  const entry: PendingRename = { title, replaced: new Set(earlier?.replaced) };
+  const entry: PendingRename = {
+    title,
+    replaced: new Set(earlier?.replaced),
+    failed: new Set(earlier?.failed),
+  };
   for (const value of replaced) if (value !== undefined) entry.replaced.add(value);
   entry.replaced.delete(title);
+  entry.failed.delete(title);
   pendingRenames.set(id, entry);
+  // A PATCH that never settles must not hold the guard forever.
+  entry.timer = setTimeout(() => unmarkSessionRenaming(id, entry), DELETED_TOMBSTONE_MS);
   return entry;
 }
 
@@ -431,10 +442,18 @@ function unmarkSessionRenaming(id: string, entry?: PendingRename): void {
   pendingRenames.delete(id);
 }
 
-function expireSessionRenaming(id: string, entry: PendingRename, title: string | null): void {
+function expireSessionRenaming(
+  id: string,
+  entry: PendingRename,
+  title: string | null,
+  updatedAt?: number,
+): void {
   if (pendingRenames.get(id) !== entry) return;
+  if (entry.timer !== undefined) clearTimeout(entry.timer);
   entry.title = title;
+  entry.updatedAt = updatedAt;
   entry.replaced.delete(title);
+  entry.failed.delete(title);
   entry.timer = setTimeout(() => unmarkSessionRenaming(id, entry), DELETED_TOMBSTONE_MS);
 }
 
@@ -447,7 +466,13 @@ function withPendingRenameTitles(
     let pageChanged = false;
     const rows = page.data.map((row) => {
       const pending = pendingRenames.get(row.id);
-      if (!pending?.replaced.has(row.title ?? null)) return row;
+      if (!pending?.replaced.has(row.title ?? null) || pending.failed.has(pending.title)) {
+        return row;
+      }
+      if (pending.updatedAt !== undefined && row.updated_at > pending.updatedAt) {
+        unmarkSessionRenaming(row.id, pending);
+        return row;
+      }
       pageChanged = true;
       return { ...row, title: pending.title };
     });
@@ -992,7 +1017,8 @@ export function useRenameConversation() {
         })) {
           const row = data?.pages.flatMap((page) => page.data).find((conv) => conv.id === id);
           if (row) {
-            listTitle = row.title;
+            // Streamed rows carry an untitled session's title as undefined.
+            listTitle = row.title ?? null;
             break;
           }
         }
@@ -1004,9 +1030,10 @@ export function useRenameConversation() {
         backfill: queryClient.getQueryData<Conversation | null>(["conversation-backfill", id])
           ?.title,
       };
+      const earlier = pendingRenames.get(id);
       const pending = markSessionRenaming(id, title, Object.values(previous));
       overlayTitle(id, title);
-      return { ...previous, pending };
+      return { ...previous, pending, earlier };
     },
     onError: (err, { id, title }, previous) => {
       // Restore the first title we managed to snapshot. A snapshotted null
@@ -1019,9 +1046,18 @@ export function useRenameConversation() {
             ? previous.session
             : previous?.backfill;
       if (previous) {
-        // The restored title can be an earlier rename the list still lags behind.
-        if (restored === undefined) unmarkSessionRenaming(id, previous.pending);
-        else expireSessionRenaming(id, previous.pending, restored);
+        const live = pendingRenames.get(id);
+        if (live !== undefined && live !== previous.pending) {
+          // A newer rename superseded this one; its title must never be kept.
+          live.failed.add(title);
+        } else if (restored === undefined || previous.pending.failed.has(restored)) {
+          unmarkSessionRenaming(id, previous.pending);
+        } else {
+          // The restored title can be an earlier rename the list still lags behind.
+          const confirmedAt =
+            previous.earlier?.title === restored ? previous.earlier.updatedAt : undefined;
+          expireSessionRenaming(id, previous.pending, restored, confirmedAt);
+        }
       }
       if (restored !== undefined) overlayTitle(id, restored);
       // The inline editor has unmounted by the time the PATCH settles, so
@@ -1031,7 +1067,9 @@ export function useRenameConversation() {
       showToast(renameFailedToast(title, err), { duration: 0 });
     },
     onSuccess: (updated, _variables, context) => {
-      if (context) expireSessionRenaming(updated.id, context.pending, updated.title);
+      if (context) {
+        expireSessionRenaming(updated.id, context.pending, updated.title, updated.updated_at);
+      }
       // The PATCH bumps server `updated_at`, which the unseen tracker
       // would otherwise read as new messages even though the user
       // initiated this themselves. Anchor the seen-baseline to the
