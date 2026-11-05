@@ -3628,6 +3628,33 @@ describe("useArchiveConversation", () => {
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  it("restores a fetched open-session row when unarchiving fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const backfillKey = ["conversation-backfill", "conv_a"];
+    const archivedRow = {
+      id: "conv_a",
+      object: "conversation" as const,
+      title: "A",
+      created_at: 0,
+      updated_at: 0,
+      labels: {},
+      permission_level: null,
+      archived: true,
+    };
+    queryClient.setQueryData(backfillKey, archivedRow);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // The optimistic overlay flipped this entry; the sidebar row reads it, so
+    // the rollback must bring its Unarchive control back.
+    expect(queryClient.getQueryData<Conversation>(backfillKey)?.archived).toBe(true);
+  });
+
   it("does not restore a row with a concurrent delete in flight", async () => {
     let settleArchive = (_res: Response) => {};
     fetchMock.mockImplementationOnce(

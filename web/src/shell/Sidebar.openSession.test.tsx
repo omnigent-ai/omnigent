@@ -9,8 +9,10 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import * as identity from "@/lib/identity";
+import { writeSessionFilter } from "@/lib/sessionFilterPreferences";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
+import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 
 const mocks = vi.hoisted(() => ({
   archive: { mutate: vi.fn() },
@@ -39,14 +41,26 @@ const LOADED = [
 /**
  * Render the sidebar on `/c/<openId>` with the given loaded list, as if the
  * session had been opened from search: its row sits only in the search cache.
+ * `sharedWithMore`, when given, is the shared scope's first page with more to
+ * load; `remembered` is a row the command palette kept when its search closed.
  */
 function renderOpenSession(
   openId: string,
   loaded: Conversation[],
   searchRows: Conversation[],
-  config: SidebarConfig = sidebarConfig,
+  {
+    config = sidebarConfig,
+    sharedWithMore,
+    remembered,
+  }: { config?: SidebarConfig; sharedWithMore?: Conversation[]; remembered?: Conversation } = {},
 ) {
-  vi.mocked(useConversations).mockImplementation(() => conversationPage(loaded));
+  vi.mocked(useConversations).mockImplementation((...args) =>
+    sharedWithMore && args[4] === "shared"
+      ? ({ ...conversationPage(sharedWithMore), hasNextPage: true } as ReturnType<
+          typeof useConversations
+        >)
+      : conversationPage(loaded),
+  );
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // A top-level session: the root walk resolves to the open session itself.
   queryClient.setQueryData(["session", openId], { id: openId, parentSessionId: null });
@@ -54,6 +68,7 @@ function renderOpenSession(
     pages: [{ data: searchRows, first_id: null, last_id: null, has_more: false }],
     pageParams: [undefined],
   });
+  if (remembered) rememberOpenSessionRow(queryClient, remembered);
   return render(
     <QueryClientProvider client={queryClient}>
       <SidebarDataProvider config={config}>
@@ -178,11 +193,57 @@ describe("Sidebar open session reveal", () => {
     expect(screen.getByText("Customer X").closest("section")).toContainElement(row);
   });
 
+  it("lists an archived open session that a loaded page already carries", async () => {
+    const archived = conversation("conv_archived", {
+      title: "Archived listed work",
+      archived: true,
+      owner: "me",
+    });
+    renderOpenSession("conv_archived", [...LOADED, archived], []);
+
+    const row = await findOpenRow(/Archived listed work/);
+    expect(sessionsSection()).toContainElement(row);
+    expect(screen.getByRole("button", { name: "Unarchive conversation" })).toBeInTheDocument();
+  });
+
+  it("reveals an own session that the All view cuts at the shared scope's cursor", async () => {
+    const older = conversation("conv_older", {
+      title: "Older own work",
+      owner: "me",
+      updated_at: 50,
+    });
+    // My sessions loaded it, but All lists only rows above shared's unloaded
+    // tail. The scope's cache entry stands in as the row's cached list copy.
+    const shared = conversation("conv_shared", { owner: "teammate", updated_at: 150 });
+    writeSessionFilter("all");
+    renderOpenSession("conv_older", [...LOADED, older], [older], { sharedWithMore: [shared] });
+
+    const row = await findOpenRow(/Older own work/);
+    expect(sessionsSection()).toContainElement(row);
+  });
+
+  it("lists a shared archived session opened from the palette on All, without Unarchive", async () => {
+    const sharedArchived = conversation("conv_shared", {
+      title: "Teammate retro",
+      archived: true,
+      owner: "teammate",
+      permission_level: 1,
+    });
+    writeSessionFilter("all");
+    // The palette's search cache is gone; only its remembered copy of the row is left.
+    renderOpenSession("conv_shared", LOADED, [], { remembered: sharedArchived });
+
+    await findOpenRow(/Teammate retro/);
+    expect(screen.queryByRole("button", { name: "Unarchive conversation" })).toBeNull();
+  });
+
   it("extends a capped list display to the open session", async () => {
     const many = Array.from({ length: 6 }, (_, index) =>
       conversation(`conv_${index}`, { title: `Session ${index}`, updated_at: 100 - index }),
     );
-    renderOpenSession("conv_5", many, [], { ...sidebarConfig, displayPageSize: 2 });
+    renderOpenSession("conv_5", many, [], {
+      config: { ...sidebarConfig, displayPageSize: 2 },
+    });
 
     // Two rows per page would otherwise leave the sixth hidden.
     await findOpenRow(/Session 5/);

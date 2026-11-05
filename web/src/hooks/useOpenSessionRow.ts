@@ -1,6 +1,7 @@
 // The open session's sidebar row, for when no loaded list page holds it.
 
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
 import type { Conversation } from "@/hooks/useConversations";
 import { authenticatedFetch } from "@/lib/identity";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -52,9 +53,21 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
 }
 
 /**
- * The open session's row, reused from any list cache (such as the search it
- * was opened from) or fetched. Rename, pin, move and archive already patch the
- * ``["conversation-backfill", id]`` key, so the row follows those edits.
+ * Keep the list row of a session about to be opened, such as a search result,
+ * so the sidebar can list it with its owner once that list is gone.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param row - The session's row from the list it was picked from.
+ */
+export function rememberOpenSessionRow(queryClient: QueryClient, row: Conversation): void {
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", row.id], row);
+}
+
+/**
+ * The open session's row, read live from any list cache (such as the search it
+ * was opened from), else the row kept by ``rememberOpenSessionRow``, else
+ * fetched. Rename, pin, move, archive and status changes patch that
+ * ``["conversation-backfill", id]`` copy.
  *
  * @param id - Top-level session to reveal, or ``null`` to disable.
  * @returns The row, or ``null`` while loading, when the session is gone, or
@@ -62,15 +75,36 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
  */
 export function useOpenSessionRow(id: string | null): Conversation | null {
   const queryClient = useQueryClient();
+  // List rows keep receiving status and attention updates, so a cached one wins.
+  const subscribe = useCallback(
+    (onChange: () => void) =>
+      id === null ? () => undefined : queryClient.getQueryCache().subscribe(onChange),
+    [queryClient, id],
+  );
+  const listRow = useSyncExternalStore(subscribe, () =>
+    id === null ? undefined : findCachedListRow(queryClient, id),
+  );
   const { data } = useQuery({
     queryKey: ["conversation-backfill", id],
-    enabled: id !== null,
+    enabled: id !== null && listRow === undefined,
     staleTime: 30_000,
     retry: false,
-    queryFn: async () =>
-      findCachedListRow(queryClient, id as string) ?? (await fetchConversationById(id as string)),
+    queryFn: async () => {
+      const fetched = await fetchConversationById(id as string);
+      // The detail response has no owner, so keep the one a remembered list row gave.
+      const knownOwner = queryClient.getQueryData<Conversation | null>([
+        "conversation-backfill",
+        id,
+      ])?.owner;
+      return fetched && fetched.owner === null && knownOwner
+        ? { ...fetched, owner: knownOwner }
+        : fetched;
+    },
   });
-  if (id === null || !data || data.id !== id) return null;
-  if (data.owner == null && !isOwnerLevel(data.permission_level)) return null;
-  return data;
+  const row = listRow ?? data;
+  if (id === null || !row || row.id !== id) return null;
+  if ((row.owner === null || row.owner === undefined) && !isOwnerLevel(row.permission_level)) {
+    return null;
+  }
+  return row;
 }

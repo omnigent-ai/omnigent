@@ -9076,6 +9076,10 @@ function patchConversationStatusInCache(
       return mutated ? { ...data, pages } : data;
     },
   );
+  // The sidebar's fetched row for an open session outside the loaded pages.
+  queryClient.setQueryData<Conversation | null>(["conversation-backfill", conversationId], (row) =>
+    row && row.status !== listStatus ? { ...row, status: listStatus } : row,
+  );
 }
 
 /**

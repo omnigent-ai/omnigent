@@ -5,6 +5,7 @@
 import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -22,6 +23,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
@@ -356,7 +358,15 @@ export function CommandPalette({
     action.run();
   };
 
+  const queryClient = useQueryClient();
   const goToSession = (id: string): void => {
+    // Search results are dropped when the palette closes; the sidebar lists
+    // the opened session from this copy, which keeps its owner.
+    const searchRow = [titleSearch.data, contentSearch.data]
+      .flatMap((results) => results?.pages ?? [])
+      .flatMap((page) => page.data)
+      .find((row) => row.id === id);
+    if (searchRow) rememberOpenSessionRow(queryClient, searchRow);
     close();
     navigate(`/c/${id}`);
   };

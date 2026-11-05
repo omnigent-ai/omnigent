@@ -941,21 +941,33 @@ export function useRenameConversation() {
 interface ArchiveListsSnapshot {
   lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
   pinned: PinnedConversationsResult | undefined;
+  /** The archived sessions' own fetched rows, such as the sidebar's open-session row. */
+  backfill: [string, Conversation | null | undefined][];
 }
 
-function snapshotArchiveLists(queryClient: QueryClient): ArchiveListsSnapshot {
+function snapshotArchiveLists(
+  queryClient: QueryClient,
+  ids: readonly string[],
+): ArchiveListsSnapshot {
   return {
     lists: [
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
     ],
     pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
+    backfill: ids.map((id) => [
+      id,
+      queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]),
+    ]),
   };
 }
 
 function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
   for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+  for (const [id, row] of snapshot.backfill) {
+    if (row !== undefined) queryClient.setQueryData(["conversation-backfill", id], row);
+  }
 }
 
 /**
@@ -980,7 +992,7 @@ async function paintConversationsArchived(
   ]);
   const marked = archived ? markSessionsArchiving(ids) : undefined;
   if (!archived) unmarkSessionsArchiving(ids);
-  const snapshot = snapshotArchiveLists(queryClient);
+  const snapshot = snapshotArchiveLists(queryClient, ids);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
   if (archived) dropFromPinnedCache(queryClient, ids);
   return { snapshot, marked };

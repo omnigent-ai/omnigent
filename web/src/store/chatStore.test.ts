@@ -7478,6 +7478,14 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(rows.find((c) => c.id === "conv_other")?.status).toBe("idle");
     });
 
+    it("patches the open session's fetched sidebar row outside the loaded pages", () => {
+      client.setQueryData(["conversation-backfill", "conv_old"], conv("conv_old", "idle"));
+      handleSessionEvent({ type: "session_status", conversationId: "conv_old", status: "running" });
+      expect(client.getQueryData<Conversation>(["conversation-backfill", "conv_old"])?.status).toBe(
+        "running",
+      );
+    });
+
     it("collapses live 'waiting' to the list's 'running' (server-list parity)", () => {
       // GET /v1/sessions maps running/waiting → "running"; the live patch must
       // match so the badge agrees with the next poll instead of flapping.

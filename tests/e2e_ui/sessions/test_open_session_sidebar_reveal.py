@@ -6,12 +6,13 @@ run starts at the user's first navigation.
 
 from __future__ import annotations
 
-import time
 import uuid
 
 import httpx
 import pytest
 from playwright.sync_api import Locator, Page, expect
+
+from tests._helpers.polling import poll_until
 
 
 def _set_session(base_url: str, session_id: str, **fields: object) -> None:
@@ -24,16 +25,6 @@ def _archived_on_server(base_url: str, session_id: str) -> bool:
     response = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     response.raise_for_status()
     return bool(response.json()["archived"])
-
-
-def _wait_unarchived(base_url: str, session_id: str) -> None:
-    """Poll until the unarchive PATCH the row sent has committed."""
-    deadline = time.monotonic() + 15.0
-    while time.monotonic() < deadline:
-        if not _archived_on_server(base_url, session_id):
-            return
-        time.sleep(0.25)
-    raise AssertionError("session still archived after the row's Unarchive click")
 
 
 def _sidebar(page: Page) -> Locator:
@@ -66,11 +57,7 @@ def test_archived_session_opened_from_search_shows_unarchive_in_sidebar(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """An archived session opened from search lists in the sidebar with Unarchive.
-
-    Fails without the reveal: archived sessions are left out of the default
-    sidebar view, so the opened session has no row and no Unarchive button.
-    """
+    """Opening an archived search result reveals its sidebar Unarchive control."""
     base_url, session_id = seeded_session
     title = f"Quarterly report draft {uuid.uuid4().hex[:6]}"
     _set_session(base_url, session_id, title=title)
@@ -92,7 +79,8 @@ def test_archived_session_opened_from_search_shows_unarchive_in_sidebar(
     expect(unarchive).to_be_visible()
     unarchive.click()
 
-    _wait_unarchived(base_url, session_id)
+    # The row's Unarchive PATCH has committed.
+    poll_until(lambda: not _archived_on_server(base_url, session_id), timeout_s=15.0)
     expect(page).to_have_url(f"{base_url}/c/{session_id}")
     row.hover()
     expect(row.get_by_role("button", name="Archive conversation")).to_be_visible()

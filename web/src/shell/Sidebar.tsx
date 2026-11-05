@@ -1979,10 +1979,6 @@ function ConversationList({
   const unseenTick = useUnseenTick(statusView);
   const draftIds = useSessionDraftIds(statusView);
   const startingId = useStartingConversationId(statusView);
-  // Freeze the active chat's sort key while you're inside it so an
-  // updated_at bump from sending a message doesn't reorder the row
-  // out from under you. Snapshot is dropped on navigate-away so the
-  // chat snaps back to its real position once you've left.
   const { conversationId: activeId } = useParams<{ conversationId: string }>();
   // Resolve the active conversation's top-level root once here (rows get a plain
   // `isActive` prop, not their own query). Falls back to the raw id while the
@@ -2001,16 +1997,12 @@ function ConversationList({
   const openSessionMissing =
     activeRootSessionId !== null &&
     !pagedConversations.some((c) => c.id === activeRootSessionId) &&
-    !pinnedConversations.some((c) => c.id === activeRootSessionId) &&
-    !loadedRows.some((c) => c.id === activeRootSessionId);
+    !pinnedConversations.some((c) => c.id === activeRootSessionId);
   const openSessionRow = useOpenSessionRow(openSessionMissing ? activeRootSessionId : null);
   const allConversations = useMemo(
     () => (openSessionRow ? [...pagedConversations, openSessionRow] : pagedConversations),
     [pagedConversations, openSessionRow],
   );
-  // An archived open session lists on the live views too; Pinned and project
-  // folders keep showing only live sessions.
-  const openArchivedId = openSessionRow?.archived === true ? openSessionRow.id : null;
   const groupOrder = useMemo(
     () =>
       view.grouping === "harness"
@@ -2079,6 +2071,7 @@ function ConversationList({
     setOptimisticActiveId(id);
   }, []);
   const displayedActiveId = optimisticActiveId ?? resolvedActiveId;
+  // Freeze the open chat's sort key until you navigate away, so sending doesn't reorder it.
   const [activeOverride, setActiveOverride] = useState<ActiveChatOverride | null>(null);
   useEffect(() => {
     setActiveOverride((prev) => computeNextActiveOverride(activeId, allConversations, prev));
@@ -2142,7 +2135,9 @@ function ConversationList({
     // also present in the paginated list, and merging both would render it twice.
     const allWithPinned = dedupeConversationsById([...allConversations, ...pinnedConversations]);
     const notArchived = allWithPinned.filter((c) => c.archived !== true);
-    const listed = allWithPinned.filter((c) => c.archived !== true || c.id === openArchivedId);
+    // An archived open session lists on the live views too, wherever its row
+    // came from; Pinned and project folders keep showing only live sessions.
+    const listed = allWithPinned.filter((c) => c.archived !== true || c.id === activeRootSessionId);
     // The filter picks the slice; the Pinned / Projects / Sessions structure is
     // then built from it, so every filter reuses the same layout.
     const tabScoped =
@@ -2260,7 +2255,7 @@ function ConversationList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     allConversations,
-    openArchivedId,
+    activeRootSessionId,
     pinnedConversations,
     pinnedSet,
     activeOverride,

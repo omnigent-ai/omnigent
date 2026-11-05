@@ -1,12 +1,16 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { renderHook, waitFor } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
-import { getSessionParent } from "@/lib/sessionHost";
+import { getSessionHost, getSessionParent } from "@/lib/sessionHost";
 import { findCachedListRow } from "@/lib/sessionListCache";
 import { conversation } from "@/test/sidebarMockHelpers";
-import { fetchConversationById, useOpenSessionRow } from "./useOpenSessionRow";
+import {
+  fetchConversationById,
+  rememberOpenSessionRow,
+  useOpenSessionRow,
+} from "./useOpenSessionRow";
 
 function mockResponse(body: unknown, status = 200): Response {
   return {
@@ -69,7 +73,8 @@ describe("fetchConversationById", () => {
         updated_at: 20,
         archived: true,
         project_id: "proj_1",
-        parent_session_id: null,
+        parent_session_id: "conv_parent",
+        host_id: "host_1",
         status: "idle",
       }),
     );
@@ -85,10 +90,14 @@ describe("fetchConversationById", () => {
       title: "Old",
       archived: true,
       project_id: "proj_1",
+      parent_session_id: "conv_parent",
+      host_id: "host_1",
       owner: null,
       permission_level: null,
     });
-    expect(getSessionParent("conv_old")).toBeNull();
+    // Session-scoped requests route through these maps before any list row loads.
+    expect(getSessionParent("conv_old")).toBe("conv_parent");
+    expect(getSessionHost("conv_old")).toBe("host_1");
   });
 
   it("returns null for a deleted session", async () => {
@@ -106,6 +115,20 @@ describe("useOpenSessionRow", () => {
     const { result } = renderOpenSessionRow(queryClient, "conv_archived");
 
     await waitFor(() => expect(result.current).toEqual(searchRow));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("follows status updates to the cached list row", async () => {
+    const queryClient = newQueryClient();
+    const searchKey = ["conversations", "search", "old"];
+    queryClient.setQueryData(searchKey, listPages([conversation("conv_live", { owner: "me" })]));
+    const { result } = renderOpenSessionRow(queryClient, "conv_live");
+    await waitFor(() => expect(result.current?.status).toBe("idle"));
+
+    const running = conversation("conv_live", { owner: "me", status: "running" });
+    act(() => queryClient.setQueryData(searchKey, listPages([running])));
+
+    expect(result.current?.status).toBe("running");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
@@ -141,6 +164,29 @@ describe("useOpenSessionRow", () => {
     const { result } = renderOpenSessionRow(queryClient, "conv_shared");
 
     await waitFor(() => expect(result.current).toEqual(sharedRow));
+  });
+
+  it("lists a remembered shared row after its search cache is gone, and keeps its owner on refetch", async () => {
+    const queryClient = newQueryClient();
+    const sharedRow = conversation("conv_shared", {
+      owner: "teammate",
+      permission_level: 1,
+      archived: true,
+    });
+    rememberOpenSessionRow(queryClient, sharedRow);
+
+    const { result } = renderOpenSessionRow(queryClient, "conv_shared");
+
+    expect(result.current).toEqual(sharedRow);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValue(
+      mockResponse({ id: "conv_shared", created_at: 1, permission_level: 1, archived: false }),
+    );
+    await act(() => queryClient.invalidateQueries({ queryKey: ["conversation-backfill"] }));
+
+    await waitFor(() => expect(result.current?.archived).toBe(false));
+    expect(result.current?.owner).toBe("teammate");
   });
 
   it("does nothing without an id", () => {

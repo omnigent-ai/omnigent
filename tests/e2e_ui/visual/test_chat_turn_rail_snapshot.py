@@ -13,9 +13,10 @@ test body).
 
 The determinism strategy is identical to ``test_chat_snapshot.py`` (see its
 module docstring): every bind call is ``page.route``-stubbed, the stream is
-answered with the ``[DONE]`` sentinel, and the sidebar list is empty. This
-transcript uses plain prose only (no fenced code) so the capture needs no Shiki
-token-color settle -- the rail spacing, not code rendering, is what it guards.
+answered with the ``[DONE]`` sentinel, and the sidebar lists only the open
+session. This transcript uses plain prose only (no fenced code) so the capture
+needs no Shiki token-color settle -- the rail spacing, not code rendering, is
+what it guards.
 """
 
 from __future__ import annotations

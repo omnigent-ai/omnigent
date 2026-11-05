@@ -20,8 +20,9 @@ items page; see ``web/src/store/chatStore.ts``):
 * the slim session reports ``status: "idle"`` and ``/health`` reports the runner
   online, so neither the "Working…" shimmer nor an offline/connecting indicator
   appears.
-* the session *list* is stubbed empty (exactly like the landing): an empty sidebar
-  means an empty ``/v1/sessions/updates`` watch-set, so the real (empty) updates
+* the session *list* is stubbed empty (exactly like the landing), so the sidebar
+  lists only the open session, from its detail stub. The
+  ``/v1/sessions/updates`` watch-set stays empty, so the real (empty) updates
   socket pushes nothing and no relative "x min ago" row timestamp can drift the
   capture. The captured value is the conversation surface, not the sidebar list.
 """
