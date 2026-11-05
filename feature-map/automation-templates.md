@@ -13,8 +13,10 @@ to customize.
   old template-page links open the Templates tab.
 - `preview`: empty and populated lists show suggested automations in the All
   filter with no search; searches and Active/Paused filters hide the preview.
-- `create`: a gallery item or suggested automation opens integration setup;
-  New automation opens a blank form.
+- `create`: New automation opens with Trigger type set to Schedule. Choose
+  Jira, Slack, GitHub, or Linear in the same form to configure matching items.
+  Gallery items preselect their integration. Switching types preserves each
+  draft until the dialog closes, including the schedule and any custom prompt edits.
 - `scope`: **equals** matches one project, channel, repository, or team.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
   the entered values; Slack placeholders omit the optional leading `#`.
@@ -102,7 +104,9 @@ to customize.
   follow `/tasks?view=templates`. Old `/tasks/templates` links redirect here.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
-- **Creation modal:** click New automation on either tab to start from scratch.
+- **Creation modal:** click New automation on either tab. Schedule is selected
+  by default; use Trigger type to select an integration and reveal its conditions
+  and session instructions. Returning to Schedule restores the schedule draft.
   With `automations_v2` on a server supporting sub-hour schedules, use Custom schedule → Minutes
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
@@ -125,7 +129,8 @@ No agent turn is needed.
 Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`
-  covers the preview and Templates tab with reload. It creates
+  covers the preview and Templates tab with reload, plus New automation's
+  trigger selector on desktop and mobile. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
   with trigger controls always active. It also converts a template to new-session mode and verifies schedule controls, list
   Run now/next-run, and detail Run now/next-run remain available.
