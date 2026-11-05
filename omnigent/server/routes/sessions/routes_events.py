@@ -1047,6 +1047,7 @@ def register_events_routes(
                                     else None,
                                 )
                             )
+                            await reopen_side_chat_tab(request, session_id)
                         continue
                     await _authorized_conversation(request, session_id, external_transcript=True)
                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
@@ -1055,11 +1056,25 @@ def register_events_routes(
                     )
                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
                 return acks
-            return await _post_event_impl(
+            ack = await _post_event_impl(
                 request,
                 session_id,
                 body,
                 in_flight=in_flight if body.type in _IN_FLIGHT_EVENT_TYPES else None,
+            )
+            await reopen_side_chat_tab(request, session_id)
+            return ack
+
+    async def reopen_side_chat_tab(request: Request, session_id: str) -> None:
+        """Bring back a closed side-chat tab on every device once a message to it is accepted.
+
+        So a follow-up queued on another device never runs out of sight, while a
+        rejected one (a sealed Codex side chat answers 409) leaves the tab closed.
+        """
+        if getattr(request.state, "reopens_side_chat_tab", False):
+            request.state.reopens_side_chat_tab = False
+            await asyncio.to_thread(
+                conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
             )
 
     router.include_router(event_router)
@@ -1267,12 +1282,13 @@ def register_events_routes(
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
-        if body.type == "message" and SIDE_CHAT_CLOSED_LABEL_KEY in (conv.labels or {}):
-            # Using a side chat whose tab was closed brings the tab back everywhere,
-            # so a follow-up queued on another device never runs out of sight.
-            await asyncio.to_thread(
-                conversation_store.delete_label, session_id, SIDE_CHAT_CLOSED_LABEL_KEY
-            )
+        if (
+            body.type == "message"
+            and isinstance(request, Request)
+            and SIDE_CHAT_CLOSED_LABEL_KEY in (conv.labels or {})
+        ):
+            # Reopened by post_event only once the message is accepted.
+            request.state.reopens_side_chat_tab = True
         if (
             body.type == "message"
             and isinstance(request, Request)

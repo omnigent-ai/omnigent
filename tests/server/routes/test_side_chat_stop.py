@@ -196,7 +196,7 @@ async def test_a_message_reopens_a_closed_side_chat_tab(
         agent_id=agent_id, labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_CLOSED_LABEL_KEY: "1"}
     )
 
-    await client.post(
+    response = await client.post(
         f"/v1/sessions/{side.id}/events",
         json={
             "type": "message",
@@ -204,5 +204,42 @@ async def test_a_message_reopens_a_closed_side_chat_tab(
         },
     )
 
+    assert response.status_code == 202, response.text
     saved = store.get_conversation(side.id)
     assert saved is not None and SIDE_CHAT_CLOSED_LABEL_KEY not in saved.labels
+
+
+async def test_a_rejected_message_leaves_a_closed_codex_side_chat_closed(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """A stale follow-up to a sealed Codex side chat is refused and its tab stays closed."""
+    store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    SqlAlchemyAgentStore(db_uri).create(agent_id, name="test", bundle_location="test:///bundle")
+    parent = store.create_conversation(agent_id=agent_id)
+    side = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent_id,
+        labels={
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat",
+            CLOSED_LABEL_KEY: "true",
+            SIDE_CHAT_CLOSED_LABEL_KEY: "1",
+        },
+        side_chat_parent_id=parent.id,
+    )
+
+    response = await client.post(
+        f"/v1/sessions/{side.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "stale"}]},
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    saved = store.get_conversation(side.id)
+    assert saved is not None and SIDE_CHAT_CLOSED_LABEL_KEY in saved.labels
+    listed = await client.get(f"/v1/sessions/{parent.id}/side_chats")
+    assert [(row["id"], row["closed"]) for row in listed.json()["data"]] == [(side.id, True)]

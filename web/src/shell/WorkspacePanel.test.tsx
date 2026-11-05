@@ -1576,31 +1576,15 @@ describe("WorkspacePanel mobile side chats", () => {
     },
   );
 
+  // Owner level either way: an admin has it without owning the session.
   it.each([
-    [4, true],
-    [3, false],
-  ])("offers a new side chat at permission level %i: %s", (permissionLevel, offered) => {
-    isMobileMock.mockReturnValue(true);
-    const before = useChatStore.getState();
-    useChatStore.setState({ sessionHarness: "claude-native" });
-    try {
-      renderWorkspace({ rightRailTab: "sidechat", mobileSideChatsOpen: true, permissionLevel });
-
-      const drawer = screen.getByTestId("side-chats-panel-drawer");
-      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
-        offered,
-      );
-    } finally {
-      useChatStore.setState({ sessionHarness: before.sessionHarness });
-    }
-  });
-
-  it("hides a new side chat when the server says this viewer can't start one", () => {
+    [true, true],
+    [false, false],
+  ])("offers a new side chat when the server allows it (%s)", (sideChatAllowed, offered) => {
     isMobileMock.mockReturnValue(true);
     const before = useChatStore.getState();
     useChatStore.setState({ sessionHarness: "claude-native" });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    // An admin sees owner level without owning the session.
     queryClient.setQueryData(["session", "conv_ws"], {
       id: "conv_ws",
       agentId: "agent",
@@ -1608,7 +1592,7 @@ describe("WorkspacePanel mobile side chats", () => {
       createdAt: 0,
       labels: {},
       permissionLevel: 4,
-      sideChatAllowed: false,
+      sideChatAllowed,
     });
     try {
       renderWorkspace({
@@ -1619,7 +1603,9 @@ describe("WorkspacePanel mobile side chats", () => {
       });
 
       const drawer = screen.getByTestId("side-chats-panel-drawer");
-      expect(within(drawer).queryByRole("button", { name: "New side chat" })).toBeNull();
+      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
+        offered,
+      );
     } finally {
       useChatStore.setState({ sessionHarness: before.sessionHarness });
     }

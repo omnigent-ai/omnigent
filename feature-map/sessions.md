@@ -503,9 +503,13 @@ keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
-Closing the side chat discards its queued follow-ups. A
-chat-only side chat can also send messages from its direct `/c/<child_id>` URL
-without choosing a workspace. The side-chat composer opens the same `/` menu
+Closing the side chat discards the follow-ups queued on that device and closes
+its tab on the owner's other devices. A follow-up queued on another device still
+sends, and like any message the server accepts for a closed generic side chat,
+including one sent from its direct `/c/<child_id>` URL, it brings the tab back
+everywhere; a sealed Codex side chat refuses it and stays closed. A chat-only
+side chat can also send messages from its direct URL without choosing a
+workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
 session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
