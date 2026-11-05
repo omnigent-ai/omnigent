@@ -294,6 +294,19 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         )
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
+        # Only a failed launch hands inputs back, so a send naming this one leaves it.
+        other_id = uuid4().hex
+        content = [{"type": "input_text", "text": "other"}]
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": content, "stable_id": other_id},
+                "replaces_failed_inputs": [pending_inputs.make_pending_id(session_id, entry.id)],
+            },
+        )
+        assert response.status_code == 202, response.text
+        assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )
@@ -301,7 +314,7 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await startup._deliver(
             env.app, session_id, env.conv_store.list_pending_inputs(session_id)[0]
         )
-        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert [item.id for item in env.conv_store.list_pending_inputs(session_id)] == [other_id]
         assert len([event for event in forwarded if event.get("type") == "message"]) == 1
         [sent] = [
             r
