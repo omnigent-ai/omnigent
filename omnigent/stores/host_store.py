@@ -206,6 +206,17 @@ def hash_host_launch_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _delete_host_row(session: Session, row: SqlHost) -> None:
+    session.delete(row)
+    session.execute(
+        sql_delete(SqlPreference).where(
+            SqlPreference.workspace_id == current_workspace_id(),
+            SqlPreference.user_id == "__host_lifecycle__",
+            SqlPreference.key.in_(["recovery:" + row.host_id, "retained_sandbox:" + row.host_id]),
+        )
+    )
+
+
 def delete_host_in_session(session: Session, row: SqlHost) -> Host:
     """Delete an already locked host while retaining pending provider cleanup."""
     host_id = row.host_id
@@ -221,12 +232,7 @@ def delete_host_in_session(session: Session, row: SqlHost) -> Host:
     if row.sandbox_provider is None or (
         row.sandbox_id is None and row.terminating_sandbox_id is None
     ):
-        session.execute(
-            sql_delete(SqlHost).where(
-                SqlHost.workspace_id == current_workspace_id(),
-                SqlHost.host_id == host_id,
-            )
-        )
+        _delete_host_row(session, row)
         return deleted
     row.token_hash = None
     row.token_expires_at = None
@@ -1643,16 +1649,7 @@ class HostStore:
             if row.terminating_sandbox_id == sandbox_id:
                 row.terminating_sandbox_id = None
             if row.sandbox_id is None and row.terminating_sandbox_id is None:
-                session.delete(row)
-                session.execute(
-                    sql_delete(SqlPreference).where(
-                        SqlPreference.workspace_id == current_workspace_id(),
-                        SqlPreference.user_id == "__host_lifecycle__",
-                        SqlPreference.key.in_(
-                            ["recovery:" + host_id, "retained_sandbox:" + host_id]
-                        ),
-                    )
-                )
+                _delete_host_row(session, row)
             return True
 
     def revoke_launch_token(self, host_id: str) -> None:

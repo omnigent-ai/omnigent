@@ -1667,7 +1667,12 @@ def test_delete_host_hides_row_and_retains_cleanup_tombstone(db_uri: str) -> Non
         assert session.get(SqlHost, (0, "dcf4eb5fc0b04985ec45f79cfda95566")) is None
 
 
-def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None:
+@pytest.mark.parametrize("cleanup_before_delete", [False, True])
+def test_stale_completion_removes_host_deleted_after_detach(
+    db_uri: str, cleanup_before_delete: bool
+) -> None:
+    from omnigent.db.db_models import SqlPreference
+
     store = HostStore(db_uri)
     host_id = "405a78021f6648e5ae887350047f76b5"
     original = store.register_managed_host(
@@ -1679,24 +1684,41 @@ def test_stale_completion_removes_host_deleted_after_detach(db_uri: str) -> None
         sandbox_id="detach-delete-sandbox",
         token_expires_at=now_epoch() + 3600,
     )
+    assert store.claim_managed_recovery(original, "recovery-token")
+    engine = get_or_create_engine(db_uri)
+    with Session(engine) as session:
+        session.add(
+            SqlPreference(
+                workspace_id=current_workspace_id(),
+                user_id="__host_lifecycle__",
+                key="retained_sandbox:" + host_id,
+                value="deleted-task",
+            )
+        )
+        session.commit()
     assert store.detach_stale_managed_sandbox(
         host_id,
         sandbox_id="detach-delete-sandbox",
         expected_updated_at=original.updated_at,
     )
+    if cleanup_before_delete:
+        assert store.mark_sandbox_terminated(host_id, sandbox_id="detach-delete-sandbox")
     deleted = store.delete_host(host_id)
     assert deleted is not None
-    assert deleted.deleted_at is not None
-    assert deleted.terminating_sandbox_id == "detach-delete-sandbox"
+    if not cleanup_before_delete:
+        assert deleted.deleted_at is not None
+        assert deleted.terminating_sandbox_id == "detach-delete-sandbox"
+        assert store.mark_sandbox_terminated(host_id, sandbox_id="detach-delete-sandbox")
 
-    assert store.mark_sandbox_terminated(
-        host_id,
-        sandbox_id="detach-delete-sandbox",
-    )
-
-    engine = get_or_create_engine(db_uri)
     with Session(engine) as session:
         assert session.get(SqlHost, (0, host_id)) is None
+        for prefix in ("recovery:", "retained_sandbox:"):
+            assert (
+                session.get(
+                    SqlPreference, (current_workspace_id(), "__host_lifecycle__", prefix + host_id)
+                )
+                is None
+            )
 
 
 def test_replace_managed_host_sandbox_cannot_recreate_missing_host(db_uri: str) -> None:

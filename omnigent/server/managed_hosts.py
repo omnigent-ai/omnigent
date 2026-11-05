@@ -4064,8 +4064,8 @@ async def _relaunch_managed_host(
     The host identity is durable while its sandbox is not: when the
     sandbox dies (the provider's lifetime cap, a crash, a manual
     terminate), the host row and the sessions bound to it remain.
-    This relaunch keeps that identity — terminate the old sandbox
-    (best-effort; it is usually already gone), provision a fresh one,
+    This relaunch keeps that identity — drain recorded sandbox generations,
+    provision a fresh one,
     and re-arm the SAME host row with a new token + sandbox id (which
     atomically revokes the previous generation's token).
 
@@ -4115,16 +4115,18 @@ async def _relaunch_managed_host(
     for sandbox_id in dict.fromkeys((host.terminating_sandbox_id, host.sandbox_id)):
         if sandbox_id is None:
             continue
-        if not await _terminate_sandbox_best_effort(
-            launcher,
-            sandbox_id,
-            host_id=host.host_id,
-            provider=host.sandbox_provider,
-        ):
+        try:
+            await asyncio.to_thread(launcher.terminate, sandbox_id)
+        except OwnerCredentialMissingError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except Exception as exc:
+            _logger.warning(
+                "Failed to clean up sandbox %s before recovery", sandbox_id, exc_info=True
+            )
             raise HTTPException(
                 status_code=502,
                 detail="Previous managed sandbox cleanup failed; retry recovery",
-            )
+            ) from exc
         if sandbox_id == host.terminating_sandbox_id:
             await asyncio.to_thread(
                 host_store.mark_sandbox_terminated, host.host_id, sandbox_id=sandbox_id
