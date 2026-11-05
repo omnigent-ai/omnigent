@@ -208,13 +208,28 @@ BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
 # ingress plus one tool relay per session), hence a pool rather than one port.
 DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 
+
+def _runner_temp_parent() -> Path:
+    """The temp root the runner used, even when this process may only read it.
+
+    Helpers launched for the runner get its ``TMPDIR`` pinned (see
+    :func:`build_mcp_config`), but Python skips a ``TMPDIR`` it can't write, and a
+    sandboxed relay may only read it. Honour the pinned value as given then, so the
+    runner's bridge tree stays under this process's trusted root.
+    """
+    pinned = os.environ.get("TMPDIR")
+    if pinned and os.path.isabs(pinned) and os.path.isdir(pinned):
+        return Path(os.path.abspath(pinned))
+    return Path(tempfile.gettempdir())
+
+
 # Root for the per-process Claude bridge tree. Namespaced by uid so
 # other Unix users on the same host cannot read the bearer token or
 # pre-create the parent as a symlink to redirect the bridge tree. The
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = Path(tempfile.gettempdir())
+_TRUSTED_PARENT = _runner_temp_parent()
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 # Markers for permission hooks parked on a verdict, keyed by SESSION id: the

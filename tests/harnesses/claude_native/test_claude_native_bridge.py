@@ -17199,3 +17199,24 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_bridge_temp_parent_follows_a_pinned_tmpdir_it_cannot_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Relay helpers run with ``TMPDIR`` pinned to the runner's, but a sandbox may let
+    them only read it. Python's tempdir then falls back elsewhere, and the bridge tree
+    the runner made would no longer sit under the helper's trusted root."""
+    from omnigent.harnesses.claude_native.bridge import _runner_temp_parent
+
+    pinned = tmp_path / "runner-tmp"
+    pinned.mkdir()
+    pinned.chmod(0o500)
+    try:
+        monkeypatch.setenv("TMPDIR", f"{pinned}/")
+        assert _runner_temp_parent() == pinned
+        monkeypatch.setenv("TMPDIR", "relative/tmp")
+        assert _runner_temp_parent() == Path(tempfile.gettempdir())
+    finally:
+        pinned.chmod(0o700)
