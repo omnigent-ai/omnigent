@@ -218,6 +218,11 @@ def test_chat_turn_rail_matches_baseline(
         content='[aria-label="Jump to the first message"] { display: none !important; }'
     )
 
+    # The open session's sidebar row comes from its own fetch; capture it settled.
+    sidebar = page.get_by_role("complementary", name="Conversations", exact=True)
+    expect(sidebar.locator(f'a[href$="/c/{_SESSION_ID}"]')).to_be_visible(timeout=30_000)
+    expect(sidebar.get_by_text("Loading…")).to_have_count(0)
+
     settle_for_snapshot(page)
 
     assert_snapshot(page)
