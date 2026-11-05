@@ -130,7 +130,7 @@ def _runner_hello() -> HelloFrame:
 
 
 @pytest.fixture()
-def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
+def app(runtime_init: None, db_uri: str, tmp_path, request: pytest.FixtureRequest) -> FastAPI:
     """FastAPI app wired WITH ``host_store`` so the inline host-launch
     branch of ``POST /v1/sessions`` is active.
 
@@ -144,6 +144,8 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     :param tmp_path: Pytest temp dir for artifacts and cache.
     :returns: A configured FastAPI app with host routes mounted.
     """
+    from omnigent.server.managed_hosts import parse_sandbox_config
+
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -156,6 +158,17 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        sandbox_config=(
+            parse_sandbox_config(
+                {
+                    "provider": "modal",
+                    "server_url": "https://managed-test.example.com",
+                    "modal": {"image": "docker.io/test/omnigent-host:latest"},
+                }
+            )
+            if getattr(request, "param", None) == "durable_startup"
+            else None
+        ),
     )
 
 
@@ -3044,6 +3057,215 @@ async def test_host_session_message_waits_for_bound_runner_before_relaunch(
     assert init_bodies and init_bodies[0]["session_id"] == session_id, (
         f"session-init body should target {session_id!r}; got {init_bodies!r}"
     )
+
+
+@pytest.mark.parametrize("app", ["durable_startup"], indirect=True)
+@pytest.mark.parametrize(
+    "outcome",
+    ["connect", "sign_in", "restart", "host_reconnect", "stop", "rebind", "expired", "claimed"],
+)
+async def test_saved_input_retains_its_slow_starting_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    from starlette.datastructures import Headers
+
+    from omnigent.server import startup_inputs
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import SessionEventInput
+    from tests._helpers.polling import poll_until_async
+    from tests.server.integration.test_sessions_web_send_stable_id import _stub_runner
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.03)
+    monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id, runner_id = session["id"], session["runner_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    startup = app.state.startup_inputs
+    forwarded: list[dict[str, Any]] = []
+    fake_runner = _stub_runner(monkeypatch, forwarded)
+    available = False
+
+    async def resolve_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        return fake_runner if available else None
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", resolve_runner)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    ordinary_wait_finished = asyncio.Event()
+    original_wait = orchestration._wait_for_runner_client
+    wait_budgets: list[float] = []
+
+    async def observe_wait(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        wait_budgets.append(kwargs["timeout_s"])
+        result = await original_wait(*args, **kwargs)
+        if result is None:
+            ordinary_wait_finished.set()
+        return result
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", observe_wait)
+    launches: list[str] = []
+    stop_seen = asyncio.Event()
+
+    async def answer_host() -> None:
+        while True:
+            output = await comm.receive_output(timeout=None)
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                continue
+            if isinstance(frame, HostRunnerStatusFrame):
+                await ordinary_wait_finished.wait()
+                reply = HostRunnerStatusResultFrame(
+                    request_id=frame.request_id,
+                    status="sign_in_pending" if outcome == "sign_in" else "alive",
+                )
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                launches.append(token_bound_runner_id(frame.binding_token))
+                reply = HostLaunchRunnerResultFrame(request_id=frame.request_id, status="launched")
+            elif isinstance(frame, HostStatFrame):
+                reply = HostStatResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    exists=True,
+                    type="directory",
+                    canonical_path=frame.path,
+                )
+            elif isinstance(frame, HostStopRunnerFrame):
+                stop_seen.set()
+                reply = HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
+            else:
+                continue
+            await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
+
+    responder = asyncio.create_task(answer_host())
+    entry = await startup.enqueue(
+        session_id,
+        SessionEventInput(
+            type="message",
+            data={"role": "user", "content": [{"type": "input_text", "text": "saved input"}]},
+        ),
+        user_id=None,
+        headers=Headers(),
+    )
+    delivery = asyncio.create_task(startup._deliver(app, session_id, entry))
+    try:
+        await asyncio.wait_for(ordinary_wait_finished.wait(), timeout=budget(2.0))
+
+        def retained_or_replaced() -> bool:
+            current = store.get_item(session_id, entry.id)
+            options = current.data.model_dump().get("startup_options", {}) if current else {}
+            return bool(options.get("runner_wait") or launches or delivery.done())
+
+        await poll_until_async(retained_or_replaced, timeout_s=budget(2.0))
+        assert launches == [], "a slow live runner must not be replaced"
+        assert not delivery.done()
+        saved = store.get_item(session_id, entry.id)
+        assert saved is not None and saved.status == "in_progress"
+        retained = saved.data.startup_options.runner_wait
+        assert retained is not None and retained.runner_id == runner_id
+        deadline = retained.deadline
+        if outcome == "sign_in":
+            from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
+
+            assert startup_inputs.STARTUP_RUNNER_CONNECT_TIMEOUT_S >= RUNNER_SIGN_IN_PENDING_WAIT_S
+        assert forwarded == []
+
+        if outcome == "host_reconnect":
+            old_connection = app.state.host_registry.get(_HOST_ID)
+            replacement = await _connect_host(app)
+            await poll_until_async(
+                lambda: app.state.host_registry.get(_HOST_ID) is not old_connection,
+                timeout_s=budget(2.0),
+            )
+            await asyncio.wait_for(
+                asyncio.gather(delivery, return_exceptions=True), timeout=budget(2.0)
+            )
+            assert store.get_item(session_id, entry.id).status == "in_progress"
+            responder.cancel()
+            await asyncio.gather(responder, return_exceptions=True)
+            await comm.wait(timeout=budget(2.0))
+            comm = replacement
+            responder = asyncio.create_task(answer_host())
+        if outcome in {"restart", "expired", "host_reconnect"}:
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+            restarted = startup_inputs.ManagedStartupInputs(
+                SqlAlchemyConversationStore(db_uri), app.state.host_registry
+            )
+            restarted.dispatch = startup.dispatch
+            if outcome == "expired":
+                monkeypatch.setattr(
+                    startup_inputs, "time", SimpleNamespace(time=lambda: deadline + 1)
+                )
+            else:
+                monkeypatch.setattr(
+                    startup_inputs, "time", SimpleNamespace(time=lambda: deadline - budget(5.0))
+                )
+            startup = restarted
+            delivery = asyncio.create_task(startup._deliver(app, session_id, saved))
+            if outcome != "expired":
+                await _wait_for_runner_connect_waiter(app, runner_id)
+                assert wait_budgets[-1] <= budget(5.0)
+                assert (
+                    store.get_item(session_id, entry.id).data.startup_options.runner_wait
+                    == retained
+                )
+        if outcome == "stop":
+            response = await client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "stop_session"}
+            )
+            assert response.status_code == 202
+            await asyncio.wait_for(stop_seen.wait(), timeout=budget(2.0))
+        elif outcome == "rebind":
+            store.replace_runner_id(session_id, uuid4().hex)
+        elif outcome == "claimed":
+            assert store.transition_pending_input(
+                session_id, entry.id, expected="in_progress", status="incomplete"
+            )
+        elif outcome != "expired":
+            available = True
+            app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        if outcome in {"stop", "claimed"}:
+            await asyncio.gather(delivery, return_exceptions=True)
+        else:
+            await asyncio.wait_for(asyncio.shield(delivery), timeout=budget(3.0))
+        assert launches == []
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        if outcome in {"connect", "sign_in", "restart", "host_reconnect"}:
+            assert len(turns) == 1 and turns[0]["persisted_item_id"] == entry.id
+            assert store.list_pending_inputs(session_id) == []
+            await startup._deliver(app, session_id, saved)
+            assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        else:
+            assert turns == []
+            pending = store.list_pending_inputs(session_id)
+            if outcome == "stop":
+                assert pending == []
+            elif outcome == "claimed":
+                assert len(pending) == 1 and pending[0].status == "incomplete"
+                assert pending[0].data.startup_options.runner_wait == retained
+            else:
+                assert len(pending) == 1 and pending[0].status == "failed"
+                assert pending[0].data.startup_options.runner_wait.deadline == deadline
+    finally:
+        delivery.cancel()
+        responder.cancel()
+        await asyncio.gather(delivery, responder, return_exceptions=True)
+        await startup.shutdown()
+        await app.state.startup_inputs.shutdown()
+        await fake_runner.aclose()
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(3.0))
 
 
 @pytest.mark.parametrize("interruption", ["cancel", "stop", "rebind"])

@@ -87,6 +87,12 @@ from omnigent.entities import (
     PagedList,
     parse_item_data,
 )
+from omnigent.entities.conversation import (
+    MessageData,
+    SlashCommandData,
+    StartupInputOptions,
+    StartupRunnerWait,
+)
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
@@ -103,6 +109,7 @@ from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
+    STARTUP_LABEL,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -2282,6 +2289,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
         return items, rows[-1].position if more else None
 
+    def _read_pending_input_row(
+        self, conversation_id: str, item_id: str
+    ) -> SqlConversationItem | None:
+        with self._conv_session("read_pending_input") as session:
+            return session.scalar(
+                select(SqlConversationItem).where(
+                    SqlConversationItem.workspace_id == current_workspace_id(),
+                    SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.id == item_id,
+                    SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+                )
+            )
+
+    def _pending_input_cancelled(self, session: Session, conversation_id: str) -> bool:
+        query = select(SqlConversationLabel).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key == STARTUP_LABEL,
+        )
+        if self._supports_for_update:
+            query = query.with_for_update()
+        label = session.scalar(query)
+        return label is not None and label.value == "cancelled"
+
     def transition_pending_input(
         self,
         conversation_id: str,
@@ -2289,36 +2320,136 @@ class SqlAlchemyConversationStore(ConversationStore):
         *,
         expected: str,
         status: str | None,
+        expected_runner_wait: StartupRunnerWait | None = None,
+        rollback: bool = False,
     ) -> bool:
-        item = self.get_item(conversation_id, item_id)
-        if item is None or item.response_id != PENDING_INPUT_RESPONSE_ID:
+        if rollback and (expected != "incomplete" or status != "in_progress"):
+            raise ValueError("Only an unsubmitted input claim can be rolled back")
+        original = self._read_pending_input_row(conversation_id, item_id)
+        if original is None or original.status != encode_item_status(expected):
             return False
+        encoded = original.data
+        needs_payload_check = expected_runner_wait is not None
+        if needs_payload_check or (expected == "failed" and status == "in_progress"):
+            [decoded] = self._decode_item_data_batch([original.data])
+            data = _to_item(original, decoded).data
+            if not isinstance(data, (MessageData, SlashCommandData)):
+                return False
+            options = data.startup_options or StartupInputOptions()
+            if expected_runner_wait is not None and options.runner_wait != expected_runner_wait:
+                return False
+            if (
+                expected == "failed"
+                and status == "in_progress"
+                and options.runner_wait is not None
+            ):
+                # Only the explicit Retry transition starts a new authorized attempt.
+                updated = data.model_copy(
+                    update={"startup_options": options.model_copy(update={"runner_wait": None})}
+                )
+                [encoded] = self._encode_item_data_batch(
+                    [strip_nul_bytes(json.dumps(updated.model_dump(exclude_none=True)))]
+                )
+                needs_payload_check = True
 
         def write(session: Session) -> bool:
             self._lock_conversation(session, conversation_id)
+            cancelled = self._pending_input_cancelled(session, conversation_id)
+            if status is not None and cancelled and not rollback:
+                return False
             row = session.get(
                 SqlConversationItem,
-                (
-                    current_workspace_id(),
-                    conversation_id,
-                    item_id,
-                    item.created_at,
-                ),
+                (current_workspace_id(), conversation_id, item_id, original.created_at),
             )
             if (
                 row is None
                 or row.response_id != PENDING_INPUT_RESPONSE_ID
                 or row.status != encode_item_status(expected)
+                or (needs_payload_check and row.data != original.data)
             ):
                 return False
-            if status is None:
+            if status is None or (rollback and cancelled):
                 session.delete(row)
             else:
                 row.status = encode_item_status(status)
+                if encoded != original.data:
+                    row.data = encoded
             return True
 
         return run_write_transaction(
             self._conv_session_immediate, "transition_pending_input", write
+        )
+
+    def claim_pending_input_runner(
+        self,
+        conversation_id: str,
+        item_id: str,
+        *,
+        runner_id: str,
+        deadline: float,
+        connected: bool = False,
+    ) -> StartupRunnerWait | None:
+        requested = StartupRunnerWait(runner_id=runner_id, deadline=deadline)
+        workspace_id = current_workspace_id()
+        for _ in range(3):
+            original = self._read_pending_input_row(conversation_id, item_id)
+            if original is None or original.status != encode_item_status("in_progress"):
+                return None
+            # Encryption/decryption can call a remote service; keep both outside the lock.
+            [decoded] = self._decode_item_data_batch([original.data])
+            data = _to_item(original, decoded).data
+            if not isinstance(data, (MessageData, SlashCommandData)):
+                return None
+            options = data.startup_options or StartupInputOptions()
+            retained = options.runner_wait or requested
+            if connected and options.runner_wait is None:
+                return None
+            if connected and retained.runner_id == runner_id and retained.deadline == deadline:
+                retained = retained.model_copy(update={"connected": True})
+            encoded = original.data
+            if options.runner_wait != retained:
+                updated = data.model_copy(
+                    update={
+                        "startup_options": options.model_copy(update={"runner_wait": retained})
+                    }
+                )
+                [encoded] = self._encode_item_data_batch(
+                    [strip_nul_bytes(json.dumps(updated.model_dump(exclude_none=True)))]
+                )
+
+            def write(
+                session: Session,
+                original_row: SqlConversationItem = original,
+                needs_update: bool = options.runner_wait != retained,
+                encoded_data: str = encoded,
+                retained_wait: StartupRunnerWait = retained,
+            ) -> tuple[bool, StartupRunnerWait | None]:
+                self._lock_conversation(session, conversation_id)
+                if self._pending_input_cancelled(session, conversation_id):
+                    return True, None
+                row = session.get(
+                    SqlConversationItem,
+                    (workspace_id, conversation_id, item_id, original_row.created_at),
+                )
+                if (
+                    row is None
+                    or row.response_id != PENDING_INPUT_RESPONSE_ID
+                    or row.status != encode_item_status("in_progress")
+                ):
+                    return True, None
+                if row.data != original_row.data:
+                    return False, None
+                if needs_update:
+                    row.data = encoded_data
+                return True, retained_wait
+
+            settled, result = run_write_transaction(
+                self._conv_session_immediate, "claim_pending_input_runner", write
+            )
+            if settled:
+                return result
+        raise OmnigentError(
+            "The queued input changed while claiming its runner", code=ErrorCode.CONFLICT
         )
 
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
@@ -4130,6 +4261,31 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
 
         run_write_transaction(self._session_immediate, "set_session_live_status", write)
+
+    def fail_session_startup(self, conversation_id: str, runner_id: str) -> bool:
+        """Fail an idle/unset session only while its retained runner still owns it."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                _RowCountResult,
+                session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.runner_id == runner_id,
+                        or_(
+                            SqlConversationMetadata.live_status.is_(None),
+                            SqlConversationMetadata.live_status
+                            == encode_session_live_status("idle"),
+                        ),
+                    )
+                    .values(live_status=encode_session_live_status("failed"))
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "fail_session_startup", write)
 
     def settle_intentionally_stopped_session(self, conversation_id: str, runner_id: str) -> bool:
         """Settle stop intent without overwriting a replacement runner or failure."""

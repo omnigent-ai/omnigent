@@ -4364,15 +4364,16 @@ async def _wait_for_host_bound_runner_client(
     host_conn: HostConnection,
     host_registry: HostRegistry,
     conversation_store: ConversationStore | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> httpx.AsyncClient | None:
-    """Wait for this runner, extending startup only for an explicit pending sign-in.
+    """Wait for a live runner within its input's retained startup or sign-in budget.
 
-    Host liveness can end the ordinary grace early for a dead or untracked
-    process. A bounded sign-in wait keeps the same binding and input until
-    authentication finishes; old hosts retain the ordinary startup budget.
+    Saved startup inputs retain an alive launch and its persisted deadline.
+    Other sends extend ordinary grace only for an explicit pending sign-in.
     Stop, rebind, cancellation and process exit still end the wait promptly.
 
-    :param conversation_store: Optional binding check while sign-in is pending.
+    :param conversation_store: Optional binding check while startup is pending.
+    :param startup_input: Durable input whose original live launch must be retained.
     """
     from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
 
@@ -4393,13 +4394,20 @@ async def _wait_for_host_bound_runner_client(
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
         return await _query_host_runner_status(host_conn, host_registry, runner_id)
 
-    async def check_pending_owner() -> None:
+    async def check_pending_owner(*, check_deadline: bool = True) -> None:
         if _intentional_stop_sessions.get(session_id) == runner_id:
+            if startup_input is not None:
+                raise asyncio.CancelledError
             raise OmnigentError(
                 "The session was stopped while waiting for host sign-in; send the message again.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        if conversation_store is not None:
+        if startup_input is not None and conversation_store is not None:
+            if not await startup_input.validate_pending(
+                conversation_store, session_id, check_deadline=check_deadline
+            ):
+                raise asyncio.CancelledError
+        elif conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if current is None or current.runner_id != runner_id:
                 raise OmnigentError(
@@ -4407,7 +4415,16 @@ async def _wait_for_host_bound_runner_client(
                     code=ErrorCode.WRONG_REPLICA,
                 )
 
-    connect_task = wait_for_connection(timeout_s)
+    retained_deadline: float | None = None
+    if startup_input is not None and startup_input.runner_wait is not None:
+        assert conversation_store is not None
+        remaining = await startup_input.retain_runner(conversation_store, session_id, runner_id)
+        if startup_input.runner_wait is not None and startup_input.runner_wait.connected:
+            remaining = timeout_s
+        retained_deadline = time.monotonic() + remaining
+    connect_task = wait_for_connection(
+        timeout_s if retained_deadline is None else max(0.0, retained_deadline - time.monotonic())
+    )
     status_task = asyncio.create_task(query_status())
     sign_in_deadline: float | None = None
     waiting_for_sign_in = False
@@ -4416,13 +4433,23 @@ async def _wait_for_host_bound_runner_client(
             done, _pending = await asyncio.wait(
                 {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if sign_in_deadline is not None:
-                await check_pending_owner()
+            connected_client = connect_task.result() if connect_task in done else None
+            if sign_in_deadline is not None or retained_deadline is not None:
+                await check_pending_owner(check_deadline=connected_client is None)
+            if (
+                retained_deadline is not None
+                and host_registry.get(host_conn.host_id) is not host_conn
+            ):
+                raise asyncio.CancelledError
             if connect_task in done:
-                client = connect_task.result()
-                if client is not None:
-                    return client
-                if waiting_for_sign_in:
+                if connected_client is not None:
+                    if startup_input is not None:
+                        assert conversation_store is not None
+                        await startup_input.confirm_connected(
+                            conversation_store, session_id, runner_id, within_deadline=True
+                        )
+                    return connected_client
+                if waiting_for_sign_in or retained_deadline is not None:
                     return None
                 if (
                     runner_exit_reports is not None
@@ -4437,14 +4464,35 @@ async def _wait_for_host_bound_runner_client(
                     await asyncio.gather(status_task, return_exceptions=True)
                     status_task = asyncio.create_task(query_status())
                     await status_task
-                if status_task.result() != "sign_in_pending":
+                if status_task.result() != "sign_in_pending" and not (
+                    startup_input is not None and status_task.result() == "alive"
+                ):
                     return None
             status = status_task.result()
             if status in ("dead", "unknown"):
                 return None
-            if sign_in_deadline is None and status not in {"alive", "sign_in_pending"}:
+            if (
+                sign_in_deadline is None
+                and retained_deadline is None
+                and status not in {"alive", "sign_in_pending"}
+            ):
                 return await connect_task
-            if status == "sign_in_pending" and not waiting_for_sign_in:
+            if startup_input is not None and status in {"alive", "sign_in_pending"}:
+                if retained_deadline is None:
+                    assert conversation_store is not None
+                    remaining = await startup_input.retain_runner(
+                        conversation_store, session_id, runner_id
+                    )
+                    if (
+                        startup_input.runner_wait is not None
+                        and startup_input.runner_wait.connected
+                    ):
+                        remaining = timeout_s
+                    retained_deadline = time.monotonic() + remaining
+                    connect_task.cancel()
+                    await asyncio.gather(connect_task, return_exceptions=True)
+                    connect_task = wait_for_connection(remaining)
+            elif status == "sign_in_pending" and not waiting_for_sign_in:
                 if sign_in_deadline is None:
                     sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
                 await check_pending_owner()
@@ -4464,9 +4512,10 @@ async def _wait_for_host_bound_runner_client(
                 connect_task = wait_for_connection(budget_s)
                 waiting_for_sign_in = False
             if (
-                sign_in_deadline is not None
-                and host_registry.get(host_conn.host_id) is not host_conn
-            ):
+                sign_in_deadline is not None or retained_deadline is not None
+            ) and host_registry.get(host_conn.host_id) is not host_conn:
+                if retained_deadline is not None:
+                    raise asyncio.CancelledError
                 return None
             status_task = asyncio.create_task(query_status(pause=True))
     finally:

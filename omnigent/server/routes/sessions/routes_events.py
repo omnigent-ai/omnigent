@@ -1184,6 +1184,10 @@ def register_events_routes(
             ),
         )
         start_fire_stage("input_validation", session_id=session_id)
+        if isinstance(request, StartupInputContext) and not await request.validate_pending(
+            conversation_store, session_id
+        ):
+            return {"queued": False}
         peer_message = body.type == "session_message"
         if peer_message:
             if not isinstance(request, Request):
@@ -1553,6 +1557,8 @@ def register_events_routes(
                     policy_phase="input",
                     policy_reason=reason,
                 )
+                if isinstance(request, StartupInputContext):
+                    return {"queued": False, "denied": True, "reason": reason}
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -1594,6 +1600,8 @@ def register_events_routes(
             )
             if _input_verdict is not None:
                 reason = _input_verdict.get("reason", "Denied by policy")
+                if isinstance(request, StartupInputContext):
+                    return {"queued": False, "denied": True, "reason": reason}
                 _publish_policy_deny(session_id, reason)
                 await _persist_policy_deny_sentinel(
                     session_id,
@@ -2788,11 +2796,15 @@ def register_events_routes(
         # a replacement.
         _runner_needs_session_init = False
         # Item event (message, function_call_output, etc.).
-        if conv.host_id is not None and await _maybe_wake_stale_resumable_managed_sandbox(
-            session_id=session_id,
-            conv=conv,
-            app_state=request.app.state,
-            conversation_store=conversation_store,
+        if (
+            conv.host_id is not None
+            and not (isinstance(request, StartupInputContext) and request.runner_wait is not None)
+            and await _maybe_wake_stale_resumable_managed_sandbox(
+                session_id=session_id,
+                conv=conv,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+            )
         ):
             # A resumable managed wake may have re-launched the runner and
             # updated liveness while this handler was holding an old row.
@@ -2804,7 +2816,11 @@ def register_events_routes(
                 raise _session_not_found()
             conv = conv_after_wake
             _runner_needs_session_init = True
-        runner_client = await _get_runner_client(session_id, runner_router)
+        runner_client = (
+            await _get_runner_client(session_id, runner_router, conversation=conv)
+            if isinstance(request, StartupInputContext)
+            else await _get_runner_client(session_id, runner_router)
+        )
         # Managed-launch rendezvous: a ``host_type="managed"`` create
         # returns before the sandbox exists, so the first message (the
         # Web UI auto-sends the composer prompt right after navigate)
@@ -2919,6 +2935,12 @@ def register_events_routes(
             _grace_host_conn = (
                 _grace_host_reg.get(conv.host_id) if _grace_host_reg is not None else None
             )
+            if (
+                isinstance(request, StartupInputContext)
+                and request.runner_wait is not None
+                and _grace_host_conn is None
+            ):
+                raise asyncio.CancelledError
             # A just-created host session already has a runner_id before
             # the runner's tunnel is registered. The Web UI can post the
             # first message during that gap; wait briefly for the pinned
@@ -2954,6 +2976,9 @@ def register_events_routes(
                         host_conn=_grace_host_conn,
                         host_registry=_grace_host_reg,
                         conversation_store=conversation_store,
+                        startup_input=request
+                        if isinstance(request, StartupInputContext)
+                        else None,
                     )
                 else:
                     # Host tunnel absent: no one to query, so this is the
@@ -2966,6 +2991,12 @@ def register_events_routes(
                         timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
                         runner_exit_reports=runner_exit_reports,
                     )
+            if (
+                runner_client is None
+                and isinstance(request, StartupInputContext)
+                and request.runner_wait is not None
+            ):
+                await request.fail_unconnected(conversation_store, session_id)
             # Relaunch on the session's host after runner recovery fails.
             # An absent host needs its own grace before it can spawn a runner.
             _host_reg = getattr(request.app.state, "host_registry", None)
@@ -3095,6 +3126,7 @@ def register_events_routes(
                     host_conn=_host_conn,
                     host_registry=_host_reg,
                     conversation_store=conversation_store,
+                    startup_input=request if isinstance(request, StartupInputContext) else None,
                 )
             if runner_client is None:
                 _runner_needs_session_init = False
@@ -3129,6 +3161,8 @@ def register_events_routes(
                 conv.kind != "sub_agent" or _is_native_terminal_session(conv)
             )
         if runner_client is None:
+            if isinstance(request, StartupInputContext) and request.runner_wait is not None:
+                await request.fail_unconnected(conversation_store, session_id)
             # A native terminal-session message must NOT be silently
             # dropped when no runner is reachable — the runner crashed
             # before connecting (the daemon couldn't bring it up). Persist
@@ -3358,6 +3392,8 @@ def register_events_routes(
                 "No runner bound for session",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
+        if isinstance(request, StartupInputContext) and conv.runner_id is not None:
+            await request.confirm_connected(conversation_store, session_id, conv.runner_id)
         refreshed_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if refreshed_conv is None:
             raise _session_not_found()
