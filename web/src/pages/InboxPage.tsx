@@ -557,6 +557,7 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}

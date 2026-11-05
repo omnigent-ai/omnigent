@@ -200,6 +200,7 @@ class ScheduledTaskStore(ABC):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
@@ -220,6 +221,10 @@ class ScheduledTaskStore(ABC):
         switches the harness its future firings run. The fire path reads
         ``agent_id`` fresh on every firing and each firing owns its own
         conversation, so past runs keep the agent they actually ran.
+
+        ``expected_schedule`` guards the recurrence, session mode and execution
+        target read before validation. A mismatch raises a conflict before any
+        changes are saved; callers must reload and revalidate before retrying.
 
         Returns ``None`` if the task does not exist.
 

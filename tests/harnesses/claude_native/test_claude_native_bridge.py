@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import io
 import itertools
 import json
@@ -21,11 +22,11 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
@@ -59,6 +60,7 @@ from omnigent.harnesses.claude_native.bridge import (
     pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
+    program_status_turn_error,
     read_assistant_text_since,
     read_claude_session_id,
     read_hook_events_from_offset,
@@ -80,6 +82,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
+from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -4131,7 +4134,7 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-fable-5"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "xhigh"
 
 
@@ -4255,6 +4258,95 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+@pytest.mark.parametrize(
+    ("launch_args", "default_mode"),
+    [
+        ((), None),
+        (("--permission-mode", "default"), "default"),
+        (("--permission-mode", "auto"), "auto"),
+    ],
+    ids=["none", "default", "auto"],
+)
+def test_augment_claude_args_allows_reading_session_attachments(
+    launch_args: tuple[str, ...],
+    default_mode: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude reads this session's attachment cache, outside the workspace, without a prompt."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = tmp_path / "bridge"
+    attachment = materialize_attachment(
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgo=",
+            "filename": "image.png",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=bridge_dir, python_executable="/venv/bin/python"
+        )
+    )
+
+    permissions = settings.get("permissions", {})
+    assert permissions.get("defaultMode") == default_mode
+    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "expected_permissions"),
+    [((), None), (("--permission-mode", "auto"), {"defaultMode": "auto"})],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
+    launch_args: tuple[str, ...],
+    expected_permissions: dict[str, str] | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache path Claude would read as a glob gets no allow rule; the launch mode stays."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data[1]"))
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=tmp_path / "bridge", python_executable="/venv/bin/python"
+        )
+    )
+
+    assert settings.get("permissions") == expected_permissions
+
+
+@pytest.mark.parametrize(
+    ("directory", "expected"),
+    [
+        (
+            PureWindowsPath(r"C:\Users\alice\.omnigent\attachments\k"),
+            "Read(//c/Users/alice/.omnigent/attachments/k/**)",
+        ),
+        (PureWindowsPath(r"\\server\share\attachments\k"), None),
+        (PureWindowsPath(r"C:attachments\k"), None),
+        (PurePosixPath("attachments/k"), None),
+        (PurePosixPath("/home/a[1]/.omnigent/attachments/k"), None),
+    ],
+    ids=[
+        "windows-drive",
+        "windows-unc",
+        "windows-drive-relative",
+        "relative",
+        "glob-metacharacters",
+    ],
+)
+def test_claude_read_rule_only_emits_exact_absolute_patterns(
+    directory: PurePath, expected: str | None
+) -> None:
+    """Paths Claude would not match literally get no rule, so reads still prompt."""
+    assert claude_native_bridge._claude_read_rule(directory) == expected
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -4267,7 +4359,7 @@ def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-sonnet-5"
-    assert "permissions" not in settings
+    assert "defaultMode" not in settings.get("permissions", {})
     assert "effortLevel" not in settings
 
 
@@ -4294,26 +4386,112 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-new"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "high"
 
 
+_FRAMEWORK_PROMPT = "Keep framework metadata separate."
+
+
+@pytest.mark.parametrize(
+    ("user_args", "merged_args"),
+    [
+        ((), None),
+        (
+            ("--append-system-prompt", "--- Reviewer profile ---"),
+            ("--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\n--- Reviewer profile ---"),
+        ),
+        (
+            ("--append-system-prompt=Review carefully.",),
+            (f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nReview carefully.",),
+        ),
+        (
+            ("--append-system-prompt", "Earlier.", "--append-system-prompt=Later."),
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nLater.",
+            ),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", ""),
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", _FRAMEWORK_PROMPT),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt="),
+            ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
+        ),
+        (("--append-system-prompt-file", "profile.md"), None),
+        (("--append-system-prompt-file=profile.md",), None),
+        (
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            (
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
+        ),
+        (("--", "--append-system-prompt=Positional."), None),
+    ],
+    ids=[
+        "no-user-prompt",
+        "user-prompt-separate-value",
+        "user-prompt-joined-value",
+        "repeated-flags-last-wins",
+        "final-empty-value-clears",
+        "final-empty-joined-value-clears",
+        "caller-file-separate-value",
+        "caller-file-joined-value",
+        "caller-file-and-prompt",
+        "after-end-of-options",
+    ],
+)
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_args: tuple[str, ...],
+    merged_args: tuple[str, ...] | None,
 ) -> None:
-    """Claude native appends framework instructions supplied by its launcher."""
-    framework_instruction = "Keep framework metadata separate."
+    """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
+    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
 
-    args = augment_claude_args(
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+    omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=framework_instruction,
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    prompt_index = omnigent_args.index("--append-system-prompt")
+    assert omnigent_args.count("--append-system-prompt") == 1
+    assert omnigent_args[prompt_index + 1] == _FRAMEWORK_PROMPT
+    if merged_args is None:
+        assert args == [*user_args, *omnigent_args]
+    else:
+        # The caller's prompt is sent once, so the launch command does not grow by its size.
+        del omnigent_args[prompt_index : prompt_index + 2]
+        assert args == [*merged_args, *omnigent_args]
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4786,6 +4964,51 @@ def test_inject_user_message_pastes_content_then_submits(
         "claude:0.0",
         "Enter",
     ]
+    assert not list(bridge_dir.glob("paste_*.bin"))
+
+
+@pytest.mark.parametrize("failure_phase", ["write", "close"])
+def test_paste_file_is_removed_when_payload_write_fails(
+    failure_phase: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed write or buffered close must not leave the prompt on disk."""
+    original_temporary_file = tempfile.NamedTemporaryFile
+    failure = OSError(errno.ENOSPC, "synthetic disk full")
+    created_paths: list[Path] = []
+
+    @contextmanager
+    def failing_temporary_file(**kwargs: Any) -> Iterator[Any]:
+        with original_temporary_file(**kwargs) as paste_file:
+            created_paths.append(Path(paste_file.name))
+            if failure_phase == "write":
+
+                def partial_write(payload: bytes) -> None:
+                    paste_file.file.write(payload[:3])
+                    paste_file.file.flush()
+                    raise failure
+
+                monkeypatch.setattr(paste_file, "write", partial_write)
+            yield paste_file
+        if failure_phase == "close":
+            raise failure
+
+    run_tmux = Mock()
+    monkeypatch.setattr(
+        claude_native_bridge.tempfile, "NamedTemporaryFile", failing_temporary_file
+    )
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: False)
+    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+
+    with pytest.raises(OSError) as caught:
+        claude_native_bridge._paste_and_submit(
+            tmp_path, "synthetic.sock", "claude:0.0", text="synthetic prompt", needle="synthetic"
+        )
+
+    assert caught.value is failure
+    assert len(created_paths) == 1
+    assert not created_paths[0].exists()
+    run_tmux.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -9168,6 +9391,31 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert "omni setup" in login.failure_message
 
 
+@pytest.mark.parametrize(
+    ("text", "code", "starts_with"),
+    [
+        # Claude's own refusal before any model call: no StopFailure hook follows.
+        ("Prompt is too long", "context_length_exceeded", "Context limit reached"),
+        (
+            "Prompt is too long · the request is ~1070450 tokens (limit 1000000)",
+            "context_length_exceeded",
+            "Context limit reached",
+        ),
+        ("Login expired · Please run /login", "native_turn_error", "Login expired"),
+        ("API Error: 500 upstream failed", "native_turn_error", "API Error: 500 upstream failed"),
+    ],
+)
+def test_program_status_turn_error_matches_stop_failure_guidance(
+    text: str, code: str, starts_with: str
+) -> None:
+    """A terminal-status error reads like the same error from ``StopFailure``."""
+    hook = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure", "error_details": text})
+    )
+    assert program_status_turn_error(text) == (code, hook.failure_message)
+    assert program_status_turn_error(text)[1].startswith(starts_with)
+
+
 def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11037,12 +11285,13 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
 
 
 @pytest.mark.parametrize(
-    ("prompt", "description"),
+    ("prompt", "description", "awaits_answer"),
     [
-        ("Enter password to configure settings.\nPassword:", "a password"),
+        ("Enter password to configure settings.\nPassword:", "a password", False),
         (
             "No Claude Code installation found. Would you like to install it? [Y/n]:",
             "installation confirmation",
+            True,
         ),
     ],
     ids=["password", "install-confirmation"],
@@ -11051,9 +11300,13 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
     prompt: str,
     description: str,
+    awaits_answer: bool,
 ) -> None:
     """
     A launcher waiting for an answer reports its prompt without reaping the pane.
+
+    The install question is answered in the terminal, so its refusal awaits an
+    answer and the delivery holds the message for it.
     """
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
@@ -11077,6 +11330,7 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
         f"Claude Code's launch command is waiting for {description} in its terminal"
     )
     assert prompt in str(raised.value)
+    assert raised.value.awaits_answer is awaits_answer
     assert len(captures) == 2
 
 
@@ -14636,6 +14890,68 @@ async def test_relay_tool_update_preserves_cached_policy_endpoint(
             assert policy_client.bodies == [_PRE_TOOL_USE_PAYLOAD, _PRE_TOOL_USE_PAYLOAD]
     finally:
         relay.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_relay_runs_only_advertised_tools(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``/tool`` refuses names the relay does not currently advertise.
+
+    Any process running as the session user can read the relay token, so the
+    token cannot tell the MCP bridge from other callers. The relay's own
+    advertised set bounds what either can run, and rewriting
+    ``tool_relay.json`` does not widen it.
+    """
+    from omnigent.harnesses.pi_native import bridge as pi_native_bridge
+
+    monkeypatch.setattr("omnigent.harnesses.pi_native.bridge._BRIDGE_ROOT", tmp_path / "pi-native")
+    bridge_dir = pi_native_bridge.prepare_bridge_dir("conv_relay_surface")
+    relay_file = bridge_dir / claude_native_bridge._TOOL_RELAY_FILE
+    dispatched: list[str] = []
+
+    async def _executor(name: str, arguments: dict[str, object]) -> str:
+        """Record each dispatched tool name."""
+        del arguments
+        dispatched.append(name)
+        return "ok"
+
+    relay = start_tool_relay(
+        bridge_dir=bridge_dir,
+        tools=[{"name": "list_comments", "parameters": {"type": "object"}}],
+        tool_executor=_executor,
+        loop=asyncio.get_running_loop(),
+    )
+    shell_call = {"name": "sys_os_shell", "arguments": {"command": "id"}}
+    try:
+        info = json.loads(relay_file.read_text(encoding="utf-8"))
+        tampered = {**info, "tools": [*info["tools"], {"name": "sys_os_shell"}]}
+        relay_file.write_text(json.dumps(tampered), encoding="utf-8")
+        async with httpx.AsyncClient(
+            base_url=info["url"],
+            headers={"Authorization": f"Bearer {info['token']}"},
+            trust_env=False,
+        ) as client:
+            advertised = await client.post(
+                "/tool", json={"name": "list_comments", "arguments": {}}
+            )
+            refused = await client.post("/tool", json=shell_call)
+            relay.update_tools(
+                [{"name": "sys_os_shell", "parameters": {"type": "object"}}], _executor
+            )
+            updated = await client.post("/tool", json=shell_call)
+            withdrawn = await client.post("/tool", json={"name": "list_comments", "arguments": {}})
+    finally:
+        relay.close()
+
+    assert "isError" not in advertised.json()
+    assert refused.json()["isError"] is True
+    assert json.loads(refused.json()["content"][0]["text"]) == {
+        "error": "unknown tool: 'sys_os_shell'"
+    }
+    assert "isError" not in updated.json()
+    assert withdrawn.json()["isError"] is True
+    assert dispatched == ["list_comments", "sys_os_shell"]
 
 
 @pytest.mark.asyncio

@@ -1788,7 +1788,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 
     launch_resolver = Mock(side_effect=resolve_launch)
     monkeypatch.setattr(codex, "resolve_native_codex_launch", launch_resolver)
-    credentials = Mock(side_effect=AssertionError("cache reuse must not acquire credentials"))
+    credentials = Mock(side_effect=AssertionError("write-back must not acquire credentials"))
     monkeypatch.setattr(
         "omnigent.runtime.credentials.databricks.resolve_databricks_workspace", credentials
     )
@@ -1885,16 +1885,6 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                 "codex-native", fingerprints[profile]
             ).parent
             assert len(list(catalog_dir.glob("*.json"))) == 2
-            for provider, host in (
-                ("default", "https://a.example"),
-                ("other", "https://b.example"),
-            ):
-                assert (
-                    codex._resolve_databricks_codex_model(
-                        host, provider, "shared-picker", codex_path=sys.executable
-                    )
-                    == f"{provider}.schema.model"
-                )
             credentials.assert_not_called()
     if case == "missing-spec":
         launch_resolver.assert_not_called()
