@@ -2733,13 +2733,6 @@ class ProjectContainerDeleteError extends Error {
   }
 }
 
-/** Tombstone archived members that no list had loaded, so a lagging refetch keeps them hidden. */
-function tombstoneUnloadedArchives(succeeded: readonly string[], loaded: readonly string[]): void {
-  const loadedIds = new Set(loaded);
-  const marked = markSessionsArchiving(succeeded.filter((id) => !loadedIds.has(id)));
-  expireSessionsArchiving(marked, marked.keys());
-}
-
 /**
  * Delete a project: archive AND unfile every member session, then delete the
  * first-class `projects` row (when the folder has one). Sessions are never
@@ -2772,8 +2765,6 @@ export function useDeleteProject() {
     },
     onError: (err, { name }, context) => {
       if (context === undefined) return;
-      const sweepFinished =
-        err instanceof BulkConversationMutationError || err instanceof ProjectContainerDeleteError;
       const failed = new Set(
         err instanceof BulkConversationMutationError
           ? err.failed
@@ -2781,7 +2772,6 @@ export function useDeleteProject() {
             ? []
             : context.memberIds,
       );
-      if (sweepFinished) tombstoneUnloadedArchives(err.succeeded, context.memberIds);
       const succeeded = context.memberIds.filter((id) => !failed.has(id));
       if (context.marked !== undefined) {
         unmarkSessionsArchiving(failed, context.marked);
@@ -2803,13 +2793,14 @@ export function useDeleteProject() {
             : `Couldn't delete project "${name}".`,
       );
     },
-    onSuccess: ({ succeeded }, _project, context) => {
-      tombstoneUnloadedArchives(succeeded, context.memberIds);
+    onSuccess: (_data, _project, context) => {
       if (context.marked !== undefined) expireSessionsArchiving(context.marked, context.memberIds);
       for (const id of context.memberIds) settleOpenSessionRow(queryClient, id, { archived: true });
     },
     mutationFn: async ({ id, name }: ProjectSummary) => {
       const ids = await fetchAllProjectSessionIds(name);
+      // Tombstone members no list had loaded too, so a refetch mid-sweep keeps them hidden.
+      const discovered = markSessionsArchiving(ids.filter((sid) => !isSessionArchiving(sid)));
       const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));
       const succeeded: string[] = [];
       const failed: string[] = [];
@@ -2824,6 +2815,8 @@ export function useDeleteProject() {
           failed.push(ids[i]);
         }
       }
+      unmarkSessionsArchiving(failed, discovered);
+      expireSessionsArchiving(discovered, succeeded);
       if (failed.length > 0) {
         throw new BulkConversationMutationError("archive and unfile", {
           failed,

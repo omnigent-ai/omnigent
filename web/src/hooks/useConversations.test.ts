@@ -4094,6 +4094,34 @@ describe("useDeleteProject", () => {
     }
     expect(toasts).toEqual([`Couldn't delete project "Sprint 42". Its sessions were archived.`]);
   });
+  it("tombstones members no list had loaded while their archive is still pending", async () => {
+    let failArchive: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith("/v1/sessions?")) {
+        return Promise.resolve(
+          mockResponse({
+            data: [{ id: "conv_unloaded" }],
+            first_id: "conv_unloaded",
+            last_id: "conv_unloaded",
+            has_more: false,
+          }),
+        );
+      }
+      return new Promise<Response>((resolve) => {
+        failArchive = resolve;
+      });
+    });
+    const { rendered } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    // A list refetch mid-sweep applies this tombstone, so the row can't show as live.
+    await waitFor(() => expect(isSessionArchiving("conv_unloaded")).toBe(true));
+
+    failArchive(mockResponse({}, { ok: false, status: 403 }));
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+    expect(isSessionArchiving("conv_unloaded")).toBe(false);
+  });
+
   /** Route the project sweep's requests; each project DELETE waits for the test to settle it. */
   function routeEmptyProjects(server: { projects: { id: string; name: string }[] }) {
     const settleDelete = new Map<string, (response: Response) => void>();
