@@ -43,6 +43,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -667,6 +668,75 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     assert len([event for event in forwarded if event.get("type") == "message"]) == 2
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 2
+
+
+async def test_saved_input_waits_while_clear_moves_the_session(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved input the host worker meets while ``/clear`` moves the session waits.
+
+    It is neither run in the session being moved nor marked failed; once the
+    move ends the worker delivers it on its own, exactly once.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    session_id = await _create(env)
+    host_id = uuid4().hex
+    saved = env.conv_store.list_pending_inputs(session_id)[0]
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+
+    def turns() -> list[dict[str, Any]]:
+        return [event for event in forwarded if event.get("type") == "message"]
+
+    refused, passes = [0], [0]
+    waits_out_move, recover = startup._waits_out_session_move, startup._recover_session
+
+    async def count_refusals(*args: Any) -> bool:
+        waited = await waits_out_move(*args)
+        refused[0] += waited
+        return waited
+
+    async def count_passes(*args: Any) -> bool:
+        passes[0] += 1
+        return await recover(*args)
+
+    monkeypatch.setattr(startup, "_waits_out_session_move", count_refusals)
+    monkeypatch.setattr(startup, "_recover_session", count_passes)
+    moving = orchestration._mark_session_moving(session_id)
+    moving.__enter__()
+    startup.host_changed(env.app, host_id)
+    [(_, worker, _)] = startup._workers.values()
+    try:
+        # The worker keeps retrying while the move holds the session.
+        await poll_until_async(lambda: refused[0] >= 3, timeout_s=10)
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (pending.id, pending.status) == (saved.id, "in_progress")
+        assert env.conv_store.list_items(session_id).data == []
+        assert turns() == []
+
+        moving.__exit__(None, None, None)
+        wake_startup_worker(host_id)
+        await poll_until_async(
+            lambda: len(turns()) == 1 and not env.conv_store.list_pending_inputs(session_id),
+            timeout_s=10,
+        )
+        # A full pass after the delivery finished does not deliver it again.
+        delivered_at = passes[0]
+        wake_startup_worker(host_id)
+        await poll_until_async(lambda: passes[0] > delivered_at, timeout_s=10)
+        assert len(turns()) == 1
+    finally:
+        if orchestration._session_is_moving(session_id):
+            moving.__exit__(None, None, None)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await runner.aclose()
 
 
 async def test_pending_input_retains_request_options_on_service_restart(startup_env: _Env) -> None:
