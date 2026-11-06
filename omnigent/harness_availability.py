@@ -5,8 +5,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Final, Literal, TypeGuard
 
+from omnigent_client import harness_readiness as _client_readiness
+
 HARNESS_BINARY_MISSING: Final[Literal["binary-missing"]] = "binary-missing"
-HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = "needs-auth"
+HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = _client_readiness.HARNESS_NEEDS_AUTH
 HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
 # A native (tmux-backed) harness whose CLI is usable but the host's tmux is
 # missing, too old, or of unknown version. Older servers drop it from a hello and
@@ -48,17 +50,9 @@ def reported_harness_availability(
     """Interpret host readiness; absent reports are unknown, absent entries unavailable."""
     from omnigent.harness_aliases import canonicalize_harness
 
-    if not harness or harness == "auto" or not readiness:
-        return None, None
-    canonical = canonicalize_harness(harness) or harness
-    value = readiness.get(canonical)
-    if value is True:
-        return True, None
-    if value is False or value is None:
-        return False, "unconfigured"
-    if isinstance(value, str):
-        return False, value
-    return None, None
+    return _client_readiness.reported_harness_availability(
+        harness, readiness, canonicalize_harness
+    )
 
 
 def harness_launch_availability(
@@ -66,5 +60,6 @@ def harness_launch_availability(
     readiness: Mapping[str, object] | None,
 ) -> tuple[bool | None, str | None]:
     """Treat host auth reports as advisory; sessions can supply credentials."""
-    available, reason = reported_harness_availability(harness, readiness)
-    return (None if reason == HARNESS_NEEDS_AUTH else available), reason
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return _client_readiness.harness_launch_availability(harness, readiness, canonicalize_harness)

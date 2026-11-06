@@ -1433,7 +1433,8 @@ same session receive the same events. The stream terminates with
 **Single source of truth: [`openapi.json`](../../openapi.json)** at
 the repo root. Every SSE event the server emits to clients is
 modeled as a typed Pydantic class in
-`omnigent/server/schemas.py`; the discriminated union
+`sdks/python-client/omnigent_client/wire.py` (re-exported by
+`omnigent/server/schemas.py`); the discriminated union
 `ServerStreamEvent` ties them together, and `scripts/dump_openapi.py`
 materializes that union into the OpenAPI 3.2 spec under
 `components.schemas.ServerStreamEvent` (referenced from the SSE
@@ -1463,7 +1464,7 @@ stream and surface queue/interrupt semantics.
 > may change in a future revision; clients should isolate the
 > constant rather than hardcoding it. Importing
 > `SessionInputConsumedEvent` from
-> `omnigent.server.schemas` is the supported pattern.
+> `omnigent_client.wire` is the supported pattern.
 
 **Response (`response.*`)** — emitted by the executor (and the AP
 streaming routes for the lifecycle events). The session stream
@@ -1492,7 +1493,7 @@ multiplexes them; the per-response stream emits them directly.
 | `response.elicitation_request` | `ElicitationRequestEvent` |
 | `response.elicitation_resolved` | `ElicitationResolvedEvent` |
 
-See the per-class docstring in `omnigent/server/schemas.py` for
+See the per-class docstring in `sdks/python-client/omnigent_client/wire.py` for
 the canonical wire shape and field types of each `response.*` event.
 When a child/sub-agent elicitation is mirrored into an ancestor stream,
 `response.elicitation_request.params.target_session_id` is the child

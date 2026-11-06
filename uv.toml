@@ -26,4 +26,6 @@ exclude-newer = "P7D"
 #   past P7D.
 # - nimble-python: the verified Agent API V2 1.2 contract release, required by
 #   nimble_research for typed run fields. Drop once it has aged past P7D.
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z" }
+# - oauthlib: 4.0.1 (published 2026-10-31) fixes CVE-2026-49272; transitive via
+#   requests-oauthlib. Drop once aged past P7D (2026-11-07).
+exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", oauthlib = "2026-11-01T00:00:00Z" }
