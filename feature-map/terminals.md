@@ -30,6 +30,9 @@ reattach when the session moves to another host.
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
+- `side-chat-view`: a side chat follows the main session's Chat/Terminal choice.
+  In Terminal view its Workspace tab shows the side chat's own agent terminal
+  when it has one (e.g. Claude native), and its chat otherwise.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -46,6 +49,9 @@ with their own terminal retain the switcher.
   off while a rail-opened shell owns the main view.
 - On a phone, use the view mode choice in the header menu.
 - Choose Resume when the terminal shows as stopped.
+- With Terminal selected, open a side chat (**+ → Start a new side chat**); its
+  Workspace tab shows its terminal once the side chat starts. Switch to Chat and
+  the tab shows its chat.
 - On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
   The shortcut targets the active cell; shells remain in the shared Workspace.
 - On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
@@ -176,6 +182,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+- **`side-chat-view`:** no e2e coverage; component test
+  `web/src/shell/WorkspacePanel.test.tsx` ("side chat view mode"). Manually, in
+  a Claude native session in Terminal view, start a side chat and send a
+  question: expect its Workspace tab to show the side chat's own terminal, not
+  the parent's. Switch to Chat and expect its chat with the draft kept.
 
 For the desktop Close shortcut, open a shell tab in an ordinary session,
 focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
