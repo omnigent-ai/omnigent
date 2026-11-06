@@ -13,6 +13,8 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
 import {
   emptyTriggerFields,
@@ -340,11 +342,25 @@ describe("header, prompt, configuration", () => {
     expect(screen.getByTestId("task-detail-project")).toHaveTextContent("missing-project");
   });
 
+  it.each(["running", "succeeded"] as const)(
+    "shows current session approvals for a %s run",
+    (status) => {
+      setTask(task());
+      setRuns([run({ status, conversationId: "conv_approval", conversationPendingApprovals: 2 })]);
+      renderPage();
+      expect(screen.getByTestId("run-pending-approval")).toHaveTextContent(
+        "Session needs approval",
+      );
+      expect(screen.getByTestId("run-open")).toHaveAttribute("href", "/c/conv_approval");
+      expect(screen.queryByTestId("run-status-label")).not.toBeInTheDocument();
+    },
+  );
+
   it.each([
     ["codex-native", "default", "Agent default"],
     ["cursor-native", "default", "Agent default"],
     ["antigravity-native", "default", "Agent default"],
-    ["native-codex", "read-only", "Read only"],
+    ["native-codex", "read-only", "Read Only"],
     ["cursor-native", "auto-review", "Auto-review"],
     ["antigravity-native", "skip", "Skip permissions"],
     ["codex-native", "future-mode", "future-mode"],
@@ -441,14 +457,38 @@ describe("loading / not-found states", () => {
 });
 
 describe("header actions", () => {
-  it("Run now shows 'Run started' toast on success", () => {
-    runNowMutate.mockImplementation(
-      (_id: string, opts?: { onSuccess?: () => void; onError?: () => void }) => opts?.onSuccess?.(),
+  it.each([{ isLoading: true }, { cached: true }, { isError: true }])(
+    "can trigger before history is ready without highlighting old history: %j",
+    (state) => {
+      setTask(task());
+      setRuns([], state);
+      runNowMutate.mockImplementation(
+        (_id: string, opts?: { onSuccess?: (runId: string) => void }) => opts?.onSuccess?.("new"),
+      );
+      const { rerender, container } = renderPage();
+      const button = screen.getByTestId("task-detail-run-now");
+      expect(button).not.toBeDisabled();
+      fireEvent.click(button);
+      expect(runNowMutate).toHaveBeenCalledOnce();
+
+      const oldRun = run({ id: "old" });
+      setRuns([oldRun]);
+      rerender(pageTree());
+      expect(container.querySelector(".animate-message-highlight")).toBeNull();
+    },
+  );
+
+  it("confirms Run now on an older server without highlighting a guessed row", () => {
+    runNowMutate.mockImplementation((_id: string, opts?: { onSuccess?: (runId: null) => void }) =>
+      opts?.onSuccess?.(null),
     );
     setTask(task());
-    renderPage();
+    const { rerender, container } = renderPage();
     fireEvent.click(screen.getByTestId("task-detail-run-now"));
-    expect(showToast).toHaveBeenCalledWith("Run started");
+    expect(showToast).toHaveBeenCalledWith("Run triggered, it will start shortly");
+    setRuns([run({ id: "unknown" })]);
+    rerender(pageTree());
+    expect(container.querySelector(".animate-message-highlight")).toBeNull();
   });
 
   it("Run now shows error toast on a generic (non-409) failure", () => {
@@ -570,6 +610,106 @@ describe("header actions", () => {
       vi.useRealTimers();
     }
   });
+
+  it.each([
+    { conversationId: null, delay: 0 },
+    { conversationId: "c_new", delay: 30_000 },
+  ])(
+    "briefly highlights a new run with $conversationId after $delay ms",
+    ({ conversationId, delay }) => {
+      vi.useFakeTimers();
+      try {
+        const oldRun = run({ id: "run_old", conversationId: null });
+        setTask(task());
+        setRuns([oldRun]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const highlighted = () =>
+          container.querySelectorAll<HTMLElement>(".animate-message-highlight");
+        expect(highlighted()).toHaveLength(0);
+        fireEvent.click(screen.getByTestId("task-detail-run-now"));
+        act(() => vi.advanceTimersByTime(delay));
+        expect(highlighted()).toHaveLength(0);
+
+        const newRun = run({ id: "run_new", status: "running", conversationId });
+        const unrelatedRun = run({ id: "scheduled_elsewhere" });
+        setRuns([unrelatedRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+        setRuns([unrelatedRun, newRun, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(screen.getAllByTestId("task-detail-run")[1]).toBe(highlighted()[0]);
+        expect(highlighted()[0]).toHaveStyle({ animationDuration: "3000ms" });
+        const highlightedRow = highlighted()[0];
+
+        act(() => vi.advanceTimersByTime(1_500));
+        setRuns([{ ...newRun, status: "succeeded", conversationId: "c_new" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(1);
+        expect(highlighted()[0]).toBe(highlightedRow);
+        expect(within(highlightedRow).getByTestId("run-open")).toHaveAttribute("href", "/c/c_new");
+        act(() => vi.advanceTimersByTime(1_500));
+        expect(highlighted()).toHaveLength(0);
+        setRuns([{ ...newRun, status: "succeeded" }, oldRun]);
+        rerender(pageTree());
+        expect(highlighted()).toHaveLength(0);
+
+        // Opening a different task must not carry over the pending highlight.
+        if (delay === 0) {
+          fireEvent.click(screen.getByTestId("task-detail-run-now"));
+          routeParams = { taskId: "st_2" };
+          setTask(task({ id: "st_2" }));
+          setRuns([run({ id: "other_task_run" })]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+          routeParams = { taskId: "st_1" };
+          setTask(task());
+          setRuns([newRun]);
+          rerender(pageTree());
+          expect(highlighted()).toHaveLength(0);
+        }
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
+  it.each(["expired", "failed retry"])(
+    "does not highlight even a matching run after %s tracking",
+    (reason) => {
+      vi.useFakeTimers();
+      try {
+        setTask(task());
+        setRuns([]);
+        runNowMutate.mockImplementation(
+          (_id: string, opts?: { onSuccess?: (runId: string) => void }) =>
+            opts?.onSuccess?.("run_new"),
+        );
+        const { rerender, container } = renderPage();
+        const button = screen.getByTestId("task-detail-run-now");
+        fireEvent.click(button);
+        act(() => vi.advanceTimersByTime(reason === "expired" ? 120_000 : 30_000));
+        if (reason === "failed retry") {
+          runNowMutate.mockImplementation(
+            (_id: string, opts?: { onError?: (error: Error) => void }) =>
+              opts?.onError?.(new Error("failed")),
+          );
+          fireEvent.click(button);
+          expect(runNowMutate).toHaveBeenCalledTimes(2);
+          expect(showToast).toHaveBeenCalledWith("Couldn't start the run");
+        }
+        setRuns([run({ id: "run_new" })]);
+        rerender(pageTree());
+        expect(container.querySelector(".animate-message-highlight")).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("toggling the Switch off pauses an active task (update to paused)", () => {
     setTask(task({ state: "active" }));
@@ -906,6 +1046,36 @@ describe("run history", () => {
     await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
   });
 
+  it("keeps spinning for a SUCCEEDED run whose session is still running", async () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_live", conversationStatus: "running" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const icon = within(row).getByTestId("run-status-icon");
+    expect(icon).toHaveAttribute("data-run-icon", "session-running");
+    expect(icon.getAttribute("class") ?? "").toContain("animate-spin");
+    expect(within(row).queryByTestId("run-status-dot")).toBeNull();
+    expect(within(row).getByTestId("run-status-label")).toHaveTextContent("Session running");
+    fireEvent.focus(icon);
+    await waitFor(() =>
+      expect(screen.getAllByText("Session still running").length).toBeGreaterThan(0),
+    );
+  });
+
+  it("shows Completed once the succeeded run's session is idle", () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_done", conversationStatus: "idle" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).queryByTestId("run-status-icon")).toBeNull();
+    expect(within(row).queryByTestId("run-status-label")).toBeNull();
+    expect(within(row).getByTestId("run-status-dot")).toHaveAttribute("data-run-icon", "read");
+  });
+
   it("a RUNNING run with a conversationId renders a clickable link", () => {
     setTask(task());
     setRuns([
@@ -1063,3 +1233,36 @@ describe("auto-mark runs unread", () => {
     expect(seedRunUnreadBaseline).not.toHaveBeenCalled();
   });
 });
+
+it.each(["continue", "new"] as const)(
+  "keeps manual controls for new-session template prompts: %s",
+  (sessionMode) => {
+    setTask(
+      task({
+        prompt: "This automation watches Jira and starts one Omnigent session",
+        sessionMode,
+        nextRunAt: "2026-03-10T14:00:00Z",
+      }),
+    );
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...SERVER_INFO_OFFLINE_FALLBACK,
+          features: { automations_v2: true },
+        }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+    if (sessionMode === "continue") {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
+        "Runs when new items match",
+      );
+      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
+    } else {
+      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
+    }
+  },
+);
