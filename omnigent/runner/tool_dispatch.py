@@ -3302,6 +3302,13 @@ async def _send_to_existing_session(
     )
 
 
+# The created session exists, and a transport error can hide whether its
+# first task was accepted, so a blind retry could duplicate the work.
+_UNCONFIRMED_FIRST_TASK_GUIDANCE = (
+    "inspect this session before continuing. Do not create a replacement; "
+    "do not automatically resend the task."
+)
+
 # sys_session_create argument -> session-create field, shared by the JSON
 # (agent_id) and multipart (config_path) creates so neither drops one.
 _SESSION_CREATE_FIELDS = (
@@ -3452,7 +3459,10 @@ async def _finalize_created_session(
         if not isinstance(send_handle, dict) or "error" in send_handle:
             return json.dumps(
                 {
-                    "error": f"child session created but message failed: {sent}",
+                    "error": (
+                        f"child session created but message failed: {sent}; "
+                        f"{_UNCONFIRMED_FIRST_TASK_GUIDANCE}"
+                    ),
                     "conversation_id": child_id,
                 }
             )
@@ -3691,9 +3701,7 @@ async def _execute_session_create(
                 handle["status"] = "created_initial_message_failed"
                 handle["error"] = (
                     f"Session created, but its first task was refused or not confirmed "
-                    f"({initial_message['error']}); "
-                    "inspect this session before continuing. Do not create a replacement; "
-                    "do not automatically resend the task."
+                    f"({initial_message['error']}); {_UNCONFIRMED_FIRST_TASK_GUIDANCE}"
                 )
         return json.dumps(handle)
     return await _finalize_created_session(

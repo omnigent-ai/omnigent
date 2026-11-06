@@ -8485,6 +8485,7 @@ async def test_sys_session_create_spawns_child_under_caller(message_sent: bool) 
     assert handle["conversation_id"] == "conv_child"
     if not message_sent:
         assert handle["error"].startswith("child session created but message failed"), output
+        assert "Do not create a replacement" in handle["error"]
         assert entry is None
         return
     assert len(posted) == 1
