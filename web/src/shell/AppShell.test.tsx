@@ -77,7 +77,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
-  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -6031,7 +6031,7 @@ describe("AppShell desktop Close", () => {
   it("opens New Terminal over an open file only once its viewer allows it", () => {
     const createShell = vi.fn();
     vi.mocked(useCreateTerminal).mockReturnValue({
-      mutate: createShell,
+      launch: createShell,
       isPending: false,
     } as unknown as ReturnType<typeof useCreateTerminal>);
     useSessionAgentMock.mockReturnValue({
