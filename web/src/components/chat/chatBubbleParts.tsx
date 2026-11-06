@@ -604,6 +604,55 @@ export function WorkingIndicator() {
   );
 }
 
+// Timed like the sidebar's "Show more" and the file tree's rows.
+const WORKING_ROW_CLOSE: KeyframeAnimationOptions = {
+  duration: 180,
+  easing: "cubic-bezier(0.4, 0, 0.2, 1)",
+  fill: "forwards",
+};
+
+/**
+ * The Working row, kept while it eases closed after the turn ends, so a
+ * transcript scrolled to its end doesn't drop by the row's height in one frame.
+ */
+export function WorkingIndicatorRow({ show }: { show: boolean }) {
+  const rowRef = useRef<HTMLDivElement>(null);
+  const [shown, setShown] = useState(show);
+  const [closing, setClosing] = useState(false);
+  if (shown !== show) {
+    setShown(show);
+    setClosing(!show);
+  }
+  useLayoutEffect(() => {
+    const row = rowRef.current;
+    if (!closing || !row) return;
+    if (
+      typeof row.animate !== "function" ||
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+    ) {
+      setClosing(false);
+      return;
+    }
+    // Close the column's gap above the row along with the row itself.
+    const gap = Number.parseFloat(getComputedStyle(row.parentElement ?? row).rowGap) || 0;
+    const animation = row.animate(
+      [
+        { height: `${row.offsetHeight}px`, marginTop: "0px", opacity: 1, overflow: "hidden" },
+        { height: "0px", marginTop: `${-gap}px`, opacity: 0, overflow: "hidden" },
+      ],
+      WORKING_ROW_CLOSE,
+    );
+    animation.onfinish = () => setClosing(false);
+    return () => animation.cancel();
+  }, [closing]);
+  if (!shown && !closing) return null;
+  return (
+    <div ref={rowRef} aria-hidden={closing || undefined}>
+      <WorkingIndicator />
+    </div>
+  );
+}
+
 /**
  * Decide whether to render the main chat's "Working…" indicator.
  *

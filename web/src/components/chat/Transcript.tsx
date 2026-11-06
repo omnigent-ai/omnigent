@@ -51,7 +51,7 @@ import {
   KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
   collectPendingElicitations,
   computeIsWorking,
@@ -457,7 +457,10 @@ function TranscriptImpl({
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                <WorkingIndicatorRow
+                  key={display.conversationId ?? "landing"}
+                  show={showWorkingIndicator}
+                />
                 {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
