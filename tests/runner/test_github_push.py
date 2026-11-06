@@ -16,15 +16,10 @@ from unittest.mock import Mock
 
 import pytest
 
-from omnigent.runner import github_resource, pr_observer, pushed_branches
+from omnigent.runner import github_resource, pr_observer
 from omnigent.runner.git_providers import github_push
 from omnigent.runner.git_providers.github_push import push_operation, pushed_prs
-from omnigent.runner.pr_observer import (
-    _shell_segments,
-    observe_hook,
-    observe_tool_completion,
-    recheck_pending,
-)
+from omnigent.runner.pr_observer import _shell_segments, observe_hook, observe_tool_completion
 from omnigent.runner.session_prs import SessionPrRegistry
 from tests._helpers.github_remote import git, github_checkout
 
@@ -501,7 +496,7 @@ class _Forge:
 @pytest.fixture
 def forge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Forge:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setattr(pr_observer, "_pushes", pushed_branches.SessionPushes())
+    monkeypatch.setattr(pr_observer, "_pushes", pr_observer.pushed_branches.SessionPushes())
     stub = _Forge()
     monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=stub.gh))
     return stub
@@ -650,7 +645,7 @@ def test_pushed_branch_without_a_pr_is_rechecked_later(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, later: str
 ) -> None:
     if later == "next-call":
-        monkeypatch.setattr(pushed_branches, "RECHECK_INTERVAL_S", 0.0)
+        monkeypatch.setattr(pr_observer.pushed_branches, "RECHECK_INTERVAL_S", 0.0)
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
     git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
@@ -664,7 +659,7 @@ def test_pushed_branch_without_a_pr_is_rechecked_later(
     else:
         with ThreadPoolExecutor(max_workers=1) as pool:
             monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
-            recheck_pending("conv_late")
+            pr_observer.recheck_pending("conv_late")
     assert _tracked("conv_late") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
