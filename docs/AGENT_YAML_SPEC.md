@@ -50,18 +50,44 @@ of the agent YAML.
 | `async` | Optional | Whether async work tools are exposed. Defaults to `true`. |
 | `cancellable` | Optional | Whether the session can be cancelled. Defaults to `true`. |
 | `timers` | Optional | Whether timer tools are exposed. Defaults to `false`. |
+| `tool_groups` | Optional | Opt out of framework-owned tool groups the agent cannot use. Every group defaults to `true`. |
 
 ## Executor
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # see the harness id list below
   model: databricks-claude-opus-4-7
   reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
     type: databricks
     profile: oss             # Databricks profile for model routing
 ```
+
+Canonical `executor.harness` ids:
+
+| Family | Headless / SDK | Native TUI |
+|---|---|---|
+| Claude Code | `claude-sdk` | `claude-native` |
+| Codex | `codex` | `codex-native` |
+| Cursor | `cursor` | `cursor-native` |
+| OpenCode | — | `opencode-native` |
+| Goose | `goose` | `goose-native` |
+| Kiro | — | `kiro-native` |
+| Antigravity | `antigravity` | `antigravity-native` |
+| GitHub Copilot | `copilot` | — |
+| Devin | — | `devin-native` |
+| Qwen Code | `qwen` | `qwen-native` |
+| Kimi Code | `kimi` | `kimi-native` |
+| Hermes | `hermes` | `hermes-native` |
+| Pi | `pi` | `pi-native` |
+| Grok Build | `grok` | — |
+| Jcode | `jcode` | — |
+| OpenAI | `openai-agents`, `open-responses` | — |
+| Custom ACP agent | `acp:<slug>` | — |
+
+Aliases such as `claude`, `opencode`, `devin`, `agy`, `github-copilot`,
+`kimi-code`, `qwen-code`, `grok-build` and `native-goose` resolve to these ids.
 
 Set the Databricks profile under `executor.auth`. The older top-level
 `executor.profile` shorthand is legacy and should not be used in new specs.
@@ -288,6 +314,84 @@ CLI flags such as `--harness` and `--model` can override or supply missing
 executor values for a run. Databricks credentials come from the spec's
 `executor.auth` block or your `omnigent setup` provider config — there is
 no profile flag.
+
+### OpenCode
+
+`harness: opencode-native` runs the real OpenCode TUI against a private
+`opencode serve` per conversation, the same path `omnigent opencode` uses. It
+requires OpenCode 2.0.x (`npm i -g @opencode/cli@2.0.32`). Free models need no
+sign-in; run `opencode auth login` to add your own providers. Omnigent stores no
+OpenCode credential. See the [OpenCode harness guide](opencode-native.md).
+
+```yaml
+executor:
+  harness: opencode-native     # aliases: opencode, native-opencode
+  model: anthropic/<model-id>  # optional; OpenCode's provider/model form
+```
+
+### Goose
+
+`harness: goose` runs Block's [Goose](https://github.com/block/goose) headlessly
+over ACP (`goose acp`). Goose's mid-turn tool approvals surface as web
+elicitation cards. `harness: goose-native` is the terminal-first counterpart
+that `omnigent goose` launches; there, Goose's own TUI approval is the tool
+gate. Both require the `goose` CLI 1.38 or newer (`brew install block-goose-cli`)
+configured with a provider via `goose configure`; Omnigent stores no Goose
+credential.
+
+```yaml
+executor:
+  harness: goose               # native: goose-native (alias: native-goose)
+  model: <model-id>            # optional; forwarded as GOOSE_MODEL
+```
+
+The provider stays whatever `goose configure` selected unless
+`HARNESS_GOOSE_PROVIDER` overrides it.
+
+### Devin
+
+`harness: devin-native` wraps the Devin CLI TUI (Cognition), the same path
+`omnigent devin` uses. Install it with
+`curl -fsSL https://cli.devin.ai/install.sh | bash` and sign in with
+`devin auth login`; Omnigent stores no Devin credential. The removed
+`devin-acp` id still resolves here. See the
+[Devin harness guide](devin-native.md).
+
+```yaml
+executor:
+  harness: devin-native        # aliases: devin, devin-acp, native-devin
+```
+
+### Hermes
+
+`harness: hermes` runs the Hermes Agent CLI (Nous Research) via
+`hermes chat -q` per turn, resuming Hermes' own session store between turns. `harness: hermes-native` is the terminal-first path
+`omnigent hermes` uses. Install Hermes 0.17.0 or newer with
+`curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` and pick a
+provider with `hermes model`; Omnigent stores no Hermes credential.
+
+```yaml
+executor:
+  harness: hermes              # native: hermes-native (alias: native-hermes)
+  model: <provider>/<model-id> # optional; omit for Hermes' configured default
+```
+
+### Grok Build and Jcode
+
+`harness: grok` (alias `grok-build`) and `harness: jcode` are builtin ACP CLI
+harnesses: Omnigent drives `grok agent stdio` or `jcode acp` through the same
+generic ACP wrap as `acp:<slug>`. By default each CLI owns its auth and model
+selection (`grok login --device-auth`, or a provider in `~/.jcode/config.toml`),
+so a `model` override is refused. When Omnigent's inference config binds
+`jcode` to an OpenAI-compatible Chat Completions provider, Omnigent writes a
+session-private Jcode config instead and forwards `model`. Jcode is not offered
+Omnigent's MCP tools. See the README's *Grok Build and Jcode* section for install
+steps.
+
+```yaml
+executor:
+  harness: grok                # or: jcode
+```
 
 ## Qwen Code
 
@@ -869,6 +973,39 @@ Use `os_env: inherit` to give the terminal the same sandbox as the agent, or
 alias a shared `sandbox:` block so `sys_os_*` and the terminal enforce the same
 policy. Keep `allow_sandbox_override: false` unless you intend to let the
 launcher weaken the sandbox at launch time.
+
+## Tool groups
+
+Several framework-owned tool groups register on every agent without any
+declaration. Each one has a `tool_groups` key so an agent can drop a group it
+cannot use — a headless sub-agent has no embedded browser to drive, and a
+byte-bounded provider counts every advertised tool against its limit.
+
+```yaml
+tool_groups:
+  browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
+  scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete
+  comments: false         # list_comments / update_comment
+  policies: false         # sys_add_policy / sys_policy_registry
+  agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
+```
+
+Every group defaults to `true`, so omitting the block changes nothing. Values
+must be booleans and group names must match exactly; a typo fails the load
+rather than silently leaving the group registered. Disabling `browser` also
+drops the embedded-browser guidance from the composed system prompt. The block
+is read the same way from a `config.yaml` bundle and a single-file agent YAML.
+
+`agent_discovery: false` is rejected while `spawn: true` or the
+`scheduled_tasks` group is on: `sys_session_create` and
+`sys_scheduled_task_create` take an `agent_id` the model looks up with
+`sys_agent_list` / `sys_agent_get`.
+
+The session read tools (`sys_session_list` / `sys_session_get_history` /
+`sys_session_get_info`), `sys_session_rename`, `ui_open_file`, and `sys_cancel_task`
+have no key: any agent in a multi-agent session needs the reads, and async work
+handles point at the cancel tool. [`ui_open_file`](agent-ui-api.md) asks current
+session viewers to open a workspace-relative file without switching sessions.
 
 ## Complete example
 

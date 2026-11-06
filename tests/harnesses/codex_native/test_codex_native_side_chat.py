@@ -46,6 +46,7 @@ _CATALOG: _JsonObject = {
         "data": [
             {
                 "id": model,
+                "defaultReasoningEffort": "medium",
                 "supportedReasoningEfforts": [{"reasoningEffort": effort} for effort in efforts],
             }
             for model, efforts in (
@@ -83,26 +84,57 @@ def _fork_started(
 
 
 # --------------------------------------------------------------------------- #
-# side_chat_question — /side detection on normalized turn input
+# side_chat_question_from_content — /side detection on typed message text
 # --------------------------------------------------------------------------- #
 def test_side_chat_question_extracts_question() -> None:
-    assert side_chat.side_chat_question(_text_items("/side why is the sky blue?")) == (
-        "why is the sky blue?"
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side why is the sky blue?")
+    ) == ("why is the sky blue?")
+    assert side_chat.side_chat_question_from_content("/side and as a string?") == (
+        "and as a string?"
     )
+    # Any text block, at any length: the reader the owner check relies on.
+    assert side_chat.side_chat_question_from_content(
+        [{"type": "input_text", "text": "/side " + " " * 4000 + "why?"}]
+    ) == (" " * 4000 + "why?")
 
 
 def test_side_chat_question_preserves_first_line_indentation() -> None:
-    assert side_chat.side_chat_question(_text_items("/side   - First\n  - Second")) == (
-        "  - First\n  - Second"
-    )
+    assert side_chat.side_chat_question_from_content(
+        _text_items("/side   - First\n  - Second")
+    ) == ("  - First\n  - Second")
 
 
 def test_side_chat_question_ignores_non_side_and_empty() -> None:
-    assert side_chat.side_chat_question(_text_items("hello")) is None
-    assert side_chat.side_chat_question(_text_items("/sidebar thing")) is None  # needs the space
-    assert side_chat.side_chat_question(_text_items("/side   ")) is None  # empty question
-    assert side_chat.side_chat_question([]) is None
-    assert side_chat.side_chat_question(_text_items("a") + _text_items("b")) is None  # multi-item
+    assert side_chat.side_chat_question_from_content(_text_items("hello")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/sidebar thing")) is None
+    assert side_chat.side_chat_question_from_content(_text_items("/side   ")) is None
+    assert side_chat.side_chat_question_from_content([]) is None
+    assert side_chat.side_chat_question_from_content(_text_items("a") + _text_items("b")) is None
+
+
+def test_an_attachment_never_reads_as_a_side_command() -> None:
+    attachment = {
+        "type": "input_file",
+        "filename": "note.txt",
+        # "/side why?"
+        "file_data": "data:text/plain;base64,L3NpZGUgd2h5Pw==",
+    }
+    assert side_chat.side_chat_question_from_content([attachment]) is None
+
+
+@pytest.mark.parametrize("attachment_type", ["input_file", "input_image", "image"])
+def test_side_command_rejects_attachments(attachment_type: str) -> None:
+    from omnigent.errors import OmnigentError
+
+    attachment = {"type": attachment_type, "file_id": "attached-file"}
+    with pytest.raises(OmnigentError, match="attachments") as error:
+        side_chat.side_chat_question_from_content([*_text_items("/side explain this"), attachment])
+    assert error.value.http_status == 400
+    assert (
+        side_chat.side_chat_question_from_content([*_text_items("explain this"), attachment])
+        is None
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -199,6 +231,25 @@ async def test_parent_side_chat_settings_reuse_the_parent_turns_catalog(
     assert settings == {"model": "gpt-6-sol", "effort": "max"}
     assert side_client.calls == []
 
+    await side_chat.submit_side_turn(
+        side_client,
+        "thread_side",
+        "follow up",
+        model="gpt-6-sol",
+        effort="max",
+        transport=socket_path,
+    )
+    await side_chat.submit_side_turn(
+        side_client,
+        "thread_side",
+        "reset effort",
+        model="gpt-6-sol",
+        reset_effort=True,
+        transport=socket_path,
+    )
+    assert [method for method, _ in side_client.calls] == ["turn/start", "turn/start"]
+    assert [params["effort"] for _, params in side_client.calls] == ["max", "medium"]
+
 
 @pytest.mark.asyncio
 async def test_fork_returns_none_when_response_has_no_thread_id() -> None:
@@ -207,17 +258,44 @@ async def test_fork_returns_none_when_response_has_no_thread_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_submit_side_turn_targets_child_thread() -> None:
-    client = _FakeCodexClient({"turn/start": {"result": {"turn": {"id": "turn_1"}}}})
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {"model": "gpt-6-sol", "effort": "max"},
+        {"model": "gpt-6-sol", "reset_effort": True},
+        {"reset_effort": True},
+        {"effort": "max"},
+        {"model": "gpt-5.5", "effort": "max"},
+    ],
+)
+async def test_submit_side_turn_targets_child_thread(settings: dict[str, Any]) -> None:
+    client = _FakeCodexClient(
+        {
+            "turn/start": {"result": {"turn": {"id": "turn_1"}}},
+            "model/list": _CATALOG,
+            "thread/read": {"result": {"thread": {"model": "gpt-5.5"}}},
+        }
+    )
 
-    turn_id = await side_chat.submit_side_turn(client, "thread_side", "why is the sky blue?")
+    turn_id = await side_chat.submit_side_turn(
+        client, "thread_side", "why is the sky blue?", **settings
+    )
 
     assert turn_id == "turn_1"
-    method, params = client.calls[0]
+    method, params = client.calls[-1]
     assert method == "turn/start"
     assert params["threadId"] == "thread_side"
     assert params["input"] == [{"type": "text", "text": "why is the sky blue?"}]
     assert "collaborationMode" not in params
+    assert params.get("model") == settings.get("model")
+    assert params.get("effort") == (
+        "medium"
+        if settings.get("reset_effort")
+        else "xhigh"
+        if settings.get("model") == "gpt-5.5" or settings == {"effort": "max"}
+        else settings.get("effort")
+    )
 
 
 @pytest.mark.parametrize(
@@ -646,3 +724,11 @@ def test_codex_native_subagent_wrapper_is_recognized() -> None:
     assert is_codex_native_subagent_wrapper("claude-code-native-ui-subagent") is False
     assert is_codex_native_subagent_wrapper("something-else") is False
     assert is_codex_native_subagent_wrapper(None) is False
+
+
+@pytest.mark.asyncio
+async def test_side_effort_reset_without_live_model_does_not_submit() -> None:
+    client = _FakeCodexClient({"thread/read": {"result": {"thread": {}}}})
+    with pytest.raises(ValueError, match="capabilities unavailable"):
+        await side_chat.submit_side_turn(client, "thread_side", "hello", reset_effort=True)
+    assert client.calls == [("thread/read", {"threadId": "thread_side", "includeTurns": False})]

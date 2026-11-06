@@ -10,6 +10,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { ApprovePage } from "./ApprovePage";
 import * as identity from "@/lib/identity";
 
@@ -29,11 +30,13 @@ function jsonResponse(body: unknown, { ok = true, status = 200 } = {}): Response
 /** Render the page at a concrete `/approve/:sessionId/:elicitationId` route. */
 function renderPage(sessionId = "sess_1", elicitationId = "eli_1") {
   return render(
-    <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
-      <Routes>
-        <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
-      </Routes>
-    </MemoryRouter>,
+    <TooltipProvider>
+      <MemoryRouter initialEntries={[`/approve/${sessionId}/${elicitationId}`]}>
+        <Routes>
+          <Route path="/approve/:sessionId/:elicitationId" element={<ApprovePage />} />
+        </Routes>
+      </MemoryRouter>
+    </TooltipProvider>,
   );
 }
 
@@ -85,6 +88,74 @@ describe("ApprovePage states", () => {
     renderPage();
     const bold = await screen.findByText("Bash", { selector: "strong" });
     expect(bold.parentElement?.textContent).toBe("Claude wants to call Bash");
+  });
+
+  it.each([
+    {
+      button: "Approve & allow directories for this session",
+      verdict: { action: "accept", content: { allow_directories: true } },
+    },
+    { button: "Approve", verdict: { action: "accept" } },
+    { button: "Reject", verdict: { action: "decline" } },
+  ])("offers directory scope while preserving the $button choice", async ({ button, verdict }) => {
+    const directories = ["/worktrees/branch", "/mount/real-branch"];
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "pending",
+          message: "Claude wants to call **Edit**",
+          policy_name: "claude_native_permission",
+          permission_directories: directories,
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ queued: false }));
+    renderPage();
+
+    const control = await screen.findByRole("button", { name: button });
+    for (const directory of directories) {
+      expect(screen.getByText(directory, { selector: "code" })).toBeInTheDocument();
+    }
+    fireEvent.click(control);
+    const posts = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(posts).toHaveLength(1);
+    expect(posts[0]![0]).toBe("/v1/sessions/sess_1/elicitations/eli_1/resolve");
+    expect(JSON.parse(posts[0]![1]!.body as string)).toEqual(verdict);
+    expect(
+      await screen.findByText(verdict.action === "accept" ? "Approved" : "Rejected"),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a gated edit as a diff and submits the verdict", async () => {
+    const toolInput = {
+      file_path: "/repo/config.py",
+      old_string: "TIMEOUT = 30\n",
+      new_string: "TIMEOUT = 60\n",
+    };
+    vi.mocked(identity.authenticatedFetch)
+      .mockResolvedValueOnce(
+        jsonResponse({
+          status: "pending",
+          message: "Claude wants to call **Edit**",
+          policy_name: "claude_native_permission",
+          content_preview: `Edit(${JSON.stringify(toolInput)})`,
+          file_edit: { tool_name: "Edit", tool_input: toolInput },
+        }),
+      )
+      .mockResolvedValueOnce(jsonResponse({ queued: false }));
+    const { container } = renderPage();
+
+    const approve = await screen.findByRole("button", { name: "Approve" });
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/config.py+1-1");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(container.textContent).not.toContain('"old_string"');
+    fireEvent.click(approve);
+    const posts = vi
+      .mocked(identity.authenticatedFetch)
+      .mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(JSON.parse(posts[0]![1]!.body as string)).toEqual({ action: "accept" });
+    expect(await screen.findByText("Approved")).toBeInTheDocument();
   });
 
   it("shows the resolved state when the elicitation is no longer pending", async () => {

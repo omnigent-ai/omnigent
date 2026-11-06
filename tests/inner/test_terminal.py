@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -1020,6 +1021,54 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
     assert ticks.wait(timeout=1.0)
     instance._stop_idle_watcher_thread()
     assert count["n"] >= 3
+
+
+def test_threaded_idle_watcher_records_when_output_changed_the_screen(tmp_path: Path) -> None:
+    """``screen_changed_within`` reports the watcher's screen diff, or ``None``
+    when the watcher has not watched for the whole window or has gone stale.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    frames = iter(["booting", "working 1", "working 2"])
+    current = {"frame": "booting"}
+
+    def _capture() -> str:
+        current["frame"] = next(frames, current["frame"])
+        return current["frame"]
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    ticks = threading.Event()
+    count = {"n": 0}
+
+    def _on_tick() -> None:
+        count["n"] += 1
+        if count["n"] >= 5:
+            ticks.set()
+
+    assert instance.screen_changed_within(60.0) is None
+    instance.start_idle_watcher_thread(on_tick=_on_tick, poll_interval_s=0.01)
+    assert ticks.wait(timeout=1.0)
+    try:
+        assert instance.screen_changed_within(60.0) is None, "watched for less than the window"
+        assert instance._screen_watch_started_at is not None
+        instance._screen_watch_started_at -= 120.0
+        assert instance.screen_changed_within(60.0) is True
+        assert instance._screen_changed_at is not None
+        instance._screen_changed_at -= 120.0
+        assert instance.screen_changed_within(60.0) is False
+    finally:
+        instance._stop_idle_watcher_thread()
+    assert instance._screen_watched_at is not None
+    instance._screen_watched_at -= 60.0
+    assert instance.screen_changed_within(60.0) is None, "a stale capture says nothing"
 
 
 def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
@@ -2317,7 +2366,7 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 ) -> None:
     """Managed-terminal preflight accepts tmux 3.3 and newer."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     terminal_mod._require_supported_tmux()
 
@@ -2334,6 +2383,8 @@ def test_require_supported_tmux_rejects_missing_binary(
     assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
     assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
     assert "brew install tmux" in str(caught.value)
+    # Desktop hosts keep the app's startup PATH, so restarting the host alone can't help.
+    assert "quit and reopen the Omnigent app" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2350,9 +2401,25 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
 ) -> None:
     """Managed terminals fail early unless tmux 3.3 support is confirmed."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_treats_undecodable_version_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``tmux -V`` that prints invalid UTF-8 still fails as a clear host setup error."""
+    tmux = tmp_path / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(
+        terminal_mod.TmuxUnavailableError, match="Could not determine the installed tmux version"
+    ):
         terminal_mod._require_supported_tmux()
 
 

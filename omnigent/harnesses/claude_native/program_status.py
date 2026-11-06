@@ -2,15 +2,36 @@
 
 from __future__ import annotations
 
+import logging
 import threading
+import time
 from collections.abc import Callable
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.terminals.program_status import (
     ProgramStatus,
     ProgramStatusReader,
     blocked_reason,
 )
+
+_logger = logging.getLogger(__name__)
+
+# How long an error report may stand before its turn is failed without the
+# StopFailure hook. The hook normally follows within about a second.
+ERROR_HOOK_GRACE_S = 5.0
+
+
+def _reports_failed_turn(report: ProgramStatus) -> bool:
+    """Whether a report describes a turn that already ended in an error.
+
+    Claude reports a turn that failed authentication as ``blocked`` with kind
+    ``auth`` until the user signs in again, so that report is not work in progress.
+
+    :param report: Current root report from the terminal's relay.
+    :returns: ``True`` for an error report or an authentication block.
+    """
+    return report.state == "error" or (report.state == "blocked" and report.kind == "auth")
 
 
 class ClaudeProgramStatusPoller:
@@ -21,20 +42,51 @@ class ClaudeProgramStatusPoller:
         reader: ProgramStatusReader,
         fallback: SessionStatusPoller,
         on_status: Callable[[str, str | None], None],
+        *,
+        on_replay: Callable[[str, str | None], None] | None = None,
+        omnigent_session_id: str | None = None,
+        terminal_instance_id: str | None = None,
+        terminal_launch_id: str | None = None,
+        turn_is_active: Callable[[], bool] | None = None,
+        turn_activity_epoch: Callable[[], int] | None = None,
+        on_failure: Callable[[str], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
+        self._on_replay = on_replay or on_status
+        self._omnigent_session_id = omnigent_session_id
+        self._terminal_instance_id = terminal_instance_id
+        self._terminal_launch_id = terminal_launch_id
+        self._error_observed = False
+        self._turn_is_active = turn_is_active
+        self._turn_activity_epoch = turn_activity_epoch
+        self._on_failure = on_failure
+        self._error_activity_epoch: int | None = None
+        self._clock = clock
         self._last: ProgramStatus | None = None
+        self._observation_version = 0
+        self._error_report: ProgramStatus | None = None
+        self._error_since: float | None = None
+        self._error_failed = False
         self._using_osc = False
         self._retired = False
         self._resync_lock = threading.Lock()
         self._resync_requested = False
 
     @property
+    def observation_version(self) -> int:
+        """Include errors hidden from publication and changes in the fallback source."""
+        return self._observation_version + self._fallback.observation_version
+
+    @property
     def active(self) -> bool:
         """Whether OSC or the file owns status instead of pane activity."""
-        return not self._retired and (self._reader.status is not None or self._fallback.active)
+        if self._retired:
+            return False
+        active = self._reader.status is not None or self._fallback.active
+        return active and not self._retired
 
     @property
     def blocked_on(self) -> str | None:
@@ -42,6 +94,8 @@ class ClaudeProgramStatusPoller:
         if self._retired:
             return None
         report = self._reader.status
+        if self._retired:
+            return None
         return blocked_reason(report) if report is not None else self._fallback.blocked_on
 
     def tick(self) -> None:
@@ -51,30 +105,88 @@ class ClaudeProgramStatusPoller:
         with self._resync_lock:
             requested = self._resync_requested
             self._resync_requested = False
-        if requested:
-            self._last = None
         report = self._reader.status
+        if self._retired:
+            return
+        is_error = report is not None and _reports_failed_turn(report)
+        # Resync must not turn a standing error into repeated observations.
+        if is_error and not self._error_observed:
+            _logger.info(
+                "Claude program error observed; deferring failed status to StopFailure",
+                extra=debug_event(
+                    "claude_program_error_observed",
+                    session_id=self._omnigent_session_id,
+                    terminal_instance_id=self._terminal_instance_id,
+                    terminal_launch_id=self._terminal_launch_id,
+                    status_source="program_status",
+                    status_publication="deferred_to_stop_failure",
+                ),
+            )
+        self._error_observed = is_error
         if report is not None:
             self._using_osc = True
-            if report != self._last:
+            changed = report != self._last
+            if changed:
+                self._observation_version += 1
+            if changed or requested:
                 self._last = report
-                status = (
-                    "running"
-                    if report.state in {"working", "blocked"}
-                    else "failed"
-                    if report.state == "error"
-                    else "idle"
-                )
-                self._on_status(status, blocked_reason(report))
+                # The StopFailure hook owns the failed edge and carries the API
+                # error text; an error report here would fail the turn first, bare.
+                if not is_error:
+                    status = "running" if report.state in {"working", "blocked"} else "idle"
+                    publish = self._on_status if changed else self._on_replay
+                    publish(status, blocked_reason(report))
+            self._fail_if_hook_overdue(report)
+            # OSC reports ``done`` while a background shell still runs; only the
+            # file says ``shell``, so keep reading it for that one signal.
+            self._fallback.observe()
         else:
+            if self._last is not None:
+                self._observation_version += 1
             if self._using_osc:
                 self._fallback.resync()
             self._using_osc = False
             self._last = None
+            self._fail_if_hook_overdue(None)
             self._fallback.tick()
 
+    def _fail_if_hook_overdue(self, report: ProgramStatus | None) -> None:
+        """Fail an error turn whose StopFailure hook is overdue, once.
+
+        The runner counts a turn in flight until a hook edge clears it, so an
+        error report that stands past the grace means the hook was lost.
+        """
+        if (
+            report is None
+            or not _reports_failed_turn(report)
+            or self._turn_is_active is None
+            or not self._turn_is_active()
+        ):
+            self._error_report = None
+            self._error_since = None
+            self._error_activity_epoch = None
+            self._error_failed = False
+            return
+        now = self._clock()
+        epoch = self._turn_activity_epoch() if self._turn_activity_epoch is not None else None
+        if (
+            report != self._error_report
+            or self._error_since is None
+            or epoch != self._error_activity_epoch
+        ):
+            self._error_report = report
+            self._error_since = now
+            self._error_activity_epoch = epoch
+            self._error_failed = False
+        elif not self._error_failed and now - self._error_since >= ERROR_HOOK_GRACE_S:
+            self._error_failed = True
+            if self._on_failure is not None and report.message and report.message.strip():
+                self._on_failure(report.message)
+            else:
+                self._on_status("failed", None)
+
     def resync(self) -> None:
-        """Re-arm the next poll after a reconnect or a forwarded idle edge."""
+        """Re-arm the next poll while retaining the native transition baseline."""
         with self._resync_lock:
             self._resync_requested = True
         self._fallback.resync()
@@ -82,4 +194,5 @@ class ClaudeProgramStatusPoller:
     def retire(self) -> None:
         """Let terminal lifecycle handling own the outcome after process exit."""
         self._retired = True
+        self._observation_version += 1
         self._fallback.retire()

@@ -1482,6 +1482,34 @@ async def test_runner_post_reports_a_removed_agent_with_fork_guidance() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("exc", "cause"),
+    [
+        (httpx.ConnectError("connect failed to internal-host:6767"), "ConnectError"),
+        (
+            RuntimeError(
+                "spec_resolver: GET /v1/sessions/conv_x/agent/contents failed with HTTP 503"
+            ),
+            "RuntimeError HTTP 503",
+        ),
+    ],
+    ids=["connection-error", "server-status"],
+)
+def test_spec_resolve_error_detail_names_structured_cause(
+    exc: BaseException, cause: str, pinned_runner_log: Path
+) -> None:
+    """The client detail names the cause type and status, never the raw text."""
+    from omnigent.runner.app import _spec_resolve_error_detail
+
+    detail = _spec_resolve_error_detail(exc)
+
+    assert detail == (
+        f"Could not load the agent spec ({cause}). "
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    assert "internal-host" not in detail and "conv_x" not in detail
+
+
 @pytest.mark.asyncio
 async def test_runner_post_returns_503_when_spec_resolver_fails(
     caplog: pytest.LogCaptureFixture,
@@ -1533,6 +1561,7 @@ async def test_runner_post_returns_503_when_spec_resolver_fails(
     # not leak into the HTTP body (it is logged on the runner instead).
     assert body["error"] == "spec_resolver_failed"
     assert body["detail"] == (
+        "Could not load the agent spec (RuntimeError). "
         f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
     )
     assert "spec resolver unavailable" not in body["detail"]
@@ -2082,13 +2111,31 @@ def test_build_spawn_env_applies_model_override(
         executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
     )
 
-    base = _build_spawn_env_from_spec(spec, "claude-sdk")
-    overridden = _build_spawn_env_from_spec(spec, "claude-sdk", model_override="claude-sonnet-4-6")
+    from omnigent.runner.resource_registry import SessionResourceRegistry
+
+    registry = SessionResourceRegistry()
+    registry.set_client_surface("desktop-session", "desktop")
+    base = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="desktop-session", resource_registry=registry
+    )
+    overridden = _build_spawn_env_from_spec(
+        spec,
+        "claude-sdk",
+        model_override="claude-sonnet-4-6",
+        session_id="desktop-session",
+        resource_registry=registry,
+    )
     assert base is not None and overridden is not None
     # Baseline uses the provider/catalog default (not the override) …
     assert base["HARNESS_CLAUDE_SDK_MODEL"] != "claude-sonnet-4-6"
     # … and the override wins, landing in the model env var the SDK reads.
     assert overridden["HARNESS_CLAUDE_SDK_MODEL"] == "claude-sonnet-4-6"
+    assert base["OMNIGENT_CLIENT_SURFACE"] == overridden["OMNIGENT_CLIENT_SURFACE"] == "desktop"
+    unknown = _build_spawn_env_from_spec(
+        spec, "claude-sdk", session_id="legacy-session", resource_registry=registry
+    )
+    assert unknown is not None
+    assert unknown["OMNIGENT_CLIENT_SURFACE"] == "unknown"
 
 
 def test_build_spawn_env_routes_hermes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2665,6 +2712,118 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+
+
+@pytest.mark.parametrize(
+    "original,calls,statuses,read_cap,baseline",
+    [
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="edit-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="write-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
+                ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
+                ("sys_os_edit", {"oldText": "uno", "newText": "one"}),
+            ],
+            ["modified"],
+            None,
+            "one\ntwo\n",
+            id="partially-reverted",
+        ),
+        pytest.param(
+            b"one\r\ntwo\r\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            ["modified"],
+            None,
+            "one\r\ntwo\r\n",
+            id="line-endings-changed",
+        ),
+        pytest.param(
+            b"\x89PNG\r\n\x1a\n\x00\xff",
+            [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
+            ["modified"],
+            None,
+            None,
+            id="binary-original",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            ["modified"],
+            4,
+            None,
+            id="original-beyond-read-cap",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_os_env_change_restoring_the_original_leaves_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
+    calls: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+    read_cap: int | None,
+    baseline: str | None,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    if read_cap is not None:
+        monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", read_cap)
+    (tmp_path / "file.txt").write_bytes(original)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    for step, (tool_name, args) in enumerate(calls, start=1):
+        result = await _execute_os_env_tool(
+            tool_name,
+            {"path": "file.txt", **args},
+            agent_spec=spec,
+            conversation_id="conv_revert",
+            filesystem_registry=filesystem_registry,
+        )
+        assert "error" not in json.loads(result)
+        if step < len(calls):
+            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+
+    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+    assert [entry["status"] for entry in listed] == statuses
+    assert filesystem_registry.get_baseline("file.txt") == baseline
 
 
 @pytest.mark.asyncio
@@ -4619,17 +4778,15 @@ async def _dispatch_model_send(
         pytest.param(
             "claude-native",
             "claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
+            "system.ai.claude-sonnet-4-6",
             id="canonical-claude-localized",
         ),
-        pytest.param(
-            "codex-native", "gpt-5-4", "databricks-gpt-5-4", id="canonical-gpt-localized"
-        ),
+        pytest.param("codex-native", "gpt-5-4", "system.ai.gpt-5-4", id="canonical-gpt-localized"),
         pytest.param(
             "claude-native",
             "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-4-6",
-            id="already-local-unchanged",
+            "system.ai.claude-sonnet-4-6",
+            id="legacy-local-canonicalized",
         ),
         pytest.param(
             "claude-native",
@@ -4651,9 +4808,9 @@ async def test_sys_session_send_localizes_canonical_model_for_gateway_child(
 
     With a Databricks default provider, a bare canonical vendor id
     (``claude-sonnet-4-6``) would die at the gateway ("model not
-    found"); the gate must persist the ``databricks-``-prefixed
-    spelling as ``model_override`` — and ONLY for mechanical ids:
-    already-local and vendor-prefixed shapes pass through verbatim.
+    found"); the gate must persist the Unity Catalog ``system.ai.`` spelling
+    as ``model_override`` — and ONLY for mechanical ids: legacy-local ids
+    canonicalize and vendor-prefixed shapes pass through.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param tmp_path: Per-test temp dir for the isolated provider config.
@@ -7857,6 +8014,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
                             "status": "running",
                             "runner_id": "r1",
                             "parent_session_id": None,
+                            "labels": {"omnigent.created_by_session_id": "conv_x"},
                         },
                         {
                             "id": "s2",
@@ -7898,6 +8056,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "created_by_session_id": "conv_x",
         },
         {
             "session_id": "s2",
@@ -7907,6 +8066,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_id": "r1",
             "runner_online": True,
             "parent_session_id": None,
+            "created_by_session_id": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -8393,6 +8553,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     event_bodies: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_bundle_model_override": True})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_requests.append(request)
             return httpx.Response(
@@ -8415,7 +8577,13 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         output = await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
+                {
+                    "config_path": "helper.yaml",
+                    "title": "auth",
+                    "message": "start",
+                    "model": "databricks-claude-sonnet-4-6",
+                    "reasoning_effort": "low",
+                }
             ),
             server_client=server_client,
             conversation_id="conv_caller",
@@ -8423,12 +8591,18 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         )
 
     # Exactly one multipart create; parent forced to the caller
-    # (child-only) and the title threaded into the metadata part.
+    # (child-only), and title, model and effort threaded into the
+    # metadata part as the agent_id create sends them.
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "low",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
@@ -8450,6 +8624,111 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "args", "error"),
+    [
+        pytest.param(
+            {}, {"model": "databricks-claude-sonnet-4-6"}, "server_too_old", id="old-server"
+        ),
+        pytest.param(
+            None, {"model": "databricks-claude-sonnet-4-6"}, "could not check", id="no-info"
+        ),
+        pytest.param(
+            {"session_bundle_model_override": True},
+            {"reasoning_effort": 3},
+            "must be a string",
+            id="non-string-effort",
+        ),
+    ],
+)
+async def test_sys_session_create_config_path_refuses_unsendable_overrides(
+    tmp_path: Path, info: dict[str, Any] | None, args: dict[str, Any], error: str
+) -> None:
+    """
+    A config_path create never drops a requested override: a server that does
+    not report ``session_bundle_model_override`` (or whose info cannot be read)
+    and a non-string value both fail with a named error before any upload.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=info) if info is not None else httpx.Response(503)
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", **args}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert error in output
+    assert creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "effort", "sent"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param(None, "low", "low", id="unclassified-harness-passes"),
+    ],
+)
+async def test_sys_session_create_config_path_checks_effort_against_the_bundle_harness(
+    tmp_path: Path, harness: str | None, effort: str, sent: str | None
+) -> None:
+    """
+    A config_path effort the bundled child's harness cannot use fails before
+    any upload instead of being stored and dropped at every turn; an alias
+    folds to the harness's value, and an unclassified harness passes through.
+
+    :param harness: The local config's harness, or ``None`` for none set.
+    :param effort: The requested effort.
+    :param sent: The effort the metadata carries, or ``None`` when refused.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = "name: helper\nprompt: help\n"
+    if harness is not None:
+        config += f"executor:\n  harness: {harness}\n"
+    (tmp_path / "helper.yaml").write_text(config)
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": effort}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    if sent is None:
+        assert "invalid 'reasoning_effort'" in output
+        assert creates == []
+        return
+    assert len(creates) == 1, output
+    assert _parse_multipart_create(creates[0])["metadata"]["reasoning_effort"] == sent
 
 
 @pytest.mark.asyncio
@@ -13347,9 +13626,15 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
+@pytest.mark.parametrize("with_client_id", [False, True])
+async def test_turn_lifecycle_events_name_the_web_message_they_settle(
+    with_client_id: bool,
+) -> None:
     conv = "conv_stable_id_on_lifecycle"
     stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
+    identity = {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    if with_client_id:
+        identity["input_stable_id"] = stable_id
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -13382,7 +13667,7 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
                 "agent_id": "ag_stable",
                 "model": "x",
                 "content": [{"role": "user", "content": "hi"}],
-                "stable_id": stable_id,
+                **identity,
             },
         )
         assert response.status_code == 200
@@ -13391,12 +13676,12 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
             "event: response.in_progress",
             "event: response.completed",
         ]
-        assert [
-            json.loads(next(line[5:] for line in frame.splitlines() if line.startswith("data:")))[
-                "input_stable_id"
-            ]
-            for frame in direct_frames
-        ] == [stable_id, stable_id]
+        for frame in direct_frames:
+            event = json.loads(
+                next(line[5:] for line in frame.splitlines() if line.startswith("data:"))
+            )
+            assert {key: event.get(key) for key in identity} == identity
+            assert ("input_stable_id" in event) is with_client_id
         events = await _drain_turn_events(
             app.state.session_event_queues,
             conv,
@@ -13409,7 +13694,10 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
         for event in events
         if event.get("type") in {"response.in_progress", "response.completed"}
     ]
-    assert [event["input_stable_id"] for event in lifecycle] == [stable_id, stable_id]
+    assert len(lifecycle) == 2
+    for event in lifecycle:
+        assert {key: event.get(key) for key in identity} == identity
+        assert ("input_stable_id" in event) is with_client_id
 
 
 @pytest.mark.asyncio

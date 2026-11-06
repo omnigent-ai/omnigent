@@ -656,6 +656,11 @@ def _pr_payload(
         "head_ref": _short_ref(pr.get("sourceRefName")),
         "head_sha": _commit(pr, "lastMergeSourceCommit"),
         "base_sha": _commit(pr, "lastMergeTargetCommit"),
+        "head_repository_url": (
+            _text(_nested(pr, "forkSource", "repository", "webUrl"))
+            if pr.get("forkSource")
+            else url.rsplit("/pullrequest/", 1)[0]
+        ),
         "checks": checks,
         "body": description if isinstance(description, str) and description.strip() else None,
         "comments": comments[:_MAX_COMMENTS],
@@ -1200,6 +1205,40 @@ class AzureDevOpsPullRequests:
         :raises ValueError: Always.
         """
         raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
+
+    def edit_details(
+        self,
+        root: str,  # noqa: ARG002 - details editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - details editing is unsupported
+        *,
+        title: str | None,  # noqa: ARG002 - details editing is unsupported
+        body: str | None,  # noqa: ARG002 - details editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps title and description editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,  # noqa: ARG002 - attachment uploads are unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - attachment uploads are unsupported
+        *,
+        name: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content_type: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content: bytes,  # noqa: ARG002 - attachment uploads are unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps attachment uploads are not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Attaching files to Azure DevOps pull requests is not supported yet.")
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""

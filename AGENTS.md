@@ -22,25 +22,93 @@ test LOC; fewer lines alone do not establish adequate coverage.
 
 - Add a unit test for non-trivial functions, methods, and exported APIs. Add
   coverage when changed behavior needs it.
-- Run the relevant tests before submitting. Document unrelated pre-existing
-  failures in the PR description.
+- Standalone local tests are optional, not a prerequisite for every commit or
+  push. When a behavior change needs an additional local check, use only the
+  smallest directly relevant non-browser test. Follow the proportional rules
+  below for styling changes and document unrelated failures in the PR.
+
+## Stay focused and keep verification proportional
+
+- Complete the requested change directly. Do not add unsolicited cleanup,
+  unrelated refactors, documentation edits, audits, or adjacent behavior work.
+- For small, reversible UI styling changes (colors, opacity, blur, radius,
+  spacing, and shadows), do not automatically add or run tests, type checks,
+  builds, linters, browser checks, or other proactive verification.
+- For behavior changes that need verification, use the smallest directly
+  relevant local check. Do not expand into broad suites, viewport/scroll
+  investigations, or unrelated regression checks without a concrete need.
+- Do not repeat checks for successive styling tweaks after the shared
+  implementation has already been validated.
+- Follow explicit requests to stop or skip checks immediately. Required commit
+  and push hooks still run when committing or pushing; never bypass them.
+- During authorized PR fixes, commit and push each completed fix promptly after
+  the required hooks pass. Do not hold fixes locally while waiting for other CI
+  results or run extra local tests solely as a prerequisite to pushing.
+
+## Dependency changes
+
+When raising a dependency floor or adding a dependency, keep it installable from
+package mirrors that embargo new releases (see the dependency notes in
+`CONTRIBUTING.md`) and run `just check-internal-mirror` when you can reach the
+Databricks PyPI proxy. If a mirror lacks the version you need, keep the floor
+below it and pin the newer release only in `uv.lock`; do not work around the
+mirror with a local or temporary index. Never add the `dependency-floor-approved`
+label yourself; a human maintainer adds it after checking the mirror.
 
 ## Committing
 
-Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or
-let it run on staged files via `git commit`). Fix any issues it reports so the
-commit lands clean — CI runs the same checks.
+The `pre-commit` hooks are the local gate, and CI runs the same checks. They
+run on `git commit` and again on `git push` only after they are installed:
+`just ensure` does that (or `just hooks` on its own), once per clone. Worktrees
+share the clone's `.git`, so one install covers them all.
+
+- Never pass `--no-verify`. A hook failure is a finding to fix, not a gate to
+  skip; the push hook will fail on the same commits anyway.
+- Files written through shell heredocs or scripts are unformatted until a hook
+  or `just lint` touches them. Let the required formatting hooks validate them;
+  a duplicate standalone Prettier run is not required before pushing. If a
+  manual check is needed, read its exit code rather than grepping hook output.
+- To check by hand, `just lint` runs the hooks over staged files and
+  `just lint-all` over the whole tree. Fix what they report, re-stage, commit.
 
 ## Local development shortcuts
 
 Use `just` for common tasks; run `just --list` for grouped recipes.
 
-- `just ensure` — install/check prerequisites
+- `just ensure` — install/check prerequisites, including the git hooks
 - `just run-ios` / `just run-android` — build/run mobile apps
 - `just dev` / `just dev-mobile` — start the omnigent dev pod
 - `just electron-dev` / `just electron-build` — Electron desktop shell
-- `just lint` / `just lint-all` — run pre-commit
+- `just lint` / `just lint-all` — run pre-commit; `just hooks` — install the git hooks
 - `just normalize-locks` — rewrite lockfile registries to PyPI/npmjs.org
+
+### Local development database
+
+- Always use the shared `~/.omnigent/chat.db` when starting or reusing a local
+  Omnigent development backend, unless the user explicitly requests isolated data.
+- Reuse a healthy backend using that database when available. Otherwise pass
+  `--database-uri "sqlite:///$HOME/.omnigent/chat.db"` explicitly to
+  `uv run --no-sync omnigent server`; do not let worktree-specific state or the
+  default `omnidev` pod select a separate database.
+- For `server --background`, set
+  `OMNIGENT_DATABASE_URI="sqlite:///$HOME/.omnigent/chat.db"` in the environment;
+  the background launcher does not forward the `--database-uri` option.
+- Point the frontend and host at the same backend, and verify the backend's
+  resolved database URI before reporting that the development servers are ready.
+- Automated tests retain their isolated databases.
+
+### No proactive browser-based verification
+
+- Do not run browser-based verification: no manual browser interaction,
+  Playwright or other browser E2E runs, browser screenshots, or recordings.
+  Only an explicit user request for browser verification in the current task
+  authorizes an exception. This prohibition takes precedence over browser-drive
+  guidance in feature maps and other repository documentation.
+- Standalone local tests, type checks, builds, and linters are optional. Prefer
+  required Git hooks and GitHub CI; use a focused non-browser local check only
+  when it is needed to diagnose or validate the requested change.
+- Reading CI logs and artifacts or updating existing browser-test source does
+  not authorize launching a local browser or rerunning browser tests locally.
 
 ## Pull requests
 
@@ -95,8 +163,8 @@ human, such as concrete manual behavior checks, rather than only listing unit
 test commands. Don't leave the user guessing how to confirm the work — tell
 them exactly what to do.
 
-To drive the app yourself and prove a user-facing change on every entry point a
-user can reach, start with `feature-map/README.md`, then read the relevant maps and linked skills.
+Use `feature-map/README.md` and the relevant maps as references for user-facing
+behavior, following the local-code-only verification preference above.
 
 ## Deprecating features
 

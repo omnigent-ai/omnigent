@@ -268,6 +268,32 @@ describe("QueuedMessagesStrip", () => {
     expect(onSteer).toHaveBeenCalledWith("q_2");
   });
 
+  it("disables send-now on every row while a message waits for its host", () => {
+    const onSteer = vi.fn();
+    render(
+      <TooltipProvider>
+        <QueuedMessagesStrip
+          messages={[
+            msg("q_1", "before"),
+            { ...msg("q_2", "held"), waitingForHost: true },
+            msg("q_3", "after"),
+          ]}
+          onDelete={vi.fn()}
+          onEdit={vi.fn()}
+          onSteer={onSteer}
+        />
+      </TooltipProvider>,
+    );
+    const [before, held, after] = screen.getAllByRole("button", {
+      name: "Send queued message now",
+    });
+    expect(before).toBeDisabled();
+    expect(held).toBeDisabled();
+    expect(after).toBeDisabled();
+    fireEvent.click(before!);
+    expect(onSteer).not.toHaveBeenCalled();
+  });
+
   it("marks failed messages and offers an explicit retry", () => {
     const onSteer = vi.fn();
     render(
@@ -489,4 +515,45 @@ describe("QueuedMessagesStrip", () => {
       "overscroll-contain",
     );
   });
+
+  it("shows the ↑ chord on the edit tooltip of the row an empty composer recalls", async () => {
+    const queue = [msg("q_1", "first"), msg("q_2", "second")];
+    const { unmount } = render(
+      <QueuedMessagesStrip
+        messages={queue}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        arrowUpRecallQueueId="q_2"
+      />,
+    );
+    fireEvent.pointerMove(screen.getAllByRole("button", { name: "Edit queued message" })[1]!, {
+      pointerType: "mouse",
+    });
+    const recallTooltip = await screen.findByRole("tooltip");
+    expect(recallTooltip).toHaveTextContent("Edit queued message");
+    expect(tooltipKeys(recallTooltip)).toEqual(["↑"]);
+    unmount();
+
+    render(
+      <QueuedMessagesStrip
+        messages={queue}
+        onDelete={vi.fn()}
+        onEdit={vi.fn()}
+        arrowUpRecallQueueId="q_2"
+      />,
+    );
+    fireEvent.pointerMove(screen.getAllByRole("button", { name: "Edit queued message" })[0]!, {
+      pointerType: "mouse",
+    });
+    const plainTooltip = await screen.findByRole("tooltip");
+    expect(plainTooltip).toHaveTextContent("Edit queued message");
+    expect(tooltipKeys(plainTooltip)).toEqual([]);
+  });
 });
+
+/** The chord chips inside a tooltip, in display order. */
+function tooltipKeys(tooltip: HTMLElement): string[] {
+  return Array.from(tooltip.querySelectorAll('[data-slot="kbd"]')).map(
+    (key) => key.textContent ?? "",
+  );
+}

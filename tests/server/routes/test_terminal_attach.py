@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -28,13 +29,15 @@ from starlette.websockets import WebSocketDisconnect
 
 from omnigent.entities import Conversation, SessionPermission
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     _globals,
     set_runner_client,
     set_runner_router,
     set_runner_ws_factory,
 )
-from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -42,9 +45,10 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
-from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
+from omnigent.terminals.ws_common import WS_CLOSE_INTERNAL_ERROR, WS_CLOSE_WRONG_REPLICA
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -93,6 +97,16 @@ class _StubPermissionStore:
         return None
 
 
+def _connected_attach_user_ids(rows: list[dict[str, Any]]) -> list[str | None]:
+    """User ids on the terminal-attach connected rows, in emit order."""
+    return [
+        row["user_id"]
+        for row in rows
+        if row["event_name"] == "attach_terminal_by_resource_id"
+        and row["attributes"].get("phase") == "connected"
+    ]
+
+
 class _StubConversationStore:
     """Minimal in-memory conversation store for terminal attach auth tests."""
 
@@ -102,12 +116,13 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str) -> None:
+    def add(self, conversation_id: str, **fields: Any) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
             root_conversation_id=conversation_id,
+            **fields,
         )
 
 
@@ -394,7 +409,9 @@ async def test_attach_terminal_rejects_missing_identity_before_runner_proxy() ->
     assert factory.calls == []
 
 
-async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
+async def test_attach_terminal_allows_owner_for_interactive_proxy(
+    debug_log_rows: list[dict[str, Any]],
+) -> None:
     """The session owner may open an interactive (write) terminal attach."""
     conv_store = _StubConversationStore()
     conv_store.add("conv_alice")
@@ -425,6 +442,29 @@ async def test_attach_terminal_allows_owner_for_interactive_proxy() -> None:
         "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach?read_only=false"
     ]
     assert b"whoami\n" in conn.received
+    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
+
+
+async def test_attach_terminal_attributes_logs_with_permissions_disabled(
+    debug_log_rows: list[dict[str, Any]], runner_client_reset: None
+) -> None:
+    """With no permission store, the attach still attributes its rows to the caller."""
+    app = FastAPI()
+    app.include_router(
+        create_terminal_attach_router(auth_provider=UnifiedAuthProvider(source="header")),
+        prefix="/v1",
+    )
+    set_runner_ws_factory(_FakeRunnerWSFactory(_FakeRunnerWSConn(wait_close_after=1)))
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_alice/resources/terminals/terminal_bash_s1/attach",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    ) as ws:
+        ws.send_bytes(b"ls\n")
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert _connected_attach_user_ids(debug_log_rows) == ["alice@example.com"]
 
 
 async def test_attach_terminal_edit_grant_denied_write_allowed_read_only() -> None:
@@ -523,18 +563,45 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
     assert interactive_factory.calls == []
 
 
-async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI) -> None:
+@pytest.mark.parametrize(
+    ("runner_id", "host_live_elsewhere", "expected_code"),
+    [
+        ("runner_reconnecting", True, WS_CLOSE_WRONG_REPLICA),
+        ("runner_reconnecting", False, 1013),
+        (None, False, WS_CLOSE_INTERNAL_ERROR),
+    ],
+    ids=["wrong_replica", "runner_tunnel_not_connected", "no_runner_pinned"],
+)
+async def test_attach_terminal_tunnel_factory_failure_close_code(
+    app: FastAPI, runner_id: str | None, host_live_elsewhere: bool, expected_code: int
+) -> None:
     """
-    A wrong-replica routing miss closes with the retryable code so the browser
-    re-dials without its slice key instead of reporting the runner offline.
+    A tunnel-factory failure closes with a code matching its cause: 4400
+    re-dials without the slice key when the host lives on another replica,
+    1013 re-dials with backoff while the pinned runner reconnects, and any
+    other failure, such as an unpinned session, keeps the internal error.
 
     :param app: The FastAPI app fixture.
+    :param runner_id: The session's pinned runner, or ``None`` when unpinned.
+    :param host_live_elsewhere: Whether the session's host is live on
+        another replica.
+    :param expected_code: The close code the browser must receive.
     """
 
-    def factory(path: str):
-        raise WrongReplicaWSError(f"tunnel for {path} lives on another replica")
+    class _HostLiveness:
+        def is_online(self, host_id: str) -> bool:
+            return host_live_elsewhere
 
-    set_runner_ws_factory(factory)
+    conversations = _StubConversationStore()
+    conversations.add("conv_ws", runner_id=runner_id, host_id="host_ws")
+    tunnels = TunnelRegistry()
+    router = RunnerRouter(
+        registry=tunnels,
+        conversation_store=conversations,
+        host_registry=HostRegistry(),
+        host_store=_HostLiveness(),
+    )
+    set_runner_ws_factory(make_tunnel_ws_factory(router, tunnels))
 
     with (
         TestClient(app).websocket_connect(
@@ -544,7 +611,7 @@ async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI
     ):
         ws.receive_bytes()
 
-    assert exc_info.value.code == WS_CLOSE_WRONG_REPLICA
+    assert exc_info.value.code == expected_code
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:

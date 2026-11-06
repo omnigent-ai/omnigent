@@ -30,11 +30,12 @@ import re
 import tempfile
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -64,6 +65,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -84,6 +87,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_message import SysSessionMessageTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -112,8 +116,10 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.reasoning_effort import validate_effort_for_harness
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -319,6 +325,7 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
@@ -474,9 +481,11 @@ _BROWSER_TIMEOUT_ERROR = (
 # unconditionally for policy enforcement (independent of the spec's
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    _COMMENT_TOOLS
+    {SysSessionMessageTool.name()}
+    | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -490,9 +499,8 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. ToolManager auto-registers these
-    # framework-owned schemas for every spec, so the native relay surface is
-    # session-static and always includes them.
+    # feature is dead for its real target. The relay filters ToolManager's
+    # schemas, so they appear unless the spec sets ``tool_groups.browser: false``.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
@@ -598,6 +606,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionMessageTool,
+            UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -630,6 +640,11 @@ _AGENT_CONFIG_SUBDIR = ".omnigent/agent-configs"
 
 # Broad internal page size for discovery fan-out reads.
 _AGENT_LIST_PAGE_LIMIT = 1000
+# ``false`` is the widest JSON value ``runner_online`` can take, so sizing pages
+# with it keeps the output budget valid after real values are filled in.
+_RUNNER_ONLINE_SIZING_PLACEHOLDER = False
+# Max concurrent ``GET /v1/runners/{id}/status`` lookups per ``sys_session_list``.
+_RUNNER_STATUS_CONCURRENCY = 8
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
 # Match the existing default ceiling for ``sys_os_shell`` output. Discovery
@@ -864,7 +879,8 @@ def _bounded_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    _OS_ENV_TOOLS
+    {SysSessionMessageTool.name()}
+    | _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -875,6 +891,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _WEB_READ_TOOLS
@@ -1859,36 +1876,6 @@ def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
     if not isinstance(raw_effort, str) or not raw_effort:
         raise ValueError("'reasoning_effort' must be a non-empty string when provided")
     return raw_effort
-
-
-def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
-    """
-    Validate *effort* against the child harness's declared effort family.
-
-    A harness whose family is ``NONE`` has no effort plumbing, and an
-    unrecognized one cannot be checked at all — the caller asked for this
-    explicitly, so reject rather than accept-and-drop. (Delivery of a
-    persisted effort takes the opposite tack and filters quietly; see the
-    reasoning guard in :mod:`omnigent.runner.app`.)
-
-    :param effort: Requested effort, e.g. ``"high"``.
-    :param harness: Resolved child harness, e.g. ``"claude-native"``.
-    :returns: The canonical effort that harness accepts.
-    :raises ValueError: If the harness supports no effort override, or
-        the value falls outside its vocabulary.
-    """
-    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
-
-    canonical = canonicalize_harness(harness) if harness is not None else None
-    supported = efforts_for_harness(harness)
-    if not supported:
-        raise ValueError(
-            f"harness {canonical or harness or 'unknown'!r} does not support "
-            "a reasoning-effort override"
-        )
-    validated = validate_effort(effort, canonical or harness or "unknown", supported)
-    assert validated is not None
-    return validated
 
 
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
@@ -2887,7 +2874,7 @@ async def _execute_subagent_tool(
                 effort_source = f"sub-agent {sub_agent_name!r} spec"
         if effective_effort is not None:
             try:
-                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                create_body["reasoning_effort"] = validate_effort_for_harness(
                     effective_effort,
                     child_harness,
                 )
@@ -3313,6 +3300,31 @@ async def _send_to_existing_session(
     )
 
 
+# sys_session_create argument -> session-create field, shared by the JSON
+# (agent_id) and multipart (config_path) creates so neither drops one.
+_SESSION_CREATE_FIELDS = (
+    ("title", "title"),
+    ("model", "model_override"),
+    ("reasoning_effort", "reasoning_effort"),
+)
+
+
+def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
+    """
+    Map ``sys_session_create`` arguments to the per-session create fields.
+
+    :param args: Tool arguments, e.g. ``{"model": "databricks-glm-5-2"}``.
+    :returns: The non-empty string fields under their create names, e.g.
+        ``{"model_override": "databricks-glm-5-2"}``.
+    """
+    fields: _JsonObject = {}
+    for arg_name, field_name in _SESSION_CREATE_FIELDS:
+        value = args.get(arg_name)
+        if isinstance(value, str) and value:
+            fields[field_name] = value
+    return fields
+
+
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
@@ -3324,9 +3336,8 @@ def _build_session_create_body(
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
-    ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
-    what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``parent_session_id`` defaults to ``conversation_id``; independent
+    placements remove it before using the gated endpoint. A non-empty ``title``, ``message``,
     ``model``, and ``reasoning_effort`` are included when provided; the
     message becomes the child's first queued user turn via
     ``initial_items``.
@@ -3352,13 +3363,10 @@ def _build_session_create_body(
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
+        **_session_create_fields(
+            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+        ),
     }
-    if isinstance(title, str) and title:
-        body["title"] = title
-    if isinstance(model, str) and model:
-        body["model_override"] = model
-    if isinstance(reasoning_effort, str) and reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -3442,7 +3450,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     """
-    Create a child session (``sys_session_create``).
+    Create a child or an independent session (``sys_session_create``).
 
     Two modes, split on the provided argument (exactly one required):
 
@@ -3453,8 +3461,9 @@ async def _execute_session_create(
       inside the caller's working directory) via the multipart
       ``POST /v1/sessions`` create.
 
-    Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
+    The default placement forces ``parent_session_id`` to the caller.
+    Independent placements use the server's gated orchestration endpoint.
+    A child inherits the caller's runner (server-side affinity), so a
     queued initial message starts a turn immediately. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
@@ -3464,7 +3473,8 @@ async def _execute_session_create(
     Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
-        ``config_path`` required, ``title`` / ``message`` optional.
+        ``config_path`` required, ``title`` / ``message`` / ``model`` /
+        ``reasoning_effort`` optional in both modes.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -3497,19 +3507,24 @@ async def _execute_session_create(
                 )
             }
         )
+    placement = args.get("placement", "child")
+    if placement not in ("child", "same_host", "managed"):
+        return json.dumps({"error": "placement must be child, same_host or managed"})
+    if placement != "child" and has_config_path:
+        return json.dumps({"error": "Independent sessions require agent_id"})
+    message = args.get("message")
+    profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
+    selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
+    if selection and placement != "managed":
+        return json.dumps({"error": "Sandbox profile selection requires placement='managed'"})
+    if any(not isinstance(value, str) or not value.strip() for value in selection.values()):
+        return json.dumps({"error": "Sandbox selection fields must be nonempty strings"})
+    if selection.get("sandbox_profile_revision") and not selection.get("sandbox_profile_id"):
+        return json.dumps({"error": "sandbox_profile_revision requires sandbox_profile_id"})
+    if placement != "child" and message is not None:
+        if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+            return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
-        # The multipart create carries only the config bundle, so an effort
-        # passed here would never reach the child. Refuse instead of dropping it.
-        if args.get("reasoning_effort") is not None:
-            return json.dumps(
-                {
-                    "error": (
-                        "sys_session_create 'reasoning_effort' is supported only "
-                        "with 'agent_id'; the 'config_path' create cannot carry "
-                        "it. Set the effort in the config you upload instead."
-                    )
-                }
-            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -3523,25 +3538,134 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
+    headers: dict[str, str] = {}
+    if placement != "child":
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        body.pop("parent_session_id")
+        # The server derives the same host/workspace from this bound source.
+        headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
+        if placement == "managed":
+            body["host_type"] = "managed"
+            body.update(selection)
+            initial_items = body.pop("initial_items", None)
+            if isinstance(initial_items, list) and initial_items:
+                body["initial_input"] = initial_items[0]
+        else:
+            body.pop("initial_items", None)
+    unconfirmed_creation = {
+        "error": "Session creation could not be confirmed; "
+        "inspect your sessions before creating another. Use sys_session_list's sessions "
+        "results, then sys_session_get_info with a discovered session_id; "
+        "do not automatically retry",
+        "agent_id": agent_id,
+        "title": args.get("title"),
+    }
+    create_requested = False
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
+            info = await server_client.get("/v1/info")
+            info.raise_for_status()
+            info_data = info.json()
+            if selection.get("sandbox_profile_id"):
+                features = info_data.get("features") if isinstance(info_data, dict) else None
+                if not isinstance(features, dict) or features.get("sandbox_profiles") is not True:
+                    return json.dumps(
+                        {
+                            "error": "This server does not advertise sandbox profile support; "
+                            "no session was created."
+                        }
+                    )
+            host_id = (
+                uuid.uuid4().hex if info_data.get("request_managed_sandbox_host_id") else None
+            )
+            if host_id is not None:
+                body["host_id"] = host_id
+                unconfirmed_creation["host_id"] = host_id
+            create_requested = True
+            resp = await post_on_host(
+                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+            )
+        else:
+            create_requested = True
+            resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
+        if placement != "child" and create_requested:
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if placement != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
+        return json.dumps(unconfirmed_creation)
+    if placement == "same_host":
+        from omnigent.runner.session_requests import is_wrong_replica
+
+        # Host loss can be reported before persistence or during the later launch.
+        if is_wrong_replica(resp) or resp.status_code == 409:
+            return json.dumps(unconfirmed_creation)
+    if placement != "child" and resp.status_code in (404, 405):
+        return json.dumps(
+            {
+                "error": "Independent session creation is unavailable on this server "
+                "or the agent was not found",
+            }
+        )
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "agent_id": agent_id})
+        denied = {"error": "access_denied", "agent_id": agent_id}
+        if placement != "child":
+            denied["detail"] = resp.text[:1000]
+        return json.dumps(denied)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data = resp.json()
-    if not isinstance(data.get("id"), str) or not data["id"]:
+    try:
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a session object")
+    except ValueError:
+        if placement != "child":
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
+    if not isinstance(data.get("id"), str) or not data["id"]:
+        if placement != "child":
+            return json.dumps(unconfirmed_creation)
+        return json.dumps({"error": "server did not return a child session id"})
+    if placement != "child":
+        handle: dict[str, object] = {
+            "conversation_id": data["id"],
+            "kind": "default",
+            "status": data.get("status") or "created",
+            "agent_id": data.get("agent_id") or agent_id,
+            "title": data.get("title") or args.get("title"),
+        }
+        if placement == "same_host" and args.get("message"):
+            from omnigent.runner.session_message import execute_message_tool
+
+            initial_message = json.loads(
+                await execute_message_tool(
+                    {"session_id": data["id"], "message": args["message"]},
+                    server_client,
+                    conversation_id,
+                )
+            )
+            handle["initial_message"] = initial_message
+            if initial_message.get("error"):
+                handle["status"] = "created_initial_message_failed"
+                handle["error"] = (
+                    f"Session created, but its first task was refused or not confirmed "
+                    f"({initial_message['error']}); "
+                    "inspect this session before continuing. Do not create a replacement; "
+                    "do not automatically resend the task."
+                )
+        return json.dumps(handle)
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
@@ -3644,6 +3768,73 @@ async def _post_child_first_message(
     return None
 
 
+async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Refuse a config_path ``model`` the server cannot store.
+
+    Servers that predate ``session_bundle_model_override`` in ``GET /v1/info``
+    reject the field with a bare 400; name the cause instead, and never drop
+    the model, which would run the child on the bundle's own.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``None`` when the server accepts the field; a JSON error otherwise.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        supported = info.json().get("session_bundle_model_override") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"sys_session_create could not check server support: {exc}"})
+    if supported:
+        return None
+    return json.dumps(
+        {
+            "error": "server_too_old",
+            "detail": (
+                "This server cannot set 'model' on a config_path child. Set "
+                "executor.model in the config, create the child by agent_id, "
+                "or upgrade the server."
+            ),
+        }
+    )
+
+
+def _config_path_effort_for_harness(bundle_bytes: bytes, effort: str) -> str:
+    """
+    Check a config_path ``reasoning_effort`` against the bundled child's harness.
+
+    A known harness with no effort plumbing, or an effort outside its
+    vocabulary, is refused instead of stored and dropped at every turn;
+    aliases fold to the harness's canonical value. A harness the registry
+    cannot classify (e.g. the runtime default) passes through, and launch
+    filters it. The check lives at the tool boundary, not the multipart
+    endpoint, so direct HTTP creates keep their shared-vocabulary rules.
+
+    :param bundle_bytes: The gzipped bundle about to be uploaded.
+    :param effort: The requested effort, e.g. ``"high"``.
+    :returns: The effort to send, e.g. ``"xhigh"`` for ``"ultra"`` on codex.
+    :raises ValueError: If the bundle's harness cannot use the effort.
+    """
+    from omnigent.models.model_catalog import spec_harness
+    from omnigent.spec import load
+    from omnigent.util.reasoning_effort import efforts_for_harness
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = load(
+                bundle_bytes,
+                dest=Path(tmpdir) / "agent",
+                expand_env=False,
+                enforce_handler_allowlist=True,
+            )
+    except Exception:  # noqa: BLE001 — the server reports an invalid bundle itself.
+        return effort
+    harness = spec_harness(spec)
+    if efforts_for_harness(harness) is None:
+        return effort
+    return validate_effort_for_harness(effort, harness)
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: _JsonObject,
@@ -3665,7 +3856,8 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title``, ``model``
+        (sent as ``model_override``) and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -3688,10 +3880,25 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: _JsonObject = {"parent_session_id": conversation_id}
-    title = args.get("title")
-    if isinstance(title, str) and title:
-        metadata["title"] = title
+    for arg_name in ("model", "reasoning_effort"):
+        if args.get(arg_name) is not None and not isinstance(args.get(arg_name), str):
+            return json.dumps({"error": f"sys_session_create '{arg_name}' must be a string"})
+    metadata: _JsonObject = {
+        "parent_session_id": conversation_id,
+        **_session_create_fields(args),
+    }
+    effort = metadata.get("reasoning_effort")
+    if isinstance(effort, str):
+        try:
+            metadata["reasoning_effort"] = await asyncio.to_thread(
+                _config_path_effort_for_harness, bundle_bytes, effort
+            )
+        except ValueError as exc:
+            return json.dumps({"error": f"sys_session_create invalid 'reasoning_effort': {exc}"})
+    if "model_override" in metadata:
+        unsupported = await _bundle_model_override_unsupported(server_client)
+        if unsupported is not None:
+            return unsupported
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -3733,8 +3940,8 @@ async def _session_create_from_config_path(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title`` /
-        ``message``.
+    :param args: Parsed tool arguments; optional ``title``, ``message``,
+        ``model`` and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param publish_event: SSE publish callback for ``session.created``.
@@ -4642,9 +4849,12 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
     "model_override",
     "reasoning_effort",
     "permission_mode",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
+    "project_id",
 )
 # Fields the update tool forwards to PATCH /v1/scheduled-tasks/{id}.
 _SCHEDULED_TASK_UPDATE_FIELDS = (
@@ -4657,12 +4867,39 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
     "reasoning_effort",
     "permission_mode",
     "max_cost_usd",
+    "session_mode",
+    "session_id",
     "workspace",
     "host_id",
     "execution_target",
     "state",
+    "project_id",
 )
 _SCHEDULED_TASK_ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Fields a server accepts only once it advertises ``scheduled_task_session_modes``.
+_SCHEDULED_TASK_SESSION_FIELDS = ("session_mode", "session_id")
+
+
+async def _scheduled_task_session_fields_refusal(
+    server_client: httpx.AsyncClient, tool_name: str, payload: _JsonObject
+) -> str | None:
+    """An error for session fields this server would reject, or ``None`` to send them.
+
+    An older server forbids unknown fields, so the payload would fail with a 422
+    that does not say why. Asked only when the call carries one of the fields; an
+    unreadable ``/v1/info`` counts as unsupported, as for task projects.
+    """
+    if not any(field in payload for field in _SCHEDULED_TASK_SESSION_FIELDS):
+        return None
+    info = await server_client.get("/v1/info", timeout=30.0)
+    if info.status_code < 400 and info.json().get("scheduled_task_session_modes") is True:
+        return None
+    return json.dumps(
+        {
+            "error": f"{tool_name}: this Omnigent server does not support session_mode or "
+            "session_id; omit them to start a new session on every run"
+        }
+    )
 
 
 def _scheduled_task_url(task_id: object) -> str | None:
@@ -4672,11 +4909,48 @@ def _scheduled_task_url(task_id: object) -> str | None:
     return f"/v1/scheduled-tasks/{task_id.lower()}"
 
 
+async def _project_id_for_name(server_client: httpx.AsyncClient, name: str) -> str:
+    """
+    Return the id of the caller's project named *name*, creating it if missing.
+
+    Uses the projects API the web picker uses, so a typed name files sessions
+    and automations into the same project. A create that loses a race to the
+    same name (409) reuses the project the other request made.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param name: The project name, e.g. ``"nightly triage"``.
+    :returns: The project id.
+    :raises ValueError: If the name is blank or the project can't be resolved.
+    """
+    trimmed = name.strip()
+    if not trimmed:
+        raise ValueError("project_name must not be empty")
+
+    async def find() -> str | None:
+        resp = await server_client.get("/v1/projects", timeout=30.0)
+        if resp.status_code >= 400:
+            raise ValueError(f"could not list projects: {resp.text[:200]}")
+        projects = resp.json().get("data", [])
+        return next((p["id"] for p in projects if p.get("name") == trimmed), None)
+
+    existing = await find()
+    if existing is not None:
+        return existing
+    created = await server_client.post("/v1/projects", json={"name": trimmed}, timeout=30.0)
+    if created.status_code < 400:
+        return str(created.json()["id"])
+    racer = await find() if created.status_code == 409 else None
+    if racer is not None:
+        return racer
+    raise ValueError(f"could not create project {trimmed!r}: {created.text[:200]}")
+
+
 async def _execute_scheduled_task_tool(
     tool_name: str,
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -4691,6 +4965,7 @@ async def _execute_scheduled_task_tool(
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: Session whose approved tool call is being dispatched.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -4699,13 +4974,56 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
+        action = "create" if tool_name == "sys_scheduled_task_create" else "update"
+        error = scheduled_task_review_error(args, action=action)
+        if error:
+            return json.dumps({"error": f"{tool_name}: {error}"})
+    if "project_name" in args and "project_id" in args:
+        return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
+    raw_project_name = args.get("project_name")
+    if "project_name" in args and not isinstance(raw_project_name, str):
+        return json.dumps(
+            {"error": f"{tool_name}: project_name must be a string; use project_id: null to clear"}
+        )
+    project_name = raw_project_name if isinstance(raw_project_name, str) else None
+    wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
+        "project_name" in args or "project_id" in args
+    )
+    mutation_headers = (
+        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
+    )
 
     try:
+        if wants_project:
+            # Older servers reject the field; refuse before creating a project for it.
+            info = await server_client.get("/v1/info", timeout=30.0)
+            if info.status_code >= 400 or info.json().get("scheduled_task_projects") is not True:
+                return json.dumps(
+                    {
+                        "error": f"{tool_name}: this server does not support automation "
+                        "projects; retry without project_name or project_id"
+                    }
+                )
         if tool_name == "sys_scheduled_task_list":
             resp = await server_client.get("/v1/scheduled-tasks", timeout=30.0)
         elif tool_name == "sys_scheduled_task_create":
             payload = {k: args[k] for k in _SCHEDULED_TASK_CREATE_FIELDS if k in args}
-            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+            refusal = await _scheduled_task_session_fields_refusal(
+                server_client, tool_name, payload
+            )
+            if refusal is not None:
+                return refusal
+            if project_name is not None:
+                payload["project_id"] = await _project_id_for_name(server_client, project_name)
+            resp = await server_client.post(
+                "/v1/scheduled-tasks",
+                json=payload,
+                timeout=30.0,
+                headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
+            )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
@@ -4719,7 +5037,25 @@ async def _execute_scheduled_task_tool(
                 resp = await server_client.delete(task_url, timeout=30.0)
             else:
                 payload = {k: args[k] for k in _SCHEDULED_TASK_UPDATE_FIELDS if k in args}
-                resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                refusal = await _scheduled_task_session_fields_refusal(
+                    server_client, tool_name, payload
+                )
+                if refusal is not None:
+                    return refusal
+                resp = None
+                if project_name is not None:
+                    # Confirm the task first so a bad id doesn't leave a new project behind.
+                    existing = await server_client.get(task_url, timeout=30.0)
+                    if existing.status_code >= 400:
+                        resp = existing
+                    else:
+                        payload["project_id"] = await _project_id_for_name(
+                            server_client, project_name
+                        )
+                if resp is None:
+                    resp = await server_client.patch(
+                        task_url, json=payload, headers=mutation_headers, timeout=30.0
+                    )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -4931,11 +5267,12 @@ async def _execute_session_query_tool(
 
     if tool_name == "sys_session_list":
         agent_name = args.get("agent_name")
+        include_archived = args.get("include_archived") is True
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            {"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+            _session_list_filters(agent_name, include_archived),
         )
         if isinstance(window, str):
             return window
@@ -4944,6 +5281,7 @@ async def _execute_session_query_tool(
             conversation_id,
             server_client,
             agent_name,
+            include_archived=include_archived,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -5084,6 +5422,9 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
+                CREATED_BY_SESSION_LABEL_KEY
+            ),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
@@ -5864,11 +6205,31 @@ def _project_agent_list(
     }
 
 
+def _session_list_filters(agent_name: object, include_archived: bool) -> _JsonObject:
+    """
+    The ``sys_session_list`` filters a continuation cursor is bound to.
+
+    ``include_archived`` is recorded only when set, so cursors issued before
+    the flag existed still match a call that omits it.
+
+    :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
+    :param include_archived: Whether archived sessions are listed.
+    :returns: The filter mapping, e.g. ``{"agent_name": None}``.
+    """
+    filters: _JsonObject = {
+        "agent_name": agent_name if isinstance(agent_name, str) and agent_name else None
+    }
+    if include_archived:
+        filters["include_archived"] = True
+    return filters
+
+
 async def _session_list_via_rest(
     conversation_id: str,
     server_client: httpx.AsyncClient,
     agent_name: object = None,
     *,
+    include_archived: bool = False,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -5889,6 +6250,7 @@ async def _session_list_via_rest(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter for the global
         ``sessions`` view; ignored for ``sub_agents``.
+    :param include_archived: Also list archived sessions in the global view.
     :param limit: Optional maximum rows returned from the global sessions view. When
         omitted, the complete legacy result is preserved while it fits.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -5902,20 +6264,72 @@ async def _session_list_via_rest(
         else await _collect_global_sessions(
             server_client,
             agent_name,
+            include_archived=include_archived,
             after=cursor_state["sessions"][1],
             limit=limit or _AGENT_LIST_PAGE_LIMIT,
         )
     )
-    return _bounded_discovery_result(
+    result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters={"agent_name": agent_name if isinstance(agent_name, str) and agent_name else None},
+        filters=_session_list_filters(agent_name, include_archived),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
     )
+    return await _fill_returned_runner_online(result, server_client)
+
+
+async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncClient) -> str:
+    """
+    Resolve ``runner_online`` for the session rows the tool actually returns.
+
+    The global view fetches up to :data:`_AGENT_LIST_PAGE_LIMIT` sessions but
+    the output budget usually keeps far fewer, so resolving before paging
+    fired one status call per runner across the whole fetch. Rows are sized
+    with the :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER`, the widest value, so
+    the chosen page stays within the budget once real values replace it.
+
+    :param result: Serialized ``sys_session_list`` result from
+        :func:`_bounded_discovery_result`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: The same result with each returned row's ``runner_online``
+        resolved; error results pass through unchanged.
+    """
+    payload = json.loads(result)
+    rows = payload.get("sessions")
+    if not isinstance(rows, list) or not rows:
+        return result
+    online = await _resolve_runner_online_map(rows, server_client)
+    for row in rows:
+        row["runner_online"] = online.get(_optional_string(row.get("runner_id")) or "")
+    return json.dumps(payload)
+
+
+async def _open_file_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Validate and forward a UI request using only the calling session's identity."""
+    if server_client is None or not conversation_id:
+        return json.dumps({"error": "ui_open_file requires server access and a session id"})
+    try:
+        body = OpenFileRequest.model_validate(args)
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/ui/open-file",
+            json=body.model_dump(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or type(result.get("subscribers")) is not int:
+            return json.dumps({"error": "ui_open_file returned an invalid delivery response"})
+        return json.dumps(result)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"ui_open_file failed: {exc}"})
 
 
 async def _rename_current_session_via_rest(
@@ -6095,9 +6509,15 @@ async def _resolve_runner_online_map(
         if isinstance(rid, str) and rid and rid not in seen:
             seen.add(rid)
             unique_ids.append(rid)
-    results = await asyncio.gather(
-        *(_runner_online_or_none(rid, server_client) for rid in unique_ids)
-    )
+    # Spread the lookups so one tool call can't burst the server (and the
+    # caller's per-user rate limit) with a status call per runner at once.
+    concurrency = asyncio.Semaphore(_RUNNER_STATUS_CONCURRENCY)
+
+    async def _bounded_lookup(runner_id: str) -> bool | None:
+        async with concurrency:
+            return await _runner_online_or_none(runner_id, server_client)
+
+    results = await asyncio.gather(*(_bounded_lookup(rid) for rid in unique_ids))
     # strict=True: results is gathered in unique_ids order, so lengths
     # match by construction — assert it rather than silently truncating.
     return dict(zip(unique_ids, results, strict=True))
@@ -6107,16 +6527,18 @@ async def _collect_global_sessions(
     server_client: httpx.AsyncClient,
     agent_name: object,
     *,
+    include_archived: bool = False,
     after: str | None,
     limit: int,
 ) -> _DiscoveryPage:
     """
-    Fetch the global session list via ``GET /v1/sessions``, with connectivity.
+    Fetch the global session list via ``GET /v1/sessions``.
 
     Projects each accessible session to ``{session_id, agent_name, title,
     status, runner_id, runner_online, parent_session_id}``.
-    ``runner_online`` is resolved once per unique bound runner (see
-    :func:`_resolve_runner_online_map`). An optional ``agent_name``
+    ``runner_online`` holds :data:`_RUNNER_ONLINE_SIZING_PLACEHOLDER` until
+    :func:`_fill_returned_runner_online` resolves it for the rows that
+    survive paging. An optional ``agent_name``
     filters the list server-side. Permission-bounded by the server (the
     runner's request carries the owning user's identity). Best-effort:
     returns ``[]`` on a fetch failure.
@@ -6124,6 +6546,8 @@ async def _collect_global_sessions(
     :param server_client: HTTP client pointed at the Omnigent server.
     :param agent_name: Optional agent-name filter; applied only when a
         non-empty string.
+    :param include_archived: Also return archived sessions, each marked
+        ``archived``.
     :param after: Server cursor from the previous page, if any.
     :param limit: Maximum number of source rows to fetch.
     :returns: Projected global session entries and continuation metadata.
@@ -6131,6 +6555,8 @@ async def _collect_global_sessions(
     params: dict[str, str | int] = {"limit": limit, "order": "desc", "visibility": "all"}
     if isinstance(agent_name, str) and agent_name:
         params["agent_name"] = agent_name
+    if include_archived:
+        params["include_archived"] = "true"
     if after is not None:
         params["after"] = after
     try:
@@ -6147,7 +6573,6 @@ async def _collect_global_sessions(
     if page.failed:
         return page
     rows = page.rows
-    online = await _resolve_runner_online_map(rows, server_client)
     return _DiscoveryPage(
         [
             {
@@ -6160,8 +6585,13 @@ async def _collect_global_sessions(
                 "title": r.get("title"),
                 "status": r.get("status"),
                 "runner_id": r.get("runner_id"),
-                "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
+                "runner_online": _RUNNER_ONLINE_SIZING_PLACEHOLDER,
                 "parent_session_id": r.get("parent_session_id"),
+                "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
+                    CREATED_BY_SESSION_LABEL_KEY
+                ),
+                # Only an archive-inclusive listing can return archived rows.
+                **({"archived": r.get("archived") is True} if include_archived else {}),
             }
             for r in rows
         ],
@@ -6683,6 +7113,10 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name == SysSessionMessageTool.name():
+            from omnigent.runner.session_message import execute_message_tool
+
+            output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
@@ -6692,6 +7126,8 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in _UI_TOOLS:
+            output = await _open_file_via_rest(args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,
@@ -6811,6 +7247,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
@@ -7147,6 +7584,35 @@ def _effective_runner_os_env_spec(
     return OSEnvSpec(type="caller_process", cwd=cwd)
 
 
+async def _read_os_env_text(os_env: OSEnvironment, path: str) -> str | None:
+    """Return *path*'s complete UTF-8 text within the read cap, keeping its line endings.
+
+    A one-byte probe skips binary files before their content is read.
+
+    :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
+        the current tool dispatch — reused to avoid opening a second connection.
+    :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
+    :returns: The text, or ``None`` when the file is missing, binary, too large
+        to read whole, or unreadable.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    try:
+        probe = await os_env.read(path=path, offset=1, limit=None, max_bytes=1)
+        if not isinstance(probe, dict) or probe.get("encoding") != "utf-8":
+            return None
+        existing = await os_env.read(path=path, offset=1, limit=None, max_bytes=_MAX_READ_BYTES)
+    except Exception:  # noqa: BLE001
+        return None  # file does not exist yet or unreadable
+    if (
+        isinstance(existing, dict)
+        and existing.get("encoding") == "utf-8"
+        and not existing.get("truncated")
+    ):
+        return cast("str", existing["content"])
+    return None
+
+
 async def _seed_os_env_snapshot(
     os_env: OSEnvironment,
     path: str,
@@ -7158,8 +7624,9 @@ async def _seed_os_env_snapshot(
     Reads the file via *os_env* and passes the content to
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
     so the before/after diff endpoint can show the original content.
-    Silently skips when the file does not yet exist (new-file creates have no
-    baseline) or when any other read error occurs.
+    A file without complete text (see :func:`_read_os_env_text`) seeds no
+    snapshot and an unknown original, since a partial or binary original
+    cannot tell when a write restores it.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -7167,14 +7634,8 @@ async def _seed_os_env_snapshot(
     :param filesystem_registry: Registry that stores the snapshot.
     :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
     """
-    try:
-        existing = await os_env.read(path=path, offset=1, limit=None)
-        if isinstance(existing, dict) and "content" in existing:
-            filesystem_registry.seed_snapshot(
-                path, existing["content"], session_id=conversation_id
-            )
-    except Exception:  # noqa: BLE001
-        pass  # file does not exist yet or unreadable — no baseline to capture
+    original = await _read_os_env_text(os_env, path)
+    filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
 
 
 async def _execute_os_env_tool(
@@ -7265,7 +7726,9 @@ async def _execute_os_env_tool(
                 # previously exist, {"created": False} for an overwrite.
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
-                filesystem_registry.record_change(_path, status, conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, status, conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
@@ -7277,7 +7740,9 @@ async def _execute_os_env_tool(
                 edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
-                filesystem_registry.record_change(_path, "modified", conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
@@ -7985,11 +8450,23 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
         if status == "completed":
+            # A confirmed completion can overturn an optimistic cancellation the
+            # parent was already told about; note the correction so the earlier
+            # cancelled line is not read as a contradiction.
+            corrected = (
+                ", superseding its earlier cancelled notice"
+                if payload.get("corrected_status") == "cancelled"
+                else ""
+            )
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
+                    f"[System: sub-agent task {handle_id} completed — {target} "
+                    f"produced no output{corrected}]"
                 )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} completed — {target} "
+                f"returned: {output}{corrected}]"
+            )
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":

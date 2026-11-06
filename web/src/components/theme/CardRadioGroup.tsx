@@ -18,6 +18,7 @@ export function CardRadioGroup<T extends string>({
   items,
   className,
   cardClassName,
+  compact = false,
 }: {
   labelledBy: string;
   value: T;
@@ -26,6 +27,7 @@ export function CardRadioGroup<T extends string>({
   items: readonly CardRadioOption<T>[];
   className?: string;
   cardClassName?: string;
+  compact?: boolean;
 }) {
   const { trackValueChange } = useOmnigentAnalytics();
   const select = componentId
@@ -63,9 +65,9 @@ export function CardRadioGroup<T extends string>({
               select(next);
               refs.current.get(next)?.focus();
             }}
-            className={themeCardClass(selected, cardClassName)}
+            className={themeCardClass(selected, compact, cardClassName)}
           >
-            {selected && <SelectedBadge />}
+            {selected && !compact && <SelectedBadge />}
             {item.body}
           </button>
         );
@@ -85,9 +87,12 @@ function SelectedBadge() {
   );
 }
 
-function themeCardClass(selected: boolean, layout?: string) {
+function themeCardClass(selected: boolean, compact: boolean, layout?: string) {
   return cn(
-    "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
+    "relative flex rounded-lg border transition-[color,background-color,border-color,box-shadow]",
+    compact
+      ? "h-9 flex-1 flex-row items-center justify-center gap-2 px-3 whitespace-nowrap outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50"
+      : "flex-col",
     selected
       ? "border-primary bg-primary/5"
       : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",

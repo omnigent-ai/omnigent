@@ -34,25 +34,22 @@ const TIERS: { id: SharingMode; label: string; description: string }[] = [
     id: "on",
     label: "On",
     description:
-      "Anyone with manage access can share a session at any level (read, edit, or manage) and toggle public / workspace read.",
+      "Users with manage access can share at read, edit, or manage level and enable public or workspace read access.",
   },
   {
     id: "read_only",
     label: "Read only",
-    description:
-      "New shares are capped at read (view) access. Edit and manage grants are rejected.",
+    description: "New shares allow Read access only; Edit and Manage grants are rejected.",
   },
   {
     id: "restricted_read_only",
     label: "Read only (restricted)",
-    description:
-      "Read-only, and sessions whose working directory is a home directory or the filesystem root cannot be shared at all — not even read.",
+    description: "Read-only. Sessions in a home directory or the filesystem root cannot be shared.",
   },
   {
     id: "off",
     label: "Off",
-    description:
-      "Sharing is disabled. No new grants can be created and the Share control is hidden.",
+    description: "Block new shares and hide the Share control.",
   },
 ];
 
@@ -65,8 +62,7 @@ const DEFAULT_PUBLIC_OPTIONS: {
   {
     id: "sandbox",
     label: "Managed hosts only",
-    description:
-      "Share sessions on server-managed sandboxes. Sessions on local hosts start private.",
+    description: "Share sessions on managed sandboxes. Local sessions start private.",
   },
   {
     id: "all",
@@ -128,8 +124,12 @@ export function SharingPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Session sharing</h1>
+      <PageScroll
+        maxWidthClassName="max-w-4xl"
+        contentClassName="px-4 md:px-8"
+        extraBottom="2.5rem"
+      >
+        <h1 className="settings-page-title mb-2 text-2xl font-medium">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
@@ -180,14 +180,13 @@ export function SharingPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+    <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div>
         <div className="mb-6">
-          <h1 className="settings-page-title text-2xl font-semibold">Session sharing</h1>
-          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
-            Control whether users on this server can share sessions with others. Applies server-wide
-            and takes effect immediately. Sharing mode and visibility defaults affect new shares.
-            The public permission ceiling also applies to existing public grants.
+          <h1 className="settings-page-title text-2xl font-medium">Session sharing</h1>
+          <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
+            Control sharing server-wide. Mode and visibility defaults affect new shares; public
+            permission limits also affect existing public grants. Changes apply immediately.
           </p>
         </div>
 
@@ -237,7 +236,7 @@ export function SharingPage() {
                             </span>
                             <span
                               id={`sharing-mode-${tier.id}-description`}
-                              className="text-sm leading-normal whitespace-normal text-muted-foreground"
+                              className="text-sm whitespace-normal text-muted-foreground"
                             >
                               {tier.description}
                             </span>
@@ -248,7 +247,7 @@ export function SharingPage() {
                   </Select>
                   <p
                     id="sharing-mode-description"
-                    className="min-w-0 flex-1 text-sm leading-normal text-muted-foreground md:pt-1"
+                    className="min-w-0 flex-1 text-sm text-muted-foreground md:pt-1"
                   >
                     {currentTier?.description}
                   </p>
@@ -263,9 +262,8 @@ export function SharingPage() {
                       className="flex-1"
                       description={
                         <>
-                          Allow sharing a session with anyone who has the link and can sign in. When
-                          off, new public grants are rejected; existing public grants remain
-                          accessible and can be revoked.
+                          Anyone with the link can access after signing in. Turning this off blocks
+                          new public grants; existing grants stay accessible and revocable.
                           {!publicEditable && (
                             <span className="mt-1 block">
                               Managed by this deployment and can&apos;t be changed here.
@@ -290,8 +288,8 @@ export function SharingPage() {
                     className="min-w-0 flex-1"
                     description={
                       <>
-                        The maximum access a public link can grant. Lowering this to Read also
-                        limits existing public Edit grants. Raising it does not upgrade Read grants.
+                        Limit access through public links. Lowering to Read limits existing Edit
+                        grants; raising it does not upgrade Read grants.
                         {!publicMaxEditable && (
                           <span className="mt-1 block">Managed by this deployment.</span>
                         )}
@@ -337,9 +335,8 @@ export function SharingPage() {
                         className="flex-1"
                         description={
                           <>
-                            New sessions start with public read access for anyone with the link who
-                            can sign in. Owners can revoke it in Share. Existing sessions are
-                            unchanged.
+                            New sessions allow public read access with a link and sign-in. Owners
+                            can revoke it in Share. Existing sessions stay unchanged.
                             {!defaultPublicEditable && (
                               <span className="mt-1 block">
                                 Managed by this deployment and can&apos;t be changed here.

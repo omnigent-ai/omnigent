@@ -26,7 +26,8 @@
  *
  * It also lists sessions with unseen agent output — the same read-state
  * behind the sidebar's unread dot — previewing the latest reply. Opening
- * the session or "Mark as read" clears a row.
+ * the session or "Mark as read" clears a row. The card can also reply; a send
+ * leaves the whole-second read baseline alone and lets the running turn hide it.
  *
  * Every kind renders as the same card: a one-line row (kind tile, label,
  * session title — preview, time, unread dot) that expands in place. All
@@ -41,13 +42,18 @@
  * what clears an approval.
  */
 
+import type { AutomationFailure } from "@/lib/scheduledTasksApi";
+import { describeRunFailure } from "@/lib/scheduleText";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import type { Query } from "@tanstack/react-query";
 import type { Session } from "@/lib/types";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangleIcon,
   ArrowRightIcon,
+  ArrowUpIcon,
   CheckIcon,
   CircleAlertIcon,
   CircleCheckIcon,
@@ -58,13 +64,20 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { ApprovalCard, type SubmitApprovalFn } from "@/components/blocks/ApprovalCard";
+import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
 import { PageScroll } from "@/components/PageScroll";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
+import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Textarea } from "@/components/ui/textarea";
+import { showToast } from "@/components/ui/toast";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
+  clearUnreadOverride,
   isConversationUnseen,
   markConversationRead,
   useUnseenTick,
@@ -84,13 +97,38 @@ import {
   writeInboxFilter,
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
-import { latestOutputPreview } from "@/lib/lastAssistantText";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
+import {
+  isComposerAltNewlineKey,
+  isComposerSendKey,
+  readSubmitWithModEnter,
+} from "@/lib/composerSendShortcutPreferences";
+import { insertComposerText } from "@/lib/composerText";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { latestOutput } from "@/lib/lastAssistantText";
+import { isEditorLevel } from "@/lib/permissionsApi";
+import { randomUUID } from "@/lib/randomUUID";
+import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
-import { approve, fetchSessionItemsPage, getSession } from "@/lib/sessionsApi";
+import {
+  ApiError,
+  HOST_OFFLINE_CODE,
+  approve,
+  fetchSessionItemsPage,
+  getSession,
+  postEvent,
+} from "@/lib/sessionsApi";
 import { userColor, userInitials } from "@/lib/userBadge";
 import { cn } from "@/lib/utils";
+import { FileViewerContext } from "@/shell/FileViewerContext";
 import { conversationDisplayLabel, getConversationAgentType } from "@/shell/sidebarNav";
 
 /** Optimistic verdicts keyed by elicitation id, mirroring the chat store's flip. */
@@ -103,6 +141,24 @@ type RespondedMap = Record<
     attempt?: string;
   }
 >;
+
+/**
+ * Per-session reply state; absent means idle. `retryStableId` names the failed
+ * attempt for an untouched retry; `outputKey` and `rowStatus` are the row's
+ * latest output and status at send time.
+ */
+type ReplyStatus =
+  | { state: "sending" }
+  | { state: "failed"; message: string; retryStableId: string }
+  | { state: "sent"; outputKey: string | null; rowStatus: string | undefined };
+
+// An answer saved in the reply's own `updated_at` second leaves the row
+// unchanged, so the preview is refetched once after that second has passed.
+const SAME_SECOND_RECHECK_MS = 2000;
+
+// The server's hold message promises a resend the Inbox doesn't do.
+const HOST_OFFLINE_REPLY_MESSAGE =
+  "The host for this session is offline, so the reply wasn’t sent. Try again once it reconnects.";
 
 const INBOX_TABS: { value: InboxFilter; label: string }[] = [
   { value: "all", label: "All" },
@@ -133,7 +189,8 @@ const PREVIEW_MAX_CHARS = 280;
 type InboxEntry =
   | { kind: "approval"; key: string; at: number; item: InboxItem }
   | { kind: "comment"; key: string; at: number; item: CommentInboxItem }
-  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem };
+  | { kind: "unread"; key: string; at: number; item: UnreadInboxItem }
+  | { kind: "automation"; key: string; at: number; item: AutomationFailure };
 
 const TILE_TONES = {
   yellow: "bg-status-yellow/12 text-status-yellow",
@@ -143,18 +200,25 @@ const TILE_TONES = {
 
 // Compact action buttons inside an expanded card.
 const OUTLINE_ACTION =
-  "rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md border-button-border bg-transparent text-ui text-muted-foreground hover:text-foreground";
 const PRIMARY_ACTION =
-  "rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
+  "mobile-touch-target mobile-app:h-auto mobile-app:whitespace-normal rounded-md bg-foreground text-ui text-card hover:bg-foreground/80 [&_svg]:text-card";
 
 export function InboxPage() {
   const queryClient = useQueryClient();
   const { trackClick } = useOmnigentAnalytics();
+  useEffect(() => {
+    void queryClient.invalidateQueries({ queryKey: ["automation-inbox"] });
+  }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
+    automationInbox,
   } = useSidebarData();
+  const taskDetailsEnabled = isFeatureEnabled(useServerInfo(), "automations_v2");
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
   const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
@@ -163,6 +227,14 @@ export function InboxPage() {
   // approval. Keying by id (not index) keeps a user's explicit toggles
   // stable when new items shift positions.
   const [expandedOverrides, setExpandedOverrides] = useState<Record<string, boolean>>({});
+  // Keyed by session id at page level: a collapsed card unmounts its body,
+  // and the draft must survive the toggle.
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, string>>({});
+  const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
+  const [submitWithModEnter] = useState(readSubmitWithModEnter);
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);
@@ -211,33 +283,77 @@ export function InboxPage() {
       queryKey: ["inbox-unread-preview", row.id, row.updated_at],
       queryFn: async () => {
         const page = await fetchSessionItemsPage(row.id, { limit: PREVIEW_SCAN_ITEMS });
-        return latestOutputPreview(page.items, PREVIEW_MAX_CHARS) ?? null;
+        return latestOutput(page.items, PREVIEW_MAX_CHARS) ?? null;
       },
       enabled: showUnread,
       staleTime: Infinity,
       retry: 1,
     })),
   });
-  const previewBySession = new Map(
-    unreadItems.map(({ row }, i) => [row.id, previewQueries[i]?.data ?? undefined]),
-  );
+  const previewBySession = new Map(unreadItems.map(({ row }, i) => [row.id, previewQueries[i]]));
+
+  // Settle once the row hides, changes status, or loads new output; then
+  // refetch, since the answer may share a cached second.
+  const settledReplyIds = Object.entries(replyStatuses)
+    .filter(([sessionId, status]) => {
+      if (status.state !== "sent") return false;
+      const index = unreadItems.findIndex(({ row }) => row.id === sessionId);
+      if (index === -1) return true;
+      const query = previewQueries[index];
+      return (
+        unreadItems[index]!.row.status !== status.rowStatus ||
+        (query?.isPending === false &&
+          !query.isError &&
+          (query.data?.key ?? null) !== status.outputKey)
+      );
+    })
+    .map(([sessionId]) => sessionId);
+  const settledReplyKey = settledReplyIds.join("\n");
+  useEffect(() => {
+    if (!settledReplyKey) return;
+    const settled = settledReplyKey.split("\n");
+    for (const sessionId of settled) {
+      void queryClient.invalidateQueries({ queryKey: ["inbox-unread-preview", sessionId] });
+    }
+    setReplyStatuses((prev) =>
+      Object.fromEntries(
+        Object.entries(prev).filter(([sessionId]) => !settled.includes(sessionId)),
+      ),
+    );
+  }, [settledReplyKey, queryClient]);
 
   const visibleApprovals = showApprovals ? items : [];
   const visibleComments = showUnread ? commentInbox.items : [];
   const visibleUnread = showUnread ? unreadItems : [];
-  const visibleCount = visibleApprovals.length + visibleComments.length + visibleUnread.length;
-  const totalCount = items.length + commentInbox.items.length + unreadItems.length;
+  const visibleAutomations = showUnread ? automationInbox.items : [];
+  const visibleCount =
+    visibleApprovals.length +
+    visibleComments.length +
+    visibleUnread.length +
+    visibleAutomations.length;
+  const totalCount =
+    items.length + commentInbox.items.length + unreadItems.length + automationInbox.items.length;
   const summary = [
     items.length > 0 && (items.length === 1 ? "1 approval" : `${items.length} approvals`),
     commentInbox.items.length > 0 &&
       (commentInbox.items.length === 1 ? "1 comment" : `${commentInbox.items.length} comments`),
     unreadItems.length > 0 && `${unreadItems.length} unread`,
+    automationInbox.items.length > 0 &&
+      (automationInbox.items.length === 1
+        ? "1 failed automation"
+        : `${automationInbox.items.length} failed automations`),
   ]
     .filter(Boolean)
     .join(" · ");
   const emptyState = EMPTY_STATES[filter];
 
   const groups = groupInboxEntries<InboxEntry>([
+    ...visibleAutomations.map((item) => ({
+      kind: "automation" as const,
+      key: `automation:${item.runId}`,
+      at: item.finishedAt ?? item.scheduledAt,
+      item,
+    })),
     ...visibleApprovals.map((item) => ({
       kind: "approval" as const,
       key: `approval:${item.elicitation.elicitationId}`,
@@ -297,7 +413,8 @@ export function InboxPage() {
     conversationsQuery.isLoading ||
     isFetchingNextPage ||
     snapshotQueries.some((q) => q.isLoading) ||
-    commentInbox.isLoading;
+    commentInbox.isLoading ||
+    (showUnread && automationInbox.isLoading);
   const failedSnapshots = snapshotQueries.filter((q) => q.isError);
   const failedSessionCount =
     failedSnapshots.length + commentInbox.failedCount + Number(Boolean(conversationsQuery.isError));
@@ -318,6 +435,15 @@ export function InboxPage() {
       };
       pendingSubmissions.current.set(elicitationId, verdict);
       setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
@@ -326,6 +452,8 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
+          clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
             const queryKey = ["inbox-elicitations", item.row.id];
@@ -337,6 +465,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          cancelLocalElicitationResolution(elicitationId, holdToken);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -355,6 +484,47 @@ export function InboxPage() {
       trackClick(`inbox.${entry.kind}.toggle_expanded`, "button");
       setExpandedOverrides((prev) => ({ ...prev, [entry.key]: !expanded }));
     };
+    if (entry.kind === "automation") {
+      const { item } = entry;
+      const failure = describeRunFailure(item.errorCode, "failed");
+      const reason = failure.stage ? `${failure.stage} · ${failure.reason}` : failure.reason;
+      return (
+        <InboxCard
+          key={entry.key}
+          testId="inbox-automation-item"
+          tile={<KindTile icon={AlertTriangleIcon} tone="red" />}
+          kindLabel="Automation failed"
+          title={item.taskName}
+          preview={reason}
+          at={entry.at}
+          unread
+          expanded={expanded}
+          onToggle={onToggle}
+        >
+          <p className="text-ui font-medium">{item.taskName}</p>
+          <p className="mt-2 text-ui text-muted-foreground">{reason}</p>
+          <InboxActions>
+            <Button asChild size="xs" className={PRIMARY_ACTION}>
+              <Link
+                to={taskDetailsEnabled ? `/tasks/${item.taskId}` : "/tasks"}
+                componentId="inbox.automation.open"
+              >
+                Open automation <ArrowRightIcon className="size-3.5" />
+              </Link>
+            </Button>
+            <Button
+              variant="outline"
+              size="xs"
+              className={OUTLINE_ACTION}
+              onClick={() => automationInbox.markRead(item.runId)}
+              componentId="inbox.automation.mark_read"
+            >
+              <CheckIcon className="size-3.5" /> Mark as read
+            </Button>
+          </InboxActions>
+        </InboxCard>
+      );
+    }
     const title = conversationDisplayLabel(entry.item.row);
 
     if (entry.kind === "approval") {
@@ -406,9 +576,11 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
+            permissionDirectories={item.elicitation.permissionDirectories}
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
             agyPermission={item.elicitation.agyPermission}
@@ -496,11 +668,95 @@ export function InboxPage() {
     const { item } = entry;
     const sessionId = item.row.id;
     const isError = item.kind === "error";
-    const preview = previewBySession.get(sessionId);
+    const previewQuery = previewBySession.get(sessionId);
+    const output = previewQuery?.data ?? undefined;
+    const preview = output?.preview;
     const markRead = () => {
-      // Drop the toggle so a later reply re-surfaces the row collapsed.
+      // Drop the toggle so a later reply re-surfaces the row collapsed, and
+      // the reply state so it can't come back stale with the row.
       setExpandedOverrides(({ [entry.key]: _cleared, ...rest }) => rest);
+      setReplyDrafts(({ [sessionId]: _draft, ...rest }) => rest);
+      setReplyStatuses(({ [sessionId]: _status, ...rest }) => rest);
       markConversationRead(sessionId, item.row.updated_at);
+    };
+    // The server refuses user messages below edit access.
+    const canReply = isEditorLevel(item.row.permission_level);
+    const replyDraft = replyDrafts[sessionId] ?? "";
+    const replyStatus = replyStatuses[sessionId];
+    const replySending = replyStatus?.state === "sending";
+    const replyAwaitingAnswer =
+      replyStatus?.state === "sent" && !settledReplyIds.includes(sessionId);
+    // A send records the current output to tell the agent's answer from it, so
+    // only a loaded preview will do; a failed fetch leaves no baseline.
+    const previewReady = previewQuery?.isSuccess === true;
+    const showReplyField = canReply && !replyAwaitingAnswer;
+    const sendIsPrimary = showReplyField && replyDraft.trim() !== "";
+    const sendReply = () => {
+      if (!replyDraft.trim() || replySending || !previewReady) return;
+      // One telemetry point for both the button and the keyboard shortcut.
+      trackClick("inbox.unread.reply", "button");
+      // Like the composer: an untouched retry reuses the failed id; editing drops it.
+      const retriesFailedSend = replyStatus?.state === "failed";
+      const stableId = retriesFailedSend
+        ? replyStatus.retryStableId
+        : randomUUID().replace(/-/g, "");
+      const outputKey = output?.key ?? null;
+      const rowStatus = item.row.status;
+      setReplyStatuses((prev) => ({ ...prev, [sessionId]: { state: "sending" } }));
+      void postEvent(
+        sessionId,
+        {
+          type: "message",
+          data: {
+            role: "user",
+            content: [{ type: "input_text", text: replyDraft }],
+            stable_id: stableId,
+          },
+        },
+        // Otherwise an offline host gets a failed turn recorded while the
+        // POST still answers `queued`, and the reply would read as sent.
+        { holdWhenHostOffline: true },
+      ).then(
+        (result) => {
+          if (result.denied) {
+            setReplyStatuses((prev) => ({
+              ...prev,
+              [sessionId]: {
+                state: "failed",
+                message: "A policy blocked this reply.",
+                retryStableId: stableId,
+              },
+            }));
+            return;
+          }
+          setReplyDrafts(({ [sessionId]: _sent, ...rest }) => rest);
+          // A retry may or may not start a turn (the server dedupes one that
+          // already ran), so it gets no note that might never settle.
+          setReplyStatuses(({ [sessionId]: _previous, ...rest }) =>
+            retriesFailedSend
+              ? rest
+              : { ...rest, [sessionId]: { state: "sent", outputKey, rowStatus } },
+          );
+          // Replying is reading: undo only an explicit "Mark as unread".
+          clearUnreadOverride(sessionId);
+          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          setTimeout(() => {
+            void queryClient.invalidateQueries({ queryKey: ["inbox-unread-preview", sessionId] });
+          }, SAME_SECOND_RECHECK_MS);
+          showToast(`Reply sent to ${title}`);
+        },
+        (error: unknown) => {
+          // Keep the draft so the user can retry or open the session instead.
+          const message =
+            error instanceof ApiError && error.code === HOST_OFFLINE_CODE
+              ? HOST_OFFLINE_REPLY_MESSAGE
+              : describeSendFailure(error).message;
+          setReplyStatuses((prev) => ({
+            ...prev,
+            [sessionId]: { state: "failed", message, retryStableId: stableId },
+          }));
+        },
+      );
     };
     return (
       <InboxCard
@@ -523,29 +779,90 @@ export function InboxPage() {
       >
         <div>
           <SessionLine title={title} />
-          {preview && (
-            <p className="mt-2 text-ui font-medium break-words whitespace-pre-wrap">{preview}</p>
-          )}
+          {preview && <LatestOutputPreview preview={preview} fullText={output?.fullText} />}
         </div>
+        {replyAwaitingAnswer && (
+          <p role="status" className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <CheckIcon aria-hidden className="size-3.5 shrink-0" />
+            Reply sent. The agent’s answer will show up here.
+          </p>
+        )}
+        {showReplyField && (
+          <InboxReplyField
+            label={`Reply to ${title}`}
+            value={replyDraft}
+            onChange={(value) => {
+              setReplyDrafts((prev) => ({ ...prev, [sessionId]: value }));
+              setReplyStatuses(({ [sessionId]: _stale, ...rest }) => rest);
+            }}
+            onSubmit={sendReply}
+            sending={replySending}
+            error={replyStatus?.state === "failed" ? replyStatus.message : undefined}
+            submitWithModEnter={submitWithModEnter}
+            preventsKeyboardSubmit={preventsKeyboardSubmit}
+          />
+        )}
+        {showReplyField && previewQuery?.isError && (
+          <p className="text-sm text-muted-foreground">
+            Couldn’t load the latest reply, so replying here is paused. Open the session to reply.
+          </p>
+        )}
         <InboxActions>
           <Button
             variant="outline"
             size="xs"
             className={OUTLINE_ACTION}
+            disabled={replySending}
             onClick={markRead}
             componentId="inbox.unread.mark_read"
           >
             <CheckIcon className="size-3.5" />
             Mark as read
           </Button>
-          <Button asChild size="xs" className={PRIMARY_ACTION}>
-            {/* Opening is reading. Mark it here: a freshly mounted chat keeps an
-                explicit "Mark as unread" override, so it wouldn't clear this row. */}
-            <Link to={`/c/${sessionId}`} onClick={markRead} componentId="inbox.unread.open_session">
+          {/* One live primary action: Send once there's a draft, else Open session. */}
+          <Button
+            asChild
+            variant={sendIsPrimary ? "outline" : "default"}
+            size="xs"
+            className={cn(
+              sendIsPrimary ? OUTLINE_ACTION : PRIMARY_ACTION,
+              "aria-disabled:pointer-events-none aria-disabled:opacity-50",
+            )}
+          >
+            {/* Opening is reading; mark it here because chat keeps an explicit
+                unread override. Locked while a reply sends. */}
+            <Link
+              to={`/c/${sessionId}`}
+              aria-disabled={replySending}
+              onClick={(event) => {
+                if (replySending) {
+                  event.preventDefault();
+                  return;
+                }
+                markRead();
+              }}
+              componentId="inbox.unread.open_session"
+            >
               Open session
               <ArrowRightIcon className="size-3.5" />
             </Link>
           </Button>
+          {showReplyField && (
+            <Button
+              variant={sendIsPrimary ? "default" : "outline"}
+              size="xs"
+              className={sendIsPrimary ? PRIMARY_ACTION : OUTLINE_ACTION}
+              disabled={!replyDraft.trim() || replySending || !previewReady}
+              onClick={sendReply}
+            >
+              {replySending ? (
+                <Loader2Icon className="size-3.5 animate-spin" />
+              ) : (
+                <ArrowUpIcon className="size-3.5" />
+              )}
+              Send
+            </Button>
+          )}
         </InboxActions>
       </InboxCard>
     );
@@ -576,9 +893,17 @@ export function InboxPage() {
         componentId="inbox.filter"
         className="mb-4"
       >
-        <TabsList variant="pill" aria-label="Inbox filter" className="gap-1">
+        <TabsList
+          variant="pill"
+          aria-label="Inbox filter"
+          className="gap-1 mobile-app:max-w-full mobile-app:flex-wrap mobile-app:justify-start"
+        >
           {INBOX_TABS.map(({ value, label }) => (
-            <TabsTrigger key={value} value={value} className="h-7 flex-none px-3">
+            <TabsTrigger
+              key={value}
+              value={value}
+              className="h-7 mobile-touch-target mobile-app:h-auto flex-none mobile-app:whitespace-normal px-3"
+            >
               {label}
             </TabsTrigger>
           ))}
@@ -610,6 +935,20 @@ export function InboxPage() {
         </div>
       )}
 
+      {showUnread && automationInbox.isError && (
+        <div role="alert" className="mb-4 flex items-center gap-2 text-ui text-destructive">
+          Couldn’t load automation failures.
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void automationInbox.refetch()}
+            componentId="inbox.retry_automations"
+          >
+            Retry automations
+          </Button>
+        </div>
+      )}
+
       {assembling && visibleCount === 0 && (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
@@ -617,15 +956,20 @@ export function InboxPage() {
         </div>
       )}
 
-      {!assembling && failedSessionCount === 0 && visibleCount === 0 && (
-        <div className="flex flex-col items-center gap-2 py-16 text-center">
-          <InboxIcon className="size-8 text-muted-foreground/50" />
-          <p className="text-ui font-medium">
-            {hasNextPage ? "Nothing waiting in these sessions" : emptyState.title}
-          </p>
-          <p className="text-sm text-muted-foreground">{emptyState.body}</p>
-        </div>
-      )}
+      {!assembling &&
+        failedSessionCount === 0 &&
+        !(showUnread && automationInbox.isError) &&
+        visibleCount === 0 && (
+          <div className="flex flex-col items-center gap-2 py-16 text-center">
+            <InboxIcon className="size-8 text-muted-foreground/50" />
+            <p className="text-ui font-medium">
+              {hasNextPage || (showUnread && automationInbox.hasNextPage)
+                ? "Nothing waiting in the loaded items"
+                : emptyState.title}
+            </p>
+            <p className="text-sm text-muted-foreground">{emptyState.body}</p>
+          </div>
+        )}
 
       <div className="flex flex-col gap-4">
         {groups.map((group) => (
@@ -650,6 +994,17 @@ export function InboxPage() {
           className="mt-4"
         >
           {isFetchingNextPage ? "Loading…" : "Load more sessions"}
+        </Button>
+      )}
+      {showUnread && automationInbox.hasNextPage && (
+        <Button
+          variant="outline"
+          disabled={automationInbox.isFetching}
+          onClick={() => void automationInbox.fetchNextPage()}
+          componentId="inbox.load_more_automations"
+          className="mt-4"
+        >
+          {automationInbox.isFetchingNextPage ? "Loading…" : "Check more automations"}
         </Button>
       )}
     </PageScroll>
@@ -764,5 +1119,122 @@ function SessionLine({ title, detail }: { title: string; detail?: string }) {
 }
 
 function InboxActions({ children }: { children: ReactNode }) {
-  return <div className="flex items-center justify-end gap-1 pt-0.5">{children}</div>;
+  return (
+    <div className="flex items-center justify-end gap-1 pt-0.5 mobile-app:flex-col mobile-app:items-stretch">
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The expanded unread card's latest-output preview. When the preview cut the
+ * reply, hovering or focusing it shows the whole reply, rendered like the chat.
+ */
+function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?: string }) {
+  const className = "mt-2 text-ui font-medium break-words whitespace-pre-wrap";
+  if (fullText === undefined) return <p className={className}>{preview}</p>;
+  return (
+    // The close delay lets the pointer cross into the card to scroll it.
+    <HoverCard openDelay={300} closeDelay={150}>
+      <HoverCardTrigger asChild>
+        <p
+          tabIndex={0}
+          className={cn(
+            className,
+            "cursor-default rounded-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50",
+          )}
+        >
+          {preview}
+        </p>
+      </HoverCardTrigger>
+      <HoverCardContent
+        side="bottom"
+        align="start"
+        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+      >
+        {/* No session is open here, so file paths stay plain text instead of
+            resolving against whichever session the file viewer last showed. */}
+        <FileViewerContext.Provider value={null}>
+          <FilePathAwareMessageResponse>{fullText}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
+/** The expanded unread card's reply box; its Send button lives in the action row. */
+function InboxReplyField({
+  label,
+  value,
+  onChange,
+  onSubmit,
+  sending,
+  error,
+  submitWithModEnter,
+  preventsKeyboardSubmit,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  sending: boolean;
+  error?: string;
+  submitWithModEnter: boolean;
+  preventsKeyboardSubmit: boolean;
+}) {
+  const errorId = useId();
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
+  return (
+    <div className="flex flex-col gap-1.5">
+      <Textarea
+        aria-label={label}
+        aria-invalid={error !== undefined}
+        aria-describedby={error === undefined ? undefined : errorId}
+        placeholder="Reply…"
+        value={value}
+        // Read-only rather than disabled, so focus stays put for a retry.
+        readOnly={sending}
+        aria-busy={sending}
+        // `setRangeText` (Alt+Enter's fallback) ignores `readonly`, and an edit
+        // would drop the sending state, so the box takes no input while it sends.
+        onChange={(event) => {
+          if (!sending) onChange(event.target.value);
+        }}
+        onKeyDown={(event) => {
+          if (sending) {
+            if (event.key === "Enter") event.preventDefault();
+            return;
+          }
+          if (isImeCompositionKeyEvent(event, isComposingRef.current)) return;
+          const keyEvent = { ...event, isComposing: event.nativeEvent.isComposing };
+          // Alt+Enter is a newline in the composer too; browsers insert nothing for it.
+          if (isComposerAltNewlineKey(keyEvent)) {
+            event.preventDefault();
+            insertComposerText(event.currentTarget, "\n");
+            return;
+          }
+          // Same send chord as the chat composer, including the Mod+Enter preference.
+          if (!isComposerSendKey(keyEvent, submitWithModEnter, preventsKeyboardSubmit)) {
+            return;
+          }
+          event.preventDefault();
+          onSubmit();
+        }}
+        onCompositionStart={() => {
+          isComposingRef.current = true;
+        }}
+        onCompositionEnd={() => {
+          isComposingRef.current = false;
+        }}
+        className="max-h-48 min-h-14 resize-none"
+      />
+      {error && (
+        <p id={errorId} role="alert" className="text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </div>
+  );
 }

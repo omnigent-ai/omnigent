@@ -76,13 +76,13 @@ from typing import Final
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import OmnigentError
 from omnigent.runtime import (
     get_runner_ws_factory,
     get_terminal_registry,
 )
-from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import RunnerUnavailableWSError, WrongReplicaWSError
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.routes._auth_helpers import require_access
 from omnigent.stores import ConversationStore
@@ -99,6 +99,7 @@ _logger = logging.getLogger(__name__)
 _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
 _WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
+_WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
 
 
 def create_terminal_attach_router(
@@ -152,7 +153,7 @@ def create_terminal_attach_router(
             resolve_terminal_entry_by_resource_id,
         )
 
-        await _authorize_terminal_attach(
+        user_id = await _authorize_terminal_attach(
             websocket,
             session_id=session_id,
             read_only=read_only,
@@ -160,6 +161,9 @@ def create_terminal_attach_router(
             permission_store=permission_store,
             conversation_store=conversation_store,
         )
+        # WebSockets bypass the HTTP middleware that attributes debug-log rows
+        # to the request's user; this handler task is per-connection.
+        set_current_user_id(user_id)
         await websocket.accept()
         _logger.info(
             "terminal attach connected for session %s terminal %s",
@@ -193,6 +197,14 @@ def create_terminal_attach_router(
                 await websocket.close(
                     code=_WS_CLOSE_WRONG_REPLICA,
                     reason="host on another replica; retry without slice key",
+                )
+                return
+            except RunnerUnavailableWSError:
+                # The bound runner's tunnel is not connected yet; a transient
+                # session state, so ask the client to re-dial with backoff.
+                await websocket.close(
+                    code=_WS_CLOSE_TRY_AGAIN_LATER,
+                    reason="session runner is not connected",
                 )
                 return
             except Exception:  # noqa: BLE001
@@ -284,7 +296,7 @@ async def _authorize_terminal_attach(
     auth_provider: AuthProvider | None,
     permission_store: PermissionStore | None,
     conversation_store: ConversationStore | None,
-) -> None:
+) -> str | None:
     """
     Authorize a terminal-attach WebSocket before accepting it.
 
@@ -313,12 +325,14 @@ async def _authorize_terminal_attach(
         all checks (single-user/dev mode).
     :param conversation_store: Conversation store consulted by the
         access check. Required when *permission_store* is set.
+    :returns: The caller's user id, or ``None`` when it cannot be resolved
+        (only possible with permissions disabled).
     :raises WebSocketException: With ``WS_1008_POLICY_VIOLATION`` when
         auth is misconfigured, the caller is unauthenticated, or the
         caller lacks the required level for the requested mode.
     """
     if permission_store is None:
-        return
+        return auth_provider.get_user_id(websocket) if auth_provider is not None else None
     if auth_provider is None or conversation_store is None:
         raise WebSocketException(
             code=status.WS_1008_POLICY_VIOLATION,
@@ -355,6 +369,7 @@ async def _authorize_terminal_attach(
             code=status.WS_1008_POLICY_VIOLATION,
             reason="not authorized",
         ) from exc
+    return user_id
 
 
 class _RunnerWSClosed(Exception):

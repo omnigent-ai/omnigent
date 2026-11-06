@@ -278,6 +278,16 @@ def _pr_payload(
     }
     refs = _object(mr.get("diff_refs"))
     author = _object(mr.get("author"))
+    source_project = mr.get("source_project_id")
+    head_repository_url = None
+    if source_project == mr.get("target_project_id"):
+        head_repository_url = ref.url.rsplit("/-/merge_requests/", 1)[0]
+    elif isinstance(source_project, int):
+        try:
+            web_url = client.object(f"projects/{source_project}").get("web_url")
+            head_repository_url = web_url if isinstance(web_url, str) and web_url else None
+        except ValueError:
+            warnings.append("GitLab source project is unavailable; file links are hidden.")
     return {
         "number": ref.number,
         "url": ref.url,
@@ -290,6 +300,7 @@ def _pr_payload(
         "head_ref": mr.get("source_branch"),
         "head_sha": refs.get("head_sha") or mr.get("sha"),
         "base_sha": refs.get("base_sha"),
+        "head_repository_url": head_repository_url,
         "body": mr.get("description"),
         "comments": comments,
         "comments_partial": comments_partial,
@@ -603,6 +614,34 @@ class GitLabPullRequests:
     ) -> dict[str, Any]:
         del root, reference, add, remove
         raise ValueError("Editing GitLab merge request reviewers is not supported yet.")
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Reject comment posting for this provider."""
+        del root, reference, body
+        raise ValueError("Posting comments for this provider is not supported yet.")
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        del root, reference, title, body
+        raise ValueError("Editing GitLab merge request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        del root, reference, name, content_type, content
+        raise ValueError("Attaching files to GitLab merge requests is not supported yet.")
 
 
 PULL_REQUESTS: PullRequestFacet = GitLabPullRequests()

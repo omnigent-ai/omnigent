@@ -63,12 +63,12 @@ def _local(plugin_path: Path | None) -> PortableConfiguration:
 async def _request(
     server: str, operation: ConfigurationSave | None = None
 ) -> ConfigurationSnapshot:
-    from omnigent.cli_auth import store_databricks_org_id
+    from omnigent.cli_auth import pin_databricks_org_id
     from omnigent.runner._entry import _make_auth_token_factory
 
     resolved = ServerUrl.from_api_base(server)
     if resolved.is_workspace_hosted and resolved.org_id is not None:
-        store_databricks_org_id(resolved.api_base, resolved.org_id)
+        pin_databricks_org_id(resolved.api_base, resolved.org_id)
     server = resolved.api_base
 
     factory = _make_auth_token_factory(

@@ -1,8 +1,9 @@
 "use client";
 
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { showToast } from "@/components/ui/toast";
-import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
 import { isElectronShell } from "@/lib/nativeBridge";
@@ -90,6 +91,9 @@ export interface ComposerMicButtonProps {
   /** Fired when Esc ends dictation. The parent should restore the text it
    *  snapshotted in {@link onVoiceStart}, discarding what was dictated. */
   onVoiceDiscard?: () => void;
+  /** Called when a take starts or ends listening; while listening, Enter and Esc
+   *  belong to dictation. */
+  onListeningChange?: (listening: boolean) => void;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -106,6 +110,7 @@ export const ComposerMicButton = ({
   enableHotkey = false,
   onVoiceStart,
   onVoiceDiscard,
+  onListeningChange,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
@@ -137,6 +142,13 @@ export const ComposerMicButton = ({
   onVoiceStartRef.current = onVoiceStart;
   const onVoiceDiscardRef = useRef(onVoiceDiscard);
   onVoiceDiscardRef.current = onVoiceDiscard;
+  const onListeningChangeRef = useRef(onListeningChange);
+  onListeningChangeRef.current = onListeningChange;
+  useEffect(() => {
+    if (!isListening) return;
+    onListeningChangeRef.current?.(true);
+    return () => onListeningChangeRef.current?.(false);
+  }, [isListening]);
   // Set by the Esc handler so late results after a discard don't repopulate the
   // composer the parent just reverted. Cleared on the next start.
   const discardingRef = useRef(false);
@@ -205,17 +217,19 @@ export const ComposerMicButton = ({
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
-      // "network" means the recognizer's cloud backend refused us —
-      // always the case in Electron/plain Chromium, occasionally a
-      // transient blip in real Chrome. Serve THIS take from the server
-      // instead; the next take tries Web Speech again.
-      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+      // An unavailable or blocked speech service can still use client mic
+      // capture with server transcription. getUserMedia checks mic permission.
+      if (
+        (err === "network" || err === "service-not-allowed") &&
+        serverAvailableRef.current &&
+        !disabledRef.current
+      ) {
         setIsListening(false);
         void toggleServerRef.current();
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
-      if (err === "not-allowed" || err === "service-not-allowed") {
+      if (err === "not-allowed") {
         reportError("Microphone access denied. Allow access and try again.");
       } else if (err && err !== "no-speech" && err !== "aborted") {
         reportError("Voice input isn't available on this device.");
@@ -462,7 +476,8 @@ export const ComposerMicButton = ({
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // only while a dictation path can run and the composer isn't disabled, so
   // the chord is inert when it can't do anything.
-  useVoiceDictationHotkey(toggle, enableHotkey && canDictate && !disabled);
+  const hotkeyEnabled = enableHotkey && canDictate && !disabled;
+  useVoiceDictationHotkey(toggle, hotkeyEnabled);
 
   // While listening, Enter commits (end the take, keep the text) and Esc
   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
@@ -513,47 +528,56 @@ export const ComposerMicButton = ({
   const tooltip = error ?? (connecting ? "Starting voice input…" : a11yLabel);
 
   return (
-    <Button
-      type="button"
-      size="icon"
-      variant="ghost"
-      disabled={disabled}
-      onClick={toggle}
-      aria-pressed={isListening}
-      aria-busy={connecting}
-      aria-label={a11yLabel}
-      title={tooltip}
-      className={cn(
-        "size-9 md:size-8",
-        isListening &&
-          "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
-        error && "text-destructive",
-        className,
-      )}
+    <KeyboardShortcutTooltip
+      label={tooltip}
+      keys={hotkeyEnabled ? VOICE_DICTATION_KEYS : undefined}
     >
-      {connecting ? (
-        <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
-      ) : isListening ? (
-        // Bars fade out and stop icon fades in on hover OR keyboard focus,
-        // so keyboard users get the stop affordance without needing hover.
-        <span className="relative flex size-4 items-center justify-center" aria-hidden>
-          <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
-            {BAR_BINS.map(([lo, hi], i) => (
-              <span
-                key={`${lo}-${hi}`}
-                ref={(el) => {
-                  barRefs.current[i] = el;
-                }}
-                className="block h-3 w-[2px] origin-center rounded-full bg-current"
-                style={{ transform: `scaleY(${BAR_BASELINE})` }}
-              />
-            ))}
+      <Button
+        type="button"
+        size="icon"
+        variant="ghost"
+        disabled={disabled}
+        onClick={toggle}
+        aria-pressed={isListening}
+        // While listening, Escape cancels dictation before page-wide shortcuts see it.
+        data-escape-owner={isListening ? "" : undefined}
+        aria-busy={connecting}
+        aria-label={a11yLabel}
+        data-composer-action="microphone"
+        data-server-dictation-available={serverAvailable}
+        data-dictating={isListening || undefined}
+        className={cn(
+          "size-9 mobile-touch-target md:size-8",
+          isListening &&
+            "bg-muted/60 text-foreground hover:bg-destructive/10 hover:text-destructive focus-visible:bg-destructive/10 focus-visible:text-destructive",
+          error && "text-destructive",
+          className,
+        )}
+      >
+        {connecting ? (
+          <Loader2Icon className="size-4 animate-spin" data-icon-size="16" aria-hidden />
+        ) : isListening ? (
+          // Bars fade out and stop icon fades in on hover OR keyboard focus,
+          // so keyboard users get the stop affordance without needing hover.
+          <span className="relative flex size-4 items-center justify-center" aria-hidden>
+            <span className="flex h-full items-center gap-[2px] transition-opacity group-hover/button:opacity-0 group-focus-visible/button:opacity-0">
+              {BAR_BINS.map(([lo, hi], i) => (
+                <span
+                  key={`${lo}-${hi}`}
+                  ref={(el) => {
+                    barRefs.current[i] = el;
+                  }}
+                  className="block h-3 w-[2px] origin-center rounded-full bg-current"
+                  style={{ transform: `scaleY(${BAR_BASELINE})` }}
+                />
+              ))}
+            </span>
+            <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
           </span>
-          <SquareIcon className="absolute size-3 fill-current opacity-0 transition-opacity group-hover/button:opacity-100 group-focus-visible/button:opacity-100" />
-        </span>
-      ) : (
-        <MicIcon className="size-4" data-icon-size="16" />
-      )}
-    </Button>
+        ) : (
+          <MicIcon className="size-4" data-icon-size="16" />
+        )}
+      </Button>
+    </KeyboardShortcutTooltip>
   );
 };

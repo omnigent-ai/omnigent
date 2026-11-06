@@ -61,6 +61,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -69,9 +70,13 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
+from omnigent.git_providers import host_of
+from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
     MERGE_OPTIONS_OBJECT,
+    PR_ATTACHMENT_OBJECT,
+    PR_DETAILS_OBJECT,
     PR_LABELS_OBJECT,
     PR_MERGE_OBJECT,
     PR_REVIEWERS_OBJECT,
@@ -172,11 +177,14 @@ def _git(argv: list[str], *, cwd: str) -> tuple[int | None, str, str]:
 
 def _in_sandbox() -> bool:
     """Whether the panel is running inside a managed sandbox (``IS_SANDBOX=1``)."""
-    return (os.environ.get("IS_SANDBOX") or "").strip() == "1"
+    return in_managed_sandbox()
 
 
-def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | None, str, str]:
-    timeout = _gh_timeout_seconds()
+def _gh(
+    argv: list[str], *, cwd: str, token: str | None = None, timeout: float | None = None
+) -> tuple[int | None, str, str]:
+    # ``timeout`` raises the per-call limit for a slow call, such as a video upload.
+    timeout = timeout or _gh_timeout_seconds()
     if (deadline := _gh_deadline.get()) is not None:
         timeout = min(timeout, deadline - time.monotonic())
         if timeout <= 0:
@@ -429,7 +437,7 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
 
 
 # Cap the comments list so a very chatty PR can't bloat the payload; keep the
-# earliest comments after merging issue comments and review bodies.
+# latest comments after merging issue comments and review bodies.
 _MAX_COMMENTS = 100
 
 
@@ -508,14 +516,17 @@ def _shape_comments(
             }
         )
     shaped.sort(key=lambda comment: comment["created_at"] or "")
-    return shaped[:_MAX_COMMENTS] if cap else shaped
+    return shaped[-_MAX_COMMENTS:] if cap else shaped
 
 
 def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
     comments = data.get("comments")
     reviews = data.get(_PR_COMMENTS_FIELD)
     shaped = _shape_comments(comments, reviews, pr_url=data.get("url"), cap=False)
-    result: dict[str, Any] = {"comments": shaped[:_MAX_COMMENTS]}
+    result: dict[str, Any] = {
+        "comments": shaped[-_MAX_COMMENTS:],
+        **_timeline_payload(data.get("timelineItems")),
+    }
     if (
         not isinstance(comments, list)
         or not isinstance(reviews, list)
@@ -525,6 +536,59 @@ def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
     ):
         result["comments_partial"] = True
     return result
+
+
+def _timeline_payload(raw: Any) -> dict[str, Any]:
+    """Shape commit and force-push activity without treating commit dates as push dates."""
+    connection = raw if isinstance(raw, dict) else {}
+    nodes = connection.get("nodes")
+    page = connection.get("pageInfo")
+    partial = not isinstance(page, dict) or page.get("hasPreviousPage") is not False
+    events: list[dict[str, Any]] = []
+    for node in nodes if isinstance(nodes, list) else []:
+        if not isinstance(node, dict) or not isinstance(node.get("id"), str) or not node["id"]:
+            partial = True
+            continue
+        if node.get("__typename") == "PullRequestCommit":
+            commit = node.get("commit")
+            if not isinstance(commit, dict):
+                partial = True
+                continue
+            author = commit.get("author")
+            author = author if isinstance(author, dict) else {}
+            user = author.get("user")
+            user = user if isinstance(user, dict) else {}
+            events.append(
+                {
+                    "id": node["id"],
+                    "kind": "commit",
+                    "author": user.get("login") or author.get("name"),
+                    "created_at": commit.get("committedDate"),
+                    "url": node.get("url"),
+                    "sha": commit.get("oid"),
+                    "message": commit.get("messageHeadline"),
+                }
+            )
+        elif node.get("__typename") == "HeadRefForcePushedEvent":
+            actor = node.get("actor")
+            actor = actor if isinstance(actor, dict) else {}
+            before = node.get("beforeCommit")
+            before = before if isinstance(before, dict) else {}
+            after = node.get("afterCommit")
+            after = after if isinstance(after, dict) else {}
+            events.append(
+                {
+                    "id": node["id"],
+                    "kind": "force_push",
+                    "author": actor.get("login"),
+                    "created_at": node.get("createdAt"),
+                    "url": after.get("url"),
+                    "sha": after.get("oid"),
+                    "previous_sha": before.get("oid"),
+                }
+            )
+    events.sort(key=lambda event: event["created_at"] or "")
+    return {"timeline_events": events, "timeline_partial": partial or not isinstance(nodes, list)}
 
 
 # GitHub label colors are six hex digits; the panel puts them in inline styles.
@@ -610,16 +674,53 @@ def _commit_lookup_repo(root: str) -> str | None:
     wasn't pushed to this repo won't be in the base repo either — so querying more
     repos for the same commit is redundant.
     """
+    return _remote_nwo(root, _commit_lookup_remote(root))
+
+
+def _commit_lookup_remote(root: str) -> str:
+    """The branch's tracking remote if it names a repo, else ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     branch = br.strip()
     if rc == 0 and branch and branch != "HEAD":
         rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
         remote = remote.strip()
-        if rc == 0 and remote and remote != ".":
-            nwo = _remote_nwo(root, remote)
-            if nwo:
-                return nwo
-    return _remote_nwo(root, "origin")
+        if rc == 0 and remote and remote != "." and _remote_nwo(root, remote):
+            return remote
+    return "origin"
+
+
+def _remotes_by_repo(root: str, lookup_remote: str) -> dict[str, list[str]]:
+    """Remotes keyed by lower-cased ``owner/repo`` on the host of ``lookup_remote``."""
+    rc, out, _ = _git(["remote"], cwd=root)
+    urls: dict[str, str] = {}
+    for remote in out.split() if rc == 0 else []:
+        rc, url, _ = _git(["remote", "get-url", remote], cwd=root)
+        if rc == 0:
+            urls[remote] = url.strip()
+    if lookup_remote not in urls:
+        return {}
+    # A same-named repo on another host, such as a GitLab mirror, is a different repo.
+    lookup_host = host_of(urls[lookup_remote])
+    by_repo: dict[str, list[str]] = {}
+    for remote, url in urls.items():
+        nwo = _owner_repo_from_url(url)
+        if nwo and host_of(url) == lookup_host:
+            by_repo.setdefault(nwo.lower(), []).append(remote)
+    return by_repo
+
+
+def _contained_in_base_branch(root: str, sha: str, remotes: Sequence[str], base_ref: str) -> bool:
+    """Whether the local tracking ref of ``base_ref`` on any of ``remotes`` contains ``sha``."""
+    for remote in remotes:
+        # An exact ref lookup, so a lookalike branch or tag can't stand in for a missing one.
+        tracking_ref = f"refs/remotes/{remote}/{base_ref}"
+        rc, tracking_oid, _ = _git(["show-ref", "--verify", "--hash", tracking_ref], cwd=root)
+        if rc != 0:
+            continue
+        rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_oid.strip()], cwd=root)
+        if rc == 0:
+            return True
+    return False
 
 
 def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
@@ -636,12 +737,38 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     Only **open** PRs are accepted. For a commit already on the default branch
     (master/main, or any merged tip) the endpoint returns the *merged* PR that
     introduced it, which is a false positive — never the branch's own outgoing
-    PR — so a closed/merged row is skipped rather than surfaced.
+    PR — so a closed/merged row is skipped rather than surfaced. Open rows are
+    false positives too when the queried fork's default branch lags the base:
+    GitHub then lists every open PR that merges the base past the commit. So an
+    open row is skipped when the commit is already on that PR's base branch
+    locally (:func:`_contained_in_base_branch`), read from remotes of the base repo
+    on the host of the queried fork's remote.
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
     if not shas or not repo:
         return None
+    base_remotes: dict[str, list[str]] | None = None
+    on_base_branch: dict[tuple[str, str, str], bool] = {}
+
+    def _is_candidate(row: Any, sha: str) -> bool:
+        nonlocal base_remotes
+        if not isinstance(row, dict) or str(row.get("state", "")).lower() != "open":
+            return False
+        base = row.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        if not isinstance(base_ref, str) or not isinstance(base_full, str):
+            return True
+        key = (sha, base_full.lower(), base_ref)
+        if key not in on_base_branch:
+            if base_remotes is None:
+                base_remotes = _remotes_by_repo(root, _commit_lookup_remote(root))
+            remotes = base_remotes.get(base_full.lower(), [])
+            on_base_branch[key] = _contained_in_base_branch(root, sha, remotes, base_ref)
+        return not on_base_branch[key]
+
     for sha in shas:
         rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
         if rc != 0:
@@ -653,16 +780,10 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         if not isinstance(rows, list) or not rows:
             continue
 
-        def _is_open(row: Any) -> bool:
-            return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
-
-        # Accept only an OPEN PR. On the default branch (and any branch whose tip
-        # is already merged) this endpoint returns the *merged* PR that introduced
-        # the commit — a false positive, since it's not the branch's own outgoing
-        # PR. A genuine fallback hit (a fork / renamed branch gh can't name) is
-        # always open, so a closed row is never the PR we want; skip it rather
-        # than falling back to the first row.
-        chosen = next((r for r in rows if _is_open(r)), None)
+        # Accept only an OPEN PR that adds the commit beyond its base branch. Merged
+        # rows, and others' PRs listed because the fork's default branch lags, aren't
+        # this branch's own PR; skip them rather than falling back to the first row.
+        chosen = next((r for r in rows if _is_candidate(r, sha)), None)
         if chosen is None:
             continue
         number = chosen.get("number")
@@ -708,7 +829,84 @@ def _gh_pr_view(
         data = json.loads(out)
     except ValueError:
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    if "comments" in fields.split(","):
+        _refresh_conversation(data, cwd=cwd, token=token)
+    return data
+
+
+def _refresh_conversation(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
+    """Read recent comments and activity, preserving gh's comments if this read fails."""
+    url = data.get("url")
+    if not isinstance(url, str):
+        return
+    try:
+        reference = PullRequestRef.from_url(url)
+        host = _host_args(cwd, reference)
+    except ValueError:
+        return
+    comments = data.get("comments")
+    refresh_comments = isinstance(comments, list) and len(comments) >= _MAX_COMMENTS
+    owner, name = reference.repository.split("/", 1)
+    query = """query($owner: String!, $name: String!, $number: Int!, $includeComments: Boolean!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          comments(last: 100) @include(if: $includeComments) {
+            nodes { author { login } body createdAt url isMinimized }
+          }
+          timelineItems(last: 100, itemTypes: [PULL_REQUEST_COMMIT, HEAD_REF_FORCE_PUSHED_EVENT]) {
+            pageInfo { hasPreviousPage }
+            nodes {
+              __typename
+              ... on PullRequestCommit {
+                id url
+                commit { oid messageHeadline committedDate author { name user { login } } }
+              }
+              ... on HeadRefForcePushedEvent {
+                id createdAt actor { login }
+                beforeCommit { oid }
+                afterCommit { oid url }
+              }
+            }
+          }
+        }
+      }
+    }"""
+    rc, out, _ = _gh(
+        [
+            "api",
+            *host,
+            "graphql",
+            # ponytail: gh handles token-scoped caching; busy comment tails stay fresh.
+            *([] if refresh_comments else ["--cache", "30s"]),
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"number={reference.number}",
+            "-F",
+            f"includeComments={str(refresh_comments).lower()}",
+        ],
+        cwd=cwd,
+        token=token,
+    )
+    if rc != 0:
+        return
+    try:
+        conversation = json.loads(out)["data"]["repository"]["pullRequest"]
+    except (ValueError, KeyError, TypeError):
+        return
+    if not isinstance(conversation, dict):
+        return
+    data["timelineItems"] = conversation.get("timelineItems")
+    comments = conversation.get("comments")
+    latest = comments.get("nodes") if isinstance(comments, dict) else None
+    if isinstance(latest, list):
+        data["comments"] = latest
 
 
 def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -918,6 +1116,16 @@ def _pr_json(root: str, reference: PullRequestRef, fields: str) -> dict[str, Any
     )
 
 
+def _head_repository_url(reference: PullRequestRef, head: object, owner: object) -> str | None:
+    """The source (possibly fork) repository's web URL; ``None`` once the fork is deleted."""
+    # Older gh reports headRepository as only {id, name}, so the owner comes separately.
+    name = head.get("name") if isinstance(head, dict) else None
+    login = owner.get("login") if isinstance(owner, dict) else None
+    if isinstance(name, str) and name and isinstance(login, str) and login:
+        return f"https://{reference.host}/{login}/{name}"
+    return None
+
+
 def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info: dict[str, Any] = {
         "object": "session.github.info",
@@ -936,7 +1144,11 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
     info["selected_account"] = preferred or next(
         (a["login"] for a in info["accounts"] if a.get("active")), None
     )
-    data = _pr_json(root, reference, _PR_VIEW_FIELDS + ",headRefOid,baseRefOid")
+    data = _pr_json(
+        root,
+        reference,
+        _PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
+    )
     if data is None:
         return info
     author = data.get("author")
@@ -954,6 +1166,9 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         "head_ref": data.get("headRefName"),
         "head_sha": data.get("headRefOid"),
         "base_sha": data.get("baseRefOid"),
+        "head_repository_url": _head_repository_url(
+            reference, data.get("headRepository"), data.get("headRepositoryOwner")
+        ),
         **_checks_fields(data),
         "body": data.get("body") or None,
         **_comments_payload(data),
@@ -1201,9 +1416,29 @@ def _pr_changed_files(root: str, reference: PullRequestRef | None) -> dict[str, 
                 "status": _GH_STATUS_MAP.get(str(entry.get("status")), "modified"),
                 "lines_added": entry.get("additions"),
                 "lines_removed": entry.get("deletions"),
+                "previous_path": entry.get("previous_filename"),
             }
         )
     return {"object": "list", "data": data, "has_more": False}
+
+
+def _pr_changed_files_at_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """List changed files at the displayed revision; flag a list GitHub truncated."""
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        pr = _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+        result = _pr_changed_files(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+    total = pr.get("changed_files")
+    total_count = total if isinstance(total, int) else None
+    shown = len(result["data"])
+    if total_count is not None and shown < total_count:
+        result["has_more"] = True
+        result["warning"] = (
+            f"The provider lists at most {shown} files; {total_count - shown} files are not shown."
+        )
+    return {**result, "total_count": total_count, "head_sha": head_sha, "base_sha": base_sha}
 
 
 def github_file_diff(
@@ -1309,6 +1544,27 @@ def _pr_patch(root: str, reference: PullRequestRef | None) -> dict[str, Any]:
     if rc != 0:
         raise ValueError("GitHub could not load the PR diff. Refresh or open the PR on GitHub.")
     return {"object": "session.github.pr_diff", "patch": out}
+
+
+def _pr_patch_at_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """Reject a patch if the PR moves before or during its fetch."""
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+        result = _pr_patch(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha, base_sha=base_sha)
+    return {**result, "head_sha": head_sha, "base_sha": base_sha}
+
+
+def _check_pr_revision(
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+) -> dict[str, Any]:
+    """Return the PR's REST payload, raising when its head or base moved."""
+    pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
+    if _api_string(pr, "head", "sha") != head_sha or _api_string(pr, "base", "sha") != base_sha:
+        raise ValueError("The pull request changed; refresh before viewing its conversations.")
+    return pr
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:
@@ -1853,3 +2109,228 @@ def _apply_reviewer_edit(
             "GitHub updated the reviewers but could not list them. Refresh to see them."
         )
     return {"object": PR_REVIEWERS_OBJECT, "reviewers": _shape_reviewers(data)}
+
+
+_DETAILS_EDIT_TIMED_OUT = (
+    "GitHub took too long to update the pull request. Refresh to see whether it applied."
+)
+# One attachment upload's ``gh`` calls share this budget, under the server's wait,
+# so a video has time to reach GitHub.
+_ATTACHMENT_REQUEST_SECONDS = 110.0
+_ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
+
+
+def _pr_json_write(
+    root: str,
+    *,
+    host: list[str],
+    token: str | None,
+    method: str,
+    endpoint: str,
+    fields: dict[str, Any],
+) -> tuple[int | None, str, str]:
+    """Send Markdown in a JSON file so shell syntax and long bodies remain literal."""
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", encoding="utf-8", delete_on_close=False
+    ) as payload:
+        json.dump(fields, payload)
+        payload.close()
+        return _gh(
+            ["api", *host, "-X", method, endpoint, "--input", payload.name],
+            cwd=root,
+            token=token,
+        )
+
+
+def _create_comment(root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+    """Post once and return GitHub's canonical comment, without a follow-up read."""
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        result = _post_comment(
+            root,
+            reference,
+            endpoint=f"repos/{reference.repository}/issues/{reference.number}/comments",
+            body=body,
+        )
+    author = result.get("user")
+    return {
+        "object": "session.github.pr_comment",
+        "comment": {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": result.get("body") or "",
+            "created_at": result.get("created_at"),
+            "url": result["html_url"],
+        },
+    }
+
+
+def _post_comment(
+    root: str, reference: PullRequestRef, *, endpoint: str, body: str
+) -> dict[str, Any]:
+    """Publish once within the caller's deadline; preserve uncertainty after dispatch."""
+    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
+    host = _host_args(root, reference)
+    token = _pr_token(root, reference)
+    if _gh_timed_out.get():
+        raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+    rc, out, err = _pr_json_write(
+        root,
+        host=host,
+        token=token,
+        method="POST",
+        endpoint=endpoint,
+        fields={"body": body},
+    )
+    if _gh_timed_out.get():
+        raise ValueError(uncertain)
+    try:
+        result = json.loads(out)
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot post to this conversation.")
+        if "(HTTP 422)" in err:
+            raise ValueError("GitHub rejected the comment. Check its length and try again later.")
+        raise ValueError(uncertain)
+    if not result.get("id") or not isinstance(result.get("html_url"), str):
+        raise ValueError(uncertain)
+    return result
+
+
+def _edit_details(
+    root: str, reference: PullRequestRef, *, title: str | None, body: str | None
+) -> dict[str, Any]:
+    """Update the PR's title and/or body with one pull requests API ``PATCH``.
+
+    The body travels in a JSON file, since a long description could pass the
+    command-line length limit as a field.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the edit must not run as another.
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+        fields = {
+            key: value for key, value in (("title", title), ("body", body)) if value is not None
+        }
+        rc, out, err = _pr_json_write(
+            root,
+            host=host,
+            token=token,
+            method="PATCH",
+            endpoint=f"repos/{reference.repository}/pulls/{reference.number}",
+            fields=fields,
+        )
+        if _gh_timed_out.get():
+            raise ValueError(_DETAILS_EDIT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        message = result.get("message") if isinstance(result, dict) else None
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot edit this pull request.")
+        if isinstance(message, str) and "(HTTP 422)" in err:
+            raise ValueError(f"GitHub rejected the change: {message}")
+        raise ValueError("GitHub could not update the pull request. Refresh to retry.")
+    body_after = result.get("body")
+    return {
+        "object": PR_DETAILS_OBJECT,
+        "title": str(result.get("title") or ""),
+        "body": body_after if isinstance(body_after, str) else "",
+    }
+
+
+def _attachments_endpoint(host: str) -> str:
+    """The user attachments upload URL that ``gh --attach`` posts to on ``host``."""
+    if host == "github.com":
+        return "https://uploads.github.com/user-attachments/assets"
+    return f"https://{host}/api/uploads/user-attachments/assets"
+
+
+def _is_attachment_url(url: str, host: str) -> bool:
+    """Whether ``url`` is a user-attachments asset on ``host``, as an upload returns."""
+    return (
+        re.fullmatch(rf"https://{re.escape(host)}/user-attachments/assets/[0-9a-f-]+", url)
+        is not None
+    )
+
+
+def _upload_attachment(
+    root: str, reference: PullRequestRef, *, name: str, content_type: str, content: bytes
+) -> dict[str, Any]:
+    """Upload a file to GitHub's user attachments as the PR's selected account.
+
+    GitHub keeps the file whether or not a description ends up linking to it.
+    """
+    with _gh_deadline_scope(time.monotonic() + _ATTACHMENT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            # The selected account's token is unknown, so the upload must not run as another.
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+        rc, out, _ = _gh(
+            ["api", *host, f"repos/{reference.repository}", "--jq", ".id"],
+            cwd=root,
+            token=token,
+        )
+        repository_id = out.strip()
+        if rc != 0 or not repository_id.isdigit():
+            if _gh_timed_out.get():
+                raise ValueError(_ATTACHMENT_TIMED_OUT)
+            raise ValueError("GitHub could not find this pull request's repository.")
+        query = (
+            f"content_type={quote(content_type, safe='')}"
+            f"&name={quote(name, safe='')}&repository_id={repository_id}"
+        )
+        with tempfile.NamedTemporaryFile(suffix=f"-{name}", delete_on_close=False) as upload:
+            upload.write(content)
+            upload.close()
+            rc, out, err = _gh(
+                [
+                    "api",
+                    "-X",
+                    "POST",
+                    f"{_attachments_endpoint(reference.host)}?{query}",
+                    "-H",
+                    "Content-Type: application/octet-stream",
+                    "--input",
+                    upload.name,
+                ],
+                cwd=root,
+                token=token,
+                timeout=_ATTACHMENT_REQUEST_SECONDS,
+            )
+        if _gh_timed_out.get():
+            raise ValueError(_ATTACHMENT_TIMED_OUT)
+    try:
+        result = json.loads(out) if out.strip() else None
+    except ValueError:
+        result = None
+    url = result.get("url") if isinstance(result, dict) else None
+    if rc == 0 and isinstance(url, str) and _is_attachment_url(url, reference.host):
+        return {
+            "object": PR_ATTACHMENT_OBJECT,
+            "url": url,
+            "name": name,
+            "content_type": content_type,
+        }
+    if re.search(r"\(HTTP 40[134]\)", err):
+        raise ValueError(
+            "The GitHub account on the host needs push access to attach files "
+            "to this pull request."
+        )
+    errors = result.get("errors") if isinstance(result, dict) else None
+    detail = next(
+        (
+            error["message"]
+            for error in (errors if isinstance(errors, list) else [])
+            if isinstance(error, dict) and isinstance(error.get("message"), str)
+        ),
+        None,
+    )
+    if detail and "(HTTP 422)" in err:
+        raise ValueError(f"GitHub rejected the file: {detail}")
+    raise ValueError("GitHub could not upload the file. Try again.")

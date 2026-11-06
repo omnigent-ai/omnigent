@@ -104,7 +104,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import request_with_429_retry
+from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
@@ -302,7 +302,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
             or native_codex_launch_base_url(launch) is not None
         )
         defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
-    except Exception:  # readiness must never raise; fail onto auth.json.
+    except Exception:
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
     if routes_through_provider and not defers_to_codex_config:
@@ -321,7 +321,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         if not _codex_auth_json_has_available_credential(source.auth_path):
             return HARNESS_NEEDS_AUTH
         return None
-    except Exception:  # readiness must never raise.
+    except Exception:
         _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
 
@@ -663,7 +663,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # best-effort; never block the launch
+    except Exception:
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -864,12 +864,13 @@ def _run_with_remote_server(
                 headers.update(new_headers)
 
             if prompt:
-                await _post_initial_prompt(
+                await post_initial_prompt(
                     base_url=base_url,
                     headers=headers,
                     session_id=prepared.session_id,
                     prompt=prompt,
                     auth=attach_auth,
+                    harness_name="Codex",
                 )
                 record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
@@ -1101,50 +1102,6 @@ async def _wait_for_codex_terminal_ready(
     )
 
 
-async def _post_initial_prompt(
-    *,
-    base_url: str,
-    headers: dict[str, str],
-    session_id: str,
-    prompt: str,
-    auth: httpx.Auth | None,
-) -> None:
-    """
-    Send the first Codex prompt through Omnigent instead of the app-server.
-
-    :param base_url: Omnigent server base URL.
-    :param headers: HTTP auth headers for Omnigent requests.
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param prompt: User prompt text.
-    :param auth: Optional refresh-capable HTTP auth for long-lived
-        Databricks-backed sessions.
-    :returns: None.
-    :raises click.ClickException: If Omnigent rejects the prompt.
-    """
-    from omnigent.cli_auth import open_server_client
-
-    async with open_server_client(
-        base_url,
-        headers=headers,
-        auth=auth,
-        timeout=httpx.Timeout(30.0),
-    ) as client:
-        resp = await client.post(
-            f"/v1/sessions/{url_component(session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": prompt}],
-                },
-            },
-        )
-    if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Codex initial prompt failed ({resp.status_code}): {error_text(resp)}"
-        )
-
-
 async def _prepare_codex_terminal(
     *,
     base_url: str,
@@ -1246,8 +1203,9 @@ async def _prepare_codex_terminal(
         # in-process codex harness. Resolved before any rollout synthesis
         # so session_meta can name the provider the launch routes through.
         _codex_launch = resolve_native_codex_launch(model=model, terminal_launch_args=codex_args)
+        resume_rollout: Path | None = None
         if thread_id is not None:
-            await _ensure_local_codex_resume_rollout(
+            resume_rollout = await _ensure_local_codex_resume_rollout(
                 client,
                 session_id=session_id,
                 external_session_id=thread_id,
@@ -1307,6 +1265,7 @@ async def _prepare_codex_terminal(
                     retain_client=codex_remote_resume_omits_permission_args(
                         app_server.codex_cli_version
                     ),
+                    rollout_path=resume_rollout,
                 )
                 write_bridge_state(
                     bridge_dir,
@@ -2306,15 +2265,16 @@ def _codex_rollout_records_from_session_items(
     ]
     seen_turn_ids: set[str] = set()
     open_function_calls: dict[str, _JsonObject] = {}
+    emitted_call_ids: set[str] = set()
     interrupted_response_ids = _interrupted_response_ids_from_session_items(items)
     remaining_function_outputs = _codex_function_output_counts(
         items,
         interrupted_response_ids=interrupted_response_ids,
     )
-    items = _codex_items_with_outputs_in_call_order(items)
+    items = _codex_items_with_outputs_in_call_order(
+        [item for item in items if _session_item_response_id(item) not in interrupted_response_ids]
+    )
     for index, item in enumerate(items):
-        if _session_item_response_id(item) in interrupted_response_ids:
-            continue
         item_call_id = item.get("call_id")
         if (
             item.get("type") == "function_call_output"
@@ -2330,17 +2290,32 @@ def _codex_rollout_records_from_session_items(
         if item.get("type") == "compaction":
             compacted_msgs = item.get("compacted_messages")
             if isinstance(compacted_msgs, list) and compacted_msgs:
-                replacement_history = [
-                    {
-                        **message,
-                        "content": sanitize_replayed_image_blocks(message["content"]),
-                    }
-                    if isinstance(message, dict)
-                    and message.get("type") == "message"
-                    and "content" in message
-                    else message
-                    for message in compacted_msgs
-                ]
+                replacement_history: list[object] = []
+                for message in compacted_msgs:
+                    if isinstance(message, dict):
+                        if message.get("type") == "message" and "content" in message:
+                            message = {
+                                **message,
+                                "content": sanitize_replayed_image_blocks(message["content"]),
+                            }
+                        elif message.get("type") == "function_call" and isinstance(
+                            message.get("arguments"), str
+                        ):
+                            message = {
+                                **message,
+                                "arguments": _codex_replayed_arguments(message["arguments"]),
+                            }
+                        elif (
+                            message.get("type")
+                            in ("function_call_output", "custom_tool_call_output")
+                            and "output" in message
+                        ):
+                            message = {
+                                **message,
+                                "output": sanitize_replayed_image_blocks(message["output"]),
+                            }
+                    replacement_history.append(message)
+                replacement_history = _codex_history_without_orphan_outputs(replacement_history)
                 replacement_call_ids = {
                     message.get("call_id")
                     for message in replacement_history
@@ -2356,6 +2331,7 @@ def _codex_rollout_records_from_session_items(
                     if call_id in remaining_function_outputs
                     and call_id not in replacement_call_ids
                 )
+                emitted_call_ids = _codex_function_call_ids(replacement_history)
                 compacted_payload: _JsonObject = {
                     "message": item.get("summary", ""),
                     "replacement_history": replacement_history,
@@ -2383,7 +2359,15 @@ def _codex_rollout_records_from_session_items(
         if isinstance(call_id, str) and call_id:
             if payload.get("type") == "function_call":
                 open_function_calls[call_id] = payload
+                emitted_call_ids.add(call_id)
             elif payload.get("type") == "function_call_output":
+                if call_id not in emitted_call_ids:
+                    # Providers pair tool results with the preceding call by position.
+                    _logger.warning(
+                        "Dropping Codex resume tool output without a preceding call: call_id=%s",
+                        call_id,
+                    )
+                    continue
                 open_function_calls.pop(call_id, None)
         turn_id = _codex_turn_id_for_session_item(
             session_id=session_id,
@@ -2476,6 +2460,37 @@ def _codex_function_output_counts(
         if item.get("type") == "function_call_output" and isinstance(call_id, str) and call_id:
             counts[call_id] += 1
     return counts
+
+
+def _codex_function_call_ids(items: Sequence[object]) -> set[str]:
+    """Return the call ids of function calls in Responses history."""
+    return {
+        item["call_id"]
+        for item in items
+        if isinstance(item, dict)
+        and item.get("type") == "function_call"
+        and isinstance(item.get("call_id"), str)
+    }
+
+
+def _codex_history_without_orphan_outputs(history: list[object]) -> list[object]:
+    """Drop function outputs whose call does not precede them in a history snapshot."""
+    call_ids: set[str] = set()
+    kept: list[object] = []
+    for item in history:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            if item.get("call_id") not in call_ids:
+                _logger.warning(
+                    "Dropping compacted Codex tool output without a preceding call: call_id=%s",
+                    item.get("call_id"),
+                )
+                continue
+        elif isinstance(item, dict) and item.get("type") == "function_call":
+            call_id = item.get("call_id")
+            if isinstance(call_id, str):
+                call_ids.add(call_id)
+        kept.append(item)
+    return kept
 
 
 def _codex_open_function_calls(items: Sequence[object]) -> dict[str, _JsonObject]:
@@ -2714,6 +2729,18 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
 _MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
 
 
+def _codex_replayed_arguments(arguments: str) -> str:
+    """Replace oversized tool arguments with a bounded replay marker."""
+    if len(arguments) <= _MAX_REPLAYED_ARGUMENTS_CHARS:
+        return arguments
+    _logger.warning(
+        "Replaying oversized Codex function_call arguments as a stub: chars=%d", len(arguments)
+    )
+    return json.dumps(
+        {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
+    )
+
+
 def _codex_function_call_payload_from_session_item(
     item: _JsonObject,
 ) -> _JsonObject | None:
@@ -2746,21 +2773,10 @@ def _codex_function_call_payload_from_session_item(
             "Cannot synthesize Codex resume rollout: Omnigent function_call "
             f"{item_id!r} has non-string arguments."
         )
-    if len(arguments) > _MAX_REPLAYED_ARGUMENTS_CHARS:
-        # An apply_patch mirror carries whole files for added or deleted ones. One
-        # oversized call would fail every request in the thread, so replay a stub.
-        _logger.warning(
-            "Replaying an oversized Codex function_call as a stub: name=%s chars=%d",
-            name,
-            len(arguments),
-        )
-        arguments = json.dumps(
-            {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
-        )
     payload: _JsonObject = {
         "type": "function_call",
         "name": name,
-        "arguments": arguments,
+        "arguments": _codex_replayed_arguments(arguments),
         "call_id": call_id,
     }
     # The Responses API rejects a replayed namespaced call without it.

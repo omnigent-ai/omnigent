@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import tempfile
 import time
 import uuid
 from collections import OrderedDict
@@ -45,6 +44,7 @@ from omnigent.debug_logging import (
     runner_primary_session_id,
     set_current_session_id,
 )
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.entities.session_resources import (
     DEFAULT_ENVIRONMENT_ID,
     session_resource_view_to_dict,
@@ -71,13 +71,13 @@ from omnigent.harness_plugins import (
     spawn_env_builders,
 )
 from omnigent.llms.errors import detect_request_size_overflow
-from omnigent.native.failure_telemetry import failure_log_attributes
+from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
 from omnigent.native.input_diagnostics import input_attributes
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
 from omnigent.runner import native as _native
-from omnigent.runner import pending_approvals
+from omnigent.runner import pending_approvals, pr_reports
 from omnigent.runner import subagent_work as _subagent_work
 from omnigent.runner.acp_subagent_sessions import (
     _chain_acp_subagent_post,
@@ -91,7 +91,9 @@ from omnigent.runner.app_support import (
     _CommentRelayBinding,
     _require_full_native_lock_coverage,
     _resolve_forwarded_message_content,
+    _shared_scheduled_run,
     _SpecEntry,
+    _TurnMessage,
     _unwrap_spec_entry,
 )
 from omnigent.runner.background_titles import (
@@ -103,8 +105,13 @@ from omnigent.runner.background_titles import (
     generate_background_title as run_background_title,
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
+from omnigent.runner.background_work_reports import BackgroundWorkReporter
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    TERMINAL_CLOSED_OUTSIDE_OMNIGENT,
+    FailureDiagnosis,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -204,15 +211,18 @@ from omnigent.runtime.prompt import (
     build_instructions_nullable,
     raw_author_instructions,
 )
+from omnigent.scheduled_context import current_scheduled_run, scheduled_run_scope
 from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
 from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
+from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
+_BRIDGE_NOTIFICATIONS = DedicatedExecutor(max_workers=2, thread_name_prefix="runner-bridge-notify")
 
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
@@ -220,6 +230,74 @@ _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
 # Pending questions outlive prompt delivery; poll outside the turn watchdog.
 _CLAUDE_PENDING_PROMPT_POLL_S = 0.5
+
+# How long a message refused by a launcher sign-in may wait, including the time the server
+# already had it queued. Must stay inside the server's pending-input lifetime, so a refusal
+# that outlasts the wait is still recorded and shown.
+_SIGN_IN_HOLD_MAX_S = 8 * 60.0
+# Refusals one sign-in wait absorbs; a pane that keeps asking after it looked ready fails.
+_SIGN_IN_HOLD_MAX_REPEATS = 3
+
+
+@dataclasses.dataclass
+class _SignInHold:
+    """
+    One session's wait for a launcher sign-in that refused its queued message.
+
+    :param deadline: ``time.monotonic()`` at which the wait gives up.
+    :param holds: Refusals absorbed so far.
+    :param waiting: Whether the queue is paused until the sign-in completes.
+    :param releasing: Whether the sign-in watcher saw the agent ready and is
+        announcing the resend; until it resumes the queue, the deadline can't.
+    :param resent: Whether the wait ran out and its message is being resent, so
+        a watcher that sees the agent ready meanwhile asks for no resend.
+    """
+
+    deadline: float
+    holds: int = 0
+    waiting: bool = False
+    releasing: bool = False
+    resent: bool = False
+
+
+def _sign_in_hold_deadline(body: Mapping[str, Any]) -> float:
+    """
+    Return when a sign-in wait for the refused message *body* gives up.
+
+    The wait gets :data:`_SIGN_IN_HOLD_MAX_S`, less the time the server says the
+    message was already queued, e.g. behind a slow start.
+
+    :param body: The refused message, carrying the server's ``input_enqueued_at_ms``
+        when the server sent one.
+    :returns: A ``time.monotonic()`` deadline, in the past when no time is left.
+    """
+    enqueued_at_ms = input_attributes(body).get("input_enqueued_at_ms")
+    queued_s = 0.0
+    if isinstance(enqueued_at_ms, int):
+        queued_s = max(0.0, time.time() - enqueued_at_ms / 1000)
+    return time.monotonic() + _SIGN_IN_HOLD_MAX_S - queued_s
+
+
+_SPEC_FETCH_HTTP_STATUS = re.compile(r"failed with HTTP (\d{3})$")
+
+
+def _spec_resolve_error_detail(exc: BaseException) -> str:
+    """Name a failed agent-spec load's structured cause in the client detail.
+
+    Only the exception type, its direct cause's type, and the server's HTTP
+    status appear; the free-form text stays in the runner log.
+
+    :param exc: The spec resolver failure, e.g. ``httpx.ConnectError(...)`` or
+        ``RuntimeError("spec_resolver: GET /v1/... failed with HTTP 503")``.
+    :returns: e.g. ``"Could not load the agent spec (ConnectError). Request
+        failed on the runner; see the runner log for details: ~/..."``.
+    """
+    cause = _native_runtime._native_terminal_start_failure_cause(exc)
+    status = _SPEC_FETCH_HTTP_STATUS.search(str(exc)) if isinstance(exc, RuntimeError) else None
+    if status is not None:
+        cause = f"{cause} HTTP {status.group(1)}"
+    detail = _client_safe_error_detail(exc, context="spec resolve")
+    return f"Could not load the agent spec ({cause}). {detail}"
 
 
 def _warn_unresolved_sub_agent(session_id: str | None, sub_agent_name: str) -> None:
@@ -393,7 +471,7 @@ _NO_BODY_STATUS_CODES = {204, 304}
 # interrupt). For these, a bare quiescence ``idle`` is NOT a completion. Add a
 # key here only together with its forwarder's ``turn_completed`` plumbing,
 # or that harness's sub-agent completions stop reaching parent inboxes.
-_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude"})
+_TURN_OUTCOME_CONFIRMING_NATIVE_AGENTS = frozenset({"claude", "pi"})
 
 
 # Not in the retryable-harness-error allowlist — desync is terminal, not transient.
@@ -422,6 +500,12 @@ _SESSION_STREAM_HEARTBEAT_S = 15.0
 # that died on its own leaves the harness parked on a readiness wait, so the
 # wait is bounded and the stream failure is then attributed to the exit.
 _TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
+# A pane Omnigent closed itself (a delivery timeout) has its turn's own error
+# on the way; releasing the harness before it lands severs the stream carrying
+# it, so the wait is longer. The pane is already gone, so nothing else waits.
+_EXPECTED_CLOSE_RELEASE_GRACE_S = 15.0
+# Display names for the terminals whose exits the runner describes to people.
+_TERMINAL_DISPLAY_NAMES = {"claude": "Claude Code"}
 
 # Banner printed by Claude Code on a voluntary /exit or /quit (exit 0).
 # The pane activity from printing it can flip the idle memo back to "running"
@@ -453,11 +537,11 @@ _INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
 )
 
 
-def _input_stable_id(source: Mapping[str, object]) -> str | None:
-    """Return one validated web input id from a runner or harness body."""
-    value = source.get("input_stable_id") or source.get("stable_id")
-    validated = input_attributes({"input_stable_id": value}).get("input_stable_id")
-    return validated if isinstance(validated, str) else None
+def _input_identity(source: Mapping[str, object]) -> dict[str, str | int]:
+    """Return validated client and server input IDs from a runner or harness body."""
+    return input_attributes(
+        {**source, "input_stable_id": source.get("input_stable_id") or source.get("stable_id")}
+    )
 
 
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
@@ -795,7 +879,7 @@ def _response_failed_payload(
     error: Mapping[str, object],
     source: str = "execution",
     *,
-    input_stable_id: str | None = None,
+    input_identity: Mapping[str, object] | None = None,
 ) -> _JsonObject:
     """Build a failure envelope with required error fields and a legacy mirror."""
     failure_error = {**_normalize_turn_error(error), **error}
@@ -805,8 +889,7 @@ def _response_failed_payload(
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
-    if input_stable_id is not None:
-        payload["input_stable_id"] = input_stable_id
+    payload.update(input_attributes(input_identity))
     return payload
 
 
@@ -814,7 +897,7 @@ def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
     *,
-    input_stable_id: str | None = None,
+    input_identity: Mapping[str, object] | None = None,
 ) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
@@ -835,7 +918,7 @@ def _response_failed_event(
         _response_failed_payload(
             error,
             source=source,
-            input_stable_id=input_stable_id,
+            input_identity=input_identity,
         )
     )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
@@ -962,26 +1045,6 @@ def _should_dispatch_tool_locally(
     if dispatch is not None and tool_name in dispatch.client_side_tool_names:
         return False
     return dispatch is not None or is_mcp or is_runner_builtin or is_spec_local
-
-
-def _side_chat_text_from_content(content: object) -> str:
-    """
-    Join user text from message content blocks for a Codex ``/side`` follow-up.
-
-    :param content: A message body's ``content`` list, e.g.
-        ``[{"type": "input_text", "text": "and why?"}]``.
-    :returns: The concatenated text with leading indentation preserved, or
-        ``""`` when there is none.
-    """
-    if not isinstance(content, list):
-        return ""
-    parts: list[str] = []
-    for block in content:
-        if isinstance(block, dict) and block.get("type") in {"text", "input_text"}:
-            text = block.get("text")
-            if isinstance(text, str) and text:
-                parts.append(text)
-    return "\n".join(parts).rstrip()
 
 
 def _normalize_turn_error(error: Mapping[str, object]) -> dict[str, str]:
@@ -1172,6 +1235,7 @@ def create_runner_app(
     mcp_manager: RunnerMcpManager | None = None,
     auth_token: str | None = None,
     auth_token_factory: Callable[[], str | None] | None = None,
+    native_pane_idle_timeout_s: float | None = None,
 ) -> FastAPI:
     """Build a fresh runner FastAPI app.
 
@@ -1207,6 +1271,8 @@ def create_runner_app(
     :param auth_token_factory: Refresh-capable server bearer factory owned by
         the runner process. Native terminal helpers reuse it instead of
         resolving host credentials again for every terminal launch.
+    :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
+        disables reaping; ``None`` uses the pane environment override or default.
     """
     import hmac
 
@@ -1261,6 +1327,7 @@ def create_runner_app(
     _session_root_spec_cache: dict[str, _SpecEntry] = {}  # session_id → unresolved root spec
     _resp_to_conv: dict[str, str] = {}  # harness response_id → conversation_id
     _live_response_id: dict[str, str] = {}
+    _turn_occurrences: dict[str, ScheduledRunLogContext | None] = {}
     app.state.live_response_id = _live_response_id
     _session_start_cache: dict[str, float] = {}  # session_id → registered start time
     _session_spec_cache: dict[str, _SpecEntry | None] = {}  # session_id → session AgentSpec
@@ -1390,6 +1457,25 @@ def create_runner_app(
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     app.state.antigravity_terminal_ensure_locks = _antigravity_terminal_ensure_locks
+    # Keyed by native agent key, which is also the pane's terminal name. Launch
+    # and ensure paths take a session's lock here; so does the idle pane reaper.
+    _native_terminal_ensure_locks = _require_full_native_lock_coverage(
+        {
+            "claude": _claude_terminal_ensure_locks,
+            "codex": _codex_terminal_ensure_locks,
+            "pi": _pi_terminal_ensure_locks,
+            "cursor": _cursor_terminal_ensure_locks,
+            "kiro": _kiro_terminal_ensure_locks,
+            "antigravity": _antigravity_terminal_ensure_locks,
+            "opencode": _opencode_terminal_ensure_locks,
+            "goose": _goose_terminal_ensure_locks,
+            "hermes": _hermes_terminal_ensure_locks,
+            "qwen": _qwen_terminal_ensure_locks,
+            "kimi": _kimi_terminal_ensure_locks,
+            "devin": _devin_terminal_ensure_locks,
+        }
+    )
+    app.state.native_terminal_ensure_locks = _native_terminal_ensure_locks
     _repl_terminal_ensure_locks: dict[str, asyncio.Lock] = {}
     _active_turns: dict[str, asyncio.Task[None] | None] = {}
     app.state.active_turns = _active_turns
@@ -1411,10 +1497,17 @@ def create_runner_app(
     app.state.session_message_buffers = _session_message_buffers
     _claude_prompt_waiters: dict[str, asyncio.Task[None]] = {}
     app.state.claude_prompt_waiters = _claude_prompt_waiters
+    # Sessions whose queued Claude message waits for a launcher sign-in.
+    _sign_in_holds: dict[str, _SignInHold] = {}
+    app.state.sign_in_holds = _sign_in_holds
+    # The web message each background turn carries, so a sign-in refusal can queue it again.
+    _turn_message_bodies: dict[str, _JsonObject] = {}
     _author_attribution_sessions: set[str] = set()
     _ingest_next_seq: dict[str, int] = {}
     _ingest_now_serving: dict[str, int] = {}
     _ingest_cond: dict[str, asyncio.Condition] = {}
+    # Server pending IDs owned by each session's current turn, including injections.
+    _turn_pending_ids: dict[str, set[str]] = {}
     _interrupted_sessions: set[str] = set()
     app.state.interrupted_sessions = _interrupted_sessions
     # Desynced conversations; cleared when a fresh turn binds.
@@ -1424,12 +1517,28 @@ def create_runner_app(
     # subprocess. The release closes the httpx client an in-flight
     # ``proxy_stream`` is reading, which surfaces there as a transport error;
     # the stream's failure handler consumes the record to report the exit.
-    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
+    _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
+    app.state.required_terminal_exit_errors = _required_terminal_exit_errors
+    _clean_terminal_exit_responses: dict[str, str | None] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
     _turn_bind_epoch: dict[str, int] = {}
     app.state.turn_bind_epoch = _turn_bind_epoch
+
+    def _log_turn_cancellation_request(session_id: str, origin: str) -> None:
+        with contextlib.suppress(Exception):
+            _logger.info(
+                "Requesting runner turn cancellation",
+                extra=debug_event(
+                    "runner_turn_cancel_requested",
+                    session_id=session_id,
+                    cancel_origin=origin,
+                    turn_epoch=_turn_bind_epoch.get(session_id),
+                    current_response_id=_live_response_id.get(session_id),
+                ),
+            )
+
     # Epoch at which desync recovery claimed the terminal token; competing sites skip their
     # ``idle`` only if the epoch still matches.
     _desync_terminalized: dict[str, int] = {}
@@ -1455,6 +1564,31 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+        """Whether a native pane shows the live work the pane reaper spares it for.
+
+        A pane parked on a permission prompt is quiet and can read ``idle``, and a
+        pane still redrawing output can too, so the status edge alone misses them.
+        Reads the same in-memory signals the reaper uses, not its tmux calls.
+
+        :param terminals: Terminal registry holding the pane instance.
+        :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
+        :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
+        :returns: ``True`` when a permission hook is parked or the pane shows recent
+            input or output.
+        """
+        from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
+
+        if approval_wait_is_fresh(session_id):
+            return True
+        instance = terminals.get(session_id, terminal_name, "main")
+        if instance is None:
+            return False
+        if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
+            return True
+        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -1469,6 +1603,20 @@ def create_runner_app(
         if pending_approvals.has_any_pending():
             return True
         session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        # Terminal ensure can start native work before any harness or web turn.
+        # Read current resources so deleting a terminal also retires this pin.
+        terminals = resource_registry.terminal_registry
+        if terminals is not None:
+            for session_id, name, _ in terminals.native_panes():
+                if not is_native_harness(
+                    resource_registry.terminal_resource_role(
+                        session_id, terminal_resource_id(name, "main")
+                    )
+                ):
+                    continue
+                session_ids.add(session_id)
+                if _native_pane_shows_live_work(terminals, session_id, name):
+                    return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -1663,13 +1811,59 @@ def create_runner_app(
         session_id: str,
         status: str,
         blocked_on: str | None = None,
+        *,
+        failure_detail: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # A lost terminal hook may still leave a cause in the program-status report.
+            event["error"] = {
+                "code": "native_failure_detail_unavailable",
+                "message": (
+                    "The native agent reported an error, but its failure details did not "
+                    "arrive. Open the terminal to inspect the error before retrying."
+                ),
+            }
+            if failure_detail:
+                from omnigent.harnesses.claude_native.bridge import program_status_turn_error
+                from omnigent.harnesses.claude_native.failure_telemetry import (
+                    claude_failure_context,
+                )
+
+                raw_context: dict[str, object] = {
+                    **claude_failure_context({}, error_text=failure_detail),
+                    "failure_source": "claude_program_status",
+                    "detail_source": "program_status_error",
+                }
+                # An API error envelope decodes to its cause; the raw report is only the fallback.
+                raw_context.setdefault("native_error_message", failure_detail)
+                context = normalize_failure_context(raw_context)
+                detail = context.get("native_error_message")
+                if isinstance(detail, str):
+                    code, message = program_status_turn_error(detail)
+                    event["error"] = {"code": code, "message": message}
+                    event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_failure_publisher(
+        lambda session_id, detail: _publish_session_status(
+            session_id, "failed", failure_detail=detail
+        )
+    )
+
+    # A session event over HTTP, so a server that predates the flag answers
+    # "Unknown event type" instead of relaying it into its public stream.
+    background_reports = BackgroundWorkReporter(
+        lambda *args, **kwargs: server_client.post(*args, **kwargs)
+    )
+
+    def _publish_session_background(session_id: str, running: bool) -> None:
+        background_reports.report(session_id, running)
+
+    resource_registry.set_session_background_publisher(_publish_session_background)
 
     def _format_terminal_command_for_failure(event: TerminalExitEvent) -> str:
         if event.command is None:
@@ -1723,9 +1917,30 @@ def create_runner_app(
             )
         return "\n".join(parts)
 
+    def _build_delivery_timeout_error(event: TerminalExitEvent) -> dict[str, Any]:
+        """Build the failure for a pane the delivery timeout closed.
+
+        Stands in for the turn's own readiness error when releasing the harness
+        severs its stream first. The executor reports that error as a
+        ``RuntimeError`` with ``undelivered`` set, since nothing reached the
+        pane; the same shape keeps both readings of one failure together and
+        lets the server keep the queued message.
+
+        :param event: The exit of the pane Omnigent closed.
+        """
+        terminal = _TERMINAL_DISPLAY_NAMES.get(event.terminal_name, event.terminal_name)
+        message = (
+            f"{terminal} terminal did not become ready before the message delivery timed "
+            "out, so Omnigent closed it and the message was not delivered. Relaunch the "
+            "terminal to continue this conversation."
+        )
+        if event.last_output:
+            message = f"{message}\n\nLast captured terminal output:\n{event.last_output}"
+        return {"code": "RuntimeError", "message": message, "undelivered": True}
+
     def _build_required_terminal_error(
         event: TerminalExitEvent, diagnosis: FailureDiagnosis | None
-    ) -> dict[str, str]:
+    ) -> dict[str, Any]:
         """Build the structured ``session.status`` error for a required-terminal exit.
 
         Always carries ``code`` + a fully-composed ``message`` (back-compat: the
@@ -1737,7 +1952,7 @@ def create_runner_app(
         :param diagnosis: The exit's :func:`classify_terminal_failure` result.
         """
         message = _format_required_terminal_exit_output(event, diagnosis)
-        error: dict[str, str] = {"code": "required_terminal_exited", "message": message}
+        error: dict[str, Any] = {"code": "required_terminal_exited", "message": message}
         if diagnosis is not None:
             error["title"] = diagnosis.title
             error["cause"] = diagnosis.cause
@@ -1788,7 +2003,9 @@ def create_runner_app(
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
         return message
 
-    def _release_required_terminal_session(session_id: str) -> None:
+    def _release_required_terminal_session(
+        session_id: str, *, grace_s: float = _TERMINAL_EXIT_RELEASE_GRACE_S
+    ) -> None:
         if process_manager is None:
             return
 
@@ -1796,7 +2013,7 @@ def create_runner_app(
             # Let a live turn stream converge first (bounded): the harness's own
             # failure event may already be on the wire, and releasing now would
             # sever the stream carrying it.
-            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            deadline = time.monotonic() + grace_s
             while session_id in _live_response_id and time.monotonic() < deadline:
                 await asyncio.sleep(0.05)
             try:
@@ -1832,6 +2049,24 @@ def create_runner_app(
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
 
+        # Omnigent killed this pane after a delivery timeout. The turn's own
+        # error is the failure; a terminal-exit failure would be a second one.
+        if event.expected_close:
+            _logger.info(
+                "required terminal %s closed by its turn's delivery timeout; "
+                "the turn reports that error: session=%s",
+                event.terminal_name,
+                event.session_id,
+                extra={"session_id": event.session_id},
+            )
+            # Should the release still sever the stream before that error lands,
+            # the drop reports this closed pane and its output, not the transport.
+            _required_terminal_exit_errors[event.session_id] = _build_delivery_timeout_error(event)
+            _release_required_terminal_session(
+                event.session_id, grace_s=_EXPECTED_CLOSE_RELEASE_GRACE_S
+            )
+            return
+
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
         _teardown_task = asyncio.create_task(
@@ -1840,37 +2075,37 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
-        # Record the exit before releasing the harness: the release severs any
-        # in-flight turn stream, whose failure handler then reports this exit
-        # instead of the transport error the severed socket raises.
-        # Classify once; the error card and the failure log share the diagnosis.
-        diagnosis = classify_terminal_failure(
-            command=event.command,
-            exit_status=event.exit_status,
-            output=event.last_output,
-        )
-        error = _build_required_terminal_error(event, diagnosis)
-        _required_terminal_exit_errors[event.session_id] = error
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
-
-        if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
-            _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
-            _release_required_terminal_session(event.session_id)
-            return
 
         # A claude /exit or /quit prints this banner and exits 0. Printing it
         # can flip the idle memo back to "running" before pane death, so treat
         # a banner exit as a clean stop rather than a failure.
-        if (
+        if (event.terminal_name in ("qwen", "antigravity") and event.session_key == "main") or (
             event.exit_status == 0
             and event.terminal_name == "claude"
             and event.last_output is not None
             and _CLAUDE_VOLUNTARY_EXIT_MARKER in event.last_output
         ):
+            # Releasing the harness can sever this response's stream after its clean exit.
+            _required_terminal_exit_errors.pop(event.session_id, None)
+            _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                event.session_id
+            )
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
             return
+
+        # Record the exit before release severs its stream, preserving the cause.
+        diagnosis = classify_terminal_failure(
+            command=event.command,
+            exit_status=event.exit_status,
+            output=event.last_output,
+        )
+        if diagnosis is None and event.closed_outside_omnigent:
+            diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
+        error = _build_required_terminal_error(event, diagnosis)
+        _required_terminal_exit_errors[event.session_id] = error
 
         if event.session_was_idle:
             _release_required_terminal_session(event.session_id)
@@ -2078,7 +2313,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -2329,14 +2564,17 @@ def create_runner_app(
                 status_code=503,
                 content={
                     "error": "spec_resolver_failed",
-                    "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                    "detail": _spec_resolve_error_detail(exc),
                 },
             )
 
         context = BackgroundTitleContext(
             prompt=body.prompt[:BACKGROUND_TITLE_MAX_PROMPT_CHARS],
             harness=effective_harness,
-            spawn_env=dict(spawn_env or {}),
+            spawn_env={
+                **(spawn_env or {}),
+                **resource_registry.client_surface_env(conversation_id),
+            },
             process_manager=process_manager,
             cwd=resolver_cwd,
             model_override=body.model_override,
@@ -2481,6 +2719,12 @@ def create_runner_app(
         # endpoint at all.
         _routing_class = init_context.routing_class
         remember_session_routing_class(session_id, _routing_class)
+        from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY
+
+        surface_labels = init_context.labels or {}
+        resource_registry.set_client_surface(
+            session_id, surface_labels.get(CLIENT_SURFACE_LABEL_KEY)
+        )
         if init_context.envelope is not None:
             _note_session_harness_override(
                 session_id, init_context.envelope.snapshot.harness_override
@@ -2505,7 +2749,7 @@ def create_runner_app(
                     status_code=503,
                     content={
                         "error": "spec_resolver_failed",
-                        "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                        "detail": _spec_resolve_error_detail(exc),
                     },
                 )
         if spec_entry is not None:
@@ -2714,22 +2958,7 @@ def create_runner_app(
             # (claude/codex/antigravity) add a pre_launch check and, for
             # claude/codex, a build_context enrichment. All wire the comment
             # relay (pi/opencode route their policy hook through it).
-            _launch_locks = _require_full_native_lock_coverage(
-                {
-                    "claude": _claude_terminal_ensure_locks,
-                    "codex": _codex_terminal_ensure_locks,
-                    "pi": _pi_terminal_ensure_locks,
-                    "cursor": _cursor_terminal_ensure_locks,
-                    "kiro": _kiro_terminal_ensure_locks,
-                    "antigravity": _antigravity_terminal_ensure_locks,
-                    "opencode": _opencode_terminal_ensure_locks,
-                    "goose": _goose_terminal_ensure_locks,
-                    "hermes": _hermes_terminal_ensure_locks,
-                    "qwen": _qwen_terminal_ensure_locks,
-                    "kimi": _kimi_terminal_ensure_locks,
-                    "devin": _devin_terminal_ensure_locks,
-                }
-            )[_native_agent.key]
+            _launch_locks = _native_terminal_ensure_locks[_native_agent.key]
             _launch_ctx = NativeLaunchContext(
                 session_id=session_id,
                 resource_registry=resource_registry,
@@ -2806,8 +3035,6 @@ def create_runner_app(
                         bundle_dir = _resolved_spec_workdir(entry) if entry is not None else None
                         agent_name = getattr(spec, "name", None)
                         skills_filter = getattr(spec, "skills_filter", "all")
-                    if bundle_dir is None:
-                        bundle_dir = Path(tempfile.mkdtemp(prefix="omnigent-skill-bundle-"))
                     _logger.info(
                         "Claude terminal auto-create inputs resolved: session=%s "
                         "bundle_dir=%s agent_name=%s skills_filter=%s",
@@ -2817,7 +3044,8 @@ def create_runner_app(
                         skills_filter,
                         extra={"session_id": session_id},
                     )
-                    _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
+                    if bundle_dir is not None:
+                        _ensure_orchestrator_skills_in_bundle(bundle_dir, spec)
                     return dataclasses.replace(
                         ctx,
                         bundle_dir=bundle_dir,
@@ -2971,10 +3199,11 @@ def create_runner_app(
                             extra={"session_id": session_id},
                         )
 
-                _relay_task = asyncio.create_task(
-                    _start_claude_relay_early(),
-                    name=f"claude-comment-relay:{session_id}",
-                )
+                with scheduled_run_scope(None, session_id=session_id):
+                    _relay_task = asyncio.create_task(
+                        _start_claude_relay_early(),
+                        name=f"claude-comment-relay:{session_id}",
+                    )
                 _relay_task.add_done_callback(_background_tasks.discard)
                 _background_tasks.add(_relay_task)
 
@@ -3390,23 +3619,32 @@ def create_runner_app(
         await _cancel_subagent_recovery(session_id)
         turn_task = _active_turns.pop(session_id, None)
         if turn_task is not None and isinstance(turn_task, asyncio.Task):
+            _log_turn_cancellation_request(session_id, "session_delete")
             turn_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await turn_task
         await mcp_execution_registry.cancel_session(session_id)
         _session_message_buffers.pop(session_id, None)
         _live_response_id.pop(session_id, None)
+        _turn_occurrences.pop(session_id, None)
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _native_interrupt_runner.clear_pending_interrupt(session_id)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
-        _ingest_cond.pop(session_id, None)
+        _turn_pending_ids.pop(session_id, None)
+        ingest_cond = _ingest_cond.pop(session_id, None)
+        if ingest_cond is not None:
+            # Wake waiters on the dropped gate, so a cancelled ticket's
+            # retirement sees it gone and ends instead of waiting forever.
+            async with ingest_cond:
+                ingest_cond.notify_all()
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -3708,10 +3946,32 @@ def create_runner_app(
             else _native_runtime.codex_native_bridge_dir(conv_id)
         )
 
+    def _codex_goal_bridge_is_inactive(conv_id: str, state: CodexNativeBridgeState) -> bool:
+        """Recognize an unloaded bridge without a recorded startup failure."""
+        from omnigent.harnesses.codex_native.bridge import (
+            bridge_dir_for_codex_home,
+            read_bridge_startup_error,
+            read_bridge_state,
+        )
+
+        registry = resource_registry.terminal_registry
+        if (
+            registry is None
+            or registry.get(conv_id, "codex", "main") is not None
+            or conv_id in _native_runtime._AUTO_CODEX_APP_SERVERS
+        ):
+            return False
+        bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
+        return (
+            read_bridge_state(bridge_dir) == state
+            and read_bridge_startup_error(bridge_dir) is None
+        )
+
     codex_goal_runner = CodexGoalRunner(
         bridge_state_for_session=_codex_native_bridge_state_for_session,
         client_safe_error_detail=_client_safe_error_detail,
         logger=_logger,
+        bridge_is_inactive=_codex_goal_bridge_is_inactive,
     )
 
     async def _native_cost_popup_config_file(conv_id: str, harness: str) -> Path:
@@ -3738,8 +3998,8 @@ def create_runner_app(
             bridge_dir = _cxb.bridge_dir_for_bridge_id(conv_id)
 
         _server_url = _required_runner_env("RUNNER_SERVER_URL")
-        _factory = _make_auth_token_factory()
-        _token = _factory() if _factory is not None else None
+        _factory = await asyncio.to_thread(_make_auth_token_factory)
+        _token = await asyncio.to_thread(_factory) if _factory is not None else None
         return await asyncio.to_thread(
             write_cost_popup_config,
             bridge_dir,
@@ -3823,21 +4083,58 @@ def create_runner_app(
     _sign_in_watch = build_sign_in_watch(
         _background_tasks=_background_tasks,
         _session_harness_name=_session_harness_name,
+        # Late-bound: the queue helpers that own the hold are defined further down.
+        _claim_sign_in_release=lambda conv_id: _claim_sign_in_release(conv_id),
+        _release_sign_in_hold=lambda conv_id: _release_sign_in_hold(conv_id),
         _sign_in_watchers=_sign_in_watchers,
         resource_registry=resource_registry,
         server_client=server_client,
     )
     _native_pane_names = _sign_in_watch.native_pane_names
     _start_sign_in_watch = _sign_in_watch.start_sign_in_watch
+    _post_sign_in_hold_notice = _sign_in_watch.post_sign_in_hold_notice
 
-    def _begin_turn_slot(conv_id: str) -> None:
+    def _begin_turn_slot(
+        conv_id: str,
+        body: Mapping[str, Any] | None = None,
+        *,
+        inputs: list[dict[str, Any]] | None = None,
+    ) -> None:
         """Bind the ``None`` sentinel and stamp a fresh epoch for the new turn.
 
         Must be used instead of a bare ``_active_turns[conv] = None`` so recovery can detect
         a replacement turn that ran and finished during a teardown await.
+
+        :param conv_id: Session whose turn slot is bound.
+        :param body: Forwarded message that starts the turn, when there is one.
+        :param inputs: Original inputs when the existing queue drain coalesces a batch.
         """
         _active_turns[conv_id] = None
+        turn_inputs = inputs if inputs is not None else [body] if body is not None else []
+        _turn_occurrences[conv_id] = _shared_scheduled_run(turn_inputs)
         _turn_bind_epoch[conv_id] = next(_turn_epoch_seq)
+        pending_id = body.get("pending_id") if body is not None else None
+        if isinstance(pending_id, str):
+            _turn_pending_ids[conv_id] = {pending_id}
+        else:
+            _turn_pending_ids.pop(conv_id, None)
+
+    def _message_already_taken(conv_id: str, body: Mapping[str, Any]) -> bool:
+        """Whether a forward repeats a message that is still queued or running.
+
+        The server re-forwards a message under the same pending id when an
+        earlier forward timed out on its side; the runner may still hold that
+        earlier forward, so taking the repeat would deliver the message twice.
+        """
+        pending_id = body.get("pending_id")
+        if not isinstance(pending_id, str):
+            return False
+        if conv_id in _active_turns and pending_id in _turn_pending_ids.get(conv_id, ()):
+            return True
+        return any(
+            queued.get("pending_id") == pending_id
+            for queued in _session_message_buffers.get(conv_id, ())
+        )
 
     def _release_live_turn_markers(conv_id: str) -> None:
         """Clear ``_live_response_id`` and the process-manager in-flight marker atomically.
@@ -3845,6 +4142,7 @@ def create_runner_app(
         The two stores represent one fact; clearing only one leaves the idle reaper stuck.
         """
         _live_response_id.pop(conv_id, None)
+        _turn_occurrences.pop(conv_id, None)
         if process_manager is not None:
             process_manager.clear_in_flight(conv_id)
 
@@ -3856,6 +4154,7 @@ def create_runner_app(
         if _active_turns.get(conv_id) is not occupant:
             return False
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         _interrupted_sessions.discard(conv_id)
         return True
@@ -3865,7 +4164,11 @@ def create_runner_app(
         *,
         error: dict[str, Any] | None = None,
         owner_response_id: str | None = None,
+        sign_in_hold: bool = False,
+        cancelled: bool = False,
     ) -> None:
+        # Harness children record PRs without a server client; report them as the turn ends.
+        pr_reports.notify(conv_id)
         # Stale-finalizer guard: when owner_response_id no longer matches the live response,
         # a newer turn has taken over — skip all conversation-state mutations.
         if owner_response_id is not None and _live_response_id.get(conv_id) != owner_response_id:
@@ -3879,6 +4182,7 @@ def create_runner_app(
             return
 
         _active_turns.pop(conv_id, None)
+        _turn_pending_ids.pop(conv_id, None)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
         # `response.compaction.completed` produced no compaction (nothing to
@@ -3895,17 +4199,29 @@ def create_runner_app(
         if error is not None and error.get("code") == "connection_error":
             _desynced_sessions.add(conv_id)
         has_buffered = bool(_session_message_buffers.get(conv_id))
+        inbox_recovery_checked = False
         was_interrupted = conv_id in _interrupted_sessions
         # Suppress terminal only if desync recovery claimed the token for THIS generation's epoch.
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
-        if was_interrupted:
+        if was_interrupted or cancelled:
             _interrupted_sessions.discard(conv_id)
-            _append_cancellation_items(conv_id)
+            if was_interrupted:
+                _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
+        elif sign_in_hold:
+            # Nothing failed: the queued message is sent once the sign-in completes.
+            pass
         elif error is not None:
+            if not has_buffered or error.get("code") != "databricks_sign_in_pending":
+                # Only a refusal that ended the wait fails the queue behind it too; after
+                # any other end, a later refusal waits afresh.
+                _sign_in_holds.pop(conv_id, None)
+            elif (hold := _sign_in_holds.get(conv_id)) is not None:
+                # The resend failed, so no resend is in flight any more.
+                hold.resent = False
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
                 _publish_turn_status(
@@ -3918,15 +4234,25 @@ def create_runner_app(
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
         else:
+            # A delivered turn proves the pane takes input, so any sign-in wait is over,
+            # and a watcher still polling could only ask for a resend that already happened.
+            _sign_in_holds.pop(conv_id, None)
+            if (watcher := _sign_in_watchers.pop(conv_id, None)) is not None:
+                watcher.cancel()
             if not has_buffered and not _suppress_status:
+                # Schedule unread inbox results before deciding the session is done.
+                # An intermediate idle lets headless clients stop the runner early.
+                _rewake_parent_if_inbox_stranded(conv_id)
+                inbox_recovery_checked = True
                 children = _subagent_work_by_parent.get(conv_id, set())
                 has_running_children = any(
-                    (e := _subagent_work_by_child.get(c)) is not None
-                    and e.status in ("launching", "running", "waiting")
-                    for c in children
+                    (entry := _subagent_work_by_child.get(child_id)) is not None
+                    and entry.status in ("launching", "running", "waiting")
+                    for child_id in children
                 )
-                _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
-        if was_interrupted:
+                waiting = has_running_children or conv_id in _subagent_wake_pending
+                _publish_turn_status(conv_id, "waiting" if waiting else "idle")
+        if was_interrupted or cancelled:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
                 # interrupt marker to unwind the harness), NOT by a user
@@ -3960,6 +4286,8 @@ def create_runner_app(
             # A clean native turn end acknowledges prompt submission, so the
             # dispatch leaves ``launching`` even when no running edge is relayed.
             mark_subagent_work_started(conv_id)
+        if inbox_recovery_checked:
+            return
         try:
             loop = asyncio.get_running_loop()
             _cont = loop.create_task(
@@ -3990,6 +4318,10 @@ def create_runner_app(
         if expected_task is not None and turn_task is not expected_task:
             return False
         turn_epoch = _turn_bind_epoch.get(conv_id, 0)
+        _log_turn_cancellation_request(
+            conv_id,
+            "desync_recovery" if conv_id in _desynced_sessions else "interrupt_or_stop",
+        )
         turn_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await turn_task
@@ -4047,7 +4379,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -4137,6 +4469,7 @@ def create_runner_app(
         )
         if stream_sentinel:
             _active_turns.pop(conv_id, None)
+            _turn_pending_ids.pop(conv_id, None)
             await _forward_harness_interrupt(conv_id, turn_epoch=_entry_epoch)
         else:
             await _cancel_inprocess_turn(conv_id)
@@ -4269,6 +4602,9 @@ def create_runner_app(
 
     def _cancel_claude_prompt_waiter(session_id: str) -> None:
         """Discard waiting input before explicit terminal interruption or teardown."""
+        _sign_in_holds.pop(session_id, None)
+        # A refusal still streaming can no longer hold the cancelled turn's message.
+        _turn_message_bodies.pop(session_id, None)
         waiter = _claude_prompt_waiters.pop(session_id, None)
         if waiter is not None or _session_harness_name(session_id) == "claude-native":
             # Cancel queued work even if the terminal control fails; restoring it
@@ -4286,11 +4622,30 @@ def create_runner_app(
         async def _wait_for_prompt() -> None:
             from omnigent.harnesses.claude_native.bridge import has_pending_user_prompt
 
+            resolved_dir = bridge_dir
+            warned = False
             try:
-                resolved_dir = bridge_dir or await _claude_prompt_bridge_dir(session_id)
                 while _session_message_buffers.get(session_id):
                     if session_id in _active_turns:
                         return
+                    if _sign_in_hold_waiting(session_id):
+                        await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                        continue
+                    if resolved_dir is None:
+                        try:
+                            resolved_dir = await _claude_prompt_bridge_dir(session_id)
+                        except (httpx.HTTPError, RuntimeError, OSError):
+                            # A failed lookup must not strand the queue; try again next poll.
+                            if not warned:
+                                warned = True
+                                _logger.warning(
+                                    "Failed to resolve the Claude bridge for %s; retrying",
+                                    session_id,
+                                    exc_info=True,
+                                    extra={"session_id": session_id},
+                                )
+                            await asyncio.sleep(_CLAUDE_PENDING_PROMPT_POLL_S)
+                            continue
                     try:
                         pending = await asyncio.to_thread(has_pending_user_prompt, resolved_dir)
                     except (OSError, RuntimeError):
@@ -4314,14 +4669,139 @@ def create_runner_app(
                 if _claude_prompt_waiters.get(session_id) is asyncio.current_task():
                     _claude_prompt_waiters.pop(session_id, None)
 
-        waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
+        with scheduled_run_scope(None, session_id=session_id):
+            waiter = asyncio.create_task(_wait_for_prompt(), name=f"claude-prompt-{session_id}")
         _claude_prompt_waiters[session_id] = waiter
         _background_tasks.add(waiter)
         waiter.add_done_callback(_background_tasks.discard)
 
-    async def _check_and_start_next_turn(
-        session_id: str,
-    ) -> None:
+    def _holds_for_sign_in(conv_id: str, error: Mapping[str, Any] | None) -> bool:
+        """
+        Return whether a turn's refusal should wait for a launcher sign-in instead of failing.
+
+        Only a main-session Claude message that never reached the pane
+        qualifies: the launcher in front of ``claude`` is showing a sign-in
+        address, so the message can be sent unchanged once the person signs in.
+        A sub-agent dispatch fails as before, since its launch bookkeeping
+        times out on its own.
+
+        :param conv_id: Session whose background turn was refused.
+        :param error: The harness ``response.failed`` error.
+        :returns: ``True`` when the message should be queued again and held.
+        """
+        if (
+            error is None
+            or error.get("code") != "databricks_sign_in_pending"
+            or not error.get("undelivered")
+            or _session_harness_name(conv_id) != "claude-native"
+            or conv_id not in _turn_message_bodies
+            or conv_id in _interrupted_sessions
+            or _is_sub_agent_session(conv_id)
+        ):
+            return False
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            # A message the server queued too long ago fails while it can still be recorded.
+            return time.monotonic() < _sign_in_hold_deadline(_turn_message_bodies[conv_id])
+        if hold.holds >= _SIGN_IN_HOLD_MAX_REPEATS or time.monotonic() >= hold.deadline:
+            # The wait ran out, or the pane kept asking after it looked signed in: this
+            # refusal stands, and so do those of the messages queued during the wait.
+            return False
+        return True
+
+    def _is_sub_agent_session(conv_id: str) -> bool:
+        """Return whether *conv_id* runs a sub-agent dispatch rather than a main session."""
+        snapshot = _session_snapshot_cache.get(conv_id)
+        return (
+            get_subagent_work(conv_id) is not None
+            or conv_id in _child_session_parents
+            or (snapshot is not None and snapshot.parent_session_id is not None)
+        )
+
+    def _hold_message_for_sign_in(conv_id: str, error: Mapping[str, Any]) -> None:
+        """
+        Queue a sign-in-refused message first again and pause the queue for the sign-in.
+
+        The sign-in watcher releases the pause once the agent can take input,
+        and the pending-prompt waiter then sends the queue in order.
+
+        :param conv_id: Session whose message the launcher's sign-in refused.
+        :param error: The harness refusal, carrying the sign-in title and link.
+        """
+        body = _turn_message_bodies[conv_id]
+        history = _session_histories.get(conv_id)
+        if history and history[-1].get("content") == body.get("content"):
+            # The queue records the message again when it sends it.
+            history.pop()
+        _session_message_buffers.setdefault(conv_id, []).insert(0, body)
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            hold = _sign_in_holds[conv_id] = _SignInHold(deadline=_sign_in_hold_deadline(body))
+        hold.holds += 1
+        hold.waiting = True
+        _logger.info(
+            "Holding a message for %s until its Databricks sign-in completes (refusal %d)",
+            conv_id,
+            hold.holds,
+            extra={"session_id": conv_id, "event_name": "native_input_held_for_sign_in"},
+        )
+        if hold.holds == 1:
+            notice = asyncio.get_running_loop().create_task(
+                _post_sign_in_hold_notice(conv_id, error), name=f"sign-in-hold-notice-{conv_id}"
+            )
+            _background_tasks.add(notice)
+            notice.add_done_callback(_background_tasks.discard)
+        _start_sign_in_watch(conv_id)
+
+    def _message_held_for_sign_in(conv_id: str) -> bool:
+        """Return whether a queued message waits on the session's sign-in, without resuming it."""
+        hold = _sign_in_holds.get(conv_id)
+        return hold is not None and hold.waiting
+
+    def _claim_sign_in_release(conv_id: str) -> bool:
+        """
+        Return whether a held message is being sent without the person resending it.
+
+        A message still waiting on the sign-in is claimed: only the watcher resumes it.
+        One the expired wait already resent needs no claim.
+        """
+        hold = _sign_in_holds.get(conv_id)
+        if hold is None:
+            return False
+        if hold.waiting:
+            hold.releasing = True
+            return True
+        return hold.resent
+
+    def _release_sign_in_hold(conv_id: str) -> None:
+        """Resume a queue paused for a sign-in."""
+        hold = _sign_in_holds.get(conv_id)
+        if hold is not None:
+            hold.waiting = False
+            hold.releasing = False
+
+    def _sign_in_hold_waiting(session_id: str) -> bool:
+        """Return whether queued input still waits on a sign-in; an expired wait resumes."""
+        hold = _sign_in_holds.get(session_id)
+        if hold is None or not hold.waiting:
+            return False
+        if hold.releasing or time.monotonic() < hold.deadline:
+            return True
+        hold.waiting = False
+        hold.resent = True
+        _logger.warning(
+            "Databricks sign-in for %s did not complete before its wait ran out; "
+            "resending its message",
+            session_id,
+            extra={"session_id": session_id},
+        )
+        return False
+
+    async def _check_and_start_next_turn(session_id: str) -> None:
+        with scheduled_run_scope(None, session_id=session_id):
+            await _drain_next_turn(session_id)
+
+    async def _drain_next_turn(session_id: str) -> None:
         _seq = _ingest_next_seq.get(session_id, 0)
         _ingest_next_seq[session_id] = _seq + 1
         _cond = _ingest_cond.get(session_id)
@@ -4340,7 +4820,23 @@ def create_runner_app(
                 _rewake_parent_if_inbox_stranded(session_id)
                 return
 
-            pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            if _sign_in_hold_waiting(session_id):
+                _start_claude_prompt_waiter(session_id)
+                return
+            try:
+                pending_bridge_dir = await _pending_claude_prompt_bridge_dir(session_id)
+            except (httpx.HTTPError, RuntimeError, OSError):
+                # Nothing else resumes this queue, so a failed pane check hands it to the
+                # waiter, which retries until the check succeeds.
+                _logger.warning(
+                    "Failed to check the Claude prompt before sending queued input for %s; "
+                    "retrying",
+                    session_id,
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
+                _start_claude_prompt_waiter(session_id)
+                return
             # Stop/delete can clear the queue while the pane inspection is in flight.
             buf = _session_message_buffers.get(session_id)
             if not buf:
@@ -4358,6 +4854,7 @@ def create_runner_app(
             # whenever a /compact is buffered, so each lands as its own turn.
             if _is_native_harness(session_id) or any(_is_sdk_compact_body(b) for b in buf):
                 next_body = buf.pop(0)
+                all_bodies = [next_body]
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
@@ -4382,31 +4879,37 @@ def create_runner_app(
                     )
                 next_body = all_bodies[-1]
 
-            if _is_sdk_compact_body(next_body):
-                # This buffered /compact now dispatches as its own turn. Mirror the
-                # idle path: publish the spinner up front AND set the flag, so
-                # (a) the relay swallows the executor's own duplicate in_progress
-                # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
-                # if the turn ends without a `response.compaction.completed` (a real
-                # executor path — the compaction-complete event can be None) rather
-                # than stranding the spinner. The prior turn has ended, so showing
-                # "Compacting…" now is accurate.
-                _publish_event(
-                    session_id,
-                    {"type": "response.compaction.in_progress", "task_id": session_id},
+            with scheduled_run_scope(_shared_scheduled_run(all_bodies), session_id=session_id):
+                if _is_sdk_compact_body(next_body):
+                    # This buffered /compact now dispatches as its own turn. Mirror the
+                    # idle path: publish the spinner up front AND set the flag, so
+                    # (a) the relay swallows the executor's own duplicate in_progress
+                    # (single spinner), and (b) _on_proxy_stream_end publishes `failed`
+                    # if the turn ends without a `response.compaction.completed` (a real
+                    # executor path — the compaction-complete event can be None) rather
+                    # than stranding the spinner. The prior turn has ended, so showing
+                    # "Compacting…" now is accurate.
+                    _publish_event(
+                        session_id,
+                        {"type": "response.compaction.in_progress", "task_id": session_id},
+                    )
+                    _sdk_compact_inprogress.add(session_id)
+                _begin_turn_slot(session_id, next_body, inputs=all_bodies)
+                _turn_pending_ids[session_id] = {
+                    pending_id
+                    for body in all_bodies
+                    if isinstance(pending_id := body.get("pending_id"), str)
+                }
+                _publish_turn_status(session_id, "running")
+                _turn_task = asyncio.create_task(
+                    _run_turn_bg(next_body, session_id),
+                    name=f"turn-cont-{session_id}",
                 )
-                _sdk_compact_inprogress.add(session_id)
-            _begin_turn_slot(session_id)
-            _publish_turn_status(session_id, "running")
-            _turn_task = asyncio.create_task(
-                _run_turn_bg(next_body, session_id),
-                name=f"turn-cont-{session_id}",
-            )
-            _active_turns[session_id] = _turn_task
-            _turn_task.add_done_callback(
-                _background_tasks.discard,
-            )
-            _background_tasks.add(_turn_task)
+                _active_turns[session_id] = _turn_task
+                _turn_task.add_done_callback(
+                    _background_tasks.discard,
+                )
+                _background_tasks.add(_turn_task)
         finally:
             async with _cond:
                 _ingest_now_serving[session_id] = _seq + 1
@@ -4571,12 +5074,16 @@ def create_runner_app(
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_completion: bool = False,
+        confirmed_cancellation: bool = False,
     ) -> _SubagentDeliveryAck:
         ack = mark_subagent_work_terminal(
             child_session_id,
             status=status,
             output=output,
             only_if_work_id=only_if_work_id,
+            confirmed_completion=confirmed_completion,
+            confirmed_cancellation=confirmed_cancellation,
         )
         if ack.entry is not None and ack.delivered_now:
             _schedule_subagent_wake(ack.entry)
@@ -4737,6 +5244,8 @@ def create_runner_app(
                 return
 
         _captured_session_id = session_id
+        # ponytail: one lock per relay; split by path only if recovery contention matters.
+        _native_file_changes_lock = asyncio.Lock()
 
         async def _relay_tool_executor(
             name: str,
@@ -4767,8 +5276,32 @@ def create_runner_app(
 
             :param payload: Hook JSON object from ``/hook/observe-tool``.
             """
-            from omnigent.runner.native_file_observer import native_file_changes
+            from omnigent.runner.native_file_observer import (
+                native_file_changes,
+                resolve_native_original,
+            )
+            from omnigent.runner.slow_io import run_slow_io
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
+
+            async def _read_text(path: str) -> str | None:
+                environment = resource_registry.resolve_environment(
+                    _captured_session_id, "default", relay_spec
+                )
+                result = await environment.read(path, max_bytes=1_048_576, regular_only=True)
+                content = result.get("content")
+                return content if not result.get("error") and isinstance(content, str) else None
+
+            async def _read_edited_text(path: str) -> str | None:
+                try:
+                    return await _read_text(path)
+                except Exception:
+                    _logger.debug(
+                        "could not read %r after a native edit",
+                        path,
+                        exc_info=True,
+                        extra={"session_id": _captured_session_id},
+                    )
+                    return None
 
             try:
                 changes = native_file_changes(payload)
@@ -4777,20 +5310,42 @@ def create_runner_app(
                 registry = await _resolve_session_fs_registry(_captured_session_id)
                 if registry is None:
                     return
-                for change in changes:
-                    if change.baseline is not None:
-                        registry.seed_snapshot(
+                async with _native_file_changes_lock:
+                    for change in changes:
+                        try:
+                            if registry.needs_snapshot(change.path):
+                                current = (
+                                    await _read_text(change.move_path or change.path)
+                                    if change.patch is not None
+                                    else None
+                                )
+                                original = await run_slow_io(
+                                    resolve_native_original, change, current
+                                )
+                                if original is not None:
+                                    registry.seed_snapshot(
+                                        change.path, original, session_id=_captured_session_id
+                                    )
+                        except Exception:
+                            _logger.warning(
+                                "native original recovery failed for session=%s path=%r",
+                                _captured_session_id,
+                                change.path,
+                                exc_info=True,
+                                extra={"session_id": _captured_session_id},
+                            )
+                        await registry.record_tracked_change(
                             change.path,
-                            change.baseline,
-                            session_id=_captured_session_id,
+                            change.operation,
+                            _captured_session_id,
+                            functools.partial(_read_edited_text, change.path),
                         )
-                    registry.record_change(change.path, change.operation, _captured_session_id)
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -4804,15 +5359,16 @@ def create_runner_app(
                 relay = current.relay
                 relay.update_tools(relay_schemas, _relay_tool_executor)
             else:
-                relay = start_tool_relay(
-                    bridge_dir=bridge_dir,
-                    tools=relay_schemas,
-                    tool_executor=_relay_tool_executor,
-                    loop=asyncio.get_running_loop(),
-                    policy_client=server_client,
-                    session_id=session_id,
-                    file_change_observer=_observe_native_file_changes,
-                )
+                with scheduled_run_scope(None, session_id=session_id):
+                    relay = start_tool_relay(
+                        bridge_dir=bridge_dir,
+                        tools=relay_schemas,
+                        tool_executor=_relay_tool_executor,
+                        loop=asyncio.get_running_loop(),
+                        policy_client=server_client,
+                        session_id=session_id,
+                        file_change_observer=_observe_native_file_changes,
+                    )
         except (OSError, RuntimeError):
             _logger.warning(
                 "Failed to start comment relay for session=%s",
@@ -4839,7 +5395,10 @@ def create_runner_app(
 
             cancelled = Event()
             try:
-                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
+                # Bridge readiness waits must not compete with git or message delivery.
+                await _BRIDGE_NOTIFICATIONS.run(
+                    post_tools_changed, bridge_dir, cancelled=cancelled
+                )
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -4858,9 +5417,10 @@ def create_runner_app(
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(
-                _notify_tools_changed(), name=f"tools-changed:{session_id}"
-            )
+            with scheduled_run_scope(None, session_id=session_id):
+                _notify_task = asyncio.create_task(
+                    _notify_tools_changed(), name=f"tools-changed:{session_id}"
+                )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
@@ -4872,6 +5432,8 @@ def create_runner_app(
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
+        _turn_message_bodies[conv] = msg_body
+        _own_epoch = _turn_bind_epoch.get(conv)
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
         # wedged stream that never reached its own _on_proxy_stream_end) so it
@@ -4881,7 +5443,10 @@ def create_runner_app(
         handed_off = [False]
         # Locate any uncoded exception logged below in the turn phase (this task's
         # context carries it for its lifetime). Coded errors keep their own phase.
-        with phase_scope(ErrorPhase.TURN):
+        with (
+            scheduled_run_scope(_turn_occurrences.get(conv), session_id=conv),
+            phase_scope(ErrorPhase.TURN),
+        ):
             try:
                 await _run_turn_bg_setup_and_stream(msg_body, conv, handed_off)
             except _ContextWindowOverflow:
@@ -4894,7 +5459,19 @@ def create_runner_app(
                     conv,
                     exc,
                     exc_info=True,
-                    extra={"session_id": conv},
+                    extra=debug_event(
+                        "runner_turn_cancelled",
+                        session_id=conv,
+                        turn_epoch=_own_epoch,
+                        current_turn_epoch=_turn_bind_epoch.get(conv),
+                        current_response_id=_live_response_id.get(conv),
+                        runner_shutting_down=_shutting_down.is_set(),
+                        interrupt_marked=conv in _interrupted_sessions,
+                        desync_marked=conv in _desynced_sessions,
+                        handed_to_harness=handed_off[0],
+                        owns_active_turn=_active_turns.get(conv) is _own_task,
+                        task_cancel_count=_own_task.cancelling() if _own_task else None,
+                    ),
                 )
                 _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
@@ -4908,13 +5485,13 @@ def create_runner_app(
                 )
                 error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
                 if not handed_off[0]:
-                    stable_id = _input_stable_id(msg_body)
-                    if stable_id is not None:
+                    identity = _input_identity(msg_body)
+                    if identity:
                         _publish_event(
                             conv,
                             _response_failed_payload(
                                 {**error, "undelivered": True},
-                                input_stable_id=stable_id,
+                                input_identity=identity,
                             ),
                         )
                 _on_proxy_stream_end(conv, error=error)
@@ -4934,6 +5511,8 @@ def create_runner_app(
                 # different task, this turn is already accounted for — skip.
                 if _active_turns.get(conv) is _own_task and _own_task is not None:
                     _on_proxy_stream_end(conv)
+                if _turn_message_bodies.get(conv) is msg_body:
+                    _turn_message_bodies.pop(conv, None)
 
     def _turn_reasoning(conv: str, msg_body: _JsonObject) -> _JsonObject | None:
         """Reasoning block to forward on a turn, or ``None`` when unset.
@@ -5110,6 +5689,9 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        _authorized_shell = msg_body.get("authorized_native_shell_command")
+        if isinstance(_authorized_shell, str):
+            harness_body["authorized_native_shell_command"] = _authorized_shell
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and
@@ -5359,14 +5941,14 @@ def create_runner_app(
                 error["message"],
                 extra={"session_id": conv},
             )
-            stable_id = _input_stable_id(harness_body)
-            if stable_id is not None:
+            identity = _input_identity(harness_body)
+            if identity:
                 _publish_event(
                     conv,
                     _response_failed_payload(
                         {**error, "undelivered": True},
                         source="harness",
-                        input_stable_id=stable_id,
+                        input_identity=identity,
                     ),
                 )
             _on_proxy_stream_end(conv, error=error)
@@ -5390,6 +5972,7 @@ def create_runner_app(
             _slot = _active_turns.get(session_id)
             if _slot is None or _slot is asyncio.current_task():
                 _active_turns.pop(session_id, None)
+                _turn_pending_ids.pop(session_id, None)
                 # Clear the live response AND the in-flight marker together (B1
                 # class fix): a bare pop would leak the process-manager marker and
                 # the idle reaper would skip the harness forever.
@@ -5469,7 +6052,7 @@ def create_runner_app(
                     status_code=503,
                     content={
                         "error": "spec_resolver_failed",
-                        "detail": _client_safe_error_detail(exc, context="spec resolve"),
+                        "detail": _spec_resolve_error_detail(exc),
                     },
                 )
         from omnigent.sandbox.copy_on_write import (
@@ -5567,6 +6150,7 @@ def create_runner_app(
         # A required-terminal exit recorded before this turn belongs to an
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
+        _clean_terminal_exit_responses.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -5697,7 +6281,7 @@ def create_runner_app(
                 should_dispatch_locally,
             )
 
-            turn_input_stable_id = _input_stable_id(body)
+            turn_input_identity = _input_identity(body)
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
@@ -5708,7 +6292,7 @@ def create_runner_app(
                 }
                 _fail = _response_failed_payload(
                     _error,
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
@@ -5717,7 +6301,7 @@ def create_runner_app(
                 )
                 yield _response_failed_event(
                     _error,
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 return
 
@@ -5784,6 +6368,21 @@ def create_runner_app(
             event_body = _wrap_as_message_event(_instr_body)
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
+            _response_data: _JsonObject = {}
+            # A sign-in refusal kept from the chat while its message waits to be resent.
+            _held_refusal: _JsonObject | None = None
+            _held_body: _JsonObject | None = None
+
+            def _report_held_refusal() -> None:
+                """Publish a kept sign-in refusal as the harness sent it: nothing is held."""
+                nonlocal _held_refusal
+                if _held_refusal is None:
+                    return
+                if turn_input_identity:
+                    _held_refusal.update(turn_input_identity)
+                _publish_event(conv_id, _held_refusal)
+                _held_refusal = None
+
             try:
                 async with client.stream(
                     "POST",
@@ -5812,7 +6411,7 @@ def create_runner_app(
                         _fail_status = _response_failed_payload(
                             _rejection,
                             source="harness",
-                            input_stable_id=turn_input_stable_id,
+                            input_identity=turn_input_identity,
                         )
                         _publish_event(
                             conv_id,
@@ -5825,7 +6424,7 @@ def create_runner_app(
                         yield _response_failed_event(
                             _rejection,
                             source="harness",
-                            input_stable_id=turn_input_stable_id,
+                            input_identity=turn_input_identity,
                         )
                         return
 
@@ -5843,7 +6442,15 @@ def create_runner_app(
                     # order instead of racing.
                     _subagent_post_chains: dict[str, _asyncio.Task[object]] = {}
                     _text_acc: list[str] = []
+                    # Parts of _text_acc the server stored before the last completed tool
+                    # call, so a later compaction snapshot already covers them.
+                    _text_acc_before_tool = 0
                     _stream_failed_error: _JsonObject | None = None
+
+                    def _owns_live_turn() -> bool:
+                        live = _live_response_id.get(conv_id)
+                        return _response_id is None or live == _response_id
+
                     async for chunk in harness_resp.aiter_text():
                         _buffer += chunk
                         while "\n\n" in _buffer:
@@ -5872,6 +6479,7 @@ def create_runner_app(
                             if event is not None:
                                 if event.get("type") == "response.created":
                                     resp_obj = event.get("response") or {}
+                                    _response_data = dict(resp_obj)
                                     _response_id = resp_obj.get("id")
                                     if _response_id and conv_id:
                                         _resp_to_conv[_response_id] = conv_id
@@ -5908,6 +6516,11 @@ def create_runner_app(
                                         ]
                                         _session_message_buffers[conv_id] = _remaining
                                         for _m in _consumed:
+                                            _pending_id = _m.get("pending_id")
+                                            if isinstance(_pending_id, str):
+                                                _turn_pending_ids.setdefault(conv_id, set()).add(
+                                                    _pending_id
+                                                )
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "message",
@@ -5936,6 +6549,7 @@ def create_runner_app(
                                             }
                                         )
                                         _text_acc.clear()
+                                    _text_acc_before_tool = 0
                                 elif _evt_type == "response.failed":
                                     _err = event.get("error") or (event.get("response") or {}).get(
                                         "error"
@@ -5945,11 +6559,23 @@ def create_runner_app(
                                         if isinstance(_err, dict)
                                         else {"message": "harness turn failed"}
                                     )
+                                    if (
+                                        dispatch is not None
+                                        and _owns_live_turn()
+                                        and _holds_for_sign_in(conv_id, _stream_failed_error)
+                                    ):
+                                        # Neither fail the turn nor mark the message
+                                        # undelivered: it is sent after the sign-in.
+                                        _held_refusal = event
+                                        _held_body = _turn_message_bodies.get(conv_id)
+                                        continue
                                 elif _evt_type == "response.output_item.done":
                                     _item = event.get("item")
                                     if isinstance(_item, dict):
                                         _it = _item.get("type")
                                         if _it == "function_call":
+                                            if _item.get("status") == "completed":
+                                                _text_acc_before_tool = len(_text_acc)
                                             _session_histories.setdefault(conv_id, []).append(
                                                 {
                                                     "type": "function_call",
@@ -5973,7 +6599,9 @@ def create_runner_app(
                                     # the up-front spinner, so drop the pending flag and
                                     # skip the stream-end `failed` fallback.
                                     _sdk_compact_inprogress.discard(conv_id)
-                                    await _handle_harness_compaction(conv_id, event)
+                                    if await _handle_harness_compaction(conv_id, event):
+                                        del _text_acc[:_text_acc_before_tool]
+                                        _text_acc_before_tool = 0
 
                                 if is_action_required(event):
                                     tool_name = get_tool_name(event)
@@ -6019,7 +6647,7 @@ def create_runner_app(
                                             _err_type, _err_msg = _lazy_err
                                             _fail = _response_failed_payload(
                                                 {"message": _err_msg, "type": _err_type},
-                                                input_stable_id=turn_input_stable_id,
+                                                input_identity=turn_input_identity,
                                             )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
@@ -6032,7 +6660,7 @@ def create_runner_app(
                                             )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type},
-                                                input_stable_id=turn_input_stable_id,
+                                                input_identity=turn_input_identity,
                                             )
                                             return
                                         _local_tool_workdir = _resolved_workdir_for_spec(
@@ -6205,9 +6833,9 @@ def create_runner_app(
                                 continue
                             if (
                                 event.get("type") in _INPUT_LIFECYCLE_EVENT_TYPES
-                                and turn_input_stable_id is not None
+                                and turn_input_identity
                             ):
-                                event["input_stable_id"] = turn_input_stable_id
+                                event.update(turn_input_identity)
                                 if data_index is not None:
                                     frame_lines[data_index] = f"data: {_json.dumps(event)}"
                                     raw_sse_bytes = ("\n".join(frame_lines) + "\n\n").encode()
@@ -6221,14 +6849,30 @@ def create_runner_app(
                     if _dispatch_tasks:
                         await _asyncio.gather(*_dispatch_tasks, return_exceptions=True)
 
+                    if (
+                        not _owns_live_turn()
+                        or _turn_message_bodies.get(conv_id) is not _held_body
+                    ):
+                        # A newer turn took the session, or an interrupt or Stop cancelled
+                        # this one meanwhile: report the refusal as usual.
+                        _report_held_refusal()
+                    _holding = _held_refusal is not None and _stream_failed_error is not None
+                    if _holding:
+                        _hold_message_for_sign_in(conv_id, _stream_failed_error)
+                        # Queued again: there is nothing left to report however the turn ends.
+                        _held_refusal = None
                     # _on_proxy_stream_end clears any claude-sdk `/compact`
                     # spinner (publishing `failed` when no compaction landed);
                     # it is the single convergence point for every turn-end path.
                     _on_proxy_stream_end(
-                        conv_id, error=_stream_failed_error, owner_response_id=_response_id
+                        conv_id,
+                        error=None if _holding else _stream_failed_error,
+                        owner_response_id=_response_id,
+                        sign_in_hold=_holding,
                     )
 
             except _ContextWindowOverflow as overflow:
+                _report_held_refusal()
                 _error = {
                     "code": "context_length_exceeded",
                     "message": overflow.detail_message
@@ -6241,17 +6885,38 @@ def create_runner_app(
                 _overflow_fail = _response_failed_payload(
                     _error,
                     source="llm",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(
                     _error,
                     source="llm",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
+                # A refusal kept before the stream broke still reports its message undelivered.
+                _report_held_refusal()
+                if (
+                    conv_id in _clean_terminal_exit_responses
+                    and _clean_terminal_exit_responses[conv_id] == _response_id
+                ):
+                    _clean_terminal_exit_responses.pop(conv_id)
+                    _on_proxy_stream_end(conv_id, owner_response_id=_response_id, cancelled=True)
+                    if _response_id is not None:
+                        cancelled_event = {
+                            "type": "response.cancelled",
+                            "response": {
+                                **_response_data,
+                                "status": "cancelled",
+                                "completed_at": int(time.time()),
+                            },
+                            **turn_input_identity,
+                        }
+                        _publish_event(conv_id, cancelled_event)
+                        yield _encode_sse_event(cancelled_event)
+                    return
                 _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
                 if _exit_error is not None:
                     # The runner ended this stream itself: the session's required
@@ -6302,15 +6967,23 @@ def create_runner_app(
                 _http_fail = _response_failed_payload(
                     _error,
                     source="harness",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(
                     _error,
                     source="harness",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
+
+            except asyncio.CancelledError:
+                if conv_id in _desynced_sessions:
+                    # A respawn or model-switch resync tore the turn down: a kept refusal
+                    # still reports its message undelivered. Stop and interrupt don't cancel
+                    # this stream; they drop the message and finalization reports it.
+                    _report_held_refusal()
+                raise
 
         return StreamingResponse(
             proxy_stream(),
@@ -6338,6 +7011,19 @@ def create_runner_app(
             )
 
         body = await request.json()
+        if isinstance(body, dict):
+            from omnigent.harnesses.codex_native.shell_input import (
+                CODEX_SHELL_AUTHORIZED_HEADER,
+                shell_command_from_input,
+            )
+
+            # Only the authenticated server transport can authorize direct shell
+            # execution; legacy or caller-supplied body fields confer no authority.
+            body.pop("authorized_native_shell_command", None)
+            if request.headers.get(CODEX_SHELL_AUTHORIZED_HEADER) == "1":
+                authorized_command = shell_command_from_input(body.get("content"))
+                if authorized_command is not None:
+                    body["authorized_native_shell_command"] = authorized_command
         body_type = body.get("type") if isinstance(body, dict) else None
         _logger.info(
             "post_session_events: conv=%s type=%s active=%s buffer_len=%d content_types=%s "
@@ -6376,7 +7062,7 @@ def create_runner_app(
                         },
                     )
             else:
-                _side_text = _side_chat_text_from_content(
+                _side_text = side_chat.side_chat_text_from_content(
                     body.get("content") if isinstance(body, dict) else None
                 )
                 if not _side_text:
@@ -6409,7 +7095,14 @@ def create_runner_app(
                     )
                 else:
                     await side_chat.submit_side_turn(
-                        _side_client, str(_side_thread_id), _side_text
+                        _side_client,
+                        str(_side_thread_id),
+                        _side_text,
+                        transport=_side_state.socket_path,
+                        model=body.get("model_override"),
+                        effort=body.get("reasoning_effort"),
+                        reset_effort="reasoning_effort" in body
+                        and body["reasoning_effort"] is None,
                     )
             except CodexAppServerResponseError as exc:
                 # Codex refused the turn (e.g. typing into a multi-agent-v2
@@ -6430,6 +7123,17 @@ def create_runner_app(
                         if _missing
                         else "codex_side_chat_rejected",
                         "detail": _rpc_message,
+                    },
+                )
+            except side_chat.SideChatEffortUnavailable:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "codex_side_chat_settings_unavailable",
+                        "detail": (
+                            "Could not resolve the side chat's default effort. "
+                            "Select an explicit effort and retry."
+                        ),
                     },
                 )
             except (ConnectionError, OSError, TimeoutError, WebSocketException) as exc:
@@ -6458,13 +7162,12 @@ def create_runner_app(
             # and the chat would sit on "Working…" for good.
             from omnigent.harnesses.codex_native import side_chat as _side_chat
 
-            _side_question = _side_chat.side_chat_question_from_text(
-                _side_chat_text_from_content(body.get("content")).lstrip()
+            _side_question = (
+                _side_chat.side_chat_question_from_content(body.get("content"))
+                if _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
+                else None
             )
-            if (
-                _side_question is not None
-                and _session_harness_name(conversation_id) == _CODEX_NATIVE_HARNESS
-            ):
+            if _side_question is not None:
                 _side_chat.request_side_chat(
                     await _codex_native_bridge_dir_for_session(conversation_id),
                     _side_question,
@@ -6484,7 +7187,7 @@ def create_runner_app(
                         "detail": "session message body must be a JSON object",
                     },
                 )
-            message_body = dict(body)
+            message_body = _TurnMessage(body, current_scheduled_run())
             message_body["conversation_id"] = conversation_id
 
             if _is_native_harness(conversation_id):
@@ -6500,6 +7203,20 @@ def create_runner_app(
                 while _ingest_now_serving.get(conversation_id, 0) != _seq:
                     await _cond.wait()
             try:
+                if _message_already_taken(conversation_id, message_body):
+                    _logger.info(
+                        "post_session_events: dropping repeated forward conv=%s pending_id=%s",
+                        conversation_id,
+                        message_body.get("pending_id"),
+                        extra={"session_id": conversation_id},
+                    )
+                    return JSONResponse(
+                        status_code=202,
+                        content={
+                            "status": "duplicate",
+                            "detail": "Message already queued or running.",
+                        },
+                    )
                 _raw_content = message_body.get("content")
                 if isinstance(_raw_content, list):
                     message_body["content"] = await _resolve_forwarded_message_content(
@@ -6598,7 +7315,11 @@ def create_runner_app(
                             status_code=202,
                             content={
                                 "status": "buffered",
-                                "detail": "Message buffered until the pending prompt is resolved.",
+                                "detail": (
+                                    "Message buffered until the Databricks sign-in completes."
+                                    if _message_held_for_sign_in(conversation_id)
+                                    else "Message buffered until the pending prompt is resolved."
+                                ),
                             },
                         )
 
@@ -6618,7 +7339,7 @@ def create_runner_app(
                     loaded.append(new_item)
                     _session_histories[conversation_id] = loaded
 
-                _begin_turn_slot(conversation_id)
+                _begin_turn_slot(conversation_id, message_body)
                 _logger.info(
                     "post_session_events: starting background turn conv=%s",
                     conversation_id,
@@ -6682,8 +7403,6 @@ def create_runner_app(
                 if turn_outcome in ("completed", "cancelled", "failed"):
                     recovered_entry = await _ensure_subagent_work_entry(conversation_id)
                     terminal_status = turn_outcome
-                    if turn_outcome == "cancelled" and recovered_entry is not None:
-                        recovered_entry.cancellation_confirmed = True
                 elif (
                     status == "idle"
                     and recovered_entry is not None
@@ -6694,6 +7413,8 @@ def create_runner_app(
                     # while its parent inbox is still unavailable.
                     terminal_status = "cancelled"
                     output = recovered_entry.output
+            if status in ("idle", "failed"):
+                pr_reports.notify(conversation_id)
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record
                 # them here too; the idle watchdog reads them for native turns.
@@ -6744,6 +7465,8 @@ def create_runner_app(
                     conversation_id,
                     status=terminal_status,
                     output=output if output is not None else "",
+                    confirmed_completion=terminal_status == "completed",
+                    confirmed_cancellation=terminal_status == "cancelled",
                 )
             elif ambiguous_idle:
                 # This harness's forwarder marks genuine turn completions
@@ -6778,10 +7501,14 @@ def create_runner_app(
                     )
                 elif status == "idle":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
+                    # Only a confirmed turn-end (``turn_completed``) may correct an
+                    # optimistic grace-timer cancellation; a legacy harness's bare
+                    # idle is unconfirmed and must not overturn it.
                     delivery_ack = _mark_subagent_terminal_and_wake(
                         conversation_id,
                         status="completed",
                         output=output if output is not None else "",
+                        confirmed_completion=turn_completed is True,
                     )
                 elif status == "failed":
                     _native_interrupt_runner.clear_pending_interrupt(conversation_id)
@@ -6815,8 +7542,20 @@ def create_runner_app(
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
+            # Killing Claude's pane fails a turn still waiting to deliver into it;
+            # mark that turn interrupted first so it ends cancelled, not failed.
+            _cancels_turn = _harness == "claude-native" and isinstance(
+                _active_turns.get(conversation_id), asyncio.Task
+            )
+            if _cancels_turn:
+                _interrupted_sessions.add(conversation_id)
             _stop_resp = await _native_interrupt_runner.stop(_harness, conversation_id)
             if _stop_resp is not None:
+                if _cancels_turn:
+                    if _stop_resp.status_code == 204:
+                        await _cancel_inprocess_turn(conversation_id)
+                    else:
+                        _interrupted_sessions.discard(conversation_id)
                 return _stop_resp
             await _cancel_inprocess_turn(conversation_id)
             return Response(status_code=204)
@@ -6835,6 +7574,7 @@ def create_runner_app(
                     {"effort": effort},
                     # An older server keeps a refused selection for the next turn.
                     legacy_server=not server_rolls_back,
+                    allow_cold_start=body.get("cold_start_settings") is True,
                 )
                 if server_rolls_back and not (
                     200 <= response.status_code < 300 or response.status_code == 504
@@ -6898,6 +7638,7 @@ def create_runner_app(
                         conversation_id,
                         settings,
                         legacy_server=body.get("rollback_on_refusal") is not True,
+                        allow_cold_start=body.get("cold_start_settings") is True,
                     )
                     if "effort" in settings and 200 <= response.status_code < 300:
                         return JSONResponse({"codex_settings_applied": True})
@@ -7029,8 +7770,20 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "clear":
+            if _session_harness_name(conversation_id) == "claude-native":
+                return await _handle_claude_native_clear(conversation_id)
+            if _session_harness_name(conversation_id) == "codex-native":
+                return await _handle_codex_native_clear(conversation_id)
             if _session_harness_name(conversation_id) == "opencode-native":
                 return await _handle_opencode_native_clear(conversation_id)
+            # Only a server that continues the work in a new session marks the
+            # request; an older server's plain clear keeps the unsupported 204.
+            if (
+                _session_harness_name(conversation_id) == "claude-sdk"
+                and isinstance(body, dict)
+                and body.get("continue_in_new_session") is True
+            ):
+                return await _handle_claude_sdk_clear(conversation_id)
             return Response(status_code=204)
 
         if body_type == "cost_approval_popup":
@@ -7084,12 +7837,14 @@ def create_runner_app(
             # more than consent (an MCP ``requestedSchema``). Dropping it here
             # is what used to make the awaiting caller invent one.
             _elicit_content = _data.get("content")
-            pending_approvals.resolve(
+            runner_owned_approval = pending_approvals.resolve(
                 _data.get("elicitation_id", ""),
                 _elicit_action == "accept",
                 _elicit_content if isinstance(_elicit_content, dict) else None,
             )
-            if _elicit_action == "decline":
+            # Ordinary Pi dialog rejection is an answer, not a tool denial.
+            pi_dialog = str(_data.get("elicitation_id", "")).startswith("elicit_pi_")
+            if _elicit_action == "decline" and (runner_owned_approval or not pi_dialog):
                 try:
                     _int_client = await process_manager.get_client(conversation_id, "any")
                     await _int_client.post(
@@ -7141,6 +7896,8 @@ def create_runner_app(
             return
         snapshot = await _session_snapshot(session_id)
         _session_start_cache[session_id] = snapshot.created_at
+        # Replay discoveries an earlier runner recorded but the server never acknowledged.
+        pr_reports.notify(session_id)
         # Only memoize a workspace the server actually returned; a failed
         # fetch is re-resolved lazily by _session_workspace_value.
         if snapshot.ok:
@@ -7296,6 +8053,10 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
+    async def _release_session_harness(session_id: str) -> None:
+        if process_manager is not None:
+            await process_manager.release(session_id)
+
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
         _background_tasks=_background_tasks,
@@ -7316,8 +8077,10 @@ def create_runner_app(
         _model_dialog_watchers=_model_dialog_watchers,
         _native_cost_popup_config_file=_native_cost_popup_config_file,
         _native_pane_status=_native_pane_status,
+        _opencode_terminal_ensure_locks=_opencode_terminal_ensure_locks,
         _publish_event=_publish_event,
         _publish_turn_status=_publish_turn_status,
+        _release_session_harness=_release_session_harness,
         _resolve_session_agent_spec=_resolve_session_agent_spec,
         _resolve_session_claude_launch_config=_resolve_session_claude_launch_config,
         _run_turn_bg=_run_turn_bg,
@@ -7333,6 +8096,7 @@ def create_runner_app(
     )
     _codex_native_model_options = _native_controls.codex_native_model_options
     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
+    _handle_claude_native_clear = _native_controls.handle_claude_native_clear
     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
     _handle_claude_native_cost_popup = _native_controls.handle_claude_native_cost_popup
     _handle_claude_native_effort_change = _native_controls.handle_claude_native_effort_change
@@ -7340,10 +8104,12 @@ def create_runner_app(
     _handle_claude_native_permission_mode_change = (
         _native_controls.handle_claude_native_permission_mode_change
     )
+    _handle_claude_sdk_clear = _native_controls.handle_claude_sdk_clear
     _handle_claude_sdk_compact = _native_controls.handle_claude_sdk_compact
     _handle_codex_native_approval_mode_change = (
         _native_controls.handle_codex_native_approval_mode_change
     )
+    _handle_codex_native_clear = _native_controls.handle_codex_native_clear
     _handle_codex_native_compact = _native_controls.handle_codex_native_compact
     _handle_codex_native_cost_popup = _native_controls.handle_codex_native_cost_popup
     _handle_codex_native_plan_mode_change = _native_controls.handle_codex_native_plan_mode_change
@@ -7545,6 +8311,7 @@ def create_runner_app(
         session_id: str,
     ) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -7575,6 +8342,7 @@ def create_runner_app(
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
         _required_terminal_exit_errors.pop(session_id, None)
+        _clean_terminal_exit_responses.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -7665,10 +8433,12 @@ def create_runner_app(
         # native session mid-turn during the restart would sit on a stale
         # ``idle`` for the rest of the turn. Re-arm them before the item scan
         # below (which skips native harnesses entirely).
+        # A server that rejected the background flag may have been upgraded.
+        background_reports.resume()
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,
@@ -7772,16 +8542,56 @@ def create_runner_app(
                 if is_native_harness(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
-                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
+                    instance = _pane_reaper_registry.get(conv_id, name, "main")
+                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
             return panes
+
+        async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
+            """Whether the server still records the session's turn as in flight.
+
+            Most native turns report their end to the server, which relays it here.
+            When that relay is lost, the runner's record says ``running`` until the
+            session is deleted; the server's status settles it.
+
+            :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
+            :returns: ``False`` when the server reports the session settled, after
+                updating the runner's record to match; ``True`` otherwise,
+                including when the server cannot be asked.
+            """
+            epoch = _turn_bind_epoch.get(conv_id)
+            try:
+                resp = await server_client.get(
+                    f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
+                )
+                body = resp.json() if resp.status_code == 200 else None
+            except Exception:  # noqa: BLE001 - any failure to ask the server keeps the pane
+                return True
+            status = body.get("status") if isinstance(body, dict) else None
+            if not isinstance(status, str) or status in _IN_FLIGHT_SESSION_STATUSES:
+                return True
+            # A turn that started while the reply was in flight makes the reply stale.
+            if (
+                conv_id in _active_turns
+                or _turn_bind_epoch.get(conv_id) != epoch
+                or _native_pane_status.get(conv_id) != "running"
+            ):
+                return True
+            _logger.info(
+                "native pane reaper: server reports %s for conversation %s, whose turn "
+                "this runner still recorded as running",
+                status,
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            _native_pane_status[conv_id] = status
+            resource_registry.note_external_session_status(conv_id, status)
+            return False
 
         async def _native_pane_is_busy(pane: PaneRef) -> bool:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
             ):
-                return True
-            if _native_pane_status.get(conv_id) == "running":
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the
@@ -7801,38 +8611,81 @@ def create_runner_app(
                 PANE_OUTPUT_BUSY_WINDOW_S
             ):
                 return True
-            # Primary evidence: tmux stamps window_activity on every byte the
-            # pane emits, so a producing terminal stays busy even when the
-            # status pipeline above has silently stalled (a stalled forwarder
-            # once froze the busy signal and got a live session reaped).
-            activity_at = await asyncio.to_thread(
-                _tmux_window_activity_at, str(pane.socket_path), "main"
+            # Output is primary evidence, independent of the status pipeline (a
+            # stalled forwarder once froze it and got a live session reaped). The
+            # watcher's screen diff ignores title updates and identical repaints.
+            screen_changed = (
+                instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S)
+                if instance is not None
+                else None
             )
-            return (
-                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
-            )
+            if screen_changed is None:
+                # No fresh watcher view: tmux stamps window_activity on every byte.
+                activity_at = await asyncio.to_thread(
+                    _tmux_window_activity_at, str(pane.socket_path), "main"
+                )
+                screen_changed = (
+                    activity_at is not None
+                    and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+                )
+            if screen_changed:
+                return True
+            if _native_pane_status.get(conv_id) == "running":
+                return await _server_confirms_turn_in_flight(conv_id)
+            return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
-            try:
-                await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
-            finally:
-                # Closing the codex TUI pane leaves its per-session app-server
-                # (and forwarder) running — no-op for other harnesses. Tear it
-                # down in ``finally`` so an idle-reaped codex session can't orphan
-                # a ``codex app-server`` for the runner's lifetime even when the
-                # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
-                _publish_terminal_deleted_event(
-                    conversation_id=pane.conversation_id,
-                    terminal_name=pane.terminal_name,
-                    session_key="main",
-                    publish_event=_publish_event,
-                )
+            conv_id = pane.conversation_id
+            reaped = pane.instance
+            if reaped is None:
+                reaped = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+            # Launch and ensure paths hold this lock, so a message that re-creates
+            # the session waits for the reap, then starts its own pane, forwarder,
+            # helper server and relay instead of having them torn down here.
+            lock = _native_terminal_ensure_locks[pane.terminal_name].setdefault(
+                conv_id, asyncio.Lock()
+            )
+            async with lock:
+                current = _pane_reaper_registry.get(conv_id, pane.terminal_name, "main")
+                if current is not None and current is not reaped:
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s was replaced after "
+                        "it was judged idle; leaving the new one",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
+                # A message can reuse the pane while the reap waits for the lock.
+                if await _native_pane_is_busy(pane):
+                    _logger.info(
+                        "native pane reaper: pane for conversation %s became busy while "
+                        "the reap waited; leaving it",
+                        conv_id,
+                        extra={"session_id": conv_id},
+                    )
+                    return
+                try:
+                    await resource_registry.close_terminal(conv_id, pane.terminal_id)
+                finally:
+                    # The pane's forwarder, helper server and tool relay outlive it
+                    # otherwise; ``finally`` so a partially failed close cannot leak them.
+                    await _native_runtime.teardown_codex_native_app_server(conv_id)
+                    await _cancel_auto_forwarder_task(conv_id)
+                    await _native_runtime.teardown_opencode_native_server(conv_id)
+                    if binding := _session_comment_relays.get(conv_id):
+                        _discard_comment_relay(conv_id, binding.relay)
+                    _publish_terminal_deleted_event(
+                        conversation_id=conv_id,
+                        terminal_name=pane.terminal_name,
+                        session_key="main",
+                        publish_event=_publish_event,
+                    )
 
         app.state.native_pane_reaper = NativePaneReaper(
             list_native_panes=_native_panes_for_reaper,
             is_busy=_native_pane_is_busy,
             reap=_reap_native_pane,
+            idle_timeout_s=native_pane_idle_timeout_s,
         )
     else:
         app.state.native_pane_reaper = None
@@ -8234,6 +9087,8 @@ def _build_spawn_env_from_spec(
 
         env = strip_desktop_session_env(env)
         env.update(desktop_session_passthrough(effective_spec.os_env))
+        if resource_registry is not None and session_id is not None:
+            env.update(resource_registry.client_surface_env(session_id))
 
     if (
         env is not None

@@ -75,6 +75,9 @@ _session_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_session_id"
 
 _runner_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_runner_id", default=None)
 _request_id_var: ContextVar[str | None] = ContextVar("omnigent_debug_request_id", default=None)
+_log_attributes_var: ContextVar[dict[str, object] | None] = ContextVar(
+    "omnigent_debug_attributes", default=None
+)
 
 
 # Ambient lifecycle phase for the code currently executing. Set with
@@ -349,6 +352,16 @@ def current_session_id() -> str | None:
 
 
 @contextlib.contextmanager
+def log_attributes_scope(**attributes: object) -> Iterator[None]:
+    """Add correlation fields to logs in this task and its children; explicit fields win."""
+    token = _log_attributes_var.set({**(_log_attributes_var.get() or {}), **attributes})
+    try:
+        yield
+    finally:
+        _log_attributes_var.reset(token)
+
+
+@contextlib.contextmanager
 def phase_scope(phase: ErrorPhase) -> Iterator[None]:
     """Mark *phase* as active for the block, restoring the prior value on exit.
 
@@ -494,8 +507,8 @@ def publish_origin_identity(server_url: str) -> str | None:
 
     Host and CLI processes call this at startup, before anything they log or
     spawn. The id comes from the URL's ``?o=`` or the stored login record, else
-    a one-time unauthenticated probe whose result is stored in that record, the
-    way an explicit ``?o=`` already is.
+    a one-time unauthenticated probe. Attribution never changes saved login
+    details; only an authenticated command may persist a workspace selector.
 
     :param server_url: The server API base, e.g.
         ``"https://example.databricks.com/api/2.0/omnigent"``.
@@ -503,16 +516,12 @@ def publish_origin_identity(server_url: str) -> str | None:
         non-Databricks server or when it cannot be resolved.
     """
     try:
-        from omnigent.cli_auth import store_databricks_org_id
         from omnigent.util.server_url import ServerUrl
 
         resolved = ServerUrl.from_api_base(server_url)
         workspace_id = resolved.org_id
         if workspace_id is None and resolved.is_workspace_hosted:
             workspace_id = _probe_workspace_id(resolved.api_base)
-            if workspace_id:
-                with contextlib.suppress(OSError):
-                    store_databricks_org_id(resolved.api_base, workspace_id)
         if workspace_id:
             os.environ[ORIGIN_WORKSPACE_ID_ENV_VAR] = workspace_id
         return workspace_id
@@ -565,12 +574,13 @@ def _stack_trace(record: logging.LogRecord) -> str | None:
 
 def _attributes(record: logging.LogRecord, source: str) -> dict[str, str]:
     raw = getattr(record, "attributes", None)
+    combined = {**(_log_attributes_var.get() or {}), **(raw if isinstance(raw, dict) else {})}
     attrs: dict[str, str] = {}
-    if isinstance(raw, dict):
+    if combined:
         # The target column is MAP<STRING,STRING>; coerce values, redact them,
         # and drop nulls. Event attributes share the same privacy boundary as
         # messages.
-        attrs = {str(k): redact_log_text(str(v)) for k, v in raw.items() if v is not None}
+        attrs = {str(k): redact_log_text(str(v)) for k, v in combined.items() if v is not None}
     for key, value in (
         ("request_id", getattr(record, "request_id", None) or _request_id_var.get()),
         (

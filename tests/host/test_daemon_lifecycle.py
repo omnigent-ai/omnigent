@@ -21,6 +21,7 @@ from omnigent.host.daemon_lifecycle import (
     DaemonLifecycleLock,
     HostDaemonRecord,
     daemon_record_path,
+    daemon_target_server_url,
     find_same_workspace_daemon,
     normalize_daemon_target,
     probe_workspace_id,
@@ -67,6 +68,42 @@ def test_equivalent_server_urls_share_record_path(tmp_path: Path) -> None:
     assert daemon_record_path(canonical, base_dir=tmp_path) == daemon_record_path(
         equivalent, base_dir=tmp_path
     )
+
+
+def test_daemon_targets_differ_per_workspace_on_one_account_host(tmp_path: Path) -> None:
+    """Daemons for two workspaces behind one account host must not share a record."""
+    server = "https://acct.example.com/api/2.0/omnigent"
+    prod = normalize_daemon_target(server, org_id="111")
+    canary = normalize_daemon_target(server, org_id="222")
+
+    assert prod == "https://acct.example.com/api/2.0/omnigent?o=111"
+    assert daemon_record_path(prod, base_dir=tmp_path) != daemon_record_path(
+        canary, base_dir=tmp_path
+    )
+    # An explicit selector on the URL is kept rather than overridden...
+    assert normalize_daemon_target(f"{server}?o=333", org_id="111") == f"{server}?o=333"
+    # ...but another query parameter doesn't suppress the workspace key.
+    assert normalize_daemon_target(f"{server}?trace=1", org_id="111") == f"{server}?trace=1&o=111"
+    assert normalize_daemon_target(f"{server}?trace=1", org_id="222") != normalize_daemon_target(
+        f"{server}?trace=1", org_id="111"
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (
+            "https://acct.example.com/api/2.0/omnigent?o=111",
+            "https://acct.example.com/api/2.0/omnigent",
+        ),
+        ("https://x.example.com/api?next=/&o=1", "https://x.example.com/api?next=%2F"),
+        ("https://x.example.com/api", "https://x.example.com/api"),
+        ("local", "local"),
+    ],
+)
+def test_daemon_target_server_url_drops_only_the_workspace_key(target: str, expected: str) -> None:
+    """Request paths are appended to the server URL, so it must not carry ``?o=``."""
+    assert daemon_target_server_url(target) == expected
 
 
 def test_find_daemon_record_reuses_legacy_url_spelling(
@@ -252,9 +289,17 @@ def test_background_daemon_claims_record_before_connecting(
 
     connected: list[str] = []
 
-    def _run(*, server_url: str, daemon_target: str, lifecycle_lock: object) -> None:
+    def _run(
+        *,
+        server_url: str,
+        daemon_target: str,
+        lifecycle_lock: object,
+        server_still_ours: object,
+    ) -> None:
         assert record_flock_is_held(daemon_record_path(target, base_dir=tmp_path)) is True
         assert lifecycle_lock is not None
+        # An explicit server URL is the user's choice; there is no local server to own.
+        assert server_still_ours is None
         # The workspace stays claimed while the daemon serves.
         other = DaemonLifecycleLock.for_workspace(_HOST_ID, "7", base_dir=tmp_path)
         assert other.try_acquire() is False
@@ -274,6 +319,48 @@ def test_background_daemon_claims_record_before_connecting(
     released = DaemonLifecycleLock.for_workspace(_HOST_ID, "7", base_dir=tmp_path)
     assert released.try_acquire() is True
     released.release()
+
+
+def test_local_daemon_binds_reconnects_to_its_own_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``--local`` daemon only reconnects while its own server holds the URL."""
+    from omnigent.host import _daemon_entry, local_server
+    from omnigent.host import identity as identity_module
+    from omnigent.process_logging import DATA_DIR_ENV_VAR
+
+    monkeypatch.setenv(DATA_DIR_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["omnigent.host._daemon_entry", "--local"])
+    monkeypatch.setattr(
+        "omnigent.process_logging.configure_process_logging",
+        lambda *_a, **_kw: tmp_path / "host.log",
+    )
+    monkeypatch.setattr(
+        identity_module,
+        "load_or_create_host_identity",
+        lambda: HostIdentity(host_id="host_local", name="local"),
+    )
+    monkeypatch.setattr(
+        local_server,
+        "ensure_local_omnigent_server",
+        lambda: local_server.LocalServerStartup(url="http://127.0.0.1:6767", spawned=True),
+    )
+    checked: list[str] = []
+    monkeypatch.setattr(
+        local_server, "local_server_still_serves", lambda url: checked.append(url) or False
+    )
+    checks: list[object] = []
+    monkeypatch.setattr(
+        "omnigent.host.connect.run_host_process",
+        lambda **kwargs: checks.append(kwargs["server_still_ours"]),
+    )
+
+    _daemon_entry.main()
+
+    [check] = checks
+    assert callable(check)
+    assert check() is False
+    assert checked == ["http://127.0.0.1:6767"]
 
 
 @pytest.mark.parametrize("held", ["target", "workspace"])
@@ -509,7 +596,23 @@ def _server_record(
         ),
         # The URL's own ?o= selector identifies the workspace without a login record.
         (f"{_VANITY}?o=1", _server_record(_WORKSPACE_HOST), {_WORKSPACE_HOST: "1"}, True, True),
-        # The same URL is the per-target record's job, not this lookup's.
+        # The same URL's per-target record (keyed by workspace) is the caller's job...
+        (
+            _VANITY,
+            HostDaemonRecord(
+                pid=4242,
+                target=f"{_VANITY}?o=1",
+                mode="server",
+                server_url=_VANITY,
+                log_path=None,
+                started_at=1,
+                host_id=_HOST_ID,
+            ),
+            {_VANITY: "1"},
+            True,
+            False,
+        ),
+        # ...as is its bare per-URL record.
         (_VANITY, _server_record(_VANITY), {_VANITY: "1"}, True, False),
         (
             _VANITY,
@@ -1082,3 +1185,57 @@ def test_probe_workspace_id_gives_up_at_its_deadline(monkeypatch: pytest.MonkeyP
         assert time.monotonic() - started < 2.0
     finally:
         released.set()
+
+
+def test_daemon_entry_keys_by_workspace_but_connects_to_the_bare_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The background daemon's record key carries ``?o=``; its server URL does not."""
+    import omnigent.host.connect as connect
+    import omnigent.host.crash_reporting as crash_reporting
+    import omnigent.host.daemon_lifecycle as daemon_lifecycle
+    import omnigent.process_logging as process_logging
+    from omnigent.host import _daemon_entry
+
+    server = "https://acct.example.com/api/2.0/omnigent"
+    monkeypatch.setattr("sys.argv", ["_daemon_entry", "--server", server])
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, f"{server}?o=111")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    # Process plumbing the record logic doesn't depend on.
+    monkeypatch.setattr(process_logging, "ensure_stdio_survives_unencodable_output", lambda: None)
+    monkeypatch.setattr(
+        process_logging, "configure_process_logging", lambda *_a, **_kw: tmp_path / "host.log"
+    )
+    monkeypatch.setattr(crash_reporting, "install_host_crash_hooks", lambda **_kw: None)
+    monkeypatch.setattr(crash_reporting, "set_host_exit_context", lambda **_kw: None)
+
+    class _Lock:
+        def try_acquire(self) -> bool:
+            return True
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(daemon_lifecycle.DaemonLifecycleLock, "for_target", lambda target: _Lock())
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        daemon_lifecycle, "write_daemon_record", lambda record, **_kw: seen.update(record=record)
+    )
+    monkeypatch.setattr(
+        connect,
+        "run_host_process",
+        lambda *, server_url, daemon_target, lifecycle_lock, server_still_ours: seen.update(
+            server_url=server_url, daemon_target=daemon_target
+        ),
+    )
+
+    _daemon_entry.main()
+
+    record = seen["record"]
+    assert isinstance(record, daemon_lifecycle.HostDaemonRecord)
+    assert record.target == f"{server}?o=111"
+    assert record.server_url == server
+    assert seen["daemon_target"] == record.target
+    assert seen["server_url"] == server
