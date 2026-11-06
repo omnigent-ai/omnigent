@@ -3375,6 +3375,59 @@ def _build_session_create_body(
     }
 
 
+def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
+    """
+    Check the project a ``sys_session_create`` call names, before any request.
+
+    :param args: Parsed tool arguments; a null ``project_name`` or ``project_id`` is absent.
+    :param placement: The requested placement, e.g. ``"same_host"``.
+    :returns: A JSON error, or ``None`` when the arguments are usable.
+    """
+    # The scheduled-task tools take project_id, so refuse it here instead of ignoring it.
+    if args.get("project_id") is not None:
+        return json.dumps(
+            {
+                "error": "sys_session_create takes project_name, the project's name as "
+                "shown in the UI, not project_id"
+            }
+        )
+    project_name = args.get("project_name")
+    if project_name is None:
+        return None
+    if placement == "child":
+        return json.dumps({"error": "project_name requires placement='same_host' or 'managed'"})
+    if not isinstance(project_name, str) or not project_name.strip():
+        return json.dumps({"error": "project_name must be a nonempty string"})
+    return None
+
+
+async def _add_named_project(
+    body: _JsonObject, args: _JsonObject, server_client: httpx.AsyncClient
+) -> str | None:
+    """
+    Add the project a checked ``sys_session_create`` call names to its create body.
+
+    Explicit ``workspace`` and ``git`` nulls keep the project's defaults off the
+    session, so only the filing applies.
+
+    :param body: The orchestrated create body to update.
+    :param args: Arguments that passed :func:`_project_argument_error`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON error when the project name can't be resolved, else ``None``.
+    """
+    project_name = args.get("project_name")
+    if project_name is None:
+        return None
+    try:
+        project_id = await _project_id_for_name(server_client, str(project_name))
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps(
+            {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
+        )
+    body.update({"project_id": project_id, "workspace": None, "git": None})
+    return None
+
+
 async def _finalize_created_session(
     data: _JsonObject,
     *,
@@ -3554,6 +3607,9 @@ async def _execute_session_create(
         return json.dumps({"error": "placement must be child, same_host or managed"})
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    project_error = _project_argument_error(args, placement)
+    if project_error is not None:
+        return project_error
     message = args.get("message")
     profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
     selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
@@ -3612,9 +3668,8 @@ async def _execute_session_create(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        host_id = None
         if placement == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
@@ -3633,12 +3688,17 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-            create_requested = True
+        project_error = await _add_named_project(body, args, server_client)
+        if project_error is not None:
+            return project_error
+        create_requested = True
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
             )
         else:
-            create_requested = True
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
@@ -3689,6 +3749,10 @@ async def _execute_session_create(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            "project_id": data.get("project_id"),
+            "project_name": await _project_name_or_none(
+                _optional_string(data.get("project_id")), server_client
+            ),
         }
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
@@ -5328,6 +5392,26 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+async def _project_name_or_none(
+    project_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """Return the name of the caller's project ``project_id``, best-effort."""
+    if not project_id:
+        return None
+    try:
+        resp = await server_client.get(
+            f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
+        )
+        if resp.status_code != 200:
+            _logger.debug("Project %s name read returned HTTP %s", project_id, resp.status_code)
+            return None
+        return _optional_string(resp.json().get("name"))
+    except Exception:
+        _logger.debug("Project %s name read failed", project_id, exc_info=True)
+        return None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -5341,13 +5425,14 @@ async def _session_get_info_via_rest(
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
+    parent linkage, workspace / git branch, project, persisted last-activity
+    time, and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
-    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
+    best-effort via ``GET /v1/hosts/{id}``, and the project name via
+    ``GET /v1/projects/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -5385,9 +5470,10 @@ async def _session_get_info_via_rest(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
+    runner_online, configured_harnesses, project_name = await asyncio.gather(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
+        _project_name_or_none(_optional_string(snap.get("project_id")), server_client),
     )
     return json.dumps(
         {
@@ -5420,6 +5506,8 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
+            "project_id": snap.get("project_id"),
+            "project_name": project_name,
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —

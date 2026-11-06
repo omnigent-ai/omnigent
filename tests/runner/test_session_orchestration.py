@@ -19,6 +19,15 @@ def test_native_message_schema(spec):
     assert schema["parameters"]["required"] == ["session_id", "message"]
 
 
+def test_create_schema_exposes_project_name():
+    schemas = build_native_relay_tool_schemas(AgentSpec(spec_version=1, spawn=True))
+    schema = next(s for s in schemas if s["name"] == "sys_session_create")
+    # The schema forbids unlisted properties, so the project argument must be declared.
+    assert schema["parameters"]["additionalProperties"] is False
+    assert schema["parameters"]["properties"]["project_name"]["type"] == "string"
+    assert "project_id" not in schema["parameters"]["properties"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("placement", "profile", "capability", "numeric_id"),
@@ -135,6 +144,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     requests = [request for request in requests if request.url.path != "/v1/info"]
     assert result["conversation_id"] == session_id
     body = json.loads(requests[0].content)
+    assert not {"project_id", "workspace", "git"} & body.keys()
     if placement == "child":
         assert [(request.method, request.url.path) for request in requests] == [
             ("POST", "/v1/sessions"),
@@ -153,6 +163,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert result["agent_id"] == "worker"
         assert len(requests) == (2 if placement == "same_host" else 1)
         assert result["title"] == "Worker task"
+        assert result["project_id"] is None
+        assert result["project_name"] is None
         register.assert_not_called()
     if placement == "managed":
         if profile:
@@ -629,3 +641,245 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     headers, body = requests[-1]
     assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
     assert ("host_id" in body) is supported
+
+
+_PROJECT_ID = "ab" * 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("named_by", ["existing_name", "new_name"])
+async def test_independent_create_files_a_named_project(placement, named_by):
+    session_id = uuid4().hex
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/info":
+            return httpx.Response(200, json={})
+        if path == f"/v1/projects/{_PROJECT_ID}":
+            return httpx.Response(200, json={"id": _PROJECT_ID, "name": "Triage"})
+        if path == "/v1/projects" and request.method == "GET":
+            found = [{"id": _PROJECT_ID, "name": "Triage"}] if named_by == "existing_name" else []
+            return httpx.Response(200, json={"data": [{"id": "other", "name": "Other"}, *found]})
+        if path == "/v1/projects":
+            return httpx.Response(200, json={"id": _PROJECT_ID, "name": "Triage"})
+        project_id = json.loads(request.content).get("project_id")
+        return httpx.Response(201, json={"id": session_id, "project_id": project_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "project_name": "Triage"}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "error" not in result, result
+    lookup = {
+        "existing_name": [("GET", "/v1/projects")],
+        "new_name": [("GET", "/v1/projects"), ("POST", "/v1/projects")],
+    }[named_by]
+    calls = [(r.method, r.url.path) for r in requests if r.url.path != "/v1/info"]
+    # The handle's project name is read by id after the create.
+    name_read = ("GET", f"/v1/projects/{_PROJECT_ID}")
+    assert calls == [*lookup, ("POST", "/v1/sessions/orchestrated"), name_read]
+    if placement == "managed":
+        # The project is resolved after the managed capability read.
+        assert requests[0].url.path == "/v1/info"
+    create = next(r for r in requests if r.url.path == "/v1/sessions/orchestrated")
+    body = json.loads(create.content)
+    assert body["agent_id"] == "worker"
+    assert body["project_id"] == _PROJECT_ID
+    # Explicit nulls stop the named project's defaults from changing the placement.
+    assert "workspace" in body and body["workspace"] is None
+    assert "git" in body and body["git"] is None
+    assert result["project_id"] == _PROJECT_ID
+    assert result["project_name"] == "Triage"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("arguments", "error"),
+    [
+        (
+            {"placement": "same_host", "project_id": _PROJECT_ID},
+            "takes project_name, the project's name as shown in the UI, not project_id",
+        ),
+        ({"project_id": _PROJECT_ID}, "takes project_name, the project's name as shown in the UI"),
+        ({"project_name": "T"}, "project_name requires placement='same_host' or 'managed'"),
+        (
+            {"placement": "child", "project_name": "T"},
+            "project_name requires placement='same_host' or 'managed'",
+        ),
+        ({"placement": "managed", "project_name": ""}, "nonempty string"),
+        ({"placement": "managed", "project_name": 123}, "nonempty string"),
+        ({"placement": "managed", "project_name": "  "}, "nonempty string"),
+        (
+            {"agent_id": None, "config_path": "agent.yaml", "project_name": "T"},
+            "project_name requires placement='same_host' or 'managed'",
+        ),
+    ],
+)
+async def test_project_arguments_are_refused_before_any_request(arguments, error):
+    requests = []
+
+    def unexpected(request):
+        requests.append(request)
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", **arguments}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert error in result.get("error", ""), result
+    assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_managed_create_resolves_no_project():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"features": {"sandbox_profiles": False}})
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "managed",
+                        "sandbox_profile_id": "build",
+                        "project_name": "New project",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "sandbox profile support" in result["error"]
+    # The project is resolved last, so this refusal creates no project.
+    assert [r.url.path for r in requests] == ["/v1/info"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"placement": "same_host", "project_id": None, "project_name": None},
+        {"project_name": None},
+        {"placement": "managed", "project_name": None},
+    ],
+)
+async def test_null_project_arguments_count_as_absent(arguments):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={})
+        if request.url.path == "/v1/projects/inherited":
+            return httpx.Response(200, json={"id": "inherited", "name": "Creator's project"})
+        return httpx.Response(201, json={"id": uuid4().hex, "project_id": "inherited"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", **arguments}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "error" not in result, result
+    creates = [r for r in requests if r.url.path in ("/v1/sessions", "/v1/sessions/orchestrated")]
+    assert len(creates) == 1
+    assert not {"project_id", "workspace", "git"} & json.loads(creates[0].content).keys()
+    if arguments.get("placement") in ("same_host", "managed"):
+        # The handle reports the project the server filed the session in, here the creator's.
+        assert result["project_id"] == "inherited"
+        assert result["project_name"] == "Creator's project"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, "connect_error"])
+async def test_a_failed_project_lookup_creates_no_session(status):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path.startswith("/v1/projects"):
+            if status == "connect_error":
+                raise httpx.ConnectError("Server unreachable")
+            return httpx.Response(status, json={"detail": "Project not found"})
+        return httpx.Response(201, json={"id": uuid4().hex})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": "same_host", "project_name": "Triage"}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "Could not resolve project_name" in result.get("error", ""), result
+    # No create was sent, so the agent is not told to look for a session that may exist.
+    assert "could not be confirmed" not in result["error"]
+    assert "/v1/sessions/orchestrated" not in [r.url.path for r in requests]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [404, "connect_error"])
+async def test_an_unreadable_project_name_keeps_the_created_session(status):
+    session_id = uuid4().hex
+
+    def respond(request):
+        if request.url.path == "/v1/projects/inherited":
+            if status == "connect_error":
+                raise httpx.ConnectError("Server unreachable")
+            return httpx.Response(status, json={"detail": "Project not found"})
+        return httpx.Response(201, json={"id": session_id, "project_id": "inherited"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "same_host"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    # The session exists, so a failed name read leaves only the name unknown.
+    assert "error" not in result, result
+    assert result["conversation_id"] == session_id
+    assert result["project_id"] == "inherited"
+    assert result["project_name"] is None
