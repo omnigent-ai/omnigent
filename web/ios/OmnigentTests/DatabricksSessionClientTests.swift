@@ -210,28 +210,45 @@ final class DatabricksSessionClientTests: XCTestCase {
       XCTFail("Expected login landing rejection")
     } catch { XCTAssertEqual(error as? DatabricksSessionError, .unexpectedLanding) }
   }
-}
 
-func webContext(_ raw: String, clientID: String = "test-client") throws -> DatabricksWebContext {
-  try DatabricksWebContext(
-    url: URL(string: raw)!,
-    configuration: DatabricksOAuthConfiguration(
-      clientID: clientID, redirectURL: "https://login.databricks.com/mobile-redirect"))
-}
+  func testWorkspaceSessionVerdictProbesIdentityWithCookieAndKeepsWorkspaceSelector() async throws {
+    let server = OAuthTestServer { request in
+      XCTAssertEqual(request.url!.path, "/omnigent/v1/me")
+      XCTAssertEqual(request.url!.query, "o=123")
+      XCTAssertEqual(request.value(forHTTPHeaderField: "Cookie"), "DBAUTH=synthetic-session")
+      XCTAssertEqual(request.value(forHTTPHeaderField: "Accept"), "application/json")
+      XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+      return .init()
+    }
+    let page = URL(string: server.workspaceURL.absoluteString + "/omnigent/c/abc?o=123#message")!
+    let cookie = try testSessionCookie(url: server.workspaceURL)
+    let verdict = await DatabricksSessionClient(session: server.session).verify(
+      pageURL: page, cookie: cookie)
+    XCTAssertEqual(verdict, .accepted)
+  }
 
-func sessionCookieHeader(
-  domain: String? = nil, path: String = "/", value: String = "synthetic-session"
-) -> String {
-  "DBAUTH=\(value); Path=\(path); Secure; HttpOnly; SameSite=Lax; Max-Age=3600"
-    + (domain.map { "; Domain=" + $0 } ?? "")
-}
+  func testWorkspaceSessionVerdictClassifiesRejections() async throws {
+    try await assertVerdict({ _ in .init(status: 401) }, .expired)
+    try await assertVerdict({ _ in .init(status: 403) }, .forbidden)
+    try await assertVerdict(
+      { _ in .init(status: 303, headers: ["Location": "/login.html?next_url=%2Fomnigent"]) },
+      .expired)
+  }
 
-@MainActor
-func testSessionCookie(url: URL, path: String = "/", value: String = "synthetic-session") throws
-  -> HTTPCookie
-{
-  let response = HTTPURLResponse(
-    url: url, statusCode: 200, httpVersion: nil,
-    headerFields: ["Set-Cookie": sessionCookieHeader(path: path, value: value)])!
-  return try XCTUnwrap(DatabricksSessionClient.cookies(from: response).first)
+  func testWorkspaceSessionVerdictKeepsSessionWhenAnswerIsUnclear() async throws {
+    try await assertVerdict(
+      { _ in .init(status: 302, headers: ["Location": "/omnigent/elsewhere"]) }, .unknown)
+    try await assertVerdict({ _ in .init(status: 503) }, .unknown)
+    try await assertVerdict({ _ in throw URLError(.notConnectedToInternet) }, .unknown)
+  }
+
+  private func assertVerdict(
+    _ handler: @escaping OAuthTestServer.Handler, _ expected: DatabricksSessionVerdict
+  ) async throws {
+    let server = OAuthTestServer(handler: handler)
+    let cookie = try testSessionCookie(url: server.workspaceURL)
+    let verdict = await DatabricksSessionClient(session: server.session).verify(
+      pageURL: server.workspaceURL.appendingPathComponent("omnigent"), cookie: cookie)
+    XCTAssertEqual(verdict, expected)
+  }
 }
