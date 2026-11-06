@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -16,8 +17,10 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
+from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _BlockingHarnessClient,
     _build_app_for_spec,
@@ -1595,21 +1598,12 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
 @pytest.mark.asyncio
 async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
     """
-    A parent going idle while holding a stuck wake flag posts a recovery wake.
+    Unread results keep a parent busy through its recovery wake.
 
-    Guards the multi-round fan-out stranding bug. ``_subagent_wake_pending`` is
-    cleared only at turn start, so a child that completes mid-turn re-arms the
-    flag with no later turn to clear it; the parent then idles with the flag
-    stuck and results still in the inbox, and further completions are debounced
-    and stranded. The fix (``_rewake_parent_if_inbox_stranded`` from
-    ``_check_and_start_next_turn``) re-arms one wake on idle.
-
-    Sequence (wake counts bracketed): (1) child A completes idle → wake [1],
-    parent turn starts (clears flag); (2) child B completes mid-turn → wake [2],
-    re-arms flag; (3) turn ends → recovery wake [3] WITH the fix, stays [2]
-    without it (the discriminator); (4) child C completes → correctly
-    *coalesced* against the re-armed flag (inbox grows, no 4th wake). Child C is
-    kept only to pin that coalesce contract — the signal is the step-3 wake.
+    Child A wakes the parent; B finishes during that turn and re-arms the
+    wake flag. When the parent ends its turn without reading the inbox, a
+    third wake must be scheduled without publishing idle. A later child C
+    coalesces against that wake. Headless clients can then await synthesis.
     """
 
     parent_id = "22b91e208e5501fb8d2b502837391f04"
@@ -1703,9 +1697,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 f"parent goes idle, got {wakes_before_idle}."
             )
 
-            # 3. End the parent turn → _check_and_start_next_turn runs the
-            # re-arm. Await the recovery wake directly (not a fixed sleep);
-            # without the fix it never posts and this wait_for times out.
+            # End the parent turn with unread results, then await the recovery wake.
             gate.set()
             try:
                 await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
@@ -1724,9 +1716,20 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
                 f"Expected the recovery wake to bring the count to 3, got "
                 f"{len(server_client.wake_posts)}."
             )
+            parent_statuses = [
+                event["status"]
+                for event in _drain_session_event_queue(
+                    runner_app._session_event_queues_ref.get(parent_id)
+                )
+                if event.get("type") == "session.status"
+            ]
+            assert parent_statuses[-1] in {"waiting", "running"}
+            assert "idle" not in parent_statuses, (
+                "Headless clients must not see completion before the inbox recovery turn."
+            )
             server_client.wake_seen.clear()
 
-            # Let the turn fully settle so C is unambiguously a post-idle event.
+            # Let the turn end so C arrives while the recovery wake is pending.
             _deadline = asyncio.get_running_loop().time() + 5.0
             while app.state.has_active_work():
                 if asyncio.get_running_loop().time() > _deadline:
@@ -1735,9 +1738,7 @@ async def test_parent_idle_with_stuck_wake_flag_posts_recovery_wake() -> None:
             for _ in range(5):
                 await asyncio.sleep(0)
 
-            # 4. Child C finishes post-idle. The recovery wake re-armed the
-            # flag, so C must COALESCE: result lands in the inbox, no new wake.
-            # Yield generously so a (wrongly) scheduled extra wake would land.
+            # Child C coalesces against the pending recovery wake.
             subagent_work.register_subagent_work(
                 parent_session_id=parent_id,
                 child_session_id=child_c,
@@ -2174,6 +2175,14 @@ async def test_repeat_identical_recovery_wake_is_suppressed() -> None:
             #    wrongly-scheduled 5th wake room to land before asserting.
             gate.set()
             await _wait_turn_idle()
+            parent_statuses = [
+                event["status"]
+                for event in _drain_session_event_queue(
+                    runner_app._session_event_queues_ref.get(parent_id)
+                )
+                if event.get("type") == "session.status"
+            ]
+            assert parent_statuses[-1] == "idle", "A suppressed duplicate wake must settle."
     finally:
         gate.set()
         for child in (child_a, child_b, child_c):
@@ -2690,6 +2699,8 @@ async def test_events_interrupt_on_native_session_injects_escape_without_marker(
 async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harnesses(
     harness: str,
     expected_statuses: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     Runner lifecycle status is edge-specific for terminal-backed harnesses.
@@ -2714,6 +2725,7 @@ async def test_message_turn_lifecycle_status_suppressed_for_terminal_backed_harn
     """
     from omnigent.runner.app import _session_event_queues_ref
 
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
     session_id = uuid.uuid4().hex
     spec = AgentSpec(
         spec_version=1,
