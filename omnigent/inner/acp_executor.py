@@ -91,8 +91,10 @@ logger = logging.getLogger(__name__)
 
 ACP_CANCEL_GRACE_SECONDS = 1.0
 _ACP_TERMINATION_TIMEOUT_SECONDS = 5.0
-# Reap allows 1s for the prompt response, 5s for termination, and 1s for cleanup.
-ACP_REAP_TIMEOUT_SECONDS = ACP_CANCEL_GRACE_SECONDS + _ACP_TERMINATION_TIMEOUT_SECONDS + 1.0
+_ACP_CLEANUP_HEADROOM_SECONDS = 1.0
+ACP_REAP_TIMEOUT_SECONDS = (
+    ACP_CANCEL_GRACE_SECONDS + _ACP_TERMINATION_TIMEOUT_SECONDS + _ACP_CLEANUP_HEADROOM_SECONDS
+)
 
 # ACP's JSON-RPC schema is agent-owned and extensible; consumers narrow fields
 # before use.
@@ -507,8 +509,8 @@ class AcpExecutor(Executor):
 
         self._rpc_id: int = 0
         self._pending: dict[int, asyncio.Future[_AcpJsonObject]] = {}
-        self._prompt_id: int | None = None
-        self._cancel_deadline: float | None = None
+        self._active_prompt_request_id: int | None = None
+        self._cancel_grace_deadline: float | None = None
 
         self._session_id: str | None = None
         self._initialized: bool = False
@@ -727,15 +729,26 @@ class AcpExecutor(Executor):
                 # check prevents a colliding request from mis-resolving our future.
                 if msg_id is not None and "method" not in msg and msg_id in self._pending:
                     fut = self._pending.pop(msg_id)
-                    if msg_id == self._prompt_id:
-                        result = msg.get("result", {})
-                        reason = result.get("stopReason") if isinstance(result, dict) else None
-                        logger.debug(
-                            "acp[%s] session/prompt %s stopReason=%s",
-                            self._config.name,
-                            msg_id,
-                            reason,
-                        )
+                    if msg_id == self._active_prompt_request_id:
+                        # run_turn may already be cancelled when the response arrives.
+                        error = msg.get("error")
+                        if isinstance(error, dict):
+                            logger.debug(
+                                "acp[%s] session/prompt %s error code=%s message=%s",
+                                self._config.name,
+                                msg_id,
+                                error.get("code"),
+                                error.get("message"),
+                            )
+                        else:
+                            result = msg.get("result", {})
+                            reason = result.get("stopReason") if isinstance(result, dict) else None
+                            logger.debug(
+                                "acp[%s] session/prompt %s stopReason=%s",
+                                self._config.name,
+                                msg_id,
+                                reason,
+                            )
                     if not fut.done():
                         fut.set_result(msg)
                 else:
@@ -1950,8 +1963,8 @@ class AcpExecutor(Executor):
         loop = asyncio.get_event_loop()
         fut: asyncio.Future[_AcpJsonObject] = loop.create_future()
         self._pending[req_id] = fut
-        self._prompt_id = req_id
-        self._cancel_deadline = None
+        self._active_prompt_request_id = req_id
+        self._cancel_grace_deadline = None
 
         await self._send(
             {
@@ -2034,8 +2047,8 @@ class AcpExecutor(Executor):
                 }
             )
             # Duplicate interrupts share the original deadline, even during reap.
-            if self._cancel_deadline is None:
-                self._cancel_deadline = (
+            if self._cancel_grace_deadline is None:
+                self._cancel_grace_deadline = (
                     asyncio.get_running_loop().time() + ACP_CANCEL_GRACE_SECONDS
                 )
             return True
@@ -2046,16 +2059,26 @@ class AcpExecutor(Executor):
     async def close_session(self, session_key: str) -> None:
         """Close a named session (no-op; the ACP session is per-process)."""
 
+    def close_timeout(self) -> float:
+        return ACP_REAP_TIMEOUT_SECONDS
+
     async def close(self) -> None:
         """Allow a cancelled prompt to answer, then terminate the agent subprocess."""
-        if self._cancel_deadline is not None and self._prompt_id is not None:
-            response = self._pending.get(self._prompt_id)
-            remaining = self._cancel_deadline - asyncio.get_running_loop().time()
-            if response is not None and not response.done() and remaining > 0:
-                # Keep the reader and stdin alive; the interrupt HTTP reply never waits here.
-                await asyncio.wait({response}, timeout=remaining)
-        self._cancel_deadline = None
-        self._prompt_id = None
+        if self._cancel_grace_deadline is not None and self._active_prompt_request_id is not None:
+            response = self._pending.get(self._active_prompt_request_id)
+            remaining = self._cancel_grace_deadline - asyncio.get_running_loop().time()
+            if response is not None and not response.done():
+                # Keep the reader and stdin alive while the cancelled prompt answers.
+                if remaining > 0:
+                    await asyncio.wait({response}, timeout=remaining)
+                if not response.done():
+                    logger.debug(
+                        "acp[%s] session/prompt %s cancel grace expired without a response",
+                        self._config.name,
+                        self._active_prompt_request_id,
+                    )
+        self._cancel_grace_deadline = None
+        self._active_prompt_request_id = None
         self._reset_session_state()
         # Tear down the Omnigent MCP relay HTTP server + its bridge dir first.
         with contextlib.suppress(Exception):

@@ -86,7 +86,6 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
-INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
@@ -99,13 +98,6 @@ _HARNESS_ALREADY_GONE_ERRORS = (TimeoutError, ConnectionError)
 # Consecutive orphaned tool callbacks (no active turn context) before forcing a Tier-1 SDK reset.
 # Reset to zero at each ``run_turn`` start so a single late straggler never trips it.
 _ORPHAN_RESYNC_THRESHOLD = 3
-
-
-def _executor_reap_timeout(executor: Executor) -> float:
-    """Keep ACP's response grace and process wait inside its outer reap budget."""
-    from omnigent.inner.acp_executor import ACP_REAP_TIMEOUT_SECONDS, AcpExecutor
-
-    return ACP_REAP_TIMEOUT_SECONDS if isinstance(executor, AcpExecutor) else INTERRUPT_TIMEOUT_S
 
 
 def _strip_mcp_tool_prefix(name: str) -> str:
@@ -677,7 +669,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=_executor_reap_timeout(executor))
+            return await asyncio.wait_for(_reap(), timeout=executor.close_timeout())
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -723,7 +715,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=_executor_reap_timeout(executor))
+                    await asyncio.wait_for(_close(), timeout=executor.close_timeout())
         finally:
             self._resyncing = False
 
