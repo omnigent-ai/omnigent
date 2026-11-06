@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -290,12 +292,21 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
             item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
             for item in snapshot["items"]
         )
+        [refused_input] = snapshot["failed_inputs"]
+        assert refused_input["content"] == _INPUT["data"]["content"]
+        assert snapshot["pending_inputs"] == []
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )
         assert retried.status_code == 202, retried.text
+        # A retry queues the input again, so it is no longer undelivered.
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["failed_inputs"] == []
+        assert [entry["pending_id"] for entry in snapshot["pending_inputs"]] == [
+            refused_input["pending_id"]
+        ]
         await startup._deliver(
             env.app, session_id, env.conv_store.list_pending_inputs(session_id)[0]
         )
@@ -659,6 +670,75 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 2
 
 
+async def test_saved_input_waits_while_clear_moves_the_session(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved input the host worker meets while ``/clear`` moves the session waits.
+
+    It is neither run in the session being moved nor marked failed; once the
+    move ends the worker delivers it on its own, exactly once.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    session_id = await _create(env)
+    host_id = uuid4().hex
+    saved = env.conv_store.list_pending_inputs(session_id)[0]
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+
+    def turns() -> list[dict[str, Any]]:
+        return [event for event in forwarded if event.get("type") == "message"]
+
+    refused, passes = [0], [0]
+    waits_out_move, recover = startup._waits_out_session_move, startup._recover_session
+
+    async def count_refusals(*args: Any) -> bool:
+        waited = await waits_out_move(*args)
+        refused[0] += waited
+        return waited
+
+    async def count_passes(*args: Any) -> bool:
+        passes[0] += 1
+        return await recover(*args)
+
+    monkeypatch.setattr(startup, "_waits_out_session_move", count_refusals)
+    monkeypatch.setattr(startup, "_recover_session", count_passes)
+    moving = orchestration._mark_session_moving(session_id)
+    moving.__enter__()
+    startup.host_changed(env.app, host_id)
+    [(_, worker, _)] = startup._workers.values()
+    try:
+        # The worker keeps retrying while the move holds the session.
+        await poll_until_async(lambda: refused[0] >= 3, timeout_s=10)
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (pending.id, pending.status) == (saved.id, "in_progress")
+        assert env.conv_store.list_items(session_id).data == []
+        assert turns() == []
+
+        moving.__exit__(None, None, None)
+        wake_startup_worker(host_id)
+        await poll_until_async(
+            lambda: len(turns()) == 1 and not env.conv_store.list_pending_inputs(session_id),
+            timeout_s=10,
+        )
+        # A full pass after the delivery finished does not deliver it again.
+        delivered_at = passes[0]
+        wake_startup_worker(host_id)
+        await poll_until_async(lambda: passes[0] > delivered_at, timeout_s=10)
+        assert len(turns()) == 1
+    finally:
+        if orchestration._session_is_moving(session_id):
+            moving.__exit__(None, None, None)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await runner.aclose()
+
+
 async def test_pending_input_retains_request_options_on_service_restart(startup_env: _Env) -> None:
     env = startup_env
     event = {**_INPUT, "model_override": "chosen-model", "tools": []}
@@ -953,12 +1033,115 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert pending.status == "failed"
     [error] = env.conv_store.list_items(session_id).data
     assert isinstance(error.data, ErrorData) and "spend limit reached" in error.data.message
+    # The snapshot keeps the undelivered message so the client can show it.
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["pending_inputs"] == []
+    assert [entry["content"] for entry in snapshot["failed_inputs"]] == [_INPUT["data"]["content"]]
     # Another replica has no tracker entry for the launch.
     env.app.state.managed_launches = type(env.app.state.managed_launches)()
     assert not await startup.accepts(conv, env.app)
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_registration_timeout_fences_prompt_before_provider_hint(
+    startup_env: _Env, db_uri: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.scheduled.fire import _ClaimedRunRecorder
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests.server.helpers import FakeSandboxLauncher
+    from tests.server.scheduled.test_claimed_fire import _claim, _deps, _runs
+    from tests.server.test_managed_hosts import _injected_config
+
+    env = startup_env
+    session_id = await _create(env)
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.configure_dispatch(True)
+    claimed = _claim(store, execution_target="managed_sandbox", host_id=None, workspace=None)
+    host_id = claimed.lease.run.host_id
+    fake = FakeSandboxLauncher()
+    env.host_store.register_managed_host(
+        host_id=host_id,
+        name="late-host",
+        user_id="local",
+        token="launch-token",
+        token_expires_at=2**31,
+        provider=fake.provider,
+        sandbox_id="late-sandbox",
+    )
+    startup = env.app.state.startup_inputs
+    startup.dispatch = AsyncMock(return_value={})
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    state = tracker.get(session_id)
+    assert state is not None
+    hint_started = asyncio.Event()
+    release_hint = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def hint() -> str:
+        loop.call_soon_threadsafe(hint_started.set)
+        release_hint.wait()
+        return "Inspect provider logs."
+
+    state.host_online_failure_hint = hint
+
+    async def launching() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            state.host_online_failure_hint = None
+
+    launch = asyncio.create_task(launching())
+    recorder = _ClaimedRunRecorder(
+        _deps(
+            store,
+            conversation_store=env.conv_store,
+            host_store=env.host_store,
+            startup_inputs=startup,
+            managed_launches=tracker,
+            sandbox_config=_injected_config(fake),
+        ),
+        claimed.task,
+        claimed.lease,
+        registration_timeout_s=0.01,
+    )
+    await recorder.session_created(session_id)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    failure = asyncio.create_task(recorder.hand_off_managed(conv, claimed.task, lambda *_: launch))
+    try:
+        await asyncio.wait_for(hint_started.wait(), 5)
+        env.conv_store.set_host_id(session_id, host_id, "/tmp/workspace")
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+        connection = _connect_host(env, host_id)
+        # A new worker and a delivery that already read the pending item both lose the claim.
+        assert not await startup._recover_session(env.app, session_id, connection)
+        context = StartupInputContext(env.app, Headers(), saved.created_by, saved.id)
+        assert not await context.claim(env.conv_store, session_id)
+        await startup._deliver(env.app, session_id, saved)
+        startup.dispatch.assert_not_awaited()
+        release_hint.set()
+        await asyncio.wait_for(failure, 5)
+    finally:
+        release_hint.set()
+        for task in (failure, launch):
+            task.cancel()
+        await asyncio.gather(failure, launch, return_exceptions=True)
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    assert run.error == (
+        "the sandbox did not register within 0.01 seconds — Inspect provider logs."
+    )
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData)
+    assert error.data.message == f"The message could not be delivered: {run.error}"
+    assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
+    assert fake.terminated == ["late-sandbox"]
+    assert state.host_online_failure_hint is None
 
 
 async def _session_count(env: _Env) -> int:
