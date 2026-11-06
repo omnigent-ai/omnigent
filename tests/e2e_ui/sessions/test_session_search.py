@@ -65,12 +65,14 @@ def test_session_search_and_general_search(
     page.wait_for_url(f"{base_url}/c/{session_b}")
     expect(picker).not_to_be_visible()
 
-    search_container = (
-        page.locator(".sidebar-brand-row")
+    search_button = (
+        page.get_by_test_id("electron-sidebar-search-button")
         if mac_electron
-        else page.get_by_role("complementary", name="Conversations", exact=True)
+        else page.get_by_role("complementary", name="Conversations", exact=True).get_by_role(
+            "button", name="Search", exact=True
+        )
     )
-    search_container.get_by_role("button", name="Search", exact=True).click()
+    search_button.click()
     general = page.get_by_role("dialog", name="Command palette", exact=True)
     expect(general).to_be_visible()
     expect(general.get_by_text("Go to Settings", exact=True)).to_be_visible()
