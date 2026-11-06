@@ -420,6 +420,10 @@ class _HiddenInputBoxWatch:
             self._hidden_turn = running_turn
         return now - self._hidden_since >= self._threshold_s
 
+    def reset(self) -> None:
+        """Forget the current hidden spell, so the next hidden read starts the delay."""
+        self._hidden_since = None
+
 
 def _monotonic() -> float:
     """Return a monotonic timestamp for activity-emit throttling.
@@ -1861,6 +1865,8 @@ class SessionResourceRegistry:
             if status_poller is not None
             else None
         )
+        # A sent alert can reach chat after the next turn starts, so that turn clears it.
+        inferred_alert_sent = False
 
         def _publish_inferred_running(
             expected: tuple[str, str | None] | None, turn: int, blocked_on: str | None
@@ -1872,6 +1878,7 @@ class SessionResourceRegistry:
                 return
 
             def deliver() -> None:
+                nonlocal inferred_alert_sent
                 # Completion, failure or a reported reason may land while this is queued.
                 if (
                     status_publisher is not None
@@ -1879,6 +1886,7 @@ class SessionResourceRegistry:
                     and self._inferred_status_edge_is_current(session_id, claimed, turn)
                 ):
                     status_publisher(session_id, "running", blocked_on, inferred=True)
+                    inferred_alert_sent = blocked_on is not None
 
             loop.call_soon_threadsafe(deliver)
 
@@ -1909,7 +1917,11 @@ class SessionResourceRegistry:
                     ),
                 )
                 _publish_inferred_running(edge, running_turn, NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
-            elif alerting and input_box_visible and turn is not None:
+            elif (
+                input_box_visible
+                and turn is not None
+                and (alerting or (inferred_alert_sent and edge == ("running", None)))
+            ):
                 _publish_inferred_running(edge, turn, None)
 
         def _on_tick() -> None:
@@ -1960,7 +1972,10 @@ class SessionResourceRegistry:
                                 stage="native_input",
                             ),
                         )
-            if hidden_input_box_watch is not None and self._accepts_inferred_status():
+            if hidden_input_box_watch is not None and not self._accepts_inferred_status():
+                # Skipped reads may have shown the box, so restart the delay once accepted.
+                hidden_input_box_watch.reset()
+            elif hidden_input_box_watch is not None:
                 # The alert is advisory; a probe failure must not stop the watcher.
                 try:
                     _check_hidden_input_box(hidden_input_box_watch)

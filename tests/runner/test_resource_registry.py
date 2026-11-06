@@ -1984,6 +1984,51 @@ async def test_status_change_before_queued_alert_delivery_is_not_overwritten(
 
 
 @pytest.mark.asyncio
+async def test_next_turn_clears_a_hidden_input_box_alert_applied_late(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An alert sent as a turn ends can reach chat during the next turn, which clears it."""
+    session_id = "conv_hidden_late_alert"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges == [("running", "terminal prompt")]
+
+    _change_session_status(session.registry, session_id, "new-turn")
+    for now in (117.0, 118.0):
+        await session.tick_at(now, _CLAUDE_WORKING_PANE)
+    assert session.inferred_edges == [("running", "terminal prompt"), ("running", None)]
+
+    # Once a clear is sent, later turns have nothing left to clear.
+    _change_session_status(session.registry, session_id, "new-turn")
+    await session.tick_at(119.0, _CLAUDE_WORKING_PANE)
+    assert session.inferred_edges == [("running", "terminal prompt"), ("running", None)]
+    assert session.registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
+async def test_hidden_input_box_delay_restarts_after_inferred_status_support_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads skipped while the server rejects alerts may have shown the box, so timing restarts."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_support_flip")
+    supported = {"value": True}
+    session.registry._accepts_inferred_status = lambda: supported["value"]
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    supported["value"] = False
+    await session.tick_at(105.0, _CLAUDE_WORKING_PANE)
+
+    supported["value"] = True
+    for now in (116.0, 130.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+    await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source", ["file", "osc"])
 @pytest.mark.parametrize("forwarded", ["running", "waiting"])
 @pytest.mark.parametrize(
