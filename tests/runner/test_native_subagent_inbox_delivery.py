@@ -789,7 +789,8 @@ async def test_passive_init_queues_a_recovered_result_without_waking_the_parent(
     async with _runner_client(app) as client:
         response = await client.post("/v1/sessions", json=_init_body(hold_subagent_wakes=True))
         assert response.status_code == 201, response.text
-        await asyncio.sleep(0)
+        for _ in range(20):
+            await asyncio.sleep(0)
         inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
         assert inbox.qsize() == 1
         assert server_client.wakes == []
@@ -815,6 +816,8 @@ async def test_passive_init_queues_a_recovered_result_without_waking_the_parent(
         async with asyncio.timeout(budget(5)):
             while not server_client.wakes:
                 await asyncio.sleep(0.01)
+        for _ in range(20):
+            await asyncio.sleep(0)
 
     assert inbox.qsize() == 1
     assert len(server_client.wakes) == 1
