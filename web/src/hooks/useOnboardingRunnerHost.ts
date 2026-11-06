@@ -2,6 +2,27 @@ import { useEffect, useRef, useState } from "react";
 import type { Host } from "@/hooks/useHosts";
 import { getHostIdentity, isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
 
+/**
+ * The online host *runner* names, given this machine's host id: this machine
+ * for "local", the only other online host for "remote". Several other online
+ * hosts leave "remote" ambiguous, so it names none.
+ */
+export function resolveRunnerHost(
+  runner: "local" | "remote",
+  localHostId: string | null,
+  hosts: Host[] | undefined,
+): { hostId: string | null; ambiguous: boolean } {
+  const online = (hosts ?? []).filter((h) => h.status === "online");
+  if (runner === "local") {
+    return {
+      hostId: online.find((h) => h.host_id === localHostId)?.host_id ?? null,
+      ambiguous: false,
+    };
+  }
+  const others = online.filter((h) => h.host_id !== localHostId);
+  return { hostId: others.length === 1 ? others[0].host_id : null, ambiguous: others.length > 1 };
+}
+
 /** How long the new-session picker waits for the onboarding runner to come online. */
 export const ONBOARDING_RUNNER_GRACE_MS = 30_000;
 
@@ -23,7 +44,7 @@ export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
   useEffect(() => {
     if (asked.current || runner !== undefined) return;
     asked.current = true;
-    void takeOnboardingRunner().then(setRunner, () => setRunner(null));
+    void takeOnboardingRunner("hostPicker").then(setRunner, () => setRunner(null));
   }, [runner]);
 
   // This machine's host id, undefined until the shell answers. Nothing resolves
@@ -45,15 +66,12 @@ export function useOnboardingRunnerHost(hosts: Host[] | undefined): {
   }, [runner]);
   const identityKnown = localHostId !== undefined;
 
-  const online = (hosts ?? []).filter((h) => h.status === "online");
   // "remote" resolves only when exactly one other host is online; with several, the user picks.
-  const others = online.filter((h) => h.host_id !== localHostId);
-  let hostId: string | null = null;
-  if (runner === "local" && identityKnown) {
-    hostId = online.find((h) => h.host_id === localHostId)?.host_id ?? null;
-  } else if (runner === "remote" && identityKnown && others.length === 1) {
-    hostId = others[0].host_id;
-  }
+  const others = (hosts ?? []).filter((h) => h.status === "online" && h.host_id !== localHostId);
+  const hostId =
+    runner && localHostId !== undefined
+      ? resolveRunnerHost(runner, localHostId, hosts).hostId
+      : null;
 
   // Stop waiting after the grace period, unless the runner already resolved.
   useEffect(() => {
