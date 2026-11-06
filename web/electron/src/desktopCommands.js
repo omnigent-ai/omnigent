@@ -15,6 +15,8 @@ const DESKTOP_COMMANDS = Object.freeze([
   "archive-session",
   "toggle-pin-session",
   "fork-session",
+  "go-back",
+  "go-forward",
 ]);
 
 /**

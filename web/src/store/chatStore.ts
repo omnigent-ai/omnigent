@@ -95,6 +95,7 @@ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
 import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
 import { describeSendFailure } from "@/lib/sendFailure";
+import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -1986,6 +1987,7 @@ export function initChatStore(client: QueryClient): void {
   // Drop this tab's held stream slots; disposed pumps release their own locks,
   // and a boot/reset starts from an empty set.
   heldStreamSlots.clear();
+  streamSlotOwners.clear();
   // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
@@ -4057,6 +4059,9 @@ const rootSetState = useChatStore.setState;
 // One held slot == one live stream this tab is counted for against the shared,
 // cross-tab cap (see `streamSlots`). Keyed by conversation id.
 const heldStreamSlots = new Map<string, StreamSlot>();
+// The pump that holds each slot. A rebind's pump takes the slot over, so the
+// pump it replaced must not release it when it exits.
+const streamSlotOwners = new Map<string, AbortController>();
 
 /**
  * Take an origin-wide stream slot for `id` before opening its stream.
@@ -4070,8 +4075,13 @@ const heldStreamSlots = new Map<string, StreamSlot>();
  * has nothing of its own to reclaim; the active conversation then opens over
  * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
-  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+async function acquireStreamSlot(id: string, owner: AbortController): Promise<boolean> {
+  // Rebinding a still-slotted stream: the new pump takes the slot over at once,
+  // so the pump it replaces can't release it while the new bind is waiting.
+  if (heldStreamSlots.has(id)) {
+    streamSlotOwners.set(id, owner);
+    return true;
+  }
   let slot = await getStreamSlotManager().tryAcquire();
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
@@ -4082,12 +4092,16 @@ async function acquireStreamSlot(id: string): Promise<boolean> {
     const evictedSlot = heldStreamSlots.get(evictedId);
     if (evictedSlot !== undefined) {
       heldStreamSlots.delete(evictedId);
+      streamSlotOwners.delete(evictedId);
       await evictedSlot.release();
     }
     slot = await getStreamSlotManager().tryAcquire();
   }
   /* eslint-enable no-await-in-loop */
-  if (slot !== null) heldStreamSlots.set(id, slot);
+  if (slot !== null) {
+    heldStreamSlots.set(id, slot);
+    streamSlotOwners.set(id, owner);
+  }
   setStreamBudgetExceeded(slot === null);
   return slot !== null;
 }
@@ -4097,7 +4111,13 @@ function releaseStreamSlot(id: string): void {
   const slot = heldStreamSlots.get(id);
   if (slot === undefined) return;
   heldStreamSlots.delete(id);
+  streamSlotOwners.delete(id);
   void slot.release();
+}
+
+/** Hand back `id`'s stream slot if `owner`'s pump still holds it. */
+function releaseOwnedStreamSlot(id: string, owner: AbortController): void {
+  if (streamSlotOwners.get(id) === owner) releaseStreamSlot(id);
 }
 
 /**
@@ -4972,6 +4992,53 @@ async function refreshFailedInputs(id: string): Promise<void> {
   });
 }
 
+/** Retries of a snapshot load that failed in a way a retry can fix. */
+const SNAPSHOT_LOAD_RETRIES = 2;
+
+/**
+ * Run a conversation's snapshot load, repeating a failure a retry can fix (a
+ * 5xx, or a dropped connection while the server restarts) while the
+ * conversation is still open. Other failures, such as a 404, throw at once.
+ */
+async function withSnapshotRetries<T>(id: string, load: () => Promise<T>): Promise<T> {
+  const entry = conversationRegistry.peek(id);
+  const stillOpen = () =>
+    entry !== undefined && conversationRegistry.peek(id) === entry && !entry.disposed;
+  // Sequential by design: each attempt waits for the one before it to fail.
+  for (let failures = 0; ; failures += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await load();
+    } catch (error) {
+      if (failures >= SNAPSHOT_LOAD_RETRIES || !isRetryableRequestError(error) || !stillOpen()) {
+        throw error;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, queryRetryDelay(failures, error));
+      });
+      if (!stillOpen()) throw error;
+    }
+  }
+}
+
+/**
+ * Load a conversation again after its load failed, in place.
+ *
+ * @param id - The conversation whose snapshot load failed.
+ */
+export async function retryConversationLoad(id: string): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.getState().conversationLoadError === null) return;
+  // A failed snapshot leaves the pump open; close it so the new bind is the
+  // entry's only subscriber, and drop its live previews, which the new stream
+  // replays in full.
+  abortConversationStream(entry);
+  dropEphemeralInFlightBlocks(id, entrySetter(entry));
+  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  await bindStream(id, entrySetter(entry), entryGetter(entry), true);
+}
+
 /**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
@@ -4999,11 +5066,11 @@ async function bindStream(
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
+  await acquireStreamSlot(id, controller);
   if (isConversationDisposed(id)) {
     // Switched away / evicted while awaiting the slot — don't open a dead
     // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+    releaseOwnedStreamSlot(id, controller);
     return;
   }
   set({ abortController: controller });
@@ -5034,15 +5101,16 @@ async function bindStream(
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
     if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+      releaseOwnedStreamSlot(id, controller);
       return;
     }
   }
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
-  // terminal close, an abort from switchTo/dispose, or eviction).
+  // terminal close, an abort from switchTo/dispose, or eviction) unless a
+  // rebind's pump has taken it over.
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
-    releaseStreamSlot(id),
+    releaseOwnedStreamSlot(id, controller),
   );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
@@ -5069,8 +5137,8 @@ async function bindStream(
   // another conversation; reusing it drops messages until a page refresh.
   // Bind fetches the whole initial window in one request; nothing loads more
   // until the reader scrolls up (`loadMoreHistory`).
-  // `retry: false` because the most common failure here is "invalid conv
-  // id in URL" (not transient).
+  // The most common failure here is an invalid id in the URL, which fails at
+  // once; `withSnapshotRetries` repeats only failures a retry can fix.
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
@@ -5080,14 +5148,18 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
+    const client = queryClient;
+    // Each request retries on its own, so a failed one doesn't repeat the other.
     const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
+      withSnapshotRetries(id, () =>
+        client.fetchQuery({
+          queryKey: ["session", id],
+          queryFn: () => getSessionSlim(id, { refreshState: true }),
+          staleTime: 0,
+          retry: false,
+        }),
+      ),
+      withSnapshotRetries(id, () => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS })),
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;

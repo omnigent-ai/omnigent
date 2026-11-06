@@ -50,7 +50,12 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
-import { APPROVE_KEYS, DECLINE_KEYS, useApprovesOnHotkey } from "@/hooks/useApproveHotkey";
+import {
+  APPROVE_KEYS,
+  DECLINE_KEYS,
+  useApprovalPromptOnScreen,
+  useApprovesOnHotkey,
+} from "@/hooks/useApproveHotkey";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
@@ -200,6 +205,8 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  /** Shown in the open chat, where Esc declines it; not its copy in Inbox. */
+  inChat?: boolean;
   nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
@@ -303,6 +310,7 @@ interface ApprovalCardProps {
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
+  inChat = false,
   nativeDelivery,
   elicitationId,
   message,
@@ -330,8 +338,9 @@ export function ApprovalCard({
 }: ApprovalCardProps) {
   // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
   const hotkeyTarget = useApprovesOnHotkey(elicitationId, status === "pending");
+  useApprovalPromptOnScreen(elicitationId, inChat && status === "pending");
   const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
-  const declineKeys = hotkeyTarget ? DECLINE_KEYS : undefined;
+  const declineKeys = hotkeyTarget && inChat ? DECLINE_KEYS : undefined;
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
@@ -1087,6 +1096,7 @@ export function ElicitationCard({
       : null;
   return (
     <ApprovalCard
+      inChat
       elicitationId={item.elicitationId}
       nativeDelivery={item.nativeDelivery}
       message={item.message}

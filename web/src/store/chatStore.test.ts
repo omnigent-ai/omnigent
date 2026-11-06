@@ -102,6 +102,7 @@ import {
   isTempConvId,
   initChatStore,
   pumpStreamEvents,
+  retryConversationLoad,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
@@ -3112,10 +3113,11 @@ describe("chatStore — send (first-send ordering)", () => {
         return mockResponse(null, { bodyStream: pushableStream().stream });
       }
       // Fail only the FIRST snapshot GET, so the bind errors with its pump live.
+      // A 404 isn't retried, so the bind fails at once.
       if (url.split("?")[0] === "/v1/sessions/conv_two_subs" && (init?.method ?? "GET") === "GET") {
         if (failSnapshot) {
           failSnapshot = false;
-          return mockResponse({}, { ok: false, status: 500 });
+          return mockResponse({}, { ok: false, status: 404 });
         }
       }
       return defaultFetchHandler(input, init);
@@ -3136,6 +3138,192 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(openedStreams[0]!.aborted).toBe(true);
     expect(openedStreams[1]!.aborted).toBe(false);
     expect(entry.getState().conversationLoadError).toBeNull();
+  });
+
+  describe("a session snapshot that fails to load", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.unstubAllEnvs();
+    });
+
+    /**
+     * Answer the session's next `request` GETs with `statuses`, and open its
+     * streams on sinks the test writes to. Returns both requests' GETs.
+     */
+    function failSnapshots(
+      id: string,
+      statuses: number[],
+      request: "metadata" | "items" = "metadata",
+    ): { gets: Record<"metadata" | "items", string[]>; streams: StreamSink[] } {
+      const gets = { metadata: [] as string[], items: [] as string[] };
+      const streams: StreamSink[] = [];
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${id}/stream`) {
+          const sink = pushableStream();
+          streams.push(sink);
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        const requested =
+          path === `/v1/sessions/${id}`
+            ? "metadata"
+            : path === `/v1/sessions/${id}/items`
+              ? "items"
+              : null;
+        if (requested !== null && (init?.method ?? "GET") === "GET") {
+          gets[requested].push(url);
+          const status = requested === request ? statuses.shift() : undefined;
+          if (status !== undefined) return mockResponse({}, { ok: false, status });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      return { gets, streams };
+    }
+
+    /** One chunk of a native reply's live preview. */
+    function previewDelta(delta: string, index: number): string {
+      return sse("response.output_text.delta", { delta, message_id: "m1", index });
+    }
+
+    it.each(["metadata", "items"] as const)(
+      "retries a failed %s request on its own",
+      async (request) => {
+        vi.useFakeTimers();
+        seedSession("conv_flaky", []);
+        const { gets } = failSnapshots("conv_flaky", [503], request);
+
+        const switched = useChatStore.getState().switchTo("conv_flaky");
+        await vi.advanceTimersByTimeAsync(100);
+        const entry = conversationRegistry.peek("conv_flaky")!;
+        expect(entry.getState()).toMatchObject({
+          loadingConversation: true,
+          conversationLoadError: null,
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+        await switched;
+
+        expect(entry.getState()).toMatchObject({
+          loadingConversation: false,
+          conversationLoadError: null,
+        });
+        expect(gets[request]).toHaveLength(2);
+        expect(gets[request === "metadata" ? "items" : "metadata"]).toHaveLength(1);
+      },
+    );
+
+    it("fails a missing session at once", async () => {
+      seedSession("conv_missing", []);
+      const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
+
+      await useChatStore.getState().switchTo("conv_missing");
+
+      const error = conversationRegistry.peek("conv_missing")!.getState().conversationLoadError;
+      expect(error).toMatchObject({ status: 404 });
+      expect(gets.metadata).toHaveLength(1);
+    });
+
+    it("loads again in place once the retries run out", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_down", []);
+      const { gets, streams } = failSnapshots("conv_down", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_down");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+      const entry = conversationRegistry.peek("conv_down")!;
+      expect(entry.getState().conversationLoadError).not.toBeNull();
+      expect(gets.metadata).toHaveLength(3);
+      // The stream stays up meanwhile, partway through a reply.
+      streams[0]!.push(previewDelta("Hello ", 0));
+      streams[0]!.push(previewDelta("wor", 1));
+      await vi.advanceTimersByTimeAsync(10);
+      const preview = () =>
+        entry
+          .getState()
+          .blocks.filter((block) => block.ctx.itemId === "live:m1")
+          .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      expect(preview()).toEqual(["Hello wor"]);
+
+      await retryConversationLoad("conv_down");
+      expect(streams).toHaveLength(2);
+      // A new stream replays the reply so far as one cumulative chunk.
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(entry.getState().conversationLoadError).toBeNull();
+      expect(gets.metadata).toHaveLength(4);
+      expect(preview()).toEqual(["Hello world!"]);
+    });
+
+    it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+      const slots = makeFakeSlotManager();
+      setStreamSlotManagerForTest(slots);
+      seedSession("conv_hostless", []);
+      let retrying = false;
+      let answerHost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.split("?")[0] === "/v1/sessions/conv_hostless/stream") {
+          // Like a real fetch, the body errors once its request is aborted.
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              init?.signal?.addEventListener("abort", () => {
+                controller.error(new DOMException("Aborted", "AbortError"));
+              });
+            },
+          });
+          return mockResponse(null, { bodyStream: body });
+        }
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_hostless" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          if (!retrying) return mockResponse({}, { ok: false, status: 404 });
+          if (answerHost === null) {
+            // The replacing bind looks up the session's host first; hold it.
+            return new Promise<Response>((resolve) => {
+              answerHost = () => resolve(defaultFetchHandler(input, init));
+            });
+          }
+        }
+        return defaultFetchHandler(input, init);
+      });
+      await useChatStore.getState().switchTo("conv_hostless");
+      expect(slots.heldByTab()).toBe(1);
+
+      retrying = true;
+      const retried = retryConversationLoad("conv_hostless");
+      // The replaced pump exits while the new bind waits on the host lookup.
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 50);
+      });
+      answerHost!();
+      await retried;
+
+      expect(
+        conversationRegistry.peek("conv_hostless")!.getState().conversationLoadError,
+      ).toBeNull();
+      expect(slots.heldByTab()).toBe(1);
+    });
+
+    it("stops retrying once the session is closed", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_closed", []);
+      const { gets } = failSnapshots("conv_closed", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_closed");
+      await vi.advanceTimersByTimeAsync(100);
+      releaseConversation("conv_closed");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+
+      expect(gets.metadata).toHaveLength(1);
+    });
   });
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
@@ -3863,12 +4051,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
   it("B2: a bind failure after navigate-away settles the real session, not the visible one", async () => {
     // The real session's snapshot fails, so ensureBoundSession rethrows the
     // load error BEFORE postedSessionId is assigned — the catch's B2 path.
+    // A 404 isn't retried, so the bind fails at once.
     seedSession("conv_visible");
     fetchMock.mockImplementation((input, init) => {
       const url = String(input);
       const path = url.split("?")[0];
       if (path === "/v1/sessions/conv_real" && (init?.method ?? "GET") === "GET") {
-        return mockResponse({}, { ok: false, status: 500 });
+        return mockResponse({}, { ok: false, status: 404 });
       }
       return defaultFetchHandler(input, init);
     });
