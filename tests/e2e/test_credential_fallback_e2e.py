@@ -154,6 +154,7 @@ def _fallback_run_env(mock_llm_server_url: str, config_home: Path) -> dict[str, 
                         "openai": {
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
+                            "models": {"default": "mock-model"},
                         },
                     }
                 }

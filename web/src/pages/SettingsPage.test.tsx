@@ -5,7 +5,16 @@
 
 import { Fragment, type ReactNode } from "react";
 import { EmbeddedProvider } from "@/lib/embedded";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -14,8 +23,13 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import {
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+} from "@/lib/projectFolderPaginationPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
+import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -373,6 +387,38 @@ describe("SettingsPage", () => {
     }
   });
 
+  it("offers the desktop shortcut only when the shell has both of its calls", async () => {
+    const getGlobalShortcut = vi
+      .fn()
+      .mockResolvedValue({ enabled: false, accelerator: "Alt+Space" });
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    // An older shell can read the shortcut but not save it.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+    };
+    renderPage("/settings/general");
+    expect(screen.queryByTestId("settings-group-desktop-app")).toBeNull();
+    cleanup();
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: vi.fn(),
+      notify: vi.fn(),
+      getGlobalShortcut,
+      setGlobalShortcut: vi.fn(),
+    };
+    renderPage("/settings/general");
+    expect(
+      await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
+    ).toBeInTheDocument();
+  });
+
   it("renders session auto-rename enabled by default", async () => {
     renderPage("/settings/general");
 
@@ -419,9 +465,9 @@ describe("SettingsPage", () => {
     const select = screen.getByTestId("terminal-clipboard-preference-select");
     expect(select).toHaveValue("ask");
     expect(screen.getByText("Copying from terminals")).toBeInTheDocument();
-    expect(screen.getByText(/Controls copying text from all sessions/)).toBeInTheDocument();
+    expect(screen.getByText(/Control copying from all sessions/)).toBeInTheDocument();
     expect(
-      screen.getByText(/Allowing copying also lets terminal programs silently replace/),
+      screen.getByText(/Allowing it lets terminal programs silently replace/),
     ).toBeInTheDocument();
     expect(screen.getByText(/all sessions and terminals on this server/)).toBeInTheDocument();
     expect(screen.getByText(/this browser or app/)).toBeInTheDocument();
@@ -533,7 +579,7 @@ describe("SettingsPage", () => {
       "md:hidden",
     );
     expect(
-      screen.getByText("Set text across the interface. Icons and spacing stay fixed."),
+      screen.getByText("Sets interface and conversation text. Icons and spacing stay fixed."),
     ).toHaveClass("max-md:hidden");
     expect(screen.getByText("Choose how Omnigent looks on this device.")).toHaveClass(
       "max-md:hidden",
@@ -541,6 +587,7 @@ describe("SettingsPage", () => {
     for (const testId of [
       "settings-group-theme",
       "settings-group-chat",
+      "settings-group-sidebar",
       "settings-group-interface-type",
       "settings-group-code-type",
       "settings-group-data",
@@ -969,16 +1016,91 @@ describe("SettingsPage", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("ui-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default.
-    expect(input.value).toBe("13");
+    // No stored preference uses the 14px desktop default.
+    expect(input.value).toBe("14");
+    expect(screen.queryByText(/^Interface \d+px · Messages/)).not.toBeInTheDocument();
     expect(screen.getByTestId("ui-font-size-inc").querySelector("svg")).toHaveClass("ui-icon");
 
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
-    expect(input.value).toBe("14");
+    expect(input.value).toBe("15");
     // The choice is persisted so it survives a refresh.
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("14");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
     // The discrete desktop size is applied live to the document root.
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("15px");
+  });
+
+  it("keeps the applied font size current through rotation and edits", () => {
+    let narrow = true;
+    const widthChanges = new Set<() => void>();
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      get matches() {
+        return query === UI_FONT_SIZE_MOBILE_QUERY && narrow;
+      },
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.add(callback as () => void);
+      },
+      removeEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChanges.delete(callback as () => void);
+      },
+    }));
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("ui-font-size-input");
+    expect(input).toHaveValue(15);
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(14);
+    fireEvent.focus(input);
+    fireEvent.blur(input);
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBeNull();
+    expect(input).toHaveValue(14);
+    act(() => {
+      narrow = true;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(15);
+    fireEvent.click(screen.getByTestId("ui-font-size-inc"));
+    expect(input).toHaveValue(16);
+    act(() => {
+      narrow = false;
+      widthChanges.forEach((callback) => callback());
+    });
+    expect(input).toHaveValue(16);
+  });
+
+  it("retains the applied font size when saving a font choice fails", () => {
+    localStorage.setItem("omnigent:ui-font-size", "18");
+    let widthChange = () => {};
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      matches: query === UI_FONT_SIZE_MOBILE_QUERY,
+      media: query,
+      onchange: null,
+      addListener: vi.fn(),
+      removeListener: vi.fn(),
+      addEventListener: (_type: unknown, callback: unknown) => {
+        if (query === UI_FONT_SIZE_MOBILE_QUERY) widthChange = callback as () => void;
+      },
+      removeEventListener: vi.fn(),
+      dispatchEvent: vi.fn(),
+    }));
+    renderPage("/settings/appearance");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota");
+    });
+    fireEvent.click(screen.getByTestId("ui-font-size-dec"));
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("17px");
+    act(() => widthChange());
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
+    cleanup();
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("ui-font-size-input")).toHaveValue(17);
   });
 
   it("disables the steppers at the min and max bounds", () => {
@@ -1051,6 +1173,15 @@ describe("SettingsPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pin Changes" }));
     fireEvent.click(screen.getByTestId("hide-unconfigured-harnesses-toggle"));
     fireEvent.click(screen.getByTestId("fold-assistant-narration-toggle"));
+    fireEvent.change(screen.getByTestId("project-folder-page-size-input"), {
+      target: { value: "3" },
+    });
+    fireEvent.click(screen.getByTestId("project-folder-collapse-toggle"));
+    const folderPagination = renderHook(() => [
+      useProjectFolderCollapse(),
+      useProjectFolderPageSize(),
+    ]);
+    expect(folderPagination.result.current).toEqual([false, 3]);
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.click(screen.getByTestId("ui-font-size-inc"));
     fireEvent.change(screen.getByTestId("ui-font-family-input") as HTMLInputElement, {
@@ -1070,7 +1201,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-theme-palette")).toBe(JSON.stringify("github"));
     expect(localStorage.getItem("omnigent:default-workspace-panel")).toBe("open");
     expect(localStorage.getItem("omnigent:default-workspace-tab")).toBe("subagents");
-    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
+    expect(localStorage.getItem("omnigent:ui-font-size")).toBe("16");
     expect(localStorage.getItem("omnigent:code-font-size")).toBe("15");
     expect(localStorage.getItem("omnigent:code-font-weight")).toBe("500");
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBe("true");
@@ -1087,7 +1218,7 @@ describe("SettingsPage", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("system");
 
     // Fonts are back to their defaults.
-    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("13");
+    expect((screen.getByTestId("ui-font-size-input") as HTMLInputElement).value).toBe("14");
     expect((screen.getByTestId("ui-font-family-input") as HTMLInputElement).value).toBe("");
     expect((screen.getByTestId("code-font-size-input") as HTMLInputElement).value).toBe("13");
     expect((screen.getByTestId("code-font-family-input") as HTMLInputElement).value).toBe("");
@@ -1130,6 +1261,9 @@ describe("SettingsPage", () => {
       "false",
     );
     expect(localStorage.getItem("omnigent:fold-assistant-narration")).toBeNull();
+    expect(localStorage.getItem("omnigent:project-folder-collapse")).toBeNull();
+    expect(localStorage.getItem("omnigent:project-folder-page-size")).toBeNull();
+    expect(folderPagination.result.current).toEqual([true, 5]);
     expect(localStorage.getItem("omnigent:hidden-picker-agents")).toBeNull();
   });
 
@@ -1178,11 +1312,67 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:ui-font-size")).toBe("15");
   });
 
+  it("places the Sidebar group after Workspace with Show more on and 5 sessions by default", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    const sidebarGroup = screen.getByTestId("settings-group-sidebar");
+    expect(screen.getByTestId("settings-group-workspace").nextElementSibling).toBe(sidebarGroup);
+    const toggle = within(sidebarGroup).getByRole("switch", {
+      name: 'Collapse project sessions behind "Show more"',
+    });
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(
+      within(sidebarGroup).getByRole("spinbutton", { name: 'Sessions to show before "Show more"' }),
+    ).toHaveValue(5);
+    expect(localStorage.getItem("omnigent:project-folder-collapse")).toBeNull();
+    expect(localStorage.getItem("omnigent:project-folder-page-size")).toBeNull();
+  });
+
+  it("hides the session count while Show more is off and keeps it for when it returns", () => {
+    localStorage.setItem("omnigent:project-folder-page-size", "3");
+    renderPage("/settings/appearance");
+    const toggle = screen.getByTestId("project-folder-collapse-toggle");
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    expect(localStorage.getItem("omnigent:project-folder-collapse")).toBe("false");
+    expect(screen.queryByTestId("project-folder-page-size-input")).not.toBeInTheDocument();
+
+    fireEvent.click(toggle);
+    expect(localStorage.getItem("omnigent:project-folder-collapse")).toBeNull();
+    expect(screen.getByTestId("project-folder-page-size-input")).toHaveValue(3);
+  });
+
+  it("saves a custom session count that survives a reload", () => {
+    localStorage.clear();
+    renderPage("/settings/appearance");
+    fireEvent.change(screen.getByTestId("project-folder-page-size-input"), {
+      target: { value: "3" },
+    });
+    expect(localStorage.getItem("omnigent:project-folder-page-size")).toBe("3");
+
+    cleanup();
+    renderPage("/settings/appearance");
+    expect(screen.getByTestId("project-folder-page-size-input")).toHaveValue(3);
+  });
+
+  // Other rejected entries are covered by projectFolderPaginationPreferences.test.ts.
+  it.each(["51", ""])("keeps the last valid session count when %j is entered", (entry) => {
+    localStorage.setItem("omnigent:project-folder-page-size", "7");
+    renderPage("/settings/appearance");
+    const input = screen.getByTestId("project-folder-page-size-input") as HTMLInputElement;
+
+    fireEvent.change(input, { target: { value: entry } });
+    expect(localStorage.getItem("omnigent:project-folder-page-size")).toBe("7");
+    fireEvent.blur(input);
+    expect(input.value).toBe("7");
+  });
+
   it("shows the default code font size and steps it up, persisting the choice", () => {
     localStorage.clear();
     renderPage("/settings/appearance");
     const input = screen.getByTestId("code-font-size-input") as HTMLInputElement;
-    // No stored preference → 13px default, matching the interface default.
+    // The code font keeps its own 13px default.
     expect(input.value).toBe("13");
 
     fireEvent.click(screen.getByTestId("code-font-size-inc"));
