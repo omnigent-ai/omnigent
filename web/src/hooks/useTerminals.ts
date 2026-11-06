@@ -381,9 +381,12 @@ export function useCreateTerminal(conversationId: string) {
           // Closed before the create returned: the DELETE was deferred to now.
           removeFromCache(info.id);
           deleteTerminal(conversationId, info.id)
-            .catch(() =>
-              showToast("Couldn't close the shell — it's still running.", { duration: 0 }),
-            )
+            .catch(() => {
+              // The shell survived: list it again so the user can retry the close.
+              clearClosedDuringLaunch(predicted.id);
+              addToCache(info);
+              showToast("Couldn't close the shell — it's still running.", { duration: 0 });
+            })
             .finally(() => clearClosedDuringLaunch(predicted.id));
           return;
         }
