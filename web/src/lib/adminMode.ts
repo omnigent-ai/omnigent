@@ -6,13 +6,13 @@ import {
   hostFetch,
   isDatabricksWorkspace,
 } from "./host";
+import { randomUUID } from "./randomUUID";
 
 const COOKIE_NAME = "omnigent_admin_mode";
 const CHANGE_KEY_PREFIX = "omnigent:admin-mode-change:";
 const listeners = new Set<() => void>();
 let adminMode: boolean | null = null;
 let userId: string | null = null;
-let initialized = false;
 let cookieReady = false;
 let modeCookieName: string | null = null;
 let initialCookie: string | undefined;
@@ -51,19 +51,30 @@ export function initializeAdminMode(): void {
     }
   }
   cookieReady = readCookie() !== undefined;
-  if (initialized || !cookieReady) return;
-  initialized = true;
-  window.addEventListener("storage", (event) => {
+}
+
+/** Watch mode changes only while the app is mounted, preserving identity on remount. */
+export function subscribeAdminModeChanges(): () => void {
+  const onStorage = (event: StorageEvent) => {
     if (adminMode !== null && event.key === changeKey() && event.newValue) location.reload();
-  });
-  window.addEventListener("pageshow", (event) => {
+  };
+  const onPageShow = (event: PageTransitionEvent) => {
     if (event.persisted && adminMode !== null) location.reload();
-  });
-  window.addEventListener("focus", () => {
+  };
+  const onFocus = () => {
     if (adminMode !== null && modeCookieName && readCookie(modeCookieName) !== initialCookie) {
       location.reload();
     }
-  });
+  };
+  window.addEventListener("storage", onStorage);
+  window.addEventListener("pageshow", onPageShow);
+  window.addEventListener("focus", onFocus);
+  onFocus();
+  return () => {
+    window.removeEventListener("storage", onStorage);
+    window.removeEventListener("pageshow", onPageShow);
+    window.removeEventListener("focus", onFocus);
+  };
 }
 
 /** Only a supporting backend and eligible account can offer the switch. */
@@ -108,14 +119,19 @@ export function useAdminMode(): boolean | null {
 /** Reload every view after the cookie takes effect, dropping cached permissions and streams. */
 export async function setAdminMode(enabled: boolean): Promise<void> {
   if (adminMode === null) throw new Error("Admin mode is unavailable for this account.");
-  const response = await hostFetch("/v1/me/admin-mode", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ enabled }),
-  });
-  if (!response.ok) throw new Error("Could not change admin mode. Try again.");
+  const changeFailed = "Could not change admin mode. Try again.";
   try {
-    localStorage.setItem(changeKey(), crypto.randomUUID());
+    const response = await hostFetch("/v1/me/admin-mode", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    if (!response.ok) throw new Error(changeFailed);
+  } catch {
+    throw new Error(changeFailed);
+  }
+  try {
+    localStorage.setItem(changeKey(), randomUUID());
   } catch {
     // Other tabs also check their cookie when they regain focus.
   }

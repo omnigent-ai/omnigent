@@ -1,5 +1,5 @@
 import { appConfig } from "./appConfig";
-import { initializeAdminMode } from "./lib/adminMode";
+import { initializeAdminMode, subscribeAdminModeChanges } from "./lib/adminMode";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
@@ -43,6 +43,7 @@ import "./index.css";
 // and a trace begins in the browser. No-op unless a collector endpoint is
 // configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
 initializeAdminMode();
+subscribeAdminModeChanges();
 initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.
