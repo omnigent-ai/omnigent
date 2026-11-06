@@ -622,6 +622,8 @@ async def _run_fire_for_task(
         return
 
     if task.continues_session:
+        task = await _release_deleted_session(deps, task)
+    if task.continues_session:
         await _continue_session(
             deps, task, fire_dispatch.reuse or _make_reuse_dispatch(deps), recorder
         )
@@ -807,6 +809,34 @@ async def _disable_for_deleted_owner(
     )
 
 
+async def _release_deleted_session(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:
+    """Drop a continued session that was deleted, so this run starts a new one.
+
+    Only a session that no longer exists is replaced: one the owner archived or
+    that no longer fits the task still fails the run, so a change they made is
+    never undone silently. The new session is recorded like a first run's, and a
+    managed sandbox is provisioned again when the deleted session's workspace is
+    gone (see :func:`_continued_host_binding`).
+    """
+    session_id = task.session_id
+    assert session_id is not None  # guarded by the caller
+    start_fire_stage("session_validation", session_id=session_id)
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    if conv is not None:
+        return task
+    _logger.info(
+        "scheduled fire: task %s continues deleted session %s; starting a new one",
+        task.id,
+        session_id,
+    )
+    await asyncio.to_thread(deps.scheduled_task_store.release_session, task.id, session_id)
+    # Another run may have recorded its replacement first; continue that one.
+    stored = await asyncio.to_thread(deps.scheduled_task_store.get, task.id)
+    if stored is None or stored.state == "deleted":
+        return task
+    return replace(task, session_id=stored.session_id)
+
+
 async def _continue_session(
     deps: FireDeps,
     task: ScheduledTask,
@@ -818,7 +848,8 @@ async def _continue_session(
     The prompt goes in the way a user's message would, also while the session is
     busy with an earlier turn, and the run succeeds once it is delivered. Never
     falls back to a new session: one that cannot take the prompt records a
-    failed run telling the owner how to start a new one.
+    failed run telling the owner how to start a new one. (A session that was
+    deleted is dropped earlier, by :func:`_release_deleted_session`.)
     """
     session_id = task.session_id
     assert session_id is not None  # guarded by the caller

@@ -2997,7 +2997,7 @@ describe("Right workspace card visibility", () => {
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("focuses the tab strip without replacing its selected soft tab", async () => {
+  it("toggles the rail in one press and picks its fixed tabs by number from anywhere", async () => {
     writeWorkspacePanelDefault("collapsed");
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3012,33 +3012,42 @@ describe("Right workspace card visibility", () => {
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
-    fireEvent.keyDown(filesTab, { key: "2" });
+    // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
+    screen.getByRole("button", { name: "Collapse right panel" }).focus();
+    fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
     expect(screen.getByTestId("files-panel")).toHaveAttribute("data-flat-view", "true");
 
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
-    const fileTab = screen.getByTitle("README.md");
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
-    expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
 
+    // With focus outside the rail, the hotkey still closes the rail on screen.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    // Reopening keeps the selected file tab.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
     expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
-    await waitFor(() => expect(fileTab).toHaveFocus());
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
-    expect(filesTab).toHaveAttribute("aria-selected", "false");
-
-    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
-    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
   });
 
-  it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
+  it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3050,7 +3059,9 @@ describe("Right workspace card visibility", () => {
       renderShell("/c/conv_browser_hotkey");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
         "aria-selected",
@@ -3060,14 +3071,25 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
   it("reveals a Browser tab over an open Terminal panel", async () => {
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     sessionStorage.setItem(
       "omnigent.web.panel-key:conv_browser_terminal",
@@ -3084,7 +3106,9 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
@@ -3095,6 +3119,7 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
@@ -3179,7 +3204,7 @@ describe("Right workspace card visibility", () => {
     await waitFor(() => expect(screen.getByTitle("README.md")).toHaveFocus());
   });
 
-  it("focuses the workspace toolbar when its selected fixed tab is hidden", async () => {
+  it("focuses the workspace toolbar on reopen when its selected fixed tab is hidden", async () => {
     writeSessionWorkspaceState("conv_compact_workspace", {
       open: true,
       rightRailTab: "changes",
@@ -3194,6 +3219,9 @@ describe("Right workspace card visibility", () => {
     const selected = screen.getByRole("tab", { name: /changes/i });
     Object.defineProperty(selected, "checkVisibility", { value: () => false });
 
+    // The rail on screen closes; reopening focuses its toolbar, since the selected tab is hidden.
+    fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
+    expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     await waitFor(() =>
@@ -5187,8 +5215,8 @@ describe("AppShell share action", () => {
       expect(
         screen.getByText(/This session's working directory \(a home or root directory\)/),
       ).toBeInTheDocument();
-      expect(screen.getByText(/Please be careful when sharing/)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /^grant$/i })).toBeInTheDocument();
+      expect(screen.getByText(/This Omnigent server allows read-only sharing/)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /^add$/i })).toBeDisabled();
     });
   });
 

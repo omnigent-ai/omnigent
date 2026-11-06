@@ -312,6 +312,69 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
   } satisfies ScheduledTasksApiModule.ScheduledTask;
 }
 
+describe("onCreated", () => {
+  function fillRequiredFields() {
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
+      target: { value: "Review pull requests" },
+    });
+  }
+
+  it("is called once, only after the create completes", async () => {
+    const onCreated = vi.fn();
+    const onOpenChange = vi.fn();
+    let finishCreate: (value: unknown) => void = () => {};
+    mutateAsync.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, {
+      expandAdvanced: false,
+    });
+    fillRequiredFields();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+
+    finishCreate({ id: "st_new" });
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("is not called when the create is rejected", async () => {
+    const onCreated = vi.fn();
+    mutateAsync.mockRejectedValueOnce(new Error("create failed"));
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} onCreated={onCreated} />, {
+      expandAdvanced: false,
+    });
+    fillRequiredFields();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    expect(await screen.findByText("create failed")).toBeVisible();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("is not called after an edit", async () => {
+    const onCreated = vi.fn();
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        onCreated={onCreated}
+        editingTask={scheduledTask()}
+      />,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+});
+
 describe("prompt-first automation setup", () => {
   it("keeps Name visible and required while Advanced is collapsed", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
@@ -1395,7 +1458,7 @@ describe("CreateScheduledTaskDialog submit", () => {
     expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("hostId");
   });
 
-  it("keeps Run on visible before Schedule with Advanced collapsed", () => {
+  it("keeps Run on and Agent visible before Schedule with Advanced collapsed", () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
     expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
       "aria-expanded",
@@ -1405,10 +1468,20 @@ describe("CreateScheduledTaskDialog submit", () => {
     const hostTrigger = screen.getByTestId("task-host-trigger");
     expect(hostField).not.toHaveClass("sm:w-64");
     expect(hostField).toContainElement(hostTrigger);
-    expect(hostTrigger).toHaveClass("w-full");
-    expect(hostTrigger.compareDocumentPosition(screen.getByTestId("schedule-preset-trigger"))).toBe(
+    expect(hostTrigger).toBeVisible();
+    const agentField = screen.getByTestId("task-agent-field");
+    expect(screen.getByTestId("task-agent-picker")).toBeVisible();
+    expect(hostField.nextElementSibling).toBe(agentField);
+    expect(agentField.compareDocumentPosition(screen.getByTestId("schedule-preset-trigger"))).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
+    fireEvent.click(screen.getByTestId("pick-agent-polly"));
+    expect(screen.getByTestId("agent-picker-stub")).toHaveTextContent("Polly");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
   });
 
   it("keeps the footer visible by letting only the dialog body scroll", () => {
@@ -3525,13 +3598,22 @@ describe("editing template prompts", () => {
   it("saves worker harness, model, and effort without rebinding the polling session", async () => {
     const task = scheduledTask({ prompt: original, sessionMode: "continue", sessionId: "poller" });
     const props = { onOpenChange: vi.fn(), editingTask: task };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+      expandAdvanced: false,
+    });
     const select = async (id: string, name: string) => {
       fireEvent.keyDown(screen.getByTestId(id), { key: "Enter" });
       fireEvent.click(await screen.findByRole("option", { name }));
     };
     expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Polly");
+    expect(screen.getByTestId("task-worker-agent-trigger")).toBeVisible();
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
     await select("task-worker-agent-trigger", "Claude Code");
+    expect(screen.getByRole("button", { name: "Advanced" })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     await select("task-model-trigger", "Opus");
     await select("task-effort-trigger", "High");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
@@ -3556,6 +3638,8 @@ describe("editing template prompts", () => {
       <CreateScheduledTaskDialog open {...props} editingTask={{ ...task, prompt: input.prompt }} />,
     );
     expect(screen.getByTestId("task-worker-agent-trigger")).toHaveTextContent("Claude Code");
+    expect(screen.queryByTestId("task-model-trigger")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("Opus");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("High");
     await select("task-worker-agent-trigger", "Polly");

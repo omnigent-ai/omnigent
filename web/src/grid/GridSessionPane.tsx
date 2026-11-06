@@ -487,6 +487,7 @@ export function GridSessionPane({
             <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
               <WorkspacePanel
                 contained
+                keyboardTarget={selected}
                 conversationId={sessionId}
                 sessionHarness={state.sessionHarness}
                 agentId={state.boundAgentId ?? session?.agentId ?? null}
