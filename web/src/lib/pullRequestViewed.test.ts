@@ -426,13 +426,14 @@ describe("useViewedFiles", () => {
     expect(remounted.result.current.persisted).toBe(false);
     reads.mockRestore();
 
-    // Another tab persists c.ts while this tab's writes are refused, and no event reaches here yet.
+    // Another head's tab marks a.ts and c.ts while this tab's writes are refused, and no event reaches
+    // here yet. This tab's unsaved a.ts mark must add to that history, not replace it.
     writes.mockRestore();
-    localStorage.setItem(KEY, stored({ "c.ts": ["c1"] }));
+    localStorage.setItem(KEY, stored({ "a.ts": ["other-head"], "c.ts": ["c1"] }));
     act(() => remounted.result.current.setMany(["b.ts"], true));
     expect(remounted.result.current.persisted).toBe(true);
     expect(readMarksFromStorage()).toEqual({
-      "a.ts": [hashes.get("a.ts")],
+      "a.ts": ["other-head", hashes.get("a.ts")],
       "b.ts": [hashes.get("b.ts")],
       "c.ts": ["c1"],
     });
@@ -460,6 +461,30 @@ describe("useViewedFiles", () => {
     expect(result.current.viewed.size).toBe(0);
     expect(result.current.persisted).toBe(true);
   });
+
+  it.each(["constructor", "toString"])(
+    "unmarks a file named %s after a refused write, without reading inherited members",
+    (name) => {
+      const namedHashes = new Map([
+        [name, "h1"],
+        ["a.ts", "a1"],
+      ]);
+      writeViewed(KEY, { [name]: ["h1"] });
+      const { result } = renderHook(() => useViewedFiles(PR, "head1", namedHashes));
+      expect(result.current.viewed).toEqual(new Set([name]));
+
+      const writes = failStorageWrites();
+      act(() => result.current.setMany([name], false));
+      expect(result.current.viewed.size).toBe(0);
+      expect(result.current.changed.size).toBe(0);
+      const remounted = renderHook(() => useViewedFiles(PR, "head1", namedHashes));
+      expect(remounted.result.current.viewed.size).toBe(0);
+      writes.mockRestore();
+
+      act(() => result.current.setMany(["a.ts"], true));
+      expect(readMarksFromStorage()).toEqual({ "a.ts": ["a1"] });
+    },
+  );
 
   it("ignores sessionStorage events", () => {
     const { result } = renderHook(() => useViewedFiles(PR, "head1", hashes));

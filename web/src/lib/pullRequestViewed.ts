@@ -125,9 +125,15 @@ const storedSchema = z.object({
   updatedAt: z.number(),
 });
 
-// This tab's changes that storage has not accepted, per key: each changed path's new hashes, or
-// null when the path was dropped. Reads apply them over what storage holds, so other tabs' writes show.
-const unsavedChanges = new Map<string, Map<string, string[] | null>>();
+/** One change this tab made that storage has not accepted yet. Replayed in order over stored marks. */
+type PendingOp = { op: "mark"; path: string; hash: string } | { op: "unmark"; path: string };
+/** Marks by file path. A Map, so a file named `constructor` is an ordinary entry. */
+type Marks = Map<string, string[]>;
+// ponytail: the log is capped, so a tab offline through more edits than this drops its oldest unsaved
+// ones. Persist the log if that shows up in practice.
+const MAX_PENDING_OPS = 200;
+// This tab's changes that storage has not accepted, per key.
+const pendingOps = new Map<string, PendingOp[]>();
 const listeners = new Set<() => void>();
 // Bumped on every change this module can observe, so snapshots are recomputed only then.
 let version = 0;
@@ -155,7 +161,7 @@ if (typeof window !== "undefined") {
       // Unreadable storage: treat the event as ours and re-read.
     }
     // A cleared store discards unsaved changes. Another tab's write is applied under them on read.
-    if (event.key === null) unsavedChanges.clear();
+    if (event.key === null) pendingOps.clear();
     else if (!isStoredKey(event.key)) return;
     notify();
   });
@@ -172,18 +178,8 @@ function readStored(key: string): z.infer<typeof storedSchema> | null {
   }
 }
 
-/** The marks storage holds for `key`, with this tab's unsaved changes applied over them. */
-function readMarks(key: string): ViewedMarks {
-  const marks = new Map(Object.entries(readStored(key)?.marks ?? {}));
-  for (const [path, hashes] of unsavedChanges.get(key) ?? []) {
-    if (hashes === null) marks.delete(path);
-    else marks.set(path, hashes);
-  }
-  return Object.fromEntries(marks);
-}
-
 function storedKeys(): string[] {
-  const keys = new Set(unsavedChanges.keys());
+  const keys = new Set(pendingOps.keys());
   try {
     for (let position = 0; position < window.localStorage.length; position++) {
       const key = window.localStorage.key(position);
@@ -202,7 +198,7 @@ function storedKeys(): string[] {
 function pruneEntries(keepKey: string, now: number): void {
   // Parses every stored entry per write; cache their ages if this shows up in profiles.
   const entries = storedKeys()
-    .filter((key) => key !== keepKey && !unsavedChanges.has(key))
+    .filter((key) => key !== keepKey && !pendingOps.has(key))
     .map((key) => [key, readStored(key)?.updatedAt ?? -Infinity] as const)
     .sort((a, b) => b[1] - a[1]);
   try {
@@ -216,37 +212,62 @@ function pruneEntries(keepKey: string, now: number): void {
   }
 }
 
-/** The paths where `marks` differs from `stored`, as the changes `readMarks` applies over `stored`. */
-function changesOver(stored: ViewedMarks, marks: ViewedMarks): Map<string, string[] | null> {
-  const changes = new Map<string, string[] | null>();
-  for (const path of new Set([...Object.keys(stored), ...Object.keys(marks)])) {
-    if (JSON.stringify(stored[path] ?? null) !== JSON.stringify(marks[path] ?? null)) {
-      changes.set(path, marks[path] ?? null);
-    }
-  }
-  return changes;
+/** The marks storage holds for `key`. Only the entries it stores, never inherited members. */
+function storedMarks(key: string): Marks {
+  return new Map(Object.entries(readStored(key)?.marks ?? {}));
 }
 
 /**
- * Store a pull request's marks under `key`. If storage refuses, the changes stay in this tab over
- * what storage holds until a write succeeds.
+ * `hashes` with `hash` recorded as the newest. Stand-ins from other heads are discarded before the
+ * hash is recorded; the new hash counts toward the limit.
  */
-export function writeViewed(key: string, marks: ViewedMarks): { persisted: boolean } {
+function recordMark(hashes: readonly string[], hash: string): string[] {
+  if (hashes.includes(hash)) return [...hashes];
+  return [...hashes.filter(isVerified), hash].slice(-MAX_HASHES_PER_PATH);
+}
+
+/** Applies one unsaved change to `marks`, in place. */
+function applyOp(marks: Marks, op: PendingOp): void {
+  if (op.op === "unmark") marks.delete(op.path);
+  else marks.set(op.path, recordMark(marks.get(op.path) ?? [], op.hash));
+}
+
+/** `stored` with `ops` replayed over it, in order. */
+function replay(stored: Marks, ops: readonly PendingOp[]): Marks {
+  const marks = new Map(stored);
+  for (const op of ops) applyOp(marks, op);
+  return marks;
+}
+
+/** The marks this tab shows: what storage holds, with this tab's unsaved changes replayed over it. */
+function readMarks(key: string): Marks {
+  return replay(storedMarks(key), pendingOps.get(key) ?? []);
+}
+
+/**
+ * Stores `marks` under `key`. If storage refuses, `ops` stay pending in this tab, so the next write
+ * replays them over whatever storage holds then.
+ */
+function persistMarks(key: string, marks: Marks, ops: PendingOp[]): { persisted: boolean } {
   const updatedAt = Date.now();
-  const value = JSON.stringify({ v: 2, marks, updatedAt });
+  const value = JSON.stringify({ v: 2, marks: Object.fromEntries(marks), updatedAt });
   pruneEntries(key, updatedAt);
   let persisted = true;
   try {
     window.localStorage.setItem(key, value);
-    unsavedChanges.delete(key);
+    pendingOps.delete(key);
   } catch {
     persisted = false;
-    const changes = changesOver(readStored(key)?.marks ?? {}, marks);
-    if (changes.size > 0) unsavedChanges.set(key, changes);
-    else unsavedChanges.delete(key);
+    if (ops.length > 0) pendingOps.set(key, ops.slice(-MAX_PENDING_OPS));
+    else pendingOps.delete(key);
   }
   notify();
   return { persisted };
+}
+
+/** Stores the marks as given. A refused write is not kept here; mutations keep unsaved changes in the log. */
+export function writeViewed(key: string, marks: ViewedMarks): { persisted: boolean } {
+  return persistMarks(key, new Map(Object.entries(marks)), []);
 }
 
 /**
@@ -254,12 +275,12 @@ export function writeViewed(key: string, marks: ViewedMarks): { persisted: boole
  * file was marked at a comparable hash that differs from them. Unverified history alone is silent.
  */
 function classify(
-  marks: ViewedMarks,
+  marks: Marks,
   fingerprintOf: (path: string) => string,
 ): { viewed: Set<string>; changed: Set<string> } {
   const viewed = new Set<string>();
   const changed = new Set<string>();
-  for (const [path, hashes] of Object.entries(marks)) {
+  for (const [path, hashes] of marks) {
     const current = fingerprintOf(path);
     if (hashes.includes(current)) viewed.add(path);
     else if (isVerified(current) && hashes.some(isVerified)) changed.add(path);
@@ -301,7 +322,7 @@ function snapshotReader(
     if (seenVersion !== version) {
       seenVersion = version;
       const { viewed, changed } = classify(readMarks(storageKey), fingerprintOf);
-      snapshot = { available: true, viewed, changed, persisted: !unsavedChanges.has(storageKey) };
+      snapshot = { available: true, viewed, changed, persisted: !pendingOps.has(storageKey) };
     }
     return snapshot;
   };
@@ -333,24 +354,24 @@ export function useViewedFiles(
   const setMany = useCallback(
     (paths: string[], viewed: boolean) => {
       if (storageKey === null || head === null) return;
-      // Start from what storage holds now plus this tab's unsaved changes, so other tabs' writes survive.
-      const after = new Map(Object.entries(readMarks(storageKey)));
-      let modified = false;
+      const pending = pendingOps.get(storageKey) ?? [];
+      // Stored marks with this tab's unsaved changes replayed over them, so other tabs' writes survive.
+      const marks = replay(storedMarks(storageKey), pending);
+      const ops: PendingOp[] = [];
       for (const path of paths) {
+        let op: PendingOp | null = null;
         if (!viewed) {
           // Unmarking forgets every hash, including one a stale view of this file still shows.
-          if (after.delete(path)) modified = true;
-          continue;
+          if (marks.has(path)) op = { op: "unmark", path };
+        } else {
+          const hash = fingerprintOf(path);
+          if (!marks.get(path)?.includes(hash)) op = { op: "mark", path, hash };
         }
-        const hash = fingerprintOf(path);
-        const hashes = after.get(path) ?? [];
-        if (hashes.includes(hash)) continue;
-        modified = true;
-        // Stand-ins from other heads can never match here, so they don't push out a comparable hash.
-        const comparable = hashes.filter(isVerified);
-        after.set(path, [...comparable, hash].slice(-MAX_HASHES_PER_PATH));
+        if (op === null) continue;
+        applyOp(marks, op);
+        ops.push(op);
       }
-      if (modified) writeViewed(storageKey, Object.fromEntries(after));
+      if (ops.length > 0) persistMarks(storageKey, marks, [...pending, ...ops]);
     },
     [storageKey, head, fingerprintOf],
   );

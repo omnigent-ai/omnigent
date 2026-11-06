@@ -710,40 +710,22 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(isCollapsed("b.ts")).toBe(false);
   });
 
-  it("does not show the notice for a marked file that left the PR", () => {
-    const { rerender } = render(
-      viewedTab({ conversationId: "viewed-removed", head: "head1", patch: twoFilePatch("new") }),
-    );
-    fireEvent.click(viewedBox("a.ts"));
-    fireEvent.click(viewedBox("b.ts"));
-
-    rerender(
-      viewedTab({
-        conversationId: "viewed-removed",
-        head: "head2",
-        files: [changed("a.ts")],
-        patch: filePatch("a.ts", "new"),
-      }),
-    );
-    expect(viewedBox("a.ts")).toBeChecked();
-    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
-    expect(screen.queryByText("Changed since viewed")).toBeNull();
-  });
-
-  it("does not raise the notice for a changed mark on a file the list omits", () => {
+  it.each([
+    ["absent from the patch", filePatch("a.ts", "new")],
+    ["changed in the patch", twoFilePatch("new", "changed")],
+  ])("does not raise the notice when the list omits a marked b.ts that is %s", (_, headPatch) => {
     const { rerender } = render(
       viewedTab({ conversationId: "viewed-omitted", head: "head1", patch: twoFilePatch("new") }),
     );
     fireEvent.click(viewedBox("a.ts"));
     fireEvent.click(viewedBox("b.ts"));
 
-    // b.ts still changes in the patch, but the list no longer shows it.
     rerender(
       viewedTab({
         conversationId: "viewed-omitted",
         head: "head2",
         files: [changed("a.ts")],
-        patch: twoFilePatch("new", "changed"),
+        patch: headPatch,
       }),
     );
     expect(viewedBox("a.ts")).toBeChecked();
