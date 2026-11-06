@@ -303,6 +303,22 @@ def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     assert "Do not block the fix or PR because footage is missing or rejected" in normalized
 
 
+def test_unprompted_caption_claims_are_checked_against_driver_sends() -> None:
+    lanes = " ".join((_RESOLVE_AGENT.parent / "recording-lanes.md").read_text().split())
+    skills = {skill.name: " ".join(skill.content.split()) for skill in load(_RESOLVE_AGENT).skills}
+    author = skills["resolve-author-fix"]
+
+    assert "The driver's sends are user actions" in lanes
+    assert '("unprompted", "without another user message")' in lanes
+    assert "it holds only between them" in lanes
+    assert "may still send a step that worked around the bug" in lanes
+    assert "Remove that step and assert the unaided outcome, or caption it" in lanes
+    assert "list the messages and actions it sends" in author
+    assert "the PR Demo and `fix_summary` may say the product acted" in author
+    assert "only where the driver sent nothing" in author
+    assert "Check the driver's sends as 2B.5 describes" in skills["resolve-review-pr"]
+
+
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
     instructions = _normalized_resolve_instructions()
     drive_pr = (_RESOLVE_AGENT / "skills" / "resolve-drive-pr" / "SKILL.md").read_text()

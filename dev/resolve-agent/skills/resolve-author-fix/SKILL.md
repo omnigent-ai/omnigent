@@ -198,6 +198,11 @@ fallback if rendering is blocked; keep any usable footage.
 - Record the user action and the corrected product behavior. Tests may drive
   and verify the interaction, but the clip must show the product, not pytest,
   assertions, debug logs, or test source.
+- Before recording with the reproduction driver, list the messages and actions
+  it sends, and apply the shared guide's check of driver sends to any step that
+  worked around the bug. The timed captions, handoff `caption`, the PR Demo and
+  `fix_summary` may say the product acted without user input only where the
+  driver sent nothing.
 - For CLI or terminal output, record the real command and its output, even if
   only an error message changes. For example, run `omnigent host` with an
   expired login and capture the corrected error message.
