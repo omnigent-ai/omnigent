@@ -781,14 +781,15 @@ async def _recover_retry_session_once(
         clear_skipped_resume,
         hold_reconnect_recovery,
         note_skipped_resume,
+        reconnect_recovery_deferred,
         release_reconnect_recovery,
         skipped_resume_runner,
     )
 
-    was_held = not wake_only and await release_reconnect_recovery(session_id, conversation_store)
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
+    was_held = not wake_only and reconnect_recovery_deferred(conv)
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
@@ -877,6 +878,8 @@ async def _recover_retry_session_once(
         trigger="retry_session",
     )
     if not wake_only:
+        # Until this handshake succeeds, the hold records the resume a wake left owed.
+        await release_reconnect_recovery(session_id, conversation_store)
         clear_skipped_resume(session_id)
 
     if _is_native_terminal_session(conv):

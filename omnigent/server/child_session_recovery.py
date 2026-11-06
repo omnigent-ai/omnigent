@@ -77,35 +77,29 @@ async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> 
         await asyncio.to_thread(store.delete_label, session_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
 
 
-async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> bool:
-    """When *session_id* is given work, end its hold and those of ancestors that recover it.
-
-    Returns whether *session_id* itself was held.
-    """
-    held_session = False
+async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
+    """When *session_id* is given work, end its hold and those of ancestors that recover it."""
     seen: set[str] = set()
     child: Conversation | None = None
     next_id: str | None = session_id
     for _ in range(_RELEASE_MAX_READS):
         if next_id is None or next_id in seen:
-            break
+            return
         conv = await asyncio.to_thread(store.get_conversation, next_id)
         if conv is None or (child is not None and conv.runner_id != child.runner_id):
-            break
+            return
         wake_running = conv.id in _wake_only_retries
         if wake_running:
             _released_during_wake.add(conv.id)
         # A running wake can land its hold after the read above.
         if wake_running or RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
             await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-            held_session = held_session or conv.id == session_id
         # As on runner connect, a hosted child recovers as its own tree.
         if conv.host_id is not None and not is_parent_owned_subagent(conv):
-            break
+            return
         seen.add(conv.id)
         child = conv
         next_id = conv.parent_conversation_id
-    return held_session
 
 
 def reconnect_recovery_deferred(conv: Conversation) -> bool:

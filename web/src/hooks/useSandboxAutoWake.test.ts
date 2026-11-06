@@ -232,13 +232,16 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("idle");
   });
 
-  it("reports a failed wake without retrying, and wakes again on request", async () => {
-    wakeMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
+  it.each<[string, Error]>([
+    ["a launch error", new Error("Sandbox resume timed out")],
+    ["another invalid input", new ApiError("Sandbox template is invalid", 400, "invalid_input")],
+  ])("reports %s without retrying, and wakes again on request", async (_label, failure) => {
+    wakeMock.mockRejectedValueOnce(failure);
     const { result, rerender } = renderWake(asleepAndOpen);
     await act(async () => {});
 
     expect(result.current.phase).toBe("failed");
-    expect(result.current.error).toBe("Couldn't start the sandbox: Sandbox resume timed out");
+    expect(result.current.error).toBe(`Couldn't start the sandbox: ${failure.message}`);
     rerender({ ...asleepAndOpen });
     expect(wakeMock).toHaveBeenCalledTimes(1);
 

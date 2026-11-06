@@ -82,7 +82,12 @@ async function startSandboxWake(conversationId: string): Promise<void> {
   } catch (error) {
     if (attempts.get(conversationId) !== attempt) return;
     // A server without `wake_session` rejects it as an unknown event type.
-    if (error instanceof ApiError && error.status === 400 && error.code === "invalid_input") {
+    if (
+      error instanceof ApiError &&
+      error.status === 400 &&
+      error.code === "invalid_input" &&
+      error.message.startsWith("Unknown event type")
+    ) {
       setAttempt(conversationId, { step: "unsupported", error: null });
       return;
     }

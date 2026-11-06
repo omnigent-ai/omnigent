@@ -4156,12 +4156,15 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
 
 
 class _RecordingRunnerClient:
-    """Accepts runner session-init POSTs and records what recovery each one deferred."""
+    """Accepts runner session-init POSTs and records what recovery each one deferred.
 
-    def __init__(self, *, fail_first: bool = False) -> None:
+    *failing_handshake* is the 1-based handshake it answers with 503.
+    """
+
+    def __init__(self, *, failing_handshake: int | None = None) -> None:
         self.suppressed_recovery: list[bool] = []
         self.held_subagent_wakes: list[bool] = []
-        self._fail_first = fail_first
+        self._failing_handshake = failing_handshake
 
     async def post(self, path: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
         from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
@@ -4170,7 +4173,7 @@ class _RecordingRunnerClient:
         assert envelope is not None
         self.suppressed_recovery.append(envelope.suppress_recovery_turn)
         self.held_subagent_wakes.append(envelope.hold_subagent_wakes)
-        status = 503 if self._fail_first and len(self.suppressed_recovery) == 1 else 201
+        status = 503 if len(self.suppressed_recovery) == self._failing_handshake else 201
         return httpx.Response(
             status, json={"id": json["session_id"]}, request=httpx.Request("POST", path)
         )
@@ -4183,14 +4186,16 @@ class _RecordingRunnerClient:
         "harness",
         "runner_holds_wakes",
         "failed_marker_lost",
+        "first_resume_fails",
     ),
     [
-        (True, False, None, True, False),
-        (False, False, None, True, False),
-        (False, True, None, True, False),
-        (False, False, "codex-native", True, False),
-        (False, False, None, False, False),
-        (False, False, None, True, True),
+        (True, False, None, True, False, False),
+        (False, False, None, True, False, False),
+        (False, True, None, True, False, False),
+        (False, False, "codex-native", True, False, False),
+        (False, False, None, False, False, False),
+        (False, False, None, True, True, False),
+        (False, False, None, True, True, True),
     ],
     ids=[
         "concurrent",
@@ -4199,6 +4204,7 @@ class _RecordingRunnerClient:
         "native-parent",
         "older-runner",
         "failed-after-marker-loss",
+        "failed-resume-after-marker-loss",
     ],
 )
 async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
@@ -4211,6 +4217,7 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     harness: str | None,
     runner_holds_wakes: bool,
     failed_marker_lost: bool,
+    first_resume_fails: bool,
 ) -> None:
     """A Resume after a wake-only retry repeats the handshake without holding results."""
     import dataclasses
@@ -4236,7 +4243,9 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
         store.set_labels(session_id, disconnect_labels)
         store.set_session_live_status(session_id, "failed")
         _session_status_cache[session_id] = "failed"
-    runner_client = _RecordingRunnerClient(fail_first=wake_handshake_fails)
+    runner_client = _RecordingRunnerClient(
+        failing_handshake=1 if wake_handshake_fails else 2 if first_resume_fails else None
+    )
     connected_client: _RecordingRunnerClient | None = None
     launched, resume_arrived = asyncio.Event(), asyncio.Event()
     hello = dataclasses.replace(
@@ -4292,6 +4301,9 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
         labels = store.get_conversation(session_id).labels  # type: ignore[union-attr]
         assert _last_task_error_from_labels(labels) is not None
         child_session_recovery.clear_skipped_resume(session_id)
+    if first_resume_fails:
+        await _retry("retry_session", status=503)
+        assert _reconnect_recovery_held(db_uri, session_id)
     resume = await _retry("retry_session")
     relaunched = {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
     native_ready = {"queued": False, "recovered": True, "recovery": "native_terminal_ready"}
@@ -4303,8 +4315,9 @@ async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
     if runner_holds_wakes:
         # A native parent never resumes from history, but the Resume still releases its results.
-        assert runner_client.suppressed_recovery == [True, harness is not None]
-        assert runner_client.held_subagent_wakes == [True, False]
+        resumes = 2 if first_resume_fails else 1
+        assert runner_client.suppressed_recovery == [True] + [harness is not None] * resumes
+        assert runner_client.held_subagent_wakes == [True] + [False] * resumes
     else:
         # An older runner would ignore the hold, so the wake sends it no handshake.
         assert runner_client.suppressed_recovery == [False]
