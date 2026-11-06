@@ -3651,7 +3651,7 @@ def _connect_broker_claude_config() -> ClaudeNativeUcodeConfig | None:
 
     workspace_state = read_ucode_state(workspace_host)
     agent_state = workspace_state.agent(_UCODE_CLAUDE_AGENT_NAME) if workspace_state else None
-    if agent_state is not None:
+    if workspace_state is not None and agent_state is not None:
         ucode_base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
         # Security: state.json is writable, and the broker bearer (apiKeyHelper)
         # is presented to whatever ANTHROPIC_BASE_URL resolves to. Only adopt
