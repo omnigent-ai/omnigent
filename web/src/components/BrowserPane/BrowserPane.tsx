@@ -19,7 +19,9 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   CookieIcon,
+  ExternalLinkIcon,
   RotateCwIcon,
+  ShieldAlertIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
@@ -103,6 +105,11 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Open this tab's page (or, on Google's access block page, the page being
+   *  signed in to) in the user's default browser. Absent in older shells. */
+  browserOpenInSystemBrowser?: (
+    conversationId: string,
+  ) => Promise<{ ok: boolean; url?: string; error?: string }>;
   /** Local Chrome profiles holding cookies for the current site (metadata only). */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
   /** Copy the current site's Chrome cookies into this conversation's session. */
@@ -117,7 +124,11 @@ interface BrowserPaneBridge {
     callback: (payload: { conversationId: string; reason: string | null }) => void,
   ) => () => void;
   onBrowserUrlChanged?: (
-    callback: (payload: { conversationId: string; url: string }) => void,
+    callback: (payload: {
+      conversationId: string;
+      url: string;
+      googleAccessBlocked?: boolean;
+    }) => void,
   ) => () => void;
   onBrowserNavState?: (
     callback: (payload: {
@@ -129,6 +140,7 @@ interface BrowserPaneBridge {
   browserHasView?: (conversationId: string) => Promise<{
     exists: boolean;
     url?: string;
+    googleAccessBlocked?: boolean;
     canGoBack?: boolean;
     canGoForward?: boolean;
   }>;
@@ -196,6 +208,21 @@ export function BrowserPane({
   // the arrow buttons.
   const [currentUrl, setCurrentUrl] = useState("");
   const [navigationError, setNavigationError] = useState<string | null>(null);
+  // Set by the shell when the page is Google's context-aware access block page.
+  const [googleAccessBlocked, setGoogleAccessBlocked] = useState(false);
+  // Set once a live url event arrives, so a slower remount snapshot can't overwrite it.
+  const urlEventSeenRef = useRef(false);
+  const [systemBrowserOpening, setSystemBrowserOpening] = useState(false);
+  // A handoff that settles after the pane switches tabs must not touch the new tab.
+  const handoffSequenceRef = useRef(0);
+  useEffect(
+    () => () => {
+      handoffSequenceRef.current++;
+      setSystemBrowserOpening(false);
+    },
+    [conversationId],
+  );
+  const systemBrowserSupported = !!getBridge()?.browserOpenInSystemBrowser;
   // Ref (not state): read synchronously in the url-changed listener; a
   // stale-closure state read would race.
   const urlEditingRef = useRef(false);
@@ -236,12 +263,16 @@ export function BrowserPane({
     if (!bridge) return;
     let cancelled = false;
     let viewChanged = false;
+    urlEventSeenRef.current = false;
 
     // A newer lifecycle event takes precedence over this asynchronous snapshot.
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        if (!urlEventSeenRef.current) {
+          setGoogleAccessBlocked(r.googleAccessBlocked === true);
+          if (!urlEditingRef.current && r.url) setCurrentUrl(r.url);
+        }
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
@@ -256,6 +287,7 @@ export function BrowserPane({
       if (payload.conversationId !== conversationId) return;
       viewChanged = true;
       setHasView(false);
+      setGoogleAccessBlocked(false);
       setCanGoBack(false);
       setCanGoForward(false);
     });
@@ -275,6 +307,8 @@ export function BrowserPane({
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      urlEventSeenRef.current = true;
+      setGoogleAccessBlocked(payload.googleAccessBlocked === true);
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
     });
@@ -374,6 +408,28 @@ export function BrowserPane({
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
     void bridge?.openBrowserDevTools?.(conversationId);
+  }, [conversationId]);
+
+  const handleOpenInSystemBrowser = useCallback(() => {
+    const bridge = getBridge();
+    if (!bridge?.browserOpenInSystemBrowser) return;
+    const sequence = ++handoffSequenceRef.current;
+    const isCurrent = () => sequence === handoffSequenceRef.current;
+    setSystemBrowserOpening(true);
+    setNavigationError(null);
+    void bridge
+      .browserOpenInSystemBrowser(conversationId)
+      .then((result) => {
+        if (isCurrent() && !result?.ok) {
+          setNavigationError(result?.error ?? "Couldn't open your browser.");
+        }
+      })
+      .catch(() => {
+        if (isCurrent()) setNavigationError("Couldn't open your browser.");
+      })
+      .finally(() => {
+        if (isCurrent()) setSystemBrowserOpening(false);
+      });
   }, [conversationId]);
 
   const handleToggleDesignMode = useCallback(() => {
@@ -720,6 +776,18 @@ export function BrowserPane({
         >
           <WrenchIcon className="size-4" />
         </button>
+        {systemBrowserSupported && (
+          <button
+            type="button"
+            onClick={handleOpenInSystemBrowser}
+            disabled={!hasView || systemBrowserOpening}
+            aria-label="Open in browser"
+            title="Open this page in your default browser"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+          >
+            <ExternalLinkIcon className="size-4" />
+          </button>
+        )}
         {cookieImportSupported && (
           <button
             type="button"
@@ -754,6 +822,32 @@ export function BrowserPane({
       {navigationError && (
         <div role="alert" className="px-2 py-1 text-destructive text-xs">
           {navigationError}
+        </div>
+      )}
+      {hasView && googleAccessBlocked && systemBrowserSupported && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-3 border-border border-b bg-muted/50 px-3 py-2 text-xs"
+        >
+          <ShieldAlertIcon className="size-4 shrink-0 text-muted-foreground" />
+          <div className="min-w-0 flex-1">
+            <p className="font-medium text-foreground">
+              Google Workspace doesn't allow sign-in from Omnigent's browser
+            </p>
+            <p className="text-muted-foreground">
+              Your organization only allows approved browsers, such as Chrome. Continue in your
+              browser instead.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={handleOpenInSystemBrowser}
+            disabled={systemBrowserOpening}
+          >
+            <ExternalLinkIcon className="size-3.5" />
+            Continue in browser
+          </Button>
         </div>
       )}
       {hasView ? (

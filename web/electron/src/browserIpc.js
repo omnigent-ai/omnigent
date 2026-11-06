@@ -11,6 +11,7 @@ const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
+const { isGoogleAccessBlockedUrl, systemBrowserCandidates } = require("./browserSystemHandoff");
 const { buildDesignModeScript } = require("./designModeScript");
 
 const { SESSION_HOST_PROTOCOL } = require("./hostIdentity");
@@ -207,7 +208,12 @@ function goForward(wc) {
  */
 function attachNavListeners({ conversationId, webContents, send }) {
   const emitPageMetadata = (url, title = webContents.getTitle()) => {
-    send("browser-url-changed", { conversationId, url, title });
+    send("browser-url-changed", {
+      conversationId,
+      url,
+      title,
+      googleAccessBlocked: isGoogleAccessBlockedUrl(url),
+    });
   };
   const emitUrl = (url) => {
     emitPageMetadata(url);
@@ -364,6 +370,7 @@ function registerBrowserIpc({
   platform = process.platform,
   // Injected so the native confirmation is testable without Electron dialogs.
   confirmCookieImport = askToImportChromeCookies,
+  openExternal = (url) => require("electron").shell.openExternal(url),
 }) {
   /**
    * Resolve the sender's registry after the privileged-origin gate. Returns
@@ -627,6 +634,7 @@ function registerBrowserIpc({
       hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true,
       url,
       title: webContents.getTitle(),
+      googleAccessBlocked: isGoogleAccessBlockedUrl(url),
       ...(pendingUrl ? { pendingUrl } : {}),
       ...readNavState(webContents),
     };
@@ -674,6 +682,71 @@ function registerBrowserIpc({
       /* destroyed */
     }
     return { ok: true };
+  });
+
+  function viewUnchanged(viewRegistry, conversationId, entry, { url, generation }) {
+    try {
+      return (
+        viewRegistry.get(conversationId) === entry &&
+        entry.navigationGeneration === generation &&
+        entry.view.webContents.getURL() === url
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  // ── Toolbar: open in the system browser ──────────────────────────────────
+  // Main picks the URL from the view itself, and only one the view's own
+  // navigation policy allows, so the renderer can't choose the destination.
+  ipcMain.handle("omnigent:browser-open-in-system-browser", async (event, args) => {
+    const g = gateRegistry(event);
+    if (g.error) return { ok: false, error: g.error };
+    const entry = g.registry.get(args?.conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    const generation = entry.navigationGeneration;
+    let currentUrl;
+    let candidates;
+    try {
+      currentUrl = entry.view.webContents.getURL();
+      candidates = systemBrowserCandidates({
+        currentUrl,
+        requestedUrl: entry.lastRequestedUrl,
+        navigationTrail: entry.navigationTrail,
+      });
+    } catch {
+      return { ok: false, error: "browser closed" };
+    }
+    let url;
+    let refusal = "This tab has no web page to open.";
+    // The policy depends only on scheme and host, so check each host once.
+    const verdictsByHost = new Map();
+    for (const candidate of candidates) {
+      const { protocol, hostname } = new URL(candidate);
+      const host = `${protocol}//${hostname}`;
+      if (!verdictsByHost.has(host)) {
+        verdictsByHost.set(host, g.registry.checkSystemBrowserUrl(args.conversationId, candidate));
+      }
+      // oxlint-disable-next-line no-await-in-loop -- stop at the first allowed candidate
+      const verdict = await verdictsByHost.get(host);
+      if (verdict.ok) {
+        url = candidate;
+        break;
+      }
+      refusal = verdict.error;
+    }
+    if (!url) return { ok: false, error: refusal };
+    // The policy check can wait on DNS; don't open a page the tab has left.
+    if (!viewUnchanged(g.registry, args.conversationId, entry, { url: currentUrl, generation })) {
+      return { ok: false, error: "The page changed. Try again." };
+    }
+    try {
+      await openExternal(url);
+      return { ok: true, url };
+    } catch (e) {
+      console.warn("[browser] openExternal failed:", e);
+      return { ok: false, error: "Couldn't open your browser." };
+    }
   });
 
   // ── Toolbar: DevTools toggle ─────────────────────────────────────────────

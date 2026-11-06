@@ -116,22 +116,26 @@ describe("BrowserPane cold-start (no view yet)", () => {
     expect(screen.queryByText(/the agent will open pages here too/)).toBeNull();
   });
 
-  it("restores a tab's URL and navigation state from its existing native view", async () => {
+  it("restores a tab's URL, navigation state and block notice from its native view", async () => {
+    const blockedTabUrl = "https://access.workspace.google.com/remediate?tab=two";
     const bridge = installBridge({
       browserHasView: vi.fn().mockResolvedValue({
         exists: true,
-        url: "https://example.com/tab-two",
+        url: blockedTabUrl,
         canGoBack: true,
         canGoForward: false,
+        googleAccessBlocked: true,
       }),
+      browserOpenInSystemBrowser: vi.fn(),
     });
     render(<BrowserPane conversationId="browser-tab:conv_a:two" />);
     await waitFor(() =>
-      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
-        "https://example.com/tab-two",
-      ),
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(blockedTabUrl),
     );
     expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Your organization only allows approved browsers",
+    );
     await waitFor(() =>
       expect(bridge.browserSetActive).toHaveBeenCalledWith("browser-tab:conv_a:two"),
     );
@@ -618,6 +622,163 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         { force: true },
       ),
     );
+  });
+});
+
+describe("BrowserPane system-browser handoff", () => {
+  const blockedUrl = "https://access.workspace.google.com/remediate?continue=x";
+
+  async function renderWithView(conversationId: string, overrides: Record<string, unknown> = {}) {
+    let fireUrl:
+      | ((p: { conversationId: string; url: string; googleAccessBlocked?: boolean }) => void)
+      | undefined;
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+      browserOpenInSystemBrowser: vi
+        .fn()
+        .mockResolvedValue({ ok: true, url: "https://example.com/" }),
+      onBrowserUrlChanged: vi.fn((cb: typeof fireUrl) => {
+        fireUrl = cb;
+        return () => {};
+      }),
+      ...overrides,
+    });
+    render(<BrowserPane conversationId={conversationId} />);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled());
+    return { bridge, fireUrl: () => fireUrl };
+  }
+
+  it("disables the toolbar button until a page is open", () => {
+    installBridge({ browserOpenInSystemBrowser: vi.fn() });
+    render(<BrowserPane conversationId="conv_empty" />);
+    expect(screen.getByRole("button", { name: "Open in browser" })).toBeDisabled();
+  });
+
+  it("opens the current page in the system browser once per click", async () => {
+    let finishOpen: (result: { ok: boolean }) => void = () => {};
+    const { bridge } = await renderWithView("conv_open", {
+      browserOpenInSystemBrowser: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishOpen = resolve;
+          }),
+      ),
+    });
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledTimes(1);
+    expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_open");
+    expect(button).toBeDisabled();
+
+    await act(async () => finishOpen({ ok: true }));
+    expect(button).toBeEnabled();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("shows the shell's error when the system browser can't be opened", async () => {
+    const { bridge } = await renderWithView("conv_fail", {
+      browserOpenInSystemBrowser: vi
+        .fn()
+        .mockResolvedValue({ ok: false, error: "The page changed. Try again." }),
+    });
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    fireEvent.click(button);
+    expect(await screen.findByRole("alert")).toHaveTextContent("The page changed. Try again.");
+
+    bridge.browserOpenInSystemBrowser.mockRejectedValueOnce(new Error("bridge gone"));
+    fireEvent.click(button);
+    await waitFor(() => expect(button).toBeEnabled());
+    expect(screen.getByRole("alert")).toHaveTextContent("Couldn't open your browser.");
+  });
+
+  it("drops a handoff result that settles after the pane switches tabs", async () => {
+    let finishOpen: (result: { ok: boolean; error?: string }) => void = () => {};
+    installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+      browserOpenInSystemBrowser: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishOpen = resolve;
+          }),
+      ),
+    });
+    const { rerender } = render(<BrowserPane conversationId="conv_first" />);
+    const button = screen.getByRole("button", { name: "Open in browser" });
+    await waitFor(() => expect(button).toBeEnabled());
+    fireEvent.click(button);
+    expect(button).toBeDisabled();
+
+    rerender(<BrowserPane conversationId="conv_second" />);
+    await waitFor(() => expect(button).toBeEnabled());
+    await act(async () => finishOpen({ ok: false, error: "The page changed. Try again." }));
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(button).toBeEnabled();
+  });
+
+  it("offers to continue a blocked Google Workspace sign-in in the system browser", async () => {
+    const { bridge, fireUrl } = await renderWithView("conv_google");
+    expect(screen.queryByText(/doesn't allow sign-in from Omnigent's browser/)).toBeNull();
+
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_google", url: blockedUrl, googleAccessBlocked: true });
+    });
+    const notice = await screen.findByRole("status");
+    expect(notice).toHaveTextContent(
+      "Google Workspace doesn't allow sign-in from Omnigent's browser",
+    );
+    fireEvent.click(within(notice).getByRole("button", { name: "Continue in browser" }));
+    await waitFor(() =>
+      expect(bridge.browserOpenInSystemBrowser).toHaveBeenCalledWith("conv_google"),
+    );
+
+    // Leaving the block page (for example, going back) removes the notice.
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_google", url: "https://example.com/" });
+    });
+    await waitFor(() => expect(screen.queryByRole("status")).toBeNull());
+  });
+
+  it("keeps a live url event over a slower remount snapshot", async () => {
+    let finishProbe: (result: Record<string, unknown>) => void = () => {};
+    let fireUrl: ((p: { conversationId: string; url: string }) => void) | undefined;
+    installBridge({
+      browserHasView: vi.fn(
+        () =>
+          new Promise((resolve) => {
+            finishProbe = resolve;
+          }),
+      ),
+      browserOpenInSystemBrowser: vi.fn(),
+      onBrowserUrlChanged: vi.fn((cb: typeof fireUrl) => {
+        fireUrl = cb;
+        return () => {};
+      }),
+    });
+    render(<BrowserPane conversationId="conv_race" />);
+    act(() => fireUrl?.({ conversationId: "conv_race", url: "https://example.com/" }));
+    await act(async () =>
+      finishProbe({ exists: true, url: blockedUrl, googleAccessBlocked: true }),
+    );
+    expect(screen.getByRole("button", { name: "Reload" })).toBeEnabled();
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
+      "https://example.com/",
+    );
+  });
+
+  it("keeps the old pane on a shell that can't hand off", async () => {
+    const { fireUrl } = await renderWithView("conv_legacy", {
+      browserOpenInSystemBrowser: undefined,
+    });
+    act(() => {
+      fireUrl()?.({ conversationId: "conv_legacy", url: blockedUrl, googleAccessBlocked: true });
+    });
+    await waitFor(() =>
+      expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(blockedUrl),
+    );
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Open in browser" })).toBeNull();
   });
 });
 
