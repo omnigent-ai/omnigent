@@ -15,6 +15,9 @@
 #   --no-databricks  omit the default Databricks extra and CLI
 #   --non-interactive, --verbose
 #
+# uv reads UV_DEFAULT_INDEX (or a default index in uv.toml), so set it to
+# install through a package mirror when pypi.org is unreachable.
+#
 # uv and git (only with --repo) are required; the installer offers to install
 # them if missing. Node/npm are needed by the Claude/Codex/Pi harnesses, tmux
 # by their terminal launchers, and bubblewrap (Linux only) to OS-sandbox those
@@ -528,7 +531,10 @@ install_omnigent() {
   fi
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"
+  if ! run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"; then
+    fail "Omnigent could not be installed. Check the error above. If your network blocks pypi.org, rerun with UV_DEFAULT_INDEX set to your package mirror, for example:
+  curl -fsSL https://omnigent.ai/install.sh | UV_DEFAULT_INDEX=https://pypi.example.com/simple sh"
+  fi
 }
 
 install_databricks_cli() (

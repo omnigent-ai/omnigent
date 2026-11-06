@@ -368,6 +368,24 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
     ]
 
 
+def test_failed_install_suggests_package_mirror(lib: Path) -> None:
+    r = run(
+        lib,
+        """
+        uv() { echo 'error: Failed to fetch: https://pypi.org/simple/omnigent/' >&2; return 2; }
+        parse_args
+        normalize_repo_url
+        install_omnigent
+        echo continued
+        """,
+    )
+    assert r.returncode != 0
+    assert "continued" not in r.stdout
+    assert "Failed to fetch: https://pypi.org/simple/omnigent/" in r.stderr
+    assert "If your network blocks pypi.org" in r.stderr
+    assert "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh" in r.stderr
+
+
 _CLI_COMMANDS = """
 uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
 uv() { [ "$1 $2" = 'python find' ] || return 1; printf '%s\\n' "$TEST_PYTHON"; }
