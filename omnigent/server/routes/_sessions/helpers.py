@@ -120,6 +120,7 @@ from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.admin_mode import effective_admin
 from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
@@ -1302,7 +1303,7 @@ def _permission_level_from_grants(
     """
     if user_id is None:
         return None
-    if is_admin:
+    if effective_admin(is_admin):
         return LEVEL_OWNER
     user_grant = next((g for g in grants if g.user_id == user_id), None)
     if user_grant is not None:

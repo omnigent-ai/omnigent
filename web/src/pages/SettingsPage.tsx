@@ -119,6 +119,7 @@ import {
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import { getAdminMode, setAdminMode, useAdminMode } from "@/lib/adminMode";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
@@ -1966,6 +1967,52 @@ function TerminalClipboardControl() {
   );
 }
 
+function AdminModeControl() {
+  const enabled = useAdminMode();
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const labelId = useId();
+  const descriptionId = useId();
+  if (enabled === null) return null;
+
+  const update = async (next: boolean) => {
+    setSaving(true);
+    setError(null);
+    try {
+      await setAdminMode(next);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "Could not change admin mode. Try again.");
+      setSaving(false);
+    }
+  };
+
+  return (
+    <SettingsGroup title="Administration" testId="settings-group-admin-mode">
+      <div className="flex items-center justify-between gap-4">
+        <SettingsLabel
+          label="Admin mode"
+          labelId={labelId}
+          descriptionId={descriptionId}
+          description="Use admin permissions for this browser session. Turn off to use your normal access."
+        />
+        <Switch
+          checked={enabled}
+          disabled={saving}
+          onCheckedChange={(next) => void update(next)}
+          aria-labelledby={labelId}
+          aria-describedby={descriptionId}
+          componentId="settings.general.admin_mode"
+        />
+      </div>
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-destructive">
+          {error}
+        </p>
+      )}
+    </SettingsGroup>
+  );
+}
+
 /** App-wide behavior settings. */
 function GeneralSection() {
   const info = useServerInfo();
@@ -2003,6 +2050,7 @@ function GeneralSection() {
             <GlobalShortcutControl />
           </SettingsGroup>
         )}
+        <AdminModeControl />
       </div>
     </Section>
   );
@@ -2742,7 +2790,11 @@ function AccountSection() {
   useEffect(() => {
     void (async () => {
       const userId = await resolveIdentity();
-      setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
+      setMe(
+        userId === null
+          ? null
+          : { id: userId, is_admin: getCurrentIsAdmin() || getAdminMode() !== null },
+      );
     })();
   }, []);
 

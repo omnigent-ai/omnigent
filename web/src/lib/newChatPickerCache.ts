@@ -1,4 +1,5 @@
 import { modelOptionSchema } from "./modelCatalogCache";
+import { getAdminMode } from "./adminMode";
 import { z } from "zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { readLastAgentId } from "./agentPreferences";
@@ -79,6 +80,7 @@ function preferenceSignature(preview: { agent: NewChatPickerPreview["agent"] }):
     readLastHostChoice(),
     readLastSandboxProvider(),
     Object.entries(readHarnessOptions(harness)).sort(([a], [b]) => a.localeCompare(b)),
+    getAdminMode(),
   ]);
 }
 

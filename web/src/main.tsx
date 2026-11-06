@@ -1,4 +1,5 @@
 import { appConfig } from "./appConfig";
+import { initializeAdminMode } from "./lib/adminMode";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
@@ -41,6 +42,7 @@ import "./index.css";
 // Start tracing before any request fires so fetch/XHR are patched in time
 // and a trace begins in the browser. No-op unless a collector endpoint is
 // configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
+initializeAdminMode();
 initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.

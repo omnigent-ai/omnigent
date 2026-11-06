@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import ANY
 
 import httpx
 import pytest
@@ -282,7 +283,13 @@ async def test_me_header_mode_behaviors(
     assert missing.json() == {"user_id": None, "is_admin": False}
     # Valid header returns the identity; alice has no admin flag set.
     assert normal.status_code == 200
-    assert normal.json() == {"user_id": "alice@example.com", "is_admin": False}
+    assert normal.json() == {
+        "user_id": "alice@example.com",
+        "is_admin": False,
+        "can_enable_admin_mode": False,
+        "admin_mode_enabled": False,
+        "admin_mode_cookie_name": ANY,
+    }
     # Reserved name is rejected (returns None → route returns null).
     assert reserved.status_code == 200
     assert reserved.json() == {"user_id": None, "is_admin": False}
@@ -319,7 +326,13 @@ async def test_custom_auth_provider_skips_unified_login_routes(
         response = await client.get("/v1/me")
 
     assert response.status_code == 200
-    assert response.json() == {"user_id": "custom@example.com", "is_admin": False}
+    assert response.json() == {
+        "user_id": "custom@example.com",
+        "is_admin": False,
+        "can_enable_admin_mode": False,
+        "admin_mode_enabled": False,
+        "admin_mode_cookie_name": ANY,
+    }
 
 
 async def test_me_is_admin_honors_admin_list_before_db_promotion(
@@ -380,7 +393,13 @@ async def test_me_is_admin_honors_admin_list_before_db_promotion(
     # DB flag is still False, but the admin-list fallback flips is_admin True —
     # matching what /auth/users would authorize for the same caller.
     assert resp.status_code == 200
-    assert resp.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert resp.json() == {
+        "user_id": "alice@example.com",
+        "is_admin": True,
+        "can_enable_admin_mode": True,
+        "admin_mode_enabled": True,
+        "admin_mode_cookie_name": ANY,
+    }
 
 
 def _header_app(
@@ -435,10 +454,22 @@ async def test_me_promotes_listed_admin_so_admin_routes_authorize(
         bob_me = await client.get("/v1/me", headers=bob)
         bob_sharing = await client.get("/v1/sharing", headers=bob)
 
-    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert me.json() == {
+        "user_id": "alice@example.com",
+        "is_admin": True,
+        "can_enable_admin_mode": True,
+        "admin_mode_enabled": True,
+        "admin_mode_cookie_name": ANY,
+    }
     assert perm_store.is_admin("alice@example.com") is True
     assert sharing.status_code == 200, sharing.text
-    assert bob_me.json() == {"user_id": "bob@example.com", "is_admin": False}
+    assert bob_me.json() == {
+        "user_id": "bob@example.com",
+        "is_admin": False,
+        "can_enable_admin_mode": False,
+        "admin_mode_enabled": False,
+        "admin_mode_cookie_name": ANY,
+    }
     assert not perm_store.user_exists("bob@example.com")
     assert bob_sharing.status_code == 403
 
@@ -463,7 +494,13 @@ async def test_me_still_answers_when_admin_promotion_fails(
         me = await client.get("/v1/me", headers={"X-Forwarded-Email": "alice@example.com"})
 
     assert me.status_code == 200
-    assert me.json() == {"user_id": "alice@example.com", "is_admin": True}
+    assert me.json() == {
+        "user_id": "alice@example.com",
+        "is_admin": True,
+        "can_enable_admin_mode": True,
+        "admin_mode_enabled": True,
+        "admin_mode_cookie_name": ANY,
+    }
     assert perm_store.is_admin("alice@example.com") is False
 
 

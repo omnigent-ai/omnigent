@@ -4,6 +4,7 @@ import { writeLastHarness } from "./harnessPreferences";
 import { getOmnigentServerIdentity } from "./host";
 import { writeLastHostChoice, writeLastSandboxProvider } from "./hostPreferences";
 import { getCurrentUserId } from "./identity";
+import { getAdminMode } from "./adminMode";
 import { writeHarnessOption } from "./modePreferences";
 import {
   getNewChatPickerCacheKey,
@@ -21,6 +22,7 @@ import {
 
 vi.mock("./host", () => ({ getOmnigentServerIdentity: vi.fn() }));
 vi.mock("./identity", () => ({ getCurrentUserId: vi.fn() }));
+vi.mock("./adminMode", () => ({ getAdminMode: vi.fn() }));
 
 const NOW = new Date("2026-09-13T12:00:00Z").getTime();
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -71,6 +73,7 @@ beforeEach(() => {
   vi.setSystemTime(NOW);
   vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-a");
   vi.mocked(getCurrentUserId).mockReturnValue("user-a@example.test");
+  vi.mocked(getAdminMode).mockReturnValue(null);
   key = getNewChatPickerCacheKey("")!;
   writeLastAgentId("a1");
   writeLastHostChoice("host_1");
@@ -274,6 +277,7 @@ describe("newChatPickerCache", () => {
 
   it.each([
     { preference: "agent", change: () => writeLastAgentId("another-agent") },
+    { preference: "admin mode", change: () => vi.mocked(getAdminMode).mockReturnValue(true) },
     { preference: "harness", change: () => writeLastHarness("a1", "auto-native") },
     { preference: "host", change: () => writeLastHostChoice("another-host") },
     { preference: "provider", change: () => writeLastSandboxProvider("modal") },

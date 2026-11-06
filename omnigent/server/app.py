@@ -85,6 +85,12 @@ from omnigent.server import (
     session_pull_requests,
     shutdown_state,
 )
+from omnigent.server.admin_mode import (
+    AdminModeMiddleware,
+    admin_mode_cookie_name,
+    create_admin_mode_router,
+    effective_admin,
+)
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
     AuthProvider,
@@ -2656,6 +2662,18 @@ def create_app(
     # outermost WS middleware — a forbidden origin is closed without even
     # reaching the metrics counter (which only counts on accept anyway).
     app.add_middleware(WebSocketOriginMiddleware)
+    admin_mode_supported = (
+        authentication_requires_identity(auth_provider) and permission_store is not None
+    )
+    if admin_mode_supported and auth_provider is not None and permission_store is not None:
+        app.add_middleware(
+            AdminModeMiddleware, auth_provider=auth_provider, base_path=resolved_base_path
+        )
+        app.include_router(
+            create_admin_mode_router(
+                auth_provider, permission_store, admin_list, resolved_base_path
+            )
+        )
     # Give the tool-policy ASK gate (which forwards the native-terminal
     # approval popup from a parked-gate background task, off any
     # request/route closure) the runner router so it can reach the bound
@@ -3797,11 +3815,10 @@ def create_app(
         session routes use). The frontend calls this on load to
         discover who it is.
 
-        Also returns ``is_admin`` — the mode-agnostic admin signal
-        (the shared ``users.is_admin`` column, set by the admin-list
-        promotion at login). The SPA gates admin chrome on it in
-        EVERY mode, including OIDC/SSO where the accounts-only
-        ``/auth/me`` endpoint does not exist.
+        ``is_admin`` reflects the browser's active admin mode. Multi-user
+        deployments also report ``can_enable_admin_mode`` for eligibility
+        and ``admin_mode_enabled`` for the active mode. API clients without
+        the browser cookie retain their existing privileges.
 
         An identity the admin list names but the database doesn't yet
         flag is promoted here, as login does for OIDC and accounts.
@@ -3838,8 +3855,18 @@ def create_app(
                 await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
             except Exception:
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
-        # Still report the list, so admin chrome shows even if promotion failed.
-        return {"user_id": user_id, "is_admin": flagged or listed}
+        eligible = flagged or listed
+        identity: dict[str, str | bool | None] = {
+            "user_id": user_id,
+            "is_admin": effective_admin(eligible),
+        }
+        if admin_mode_supported:
+            identity.update(
+                can_enable_admin_mode=eligible,
+                admin_mode_enabled=effective_admin(eligible),
+                admin_mode_cookie_name=admin_mode_cookie_name(request, resolved_base_path),
+            )
+        return identity
 
     app.include_router(
         create_sessions_router(

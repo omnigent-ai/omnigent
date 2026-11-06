@@ -26,6 +26,7 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
+import { initializeAdminMode } from "./lib/adminMode";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { useResolvedThemeMode } from "./components/theme/useResolvedThemeMode";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
@@ -278,6 +279,7 @@ export function OmnigentApp({
   // belt-and-suspenders that captures the first non-empty props.
   useState(() => {
     setOmnigentHostConfig(hostConfig);
+    initializeAdminMode();
     return null;
   });
 
