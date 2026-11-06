@@ -736,8 +736,8 @@ Other connection providers alone do not enable the managed MCP picker.
   composer only), run from `web/electron` after building the SPA
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
   node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
-  server without dictation, then the mic dictating through a fake-engine
-  server. Manually, for the in-session, new-session and side-chat composers:
+  server without dictation (on macOS, the macOS Dictation mic instead), then
+  the mic dictating through a fake-engine server. Manually, for the in-session, new-session and side-chat composers:
   connect the desktop app to a default `omnigent server` (`/v1/info` reports
   `dictation_available: false`) and expect no mic and ⌘/Ctrl+Alt+V to do
   nothing on Windows or Linux; on a Mac expect the mic, and clicking it or

@@ -1,4 +1,5 @@
-// The desktop mic follows the server's dictation capability (GET /v1/info).
+// The desktop mic follows the server's dictation capability (GET /v1/info);
+// without it, only macOS offers a mic (macOS Dictation).
 // Run from web/electron after building the SPA (see e2e/README.md):
 //   OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a node --test e2e/desktop_dictation_availability.e2e.js
 
@@ -131,8 +132,8 @@ describe(
       if (tmpDir) fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it("offers no mic when the server has no dictation", async () => {
-      const clipName = "mic-hidden-without-server-dictation";
+    it("offers no mic without server dictation, except macOS Dictation on a Mac", async () => {
+      const clipName = "mic-without-server-dictation";
       const server = await spawnServer(fs.mkdtempSync(path.join(tmpDir, "no-dictation-")), {
         env: () => ({ OMNIGENT_DICTATION_ENGINE: UNAVAILABLE_ENGINE }),
       });
@@ -150,7 +151,13 @@ describe(
           // Watch for a mic through the whole hold that the clip shows, not at one instant.
           const mic = window.getByRole("button", { name: MIC_NAME });
           const appeared = await pollUntil(window, async () => (await mic.count()) > 0, 3000);
-          assert.equal(appeared, false, "a mic was offered although no dictation path can work");
+          if (process.platform === "darwin") {
+            // Stop at the offer: a click would start the real macOS Dictation.
+            assert.equal(appeared, true, "the macOS Dictation mic was not offered");
+            assert.equal(await mic.getAttribute("data-server-dictation-available"), "false");
+          } else {
+            assert.equal(appeared, false, "a mic was offered although no dictation path can work");
+          }
         } finally {
           saved = await teardownDesktop(desktop, clipName);
         }

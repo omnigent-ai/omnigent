@@ -755,26 +755,16 @@ describe("ComposerMicButton (server dictation)", () => {
     });
   });
 
-  it("in Electron without server dictation, offers no mic", async () => {
-    // Electron's Web Speech has no backend, so without the server fallback no
-    // dictation path can work — a mic there could only fail when clicked.
-    await inElectronShell(() => {
-      render(
-        <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
-          <ComposerMicButton onTranscript={vi.fn()} />
-        </CapabilitiesContext.Provider>,
-      );
-      expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
-    });
-  });
-
-  it("in Electron without server dictation, the dictation hotkey is inert", async () => {
+  it("in Electron without server dictation or macOS Dictation, offers no mic and an inert hotkey", async () => {
+    // Electron's Web Speech has no backend, so without the server (or the macOS
+    // shell's Dictation) no path can work — a mic there could only fail.
     await inElectronShell(async () => {
       render(
         <CapabilitiesContext.Provider value={NO_DICTATION_INFO}>
           <ComposerMicButton onTranscript={vi.fn()} enableHotkey />
         </CapabilitiesContext.Provider>,
       );
+      expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
       const chord = dictationChord();
       await act(async () => {
         window.dispatchEvent(chord);
@@ -825,25 +815,31 @@ describe("ComposerMicButton (server dictation)", () => {
   });
 
   it("on macOS without server dictation, hands the take to macOS Dictation in the message box", async () => {
-    const startSystemDictation = vi.fn(async () => true);
+    // macOS Dictation types into the field focused when it starts, so record
+    // the focus at the moment the shell is asked.
+    const focusedAtStart: (Element | null)[] = [];
+    const startSystemDictation = vi.fn(async () => {
+      focusedAtStart.push(document.activeElement);
+      return true;
+    });
     await inElectronShell(
       async () => {
         render(<MacDesktopComposer info={NO_DICTATION_INFO} enableHotkey />);
         const message = screen.getByRole("textbox", { name: "Message" });
+        const mic = screen.getByRole("button", { name: "Voice dictation" });
         expect(message).not.toHaveFocus();
 
         await clickMic();
-        // macOS Dictation types into the focused field, so the message box
-        // takes focus before the shell starts it.
-        expect(message).toHaveFocus();
-        expect(startSystemDictation).toHaveBeenCalledTimes(1);
+        expect(focusedAtStart).toEqual([message]);
 
+        // The hotkey works from anywhere, so focus starts elsewhere this time.
+        mic.focus();
         const chord = dictationChord();
         await act(async () => {
           window.dispatchEvent(chord);
         });
         expect(chord.defaultPrevented).toBe(true);
-        expect(startSystemDictation).toHaveBeenCalledTimes(2);
+        expect(focusedAtStart).toEqual([message, message]);
 
         // macOS owns the take: no in-app take, listening state, or error.
         expect(sessionStartMock).not.toHaveBeenCalled();

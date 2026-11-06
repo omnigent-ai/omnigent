@@ -76,6 +76,7 @@ function loadMainHarness({
       calls.windowCloses += 1;
     },
   };
+  let focusedWindow = win;
 
   class FakeSemVer {
     constructor(version) {
@@ -128,7 +129,7 @@ function loadMainHarness({
     },
     BrowserWindow: Object.assign(function BrowserWindow() {}, {
       fromWebContents: (webContents) => (webContents === sender ? win : null),
-      getFocusedWindow: () => win,
+      getFocusedWindow: () => focusedWindow,
       getAllWindows: () => [win],
     }),
     Menu: {
@@ -311,6 +312,9 @@ function loadMainHarness({
     ipcHandlers,
     ipcListeners,
     win,
+    setFocusedWindow: (next) => {
+      focusedWindow = next;
+    },
     pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     runMainImmediates: () => {
@@ -890,6 +894,22 @@ describe("system dictation request", () => {
       await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.unpinned),
       false,
     );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a window that isn't focused", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const start = harness.ipcHandlers.get("omnigent:start-system-dictation");
+
+    // Dictation types into the key window, so a background window must not start it.
+    for (const focused of [null, { isDestroyed: () => false }]) {
+      harness.setFocusedWindow(focused);
+      // oxlint-disable-next-line no-await-in-loop -- Each case reads the call log afterwards.
+      assert.equal(await start(harness.events.pinned), false);
+    }
+    assert.equal(harness.calls.webContentsFocuses, 0);
     assert.deepEqual(harness.calls.firstResponderActions, []);
   });
 
