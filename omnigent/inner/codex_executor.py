@@ -1336,6 +1336,7 @@ def materialize_codex_provider_config(
     *,
     retry_policy: RetryPolicy | None = None,
     effective_providers: Mapping[str, object] | None = None,
+    effective_provider_id: str | None = None,
     client_surface: str | None = None,
 ) -> list[str]:
     """Move generated provider definitions into a private Codex config.
@@ -1356,6 +1357,8 @@ def materialize_codex_provider_config(
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :param effective_providers: Provider tables resolved by Codex's ``config/read``.
         Only display names and attribution headers are copied from inherited providers.
+    :param effective_provider_id: Active provider from that same ``config/read`` snapshot.
+        Its nonempty canonical name may complete a blank private display name.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1429,11 +1432,24 @@ def materialize_codex_provider_config(
                 inline_provider[key] = value
             providers[provider_name] = inline_provider
             provider_config = inline_provider
+        resolved = (effective_providers or {}).get(provider_name)
+        if provider_name == effective_provider_id and isinstance(resolved, Mapping):
+            effective_name = resolved.get("name")
+            configured_name = provider_config.get("name")
+            # CLI overlays can complete a name that hook-trust disk validation rejects.
+            if (
+                isinstance(effective_name, str)
+                and effective_name.strip()
+                and (
+                    "name" not in provider_config
+                    or (isinstance(configured_name, str) and not configured_name.strip())
+                )
+            ):
+                provider_config["name"] = effective_name
         provider_config["request_max_retries"] = policy.max_retries
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
-        resolved = (effective_providers or {}).get(provider_name)
         effective = resolved if isinstance(resolved, Mapping) else provider_config
         base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):

@@ -2001,12 +2001,16 @@ async def prepare_codex_provider_config(
     providers = config.get("model_providers") if isinstance(config, dict) else None
     if not isinstance(providers, dict) or not providers:
         return overrides
+    effective_provider_id = config.get("model_provider") if isinstance(config, dict) else None
     return materialize_codex_provider_config(
         codex_home,
         overrides,
         retry_policy=retry_policy,
         client_surface=client_surface,
         effective_providers=providers,
+        effective_provider_id=effective_provider_id
+        if isinstance(effective_provider_id, str)
+        else None,
     )
 
 

@@ -4696,6 +4696,131 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     assert "base_url" not in provider
 
 
+@pytest.mark.parametrize(
+    ("existing_name", "base_url"),
+    [
+        ("", "https://ws.cloud.databricks.com/ai-gateway/codex/v1"),
+        (" \t", "https://ws.cloud.databricks.com/ai-gateway/codex/v1"),
+        ("", "https://example.test/v1"),
+        (" \t", "https://example.test/v1"),
+        (None, "https://example.test/v1"),
+    ],
+)
+def test_materialize_active_provider_completes_only_its_display_name(
+    tmp_path: Path, existing_name: str | None, base_url: str
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    home = tmp_path / "private"
+    home.mkdir()
+    config_path = home / "config.toml"
+    config_path.write_text(
+        "[model_providers.Managed]\n"
+        + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
+        + f'base_url = {json.dumps(base_url)}\nwire_api = "responses"\n'
+        + '[model_providers.Managed.auth]\ncommand = "owned-helper"\n'
+        + '[model_providers.Inactive]\nname = ""\nbase_url = "https://other.test"\n'
+    )
+    effective = {"Managed": {"name": "Canonical Gateway", "base_url": base_url}}
+    snapshot = json.loads(json.dumps(effective))
+    overrides = ['model_provider="Managed"', 'model_reasoning_effort="high"']
+    materialize_codex_provider_config(home, overrides, effective_providers=effective)
+    before = tomllib.loads(config_path.read_text())
+
+    result = materialize_codex_provider_config(
+        home,
+        overrides,
+        effective_providers=effective,
+        effective_provider_id="Managed",
+    )
+
+    expected = before
+    expected["model_providers"]["Managed"]["name"] = "Canonical Gateway"
+    assert tomllib.loads(config_path.read_text()) == expected
+    assert result == overrides == ['model_provider="Managed"', 'model_reasoning_effort="high"']
+    assert effective == snapshot
+    assert expected["model_providers"]["Inactive"]["name"] == ""
+
+
+@pytest.mark.parametrize(
+    ("configured_name", "active_id", "canonical_name"),
+    [
+        ("", None, "Canonical Gateway"),
+        ("", "Other", "Canonical Gateway"),
+        ("Keep exact name ", "Managed", "Canonical Gateway"),
+        (7, "Managed", "Canonical Gateway"),
+        (False, "Managed", "Canonical Gateway"),
+        ("", "Managed", None),
+        ("", "Managed", ""),
+        ("", "Managed", " \t"),
+        ("", "Managed", 7),
+    ],
+)
+def test_materialize_active_name_preserves_unknown_and_invalid_config_bytes(
+    tmp_path: Path,
+    configured_name: str | int | bool,
+    active_id: str | None,
+    canonical_name: str | int | None,
+) -> None:
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    home = tmp_path / "private"
+    home.mkdir()
+    config_path = home / "config.toml"
+    config_path.write_text(
+        f"[model_providers.Managed]\nname = {json.dumps(configured_name)}\n"
+        'base_url = "https://example.test/v1"\nwire_api = "responses"\n'
+    )
+    effective = {"Managed": {"name": canonical_name, "base_url": "https://example.test/v1"}}
+    overrides = ['model_provider="Managed"']
+    materialize_codex_provider_config(home, overrides, effective_providers=effective)
+    before = config_path.read_bytes()
+
+    assert (
+        materialize_codex_provider_config(
+            home,
+            overrides,
+            effective_providers=effective,
+            effective_provider_id=active_id,
+        )
+        == overrides
+    )
+    assert config_path.read_bytes() == before
+
+
+def test_materialize_active_name_does_not_coerce_explicit_null_from_config_reader(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import tomlkit
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    home = tmp_path / "private"
+    home.mkdir()
+    config_path = home / "config.toml"
+    original = '[model_providers.Managed]\nname = "untouched"\n'
+    config_path.write_text(original)
+    parse = tomlkit.parse
+
+    def malformed_reader(text: str) -> dict[str, Any]:
+        document = parse(text).unwrap()
+        document["model_providers"]["Managed"]["name"] = None
+        return document
+
+    monkeypatch.setattr(tomlkit, "parse", malformed_reader)
+    with pytest.raises(tomlkit.exceptions.ConvertError):
+        materialize_codex_provider_config(
+            home,
+            [],
+            effective_providers={"Managed": {"name": "Canonical Gateway"}},
+            effective_provider_id="Managed",
+        )
+    assert config_path.read_bytes() == original.encode()
+    assert not list(home.glob("config.toml.*"))
+
+
 def test_materialize_ignores_non_gateway_effective_providers(
     tmp_path: Path,
 ) -> None:
