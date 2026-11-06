@@ -11,6 +11,7 @@
 // reading `window.__OMNIGENT_BASE_PATH__`.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup } from "@testing-library/react";
 
 const isDatabricksWorkspace = vi.fn();
 const resolveMediaUrl = vi.fn();
@@ -22,20 +23,29 @@ vi.mock("@/lib/host", () => ({
   isDatabricksWorkspace: () => isDatabricksWorkspace(),
   resolveMediaUrl: (p: string) => resolveMediaUrl(p),
 }));
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: (...args: unknown[]) => authenticatedFetch(...args),
+}));
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
-  browseLocationBase: () => "",
-  browseLocationSegment: (p: string) => p,
+  browseLocationBase: (path: string) => (path.startsWith("/") ? "host" : ""),
+  browseLocationSegment: (path: string) =>
+    path.replace(/^\//, "").split("/").map(encodeURIComponent).join("/"),
   useWorkspaceServeable: () => ({}),
 }));
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
 import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { downloadWorkspaceFile, workspaceFileMediaUrl } from "./useFileContent";
+import {
+  downloadWorkspaceFile,
+  workspaceFileDownloadUrl,
+  usesDirectFileDownload,
+  fetchWorkspaceFileBlob,
+  workspaceFileMediaUrl,
+} from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -50,6 +60,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete window.__OMNIGENT_BASE_PATH__;
@@ -77,7 +88,44 @@ describe("downloadWorkspaceFile base-path handling", () => {
 
     await downloadWorkspaceFile("sess_abc", "src/main.py");
 
-    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL);
+    expect(authenticatedFetch).toHaveBeenCalledExactlyOnceWith(RAW_URL);
+  });
+});
+
+describe("raw file helpers", () => {
+  it("encodes the session and absolute path with base=host", () => {
+    expect(workspaceFileDownloadUrl("session space", "/tmp/my clip.mp4")).toBe(
+      "/v1/sessions/session%20space/resources/environments/default/filesystem/tmp/my%20clip.mp4?download=true&base=host",
+    );
+  });
+  it.each(["browser", "managed", "ios", "android"])("selects transport for %s", (surface) => {
+    isDatabricksWorkspace.mockReturnValue(surface === "managed");
+    isIOSShell.mockReturnValue(surface === "ios");
+    isAndroidShell.mockReturnValue(surface === "android");
+    expect(usesDirectFileDownload()).toBe(surface === "browser");
+  });
+  it("fetches a complete blob with the raw URL", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
+    const blob = new Blob(["complete"]);
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
+    expect(await fetchWorkspaceFileBlob("sess_abc", "src/main.py")).toBe(blob);
+    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: undefined });
+  });
+  it("forwards the optional abort signal to authenticatedFetch", async () => {
+    const controller = new AbortController();
+    const blob = new Blob(["video"]);
+    authenticatedFetch.mockResolvedValue({ ok: true, blob: async () => blob });
+
+    await expect(
+      fetchWorkspaceFileBlob("sess_abc", "src/main.py", controller.signal),
+    ).resolves.toBe(blob);
+    expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL, { signal: controller.signal });
+  });
+  it("rejects a failed raw download", async () => {
+    authenticatedFetch.mockResolvedValue({ ok: false, status: 404, statusText: "Not Found" });
+    await expect(fetchWorkspaceFileBlob("sess_abc", "src/main.py")).rejects.toThrow(
+      "404 Not Found",
+    );
   });
 });
 
