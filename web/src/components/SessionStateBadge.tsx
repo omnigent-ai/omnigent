@@ -23,7 +23,6 @@ interface Visual {
 }
 
 function awaitingTooltip(count: number, terminalReason: string | undefined): string {
-  // The runner infers this reason from the terminal's screen, so stay tentative.
   if (terminalReason === TERMINAL_PROMPT_BLOCKED_ON) {
     return "May need your input in the agent's terminal";
   }
@@ -35,14 +34,15 @@ function describe(state: SessionState): Visual {
   switch (state.kind) {
     case "awaiting": {
       const tooltip = awaitingTooltip(state.count, state.terminalReason);
+      // The runner infers this reason from the terminal's screen, so stay tentative.
+      const label =
+        state.terminalReason === TERMINAL_PROMPT_BLOCKED_ON ? "May need input" : "Needs response";
       return {
         kind: state.kind,
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">
-            Needs response
-          </Badge>
+          <Badge className="border-transparent bg-brand-accent/15 text-brand-accent">{label}</Badge>
         ),
       };
     }

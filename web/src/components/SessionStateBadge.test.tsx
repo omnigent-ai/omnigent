@@ -39,7 +39,7 @@ describe("SessionStateBadge — per-state rendering", () => {
   it("hedges a terminal prompt the runner inferred from the screen", () => {
     renderBadge({ kind: "awaiting", count: 0, terminalReason: TERMINAL_PROMPT_BLOCKED_ON });
     const badge = screen.getByTestId("session-state-badge");
-    expect(badge).toHaveTextContent("Needs response");
+    expect(badge).toHaveTextContent("May need input");
     expect(badge).toHaveAttribute("aria-label", "May need your input in the agent's terminal");
   });
 

@@ -32,8 +32,8 @@ reattach when the session moves to another host.
   says so and routes the user to the terminal. When Claude Code still reports a
   running turn but its input box has been hidden for 15 seconds (for example a
   dialog opened while a reply streams), chat says something in the terminal may
-  need input, and the sidebar shows "Needs response" with a tooltip saying it may
-  need input, until the input box returns. `!` shell mode and the ctrl+r history
+  need input, and the sidebar row moves to Needs attention with a "May need input"
+  tag, until the input box returns. `!` shell mode and the ctrl+r history
   search keep the input box in use, so they do not count as hidden.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
