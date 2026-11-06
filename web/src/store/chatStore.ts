@@ -6685,7 +6685,7 @@ export async function startStreamPump(
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
           failedOpens += 1;
           // Offline failures are the network, not the sign-in, so only probe while online.
-          if (navigator.onLine && (await streamSignInExpired(failedOpens))) {
+          if (navigator.onLine && (await streamSignInExpired(id, failedOpens, controller.signal))) {
             failUnavailableStream(set, null, SIGN_IN_NOTICE);
             set({ status: "idle" });
             break;
@@ -6752,7 +6752,7 @@ export async function startStreamPump(
           }
           console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
           failedOpens += 1;
-          if (await streamSignInExpired(failedOpens)) {
+          if (await streamSignInExpired(id, failedOpens, controller.signal)) {
             failUnavailableStream(set, null, SIGN_IN_NOTICE);
             set({ status: "idle" });
             break;
@@ -9825,9 +9825,20 @@ const SIGN_IN_NOTICE: StreamNotice = {
   message: "Reload the page to sign in again.",
 };
 
-/** Whether repeated failed opens point at an expired sign-in, which retrying cannot fix. */
-async function streamSignInExpired(failedOpens: number): Promise<boolean> {
-  return failedOpens >= SIGN_IN_PROBE_AFTER_FAILED_OPENS && (await isSignInExpired());
+/**
+ * Whether repeated failed opens point at an expired sign-in, which retrying cannot
+ * fix. A probe that never answers reads as not expired, and the loop keeps retrying.
+ */
+async function streamSignInExpired(
+  id: string,
+  failedOpens: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (failedOpens < SIGN_IN_PROBE_AFTER_FAILED_OPENS) return false;
+  const expired = await withReadTimeout((probeSignal) =>
+    isSignInExpired(AbortSignal.any([signal, probeSignal])),
+  ).catch(() => false);
+  return expired && !signal.aborted && !isConversationDisposed(id);
 }
 
 /**

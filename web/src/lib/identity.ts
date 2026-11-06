@@ -728,9 +728,13 @@ const SIGN_IN_PROBE_PATH = "/v1/me";
  * retry cannot renew the sign-in. A failed probe says nothing, so it reads as not
  * expired and the caller keeps retrying.
  */
-export async function isSignInExpired(): Promise<boolean> {
+export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
   try {
-    const res = await hostFetch(SIGN_IN_PROBE_PATH, { redirect: "manual", cache: "no-store" });
+    const res = await hostFetch(SIGN_IN_PROBE_PATH, {
+      redirect: "manual",
+      cache: "no-store",
+      signal,
+    });
     if (res.type === "opaqueredirect" || res.status === 401 || res.status === 403) return true;
     return res.ok && (res.headers.get("content-type") ?? "").toLowerCase().includes("text/html");
   } catch {

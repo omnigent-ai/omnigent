@@ -16871,6 +16871,36 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
+  it("keeps the reconnect loop going when the sign-in probe never answers", async () => {
+    seedSession("conv_probe_hangs", []);
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/me")) {
+        // Never answers, but rejects on abort like a real fetch.
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+        });
+      }
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        opens += 1;
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_probe_hangs", abortController: controller });
+
+    const loop = startStreamPump("conv_probe_hangs", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    // The probe is bounded by its read deadline, so the loop keeps opening streams.
+    expect(opens).toBeGreaterThan(4);
+    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+    controller.abort();
+    await loop;
+  });
+
   it("keeps retrying a failed connect while the sign-in probe cannot reach the server", async () => {
     seedSession("conv_probe_down", []);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
