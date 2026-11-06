@@ -22,9 +22,12 @@ from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 
 
-@pytest.mark.parametrize("helper", [None, "", "printf test-token"])
+@pytest.mark.parametrize(
+    ("helper", "subscription_auth"),
+    [(None, False), ("", False), ("printf test-token", False), (None, True)],
+)
 def test_model_probe_uses_configured_auth_helper(
-    monkeypatch: pytest.MonkeyPatch, helper: str | None
+    monkeypatch: pytest.MonkeyPatch, helper: str | None, subscription_auth: bool
 ) -> None:
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         monkeypatch.setenv(name, "ambient-credential")
@@ -33,16 +36,16 @@ def test_model_probe_uses_configured_auth_helper(
     )
     config = (
         claude_native.ClaudeNativeUcodeConfig(
-            env={"CLAUDE_CODE_USE_GATEWAY": "1"}, api_key_helper=helper
+            env={}, api_key_helper=helper, subscription_auth=subscription_auth
         )
-        if helper is not None
+        if helper is not None or subscription_auth
         else None
     )
 
     _, args, env = claude_native._claude_model_probe_invocation(config)
 
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-        if helper:
+        if helper or subscription_auth:
             assert name not in env
         else:
             assert env[name] == "ambient-credential"
