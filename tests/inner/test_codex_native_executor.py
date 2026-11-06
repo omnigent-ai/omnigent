@@ -1570,6 +1570,64 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     assert read_bridge_state(tmp_path) == replacement
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
+@pytest.mark.parametrize("confirmed", [False, True], ids=["unconfirmed", "confirmed-busy"])
+async def test_shell_completion_waits_past_legacy_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool, confirmed: bool
+) -> None:
+    from types import SimpleNamespace
+
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(
+        initial,
+        active_shell_turn_id="turn_shell" if observed else None,
+        pending_shell_command_id=None if observed else "pending_shell",
+    )
+    write_bridge_state(tmp_path, pending)
+    elapsed = 0.0
+
+    class RunningShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/steer" and params["input"] == []
+            if elapsed > 60:
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            if confirmed:
+                raise CodexAppServerResponseError(
+                    {
+                        "code": -32600,
+                        "message": f"expected active turn id `{params['expectedTurnId']}` "
+                        "but found `turn_shell`",
+                    }
+                )
+            return {"result": {}}
+
+    async def advance_shell(_seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += 61
+
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: elapsed)
+    local_asyncio.sleep = advance_shell
+    monkeypatch.setattr(codex_native_executor, "asyncio", local_asyncio)
+    wait = codex_native_executor._wait_for_shell_completion(
+        RunningShellClient(), tmp_path, pending
+    )
+    if confirmed:
+        settled = await wait
+        assert settled.active_shell_turn_id is None
+        assert settled.pending_shell_command_id is None
+    else:
+        with pytest.raises(codex_native_executor._CodexNativeInputUndelivered):
+            await wait
+        assert read_bridge_state(tmp_path) == pending
+    assert elapsed > 60
+
+
 @pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
 def test_shell_wait_timeout_and_cancellation_do_not_consume_followup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool
@@ -4935,6 +4993,10 @@ def test_interrupt_with_active_turn_and_pending_mcp_stops_both(
         ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"}),
     ]
     assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id == "turn_active"
 
 
 def test_interrupt_with_no_active_turn_cancels_mcp_startup(
@@ -4970,6 +5032,8 @@ def test_interrupt_with_no_active_turn_cancels_mcp_startup(
         ("turn/interrupt", {"threadId": "thread_123", "turnId": ""})
     ]
     assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None and stopped.interrupt_generation == 1
 
 
 def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
@@ -4996,6 +5060,87 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
 
     assert interrupted is False
     assert _FakeCodexNativeClient.requests == []
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id is None
+
+
+def test_interrupt_fences_the_owner_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slow native connection starts only after the durable Stop generation."""
+
+    class _FenceCheckingClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+
+        async def connect(self) -> None:
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.interrupt_generation == 1
+            assert state.interrupted_turn_id == "turn_active"
+            await super().connect()
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FenceCheckingClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+
+    assert asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert _FenceCheckingClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"})
+    ]
+
+
+@pytest.mark.parametrize("transferred", [False, True])
+def test_interrupt_without_locked_target_proof_never_opens_a_native_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transferred: bool,
+) -> None:
+    """A failure before locked target proof cannot authorize an observed stale owner."""
+    from dataclasses import replace
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+
+    storage_failure = OSError("disk full")
+
+    def fail_fence(path: Path, *, expected: CodexNativeBridgeState):
+        assert path == tmp_path and expected == observed
+        if transferred:
+            write_bridge_state(
+                tmp_path,
+                replace(
+                    observed,
+                    session_id="replacement-session",
+                    active_turn_id="replacement-turn",
+                ),
+            )
+        raise storage_failure
+
+    monkeypatch.setattr("omnigent.inner.codex_native_executor.record_codex_interrupt", fail_fence)
+
+    with pytest.raises(OSError) as raised:
+        asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert raised.value is storage_failure
+    assert _FakeCodexNativeClient.requests == []
+    assert _FakeCodexNativeClient.created == []
+    if transferred:
+        successor = read_bridge_state(tmp_path)
+        assert successor is not None
+        assert successor.active_turn_id == "replacement-turn"
+        assert successor.interrupt_generation == 0
 
 
 @pytest.mark.parametrize(
@@ -5115,3 +5260,513 @@ def test_large_input_without_server_receipt_contract_is_refused_before_native_su
     assert failure.code == "input_too_large"
     assert failure.message == codex_native_executor._SPILL_SERVER_UNSUPPORTED_FAILURE.message
     assert _FakeCodexNativeClient.requests == []
+
+
+@pytest.mark.parametrize(
+    ("waiting_on", "outcome"),
+    [
+        (kind, outcome)
+        for kind in ("compaction", "shell")
+        for outcome in ("complete", "backend-exit", "stop", "rebind")
+    ]
+    + [("shell", "unverifiable"), ("shell", "confirmation-lost")],
+)
+async def test_owned_native_wait_past_sixty_seconds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, waiting_on: str, outcome: str
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+
+    _seed_bridge(tmp_path, active_turn_id="turn_busy")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    if waiting_on == "shell":
+        observed = replace(observed, pending_shell_command_id="shell_pending")
+        write_bridge_state(tmp_path, observed)
+    clock = 0.0
+    sleeps: list[float] = []
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: clock)
+
+    async def advance(seconds: float) -> None:
+        nonlocal clock
+        clock += seconds
+        sleeps.append(seconds)
+        if clock >= 75:
+            if outcome == "complete":
+                write_bridge_state(
+                    tmp_path, replace(observed, active_turn_id=None, pending_shell_command_id=None)
+                )
+            elif outcome == "backend-exit":
+                codex_bridge.record_app_server_stopped(tmp_path)
+            elif outcome == "stop":
+                assert codex_bridge.record_codex_interrupt(tmp_path, expected=observed) is not None
+                write_bridge_state(tmp_path, replace(observed, active_turn_id=None))
+            elif outcome == "rebind":
+                write_bridge_state(tmp_path, replace(observed, thread_id="replacement"))
+
+    async def probe(*_args):
+        await advance(0)
+        assert clock <= 120, "an unconfirmed shell lost its finite fallback"
+        return outcome != "unverifiable" and (outcome != "confirmation-lost" or clock < 30)
+
+    local_asyncio.sleep = advance
+    monkeypatch.setattr(codex_native_executor, "asyncio", local_asyncio)
+    monkeypatch.setattr(codex_native_executor, "_reconcile_shell_command", probe)
+    if waiting_on == "shell":
+        wait = codex_native_executor._wait_for_shell_completion(
+            _FakeCodexNativeClient(), tmp_path, observed
+        )
+    else:
+        wait = codex_native_executor._wait_for_compaction_turn(tmp_path, observed)
+    if outcome == "complete":
+        current = await wait
+        assert current.active_turn_id is None
+    else:
+        exception = (
+            asyncio.CancelledError
+            if outcome == "stop"
+            else codex_native_executor._CodexNativeInputUndelivered
+        )
+        with pytest.raises(exception):
+            await wait
+    if outcome == "unverifiable":
+        assert 60 <= clock < 75
+    elif outcome == "confirmation-lost":
+        assert 90 <= clock < 105
+    else:
+        assert clock >= 75
+    assert sleeps and max(sleeps) <= 0.25
+
+
+@pytest.mark.parametrize(
+    ("entry_point", "queued_count"),
+    [("enqueue", 1), ("enqueue", 2), ("run_turn", 1), ("run_turn", 2), ("adapter", 1)],
+)
+@pytest.mark.parametrize(
+    ("rebind", "clear_relaunch", "pause_clear"),
+    [(False, False, False), (True, False, False), (False, True, False), (False, True, True)],
+)
+async def test_compaction_wait_cannot_revive_input_after_executor_interrupt(
+    draining_client,
+    tmp_path: Path,
+    queued_count: int,
+    entry_point: str,
+    rebind: bool,
+    clear_relaunch: bool,
+    pause_clear: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.inner.executor import TurnCancelled
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    refused = asyncio.Event()
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.on_refusal = refused.set
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    executor.interrupt_session = AsyncMock(wraps=executor.interrupt_session)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    request = CreateResponseRequest(model="test-agent", input="held input")
+    context = TurnContext(
+        response_id="resp_held", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    if entry_point == "adapter":
+        adapter._in_flight[context.response_id] = context
+
+    async def send():
+        if entry_point == "adapter":
+            return await adapter.run_turn(request, context)
+        if entry_point == "enqueue":
+            return await executor.enqueue_session_message("main", "held input")
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "held input"}], [], ""
+            )
+        ]
+
+    deliveries = [asyncio.create_task(send())]
+    try:
+        await asyncio.wait_for(refused.wait(), 2)
+        if queued_count == 2:
+            deliveries.append(asyncio.create_task(send()))
+            await asyncio.sleep(0)
+        if entry_point == "adapter":
+            response = await adapter._handle_interrupt_event()
+            assert response.status_code == 204
+            assert context.cancelled.is_set()
+        else:
+            assert await executor.interrupt_session("main") is True
+        current = read_bridge_state(tmp_path)
+        assert current is not None and current.interrupt_generation == 1
+        replacement = replace(observed, active_turn_id=None)
+        if rebind:
+            replacement = replace(
+                replacement, thread_id="replacement", active_turn_id="newer_turn"
+            )
+        if clear_relaunch:
+            from omnigent.harnesses.codex_native.bridge import clear_bridge_state
+
+            clear_bridge_state(tmp_path)
+            if pause_clear:
+                await asyncio.sleep(0.3)
+        write_bridge_state(tmp_path, replacement)
+        for delivery in deliveries:
+            if entry_point == "enqueue":
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(delivery, 2)
+            else:
+                result = await asyncio.wait_for(delivery, 2)
+                if entry_point == "adapter":
+                    assert result is None
+                    assert context.cancelled.is_set()
+                    assert adapter._executor is executor
+                    assert adapter._abandoned_executor_cleanup is None
+                else:
+                    [cancelled] = result
+                    assert isinstance(cancelled, TurnCancelled)
+        executor.interrupt_session.assert_awaited_once()
+    finally:
+        for delivery in deliveries:
+            delivery.cancel()
+        await asyncio.gather(*deliveries, return_exceptions=True)
+    assert draining_client.accepted_inputs == []
+    assert [method for method, _ in draining_client.requests] == ["turn/steer", "turn/interrupt"]
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.interrupt_generation == 1
+    if rebind:
+        assert current.thread_id == "replacement"
+        assert current.active_turn_id == "newer_turn"
+    if clear_relaunch:
+        assert current.socket_path == observed.socket_path
+        assert current.thread_id == observed.thread_id
+        assert current.codex_home == observed.codex_home
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_shell_transport_exit_preserves_submission_evidence(
+    tmp_path: Path, accepted: bool
+) -> None:
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    state = replace(state, pending_shell_command_id="shell_pending")
+    write_bridge_state(tmp_path, state)
+
+    class ClosedShell(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/steer" and params["input"] == []
+            raise ConnectionResetError("Synthetic app-server exit")
+
+    wait = codex_native_executor._wait_for_shell_completion(
+        ClosedShell(), tmp_path, state, require_idle=not accepted
+    )
+    if accepted:
+        assert await wait == state
+    else:
+        with pytest.raises(codex_native_executor._CodexNativeInputUndelivered) as error:
+            await wait
+        assert error.value.failure.code == "codex_app_server_stopped"
+    assert read_bridge_state(tmp_path) == state
+
+
+@pytest.mark.parametrize("entry_point", ["enqueue", "run_turn"])
+@pytest.mark.parametrize(
+    "replacement_kind", ["native-owner", "other-session", "counter-reset", "checkpoint-corrupt"]
+)
+async def test_queued_native_binding_change_without_stop_stays_undelivered(
+    tmp_path: Path, entry_point: str, replacement_kind: str
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    observed = replace(observed, interrupt_generation=2)
+    write_bridge_state(tmp_path, observed)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    _FakeCodexNativeClient.requests = []
+
+    async def send():
+        if entry_point == "enqueue":
+            return await executor.enqueue_session_message("main", "held input")
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "held input"}], [], ""
+            )
+        ]
+
+    await executor._inject_lock.acquire()
+    delivery = asyncio.create_task(send())
+    try:
+        await asyncio.sleep(0)
+        replacement = replace(observed, thread_id="replacement", active_turn_id="newer_turn")
+        if replacement_kind == "other-session":
+            replacement = replace(
+                replacement, session_id="different_session", interrupt_generation=3
+            )
+        elif replacement_kind == "counter-reset":
+            # An older writer removed state without retaining a Stop checkpoint.
+            (tmp_path / "state.json").unlink()
+            replacement = replace(replacement, interrupt_generation=0)
+        write_bridge_state(tmp_path, replacement)
+        if replacement_kind == "checkpoint-corrupt":
+            from omnigent.harnesses.codex_native import bridge as codex_bridge
+
+            (tmp_path / codex_bridge._INTERRUPT_GENERATIONS_FILE).write_text("{")
+        executor._inject_lock.release()
+        result = await asyncio.wait_for(delivery, 2)
+    finally:
+        if executor._inject_lock.locked():
+            executor._inject_lock.release()
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+    if entry_point == "enqueue":
+        assert result is False
+    else:
+        [failure] = result
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is True and failure.preserve_session is True
+    assert read_bridge_state(tmp_path) == replacement
+    assert _FakeCodexNativeClient.requests == []
+
+
+@pytest.mark.parametrize("entry_point", ["adapter", "enqueue"])
+@pytest.mark.parametrize("request_session_id", [None, "conv_123"])
+@pytest.mark.parametrize(
+    ("preparation", "action", "initially_missing", "preparation_result"),
+    [
+        *[
+            (phase, action, False, "normal")
+            for phase in ("content", "mirror")
+            for action in ("stop", "rebind")
+        ],
+        *[
+            ("content", action, True, result)
+            for action in ("stop", "stop-before-publication")
+            for result in ("normal", "empty", "error")
+        ],
+        ("content", "launch", True, "normal"),
+        ("content", "stop-during-owner-read", True, "normal"),
+    ],
+)
+async def test_native_preparation_keeps_its_original_delivery_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    draining_client,
+    entry_point: str,
+    request_session_id: str | None,
+    preparation: str,
+    action: str,
+    initially_missing: bool,
+    preparation_result: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.codex_native.bridge import clear_bridge_state, record_codex_interrupt
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    if not initially_missing:
+        _seed_bridge(tmp_path, active_turn_id="turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert (observed is None) == initially_missing
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    name = "_content_to_input_items" if preparation == "content" else "_spilled_mirror_fits"
+    original = getattr(codex_native_executor, name)
+
+    def prepare(*args, **kwargs):
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(2), "input preparation blocked the event loop"
+        if preparation == "mirror" and action == "stop":
+            return False
+        if preparation_result == "empty":
+            return []
+        if preparation_result == "error":
+            raise OSError("Synthetic input preparation failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native_executor, name, prepare)
+    if action == "stop-during-owner-read":
+        read_state = codex_native_executor.read_bridge_state
+        pending_stop = True
+
+        def observe_owner(bridge_dir):
+            nonlocal pending_stop
+            current = read_state(bridge_dir)
+            if current is None and pending_stop:
+                pending_stop = False
+                _seed_bridge(tmp_path, active_turn_id="turn_original")
+                owner = read_state(tmp_path)
+                assert owner is not None
+                record_codex_interrupt(tmp_path, expected=owner)
+            return current
+
+        monkeypatch.setattr(codex_native_executor, "read_bridge_state", observe_owner)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    executor._request_session_id = request_session_id
+    executor.interrupt_session = AsyncMock(wraps=executor.interrupt_session)
+    if action == "launch":
+        draining_client.delivery_errors = []
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    context = TurnContext(
+        response_id="resp_prepared", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    request = CreateResponseRequest(model="test-agent", input="held input")
+
+    async def deliver():
+        if entry_point == "adapter":
+            return await adapter.run_turn(request, context)
+        return await executor.enqueue_session_message("main", "held input")
+
+    delivery = asyncio.create_task(deliver())
+    try:
+        await asyncio.wait_for(started.wait(), 5)
+        assert draining_client.requests == []
+        if action == "stop-before-publication":
+            if request_session_id is not None:
+                assert await executor.interrupt_session("main") is False
+            else:
+                assert record_codex_interrupt(tmp_path, session_id="conv_123") is None
+        if observed is None:
+            _seed_bridge(tmp_path, active_turn_id="turn_original")
+            observed = read_bridge_state(tmp_path)
+            assert observed is not None
+        if action == "stop":
+            assert await executor.interrupt_session("main") is True
+        if action in {"stop", "stop-before-publication", "stop-during-owner-read"}:
+            clear_bridge_state(tmp_path)
+        replacement = (
+            observed
+            if action == "launch"
+            else replace(observed, thread_id="replacement", active_turn_id="newer_turn")
+        )
+        write_bridge_state(tmp_path, replacement)
+        replacement = read_bridge_state(tmp_path)
+        assert replacement is not None
+    finally:
+        release.set()
+        [result] = await asyncio.gather(delivery, return_exceptions=True)
+        if adapter._abandoned_executor_cleanup is not None:
+            await adapter._abandoned_executor_cleanup
+
+    if action in {"stop", "stop-before-publication", "stop-during-owner-read"}:
+        if entry_point == "adapter":
+            assert result is None
+            assert context.cancelled.is_set()
+        else:
+            assert isinstance(result, asyncio.CancelledError)
+    elif action == "launch":
+        assert not isinstance(result, BaseException)
+        assert not context.cancelled.is_set()
+        if entry_point == "enqueue":
+            assert result is True
+    elif entry_point == "adapter":
+        assert isinstance(result, InnerExecutorError) and result.undelivered
+    else:
+        assert result is False
+    if entry_point == "adapter":
+        assert adapter._executor is executor
+        assert adapter._abandoned_executor_cleanup is None
+    assert executor.interrupt_session.await_count == (
+        1
+        if action == "stop"
+        or (action == "stop-before-publication" and request_session_id is not None)
+        else 0
+    )
+    if action == "launch":
+        assert draining_client.accepted_inputs == [[{"type": "text", "text": "held input"}]]
+        assert [method for method, _ in draining_client.requests] == ["turn/steer"]
+        return
+    assert read_bridge_state(tmp_path) == replacement
+    assert draining_client.accepted_inputs == []
+    assert [method for method, _ in draining_client.requests] == (
+        ["turn/interrupt"] if action == "stop" else []
+    )
+
+
+@pytest.mark.parametrize("request_session_id", [None, "conv_123"])
+@pytest.mark.parametrize("stop_during_startup", [False, True])
+async def test_cold_native_input_keeps_its_checkpoint_through_bridge_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    draining_client,
+    request_session_id: str | None,
+    stop_during_startup: bool,
+) -> None:
+    from omnigent.harnesses.codex_native.bridge import clear_bridge_state, record_codex_interrupt
+    from omnigent.inner.executor import TurnCancelled
+
+    _seed_bridge(tmp_path)
+    previous = read_bridge_state(tmp_path)
+    assert previous is not None
+    record_codex_interrupt(tmp_path, expected=previous)
+    clear_bridge_state(tmp_path)
+    waiting = asyncio.Event()
+    original_wait = codex_native_executor._wait_for_bridge_state
+
+    async def wait_for_bridge(*args, **kwargs):
+        waiting.set()
+        return await original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(codex_native_executor, "_wait_for_bridge_state", wait_for_bridge)
+    draining_client.delivery_errors = []
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    executor._request_session_id = request_session_id
+
+    async def send():
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "held input"}], [], ""
+            )
+        ]
+
+    delivery = asyncio.create_task(send())
+    try:
+        await asyncio.wait_for(waiting.wait(), 2)
+        if stop_during_startup:
+            if request_session_id is not None:
+                assert await executor.interrupt_session("main") is False
+            else:
+                record_codex_interrupt(tmp_path, session_id="conv_123")
+        _seed_bridge(tmp_path)
+        [result] = await asyncio.wait_for(delivery, 2)
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+    assert isinstance(result, TurnCancelled if stop_during_startup else TurnComplete)
+    assert [method for method, _ in draining_client.requests] == (
+        [] if stop_during_startup else ["turn/start"]
+    )
+
+
+def test_interrupt_actual_lock_acquisition_failure_never_opens_a_native_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FakeCodexNativeClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    observed = read_bridge_state(tmp_path)
+    lock = tmp_path / "state.lock"
+    lock.unlink()
+    lock.mkdir()
+    with pytest.raises(IsADirectoryError):
+        asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert _FakeCodexNativeClient.requests == []
+    assert _FakeCodexNativeClient.created == []
+    assert read_bridge_state(tmp_path) == observed
+    assert not (tmp_path / "interrupt_generations.json").exists()
