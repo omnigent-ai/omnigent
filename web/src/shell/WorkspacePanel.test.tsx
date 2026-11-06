@@ -1049,9 +1049,13 @@ describe('WorkspacePanel "+" new-tab menu', () => {
 
     rerender({ openFiles: [] });
     expect(screen.getAllByRole("button", { name: "Open new" })).toHaveLength(1);
-    expect(trailing.firstElementChild).toContainElement(
-      screen.getByRole("button", { name: "Open new" }),
-    );
+    // The same trigger, not a remounted copy, survives closing the last tab and reopening one.
+    expect(screen.getByRole("button", { name: "Open new" })).toBe(plus);
+    expect(trailing.firstElementChild).toContainElement(plus);
+
+    rerender({ openFiles: ["src/App.tsx"] });
+    expect(screen.getByRole("button", { name: "Open new" })).toBe(plus);
+    expect(trailing.firstElementChild).toContainElement(plus);
   });
 
   it.each([false, true])(
