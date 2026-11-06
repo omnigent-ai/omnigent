@@ -9809,34 +9809,37 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(after.pendingUserMessages).toEqual([]);
     });
 
-    it.each([false, true])("ignores meta input events with user_authored = %s", (userAuthored) => {
-      const existingBlocks: AnyBlock[] = [];
-      useChatStore.setState({
-        blocks: existingBlocks,
-        pendingUserMessages: [
+    it.each([false, true])(
+      "ignores meta input (user_authored=%s) without consuming pending user messages",
+      (userAuthored) => {
+        const existingBlocks: AnyBlock[] = [];
+        useChatStore.setState({
+          blocks: existingBlocks,
+          pendingUserMessages: [
+            { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
+          ],
+        });
+
+        handleSessionEvent({
+          type: "session_input_consumed",
+          itemId: "msg_meta",
+          itemType: "message",
+          isMeta: true,
+          data: {
+            role: "user",
+            is_meta: true,
+            content: [{ type: "input_text", text: "<skill>hidden</skill>" }],
+            user_authored: userAuthored,
+          },
+        });
+
+        const after = useChatStore.getState();
+        expect(after.blocks).toBe(existingBlocks);
+        expect(after.pendingUserMessages).toEqual([
           { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
-        ],
-      });
-
-      handleSessionEvent({
-        type: "session_input_consumed",
-        itemId: "msg_meta",
-        itemType: "message",
-        isMeta: true,
-        data: {
-          role: "user",
-          is_meta: true,
-          content: [{ type: "input_text", text: "<skill>hidden</skill>" }],
-          user_authored: userAuthored,
-        },
-      });
-
-      const after = useChatStore.getState();
-      expect(after.blocks).toBe(existingBlocks);
-      expect(after.pendingUserMessages).toEqual([
-        { tempId: "pend_1", content: [{ type: "input_text", text: "visible pending" }] },
-      ]);
-    });
+        ]);
+      },
+    );
 
     it("renders a meta background-task wake as a system marker without consuming pending", () => {
       // Claude Code resumes on a finished background task with no human

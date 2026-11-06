@@ -403,6 +403,47 @@ async def test_create_titled_session_keeps_title_after_first_message(
     assert not message.get("is_meta")
 
 
+@pytest.mark.parametrize("event_type", ["message", "external_conversation_item"])
+async def test_client_meta_and_external_messages_do_not_infer_user_authorship(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+) -> None:
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    content_text = "Client meta input" if event_type == "message" else "External input"
+    item_data: dict[str, Any] = {
+        "role": "user",
+        "content": [{"type": "input_text", "text": content_text}],
+    }
+    if event_type == "message":
+        item_data["is_meta"] = True
+        event_data = item_data
+    else:
+        event_data = {
+            "item_type": "message",
+            "item_data": item_data,
+            "response_id": "external_turn",
+        }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    ) as fake_runner:
+        _route_to_runner(monkeypatch, fake_runner)
+        response = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={"type": event_type, "data": event_data},
+        )
+        assert response.status_code == 202, response.text
+
+    items_response = await client.get(f"/v1/sessions/{session['id']}/items")
+    assert items_response.status_code == 200, items_response.text
+    [message] = [item for item in items_response.json()["data"] if item["type"] == "message"]
+    assert message["content"] == item_data["content"]
+    assert message.get("is_meta", False) is (event_type == "message")
+    assert "user_authored" not in message
+
+
 async def test_sidebar_rename_wins_in_flight_background_title(
     client: httpx.AsyncClient,
     app: Any,
@@ -2785,7 +2826,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     items = items_resp.json()["data"]
     visible = next(item for item in items if item["type"] == "slash_command")
     meta = next(item for item in items if item["type"] == "message" and item.get("is_meta"))
-    assert meta["is_meta"] is True
+    # Explicit skill invocation marks even its hidden expansion as user-authored.
     assert meta["user_authored"] is True
     assert visible["name"] == "grill-me"
     assert visible["kind"] == "skill"
@@ -2831,52 +2872,6 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     session_resp = await client.get(f"/v1/sessions/{session['id']}")
     assert session_resp.status_code == 200, session_resp.text
     assert session_resp.json()["title"] == "/grill-me review this rollout"
-
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handler),
-        base_url="http://runner",
-    ) as fake_runner:
-        _route_to_runner(monkeypatch, fake_runner)
-        for text, is_meta in [("Plain user input", False), ("Timer elapsed", True)]:
-            response = await client.post(
-                f"/v1/sessions/{session['id']}/events",
-                json={
-                    "type": "message",
-                    "data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": text}],
-                        "is_meta": is_meta,
-                    },
-                },
-            )
-            assert response.status_code == 202, response.text
-        response = await client.post(
-            f"/v1/sessions/{session['id']}/events",
-            json={
-                "type": "external_conversation_item",
-                "data": {
-                    "item_type": "message",
-                    "item_data": {
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": "External input"}],
-                    },
-                    "response_id": "external_turn",
-                },
-            },
-        )
-        assert response.status_code == 202, response.text
-
-    items_resp = await client.get(f"/v1/sessions/{session['id']}/items")
-    assert items_resp.status_code == 200, items_resp.text
-    messages = {
-        item["content"][0]["text"]: item
-        for item in items_resp.json()["data"]
-        if item["type"] == "message"
-    }
-    assert messages["Plain user input"]["user_authored"] is True
-    assert messages["Timer elapsed"]["is_meta"] is True
-    assert "user_authored" not in messages["Timer elapsed"]
-    assert "user_authored" not in messages["External input"]
 
 
 @pytest.mark.parametrize("in_sub_agent", [False, True])
