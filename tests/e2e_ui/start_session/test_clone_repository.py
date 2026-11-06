@@ -25,6 +25,7 @@ from playwright.sync_api import Page, expect
 
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
+from tests._helpers.session import bundle_files
 from tests.e2e_ui.conftest import configure_mock_llm
 
 _HOST_ONLINE_TIMEOUT_S = 180.0
@@ -38,6 +39,7 @@ class CloneHost:
     name: str
     home: Path
     agent_id: str
+    agent_label: str
 
 
 def _make_remote(forge: Path, slug: str) -> None:
@@ -54,9 +56,16 @@ def _make_remote(forge: Path, slug: str) -> None:
     )
 
 
-def _hello_world_agent_id(base_url: str) -> str:
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0, trust_env=False).json()["data"]
-    return next(agent["id"] for agent in agents if agent["name"] == "hello_world")
+def _install_mock_backed_agent(client: httpx.Client, name: str) -> str:
+    """Install a uniquely named user agent so no same-named agent can shadow it."""
+    config = (
+        f"spec_version: 1\nname: {name}\nprompt: Reply with one short sentence.\n"
+        "executor:\n  model: gpt-4o-mini\n  config:\n    harness: openai-agents\n"
+    )
+    bundle = bundle_files({"config.yaml": config.encode()})
+    installed = client.post("/v1/agents", files={"bundle": ("agent.tar.gz", bundle)})
+    installed.raise_for_status()
+    return str(installed.json()["id"])
 
 
 @pytest.fixture(scope="module")
@@ -105,9 +114,13 @@ def clone_host(
         ) as host,
     ):
         host.wait_online(client, timeout=_HOST_ONLINE_TIMEOUT_S, poll_interval=1)
-        yield CloneHost(
-            live_server, host.host_id, name, host.home, _hello_world_agent_id(live_server)
-        )
+        agent_name = f"repo_assistant_{uuid.uuid4().hex[:6]}"
+        agent_id = _install_mock_backed_agent(client, agent_name)
+        try:
+            yield CloneHost(live_server, host.host_id, name, host.home, agent_id, agent_name)
+        finally:
+            with contextlib.suppress(httpx.HTTPError):
+                client.delete(f"/v1/agents/{agent_id}")
 
 
 def _seed_composer(page: Page, host: CloneHost) -> None:
@@ -124,9 +137,11 @@ def _pause(page: Page, milliseconds: int) -> None:
         page.wait_for_timeout(milliseconds)
 
 
-def _send_first_message(page: Page, mock_url: str, text: str) -> str:
+def _send_first_message(page: Page, host: CloneHost, mock_url: str, text: str) -> str:
     reply = f"Ready to work in {text.rsplit(' ', 1)[1]}."
     configure_mock_llm(mock_url, [{"text": reply}, {"text": reply}], match=text)
+    agent_picker = page.get_by_test_id("new-chat-landing-agent-select")
+    expect(agent_picker).to_contain_text(re.compile(host.agent_label, re.IGNORECASE))
     page.get_by_test_id("new-chat-landing-input").press_sequentially(text, delay=30)
     _pause(page, 1000)
     page.get_by_test_id("new-chat-landing-submit").click()
@@ -196,7 +211,9 @@ def test_clone_repository_from_composer_workspace_menu(
     _pause(page, 2500)
 
     sessions.append(
-        _send_first_message(page, mock_llm_server_url, "Summarize the README in demo-service")
+        _send_first_message(
+            page, clone_host, mock_llm_server_url, "Summarize the README in demo-service"
+        )
     )
     _assert_session_in(clone_host.base_url, sessions[0], clone_host.host_id, destination)
     _pause(page, 4000)
@@ -248,7 +265,9 @@ def test_new_project_clones_repository_as_its_default_workspace(
     _pause(page, 2500)
 
     sessions.append(
-        _send_first_message(page, mock_llm_server_url, "List the open tasks in billing-api")
+        _send_first_message(
+            page, clone_host, mock_llm_server_url, "List the open tasks in billing-api"
+        )
     )
     _assert_session_in(clone_host.base_url, sessions[0], clone_host.host_id, destination)
     _pause(page, 4000)
