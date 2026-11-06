@@ -324,15 +324,47 @@ describe("ChatComposer", () => {
     expect(onKeyDown).not.toHaveBeenCalled();
   });
 
-  it("leaves Alt+Enter alone; Shift+Enter is the newline chord", () => {
+  it.each([
+    [false, false],
+    [true, false],
+    [false, true],
+  ])(
+    "inserts a line break at the caret on Alt+Enter (mod-enter: %s, touch: %s)",
+    (submitWithModEnter, preventsKeyboardSubmit) => {
+      const onKeyDown = vi.fn();
+      const onChange = vi.fn();
+      render(
+        <ChatComposer
+          keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
+          input={{ "aria-label": "Draft", defaultValue: "firstsecond", onChange, onKeyDown }}
+          actions={{ leading: null, trailing: null }}
+        />,
+      );
+      const input = screen.getByRole<HTMLTextAreaElement>("textbox");
+      input.setSelectionRange(5, 5);
+
+      expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(false);
+      expect(input).toHaveValue("first\nsecond");
+      expect(input.selectionStart).toBe(6);
+      expect(onChange).toHaveBeenCalledOnce();
+      // Menus and send chords never see it, so it can't complete or submit.
+      expect(onKeyDown).not.toHaveBeenCalled();
+    },
+  );
+
+  it("leaves Alt chords with Ctrl/Cmd, or mid-composition, to the browser", () => {
+    const onKeyDown = vi.fn();
     render(
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
-        input={{ "aria-label": "Draft", defaultValue: "draft" }}
+        input={{ "aria-label": "Draft", defaultValue: "draft", onKeyDown }}
         actions={{ leading: null, trailing: null }}
       />,
     );
     const input = screen.getByRole("textbox");
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true, ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(input, { key: "Enter", altKey: true, metaKey: true })).toBe(true);
+    fireEvent.compositionStart(input);
     expect(fireEvent.keyDown(input, { key: "Enter", altKey: true })).toBe(true);
     expect(input).toHaveValue("draft");
   });
