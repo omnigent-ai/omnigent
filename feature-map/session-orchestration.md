@@ -24,7 +24,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
-  Managed creation uses the server's configured default sandbox provider.
+  Managed creation uses the server's configured default sandbox provider. An
+  independent session is filed in its creator's project, if that project still
+  exists; the project's agent and workspace defaults don't apply to it.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add
@@ -65,9 +67,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   `/tasks?view=templates`. Suggestions appear below saved automations or the
   empty-state message with All selected and search cleared. The old
   `/tasks/templates` URL redirects to the Templates tab.
-  Pick a template, fill in the trigger builder, and save: the hourly automation's kept session starts one worker per new match
+  Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
-  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
 ## Driving it with the repro environment
 

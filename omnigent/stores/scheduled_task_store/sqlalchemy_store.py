@@ -41,6 +41,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
     STALE_RUN_MAX_AGE_SECONDS,
@@ -390,6 +391,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -414,6 +416,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            if expected_schedule is not None:
+                current = _to_entity(row)
+                if any(
+                    getattr(current, field) != getattr(expected_schedule, field)
+                    for field in ("rrule", "session_mode", "execution_target")
+                ):
+                    raise OmnigentError(
+                        "The automation's schedule or execution settings changed. "
+                        "Reload and try again.",
+                        code=ErrorCode.CONFLICT,
+                    )
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
@@ -547,6 +560,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return "adopted"
 
         return run_write_transaction(self._session_immediate, "adopt_task_session", write)
+
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """Clear the task's session under the task lock, only if it is still *session_id*."""
+
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.state == encode_scheduled_task_state("deleted")
+                or row.session_id != session_id
+            ):
+                return False
+            row.session_id = None
+            return True
+
+        return run_write_transaction(self._session_immediate, "release_task_session", write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""

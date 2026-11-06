@@ -579,12 +579,10 @@ def test_build_codex_native_server_pins_profile_resolved_model(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
-                model=model or "databricks-gpt-5-4-mini",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
+            model=model or "databricks-gpt-5-4-mini",
+            host="https://ws.example",
         ),
     )
 
@@ -645,12 +643,10 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
-                model=model or "databricks-gpt-5-6-luna",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
+            model=model or "databricks-gpt-5-6-luna",
+            host="https://ws.example",
         ),
     )
 
