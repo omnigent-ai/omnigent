@@ -40,7 +40,6 @@ from omnigent.harness_availability import (
     CODEX_CANONICAL_HARNESSES,
     HARNESS_BINARY_MISSING,
     HARNESS_NEEDS_AUTH,
-    HARNESS_PROBE_UNANSWERED,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
@@ -56,11 +55,10 @@ from omnigent.onboarding.harness_install import (
     KIRO_KEY,
     OPENCODE_KEY,
     PI_KEY,
-    PROBE_UNANSWERED,
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
     harness_cli_binary,
-    harness_cli_probe_outcome,
+    harness_cli_installed,
     required_cli_for_harness,
 )
 from omnigent.onboarding.provider_config import (
@@ -909,11 +907,8 @@ def _binary_availability_reason(install_key: str) -> HarnessAvailability:
     exposed to the web UI as ``"version-too-low"`` so the user sees a prompt
     to upgrade rather than "binary-missing".
     """
-    outcome = harness_cli_probe_outcome(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S)
-    if outcome is True:
+    if harness_cli_installed(install_key, timeout=READINESS_CLI_PROBE_TIMEOUT_S):
         return True
-    if outcome == PROBE_UNANSWERED:
-        return HARNESS_PROBE_UNANSWERED
     if harness_cli_binary(install_key) is not None:
         return HARNESS_VERSION_TOO_LOW
     return HARNESS_BINARY_MISSING
@@ -1024,17 +1019,10 @@ def harness_is_configured(harness: str) -> bool:
         ``"openai-agents"``, ``"agents_sdk"``, ``"kiro-native"``, ``"pi"``,
         ``"pi-native"``, ``"qwen"``, or ``"qwen-code"``.
     :returns: ``True`` when launchable (CLI installed, or a harness the
-        daemon doesn't gate), or when the version probe never answered
-        (launch surfaces the real error at runtime); ``False`` when the
-        binary is missing or on an unsupported version.
+        daemon doesn't gate); ``False`` when the binary is missing or on
+        an unsupported version.
     """
-    state = _harness_availability_core(harness)
-    if state is True:
-        return True
-    # A probe that never answered (self-configuring launcher shim) is not
-    # evidence of a version problem — the binary exists and may work once
-    # launched, so don't hard-block the session it belongs to.
-    return state == HARNESS_PROBE_UNANSWERED
+    return _harness_availability_core(harness) is True
 
 
 def _is_codex_family_harness(canonical: str) -> bool:
