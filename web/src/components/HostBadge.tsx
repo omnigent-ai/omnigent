@@ -106,7 +106,7 @@ export function HostBadge({
   onReconnect?: () => void;
   /** The session's sandbox is being woken; the composer dot spins until it is online. */
   starting?: boolean;
-  appearance?: "status" | "composer";
+  appearance?: "status" | "composer" | "header";
   readOnly?: boolean;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
@@ -162,7 +162,7 @@ export function HostBadge({
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
-  if (appearance === "composer") {
+  if (appearance === "composer" || appearance === "header") {
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
     // A wake, or a launch or resume the server reports by stage, spins the status
@@ -202,7 +202,7 @@ export function HostBadge({
     }
     return (
       <>
-        <DropdownMenu onOpenChange={setMenuOpen}>
+        <DropdownMenu modal={appearance !== "header"} onOpenChange={setMenuOpen}>
           <ComposerMenuTooltip
             menuOpen={menuOpen}
             content={<ComposerConfigTooltipRows rows={tooltipRows} />}
@@ -212,6 +212,7 @@ export function HostBadge({
             <DropdownMenuTrigger asChild>
               <ComposerHostTrigger
                 label={label}
+                appearance={appearance}
                 status={launchStatus && !hostStarting ? undefined : dotStatus}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
                 data-testid="composer-host-select"
@@ -219,8 +220,8 @@ export function HostBadge({
             </DropdownMenuTrigger>
           </ComposerMenuTooltip>
           <DropdownMenuContent
-            align="start"
-            side="top"
+            align={appearance === "header" ? "end" : "start"}
+            side={appearance === "header" ? "bottom" : "top"}
             sideOffset={8}
             className="composer-host-menu w-max min-w-[220px]"
             data-testid="composer-host-menu"

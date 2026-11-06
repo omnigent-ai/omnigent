@@ -2504,14 +2504,43 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
+        return await self._finish_stop(frame, self._claim_runner_for_stop(frame))
+
+    def _claim_runner_for_stop(self, frame: HostStopRunnerFrame) -> _RunnerHandle | None:
+        """Untrack the runner a stop names, marking its exit as intentional.
+
+        This is the only part of a stop that must keep arrival order with
+        launches, so the frame dispatcher runs it under the lifecycle lock.
+
+        :param frame: The stop request frame.
+        :returns: The claimed handle, or ``None`` for an unknown runner.
+        """
         handle = self._runners.pop(frame.runner_id, None)
+        if handle is not None:
+            handle.stop_requested = True
+        return handle
+
+    async def _finish_stop(
+        self,
+        frame: HostStopRunnerFrame,
+        handle: _RunnerHandle | None,
+    ) -> HostStopRunnerResultFrame:
+        """Terminate a claimed runner and build the stop result.
+
+        Runs outside the lifecycle lock: termination can wait out the
+        runner's exit grace, and launches queued behind a burst of stops
+        would otherwise exceed the server's launch timeout.
+
+        :param frame: The stop request frame.
+        :param handle: The handle from :meth:`_claim_runner_for_stop`.
+        :returns: Result frame with status.
+        """
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -4340,6 +4369,18 @@ class HostProcess:
                 head_sha=cast("str | None", params.get("head_sha")),
                 base_sha=cast("str | None", params.get("base_sha")),
             )
+        if op == "github_commits":
+            return r.github_commits(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                head_sha=cast("str | None", params.get("head_sha")),
+            )
+        if op == "github_commit_diff":
+            return r.github_commit_diff(
+                session_id,
+                cast("str | None", params.get("pr_url")),
+                commit_sha=cast("str | None", params.get("commit_sha")),
+            )
         if op == "github_labels":
             return r.github_labels(session_id, cast("str | None", params.get("pr_url")))
         if op == "github_merge_options":
@@ -5899,7 +5940,8 @@ class HostProcess:
                 raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
-                stop_result = await self._handle_stop(frame)
+                stopping_handle = self._claim_runner_for_stop(frame)
+            stop_result = await self._finish_stop(frame, stopping_handle)
             await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))

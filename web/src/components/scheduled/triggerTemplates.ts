@@ -65,6 +65,8 @@ export interface TriggerPromptContext {
   model?: string;
   /** The task's reasoning effort override. */
   effort?: string;
+  /** The initial search must cover the wait until the first poll. */
+  pollingIntervalMinutes?: number;
 }
 
 export interface TriggerConditionField {
@@ -351,6 +353,80 @@ export function combineTriggerPrompt(userPrompt: string, systemPrompt: string | 
   const postingSeparator =
     postingInstructions === POSTING_INSTRUCTIONS ? "\n" : SESSION_POSTING_INSTRUCTIONS;
   return `${managerInstructions}${SESSION_INSTRUCTIONS}${userPrompt}${postingSeparator}${postingInstructions}`;
+}
+
+export interface TriggerWorkerSettings {
+  /** Null keeps the polling session's agent. */
+  agentId: string | null;
+  model: string;
+  effort: string;
+}
+
+const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
+const WORKER_SETTINGS_PATTERN = new RegExp(
+  `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
+    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
+    `(?:, model (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
+    `, and a message under 8000 characters\\.`,
+  "g",
+);
+
+function workerSettingsMatch(prompt: string) {
+  const parts = splitTriggerPrompt(prompt);
+  if (parts.systemPrompt === null) return null;
+  const manager = parts.systemPrompt.split(SESSION_POSTING_INSTRUCTIONS)[0];
+  const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  // Only the generated call and its result references have unambiguous settings.
+  const otherInstructions = manager
+    .replace(match[0], "")
+    .replace(/\bthat\s+`?sys_session_create`?\s+returned\b/gi, "");
+  if (/\bsys_session_create\b/i.test(otherInstructions)) return null;
+  try {
+    const settings: TriggerWorkerSettings = {
+      agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
+      model: match[3] === undefined ? "" : JSON.parse(match[3]),
+      effort: match[4] === undefined ? "" : JSON.parse(match[4]),
+    };
+    return { parts, match, settings };
+  } catch {
+    return null;
+  }
+}
+
+/** Read the generated creation call without treating worker task text as configuration. */
+export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings | null {
+  return workerSettingsMatch(prompt)?.settings ?? null;
+}
+
+/** Placement remains part of the authored instructions when the poller moves. */
+export function readTriggerWorkerPlacement(prompt: string): "managed" | "same_host" | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  return parsed.match[2].startsWith('placement "managed"') ? "managed" : "same_host";
+}
+
+/** Change only the creation-call settings, preserving the rest of the authored prompt. */
+export function updateTriggerWorkerSettings(
+  prompt: string,
+  settings: TriggerWorkerSettings,
+): string | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  const { parts, match } = parsed;
+  const args = [
+    `agent_id ${settings.agentId === null ? "set to your agent ID" : JSON.stringify(settings.agentId)}`,
+    match[2],
+    ...(settings.model ? [`model ${JSON.stringify(settings.model)}`] : []),
+    ...(settings.effort ? [`reasoning_effort ${JSON.stringify(settings.effort)}`] : []),
+  ];
+  const systemPrompt = parts.systemPrompt!.replace(
+    match[0],
+    () => `call sys_session_create with ${args.join(", ")}, and a message under 8000 characters.`,
+  );
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
 }
 
 const SERVICE_NAMES: Record<TriggerSource, string> = {
@@ -686,6 +762,9 @@ export function renderTriggerPrompt(
 ): string {
   const text = sourceText(source, fields);
   const service = triggerServiceName(source);
+  const initialLookbackMinutes = Math.max(60, ctx.pollingIntervalMinutes ?? 60);
+  const initialLookback =
+    initialLookbackMinutes === 60 ? "one hour" : `${initialLookbackMinutes} minutes`;
   const createArgs = [
     "agent_id set to your agent ID",
     `placement "${ctx.placement}"`,
@@ -704,7 +783,7 @@ export function renderTriggerPrompt(
   ];
   const steps = [
     ...(source === "github" ? [GITHUB_ACCOUNT_INSTRUCTIONS] : []),
-    `Read your state from your most recent reply in this session that has a "${CHECKED_THROUGH}" line: that check time, and any ${pendingLines.join(" and ")} lines. On the first run, use one hour ago and nothing pending. If you have no way to use ${service} here, or signing in to it fails, skip to your reply and say that this automation needs ${TRIGGER_TEMPLATES[source].toolsExample} where it runs.`,
+    `Read your state from your most recent reply in this session that has a "${CHECKED_THROUGH}" line: that check time, and any ${pendingLines.join(" and ")} lines. On the first run, use ${initialLookback} ago and nothing pending. If you have no way to use ${service} here, or signing in to it fails, skip to your reply and say that this automation needs ${TRIGGER_TEMPLATES[source].toolsExample} where it runs.`,
     `For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true). If no such session exists and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ${text.item} again by the key in its title, and handle it with this run's matches below, since the search window may have moved past it. If the rows have no archived field, an archived session could be hiding: keep the entry pending and ask the owner in your reply to check for that session. Otherwise read that session's history with sys_session_get_history. If your task message is there, it was delivered: drop the entry. If it isn't, keep the entry pending and point the owner to that session in your reply: the task may still be queued where the history can't show it, so never resend it and never create another session for it.`,
     ...(managerPostsLink
       ? [

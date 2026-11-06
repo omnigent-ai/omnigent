@@ -876,7 +876,10 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         assert reason in (run.error or "")
 
 
-async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, monkeypatch) -> None:
+@pytest.mark.parametrize("hint_outcome", ["absent", "hint", "none", "empty", "raises", "blocked"])
+async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
+    store, monkeypatch, hint_outcome
+) -> None:
     from omnigent.server import managed_hosts
     from omnigent.server.routes import sessions
 
@@ -886,8 +889,25 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     startup = FakeStartupInputs()
     cancelled = asyncio.Event()
+    release_hint = threading.Event()
+    event_loop_thread = threading.get_ident()
+    hint_threads: list[int] = []
+    monkeypatch.setattr(fire_mod, "_REGISTRATION_HINT_TIMEOUT_S", 0.01)
+
+    def hint() -> str | None:
+        hint_threads.append(threading.get_ident())
+        if hint_outcome == "raises":
+            raise RuntimeError("provider unavailable")
+        if hint_outcome == "blocked":
+            release_hint.wait()
+        if hint_outcome == "empty":
+            return ""
+        return "Check provider sign-in and retry." if hint_outcome == "hint" else None
 
     async def launch(**kwargs: Any) -> None:
+        state = kwargs["tracker"].get(kwargs["session_id"])
+        if hint_outcome != "absent":
+            state.host_online_failure_hint = hint
         try:
             await asyncio.Event().wait()  # Provisioning never finishes.
         except asyncio.CancelledError:
@@ -909,6 +929,7 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     try:
         await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
     finally:
+        release_hint.set()
         await _drain_managed_launches()
 
     [run] = _runs(store, claimed.task)
@@ -917,7 +938,88 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     assert terminate.await_args.args[0] is hosts.hosts[host_id]
     # The saved prompt fails with the timeout first. The cancelled launch's later
     # attempt finds nothing pending, so a generic shutdown reason never shows.
-    assert "did not register within 0.2 seconds" in startup.launch_failures[0][1]
+    reason = "the sandbox did not register within 0.2 seconds"
+    if hint_outcome == "hint":
+        reason += " — Check provider sign-in and retry."
+    assert startup.launch_failures[0][1] == reason
+    assert run.error == reason
+    assert len(hint_threads) == (0 if hint_outcome == "absent" else 1)
+    assert event_loop_thread not in hint_threads
+
+
+async def test_replacement_registration_timeout_preserves_provider_guidance(
+    store, db_uri, monkeypatch
+) -> None:
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions.helpers import _provision_managed_sandbox
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+    from tests.server.test_managed_hosts import _injected_config
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    host_id = claimed.lease.run.host_id
+    hosts = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="durable-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="old-token",
+        token_expires_at=int(time.time()) + 3600,
+        provider=fake.provider,
+        sandbox_id="old-sandbox",
+    )
+    monkeypatch.setattr(
+        fake, "host_online_failure_hint", lambda sandbox_id: f"Inspect logs for {sandbox_id}"
+    )
+    states = []
+
+    async def launch(**kwargs: Any) -> None:
+        states.append(kwargs["tracker"].get(kwargs["session_id"]))
+        # Exercise provider selection and registration; no runner can start before binding.
+        await _provision_managed_sandbox(
+            session_id=kwargs["session_id"],
+            owner=kwargs["owner"],
+            sandbox_config=kwargs["sandbox_config"],
+            repos=kwargs["repos"],
+            tracker=kwargs["tracker"],
+            host_store=kwargs["host_store"],
+            relaunch_host=kwargs["relaunch_host"],
+        )
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", launch)
+    startup = FakeStartupInputs()
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            host_store=hosts,
+            sandbox_config=_injected_config(fake),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        ),
+        registration_timeout_s=0.5,
+    )
+    try:
+        await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
+    finally:
+        await _drain_managed_launches()
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    assert run.error == (
+        "the sandbox did not register within 0.5 seconds — Inspect logs for sb-fake-1"
+    )
+    assert startup.launch_failures[0][1] == run.error
+    assert states[0].host_online_failure_hint is None
+    assert fake.host_starts[0].host_id == host_id
+    assert fake.host_starts[0].host_name == "durable-host"
+    assert fake.terminated == ["old-sandbox", "sb-fake-1"]
+    assert hosts.get_host(host_id) is None
 
 
 async def test_lost_lease_during_the_binding_wait_leaves_the_launch_running(

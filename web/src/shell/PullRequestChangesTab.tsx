@@ -38,7 +38,7 @@ import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileVie
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
-import { useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
+import { patchFileHashes, useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
 import {
   DiffStat,
@@ -464,7 +464,27 @@ export function PullRequestChangesTab({
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
   const renderedHead = pinnedHead && prDiff.data?.head_sha === pinnedHead ? pinnedHead : null;
-  const viewedFiles = useViewedFiles(identity, renderedHead);
+  // Parse the one whole-PR patch into per-file diffs, keyed by path.
+  const { filesByPath, parseError } = useMemo(() => {
+    const map = new Map<string, FileDiffMetadata>();
+    const patch = prDiff.data?.patch;
+    if (patch) {
+      try {
+        for (const parsed of parsePatchFiles(patch)) {
+          for (const f of parsed.files) map.set(f.name, f);
+        }
+      } catch {
+        return {
+          filesByPath: map,
+          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
+        };
+      }
+    }
+    return { filesByPath: map, parseError: undefined };
+  }, [prDiff.data]);
+  // Hashed from this parse, before the expand-context loader edits these files.
+  const patchHashes = useMemo(() => patchFileHashes(filesByPath), [filesByPath]);
+  const viewedFiles = useViewedFiles(identity, renderedHead, patchHashes);
 
   const themeType = useResolvedThemeMode();
   // Diff layout is the app-global FileViewer preference (unified/split); seed
@@ -488,6 +508,8 @@ export function PullRequestChangesTab({
     [files, view.pathFilter, hiddenPaths],
   );
   const viewedCount = files.filter((file) => viewedFiles.viewed.has(file.path)).length;
+  // Only changed files the list shows raise the notice; marks on files that left the PR stay quiet.
+  const changedListed = files.some((file) => viewedFiles.changed.has(file.path));
   // Hide viewed has emptied every file the path filter still matches.
   const matchingCount = filterChangedPaths(files, view.pathFilter).length;
   const allViewed = view.hideViewed && visibleFiles.length === 0 && matchingCount > 0;
@@ -612,25 +634,6 @@ export function PullRequestChangesTab({
       return next;
     });
   }, [visibleFiles, allCollapsed, clearReveal, releaseMarkCollapse]);
-
-  // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = prDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [prDiff.data]);
 
   // Expand-context loader: fetch a file's full old/new content on demand when
   // the reader expands unchanged regions.
@@ -1035,12 +1038,12 @@ export function PullRequestChangesTab({
           {coverageNote}
         </p>
       )}
-      {viewedFiles.resetNotice && view.dismissedResetHead !== renderedHead && (
+      {changedListed && view.dismissedResetHead !== renderedHead && (
         <div
           role="status"
           className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1 text-ui text-muted-foreground"
         >
-          New commits since you last viewed — viewed marks were reset.
+          New commits since you last viewed — changed files lost their viewed marks.
           <Button
             variant="ghost"
             size="sm"
@@ -1217,6 +1220,7 @@ export function PullRequestChangesTab({
                       <PullRequestViewedToggle
                         path={file.path}
                         viewed={viewedFiles.viewed.has(file.path)}
+                        changed={viewedFiles.changed.has(file.path)}
                         onToggle={() => toggleViewed(file.path)}
                       />
                     )}
