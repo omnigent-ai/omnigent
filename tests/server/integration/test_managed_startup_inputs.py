@@ -153,11 +153,13 @@ def _bind(env: _Env, session_id: str):
 
 
 @pytest.mark.parametrize(
-    "name,native",
+    "name,native,ordinary",
     [
-        ("startup-probe", False),
-        (CLAUDE_NATIVE_CODING_AGENT.agent_name, True),
-        (CODEX_NATIVE_CODING_AGENT.agent_name, True),
+        ("startup-probe", False, False),
+        (CLAUDE_NATIVE_CODING_AGENT.agent_name, True, False),
+        (CODEX_NATIVE_CODING_AGENT.agent_name, True, False),
+        pytest.param(CLAUDE_NATIVE_CODING_AGENT.agent_name, True, True, id="ordinary-claude"),
+        pytest.param(CODEX_NATIVE_CODING_AGENT.agent_name, True, True, id="ordinary-codex"),
     ],
 )
 @pytest.mark.parametrize("scheduled", [False, True])
@@ -166,6 +168,7 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     native: bool,
+    ordinary: bool,
     scheduled,
     scheduled_run_context,
     caplog,
@@ -176,9 +179,25 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
     runner = _stub_runner(monkeypatch, forwarded)
     try:
         with scheduled_run_scope(scheduled_run_context if scheduled else None):
-            session_id = await _create(env, name=name)
+            session_id = (
+                await _create(env, name=name, initial_input=None)
+                if ordinary
+                else await _create(env, name=name)
+            )
+            if ordinary:
+                env.conv_store.delete_label(session_id, STARTUP_LABEL)
+                env.conv_store.set_host_id(session_id, uuid4().hex, "/tmp/ordinary-workspace")
+                env.conv_store.set_runner_id(session_id, uuid4().hex)
+                conv = env.conv_store.get_conversation(session_id)
+                assert conv is not None and conv.host_id is not None
+                _connect_host(env, conv.host_id)
+                monkeypatch.setattr(env.app.state.startup_inputs, "host_changed", lambda *_: None)
+                accepted = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+                assert accepted.status_code == 202, accepted.text
         original = env.app.state.startup_inputs
-        entry = env.conv_store.list_pending_inputs(session_id)[0]
+        saved_inputs = env.conv_store.list_pending_inputs(session_id)
+        assert len(saved_inputs) == 1, "accepted native input must survive loss of process memory"
+        entry = saved_inputs[0]
         assert entry.status == "in_progress"
         assert entry.data.startup_options.scheduled_run == (
             scheduled_run_context if scheduled else None
@@ -194,7 +213,8 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         pending_id = snapshot["pending_inputs"][0]["pending_id"]
         assert not [event for event in forwarded if event.get("type") == "message"]
 
-        entry = _bind(env, session_id)
+        entry = entry if ordinary else _bind(env, session_id)
+        pending_inputs.reset_for_tests()
         restarted = ManagedStartupInputs(env.conv_store, original.hosts)
         restarted.dispatch = original.dispatch
         await asyncio.gather(
@@ -226,6 +246,98 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
         assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 1
         assert snapshot["pending_inputs"] == []
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "name", [CLAUDE_NATIVE_CODING_AGENT.agent_name, CODEX_NATIVE_CODING_AGENT.agent_name]
+)
+@pytest.mark.parametrize("outcome", ["receipt", "stop"])
+async def test_ordinary_native_input_uses_the_host_worker_without_replay(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, outcome: str
+) -> None:
+    env = startup_env
+    session_id = await _create(env, name=name, initial_input=None)
+    env.conv_store.delete_label(session_id, STARTUP_LABEL)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/ordinary-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+    dispatch = startup.dispatch
+    entered = asyncio.Event()
+
+    async def wait_before_handoff(*_: Any) -> dict[str, bool]:
+        entered.set()
+        await asyncio.Future()
+        return {"queued": True}
+
+    if outcome == "stop":
+        startup.dispatch = wait_before_handoff
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+    restarted.dispatch = dispatch
+    try:
+        accepted = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert accepted.status_code == 202, accepted.text
+        [saved] = env.conv_store.list_pending_inputs(session_id)
+        if outcome == "stop":
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            stopped = await env.client.post(
+                f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+            )
+            assert stopped.status_code == 202, stopped.text
+            assert env.conv_store.list_pending_inputs(session_id) == []
+        else:
+            await poll_until_async(
+                lambda: len([event for event in forwarded if event.get("type") == "message"]) == 1,
+                timeout_s=5,
+            )
+            [current] = env.conv_store.list_pending_inputs(session_id)
+            assert current.status == "incomplete", "an uncertain native send must not be replayed"
+        pending_inputs.reset_for_tests()
+        await restarted._deliver(env.app, session_id, saved)
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == int(outcome == "receipt")
+        if outcome == "receipt":
+            await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+            assert env.conv_store.list_pending_inputs(session_id) == []
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["pending_inputs"] == []
+    finally:
+        await restarted.shutdown()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("connection", ["external", "missing", "cancelled"])
+async def test_ordinary_native_queue_preserves_other_host_and_stop_paths(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, connection: str
+) -> None:
+    env = startup_env
+    session_id = await _create(env, name=CLAUDE_NATIVE_CODING_AGENT.agent_name, initial_input=None)
+    env.conv_store.delete_label(session_id, STARTUP_LABEL)
+    host_id = uuid4().hex
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/ordinary-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    if connection != "missing":
+        env.app.state.host_registry.register(
+            host_id,
+            AsyncMock(),
+            HostHelloFrame(version="test", frame_protocol_version=1, name="host-test", runners=[]),
+            owner=None,
+            registered_with_managed_token=connection != "external",
+        )
+    if connection == "cancelled":
+        env.conv_store.set_labels(session_id, {STARTUP_LABEL: "cancelled"})
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        accepted = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert accepted.status_code == 202, accepted.text
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        assert env.conv_store.list_pending_inputs(session_id) == []
     finally:
         await runner.aclose()
 
