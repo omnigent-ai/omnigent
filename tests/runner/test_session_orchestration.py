@@ -700,6 +700,7 @@ async def test_independent_create_files_a_named_project(placement, named_by):
             {"placement": "same_host", "project_id": _PROJECT_ID},
             "takes project_name, the project's name as shown in the UI, not project_id",
         ),
+        ({"project_id": _PROJECT_ID}, "takes project_name, the project's name as shown in the UI"),
         ({"project_name": "T"}, "project_name requires placement='same_host' or 'managed'"),
         (
             {"placement": "child", "project_name": "T"},

@@ -688,7 +688,7 @@ class SysSessionGetInfoTool(Tool):
     session is described.
 
     Runner-dispatched: the runner proxies ``GET /v1/sessions/{id}``
-    (plus best-effort runner status and host readiness lookups) and projects
+    (plus best-effort runner status, host readiness and project name lookups) and projects
     the result. Returns
     ``session_not_found`` when the id is unknown and ``access_denied``
     when the server refuses the read.
