@@ -71,7 +71,7 @@ RUNNER_ISOLATE_SESSION_ENV_VAR = "OMNIGENT_RUNNER_ISOLATE_SESSION"
 # Set by a launching host for its first-connect watchdog; absent for CLI-local
 # runners, which have no host watching them.
 RUNNER_CONNECT_MARKER_ENV_VAR = "OMNIGENT_RUNNER_CONNECT_MARKER"
-RUNNER_SIGN_IN_PENDING_WAIT_S = 150.0
+RUNNER_SIGN_IN_PENDING_WAIT_S = 8 * 60.0
 
 # Marker env var stamped into every agent-facing environment so any
 # process launched inside an Omnigent agent session can detect it is

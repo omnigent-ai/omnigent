@@ -34,8 +34,8 @@ be able to write resources without a separate Omnigent account.
   re-authentication prompt. When a newly launched runner explicitly reports a
   pending host sign-in, its first message waits on that same runner until the
   sign-in finishes or its bounded wait expires. A temporarily missing runner
-  credential uses the same pending status for up to two minutes, including
-  scheduled and managed launches. A runner the server refuses on
+  credential uses the same eight-minute sign-in budget, including scheduled
+  and managed launches. Returned but rejected credentials cannot renew it. A runner the server refuses on
   credentials before it connects is reported with a sign-in-again instruction
   naming `omnigent login`, not as a runner crash.
 - `proxy-env`: login detects the right mode even with HTTP proxy variables set.

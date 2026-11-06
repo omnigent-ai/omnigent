@@ -179,7 +179,17 @@ def test_touch_connect_marker_survives_unwritable_path(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    "state", ["valid", "other_runner", "expired", "future", "malformed", "boolean", "connected"]
+    "state",
+    [
+        "valid",
+        "long_valid",
+        "other_runner",
+        "expired",
+        "future",
+        "malformed",
+        "boolean",
+        "connected",
+    ],
 )
 def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypatch, state) -> None:
     import json
@@ -193,7 +203,7 @@ def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypat
 
     connected = tmp_path / "runner.connected"
     monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(connected))
-    mark_sign_in_pending("runner-owned", time.monotonic() + 20)
+    mark_sign_in_pending("runner-owned", time.monotonic() + (236 if state == "long_valid" else 20))
     marker = sign_in_pending_marker_path(connected)
     if state == "other_runner":
         mark_sign_in_pending("runner-other", time.monotonic() + 20)
@@ -206,6 +216,8 @@ def test_pending_sign_in_marker_is_launch_scoped_and_bounded(tmp_path, monkeypat
         marker.write_text("{invalid")
     elif state == "connected":
         connected.touch()
-    assert runner_sign_in_is_pending(connected, "runner-owned") is (state == "valid")
+    assert runner_sign_in_is_pending(connected, "runner-owned") is (
+        state in {"valid", "long_valid"}
+    )
     mark_sign_in_pending("runner-owned", None)
     assert not marker.exists()

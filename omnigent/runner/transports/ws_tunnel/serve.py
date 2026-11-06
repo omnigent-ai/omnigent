@@ -124,7 +124,7 @@ _REFRESHABLE_HTTP_STATUSES = {401, 403}
 _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS = 3
 # A never-connected runner keeps re-minting a missing or rejected credential for this
 # long before it exits; a transient mint failure or grant refresh clears within the window.
-_NO_CREDENTIAL_FATAL_WINDOW_S = 120.0
+_NO_CREDENTIAL_FATAL_WINDOW_S = RUNNER_SIGN_IN_PENDING_WAIT_S
 # Routine server-initiated recycles, NOT errors: 1012 "service restart" and
 # 1001 "going away" (and a 502 upgrade rejection) are how the Databricks Apps
 # ingress cycles long-lived WebSockets out from under a healthy app. The
@@ -631,7 +631,11 @@ async def serve_tunnel(
                 if http_status is not None and http_status in _REFRESHABLE_HTTP_STATUSES:
                     http_auth_rejection_streak += 1
                     if http_auth_rejection_started is None:
-                        http_auth_rejection_started = time.monotonic()
+                        http_auth_rejection_started = (
+                            sign_in_wait_started
+                            if sign_in_wait_started is not None
+                            else time.monotonic()
+                        )
                     no_credential_to_send = (
                         auth_token is None
                         and auth_token_factory is not None

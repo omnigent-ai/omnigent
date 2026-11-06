@@ -435,6 +435,7 @@ async def test_wait_for_runner_client_never_connected_makes_no_lookup(
     "outcome",
     [
         "connected",
+        "late_credential",
         "deadline_tie",
         "late_pending",
         "stopped",
@@ -455,7 +456,10 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
     clock = _VirtualTime()
     monkeypatch.setattr(orchestration, "time", SimpleNamespace(monotonic=clock.monotonic))
     monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0)
-    monkeypatch.setattr("omnigent.runner.identity.RUNNER_SIGN_IN_PENDING_WAIT_S", 150.0)
+    from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
+
+    wait_budget = RUNNER_SIGN_IN_PENDING_WAIT_S if outcome == "late_credential" else 150.0
+    monkeypatch.setattr("omnigent.runner.identity.RUNNER_SIGN_IN_PENDING_WAIT_S", wait_budget)
     ordinary_expired = asyncio.Event()
     pending_wait_started = asyncio.Event()
     status_poll_started = asyncio.Event()
@@ -545,7 +549,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
                 clock.now = 30.0
                 ordinary_expired.set()
             await pending_wait_started.wait()
-            assert waits == [30.0, 150.0]
+            assert waits == [30.0, wait_budget]
             if outcome == "host_reconnected":
                 await status_poll_started.wait()
                 connection = SimpleNamespace(host_id="host-owned")
@@ -553,14 +557,21 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome, 
                 await pending_rechecked.wait()
                 assert queried_connections[-1] is connection
                 next_status.put_nowait("sign_in_pending")
-                assert waits == [30.0, 150.0], "a host reconnect renewed the credential wait"
-            if outcome in {"connected", "deadline_tie", "late_pending", "expired"}:
-                clock.now += 31.0
-                next_status.put_nowait("sign_in_pending")
-                await pending_rechecked.wait()
-                assert waits == [30.0, 150.0], "a repeated status renewed the sign-in wait"
+                assert waits == [30.0, wait_budget], "a host reconnect renewed the credential wait"
             if outcome in {
                 "connected",
+                "late_credential",
+                "deadline_tie",
+                "late_pending",
+                "expired",
+            }:
+                clock.now = 236.0 if outcome == "late_credential" else clock.now + 31.0
+                next_status.put_nowait("sign_in_pending")
+                await pending_rechecked.wait()
+                assert waits == [30.0, wait_budget], "a repeated status renewed the sign-in wait"
+            if outcome in {
+                "connected",
+                "late_credential",
                 "deadline_tie",
                 "late_pending",
                 "host_reconnected",

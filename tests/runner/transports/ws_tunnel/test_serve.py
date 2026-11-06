@@ -56,9 +56,11 @@ from omnigent.runner.transports.ws_tunnel.serve import (
 
 
 @pytest.fixture(autouse=True)
-def _no_credential_window_elapsed(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep older no-credential scenarios on their immediate-exit budget."""
+def _no_credential_window_elapsed(monkeypatch: pytest.MonkeyPatch) -> float:
+    """Keep older scenarios immediate while exposing the actual production window."""
+    window = serve_module._NO_CREDENTIAL_FATAL_WINDOW_S
     monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 0.0)
+    return window
 
 
 @dataclass
@@ -523,10 +525,12 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     tmp_path: Path,
     outcome: str,
     initial_credential: str | None,
+    _no_credential_window_elapsed: float,
 ) -> None:
     """Credential recovery past normal startup grace preserves a bounded pending launch."""
     monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
-    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", 120.0)
+    window = _no_credential_window_elapsed
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", window)
     monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
     marker = tmp_path / "runner.connected"
     monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
@@ -537,18 +541,18 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     shutdown = asyncio.Event()
 
     def _mint() -> str | None:
-        return initial_credential if sum(sleeps) < 45 else "tok-recovered"
+        return initial_credential if sum(sleeps) < 236 else "tok-recovered"
 
     async def _serve_once(app: Any, *, auth_token: str | None = None, **kwargs: Any) -> None:
         del app
         upgrades.append(auth_token)
         pending.append(runner_sign_in_is_pending(marker, runner_id))
         if len(upgrades) > 1:
-            assert pending[-1] is (sum(sleeps) < 120)
+            assert pending[-1] is (sum(sleeps) < window)
             deadlines.append(
                 json.loads(sign_in_pending_marker_path(marker).read_text())["deadline"]
             )
-        if sum(sleeps) >= 30 and outcome == "shutdown":
+        if sum(sleeps) >= 180 and outcome == "shutdown":
             shutdown.set()
         if auth_token != "tok-recovered" or outcome == "rejected":
             raise InvalidStatus(Response(401, "Unauthorized", [], b""))
@@ -562,8 +566,9 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     advance_clock = serve_module.asyncio.sleep
 
     async def _sleep(delay: float) -> None:
-        await advance_clock(delay)
-        if outcome == "cancelled" and sum(sleeps) >= 30:
+        remaining = 236 - sum(sleeps)
+        await advance_clock(min(delay, remaining) if remaining > 0 else delay)
+        if outcome == "cancelled" and sum(sleeps) >= 180:
             raise asyncio.CancelledError
 
     monkeypatch.setattr(
@@ -597,10 +602,10 @@ async def test_serve_tunnel_rides_out_a_transient_missing_credential(
     if outcome in {"connected", "rejected"}:
         assert upgrades[-1] == "tok-recovered"
         if outcome == "connected":
-            assert 30 < sum(sleeps) < 120
+            assert 30 < sum(sleeps) < window
         else:
             # A refused token is retried for the whole window before the runner exits.
-            assert 120 <= sum(sleeps) < 150
+            assert window <= sum(sleeps) < window + serve_module._MAX_RECONNECT_DELAY_S
     else:
         assert pending[-1] is True
     assert marker.exists() is (outcome == "connected")
@@ -709,6 +714,42 @@ async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
     assert len(set(deadlines)) == 1
     assert not marker.exists()
     assert not sign_in_pending_marker_path(marker).exists()
+
+
+@pytest.mark.asyncio
+async def test_rejected_upgrade_does_not_renew_an_existing_sign_in_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _no_credential_window_elapsed: float
+) -> None:
+    window = _no_credential_window_elapsed
+    monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", window)
+    monkeypatch.setattr(serve_module, "_SIGN_IN_PENDING_POLL_INTERVAL_S", 60.0)
+    monkeypatch.setattr(serve_module.random, "uniform", lambda *_args: 0.0)
+    marker = tmp_path / "runner.connected"
+    monkeypatch.setenv(RUNNER_CONNECT_MARKER_ENV_VAR, str(marker))
+    sleeps = _clock_advanced_by_sleep(monkeypatch)
+    monkeypatch.setattr("omnigent.runner.identity.time", serve_module.time)
+    original_deadline = serve_module.time.monotonic() + window
+    deadlines: list[float] = []
+
+    async def reject(app: Any, **_kwargs: Any) -> None:
+        del app
+        pending = sign_in_pending_marker_path(marker)
+        if pending.exists():
+            deadlines.append(json.loads(pending.read_text())["deadline"])
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", reject)
+    with pytest.raises(serve_module.RunnerTunnelAuthRejectedError):
+        await serve_tunnel(
+            _noop_app,
+            server_url="https://synthetic.invalid/omnigent",
+            runner_id="runner-owned",
+            runner_version="test",
+            auth_token_factory=_SignInFactory(pending_calls=3, token="tok-refused"),
+        )
+    assert sum(sleeps) < window + serve_module._MAX_RECONNECT_DELAY_S
+    assert deadlines and set(deadlines) == {original_deadline}
+    assert not marker.exists() and not sign_in_pending_marker_path(marker).exists()
 
 
 class _SignInFactory:
