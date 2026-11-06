@@ -9244,6 +9244,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
                     "git_branch": "feature/x",
+                    "project_id": "proj_1",
                     "pending_elicitations": [{"id": "el_1"}, {"id": "el_2"}],
                 },
             )
@@ -9284,6 +9285,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         "cursor-native": False,
     }
     assert info["parent_session_id"] == "conv_parent"
+    assert info["project_id"] == "proj_1"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.
