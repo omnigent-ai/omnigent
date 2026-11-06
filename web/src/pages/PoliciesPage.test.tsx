@@ -177,6 +177,8 @@ describe("PoliciesPage actions", () => {
 
   it("deletes a policy through the confirmation dialog", async () => {
     setPolicies([policy({ id: "p1", name: "block_canada" })]);
+    // Never settles, so the dialog closing can't come from a success callback.
+    deleteMutate.mockImplementation(() => {});
     renderPage();
 
     await screen.findByText("block_canada");

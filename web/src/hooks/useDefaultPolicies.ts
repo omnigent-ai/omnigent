@@ -105,9 +105,17 @@ export function useDeleteDefaultPolicy() {
       return { previous };
     },
     onError: (err, policyId, context) => {
-      queryClient.setQueryData(QUERY_KEY, context?.previous);
-      const name = context?.previous?.find((policy) => policy.id === policyId)?.name ?? "policy";
-      showToast(`Couldn't remove ${name}: ${err.message}`);
+      // Put back only this row: another removal may have landed since the snapshot.
+      const previous = context?.previous ?? [];
+      const index = previous.findIndex((policy) => policy.id === policyId);
+      const restored = index >= 0 ? previous[index] : undefined;
+      if (restored !== undefined) {
+        queryClient.setQueryData<DefaultPolicy[]>(QUERY_KEY, (old) => {
+          if (old === undefined || old.some((policy) => policy.id === policyId)) return old;
+          return [...old.slice(0, index), restored, ...old.slice(index)];
+        });
+      }
+      showToast(`Couldn't remove ${restored?.name ?? "policy"}: ${err.message}`);
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });

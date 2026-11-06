@@ -6,7 +6,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   useAddDefaultPolicy,
   useDefaultPolicies,
@@ -164,34 +164,44 @@ describe("useDeleteDefaultPolicy", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["default-policies"] });
   });
 
-  it("drops the row at once and restores it with a toast when the DELETE fails", async () => {
-    let settle: (response: Response) => void = () => {};
-    fetchMock.mockReturnValueOnce(
-      new Promise<Response>((resolve) => {
-        settle = resolve;
-      }),
-    );
+  it("drops the row at once and restores only it when its DELETE fails", async () => {
+    let failFirst: (response: Response) => void = () => {};
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          failFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse(undefined));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const seeded = [
       { id: "p1", name: "block_canada" },
       { id: "p2", name: "budget" },
+      { id: "p3", name: "audit" },
     ] as DefaultPolicy[];
     queryClient.setQueryData(["default-policies"], seeded);
     const toasts: string[] = [];
-    window.addEventListener("omnigent:toast", (e) => {
+    const onToast = (e: Event) => {
       toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
-    });
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
     const { result } = renderDelete(queryClient);
 
     result.current.mutate("p1");
     await waitFor(() =>
-      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[1]]),
+      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[1], seeded[2]]),
+    );
+    // A second removal lands while the first is still in flight.
+    result.current.mutate("p2");
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[2]]),
     );
 
-    settle(mockResponse({}, { ok: false, status: 500 }));
-    await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(queryClient.getQueryData(["default-policies"])).toEqual(seeded);
-    expect(toasts).toEqual(["Couldn't remove block_canada: 500 OK"]);
+    failFirst(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(toasts).toEqual(["Couldn't remove block_canada: 500 OK"]));
+    // Only the failed row returns, at its old position; the removed p2 stays gone.
+    expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[0], seeded[2]]);
   });
 
   it("throws on non-2xx", async () => {

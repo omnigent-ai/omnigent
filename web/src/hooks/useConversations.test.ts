@@ -42,6 +42,7 @@ import {
   fetchPinnedConversations,
   usePinnedConversations,
   clearSessionTombstones,
+  isSessionArchiving,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -3957,6 +3958,9 @@ describe("useDeleteProject", () => {
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    // No list had loaded these members, so tombstones keep a lagging refetch from showing them.
+    expect(isSessionArchiving("conv_a")).toBe(true);
+    expect(isSessionArchiving("conv_b")).toBe(true);
   });
 
   it("throws with succeeded/failed split when some archives fail", async () => {
@@ -3991,6 +3995,16 @@ describe("useDeleteProject", () => {
       total: 2,
     });
   });
+
+  function collectToasts(): string[] {
+    const toasts: string[] = [];
+    const onToast = (e: Event) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    return toasts;
+  }
 
   function seedProjectCaches() {
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
@@ -4037,10 +4051,7 @@ describe("useDeleteProject", () => {
       )
       .mockResolvedValueOnce(archivedConv("conv_a"))
       .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
-    const toasts: string[] = [];
-    window.addEventListener("omnigent:toast", (e) => {
-      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
-    });
+    const toasts = collectToasts();
     const { queryClient, rendered, visibleIds } = seedProjectCaches();
 
     rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
@@ -4052,6 +4063,36 @@ describe("useDeleteProject", () => {
     expect(toasts).toEqual([
       `Couldn't delete project "Sprint 42": some sessions couldn't be archived (you may not own them).`,
     ]);
+  });
+
+  it("keeps archived members hidden when only the project DELETE fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_a" }, { id: "conv_b" }, { id: "conv_unloaded" }],
+          first_id: "conv_a",
+          last_id: "conv_unloaded",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(archivedConv("conv_b"))
+      .mockResolvedValueOnce(archivedConv("conv_unloaded"))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const toasts = collectToasts();
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // The folder comes back, but every member did archive, so none of them do.
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_1", name: "Sprint 42" }]);
+    expect(visibleIds()).toEqual(["conv_other"]);
+    // Live tombstones make a lagging list refetch report them archived too.
+    for (const id of ["conv_a", "conv_b", "conv_unloaded"]) {
+      expect(isSessionArchiving(id)).toBe(true);
+    }
+    expect(toasts).toEqual([`Couldn't delete project "Sprint 42". Its sessions were archived.`]);
   });
 });
 

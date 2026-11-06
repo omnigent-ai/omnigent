@@ -2716,6 +2716,24 @@ function cachedProjectMemberIds(queryClient: QueryClient, project: ProjectSummar
   return [...ids];
 }
 
+/** Every member was archived and unfiled, but the project row's DELETE failed. */
+class ProjectContainerDeleteError extends Error {
+  readonly succeeded: string[];
+
+  constructor(succeeded: string[], cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ProjectContainerDeleteError";
+    this.succeeded = succeeded;
+  }
+}
+
+/** Tombstone archived members that no list had loaded, so a lagging refetch keeps them hidden. */
+function tombstoneUnloadedArchives(succeeded: readonly string[], loaded: readonly string[]): void {
+  const loadedIds = new Set(loaded);
+  const marked = markSessionsArchiving(succeeded.filter((id) => !loadedIds.has(id)));
+  expireSessionsArchiving(marked, marked.keys());
+}
+
 /**
  * Delete a project: archive AND unfile every member session, then delete the
  * first-class `projects` row (when the folder has one). Sessions are never
@@ -2724,7 +2742,8 @@ function cachedProjectMemberIds(queryClient: QueryClient, project: ProjectSummar
  * folder's `{ id, name }`: `name` drives the member sweep (dual-read
  * `?project=`), `id` deletes the container (skipped for a label-only folder,
  * which has none). Throws a `BulkConversationMutationError` if any member
- * failed (e.g. a shared session the user can't modify), leaving those in place.
+ * failed (e.g. a shared session the user can't modify), leaving those in place,
+ * or a `ProjectContainerDeleteError` if only the final container DELETE failed.
  *
  * Optimistic: `onMutate` hides the folder and its loaded members at once, so
  * the caller can close its dialog without waiting out the sweep. A failure
@@ -2746,9 +2765,16 @@ export function useDeleteProject() {
     },
     onError: (err, { name }, context) => {
       if (context === undefined) return;
+      const sweepFinished =
+        err instanceof BulkConversationMutationError || err instanceof ProjectContainerDeleteError;
       const failed = new Set(
-        err instanceof BulkConversationMutationError ? err.failed : context.memberIds,
+        err instanceof BulkConversationMutationError
+          ? err.failed
+          : err instanceof ProjectContainerDeleteError
+            ? []
+            : context.memberIds,
       );
+      if (sweepFinished) tombstoneUnloadedArchives(err.succeeded, context.memberIds);
       const succeeded = context.memberIds.filter((id) => !failed.has(id));
       if (context.marked !== undefined) {
         unmarkSessionsArchiving(failed, context.marked);
@@ -2760,10 +2786,13 @@ export function useDeleteProject() {
       showToast(
         err instanceof BulkConversationMutationError
           ? `Couldn't delete project "${name}": some sessions couldn't be archived (you may not own them).`
-          : `Couldn't delete project "${name}".`,
+          : err instanceof ProjectContainerDeleteError
+            ? `Couldn't delete project "${name}". Its sessions were archived.`
+            : `Couldn't delete project "${name}".`,
       );
     },
-    onSuccess: (_data, _project, context) => {
+    onSuccess: ({ succeeded }, _project, context) => {
+      tombstoneUnloadedArchives(succeeded, context.memberIds);
       if (context.marked !== undefined) expireSessionsArchiving(context.marked, context.memberIds);
       for (const id of context.memberIds) settleOpenSessionRow(queryClient, id, { archived: true });
     },
@@ -2793,7 +2822,13 @@ export function useDeleteProject() {
       // All members detached — remove the first-class container if present.
       // (A label-only folder has no row; clearing the labels above already
       // makes it vanish from the project list.)
-      if (id !== null) await apiDeleteProject(id);
+      if (id !== null) {
+        try {
+          await apiDeleteProject(id);
+        } catch (err) {
+          throw new ProjectContainerDeleteError(succeeded, err);
+        }
+      }
       return { succeeded, failed };
     },
     onSettled: () => {

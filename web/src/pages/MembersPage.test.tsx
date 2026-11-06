@@ -9,7 +9,7 @@
 
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
@@ -200,9 +200,11 @@ describe("MembersPage actions", () => {
     vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
     vi.mocked(accountsApi.deleteUser).mockResolvedValue({ ok: false, error: "nope", status: 500 });
     const toasts: string[] = [];
-    window.addEventListener("omnigent:toast", (e) => {
+    const onToast = (e: Event) => {
       toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
-    });
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
     renderPage();
 
     const bobRow = (await screen.findByText("bob")).closest("tr")!;
@@ -212,6 +214,37 @@ describe("MembersPage actions", () => {
 
     await waitFor(() => expect(toasts).toEqual(["Couldn't remove bob: nope"]));
     expect(await screen.findByText("bob")).toBeInTheDocument();
+  });
+
+  it("keeps a row hidden while its delete is still running after another one finishes", async () => {
+    vi.mocked(accountsApi.listUsers)
+      .mockResolvedValueOnce([user({ id: "alice" }), user({ id: "bob" })])
+      .mockResolvedValue([user({ id: "alice" })]); // alice's delete hasn't landed yet
+    let finishAlice: (result: { ok: true }) => void = () => {};
+    vi.mocked(accountsApi.deleteUser)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishAlice = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({ ok: true });
+    renderPage();
+
+    const remove = async (name: string) => {
+      const row = (await screen.findByText(name)).closest("tr")!;
+      fireEvent.click(within(row).getByRole("button", { name: /Remove/ }));
+      const dialog = await screen.findByRole("dialog");
+      fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    };
+    await remove("alice");
+    await remove("bob");
+
+    // bob's delete refreshes the list, which still contains alice.
+    expect(await screen.findByText("No members yet.")).toBeInTheDocument();
+    expect(screen.queryByText("alice")).toBeNull();
+    finishAlice({ ok: true });
+    await waitFor(() => expect(accountsApi.listUsers).toHaveBeenCalledTimes(3));
   });
 
   it("creates an invite and surfaces the single-use URL", async () => {

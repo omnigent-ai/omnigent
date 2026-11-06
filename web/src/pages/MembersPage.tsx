@@ -23,7 +23,7 @@
  * accidentally caching secrets in a list endpoint.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -75,9 +75,15 @@ export function MembersPage() {
   const [deleteCandidate, setDeleteCandidate] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Deletes still in flight stay hidden even if a refresh lists them.
+  const pendingDeletes = useRef(new Set<string>());
+  const latestRefresh = useRef(0);
 
   const refresh = useCallback(async () => {
+    const request = ++latestRefresh.current;
     const list = await listUsers();
+    // Overlapping deletes each refresh; only the newest response may land.
+    if (request !== latestRefresh.current) return;
     if (list === null) {
       setLoadError(
         "Could not load members. You may not have admin permission, or the server is unreachable.",
@@ -86,7 +92,7 @@ export function MembersPage() {
       return;
     }
     setLoadError(null);
-    setUsers(list);
+    setUsers(list.filter((u) => !pendingDeletes.current.has(u.id)));
   }, []);
 
   // Initial load: identity probe + members list. Skipped in single-user
@@ -174,8 +180,10 @@ export function MembersPage() {
     const userId = deleteCandidate;
     // Close now and drop the row; the refresh puts it back if the delete failed.
     setDeleteCandidate(null);
+    pendingDeletes.current.add(userId);
     setUsers((current) => current?.filter((u) => u.id !== userId) ?? null);
     const result = await deleteUser(userId);
+    pendingDeletes.current.delete(userId);
     if (!result.ok) showToast(`Couldn't remove ${userId}: ${result.error}`);
     await refresh();
   }
