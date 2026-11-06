@@ -1815,6 +1815,38 @@ async def test_server_without_inferred_status_support_gets_no_terminal_alert(
 
 
 @pytest.mark.asyncio
+async def test_failed_input_box_probe_skips_only_that_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe that raises leaves the watcher running, so later reads raise and clear the alert."""
+    session_id = "conv_hidden_probe_failure"
+    failing = {"value": False}
+
+    def fail_once() -> None:
+        if failing["value"]:
+            failing["value"] = False
+            raise RuntimeError("pane probe failed")
+
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, session_id, during_probe=fail_once
+    )
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    failing["value"] = True
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
+    assert session.published == [("running", None)]
+    await session.tick_at(117.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+
+    failing["value"] = True
+    await session.tick_at(118.0, _CLAUDE_WORKING_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+    await session.tick_at(119.0, _CLAUDE_WORKING_PANE)
+    assert session.published[1:] == [("running", "terminal prompt"), ("running", None)]
+    assert session.registry.session_turn_is_active(session_id)
+
+
+@pytest.mark.asyncio
 async def test_reported_reason_replaces_hidden_input_box_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

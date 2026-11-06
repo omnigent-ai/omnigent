@@ -36,6 +36,8 @@ reattach when the session moves to another host.
   tag, until the input box returns. `!` shell mode, the ctrl+r history search
   and a draft quoting a dialog's title keep the input box in use, so they do
   not count as hidden. A runner connected to an older server sends no alert.
+  After a reconnect while every session is idle, alerts resume once the server
+  next initializes a session, for example when chat sends a message.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
