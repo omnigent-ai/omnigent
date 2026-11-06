@@ -73,7 +73,7 @@ function TaskCommand({ command, label }: { command: string; label: string }) {
 }
 
 /** Running shells and monitors, independent of foreground work; the count is authoritative. */
-export function BackgroundTaskIndicator() {
+export function BackgroundTaskIndicator({ className }: { className?: string }) {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -126,7 +126,10 @@ export function BackgroundTaskIndicator() {
             size="xs"
             data-testid="background-task-pill"
             aria-label={`${countLabel} still running`}
-            className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
+            className={cn(
+              "shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2",
+              className,
+            )}
           >
             <SquareTerminalIcon className="size-3.5" strokeWidth={1.5} aria-hidden="true" />
             {bgCount}
