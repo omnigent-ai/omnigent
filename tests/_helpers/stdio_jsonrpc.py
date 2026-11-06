@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import select
-import subprocess
 import time
 import weakref
 from typing import TextIO
@@ -47,13 +46,3 @@ def read_json_line(handle: TextIO, *, timeout_s: float) -> dict[str, object]:
     payload = json.loads(line)
     assert isinstance(payload, dict)
     return payload
-
-
-def stop_process(process: subprocess.Popen[str], *, timeout_s: float = 5.0) -> None:
-    """Terminate a subprocess, killing it if it ignores the request, and reap it."""
-    process.terminate()
-    try:
-        process.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=timeout_s)

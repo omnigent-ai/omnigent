@@ -8,7 +8,8 @@ import time
 
 import pytest
 
-from tests._helpers.stdio_jsonrpc import read_json_line, stop_process
+from tests._helpers.live_server import terminate_process
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="select() on pipes is POSIX-only")
 
@@ -29,7 +30,7 @@ def test_a_partial_line_times_out_instead_of_blocking() -> None:
             read_json_line(child.stdout, timeout_s=0.5)
         assert time.monotonic() - started < 5
     finally:
-        stop_process(child)
+        terminate_process(child, timeout_s=5)
 
 
 def test_lines_written_together_are_read_one_at_a_time() -> None:
@@ -41,7 +42,7 @@ def test_lines_written_together_are_read_one_at_a_time() -> None:
     try:
         assert [read_json_line(child.stdout, timeout_s=5)["id"] for _ in range(3)] == [1, 2, 3]
     finally:
-        stop_process(child)
+        terminate_process(child, timeout_s=5)
 
 
 def test_a_closed_output_is_reported_at_once() -> None:
@@ -52,4 +53,4 @@ def test_a_closed_output_is_reported_at_once() -> None:
             read_json_line(child.stdout, timeout_s=10)
         assert time.monotonic() - started < 5
     finally:
-        stop_process(child)
+        terminate_process(child, timeout_s=5)
