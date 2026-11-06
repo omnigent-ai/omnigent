@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from functools import partial
+from operator import ge, gt, le, lt
 from typing import Any, cast
 
 from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
@@ -40,6 +41,7 @@ from omnigent.db.utils import (
     run_write_transaction,
 )
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.scheduled.run_reconciler import (
     STALE_RUN_ERROR_CODE,
     STALE_RUN_MAX_AGE_SECONDS,
@@ -49,7 +51,11 @@ from omnigent.server.scheduled.schedule import (
     occurrence_host_id,
     scheduled_trigger_key,
 )
-from omnigent.stores.scheduled_task_store import AdoptOutcome, ScheduledTaskStore
+from omnigent.stores.scheduled_task_store import (
+    AdoptOutcome,
+    AutomationFailure,
+    ScheduledTaskStore,
+)
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
     DispatchCursor,
@@ -147,6 +153,7 @@ _SESSION_CREATION_FIELDS = (
     "agent_id",
     "host_id",
     "workspace",
+    "base_branch",
     "execution_target",
     "model_override",
     "reasoning_effort",
@@ -235,6 +242,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         session_mode: str = "new",
         session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
@@ -262,7 +270,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 session_mode=encode_scheduled_task_session_mode(session_mode),
                 session_id=session_id,
                 workspace=workspace,
-                base_branch=None,
+                base_branch=base_branch,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
                 project_id=project_id,
@@ -376,20 +384,22 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
         ``None`` leaves most fields unchanged. For the per-task overrides
         (``model_override``, ``reasoning_effort``, ``permission_mode``),
-        ``workspace``, ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``workspace``, ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (a set
         ``bypassPermissions`` can be turned back off), and clearing both
         ``host_id`` and ``workspace`` unpins a task (e.g. switching it to
@@ -406,6 +416,17 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            if expected_schedule is not None:
+                current = _to_entity(row)
+                if any(
+                    getattr(current, field) != getattr(expected_schedule, field)
+                    for field in ("rrule", "session_mode", "execution_target")
+                ):
+                    raise OmnigentError(
+                        "The automation's schedule or execution settings changed. "
+                        "Reload and try again.",
+                        code=ErrorCode.CONFLICT,
+                    )
             if state is not None and state != "deleted":
                 require_active_account(session, row.user_id, generation=row.account_generation)
             schedule_before = (row.rrule, row.timezone, row.state)
@@ -447,6 +468,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 changed = True
             if workspace is not _UNSET and row.workspace != workspace:
                 row.workspace = workspace
+                changed = True
+            if base_branch is not _UNSET and row.base_branch != base_branch:
+                row.base_branch = base_branch
                 changed = True
             if host_id is not _UNSET and row.host_id != host_id:
                 row.host_id = host_id
@@ -536,6 +560,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return "adopted"
 
         return run_write_transaction(self._session_immediate, "adopt_task_session", write)
+
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """Clear the task's session under the task lock, only if it is still *session_id*."""
+
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.state == encode_scheduled_task_state("deleted")
+                or row.session_id != session_id
+            ):
+                return False
+            row.session_id = None
+            return True
+
+        return run_write_transaction(self._session_immediate, "release_task_session", write)
 
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
@@ -707,6 +749,86 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             return _run_to_entity(row)
 
         return run_write_transaction(self._session_immediate, "insert_task_run", write)
+
+    def list_inbox_failures(
+        self,
+        *,
+        owner_user_id: str | None,
+        generation: str | None = None,
+        check_generation: bool = False,
+        after: tuple[int, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
+        """Bound discovery by the owner/task index, then read one indexed run/task."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self._session("list_inbox_failures") as session:
+            stmt = select(
+                SqlScheduledTask.id,
+                SqlScheduledTask.name,
+                SqlScheduledTask.created_at,
+                SqlScheduledTask.state,
+                SqlScheduledTask.account_generation,
+                SqlScheduledTask.user_id,
+            ).where(
+                SqlScheduledTask.workspace_id == current_workspace_id(),
+                SqlScheduledTask.user_id == owner_user_id,
+            )
+            if after is not None:
+                stmt = stmt.where(
+                    self._cursor_after(
+                        (SqlScheduledTask.created_at, SqlScheduledTask.id), after, descending=True
+                    )
+                )
+            tasks = session.execute(
+                stmt.order_by(
+                    SqlScheduledTask.created_at.desc(), SqlScheduledTask.id.desc()
+                ).limit(limit + 1)
+            ).all()
+            page = tasks[:limit]
+            cursor = (page[-1].created_at, page[-1].id) if len(tasks) > limit else None
+            failures = []
+            for task in page:
+                # Filter after paging to bound scans even through deleted/rotated owners.
+                if (
+                    task.user_id != owner_user_id
+                    or task.state == encode_scheduled_task_state("deleted")
+                    or (check_generation and task.account_generation != generation)
+                ):
+                    continue
+                run = session.execute(
+                    select(
+                        SqlScheduledTaskRun.id,
+                        SqlScheduledTaskRun.status,
+                        SqlScheduledTaskRun.conversation_id,
+                        SqlScheduledTaskRun.scheduled_at,
+                        SqlScheduledTaskRun.finished_at,
+                        SqlScheduledTaskRun.error_code,
+                    )
+                    .where(
+                        SqlScheduledTaskRun.workspace_id == current_workspace_id(),
+                        SqlScheduledTaskRun.scheduled_task_id == task.id,
+                    )
+                    .order_by(
+                        SqlScheduledTaskRun.scheduled_at.desc(), SqlScheduledTaskRun.id.desc()
+                    )
+                    .limit(1)
+                ).first()
+                if run is not None and (
+                    run.status == encode_scheduled_task_run_status("failed")
+                    and run.conversation_id is None
+                ):
+                    failures.append(
+                        AutomationFailure(
+                            task_id=task.id,
+                            task_name=task.name,
+                            run_id=run.id,
+                            scheduled_at=run.scheduled_at,
+                            finished_at=run.finished_at,
+                            error_code=run.error_code,
+                        )
+                    )
+            return failures, cursor
 
     def list_runs(
         self,
@@ -897,18 +1019,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     # ── Database scheduler ───────────────────────────────────────
 
     def _cursor_after(
-        self, columns: tuple[Any, ...], cursor: tuple[Any, ...], *, inclusive: bool = False
+        self,
+        columns: tuple[Any, ...],
+        cursor: tuple[Any, ...],
+        *,
+        inclusive: bool = False,
+        descending: bool = False,
     ) -> ColumnElement[bool]:
         """MySQL needs scalar ranges to seek past a composite cursor."""
+        compare = lt if descending else gt
+        compare_inclusive = le if descending else ge
         if self._engine.dialect.name != "mysql":
-            return tuple_(*columns) >= cursor if inclusive else tuple_(*columns) > cursor
+            return (compare_inclusive if inclusive else compare)(tuple_(*columns), cursor)
         return or_(
             *(
                 and_(
                     *(columns[previous] == cursor[previous] for previous in range(index)),
-                    column >= cursor[index]
-                    if inclusive and index == len(columns) - 1
-                    else column > cursor[index],
+                    (compare_inclusive if inclusive and index == len(columns) - 1 else compare)(
+                        column, cursor[index]
+                    ),
                 )
                 for index, column in enumerate(columns)
             )
