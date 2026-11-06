@@ -2,9 +2,10 @@
 
 Covers the two hook changes end to end:
 
-- ``usePinnedSessionHotkeys`` — in the browser, ``Ctrl/Cmd+Alt+<digit>`` jumps
-  to the Nth *pinned* session (plain ``Cmd+digit`` is the native tab switch,
-  so the browser path owns the Alt chord and matches ``e.code``).
+- ``useSessionNumberHotkeys`` — in the browser, ``Ctrl/Cmd+Alt+<digit>`` jumps
+  to the Nth session the sidebar lists, pinned rows first (plain ``Cmd+digit``
+  is the native tab switch, so the browser path owns the Alt chord and matches
+  ``e.code``).
 - ``useSidebarToggleHotkeys`` — ``Ctrl/Cmd+Alt+[`` toggles the left sidebar
   (exercising the handler, AltGraph guard included, on a real keydown). The
   sidebar collapses by animating its width to zero rather than unmounting, so

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import logging
+import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -49,6 +52,7 @@ from tests.server.integration.test_managed_launch_failure_teardown import (
 from tests.server.integration.test_managed_launch_failure_teardown import (
     teardown_env as teardown_env,
 )
+from tests.server.integration.test_session_host_launch import _NoopRunnerWS, _runner_hello
 from tests.server.integration.test_sessions_native_kickoff_duplicate import (
     _simulate_transcript_forwarder_echo,
 )
@@ -290,12 +294,21 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
             item["type"] == "error" and item["data"]["code"] == "startup_input_failed"
             for item in snapshot["items"]
         )
+        [refused_input] = snapshot["failed_inputs"]
+        assert refused_input["content"] == _INPUT["data"]["content"]
+        assert snapshot["pending_inputs"] == []
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )
         assert retried.status_code == 202, retried.text
+        # A retry queues the input again, so it is no longer undelivered.
+        snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot["failed_inputs"] == []
+        assert [entry["pending_id"] for entry in snapshot["pending_inputs"]] == [
+            refused_input["pending_id"]
+        ]
         await startup._deliver(
             env.app, session_id, env.conv_store.list_pending_inputs(session_id)[0]
         )
@@ -659,6 +672,75 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     assert len([item for item in snapshot["items"] if item["type"] == "message"]) == 2
 
 
+async def test_saved_input_waits_while_clear_moves_the_session(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved input the host worker meets while ``/clear`` moves the session waits.
+
+    It is neither run in the session being moved nor marked failed; once the
+    move ends the worker delivers it on its own, exactly once.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    session_id = await _create(env)
+    host_id = uuid4().hex
+    saved = env.conv_store.list_pending_inputs(session_id)[0]
+    env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+    env.conv_store.set_runner_id(session_id, uuid4().hex)
+    _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+
+    def turns() -> list[dict[str, Any]]:
+        return [event for event in forwarded if event.get("type") == "message"]
+
+    refused, passes = [0], [0]
+    waits_out_move, recover = startup._waits_out_session_move, startup._recover_session
+
+    async def count_refusals(*args: Any) -> bool:
+        waited = await waits_out_move(*args)
+        refused[0] += waited
+        return waited
+
+    async def count_passes(*args: Any) -> bool:
+        passes[0] += 1
+        return await recover(*args)
+
+    monkeypatch.setattr(startup, "_waits_out_session_move", count_refusals)
+    monkeypatch.setattr(startup, "_recover_session", count_passes)
+    moving = orchestration._mark_session_moving(session_id)
+    moving.__enter__()
+    startup.host_changed(env.app, host_id)
+    [(_, worker, _)] = startup._workers.values()
+    try:
+        # The worker keeps retrying while the move holds the session.
+        await poll_until_async(lambda: refused[0] >= 3, timeout_s=10)
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (pending.id, pending.status) == (saved.id, "in_progress")
+        assert env.conv_store.list_items(session_id).data == []
+        assert turns() == []
+
+        moving.__exit__(None, None, None)
+        wake_startup_worker(host_id)
+        await poll_until_async(
+            lambda: len(turns()) == 1 and not env.conv_store.list_pending_inputs(session_id),
+            timeout_s=10,
+        )
+        # A full pass after the delivery finished does not deliver it again.
+        delivered_at = passes[0]
+        wake_startup_worker(host_id)
+        await poll_until_async(lambda: passes[0] > delivered_at, timeout_s=10)
+        assert len(turns()) == 1
+    finally:
+        if orchestration._session_is_moving(session_id):
+            moving.__exit__(None, None, None)
+        worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+        await runner.aclose()
+
+
 async def test_pending_input_retains_request_options_on_service_restart(startup_env: _Env) -> None:
     env = startup_env
     event = {**_INPUT, "model_override": "chosen-model", "tools": []}
@@ -713,6 +795,21 @@ async def test_host_refusal_keeps_startup_input_without_failing_session(
     snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
     assert snapshot["status"] != "failed"
     assert snapshot["last_task_error"] is None
+
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        assert await startup.retry(session_id)
+        [retried] = env.conv_store.list_pending_inputs(session_id)
+        assert retried.id == saved.id
+        await startup._deliver(env.app, session_id, retried)
+        await startup._deliver(env.app, session_id, retried)
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1
+        assert launch.await_count == 1
+    finally:
+        await runner.aclose()
 
 
 async def test_saved_sdk_skill_resolves_after_launch_and_replaces_pending_bubble(
@@ -804,6 +901,155 @@ def _stub_launch(
     stub = AsyncMock(side_effect=launch)
     monkeypatch.setattr("omnigent.server.routes.sessions._launch_runner_on_host", stub)
     return stub
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "connected",
+        "worker_restart",
+        "stop",
+        "expired",
+        "old_input",
+        "host_reconnected",
+        "host_reconnected_expired",
+    ],
+)
+async def test_saved_input_retains_the_slow_starting_runner(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Accepted input and its live runner survive the ordinary connect grace."""
+    from omnigent.server.routes import sessions as facade
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    session_id = await _create(
+        env,
+        name=(
+            CODEX_NATIVE_CODING_AGENT.agent_name
+            if outcome in {"expired", "host_reconnected_expired"}
+            else "startup-probe"
+        ),
+    )
+    saved = _bind(env, session_id)
+    if outcome == "old_input":
+        saved = saved.model_copy(update={"created_at": saved.created_at - 7200})
+    conv = env.conv_store.get_conversation(session_id)
+    runner_id = uuid4().hex
+    env.conv_store.set_runner_id(session_id, runner_id)
+    _connect_host(env, conv.host_id)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    connected = False
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        return runner if connected else None
+
+    grace = 0.03
+    monkeypatch.setattr(facade, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", grace)
+    monkeypatch.setattr(facade, "_get_runner_client", resolve)
+    expires = outcome in {"expired", "host_reconnected_expired"}
+    launch_started = orchestration.time.monotonic() - (599.7 if expires else 0)
+    queried_connections: list[Any] = []
+
+    async def status(connection: Any, *_args: Any, on_launch_age: Any = None) -> str:
+        queried_connections.append(connection)
+        if on_launch_age is not None:
+            on_launch_age(orchestration.time.monotonic() - launch_started)
+        return "alive"
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
+    monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
+    launch = _stub_launch(env, monkeypatch)
+    ordinary_finished = asyncio.Event()
+    extended = asyncio.Event()
+    waits: list[float] = []
+    original_wait = orchestration._wait_for_runner_client
+
+    async def wait(*args: Any, timeout_s: float, **kwargs: Any) -> Any:
+        waits.append(timeout_s)
+        if timeout_s > grace:
+            extended.set()
+        try:
+            return await original_wait(*args, timeout_s=timeout_s, **kwargs)
+        finally:
+            if timeout_s == grace:
+                ordinary_finished.set()
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
+    startup = env.app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_args: None)
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, saved))
+    restarted: ManagedStartupInputs | None = None
+    try:
+        await asyncio.wait_for(ordinary_finished.wait(), budget(5))
+        await poll_until_async(lambda: extended.is_set() or delivery.done(), timeout_s=budget(5))
+        assert extended.is_set(), "the saved input failed while its original runner was alive"
+        assert not delivery.done()
+        assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+        assert launch.await_count == 0
+        retry = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={**_INPUT, "data": {**_INPUT["data"], "stable_id": saved.id}},
+        )
+        assert retry.status_code == 202, retry.text
+        assert len(env.conv_store.list_pending_inputs(session_id)) == 1
+        assert launch.await_count == 0
+
+        if outcome.startswith("host_reconnected"):
+            replacement = _connect_host(env, conv.host_id)
+            await poll_until_async(
+                lambda: (
+                    any(connection is replacement for connection in queried_connections)
+                    or delivery.done()
+                ),
+                timeout_s=budget(5),
+            )
+            assert launch.await_count == 0, "a same-host reconnect replaced the admitted runner"
+            assert any(connection is replacement for connection in queried_connections)
+            assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+        if outcome == "worker_restart":
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+            ordinary_finished.clear()
+            extended.clear()
+            previous_wait_count = len(waits)
+            restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+            restarted.dispatch = startup.dispatch
+            delivery = asyncio.create_task(restarted._deliver(env.app, session_id, saved))
+            await asyncio.wait_for(extended.wait(), budget(5))
+            assert waits[previous_wait_count] > grace, "restart reused ordinary grace"
+            assert waits[-1] < waits[1], "restarting the worker renewed the startup deadline"
+            assert launch.await_count == 0
+        elif outcome == "stop":
+            await startup.cancel(session_id)
+            assert delivery.cancelled()
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            assert env.conv_store.list_items(session_id).data == []
+            return
+        elif expires:
+            await asyncio.wait_for(delivery, budget(5))
+            await startup._deliver(env.app, session_id, saved)
+            [pending] = env.conv_store.list_pending_inputs(session_id)
+            assert pending.id == saved.id and pending.status == "failed"
+            assert launch.await_count == 0
+            [error] = env.conv_store.list_items(session_id).data
+            assert error.data.code == "startup_input_failed"
+            assert not forwarded
+            return
+
+        connected = True
+        env.app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        await asyncio.wait_for(delivery, budget(5))
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        assert launch.await_count == 0
+        assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        if restarted is not None:
+            await restarted.shutdown()
+        await runner.aclose()
 
 
 async def test_host_replica_starts_the_runner_its_launch_skipped(
@@ -954,12 +1200,115 @@ async def test_failed_create_launch_is_visible_to_every_replica(
     assert pending.status == "failed"
     [error] = env.conv_store.list_items(session_id).data
     assert isinstance(error.data, ErrorData) and "spend limit reached" in error.data.message
+    # The snapshot keeps the undelivered message so the client can show it.
+    snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
+    assert snapshot["pending_inputs"] == []
+    assert [entry["content"] for entry in snapshot["failed_inputs"]] == [_INPUT["data"]["content"]]
     # Another replica has no tracker entry for the launch.
     env.app.state.managed_launches = type(env.app.state.managed_launches)()
     assert not await startup.accepts(conv, env.app)
     assert (
         await startup._recover_session(env.app, session_id, _connect_host(env, host_id)) is False
     )
+
+
+async def test_registration_timeout_fences_prompt_before_provider_hint(
+    startup_env: _Env, db_uri: str
+) -> None:
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
+    from omnigent.server.scheduled.fire import _ClaimedRunRecorder
+    from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+    from tests.server.helpers import FakeSandboxLauncher
+    from tests.server.scheduled.test_claimed_fire import _claim, _deps, _runs
+    from tests.server.test_managed_hosts import _injected_config
+
+    env = startup_env
+    session_id = await _create(env)
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.configure_dispatch(True)
+    claimed = _claim(store, execution_target="managed_sandbox", host_id=None, workspace=None)
+    host_id = claimed.lease.run.host_id
+    fake = FakeSandboxLauncher()
+    env.host_store.register_managed_host(
+        host_id=host_id,
+        name="late-host",
+        user_id="local",
+        token="launch-token",
+        token_expires_at=2**31,
+        provider=fake.provider,
+        sandbox_id="late-sandbox",
+    )
+    startup = env.app.state.startup_inputs
+    startup.dispatch = AsyncMock(return_value={})
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+    state = tracker.get(session_id)
+    assert state is not None
+    hint_started = asyncio.Event()
+    release_hint = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def hint() -> str:
+        loop.call_soon_threadsafe(hint_started.set)
+        release_hint.wait()
+        return "Inspect provider logs."
+
+    state.host_online_failure_hint = hint
+
+    async def launching() -> None:
+        try:
+            await asyncio.Future()
+        finally:
+            state.host_online_failure_hint = None
+
+    launch = asyncio.create_task(launching())
+    recorder = _ClaimedRunRecorder(
+        _deps(
+            store,
+            conversation_store=env.conv_store,
+            host_store=env.host_store,
+            startup_inputs=startup,
+            managed_launches=tracker,
+            sandbox_config=_injected_config(fake),
+        ),
+        claimed.task,
+        claimed.lease,
+        registration_timeout_s=0.01,
+    )
+    await recorder.session_created(session_id)
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None
+    failure = asyncio.create_task(recorder.hand_off_managed(conv, claimed.task, lambda *_: launch))
+    try:
+        await asyncio.wait_for(hint_started.wait(), 5)
+        env.conv_store.set_host_id(session_id, host_id, "/tmp/workspace")
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+        connection = _connect_host(env, host_id)
+        # A new worker and a delivery that already read the pending item both lose the claim.
+        assert not await startup._recover_session(env.app, session_id, connection)
+        context = StartupInputContext(env.app, Headers(), saved.created_by, saved.id)
+        assert not await context.claim(env.conv_store, session_id)
+        await startup._deliver(env.app, session_id, saved)
+        startup.dispatch.assert_not_awaited()
+        release_hint.set()
+        await asyncio.wait_for(failure, 5)
+    finally:
+        release_hint.set()
+        for task in (failure, launch):
+            task.cancel()
+        await asyncio.gather(failure, launch, return_exceptions=True)
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    assert run.error == (
+        "the sandbox did not register within 0.01 seconds — Inspect provider logs."
+    )
+    [error] = env.conv_store.list_items(session_id).data
+    assert isinstance(error.data, ErrorData)
+    assert error.data.message == f"The message could not be delivered: {run.error}"
+    assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
+    assert fake.terminated == ["late-sandbox"]
+    assert state.host_online_failure_hint is None
 
 
 async def _session_count(env: _Env) -> int:
@@ -1262,3 +1611,317 @@ async def test_saved_delivery_identifies_failed_boundary(
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
     ) == int(reported_stage == "post_delivery")
+
+
+@pytest.mark.parametrize("name", ["startup-probe", CODEX_NATIVE_CODING_AGENT.agent_name])
+@pytest.mark.parametrize("boundary", ["submission_claim", "resolved_client"])
+async def test_retained_startup_rebind_during_submission_claim_sends_nothing(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, boundary: str
+) -> None:
+    """A completed ownership read cannot authorize a later claim on a retired runner."""
+    import time
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    env = startup_env
+    session_id = await _create(env, name=name)
+    entry = _bind(env, session_id)
+    original_runner, replacement_runner = uuid4().hex, uuid4().hex
+    env.conv_store.replace_runner_id(session_id, original_runner)
+    if boundary == "submission_claim":
+        env.conv_store.claim_pending_input_runner(
+            session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+        )
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    transition = env.conv_store.transition_pending_input
+    rebound = False
+
+    def rebind() -> None:
+        nonlocal rebound
+        assert not rebound
+        rebound = True
+        env.conv_store.replace_runner_id(session_id, replacement_runner)
+        env.conv_store.set_session_live_status(session_id, "running")
+        sessions._session_status_cache[session_id] = "running"
+        sessions._session_active_response_cache[session_id] = "replacement-turn"
+
+    def claim_after_rebind(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("status") == "incomplete" and not rebound:
+            rebind()
+        return transition(*args, **kwargs)
+
+    async def resolve_then_rebind(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        if not rebound:
+            current = env.conv_store.get_conversation(session_id)
+            assert current is not None and current.runner_id == original_runner
+            rebind()
+        return runner
+
+    if boundary == "submission_claim":
+        monkeypatch.setattr(env.conv_store, "transition_pending_input", claim_after_rebind)
+    else:
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_then_rebind)
+    try:
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        await asyncio.wrap_future(
+            session_live_state.submit("test_startup_claim_barrier", lambda: None)
+        )
+        assert rebound
+        assert not [event for event in forwarded if event.get("type") == "message"]
+        current = env.conv_store.get_conversation(session_id)
+        assert current is not None and current.runner_id == replacement_runner
+        assert current.live_status == sessions._session_status_cache[session_id] == "running"
+        assert sessions._session_active_response_cache[session_id] == "replacement-turn"
+        [unsent] = env.conv_store.list_pending_inputs(session_id)
+        assert unsent.id == entry.id and unsent.status == "failed"
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    ("race", "boundary"),
+    [
+        ("replacement", "failure_cas"),
+        ("retention", "failure_cas"),
+        ("same_running", "failure_cas"),
+        ("same_waiting", "failure_cas"),
+        ("receipt", "failure_cas"),
+        ("stop", "failure_cas"),
+        ("replacement", "error_append"),
+        ("same_running", "error_append"),
+    ],
+)
+async def test_retained_startup_failure_preserves_newer_outcomes(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, race: str, boundary: str
+) -> None:
+    """A late refusal belongs to its pending input, not a successor or a settled receipt."""
+    import time
+
+    from omnigent.entities.conversation import NewConversationItem
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    original_runner, replacement_runner = uuid4().hex, uuid4().hex
+    env.conv_store.replace_runner_id(session_id, original_runner)
+    if race != "retention":
+        env.conv_store.claim_pending_input_runner(
+            session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+        )
+    env.conv_store.set_session_live_status(session_id, "idle")
+    sessions._session_status_cache[session_id] = "idle"
+    transition, append = env.conv_store.transition_pending_input, env.conv_store.append
+    injected = False
+    expected_status = (
+        "waiting"
+        if race == "same_waiting"
+        else "idle"
+        if race in {"receipt", "stop"}
+        else "running"
+    )
+
+    def overtake_failure() -> None:
+        nonlocal injected
+        if injected:
+            return
+        injected = True
+        if race == "replacement":
+            env.conv_store.replace_runner_id(session_id, replacement_runner)
+        elif race == "retention":
+            assert (
+                env.conv_store.claim_pending_input_runner(
+                    session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+                )
+                is not None
+            )
+        elif race == "receipt":
+            append(
+                session_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="native-receipt",
+                        stable_id=uuid4().hex,
+                        replaces_pending_id=entry.id,
+                        data=entry.data,
+                    )
+                ],
+            )
+        elif race == "stop":
+            env.conv_store.set_labels(session_id, {STARTUP_LABEL: "cancelled"})
+            current = env.conv_store.get_item(session_id, entry.id)
+            assert current is not None
+            assert transition(session_id, entry.id, expected=current.status, status=None)
+        env.conv_store.set_session_live_status(session_id, expected_status)
+        sessions._session_status_cache[session_id] = expected_status
+        if expected_status in {"running", "waiting"}:
+            sessions._session_active_response_cache[session_id] = "successor-turn"
+
+    def fail_after_newer_outcome(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("status") == "failed" and boundary == "failure_cas":
+            overtake_failure()
+        return transition(*args, **kwargs)
+
+    def append_after_newer_outcome(conversation_id: str, items: Any, **kwargs: Any) -> Any:
+        if boundary == "error_append" and any(isinstance(item.data, ErrorData) for item in items):
+            overtake_failure()
+        return append(conversation_id, items, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_after_newer_outcome)
+    monkeypatch.setattr(env.conv_store, "append", append_after_newer_outcome)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(side_effect=RuntimeError("synthetic pre-delivery refusal")),
+    )
+    await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+    await asyncio.wrap_future(
+        session_live_state.submit("test_startup_failure_barrier", lambda: None)
+    )
+    assert injected
+    current = env.conv_store.get_conversation(session_id)
+    assert current is not None
+    assert current.runner_id == (replacement_runner if race == "replacement" else original_runner)
+    assert current.live_status == sessions._session_status_cache[session_id] == expected_status
+    if expected_status in {"running", "waiting"}:
+        assert sessions._session_active_response_cache[session_id] == "successor-turn"
+    else:
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert not [
+            item for item in env.conv_store.list_items(session_id).data if item.type == "error"
+        ]
+
+    if race == "retention":
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (
+            pending.status == "in_progress"
+            and pending.data.startup_options.runner_wait is not None
+        )
+
+
+async def test_retained_startup_connection_outlives_its_connect_deadline(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparation after a timely connection must not become a connection-timeout failure."""
+    from types import SimpleNamespace
+
+    from omnigent.server import startup_inputs
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    runner_id = uuid4().hex
+    env.conv_store.replace_runner_id(session_id, runner_id)
+    current = env.conv_store.get_conversation(session_id)
+    assert current is not None and current.host_id is not None
+    _connect_host(env, current.host_id)
+    deadline, clock = 1010.0, [1000.0]
+    env.conv_store.claim_pending_input_runner(
+        session_id, entry.id, runner_id=runner_id, deadline=deadline
+    )
+    monkeypatch.setattr(startup_inputs, "time", SimpleNamespace(time=lambda: clock[0]))
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    connected = False
+
+    async def connect(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        nonlocal connected
+        assert kwargs["runner_id"] == runner_id
+        assert clock[0] < deadline
+        connected = True
+        return runner
+
+    async def prepare(*args: Any, **kwargs: Any) -> None:
+        assert connected
+        clock[0] = deadline + 1
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", connect)
+    monkeypatch.setattr(
+        orchestration, "_query_host_runner_status", AsyncMock(return_value="alive")
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", prepare)
+    try:
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        assert connected
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and turns[0]["persisted_item_id"] == entry.id
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert not [
+            item for item in env.conv_store.list_items(session_id).data if item.type == "error"
+        ]
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_stop_retires_a_dispatched_startup_failure_write(
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    repeat_cancel: bool,
+) -> None:
+    import threading
+    import time
+
+    from omnigent.server.routes import sessions
+    from tests._helpers.polling import poll_until_async
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    runner_id = uuid4().hex
+    env.conv_store.replace_runner_id(session_id, runner_id)
+    env.conv_store.claim_pending_input_runner(
+        session_id, entry.id, runner_id=runner_id, deadline=time.time() + 120
+    )
+    env.conv_store.set_session_live_status(session_id, "idle")
+    sessions._session_status_cache[session_id] = "idle"
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    failure_write = env.conv_store.fail_session_startup
+    cancellation: list[Any] = []
+
+    def blocked_write(*args: Any, **kwargs: Any) -> bool:
+        cancellation.append(kwargs.get("cancelled"))
+        entered.set()
+        try:
+            assert release.wait(5)
+            return failure_write(*args, **kwargs)
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(env.conv_store, "fail_session_startup", blocked_write)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(side_effect=RuntimeError("synthetic policy refusal")),
+    )
+    startup = env.app.state.startup_inputs
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, entry))
+    stop = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        stop = asyncio.create_task(startup.cancel(session_id))
+        await poll_until_async(
+            lambda: (
+                stop.done()
+                or (bool(cancellation) and cancellation[0] is not None and cancellation[0]())
+            ),
+            timeout_s=3,
+        )
+        if repeat_cancel:
+            delivery.cancel()
+        release.set()
+        await asyncio.wait_for(stop, 3)
+        assert await asyncio.to_thread(drained.wait, 3)
+        assert env.conv_store.get_conversation(session_id).live_status == "idle"
+        assert env.conv_store.list_pending_inputs(session_id) == []
+    finally:
+        release.set()
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        if stop is not None:
+            await asyncio.gather(stop, return_exceptions=True)

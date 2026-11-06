@@ -23,13 +23,15 @@ import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from time import monotonic
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
 from omnigent.db.db_models import InvalidUuidError, uuid_to_bytes
+from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import debug_event, set_current_user_id
 from omnigent.errors import ErrorCategory, ErrorImpact, ErrorPhase
 from omnigent.host.frames import (
@@ -93,6 +95,9 @@ from omnigent.server.host_registry import (
 )
 from omnigent.server.tunnel_handshake import receive_tunnel_hello
 from omnigent.stores.host_store import HostStore
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_hosts import ManagedSandboxDeployment
 
 _logger = logging.getLogger(__name__)
 
@@ -160,6 +165,7 @@ def create_host_tunnel_router(
     local_single_user: bool | None = None,
     runner_exit_reports: RunnerExitReports | None = None,
     harness_install: HarnessInstallGate = False,
+    sandbox_config: ManagedSandboxDeployment | None = None,
 ) -> APIRouter:
     """Build the router hosting the ``/hosts/{id}/tunnel`` WS endpoint.
 
@@ -205,6 +211,8 @@ def create_host_tunnel_router(
         minimal test wiring) drops the reports.
     :param harness_install: Static or callable harness-install gate. A capable
         host is asked for accounts after connect only when this resolves true.
+    :param sandbox_config: Provider TTLs for renewing authenticated managed
+        hosts. Missing providers keep their existing token expiry.
     :returns: A FastAPI router with the host tunnel endpoint.
     """
     from omnigent.server.auth import local_single_user_enabled
@@ -256,6 +264,7 @@ def create_host_tunnel_router(
         # only the handshake headers/cookies, which Starlette exposes before
         # ``accept()``.
         managed_token = ws.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        managed_token_ttl_s = None
         if managed_token is not None:
             # A managed-host launch token is an explicit credential: when
             # presented, it must resolve — never fall through to user auth
@@ -271,6 +280,26 @@ def create_host_tunnel_router(
                 await ws.close(code=4004, reason="unauthenticated")
                 return
             tunnel_owner = managed.user_id
+            if sandbox_config is not None:
+                provider_config = sandbox_config.for_provider(managed.sandbox_provider)
+                if (
+                    provider_config is None
+                    and len(sandbox_config.configs) == 1
+                    and sandbox_config.default.provider is None
+                ):
+                    try:
+                        launcher = await asyncio.to_thread(sandbox_config.default.launcher_factory)
+                    except Exception:
+                        _logger.debug(
+                            "Cannot resolve sandbox provider for host %s; skipping token renewal",
+                            host_id,
+                            exc_info=True,
+                        )
+                    else:
+                        if launcher.provider == managed.sandbox_provider:
+                            provider_config = sandbox_config.default
+                if provider_config is not None:
+                    managed_token_ttl_s = provider_config.token_ttl_s
         elif auth_provider is not None:
             authenticated_owner = auth_provider.get_user_id(ws)
             if authenticated_owner is None:
@@ -455,12 +484,16 @@ def create_host_tunnel_router(
                     name=f"host-sender:{host_id}",
                 )
                 heartbeat_requested = asyncio.Event()
+                if managed_token_ttl_s is not None:
+                    heartbeat_requested.set()
                 heartbeat_task = asyncio.create_task(
                     _heartbeat_loop(
                         heartbeat_requested,
                         host_id=host_id,
                         host_store=host_store,
                         connection_id=frame.connection_id,
+                        managed_token=managed_token,
+                        token_ttl_s=managed_token_ttl_s,
                     ),
                     name=f"host-heartbeat:{host_id}",
                 )
@@ -924,7 +957,9 @@ async def _receive_loop(
         if isinstance(frame, HostRunnerStatusResultFrame):
             status_future = conn.pending_runner_status.pop(frame.request_id, None)
             if status_future is not None and not status_future.done():
-                status_future.set_result({"status": frame.status})
+                status_future.set_result(
+                    {"status": frame.status, "launch_age_s": frame.launch_age_s}
+                )
             continue
 
         if isinstance(frame, HostStatResultFrame):
@@ -1289,19 +1324,35 @@ async def _heartbeat_loop(
     host_id: str,
     host_store: HostStore,
     connection_id: str | None = None,
+    managed_token: str | None = None,
+    token_ttl_s: int | None = None,
 ) -> None:
-    """Serialize host-liveness writes independently of socket pings."""
+    """Persist liveness off the ping loop; renew tokens halfway through their TTL."""
     failure_count = 0
     last_failure_log_at = 0.0
+    next_token_renewal_at = 0.0
+    heartbeat_cancelled = threading.Event()
     while True:
         await requested.wait()
         requested.clear()
         started_at = time.monotonic()
+        renewal_started_at = monotonic()
+        renewal_ttl_s = token_ttl_s if renewal_started_at >= next_token_renewal_at else None
         try:
-            # Cancellation cannot stop the thread, but heartbeat only updates
-            # last-seen; a late write cannot change an offline host's status.
-            await asyncio.to_thread(host_store.heartbeat, host_id)
+            # A late managed heartbeat must still match its live credential.
+            if managed_token is not None:
+                await asyncio.to_thread(
+                    host_store.heartbeat,
+                    host_id,
+                    managed_token=managed_token,
+                    token_ttl_s=renewal_ttl_s,
+                    observed_at=now_epoch(),
+                    cancelled=heartbeat_cancelled.is_set,
+                )
+            else:
+                await asyncio.to_thread(host_store.heartbeat, host_id)
         except asyncio.CancelledError:
+            heartbeat_cancelled.set()
             raise
         except Exception as exc:  # noqa: BLE001 -- persistence must not kill the tunnel
             failure_count += 1
@@ -1330,6 +1381,8 @@ async def _heartbeat_loop(
                 last_failure_log_at = now
             continue
 
+        if renewal_ttl_s is not None:
+            next_token_renewal_at = renewal_started_at + renewal_ttl_s / 2
         if failure_count:
             _logger.info(
                 "Host %s heartbeat persistence recovered after %d failure(s)",

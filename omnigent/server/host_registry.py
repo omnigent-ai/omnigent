@@ -509,7 +509,7 @@ class HostConnection:
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
-    pending_runner_status: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+    pending_runner_status: dict[str, asyncio.Future[dict[str, str | float | None]]] = field(
         default_factory=dict,
     )
     pending_stats: dict[str, asyncio.Future[dict[str, Any]]] = field(

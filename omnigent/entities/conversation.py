@@ -225,6 +225,8 @@ class Conversation:
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
+    :param side_chat_parent_id: The session whose Workspace rail lists this
+        one as a side chat, or ``None`` when it is not a listed side chat.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -269,17 +271,31 @@ class Conversation:
     # outstanding approval-prompt count (None = never written);
     # ``runner_last_seen`` is the runner tunnel's last heartbeat (epoch
     # seconds, None = no live stamp) — carried on the row so a session list
-    # can judge runner liveness without a second connectivity query.
+    # can judge runner liveness without a second connectivity query;
+    # ``background_work_running`` is whether a background shell outlives the
+    # ended turn (None = never written); ``blocked_on`` is why a running
+    # session's agent is parked on a terminal prompt (None = not parked).
     live_status: str | None = None
     pending_elicitation_count: int | None = None
     runner_last_seen: int | None = None
+    background_work_running: bool | None = None
+    blocked_on: str | None = None
     project_id: str | None = None
+    side_chat_parent_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None
 
 
 # ── Conversation item data types ───────────────────────
+
+
+class StartupRunnerWait(BaseModel):
+    """One accepted input's runner and absolute startup deadline, retained across restarts."""
+
+    runner_id: str = Field(min_length=1)
+    deadline: float = Field(gt=0, allow_inf_nan=False)
+    connected: bool = False
 
 
 class StartupInputOptions(BaseModel):
@@ -289,6 +305,7 @@ class StartupInputOptions(BaseModel):
     tools: list[dict[str, Any]] | None = None
     background_titles_enabled: bool = False
     scheduled_run: ScheduledRunLogContext | None = None
+    runner_wait: StartupRunnerWait | None = None
 
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.

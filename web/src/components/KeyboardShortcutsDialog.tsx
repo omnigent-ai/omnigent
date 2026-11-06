@@ -9,21 +9,42 @@
 // (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
 // it without prop-drilling). Mount it once near the app shell.
 
-import { Fragment, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
+  ADDRESS_BAR_KEYS,
   ALT_KEY,
+  ARCHIVE_SESSION_KEYS,
+  CLOSE_KEYS,
+  CLOSE_WINDOW_KEYS,
+  ARROW_DOWN_KEY,
+  ARROW_UP_KEY,
   composerNewLineShortcutKeys,
   composerSendShortcutKeys,
   composerSteerAllShortcutKeys,
   CTRL_KEY,
   ENTER_KEY,
+  ESC_KEY,
+  FORK_SESSION_KEYS,
   Kbd,
   MOD_KEY,
+  NEW_BROWSER_TAB_KEYS,
+  NEW_TERMINAL_KEYS,
   newSessionShortcutKeys,
+  NEXT_TAB_KEYS,
+  PIN_SESSION_KEYS,
+  PREVIOUS_TAB_KEYS,
+  sessionNumberShortcutKeys,
+  QUIT_KEYS,
+  RELOAD_KEYS,
+  REOPEN_TAB_KEYS,
+  rightSidebarToggleShortcutKeys,
+  settingsShortcutKeys,
   SHIFT_KEY,
+  sidebarToggleShortcutKeys,
   SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
+  workspaceTabShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import {
   Dialog,
@@ -38,7 +59,12 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
+import {
+  isElectronShell,
+  isNativeShell,
+  supportsBrowser,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -50,9 +76,9 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const UP = "↑";
-const DOWN = "↓";
+// Same glyph constants the control tooltips use, so the dialog and tooltips match.
+const UP = ARROW_UP_KEY;
+const DOWN = ARROW_DOWN_KEY;
 const BRACKET_LEFT = "[";
 const BRACKET_RIGHT = "]";
 
@@ -61,9 +87,10 @@ interface Shortcut {
   /** Keys rendered left→right as chips. A chord (held together) or, for the
    *  arrow-pairs, the two interchangeable keys for that action. */
   keys: string[];
-  lastKeySeparator?: string;
   /** Another chord for the same action, shown after "or". */
   alternateKeys?: string[];
+  /** Hidden on touch and narrow layouts, where Enter inserts a newline instead of submitting. */
+  desktopOnly?: boolean;
 }
 
 interface ShortcutGroup {
@@ -82,7 +109,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
-      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
+      { label: "Open Settings", keys: settingsShortcutKeys(false) },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -92,36 +119,36 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Recall previous prompt", keys: [UP] },
       { label: "Recall next prompt", keys: [DOWN] },
       { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
+      { label: "Decline approval prompt", keys: [ESC_KEY] },
+      { label: "Next question, or submit all answers", keys: [ENTER_KEY], desktopOnly: true },
+      { label: "Pick a question option by number", keys: ["1…9"], desktopOnly: true },
+      { label: "Cancel pending question", keys: ["Esc"], desktopOnly: true },
       { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
       { label: "Cycle model", keys: [CTRL_KEY, ALT_KEY, "M"] },
       { label: "Cycle reasoning effort", keys: [CTRL_KEY, ALT_KEY, "E"] },
       { label: "Cycle permission mode (in session)", keys: [SHIFT_KEY, "Tab"] },
       { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
       { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
-      { label: "Stop response", keys: ["Esc"] },
+      { label: "Stop response", keys: [ESC_KEY] },
     ],
   },
   {
     title: "Navigation",
     items: [
-      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
-      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
+      { label: "Go back", keys: [MOD_KEY, BRACKET_LEFT] },
+      { label: "Go forward", keys: [MOD_KEY, BRACKET_RIGHT] },
     ],
   },
   {
     title: "View",
     items: [
       { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
+      { label: "Toggle conversations sidebar", keys: sidebarToggleShortcutKeys(false) },
+      { label: "Toggle workspace sidebar", keys: rightSidebarToggleShortcutKeys(false) },
       { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
-      {
-        label: "Select a workspace tab",
-        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
-        lastKeySeparator: "+",
-      },
-      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
+      { label: "Select a workspace tab", keys: workspaceTabShortcutKeys("1…4") },
+      { label: "Open a new browser tab", keys: [...NEW_BROWSER_TAB_KEYS] },
+      { label: "Open a new shell", keys: [...NEW_TERMINAL_KEYS] },
     ],
   },
   {
@@ -138,19 +165,43 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
     items: [
       { label: "Navigate suggestions", keys: [UP, DOWN] },
       { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
+      { label: "Dismiss menu", keys: [ESC_KEY] },
     ],
   },
 ];
 
-// Numeric pinned-session jump. The chord is platform-aware (see
-// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
+// Desktop menu commands (File → Close, Session → Pin/Archive, Quit), present
+// only when the shell hands them to the page.
+const DESKTOP_COMMAND_SHORTCUTS: Shortcut[] = [
+  { label: "Close tab, or leave the session", keys: [...CLOSE_KEYS] },
+  { label: "Close window", keys: [...CLOSE_WINDOW_KEYS] },
+  { label: "Pin or unpin current session", keys: [...PIN_SESSION_KEYS] },
+  { label: "Archive current session", keys: [...ARCHIVE_SESSION_KEYS] },
+  { label: "Fork current session", keys: [...FORK_SESSION_KEYS] },
+  { label: "Quit Omnigent", keys: [...QUIT_KEYS] },
+];
+
+// Desktop menu chords for the workspace rail's tabs.
+const DESKTOP_TAB_SHORTCUTS: Shortcut[] = [
+  { label: "Show the previous workspace tab", keys: [...PREVIOUS_TAB_KEYS] },
+  { label: "Show the next workspace tab", keys: [...NEXT_TAB_KEYS] },
+  { label: "Reopen the last closed tab", keys: [...REOPEN_TAB_KEYS] },
+];
+
+// Desktop menu chords that act on the browser tab in the workspace rail.
+const DESKTOP_BROWSER_SHORTCUTS: Shortcut[] = [
+  { label: "Reload the browser tab", keys: [...RELOAD_KEYS] },
+  { label: "Focus the browser address bar", keys: [...ADDRESS_BAR_KEYS] },
+];
+
+// Numbered sidebar-session jump. The chord is platform-aware (see
+// useSessionNumberHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
 // Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
 // native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
+function sessionNumberShortcut(native: boolean): Shortcut {
   return {
-    label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
+    label: "Jump to a sidebar session (1–10)",
+    keys: sessionNumberShortcutKeys("1…0", native),
   };
 }
 
@@ -164,6 +215,7 @@ function shortcutGroupsFor(
   contentSearch: boolean,
   grids: boolean,
   splitTerminal: boolean,
+  desktopCommands: boolean,
 ): ShortcutGroup[] {
   const groups = SHORTCUT_GROUPS.map((group) => {
     if (group.title === "General") {
@@ -171,27 +223,36 @@ function shortcutGroupsFor(
         ...group,
         items: [
           { label: "Start a new session", keys: newSessionShortcutKeys(native) },
-          ...group.items,
+          // The desktop menu's Settings item owns ⌘, there.
+          ...group.items.map((item) =>
+            item.label === "Open Settings"
+              ? { ...item, keys: settingsShortcutKeys(desktopCommands) }
+              : item,
+          ),
+          ...(desktopCommands ? DESKTOP_COMMAND_SHORTCUTS : []),
         ],
       };
     }
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
+    if (group.title === "In chats") {
+      const chatItems = preventsKeyboardSubmit
+        ? group.items.filter((item) => !item.desktopOnly)
+        : group.items;
       return {
         ...group,
-        items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
-          {
-            label: "Send now, with all queued messages",
-            keys: composerSteerAllShortcutKeys(submitWithModEnter),
-          },
-          {
-            label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
-            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
-            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
-          },
-          ...group.items,
-        ],
+        items: preventsKeyboardSubmit
+          ? chatItems
+          : [
+              { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
+              {
+                label: "Send now, with all queued messages",
+                keys: composerSteerAllShortcutKeys(submitWithModEnter),
+              },
+              {
+                label: "New line in message",
+                keys: composerNewLineShortcutKeys(submitWithModEnter),
+              },
+              ...chatItems,
+            ],
       };
     }
     if (group.title === "Navigation") {
@@ -200,7 +261,7 @@ function shortcutGroupsFor(
         items: [
           ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
           ...group.items,
-          pinnedSessionShortcut(native),
+          sessionNumberShortcut(native),
         ],
       };
     }
@@ -210,13 +271,26 @@ function shortcutGroupsFor(
         items: group.items
           .filter(
             (item) =>
-              (browser || item.label !== "Open a new browser tab") &&
+              // ⌘T is the desktop menu's New Browser Tab, so older shells have no chord.
+              ((browser && desktopCommands) || item.label !== "Open a new browser tab") &&
               (contentSearch || item.label !== "Search workspace contents"),
           )
-          .map((item) =>
-            contentSearch && item.label === "Select a workspace tab"
-              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
-              : item,
+          .map((item) => {
+            if (contentSearch && item.label === "Select a workspace tab") {
+              return { ...item, keys: workspaceTabShortcutKeys("1…5") };
+            }
+            // The desktop app uses ⌘B / ⇧⌘B, which a browser keeps for bookmarks.
+            if (item.label === "Toggle conversations sidebar") {
+              return { ...item, keys: sidebarToggleShortcutKeys(native) };
+            }
+            if (item.label === "Toggle workspace sidebar") {
+              return { ...item, keys: rightSidebarToggleShortcutKeys(native) };
+            }
+            return item;
+          })
+          .concat(
+            desktopCommands ? DESKTOP_TAB_SHORTCUTS : [],
+            desktopCommands && browser ? DESKTOP_BROWSER_SHORTCUTS : [],
           ),
       };
     }
@@ -263,6 +337,7 @@ export function KeyboardShortcutsList({
     !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
     !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
     !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
+    supportsDesktopCommands(),
   );
   const settings = variant === "settings";
   return (
@@ -293,15 +368,8 @@ export function KeyboardShortcutsList({
               >
                 <span className="text-ui text-foreground">{item.label}</span>
                 <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key, index) => (
-                    <Fragment key={`${item.label}-${key}`}>
-                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
-                        <span aria-hidden="true" className="text-muted-foreground/70">
-                          {item.lastKeySeparator}
-                        </span>
-                      ) : null}
-                      <Kbd>{key}</Kbd>
-                    </Fragment>
+                  {item.keys.map((key) => (
+                    <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
                   ))}
                   {item.alternateKeys ? (
                     <>

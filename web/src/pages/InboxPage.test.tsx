@@ -26,6 +26,7 @@ import type { Conversation } from "@/hooks/useConversations";
 import * as conversationsHook from "@/hooks/useConversations";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
 import * as commentInboxHook from "@/hooks/useCommentInbox";
+import { resetLocalElicitationResolutionsForTests } from "@/lib/localElicitationResolutions";
 import * as sessionsApi from "@/lib/sessionsApi";
 import {
   type AskUserQuestionDraft,
@@ -197,6 +198,7 @@ afterEach(() => {
   cleanup();
   vi.clearAllMocks();
   resetReadStateForTests();
+  resetLocalElicitationResolutionsForTests();
   localStorage.clear();
   clearAskUserQuestionDraft("eli_1");
   clearAskUserQuestionDraft("eli_question");
@@ -392,6 +394,25 @@ describe("InboxPage approval items", () => {
       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
     );
     expect(getAskUserQuestionDraft("eli_1", draftSignature)).toBeUndefined();
+  });
+
+  it("keeps an answered approval of an unseen idle session out of the unread list", async () => {
+    // WHY: answering lowers the sidebar's count at once, but the card stays listed
+    // until the server drops the prompt, so the session must not also read as unread.
+    const row = unreadConversation({ pending_elicitations_count: 1 });
+    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
+    vi.mocked(sessionsApi.getSession).mockResolvedValue({
+      pendingElicitations: [rawElicitation("eli_1", "Approve this?")],
+    } as unknown as Awaited<ReturnType<typeof sessionsApi.getSession>>);
+    vi.mocked(sessionsApi.approve).mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+    );
+    expect(screen.queryByTestId("inbox-unread")).not.toBeInTheDocument();
   });
 
   it("offers auto mode from a snapshot and sends the choice to the owning session", async () => {
@@ -1123,23 +1144,6 @@ describe("InboxPage replies", () => {
     await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
   });
 
-  it("inserts a newline on Alt+Enter instead of sending", async () => {
-    const row = unreadConversation();
-    vi.mocked(conversationsHook.useConversations).mockReturnValue(conversationsStub([row]));
-    renderPage();
-
-    await screen.findByTestId("inbox-unread");
-    const box = within(expandUnread()).getByRole<HTMLTextAreaElement>("textbox", {
-      name: /Reply to/,
-    });
-    fireEvent.change(box, { target: { value: "firstsecond" } });
-    box.setSelectionRange(5, 5);
-
-    expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
-    expect(box).toHaveValue("first\nsecond");
-    expect(sessionsApi.postEvent).not.toHaveBeenCalled();
-  });
-
   it("never sends the Enter that confirms an IME candidate", async () => {
     // WHY: Safari confirms a candidate with an Enter that isn't flagged as
     // composing (keyCode 229), which would send a half-typed reply.
@@ -1185,7 +1189,7 @@ describe("InboxPage replies", () => {
     );
     fireEvent.keyDown(box, { key: "Enter" });
     fireEvent.click(send);
-    // Alt+Enter's fallback edits even a read-only box; it must not unlock it.
+    // Enter with a modifier is held while the reply sends, too.
     expect(fireEvent.keyDown(box, { key: "Enter", altKey: true })).toBe(false);
     fireEvent.change(box, { target: { value: "Ship it twice" } });
     expect(box).toHaveValue("Ship it");

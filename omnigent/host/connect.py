@@ -198,6 +198,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_AUTH_REJECTED_CAUSE,
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -1213,6 +1214,8 @@ class _RunnerHandle:
         or superseded launches, even after the exit watcher pops them.
     :param create_time: Process start time recorded while the runner was
         alive, used to reject a reused PID before signalling a forked runner.
+    :param launch_started_monotonic: Owning spawn's immutable start, retained
+        across tunnel reconnects; absent for handles without launch-age authority.
     """
 
     proc: subprocess.Popen[bytes] | ZygoteRunnerProc
@@ -1221,6 +1224,7 @@ class _RunnerHandle:
     connect_marker: Path | None = None
     stop_requested: bool = False
     create_time: float | None = None
+    launch_started_monotonic: float | None = None
 
 
 @dataclass(frozen=True)
@@ -2213,6 +2217,7 @@ class HostProcess:
         # zygote would retain its exit status forever. On cancellation we let
         # the spawn land and then tear that runner down.
         with self._host_subprocess_op():
+            launch_started_monotonic = time.monotonic()
             spawn = asyncio.ensure_future(
                 asyncio.to_thread(self._spawn_runner_proc, env, _session_slug, workspace)
             )
@@ -2281,6 +2286,7 @@ class HostProcess:
             session_id=frame.session_id or None,
             connect_marker=_connect_marker_path(log_path),
             create_time=_proc.process_create_time(proc.pid),
+            launch_started_monotonic=launch_started_monotonic,
         )
         launch_context = current_scheduled_run()
         with scheduled_run_scope(None, session_id=frame.session_id):
@@ -2504,14 +2510,43 @@ class HostProcess:
         :param frame: The stop request frame.
         :returns: Result frame with status.
         """
+        return await self._finish_stop(frame, self._claim_runner_for_stop(frame))
+
+    def _claim_runner_for_stop(self, frame: HostStopRunnerFrame) -> _RunnerHandle | None:
+        """Untrack the runner a stop names, marking its exit as intentional.
+
+        This is the only part of a stop that must keep arrival order with
+        launches, so the frame dispatcher runs it under the lifecycle lock.
+
+        :param frame: The stop request frame.
+        :returns: The claimed handle, or ``None`` for an unknown runner.
+        """
         handle = self._runners.pop(frame.runner_id, None)
+        if handle is not None:
+            handle.stop_requested = True
+        return handle
+
+    async def _finish_stop(
+        self,
+        frame: HostStopRunnerFrame,
+        handle: _RunnerHandle | None,
+    ) -> HostStopRunnerResultFrame:
+        """Terminate a claimed runner and build the stop result.
+
+        Runs outside the lifecycle lock: termination can wait out the
+        runner's exit grace, and launches queued behind a burst of stops
+        would otherwise exceed the server's launch timeout.
+
+        :param frame: The stop request frame.
+        :param handle: The handle from :meth:`_claim_runner_for_stop`.
+        :returns: Result frame with status.
+        """
         if handle is None:
             return HostStopRunnerResultFrame(
                 request_id=frame.request_id,
                 status="failed",
                 error=f"unknown runner: {frame.runner_id}",
             )
-        handle.stop_requested = True
         # The poll/terminate/wait round-trips are lock-free waitpid calls for a
         # direct-Popen runner, but blocking control-socket exchanges for a
         # zygote-forked one — run them off the loop so a wedged zygote can't
@@ -2647,6 +2682,7 @@ class HostProcess:
             # Shield shared completions from a status request's cancellation.
             await asyncio.shield(asyncio.gather(*pending, return_exceptions=True))
         handle = self._runners.get(frame.runner_id)
+        launch_age_s = None
         if handle is None:
             status = "unknown"
         else:
@@ -2667,9 +2703,34 @@ class HostProcess:
                 and not handle.stop_requested
             ):
                 status = "sign_in_pending"
+            if (
+                status == "alive"
+                and handle.create_time is not None
+                and handle.launch_started_monotonic is not None
+                and handle.connect_marker is not None
+                and not handle.stop_requested
+            ):
+                identity = await asyncio.to_thread(_proc.process_create_time, handle.proc.pid)
+                if identity is not None and identity != handle.create_time:
+                    status = "unknown"
+                elif identity == handle.create_time:
+                    try:
+                        connected = await asyncio.to_thread(handle.connect_marker.exists)
+                    except OSError:
+                        connected = None
+                    if (
+                        connected is False
+                        and self._runners.get(frame.runner_id) is handle
+                        and not handle.stop_requested
+                    ):
+                        launch_age_s = time.monotonic() - handle.launch_started_monotonic
+            if self._runners.get(frame.runner_id) is not handle or handle.stop_requested:
+                status = "unknown"
+                launch_age_s = None
         return HostRunnerStatusResultFrame(
             request_id=frame.request_id,
             status=status,
+            launch_age_s=launch_age_s,
         )
 
     async def _watch_runner(
@@ -2740,8 +2801,8 @@ class HostProcess:
             )
             if auth_rejected:
                 error = (
-                    "The server rejected this host's credentials, so the runner could not "
-                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{RUNNER_AUTH_REJECTED_CAUSE} Sign in again with "
+                    f"`{cli_invocation()} login "
                     f"{self._login_hint_url()}` "
                     f"on this host, then retry. Details: {error}"
                 )
@@ -5899,7 +5960,8 @@ class HostProcess:
                 raise launch_fault
         elif isinstance(frame, HostStopRunnerFrame):
             async with self._runner_lifecycle_lock:
-                stop_result = await self._handle_stop(frame)
+                stopping_handle = self._claim_runner_for_stop(frame)
+            stop_result = await self._finish_stop(frame, stopping_handle)
             await self._send_text(ws, self._encode_frame(stop_result))
         elif isinstance(frame, HostRunnerStatusFrame):
             await self._send_text(ws, self._encode_frame(await self._handle_runner_status(frame)))
