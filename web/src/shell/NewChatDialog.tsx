@@ -118,6 +118,8 @@ import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTi
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
+import { isInlineRenameFocused } from "@/lib/inlineRename";
+import { requestsComposerFocus } from "@/hooks/useNewSessionHotkey";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
@@ -2411,6 +2413,16 @@ export function NewChatLandingScreen() {
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  // Cmd/Ctrl+N and File > New Session navigate here asking for focus. With the
+  // page already showing, that adds a history entry without remounting, so the
+  // textarea's autoFocus can't fire. Touch viewports skip it to keep the keyboard down.
+  const isMobileViewportRef = useRef(isMobileViewport);
+  isMobileViewportRef.current = isMobileViewport;
+  useEffect(() => {
+    if (!requestsComposerFocus(location.state)) return;
+    if (isMobileViewportRef.current || isInlineRenameFocused()) return;
+    textareaRef.current?.focus({ preventScroll: true });
+  }, [location.key, location.state]);
   const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
   const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
     "closed",

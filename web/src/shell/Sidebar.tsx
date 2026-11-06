@@ -10,6 +10,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
+import { NEW_SESSION_COMPOSER_FOCUS_STATE } from "@/hooks/useNewSessionHotkey";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
@@ -1275,7 +1276,8 @@ function SidebarImpl({
               {/* "New session" routes to the home composer ("/"), which now owns
             session creation end-to-end (host/workspace/worktree chips +
             send). Rendered as a Link so cmd/middle-click opens it in a new
-            tab; onNavClick still closes the sidebar on a plain mobile tap. */}
+            tab; onNavClick still closes the sidebar on a plain mobile tap. The
+            state lands the caret in the composer, like Cmd/Ctrl+N. */}
               <Button
                 asChild
                 className={cn(
@@ -1297,6 +1299,7 @@ function SidebarImpl({
               (the button stays visible on both tabs). */}
                 <Link
                   to="/"
+                  state={NEW_SESSION_COMPOSER_FOCUS_STATE}
                   componentId="sidebar.new_chat"
                   aria-keyshortcuts={newSessionAriaShortcut()}
                   onClick={(e) => {

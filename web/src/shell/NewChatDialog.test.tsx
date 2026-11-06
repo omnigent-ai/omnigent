@@ -39,6 +39,7 @@ import type * as ChatStoreModule from "@/store/chatStore";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { NEW_SESSION_COMPOSER_FOCUS_STATE } from "@/hooks/useNewSessionHotkey";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback, useCallback } from "react";
 import {
@@ -1381,6 +1382,15 @@ function LandingNavigationProbe() {
       <button type="button" onClick={() => navigate("?prompt=Another+request")}>
         Open another prompt link
       </button>
+      <button type="button" onClick={() => navigate("/")}>
+        Revisit the page
+      </button>
+      <button
+        type="button"
+        onClick={() => navigate("/", { state: NEW_SESSION_COMPOSER_FOCUS_STATE })}
+      >
+        Start another new session
+      </button>
     </>
   );
 }
@@ -1561,6 +1571,22 @@ describe("prompt URL handoff", () => {
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Edited by the user");
     fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
     expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Another request");
+  });
+
+  it("puts the caret back in the composer when New session reopens the page", () => {
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    expect(input).toHaveFocus();
+    // A plain revisit of "/" leaves focus where the user put it.
+    const revisit = screen.getByRole("button", { name: "Revisit the page" });
+    revisit.focus();
+    fireEvent.click(revisit);
+    expect(revisit).toHaveFocus();
+    // Cmd/Ctrl+N navigates to "/" without remounting the page, asking for focus.
+    const again = screen.getByRole("button", { name: "Start another new session" });
+    again.focus();
+    fireEvent.click(again);
+    expect(input).toHaveFocus();
   });
 
   it("overrides an old draft with a new link, then restores subsequent edits", () => {
