@@ -625,7 +625,16 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+    "evidence",
+    [
+        "permission_prompt",
+        "pane_output",
+        "pane_input",
+        "no_evidence",
+        "child_completed",
+        "child_failed",
+        "child_cancelled",
+    ],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
@@ -645,16 +654,22 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     :returns: None.
     """
     from omnigent.harnesses.claude_native import bridge
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.native._native_forwarder_health import NativeSubagentActivity
     from omnigent.runner.native import NativeLaunchContext
-    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.runner.resource_registry import (
+        CLAUDE_NATIVE_TERMINAL_ROLE,
+        CODEX_NATIVE_TERMINAL_ROLE,
+    )
     from omnigent.spec.types import AgentSpec, ExecutorSpec
     from omnigent.terminals import TerminalRegistry
     from tests.runner.conftest import _runner_client, _spec_resolver_returning
     from tests.runner.helpers import make_test_terminal_instance
 
     conv_id = "conv_idle_edge_live_pane"
+    terminal_name = "codex" if evidence.startswith("child_") else "claude"
     terminals = TerminalRegistry()
-    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
     monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
     monkeypatch.setattr(instance, "close", AsyncMock())
     monkeypatch.setattr(
@@ -670,21 +685,25 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
         bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
     spec = AgentSpec(
         spec_version=1,
-        name="claude-native-ui",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+        name=f"{terminal_name}-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": f"{terminal_name}-native"}),
     )
 
     async def launch(ctx: NativeLaunchContext):
-        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        terminals._by_conversation.setdefault(conv_id, {})[(terminal_name, "main")] = instance
         return await ctx.resource_registry.observe_required_terminal(
             conv_id,
-            "claude",
+            terminal_name,
             "main",
             instance,
-            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+            resource_role=(
+                CODEX_NATIVE_TERMINAL_ROLE
+                if terminal_name == "codex"
+                else CLAUDE_NATIVE_TERMINAL_ROLE
+            ),
         )
 
-    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    monkeypatch.setattr(f"omnigent.runner.native._launch_{terminal_name}", launch)
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
     )
@@ -697,11 +716,38 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
         async with _runner_client(app) as client:
             ensured = await client.post(
                 f"/v1/sessions/{conv_id}/resources/terminals",
-                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+                json={
+                    "terminal": terminal_name,
+                    "session_key": "main",
+                    "ensure_native_terminal": True,
+                },
             )
             assert ensured.status_code == 200, ensured.text
-            publish = app.state.session_resource_registry._session_status_publisher
-            publish(conv_id, "running", None)
-            publish(conv_id, "idle", None)
-            assert app.state.native_pane_status[conv_id] == "idle"
-            assert app.state.has_active_work() is (evidence != "no_evidence")
+            activity = NativeSubagentActivity(conv_id)
+            child_state = forwarder._CodexForwarderState(child_activity=activity)
+            child_params = {"threadId": "thread_child", "turn": {"id": "turn_child"}}
+            try:
+                if terminal_name == "codex":
+                    forwarder._note_child_activity_event(child_state, "turn/started", child_params)
+                publish = app.state.session_resource_registry._session_status_publisher
+                publish(conv_id, "running", None)
+                publish(conv_id, "idle", None)
+                assert app.state.native_pane_status[conv_id] == "idle"
+                assert app.state.has_active_work() is (evidence != "no_evidence")
+                if terminal_name == "codex":
+
+                    async def settle_child() -> None:
+                        if evidence == "child_cancelled":
+                            activity.close()
+                        else:
+                            method = (
+                                "turn/failed" if evidence == "child_failed" else "turn/completed"
+                            )
+                            forwarder._note_child_activity_event(child_state, method, child_params)
+
+                    await _assert_monitor_blocked_then_shuts_down(
+                        has_active_work=app.state.has_active_work, release=settle_child
+                    )
+                    assert app.state.has_active_work() is False
+            finally:
+                activity.close()
