@@ -111,12 +111,10 @@ class FakeInstaller:
     [
         (ANTHROPIC_FAMILY, "OMNIGENT_CLAUDE_PATH"),
         (OPENAI_FAMILY, "OMNIGENT_CODEX_PATH"),
-        (GEMINI_FAMILY, "OMNIGENT_ANTIGRAVITY_PATH"),
         (hi.PI_KEY, "OMNIGENT_PI_PATH"),
         (hi.KIMI_KEY, "OMNIGENT_KIMI_PATH"),
         (hi.CURSOR_KEY, "OMNIGENT_CURSOR_PATH"),
         (hi.KIRO_KEY, "OMNIGENT_KIRO_PATH"),
-        (hi.OPENCODE_KEY, "OMNIGENT_OPENCODE_PATH"),
         (hi.QWEN_KEY, "OMNIGENT_QWEN_PATH"),
         (hi.GOOSE_KEY, "OMNIGENT_GOOSE_PATH"),
         (hi.HERMES_KEY, "OMNIGENT_HERMES_PATH"),
@@ -140,6 +138,28 @@ def test_harness_cli_binary_uses_selected_path(
         ),
     )
     assert hi.harness_cli_binary(key) == (selected if selected_exists else None)
+
+
+@pytest.mark.parametrize(
+    ("key", "path_variable"),
+    [
+        (GEMINI_FAMILY, "OMNIGENT_ANTIGRAVITY_PATH"),
+        (hi.OPENCODE_KEY, "OMNIGENT_OPENCODE_PATH"),
+    ],
+)
+def test_harness_cli_binary_ignores_a_path_its_native_launch_does_not_read(
+    monkeypatch: pytest.MonkeyPatch, key: str, path_variable: str
+) -> None:
+    """Native launch finds these CLIs on PATH, so readiness reports that binary."""
+    spec = hi.harness_install_spec(key)
+    assert spec is not None
+    monkeypatch.setenv(path_variable, "/test/custom vendor/selected-cli")
+    monkeypatch.setattr(
+        hi.shutil,
+        "which",
+        lambda name: f"/test/path/{name}" if name == spec.binary else None,
+    )
+    assert hi.harness_cli_binary(key) == f"/test/path/{spec.binary}"
 
 
 @pytest.mark.parametrize("key", [ANTHROPIC_FAMILY, OPENAI_FAMILY, hi.CURSOR_KEY])

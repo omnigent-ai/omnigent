@@ -934,6 +934,11 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
+# Native launches of these families find their CLI on PATH and never read its
+# OMNIGENT_<HARNESS>_PATH override, so readiness must not honor that override either.
+_PATH_OVERRIDE_UNREAD_BY_LAUNCH = frozenset({GEMINI_FAMILY, OPENCODE_KEY})
+
+
 def harness_cli_binary(key: str) -> str | None:
     """Resolve the selected CLI without substituting a different installed binary."""
     from omnigent.harness_startup_config import resolve_harness_path
@@ -941,11 +946,9 @@ def harness_cli_binary(key: str) -> str | None:
     spec = harness_install_spec(key)
     if spec is None:
         return None
-    path_key = {
-        ANTHROPIC_FAMILY: "claude",
-        OPENAI_FAMILY: "codex",
-        GEMINI_FAMILY: "antigravity",
-    }.get(key, key)
+    if key in _PATH_OVERRIDE_UNREAD_BY_LAUNCH:
+        return resolve_cli_binary(spec.binary)
+    path_key = {ANTHROPIC_FAMILY: "claude", OPENAI_FAMILY: "codex"}.get(key, key)
     command = resolve_harness_path(path_key) or spec.binary
     return resolve_cli_binary(command)
 
