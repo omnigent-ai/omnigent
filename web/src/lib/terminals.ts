@@ -277,12 +277,23 @@ export function terminalResourceId(terminalName: string, sessionKey: string): st
 export type TerminalLaunchMode = "attach" | "wait";
 
 const launchingTerminals = new Map<string, TerminalLaunchMode>();
+/** The conversation each launching terminal belongs to. */
+const launchingConversations = new Map<string, string>();
 const launchListeners = new Set<() => void>();
 
 /** Record *terminalId*'s in-flight create, or clear it with ``null``. */
-export function setTerminalLaunching(terminalId: string, mode: TerminalLaunchMode | null): void {
-  if (mode === null) launchingTerminals.delete(terminalId);
-  else launchingTerminals.set(terminalId, mode);
+export function setTerminalLaunching(
+  terminalId: string,
+  mode: TerminalLaunchMode | null,
+  conversationId = "",
+): void {
+  if (mode === null) {
+    launchingTerminals.delete(terminalId);
+    launchingConversations.delete(terminalId);
+  } else {
+    launchingTerminals.set(terminalId, mode);
+    launchingConversations.set(terminalId, conversationId);
+  }
   for (const listener of launchListeners) listener();
 }
 
@@ -324,9 +335,12 @@ export function clearClosedDuringLaunch(terminalId: string): void {
   closedDuringLaunch.delete(terminalId);
 }
 
-/** Whether any shell create is in flight; launches don't overlap. */
-export function anyTerminalLaunching(): boolean {
-  return launchingTerminals.size > 0;
+/** Whether a shell create is in flight in *conversationId*; its launches don't overlap. */
+export function anyTerminalLaunching(conversationId: string): boolean {
+  for (const owner of launchingConversations.values()) {
+    if (owner === conversationId) return true;
+  }
+  return false;
 }
 
 /** Subscribe to launch-state changes (for ``useSyncExternalStore``). */

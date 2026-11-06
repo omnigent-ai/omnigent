@@ -99,6 +99,9 @@ export const RECONNECT_BACKOFF_MS = [
  */
 export const RECONNECT_STABLE_MS = 30_000;
 
+/** Closes an attach can get when it arrives before its shell exists. */
+const LAUNCH_REFUSAL_CODES: ReadonlySet<number> = new Set([4404, 4500]);
+
 function isReconnectableTerminalClose(code: number): boolean {
   return (
     isUnexpectedTerminalClose(code) || (code === WS_CLOSE_WRONG_REPLICA && !isDatabricksWorkspace())
@@ -337,6 +340,9 @@ export function TerminalView({
   }, []);
 
   const notifyActivity = useCallback(() => {
+    // Terminal output: the attach reached a live shell, so a later close is
+    // not a launch refusal.
+    dialedDuringLaunchRef.current = false;
     onActivityRef.current?.();
   }, []);
 
@@ -679,14 +685,11 @@ export function TerminalView({
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // An early attach can close before its shell exists (4404 before
+  // An early attach can be refused before its shell exists (4404 before
   // registration, 4500 while the runner is being rebound). After the create
-  // succeeds, retry once without ``await_launch``. Closes the reconnect effect
-  // already re-dials are left to it.
-  const closedByOwnLaunch =
-    state.kind === "closed" &&
-    state.code !== WS_CLOSE_WRONG_REPLICA &&
-    !isReconnectableTerminalClose(state.code);
+  // succeeds, retry once without ``await_launch``. Deliberate closes (e.g.
+  // 4405 detached) and closes after the shell produced output are left alone.
+  const closedByOwnLaunch = state.kind === "closed" && LAUNCH_REFUSAL_CODES.has(state.code);
   useEffect(() => {
     if (!dialedDuringLaunchRef.current || launchMode !== null || !closedByOwnLaunch) return;
     dialedDuringLaunchRef.current = false;

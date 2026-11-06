@@ -626,6 +626,33 @@ describe("useCreateTerminal launch", () => {
     await vi.waitFor(() => expect(shortcut.hook.result.current.isPending).toBe(false));
   });
 
+  it("lets another conversation launch while one conversation's shell is in flight", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    const responders: ((response: Response) => void)[] = [];
+    const bodies: string[] = [];
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      bodies.push(init?.body as string);
+      return new Promise<Response>((resolve) => {
+        responders.push(resolve);
+      });
+    });
+    const sessionA = renderLaunch("conv_launch_a");
+    const sessionB = renderLaunch("conv_launch_b");
+    const onOpenB = vi.fn();
+
+    act(() => sessionA.hook.result.current.launch("zsh"));
+    await vi.waitFor(() => expect(bodies).toHaveLength(1));
+    expect(sessionB.hook.result.current.isPending).toBe(false);
+    act(() => sessionB.hook.result.current.launch("zsh", { onOpen: onOpenB }));
+
+    expect(onOpenB).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(bodies).toHaveLength(2));
+    await act(async () => {
+      responders[0](createdResponse(bodies[0]));
+      responders[1](createdResponse(bodies[1]));
+    });
+  });
+
   it("removes the early-opened terminal and reports it when the create fails", async () => {
     runnerOnlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValueOnce(
