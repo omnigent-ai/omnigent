@@ -284,7 +284,7 @@ describe("ImportReviewGate", () => {
     await expectStaysClosed();
   });
 
-  it("keeps an identified remote host when another host comes online", async () => {
+  it("keeps an identified remote host when another host comes online or it drops", async () => {
     installShell("remote");
     serve([host("laptop"), host("arca")], { arca: ["from-arca"] });
     const { client } = renderWithClient(<ImportReviewGate />);
@@ -296,6 +296,15 @@ describe("ImportReviewGate", () => {
       setTimeout(resolve, 100);
     });
     expect(screen.getByText("/from-arca")).toBeTruthy();
+
+    // With Arca offline, the lone online candidate is box; the review still waits for Arca.
+    serve([host("laptop"), host("arca", { status: "offline" }), host("box")], {
+      arca: ["from-arca"],
+      box: ["from-box"],
+    });
+    await client.invalidateQueries({ queryKey: ["hosts"] });
+    expect(await screen.findByText("Connecting to arca-machine…")).toBeTruthy();
+    expect(screen.queryByText("/from-box")).toBeNull();
     expect(skillRequestsFor("box")).toHaveLength(0);
   });
 

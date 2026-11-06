@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { ImportContextModal } from "@/components/onboarding/ImportContextModal";
 import { useHarnessInventory, type HarnessInventory } from "@/hooks/useHarnessInventory";
 import { useHosts, type Host } from "@/hooks/useHosts";
-import { resolveRunnerHost } from "@/hooks/useOnboardingRunnerHost";
+import { resolveRunnerHost, useLocalHostIdentity } from "@/hooks/useOnboardingRunnerHost";
 import {
   clearImportReviewRequest,
   importsReviewed,
@@ -15,7 +15,7 @@ import {
 } from "@/lib/importReviewState";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { getHostIdentity, isElectronShell, takeOnboardingRunner } from "@/lib/nativeBridge";
+import { isElectronShell, takeOnboardingRunner, type OnboardingRunner } from "@/lib/nativeBridge";
 
 function InventoryModal({
   hostId,
@@ -84,23 +84,29 @@ function OnboardingImportReview() {
   return null;
 }
 
-/**
- * This machine's identity for a runner-only request: undefined while the shell
- * answers, null when it can't say. A null `hostId` means it never hosted.
- */
-function useLocalIdentity(enabled: boolean): { hostId: string | null } | null | undefined {
-  const [identity, setIdentity] = useState<{ hostId: string | null } | null | undefined>(undefined);
-  useEffect(() => {
-    if (!enabled) return;
-    let cancelled = false;
-    void getHostIdentity().then((result) => {
-      if (!cancelled) setIdentity(result ? { hostId: result.hostId ?? null } : null);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [enabled]);
-  return identity;
+/** Where a runner-only review stands once the shell and host list answer. */
+type RunnerReviewTarget =
+  | { status: "loading" }
+  | { status: "waiting" }
+  | { status: "found"; hostId: string }
+  | { status: "abandoned" };
+
+function resolveReviewTarget(
+  runner: OnboardingRunner,
+  identity: { hostId: string | null } | null | undefined,
+  hosts: Host[] | undefined,
+): RunnerReviewTarget {
+  if (identity === undefined || hosts === undefined) return { status: "loading" };
+  // Without this machine's identity, "remote" could mistake it for the other host.
+  if (identity === null) return { status: "abandoned" };
+  // "local" names this machine even before it's online, so the review can wait for it.
+  if (runner === "local") {
+    return identity.hostId ? { status: "found", hostId: identity.hostId } : { status: "abandoned" };
+  }
+  // The shell hands "remote" over once Arca reports online, so a lone other host is Arca.
+  const resolved = resolveRunnerHost("remote", identity.hostId, hosts);
+  if (resolved.ambiguous) return { status: "abandoned" };
+  return resolved.hostId ? { status: "found", hostId: resolved.hostId } : { status: "waiting" };
 }
 
 /** Loading copy while the target isn't online; the default once it's fetching inventory. */
@@ -120,35 +126,30 @@ function connectingMessage(host: Host | null, runner: ImportReviewTarget["runner
  */
 function RequestedImportReview({ target }: { target: ImportReviewTarget }) {
   const { data: hosts } = useHosts();
-  const byRunner = target.hostId === undefined;
-  const identity = useLocalIdentity(byRunner);
-  // Once identified, the host stays put even if more hosts come online.
-  const identified = useRef<{ hostId: string; reviewed: boolean } | null>(null);
-  let ambiguous = false;
-  if (byRunner && identified.current === null && identity && hosts !== undefined) {
-    const resolved =
-      target.runner === "local"
-        ? { hostId: identity.hostId, ambiguous: false }
-        : resolveRunnerHost("remote", identity.hostId, hosts);
-    ambiguous = resolved.ambiguous;
-    if (resolved.hostId !== null) {
-      identified.current = { hostId: resolved.hostId, reviewed: importsReviewed(resolved.hostId) };
-    }
-  }
-  const hostId = target.hostId ?? identified.current?.hostId ?? null;
-  // Without this machine's identity, "remote" could mistake it for the other host.
-  const unresolvable =
-    byRunner && (identity === null || (target.runner === "local" && identity?.hostId === null));
-  const skip = ambiguous || unresolvable || identified.current?.reviewed === true;
+  const identity = useLocalHostIdentity(target.hostId === undefined);
+  // The runner's host once found; it stays put even if more hosts come online.
+  const [found, setFound] = useState<{ hostId: string; reviewed: boolean } | null>(null);
+  const resolution =
+    target.hostId === undefined && found === null
+      ? resolveReviewTarget(target.runner, identity, hosts)
+      : null;
+  const resolvedHostId = resolution?.status === "found" ? resolution.hostId : null;
   useEffect(() => {
-    if (skip) clearImportReviewRequest();
-  }, [skip]);
+    if (resolvedHostId !== null) {
+      setFound({ hostId: resolvedHostId, reviewed: importsReviewed(resolvedHostId) });
+    }
+  }, [resolvedHostId]);
+  const abandoned = resolution?.status === "abandoned" || found?.reviewed === true;
+  useEffect(() => {
+    if (abandoned) clearImportReviewRequest();
+  }, [abandoned]);
 
+  const hostId = target.hostId ?? found?.hostId ?? null;
   const host = hosts?.find((candidate) => candidate.host_id === hostId) ?? null;
-  const inventory = useHarnessInventory(skip ? null : host, { awaitConnection: true });
-  // Wait for the hosts and identity so an ambiguous remote never flashes open.
-  if (byRunner && (hosts === undefined || identity === undefined)) return null;
-  if (skip) return null;
+  const inventory = useHarnessInventory(abandoned ? null : host, { awaitConnection: true });
+  // Opens once the host is settled or still connecting, so an ambiguous or
+  // already reviewed host never flashes open.
+  if (abandoned || resolution?.status === "loading" || resolution?.status === "found") return null;
   return (
     <InventoryModal
       hostId={hostId}
