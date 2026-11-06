@@ -160,10 +160,13 @@ class PongFrame:
     :param busy: Runner-to-server only. Whether the runner did work since its
         previous pong, so the server extends a managed sandbox only while it is
         in use. ``None`` (omitted on the wire) means the sender does not report it.
+    :param idle_s: Runner-to-server only. Seconds since the runner last did work,
+        or ``None`` before any work or when not reported.
     """
 
     ts: int
     busy: bool | None = None
+    idle_s: float | None = None
 
 
 @dataclass
@@ -339,6 +342,8 @@ def encode_frame(frame: Frame) -> str:
         pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
         if frame.busy is not None:
             pong["busy"] = frame.busy
+        if frame.idle_s is not None:
+            pong["idle_s"] = round(frame.idle_s, 1)
         return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
@@ -464,8 +469,15 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
             busy = msg.get("busy")
+            idle_s = msg.get("idle_s")
             return PongFrame(
-                ts=_required_int(msg, "ts"), busy=busy if isinstance(busy, bool) else None
+                ts=_required_int(msg, "ts"),
+                busy=busy if isinstance(busy, bool) else None,
+                idle_s=float(idle_s)
+                if isinstance(idle_s, (int, float))
+                and not isinstance(idle_s, bool)
+                and idle_s >= 0
+                else None,
             )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)

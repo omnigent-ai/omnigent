@@ -15,7 +15,12 @@ extends a managed sandbox only for intervals in which the runner was busy (see
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
+
+# The runner's built-in idle timeout, used when no runner.idle_timeout_s is set.
+# Here (not in omnigent.runner._entry) so the server can read it cheaply.
+DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 
 
 class RunnerBusyCheck:
@@ -39,6 +44,7 @@ class RunnerBusyCheck:
         self._has_active_work = has_active_work
         self._get_last_activity = get_last_activity
         self._last_activity_at: float | None = None
+        self._last_busy_at: float | None = None
 
     def check(self) -> bool:
         """Return whether the runner is busy now or made progress since the last call.
@@ -52,4 +58,20 @@ class RunnerBusyCheck:
             self._last_activity_at is None or activity_at > self._last_activity_at
         )
         self._last_activity_at = activity_at
-        return self._has_active_work() or advanced
+        busy = self._has_active_work() or advanced
+        if busy:
+            self._last_busy_at = time.monotonic()
+        return busy
+
+    def report(self) -> tuple[bool, float | None]:
+        """Return :meth:`check` and the seconds since this check last saw work.
+
+        The idle time lets a server that lost its own history (a restart, or a
+        reconnect to another replica) resume a keep-warm grace where it was.
+
+        :returns: ``(busy, idle_s)``; ``idle_s`` is ``None`` before any work.
+        """
+        busy = self.check()
+        if self._last_busy_at is None:
+            return busy, None
+        return busy, 0.0 if busy else time.monotonic() - self._last_busy_at

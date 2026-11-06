@@ -2438,7 +2438,7 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     monkeypatch.setattr(
         managed_host_keepalive,
         "record_pong",
-        lambda runner_id, busy: busy_reports.append((runner_id, busy)),
+        lambda runner_id, busy, idle_s=None: busy_reports.append((runner_id, busy)),
     )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()

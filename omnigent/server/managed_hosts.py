@@ -206,6 +206,7 @@ from omnigent.onboarding.sandboxes.base import (
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.runner.busy_check import DEFAULT_RUNNER_IDLE_TIMEOUT_S
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -1314,22 +1315,21 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     return int(value)
 
 
-# Matches the runner's built-in idle timeout (omnigent.runner._entry), which applies
-# when neither keep_warm_s nor host_config.runner.idle_timeout_s is set.
-_RUNNER_DEFAULT_IDLE_TIMEOUT_S = 60 * 60
-
-
 def _keep_warm_after_work_s(host_config: dict[str, object] | None) -> float:
     """Seconds an agent_sandbox stays warm after its last work: the runner idle timeout.
 
     ``keep_warm_s`` has already been folded into ``host_config.runner.idle_timeout_s``
-    by :func:`_apply_keep_warm`.
+    by :func:`_apply_keep_warm`. An explicit ``0`` disables the runner's idle
+    shutdown, so the sandbox stays warm for as long as the runner is connected.
     """
     runner = (host_config or {}).get("runner")
     idle = runner.get("idle_timeout_s") if isinstance(runner, dict) else None
-    if isinstance(idle, (int, float)) and not isinstance(idle, bool) and idle > 0:
-        return float(idle)
-    return float(_RUNNER_DEFAULT_IDLE_TIMEOUT_S)
+    if isinstance(idle, (int, float)) and not isinstance(idle, bool):
+        if idle == 0:
+            return math.inf
+        if idle > 0:
+            return float(idle)
+    return float(DEFAULT_RUNNER_IDLE_TIMEOUT_S)
 
 
 def _apply_keep_warm(

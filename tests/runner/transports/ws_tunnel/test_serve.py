@@ -2070,23 +2070,24 @@ async def test_handle_tunnel_frame_drops_malformed_frame(
     assert sent == []
 
 
-def _report_busy_failure() -> bool:
+def _report_busy_failure() -> tuple[bool, float | None]:
     raise RuntimeError("activity state unavailable")
 
 
 @pytest.mark.parametrize(
     ("report_busy", "expected"),
     [
-        pytest.param(None, None, id="not-reported"),
-        pytest.param(lambda: True, True, id="busy"),
-        pytest.param(lambda: False, False, id="idle"),
+        pytest.param(None, (None, None), id="not-reported"),
+        pytest.param(lambda: (True, 0.0), (True, 0.0), id="busy"),
+        pytest.param(lambda: (False, 12.5), (False, 12.5), id="idle"),
         # Keeping a sandbox warm one extra interval beats stopping an in-use one.
-        pytest.param(_report_busy_failure, True, id="failing-report-counts-as-busy"),
+        pytest.param(_report_busy_failure, (True, None), id="failing-report-counts-as-busy"),
     ],
 )
 @pytest.mark.asyncio
 async def test_pong_carries_the_runners_busy_report(
-    report_busy: Callable[[], bool] | None, expected: bool | None
+    report_busy: Callable[[], tuple[bool, float | None]] | None,
+    expected: tuple[bool | None, float | None],
 ) -> None:
     """A ping is answered with a pong carrying the runner's busy report.
 
@@ -2103,7 +2104,8 @@ async def test_pong_carries_the_runners_busy_report(
         _noop_app, encode_frame(PingFrame(ts=123)), _send_text, {}, {}, report_busy=report_busy
     )
 
-    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, busy=expected)]
+    busy, idle_s = expected
+    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, busy=busy, idle_s=idle_s)]
 
 
 @pytest.mark.asyncio

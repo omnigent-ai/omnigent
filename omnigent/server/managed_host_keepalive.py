@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -144,7 +145,7 @@ def keepalive_interval_s(runner_id: str) -> float:
     return _interval_for(runner_id)
 
 
-def record_pong(runner_id: str, busy: bool | None) -> None:
+def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = None) -> None:
     """Note whether *runner_id* is doing work, from one of its tunnel pongs.
 
     Once a runner reports, :func:`touch` skips it for any interval in which no
@@ -154,6 +155,9 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
 
     :param runner_id: Runner that sent the pong.
     :param busy: The pong's busy report; ``None`` when the runner does not report.
+    :param idle_s: Seconds since the runner last did work, as it reports. Lets a
+        server without this runner's history (a restart, or a reconnect to
+        another replica) resume its keep-warm grace; it is never new work.
     """
     if _sandbox_config is None or _host_store is None:
         return
@@ -164,9 +168,14 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
         return
     was_busy = _last_pong_busy.get(runner_id)
     _last_pong_busy[runner_id] = busy
-    _last_report_at[runner_id] = time.monotonic()
+    now = time.monotonic()
+    _last_report_at[runner_id] = now
     if not busy:
         _busy_since_kept.setdefault(runner_id, False)
+        if idle_s is not None:
+            reported = now - idle_s
+            if reported > _last_busy_at.get(runner_id, float("-inf")):
+                _last_busy_at[runner_id] = reported
         return
     _busy_since_kept[runner_id] = True
     _last_busy_at[runner_id] = time.monotonic()
@@ -257,8 +266,11 @@ def touch(runner_id: str, *, force: bool = False) -> None:
 
 def _within_warm_grace(runner_id: str, now: float) -> bool:
     """Whether *runner_id* last reported busy within its provider's keep-warm grace."""
-    last_busy = _last_busy_at.get(runner_id)
     grace = _runner_warm_grace_s.get(runner_id, 0.0)
+    if math.isinf(grace):
+        # The runner never idles out (runner.idle_timeout_s 0): warm while connected.
+        return True
+    last_busy = _last_busy_at.get(runner_id)
     return last_busy is not None and now - last_busy < grace
 
 

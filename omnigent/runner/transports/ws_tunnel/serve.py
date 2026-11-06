@@ -355,7 +355,7 @@ class _TunnelActivityKwargs(TypedDict, total=False):
     """Optional activity callbacks forwarded to each tunnel connection."""
 
     on_activity: Callable[[], None]
-    report_busy: Callable[[], bool]
+    report_busy: Callable[[], tuple[bool, float | None]]
 
 
 async def serve_tunnel(
@@ -369,7 +369,7 @@ async def serve_tunnel(
     auth_token_factory: Callable[[], str | None] | None = None,
     on_reconnect: Callable[[], Awaitable[None]] | None = None,
     on_activity: Callable[[], None] | None = None,
-    report_busy: Callable[[], bool] | None = None,
+    report_busy: Callable[[], tuple[bool, float | None]] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
@@ -1055,7 +1055,7 @@ async def _serve_tunnel_once(
     auth_token: str | None = None,
     tunnel_token: str | None = None,
     on_activity: Callable[[], None] | None = None,
-    report_busy: Callable[[], bool] | None = None,
+    report_busy: Callable[[], tuple[bool, float | None]] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
@@ -1564,7 +1564,7 @@ async def _handle_tunnel_frame(
     ws_channels: dict[str, _RunnerWSChannel],
     *,
     on_activity: Callable[[], None] | None = None,
-    report_busy: Callable[[], bool] | None = None,
+    report_busy: Callable[[], tuple[bool, float | None]] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
     passive_dispatch_tasks: set[asyncio.Task[None]] | None = None,
@@ -1609,7 +1609,8 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, PingFrame):
         if diagnostics is not None:
             diagnostics.app_ping_received()
-        await send_text(encode_frame(PongFrame(ts=frame.ts, busy=_busy_for_pong(report_busy))))
+        busy, idle_s = _busy_for_pong(report_busy)
+        await send_text(encode_frame(PongFrame(ts=frame.ts, busy=busy, idle_s=idle_s)))
         if diagnostics is not None:
             diagnostics.app_pong_sent()
     elif isinstance(frame, RequestFrame):
@@ -1687,22 +1688,25 @@ async def _handle_tunnel_frame(
         closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
 
 
-def _busy_for_pong(report_busy: Callable[[], bool] | None) -> bool | None:
-    """Return the pong's busy report, or ``None`` when the runner does not report.
+def _busy_for_pong(
+    report_busy: Callable[[], tuple[bool, float | None]] | None,
+) -> tuple[bool | None, float | None]:
+    """Return the pong's ``(busy, idle_s)`` report; ``(None, None)`` if unreported.
 
     A failing callback reports busy: keeping a sandbox warm for one extra
     interval is cheaper than letting an in-use one stop.
 
     :param report_busy: The runner's busy callback, if any.
-    :returns: The busy report for the next pong.
+    :returns: The busy flag and idle seconds for the next pong.
     """
     if report_busy is None:
-        return None
+        return None, None
     try:
-        return bool(report_busy())
+        busy, idle_s = report_busy()
+        return bool(busy), idle_s
     except Exception:  # noqa: BLE001 — a busy report must never break the pong
         _logger.debug("runner busy report failed; reporting busy", exc_info=True)
-        return True
+        return True, None
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:

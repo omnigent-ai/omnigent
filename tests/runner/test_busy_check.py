@@ -24,6 +24,21 @@ def test_native_progress_is_busy_only_when_it_advances() -> None:
     assert busy.check()
 
 
+def test_report_gives_seconds_since_the_last_work(monkeypatch) -> None:
+    from omnigent.runner import busy_check
+
+    clock = [100.0]
+    monkeypatch.setattr(busy_check.time, "monotonic", lambda: clock[0])
+    active = False
+    busy = RunnerBusyCheck(lambda: active)
+    assert busy.report() == (False, None), "no work yet, so no idle time to report"
+    active = True
+    assert busy.report() == (True, 0.0)
+    active = False
+    clock[0] = 130.0
+    assert busy.report() == (False, 30.0)
+
+
 def test_each_consumer_tracks_progress_independently() -> None:
     activity_at = 1.0
     first = RunnerBusyCheck(lambda: False, lambda: activity_at)

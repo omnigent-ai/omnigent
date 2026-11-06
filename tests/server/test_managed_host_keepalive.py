@@ -575,3 +575,29 @@ def test_provider_grace_reaches_the_runner_cache(
     monkeypatch.setattr(managed_host_keepalive, "_runner_warm_grace_s", {})
     managed_host_keepalive._keep_alive_for_runner("r1")
     assert managed_host_keepalive._runner_warm_grace_s == {"r1": expected}
+
+
+def test_a_fresh_server_resumes_the_remaining_grace_from_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # After a server restart this runner has no history here; its reported idle
+    # time restores the keep-warm grace without counting as new work.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
+    managed_host_keepalive.touch("r1")  # the new server's first touch
+    managed_host_keepalive.record_pong("r1", False, idle_s=300.0)  # last work 5 min ago
+    gate.tick()  # 900s after the last work: inside the 1500s grace
+    gate.tick()  # 1500s after: grace over
+    assert gate.submitted == ["r1", "r1"]
+    assert managed_host_keepalive._busy_since_kept["r1"] is False, "idle time is not new work"
+
+
+def test_an_unlimited_grace_keeps_an_idle_runner_warm(monkeypatch: pytest.MonkeyPatch) -> None:
+    # runner.idle_timeout_s 0: the runner never idles out, so neither does its sandbox.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive._runner_warm_grace_s["r1"] = float("inf")
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", False)
+    gate.tick()
+    gate.tick()
+    assert gate.submitted == ["r1"] * 3

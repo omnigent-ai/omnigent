@@ -2653,7 +2653,7 @@ async def test_turn_finished_between_busy_checks_still_reports_busy_once() -> No
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
         server_client=_FakeFileServerClient(),  # type: ignore[arg-type]
     )
-    busy = RunnerBusyCheck(app.state.has_active_work, app.state.last_event_published_at)
+    busy = RunnerBusyCheck(app.state.has_sandbox_work, app.state.last_event_published_at)
     assert busy.check() is False
 
     async with _runner_client(app) as client:

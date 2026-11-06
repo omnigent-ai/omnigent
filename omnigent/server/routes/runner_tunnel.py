@@ -1006,7 +1006,9 @@ async def _receive_loop(
                 )
                 # Gate managed-sandbox refreshes on the runner's own busy report.
                 try:
-                    managed_host_keepalive.record_pong(runner_id, resp_frame.busy)
+                    managed_host_keepalive.record_pong(
+                        runner_id, resp_frame.busy, idle_s=resp_frame.idle_s
+                    )
                 except Exception:
                     _logger.exception(
                         "managed keepalive pong record failed for runner %s", runner_id
