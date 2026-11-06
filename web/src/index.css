@@ -110,7 +110,7 @@
   --color-primary-cta: var(--primary-cta);
   --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
-  --color-popover: var(--popover);
+  --color-popover: var(--overlay-surface-bg, var(--popover));
   --color-card-foreground: var(--card-foreground);
   --color-card: var(--card);
   /* Opaque form of --card, for card surfaces that must fully hide
@@ -298,7 +298,8 @@
   --composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white);
   --primary-cta: #e8ecf0;
   --primary-cta-foreground: #11171c;
-  --menu-surface-bg: var(--composer-surface-bg);
+  /* Dialogs and menus share a raised variant of the app background. */
+  --overlay-surface-bg: var(--composer-surface-bg);
   --card-surface-bg: color-mix(
     in srgb,
     color-mix(in srgb, var(--card) 95%, white) 75%,
@@ -1198,6 +1199,10 @@ aside[aria-label="Workspace"][data-maximized] {
   pointer-events: none !important;
 }
 
+.dark [data-slot="dialog-content"] {
+  border: 1px solid var(--menu-surface-border);
+}
+
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
 .dark [data-slot="select-content"]:not(.menu-surface),
@@ -1210,12 +1215,12 @@ aside[aria-label="Workspace"][data-maximized] {
 }
 
 :root:not(.dark) .menu-surface {
-  background-color: #fff;
+  background-color: var(--popover);
   border: 1px solid rgb(0 0 0 / 8%);
 }
 
 .dark .menu-surface {
-  background-color: var(--menu-surface-bg);
+  background-color: var(--overlay-surface-bg);
   border: 1px solid var(--menu-surface-border);
   -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
   backdrop-filter: var(--menu-surface-backdrop-filter);
@@ -1235,6 +1240,10 @@ aside[aria-label="Workspace"][data-maximized] {
 
   .mobile-menu-glass [data-slot="command"] {
     background: transparent;
+  }
+
+  .dark .mobile-menu-glass-layer .omni-glass-surface {
+    --omni-glass-background: var(--overlay-surface-bg);
   }
 }
 

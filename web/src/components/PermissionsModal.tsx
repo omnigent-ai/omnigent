@@ -16,8 +16,9 @@ import {
   useState,
 } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { CheckIcon, LinkIcon, QrCodeIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
+import { CheckIcon, LinkIcon, LockIcon, QrCodeIcon, Trash2Icon, UsersIcon } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
+import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -36,12 +37,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
-import {
-  type Permission,
-  useGrantPermission,
-  usePermissions,
-  useRevokePermission,
-} from "@/hooks/usePermissions";
+import { useGrantPermission, usePermissions, useRevokePermission } from "@/hooks/usePermissions";
 import { useSession } from "@/hooks/useSession";
 import { usePublicSharingMaxLevel } from "@/hooks/useSharing";
 import { useUserSearch } from "@/hooks/useUserSearch";
@@ -50,7 +46,13 @@ import { copyText } from "@/lib/clipboard";
 import { updateSession } from "@/lib/sessionsApi";
 import { getOmnigentUserSearch } from "@/lib/host";
 import { getShareableSessionLink } from "@/lib/shareLink";
-import { workspaceSharingBlocked } from "@/lib/permissionsApi";
+import { getCurrentUserId } from "@/lib/identity";
+import {
+  type Permission,
+  grantPermission,
+  revokePermission,
+  workspaceSharingBlocked,
+} from "@/lib/permissionsApi";
 import { useRebasePath } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 
@@ -77,107 +79,132 @@ export function PermissionsModal({
   open,
   onOpenChange,
 }: PermissionsModalProps) {
-  // Server sharing policy. While the boot probe is in flight we treat the
-  // server as "on" (fail open) so the modal renders its full controls; the
-  // server-side gate is the real enforcement point regardless.
   const info = useServerInfo();
   const sharingMode = info === "loading" ? "on" : info.sharing_mode;
   const sharingOff = sharingMode === "off";
   const sharingReadOnly = sharingMode === "read_only" || sharingMode === "restricted_read_only";
-  const workspaceBlocked =
-    sharingMode === "restricted_read_only" && workspaceSharingBlocked(workspace);
-  // Disabling public sharing prevents new grants but still permits revocation.
   const publicSharingEnabled = info === "loading" ? true : info.public_sharing_enabled;
   const { data: livePublicMaxLevel } = usePublicSharingMaxLevel(open && !sharingOff);
   const publicMaxLevel =
     (livePublicMaxLevel ?? (info === "loading" ? "read" : info.public_sharing_max_level)) === "edit"
       ? 2
       : 1;
-  // In "off" mode never fetch the grant list — the modal short-circuits to a
-  // notice below, so the request would be wasted (and the server rejects any
-  // grant anyway).
-  const { data: permissions, isLoading } = usePermissions(open && !sharingOff ? sessionId : null);
+  const {
+    data: permissions,
+    isLoading,
+    error: permissionsError,
+  } = usePermissions(open && !sharingOff ? sessionId : null);
+  const { session } = useSession(open && !sharingOff ? sessionId : null);
+  const workspaceBlocked =
+    sharingMode === "restricted_read_only" &&
+    workspaceSharingBlocked(workspace ?? session?.workspace);
   const grant = useGrantPermission(sessionId);
   const revoke = useRevokePermission(sessionId);
-
+  const queryClient = useQueryClient();
   const [newUserId, setNewUserId] = useState("");
   const [newLevel, setNewLevel] = useState("1");
   const [error, setError] = useState<string | null>(null);
   const [showQr, setShowQr] = useState(false);
+  const controlsId = useId();
   const blockedNoticeId = useId();
+  const currentUserId = getCurrentUserId();
+  const people = (permissions ?? []).filter((permission) => permission.user_id !== PUBLIC_USER);
+  const publicGrant = permissions?.find((permission) => permission.user_id === PUBLIC_USER);
+  const sharedGrants = (permissions ?? []).filter(
+    (permission) => permission.level < 3 && permission.user_id !== currentUserId,
+  );
+  function displayedLevel(permission: Permission) {
+    return permission.user_id === PUBLIC_USER
+      ? Math.min(permission.level, publicMaxLevel, sharingReadOnly ? 1 : 2)
+      : permission.level;
+  }
+  const sharedLevels = new Set(sharedGrants.map(displayedLevel));
+  const sharedLevel =
+    sharedLevels.size > 1
+      ? ""
+      : String(sharedGrants[0] ? displayedLevel(sharedGrants[0]) : newLevel);
+  const roleMaxLevel = sharingReadOnly ? 1 : publicGrant ? publicMaxLevel : 2;
+  const selectableLevel = Number(sharedLevel) <= roleMaxLevel ? sharedLevel : "";
+  const leadingPeople = people
+    .filter((permission) => permission.user_id === currentUserId || permission.level === 4)
+    .sort(
+      (first, second) =>
+        Number(second.user_id === currentUserId) - Number(first.user_id === currentUserId),
+    );
+  const accessEntries = [
+    ...leadingPeople,
+    ...(publicGrant ? [publicGrant] : []),
+    ...people.filter((permission) => !leadingPeople.includes(permission)),
+  ];
+  const reportError = (failure: Error) => setError(failure.message);
+  const refreshPermissions = () =>
+    queryClient.invalidateQueries({ queryKey: ["permissions", sessionId] });
 
-  // Whether the owner shared the workspace files with view-level collaborators.
-  // Read from the (shared-cache) session snapshot; the toggle PATCHes it and
-  // invalidates the snapshot so the rail's file surfaces appear/disappear.
-  const { session } = useSession(open && !sharingOff ? sessionId : null);
-  const queryClient = useQueryClient();
+  async function applySharedLevel(level: number) {
+    const results = await Promise.allSettled(
+      sharedGrants
+        .filter((permission) => permission.level !== level)
+        .map((permission) => grantPermission(sessionId, permission.user_id, level)),
+    );
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
+  }
+
+  const sharedPermission = useMutation({
+    mutationFn: async (value: string) => {
+      const level = Number(value);
+      if (workspaceBlocked || level < 1 || level > roleMaxLevel) return;
+      await applySharedLevel(level);
+      setNewLevel(value);
+    },
+    onError: reportError,
+    onSettled: refreshPermissions,
+  });
+  const linkAccess = useMutation({
+    mutationFn: async (access: string) => {
+      if (access === "restricted") {
+        await revokePermission(sessionId, PUBLIC_USER);
+        return;
+      }
+      if (workspaceBlocked || !publicSharingEnabled) return;
+      const level = Math.min(Number(sharedLevel || newLevel), sharingReadOnly ? 1 : publicMaxLevel);
+      await applySharedLevel(level);
+      await grantPermission(sessionId, PUBLIC_USER, level);
+      setNewLevel(String(level));
+    },
+    onError: reportError,
+    onSettled: refreshPermissions,
+  });
+  const busy =
+    isLoading ||
+    !!permissionsError ||
+    grant.isPending ||
+    revoke.isPending ||
+    sharedPermission.isPending ||
+    linkAccess.isPending;
   const shareWorkspace = useMutation({
     mutationFn: (next: boolean) => updateSession(sessionId, { shareWorkspaceFiles: next }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
-    },
-    onError: (err: Error) => setError(err.message),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["session", sessionId] }),
+    onError: reportError,
   });
-  // Only a session with a workspace on disk has files to share; a plain
-  // chat agent has none, so the toggle would be inert — hide it there.
-  const hasWorkspace = !!session?.workspace;
-  const workspaceShared = session?.shareWorkspaceFiles ?? false;
 
-  const userGrants = (permissions ?? []).filter((p) => p.user_id !== PUBLIC_USER);
-  const publicGrant = (permissions ?? []).find((p) => p.user_id === PUBLIC_USER);
-  const publicLevel = publicGrant ? Math.min(publicGrant.level, publicMaxLevel) : 0;
-
-  function handleGrant(e: FormEvent) {
-    e.preventDefault();
-    const trimmed = newUserId.trim();
-    if (!trimmed || workspaceBlocked) return;
+  function handleGrant(event: FormEvent) {
+    event.preventDefault();
+    const userId = newUserId.trim();
+    if (!userId || workspaceBlocked || busy || !selectableLevel || publicGrant) return;
     setError(null);
     grant.mutate(
-      { userId: trimmed, level: parseInt(newLevel, 10) },
-      {
-        onSuccess: () => {
-          setNewUserId("");
-          setNewLevel("1");
-        },
-        onError: (err) => setError(err.message),
-      },
+      { userId, level: Number(selectableLevel) },
+      { onSuccess: () => setNewUserId(""), onError: reportError },
     );
   }
 
-  function handleRevoke(userId: string) {
-    setError(null);
-    revoke.mutate(userId, {
-      onError: (err) => setError(err.message),
-    });
-  }
-
-  function handleChangeLevel(userId: string, level: number) {
-    if (workspaceBlocked) return;
-    setError(null);
-    grant.mutate({ userId, level }, { onError: (err) => setError(err.message) });
-  }
-
-  function handlePublicLevel(value: string) {
-    const level = Number(value);
-    if (level > 0 && (workspaceBlocked || !publicSharingEnabled)) return;
-    setError(null);
-    if (level > 0) {
-      grant.mutate({ userId: PUBLIC_USER, level }, { onError: (err) => setError(err.message) });
-    } else {
-      revoke.mutate(PUBLIC_USER, {
-        onError: (err) => setError(err.message),
-      });
-    }
-  }
-
-  // "off" short-circuit: sharing is disabled server-wide, so skip the whole
-  // grant UI and show a plain notice instead. Mirrors the server's 403.
   if (sharingOff) {
     return (
       <Dialog open={open} onOpenChange={onOpenChange}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">Sharing unavailable</DialogTitle>
+            <DialogTitle>Sharing unavailable</DialogTitle>
             <DialogDescription>
               Sharing has been disabled for this Omnigent server.
             </DialogDescription>
@@ -194,204 +221,226 @@ export function PermissionsModal({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="max-h-[85vh] gap-5 overflow-y-auto sm:max-w-[480px]">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">Share this session</DialogTitle>
-          <DialogDescription asChild>
-            <div className="space-y-3">
-              <p>
-                {sharingReadOnly
-                  ? "This server allows read-only sharing — invite others to view this session."
-                  : "Invite others to view or collaborate on this session."}
-              </p>
-              {sharingReadOnly && (
-                <p>
-                  Please be careful when sharing. Read access will allow for reading of all session
-                  outputs.
-                </p>
-              )}
-            </div>
+          <DialogTitle>Share this session</DialogTitle>
+          <DialogDescription className="sr-only">
+            Manage who can open this session and its workspace files.
           </DialogDescription>
         </DialogHeader>
 
-        {(publicSharingEnabled || publicGrant) && (
-          <div className="flex min-w-0 items-center justify-between gap-3 rounded-lg border px-3 py-2">
-            <div className="min-w-0">
-              <p className="text-ui font-medium">General access</p>
-              <p className="text-sm text-muted-foreground">
-                Anyone with the link, sign-in required
-              </p>
-            </div>
+        <div className="space-y-4 border-b border-border pb-5">
+          <p className="text-xs leading-relaxed text-muted-foreground">
+            {sharingReadOnly
+              ? "This Omnigent server allows read-only sharing. Invite others to read this session."
+              : "This Omnigent server allows Read and Edit access for added people."}
+            {publicSharingEnabled
+              ? ` Anyone signed in is limited to ${sharingReadOnly || publicMaxLevel === 1 ? "Read" : "Edit"} access.`
+              : " Access is limited to added people on this server."}
+          </p>
+          <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
+            <label className="text-sm font-medium" htmlFor={`${controlsId}-access`}>
+              Who can access
+            </label>
             <Select
-              value={String(publicLevel)}
-              onValueChange={handlePublicLevel}
-              disabled={
-                isLoading ||
-                grant.isPending ||
-                revoke.isPending ||
-                (workspaceBlocked && !publicGrant)
-              }
+              value={publicGrant ? "signed-in" : "restricted"}
+              onValueChange={(value) => {
+                setError(null);
+                linkAccess.mutate(value);
+              }}
+              disabled={busy || (workspaceBlocked && !publicGrant)}
               componentId="diagnostics.permissions.public_level"
               valueHasNoPii
             >
-              <SelectTrigger className="h-8 w-28 shrink-0" aria-label="General access">
+              <SelectTrigger
+                id={`${controlsId}-access`}
+                className="w-full min-w-0 sm:w-48 sm:justify-self-end"
+              >
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value="0">No access</SelectItem>
-                <SelectItem value="1" disabled={workspaceBlocked || !publicSharingEnabled}>
-                  Read
-                </SelectItem>
-                {publicMaxLevel === 2 && (
+              <SelectContent position="popper" align="end">
+                <SelectItem value="restricted">Only added people</SelectItem>
+                {(publicSharingEnabled || publicGrant) && (
                   <SelectItem
-                    value="2"
-                    disabled={sharingReadOnly || workspaceBlocked || !publicSharingEnabled}
+                    value="signed-in"
+                    disabled={workspaceBlocked || !publicSharingEnabled}
                   >
-                    Edit
+                    Anyone signed in
                   </SelectItem>
                 )}
               </SelectContent>
             </Select>
           </div>
-        )}
-
-        {/* Workspace-files toggle — off by default so a view-only share never
-            leaks the session's files (which routinely hold secrets). Only the
-            file surfaces open up; edit collaborators already have them. Shown
-            only for sessions that actually have a workspace on disk. */}
-        {hasWorkspace && (
-          <div
-            className="flex items-center justify-between rounded-lg border px-3 py-2"
-            data-testid="share-workspace-files"
-          >
-            <div>
-              <p className="text-ui font-medium">Workspace files</p>
-              <p className="text-sm text-muted-foreground">
-                Let people with view access browse this session's files
-              </p>
-            </div>
-            <Switch
-              checked={workspaceShared}
-              onCheckedChange={(checked) => {
-                setError(null);
-                shareWorkspace.mutate(checked);
-              }}
-              disabled={shareWorkspace.isPending}
-              componentId="diagnostics.permissions.share_workspace_toggle"
-            />
-          </div>
-        )}
-
-        {/* Current grants. DialogContent is a grid, and grid items default to
-            min-width:auto — without min-w-0 a long nowrap email sets the whole
-            track's min-content and pushes every row past the dialog edge. */}
-        <div className="min-w-0" data-testid="share-grants">
-          {isLoading ? (
-            <p className="text-ui text-muted-foreground py-2">Loading…</p>
-          ) : userGrants.length === 0 ? (
-            <p className="text-ui text-muted-foreground py-2">No grants yet.</p>
-          ) : (
-            <>
-              {/* Column headers */}
-              <div className="flex items-center gap-2 px-2 pb-0.5">
-                <span className="flex-1 text-sm font-medium uppercase tracking-wide text-muted-foreground">
-                  Name
-                </span>
-                <span className="w-28 text-sm font-medium uppercase tracking-wide text-muted-foreground">
-                  Permission
-                </span>
-                <span className="size-7 shrink-0" aria-hidden="true" />
-              </div>
-              <div className="max-h-48 overflow-y-auto">
-                {userGrants.map((p) => (
-                  <GrantRow
-                    key={p.user_id}
-                    permission={p}
-                    onRevoke={handleRevoke}
-                    onChangeLevel={handleChangeLevel}
-                    busy={grant.isPending || revoke.isPending}
-                    readOnly={sharingReadOnly}
-                  />
-                ))}
-              </div>
-            </>
-          )}
-        </div>
-
-        {/* Shown above the disabled add-grant form so it reads as the reason the
-            controls are inert, before the user tries them. */}
-        {workspaceBlocked && (
-          <p id={blockedNoticeId} className="text-sm text-destructive">
-            This session&apos;s working directory (a home or root directory) cannot be shared on
-            this Omnigent server.
-          </p>
-        )}
-
-        {/* Add grant form */}
-        <form onSubmit={handleGrant} className="flex items-end gap-2">
-          <div className="flex-1">
-            <label htmlFor="perm-user" className="text-sm font-medium text-muted-foreground">
-              User ID
-            </label>
-            <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
-          </div>
-          <div>
-            <label htmlFor="perm-level" className="text-sm font-medium text-muted-foreground">
-              Level
+          <div className="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-3">
+            <label className="text-sm font-medium" htmlFor={`${controlsId}-role`}>
+              What can they do?
             </label>
             <Select
-              value={newLevel}
-              onValueChange={setNewLevel}
-              disabled={workspaceBlocked}
+              value={selectableLevel}
+              onValueChange={(value) => {
+                setError(null);
+                sharedPermission.mutate(value);
+              }}
+              disabled={busy || workspaceBlocked || (!!publicGrant && !publicSharingEnabled)}
               componentId="diagnostics.permissions.grant_level"
               valueHasNoPii
             >
-              <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
-                <SelectValue />
+              <SelectTrigger
+                id={`${controlsId}-role`}
+                className="w-full min-w-0 sm:w-32 sm:justify-self-end"
+              >
+                <SelectValue
+                  placeholder={
+                    sharedLevel ? `${LEVEL_LABELS[Number(sharedLevel)]} (existing)` : "Mixed access"
+                  }
+                />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="end">
                 <SelectItem value="1">Read</SelectItem>
-                {/* Read-only sharing caps new grants at view; hide Edit. */}
-                {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                {roleMaxLevel === 2 && <SelectItem value="2">Edit</SelectItem>}
               </SelectContent>
             </Select>
           </div>
-          <Button
-            type="submit"
-            size="sm"
-            loading={grant.isPending}
-            disabled={workspaceBlocked || !newUserId.trim()}
-            aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
-            componentId="diagnostics.permissions.grant"
-          >
-            <UserPlusIcon className="mr-1 size-3.5" />
-            Grant
-          </Button>
-        </form>
+          {workspaceBlocked && (
+            <p id={blockedNoticeId} className="text-sm text-destructive">
+              This session&apos;s working directory (a home or root directory) cannot be shared on
+              this Omnigent server.
+            </p>
+          )}
+        </div>
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
-
-        {/* Keep the default stacking below sm: one row of Copy link + QR +
-            Done overflows a phone-width dialog and widens the whole grid. */}
-        <DialogFooter className="sm:justify-between">
-          <div className="flex items-center gap-2">
-            <CopyLinkButton sessionId={sessionId} />
-            <Button
-              variant="ghost"
-              onClick={() => setShowQr(true)}
-              className="gap-1.5 text-primary"
+        <div className="min-w-0 space-y-3" data-testid="share-grants">
+          <p className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+            <UsersIcon className="size-3.5" aria-hidden="true" />
+            People with access
+          </p>
+          {!publicGrant && (
+            <form
+              onSubmit={handleGrant}
+              className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2"
             >
-              <QrCodeIcon className="size-3.5" />
-              Open in mobile app
-            </Button>
+              <label htmlFor="perm-user" className="sr-only">
+                User ID
+              </label>
+              <AddUserField
+                value={newUserId}
+                onChange={setNewUserId}
+                disabled={workspaceBlocked || busy}
+              />
+              <Button
+                type="submit"
+                loading={grant.isPending}
+                disabled={workspaceBlocked || busy || !newUserId.trim() || !selectableLevel}
+                aria-describedby={workspaceBlocked ? blockedNoticeId : undefined}
+                componentId="diagnostics.permissions.grant"
+              >
+                Add
+              </Button>
+            </form>
+          )}
+          {isLoading ? (
+            <p className="text-sm text-muted-foreground">Loading…</p>
+          ) : accessEntries.length === 0 ? (
+            <p className="text-sm text-muted-foreground">No grants yet.</p>
+          ) : (
+            <ul className="max-h-52 space-y-1 overflow-y-auto" aria-label="People with access">
+              {accessEntries.map((permission) => {
+                const everyone = permission.user_id === PUBLIC_USER;
+                const label = everyone ? "Everyone" : permission.user_id;
+                return (
+                  <li key={permission.user_id} className="flex min-w-0 items-center gap-3 py-2">
+                    <Avatar>
+                      <AvatarFallback>
+                        {everyone ? (
+                          <UsersIcon className="size-4" aria-hidden="true" />
+                        ) : (
+                          label.slice(0, 1).toUpperCase()
+                        )}
+                      </AvatarFallback>
+                    </Avatar>
+                    <p className="min-w-0 flex-1 truncate font-medium" title={label}>
+                      {label}
+                    </p>
+                    <span className="shrink-0 text-sm text-muted-foreground">
+                      {LEVEL_LABELS[displayedLevel(permission)] ?? "Unknown"}
+                    </span>
+                    {permission.level !== 4 && !publicGrant && (
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        disabled={busy}
+                        className="shrink-0 text-muted-foreground hover:text-destructive"
+                        aria-label={`Remove access for ${permission.user_id}`}
+                        title="Remove access"
+                        onClick={() => {
+                          setError(null);
+                          revoke.mutate(permission.user_id, { onError: reportError });
+                        }}
+                        componentId="diagnostics.permissions.revoke"
+                      >
+                        <Trash2Icon className="size-3.5" aria-hidden="true" />
+                      </Button>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+
+        {!!session?.workspace && (
+          <div className="space-y-3 border-t border-border pt-5">
+            <p className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+              <LockIcon className="size-3.5" aria-hidden="true" />
+              What they can access
+            </p>
+            <div
+              className="flex items-center justify-between gap-4 rounded-lg border border-border px-3 py-3"
+              data-testid="share-workspace-files"
+            >
+              <div className="min-w-0 flex-1 space-y-1">
+                <label htmlFor={`${controlsId}-files`} className="block cursor-pointer text-sm">
+                  Viewers can browse workspace files
+                </label>
+                {session.shareWorkspaceFiles && (
+                  <p
+                    id={`${controlsId}-files-description`}
+                    className="text-[0.85em] leading-snug text-muted-foreground"
+                  >
+                    People with Read access can browse files. Edit access and higher also allow file
+                    changes. Existing workspace access still applies.
+                  </p>
+                )}
+              </div>
+              <Switch
+                id={`${controlsId}-files`}
+                aria-describedby={
+                  session.shareWorkspaceFiles ? `${controlsId}-files-description` : undefined
+                }
+                checked={session.shareWorkspaceFiles ?? false}
+                onCheckedChange={(checked) => {
+                  setError(null);
+                  shareWorkspace.mutate(checked);
+                }}
+                disabled={shareWorkspace.isPending || workspaceBlocked}
+                componentId="diagnostics.permissions.share_workspace_toggle"
+              />
+            </div>
           </div>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Done
+        )}
+        {(error || permissionsError) && (
+          <p role="alert" className="text-sm text-destructive">
+            {error ?? permissionsError?.message}
+          </p>
+        )}
+        <DialogFooter className="sm:justify-between">
+          <Button variant="ghost" onClick={() => setShowQr(true)} className="gap-1.5 text-primary">
+            <QrCodeIcon className="size-4" />
+            Open in mobile app
           </Button>
+          <CopyLinkButton sessionId={sessionId} />
         </DialogFooter>
       </DialogContent>
-
-      {/* Separate modal for the QR code so the share dialog stays compact. */}
       <QrCodeDialog sessionId={sessionId} open={showQr} onOpenChange={setShowQr} />
     </Dialog>
   );
@@ -420,7 +469,7 @@ function AddUserField({ value, onChange, disabled }: AddUserFieldProps) {
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="alice@example.com"
-        className="mt-1 h-8"
+        className="h-8 min-w-0"
         disabled={disabled}
       />
     );
@@ -526,13 +575,13 @@ function AddUserCombobox({ value, onChange, disabled }: AddUserFieldProps) {
         onBlur={() => setOpen(false)}
         onKeyDown={handleKeyDown}
         placeholder="alice@example.com"
-        className="mt-1 h-8"
+        className="h-8 min-w-0"
         autoComplete="off"
         disabled={disabled}
       />
       {isOpen && (
         // Wider than the (narrow) field so suggested emails aren't truncated.
-        <div className="absolute left-0 top-full z-50 mt-1 w-96 rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu">
+        <div className="absolute left-0 top-full z-50 mt-1 w-full sm:w-96 max-w-[calc(100vw-4rem)] rounded-[12px] border border-border bg-popover p-2 text-popover-foreground shadow-menu">
           {isLoading ? (
             <div className="py-6 text-center text-ui text-muted-foreground">Searching…</div>
           ) : suggestions.length === 0 ? (
@@ -616,9 +665,8 @@ function CopyLinkButton({ sessionId }: { sessionId: string }) {
 
   return (
     <Button
-      variant="ghost"
       onClick={handleCopy}
-      className="gap-1.5 text-primary"
+      className="gap-1.5"
       componentId="diagnostics.permissions.copy_link"
     >
       {copied ? <CheckIcon className="size-3.5" /> : <LinkIcon className="size-3.5" />}
@@ -680,76 +728,5 @@ function QrCodeDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  );
-}
-
-function GrantRow({
-  permission,
-  onRevoke,
-  onChangeLevel,
-  busy,
-  readOnly,
-}: {
-  permission: Permission;
-  onRevoke: (userId: string) => void;
-  onChangeLevel: (userId: string, level: number) => void;
-  busy: boolean;
-  readOnly: boolean;
-}) {
-  const isOwner = permission.level === 4;
-  // Manage is not grantable from the UI, so a pre-existing manage grant
-  // renders as a fixed label rather than a dropdown choice. Unlike the
-  // owner row it can still be revoked.
-  const isManage = permission.level === 3;
-  // Read-only sharing mode: existing grants can't be re-leveled, so the level
-  // shows as a fixed label (like owner/manage) — but the row stays revocable.
-  const fixedLevel = isOwner || isManage || readOnly;
-
-  return (
-    <div className="flex items-center gap-2 rounded-md px-2 py-0.5 hover:bg-muted/50">
-      {/* Tail truncation keeps the local part — the distinguishing half when
-          every grantee shares one company domain — and the title tooltip
-          carries the full id. */}
-      <span className="flex-1 truncate text-ui" title={permission.user_id}>
-        {permission.user_id}
-      </span>
-      {fixedLevel ? (
-        <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
-        </span>
-      ) : (
-        <Select
-          value={String(permission.level)}
-          onValueChange={(v) => onChangeLevel(permission.user_id, parseInt(v, 10))}
-          disabled={busy}
-        >
-          <SelectTrigger
-            className="h-8 w-28"
-            aria-label={`Permission level for ${permission.user_id}`}
-          >
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent position="popper" align="start">
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
-          </SelectContent>
-        </Select>
-      )}
-      {isOwner ? (
-        <span className="size-7 shrink-0" aria-hidden="true" />
-      ) : (
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          onClick={() => onRevoke(permission.user_id)}
-          disabled={busy}
-          className="shrink-0 text-muted-foreground hover:text-destructive"
-          componentId="diagnostics.permissions.revoke"
-        >
-          <Trash2Icon className="size-3.5" />
-          <span className="sr-only">Revoke</span>
-        </Button>
-      )}
-    </div>
   );
 }
