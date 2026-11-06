@@ -35,6 +35,7 @@ from omnigent.entities import (
     NewConversationItem,
 )
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.claude_native.bridge import _CONTEXT_OVERFLOW_REPLACEMENT
 from omnigent.host.frames import HostHelloFrame
 from omnigent.llms.context_window import ModelPricing
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
@@ -6208,6 +6209,33 @@ _CODEX_PROVIDER_DISK_FULL_CARD = {
 @pytest.mark.parametrize(
     ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
+        pytest.param(
+            '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}',
+            "context_length_exceeded",
+            {"title": "Context limit reached", "cause": _CONTEXT_OVERFLOW_REPLACEMENT},
+            "claude-code-native-ui",
+            False,
+            {},
+            id="wrapped_context_large",
+        ),
+        pytest.param(
+            '400 {"message":"prompt is too long: 1028000 tokens > 1000000 maximum"}',
+            "context_length_exceeded",
+            {"title": "Context limit reached", "cause": _CONTEXT_OVERFLOW_REPLACEMENT},
+            "claude-code-native-ui",
+            False,
+            {},
+            id="wrapped_context_near_limit",
+        ),
+        pytest.param(
+            "Claude Code ended the turn with an API error (invalid_request).",
+            "native_turn_error",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+            id="opaque_request_category",
+        ),
         (
             "Request timed out",
             "transient_upstream_error",

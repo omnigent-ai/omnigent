@@ -9478,6 +9478,37 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
             "context_length_exceeded",
             "Context limit reached",
         ),
+        pytest.param(
+            '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}',
+            "context_length_exceeded",
+            "Context limit reached",
+            id="wrapped_context_flat",
+        ),
+        pytest.param(
+            'API Error: 400 {"error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 1028000 tokens > 1000000 maximum"}}',
+            "context_length_exceeded",
+            "Context limit reached",
+            id="wrapped_context_nested",
+        ),
+        pytest.param(
+            claude_native_bridge._CONTEXT_OVERFLOW_REPLACEMENT,
+            "context_length_exceeded",
+            "Context limit reached",
+            id="normalized_context",
+        ),
+        pytest.param(
+            "Claude Code ended the turn with an API error (invalid_request).",
+            "native_turn_error",
+            "Claude Code ended",
+            id="opaque_request_category",
+        ),
+        pytest.param(
+            '400 {"message":"Unexpected parameter: max_tokens"}',
+            "native_turn_error",
+            "400",
+            id="opaque_request_parameter",
+        ),
         ("Login expired · Please run /login", "native_turn_error", "Login expired"),
         ("API Error: 500 upstream failed", "native_turn_error", "API Error: 500 upstream failed"),
     ],
@@ -17258,3 +17289,17 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.parametrize("prefix", ["400 ", "API Error: 400 "])
+@pytest.mark.parametrize("is_api_error", [False, True])
+def test_wrapped_context_guidance_requires_authoritative_api_error(
+    tmp_path: Path, prefix: str, is_api_error: bool
+) -> None:
+    raw = prefix + '{"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}'
+    display = _assistant_transcript_text(tmp_path, raw, is_api_error=is_api_error)
+    if is_api_error:
+        assert display.startswith("Context limit reached")
+        assert "/compact" in display and "/clear" in display
+    else:
+        assert display == raw

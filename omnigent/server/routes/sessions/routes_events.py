@@ -64,6 +64,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_run
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
     CODEX_PROVIDER_AUTH_FAILED,
+    FailureDiagnosis,
     classify_native_turn_error,
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
@@ -2677,6 +2678,13 @@ def register_events_routes(
                     # A retry can clear a temporary failure, so keep its retryable code.
                     if classified_code not in {"rate_limit_exceeded", "transient_upstream_error"}:
                         classified_code = CODEX_COMPACTION_MODEL_FAILED
+                if harness == "claude-native":
+                    from omnigent.harnesses.claude_native.bridge import program_status_turn_error
+
+                    native_code, guidance = program_status_turn_error(output)
+                    if native_code == "context_length_exceeded":
+                        classified_code = native_code
+                        diagnosis = FailureDiagnosis(title="Context limit reached", cause=guidance)
                 status_error = ErrorDetail(
                     code=classified_code,
                     message=output.strip(),

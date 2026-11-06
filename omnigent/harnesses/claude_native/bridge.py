@@ -11094,6 +11094,17 @@ def _assistant_message_item(
     )
 
 
+def _is_context_overflow_text(text: str, *, is_api_error: bool) -> bool:
+    """Recognize Claude's own context refusal, including its HTTP error envelope."""
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped) or stripped == _CONTEXT_OVERFLOW_REPLACEMENT:
+        return True
+    if not is_api_error:
+        return False
+    detail = claude_failure_context({}, error_text=stripped).get("native_error_message")
+    return isinstance(detail, str) and bool(_CONTEXT_OVERFLOW_RE.match(detail.strip()))
+
+
 def _display_text(text: str, *, is_api_error: bool) -> str:
     """
     Rewrite Claude text whose own remedy is a dead end in the web chat.
@@ -11104,7 +11115,7 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     :returns: The text to show, e.g. the context-overflow guidance.
     """
     stripped = text.strip()
-    if _CONTEXT_OVERFLOW_RE.match(stripped):
+    if _is_context_overflow_text(text, is_api_error=is_api_error):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
@@ -11115,19 +11126,16 @@ def program_status_turn_error(text: str) -> tuple[str, str]:
     """
     Name the error code and display text for an error Claude reported itself.
 
-    Claude Code refuses a turn whose context is already full before calling
-    the model: it ends the turn with "Prompt is too long" in its terminal
-    status and fires no ``StopFailure`` hook, so that status is the only
-    record of the cause. The text gets the same rewrite as a ``StopFailure``
-    message, and an overflow gets its own code so the failure card describes
-    it instead of a generic turn error.
+    Local context refusals may have no ``StopFailure`` hook; API refusals
+    wrap the same reason in an HTTP error body. Both use the same recovery
+    guidance and context-overflow code.
 
     :param text: Claude's error text, e.g. ``"Prompt is too long"``.
     :returns: ``(code, message)``, e.g. ``("context_length_exceeded",
         "Context limit reached — ...")``; other errors keep
         ``"native_turn_error"``.
     """
-    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+    if _is_context_overflow_text(text, is_api_error=True):
         return "context_length_exceeded", _CONTEXT_OVERFLOW_REPLACEMENT
     return "native_turn_error", _display_text(text, is_api_error=True)
 

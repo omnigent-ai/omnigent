@@ -13,6 +13,7 @@ import pytest
 
 import omnigent.harnesses.claude_native.forwarder as forwarder
 from omnigent.harnesses.claude_native.bridge import (
+    _CONTEXT_OVERFLOW_REPLACEMENT,
     ClaudeHookRecord,
     record_hook_event,
 )
@@ -294,6 +295,16 @@ async def test_forwarder_posts_external_session_status_on_stop_failure_hook(
 @pytest.mark.parametrize(
     ("payload_fields", "expected_detail"),
     [
+        pytest.param(
+            {
+                "error": "invalid_request",
+                "error_details": (
+                    '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}'
+                ),
+            },
+            _CONTEXT_OVERFLOW_REPLACEMENT,
+            id="wrapped_context",
+        ),
         (
             {
                 "error": "server_error",
