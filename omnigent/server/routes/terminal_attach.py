@@ -71,7 +71,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Final
+from collections.abc import Callable
+from typing import Any, Final
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect, WebSocketException
 from starlette import status
@@ -100,6 +101,8 @@ _WS_CLOSE_TERMINAL_NOT_FOUND: Final[int] = WS_CLOSE_TERMINAL_NOT_FOUND
 _WS_CLOSE_INTERNAL_ERROR: Final[int] = WS_CLOSE_INTERNAL_ERROR
 _WS_CLOSE_WRONG_REPLICA: Final[int] = WS_CLOSE_WRONG_REPLICA
 _WS_CLOSE_TRY_AGAIN_LATER: Final[int] = 1013
+# Poll interval while an await_launch attach waits for a waking runner's tunnel.
+_RUNNER_WS_RETRY_S: Final[float] = 0.1
 
 
 def create_terminal_attach_router(
@@ -135,6 +138,7 @@ def create_terminal_attach_router(
         session_id: str,
         terminal_id: str,
         read_only: bool = Query(default=False),
+        await_launch: bool = Query(default=False),
     ) -> None:
         """
         Attach to a terminal by resource id via WebSocket.
@@ -148,9 +152,12 @@ def create_terminal_attach_router(
         :param terminal_id: Opaque terminal resource id,
             e.g. ``"terminal_bash_s1"``.
         :param read_only: Prevent terminal input when ``True``.
+        :param await_launch: Wait briefly for a terminal whose create request
+            is still in flight instead of closing as not found.
         """
         from omnigent.entities.session_resources import (
             resolve_terminal_entry_by_resource_id,
+            wait_for_terminal_entry_by_resource_id,
         )
 
         user_id = await _authorize_terminal_attach(
@@ -182,12 +189,19 @@ def create_terminal_attach_router(
         if ws_factory is not None:
             from urllib.parse import urlencode
 
-            qs = urlencode({"read_only": "true" if read_only else "false"})
+            query = {"read_only": "true" if read_only else "false"}
+            if await_launch:
+                query["await_launch"] = "true"
+            qs = urlencode(query)
             runner_path = (
                 f"/v1/sessions/{session_id}/resources/terminals/{terminal_id}/attach?{qs}"
             )
             try:
-                runner_cm = ws_factory(runner_path)
+                runner_cm = (
+                    await _wait_for_runner_ws(ws_factory, runner_path)
+                    if await_launch
+                    else ws_factory(runner_path)
+                )
             except WrongReplicaWSError:
                 # Wrong-replica routing miss: the runner tunnel is bound but not
                 # on this replica (the key routed here, but the host homed its
@@ -260,6 +274,12 @@ def create_terminal_attach_router(
             terminal_id,
             terminal_registry,
         )
+        if entry is None and await_launch:
+            entry = await wait_for_terminal_entry_by_resource_id(
+                session_id,
+                terminal_id,
+                terminal_registry,
+            )
         if entry is None or not entry.instance.running or not await entry.instance.is_alive():
             await websocket.close(
                 code=_WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -370,6 +390,25 @@ async def _authorize_terminal_attach(
             reason="not authorized",
         ) from exc
     return user_id
+
+
+async def _wait_for_runner_ws(ws_factory: Callable[[str], Any], runner_path: str) -> Any:
+    """Open the runner WS once its tunnel connects, for a shell create in flight.
+
+    The create may be waking the session's runner, so an unavailable tunnel
+    is retried until :data:`TERMINAL_LAUNCH_ATTACH_WAIT_S` instead of closing.
+    """
+    from omnigent.entities import session_resources
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S
+    while True:
+        try:
+            return ws_factory(runner_path)
+        except RunnerUnavailableWSError:
+            if loop.time() >= deadline:
+                raise
+            await asyncio.sleep(_RUNNER_WS_RETRY_S)
 
 
 class _RunnerWSClosed(Exception):
