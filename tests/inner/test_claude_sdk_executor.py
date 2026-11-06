@@ -4124,6 +4124,11 @@ async def test_live_mcp_status_and_reconnect_for_the_mcp_panel(
         assert len(reconnects) == 3
 
 
+# The relay round trips read the serve-mcp pipe with select(), and the relay keeps its
+# control socket in a directory, both of which are POSIX-only.
+_POSIX_ONLY = pytest.mark.skipif(sys.platform == "win32", reason="POSIX pipes and sockets")
+
+
 def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: str) -> list[dict]:
     """Run a Claude Code MCP entry as Claude Code would, expanding ``${VAR}``s from ``env``."""
     import subprocess
@@ -4184,6 +4189,7 @@ def _deploy_managed_mcp(
     )
 
 
+@_POSIX_ONLY
 @pytest.mark.asyncio
 async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4300,6 +4306,7 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         await executor.close_session("managed")
 
 
+@_POSIX_ONLY
 @pytest.mark.asyncio
 async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fails(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -4448,7 +4455,9 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         assert len(fake_sdk.created_clients) == clients_before
         assert "managed" not in executor._clients
         assert len(started) == 1
-        assert not started[0].bridge_dir.exists() and not started[0].socket_dir.exists()
+        socket_dir = started[0].socket_dir
+        assert not started[0].bridge_dir.exists()
+        assert socket_dir is None or not socket_dir.exists()
         executor._cli_sandbox = None
 
         # A relay that cannot start leaves no bridge directory and starts no CLI.
@@ -4512,6 +4521,7 @@ def _sandbox_grants(backend: str, policy, workspace: Path) -> tuple[set[str], se
 
 
 @pytest.mark.asyncio
+@_POSIX_ONLY
 @pytest.mark.parametrize("backend", ["linux_bwrap", "darwin_seatbelt"])
 async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_only(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, backend: str
