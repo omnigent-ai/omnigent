@@ -41,6 +41,8 @@ function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
 // replica (the ``?omnigent_slice_key=`` doesn't match where the tunnel lives).
 // Mirrors ``ws_common.py`` ``WS_CLOSE_WRONG_REPLICA``.
 export const WS_CLOSE_WRONG_REPLICA = 4400;
+// Mirrors ``ws_common.py`` ``WS_CLOSE_TERMINAL_NOT_FOUND``.
+export const WS_CLOSE_TERMINAL_NOT_FOUND = 4404;
 
 /**
  * Return an xterm `ITheme` object matched to the app's light or dark palette.

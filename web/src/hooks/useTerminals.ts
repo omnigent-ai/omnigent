@@ -6,6 +6,9 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { randomUUID } from "@/lib/randomUUID";
 import {
+  clearClosedDuringLaunch,
+  isClosedDuringLaunch,
+  requestCloseDuringLaunch,
   setTerminalLaunching,
   terminalInfoFromResource,
   terminalResourceId,
@@ -355,7 +358,10 @@ export function useCreateTerminal(conversationId: string) {
       typeof request === "string"
         ? createTerminal(conversationId, request)
         : createTerminal(conversationId, request.terminal, request.sessionKey),
-    onSuccess: addToCache,
+    // A shell the user closed while its create was in flight stays closed.
+    onSuccess: (info) => {
+      if (!isClosedDuringLaunch(info.id)) addToCache(info);
+    },
   });
   const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
     const sessionKey = newTerminalSessionKey();
@@ -371,6 +377,16 @@ export function useCreateTerminal(conversationId: string) {
     mutation
       .mutateAsync({ terminal, sessionKey })
       .then((info) => {
+        if (isClosedDuringLaunch(predicted.id)) {
+          // Closed before the create returned: the DELETE was deferred to now.
+          removeFromCache(info.id);
+          deleteTerminal(conversationId, info.id)
+            .catch(() =>
+              showToast("Couldn't close the shell — it's still running.", { duration: 0 }),
+            )
+            .finally(() => clearClosedDuringLaunch(predicted.id));
+          return;
+        }
         if (info.id === predicted.id) {
           // Keep the tab's slot; take the server's fields over the prediction.
           const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
@@ -384,6 +400,7 @@ export function useCreateTerminal(conversationId: string) {
         callbacks.onOpen?.(info);
       })
       .catch((error: unknown) => {
+        clearClosedDuringLaunch(predicted.id);
         removeFromCache(predicted.id);
         callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
       })
@@ -431,7 +448,12 @@ export async function deleteTerminal(conversationId: string, terminalId: string)
 export function useDeleteTerminal(conversationId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (terminalId: string) => deleteTerminal(conversationId, terminalId),
+    // A shell still being created has nothing to DELETE yet: its launch
+    // deletes it once the create returns.
+    mutationFn: async (terminalId: string) => {
+      if (requestCloseDuringLaunch(terminalId)) return;
+      await deleteTerminal(conversationId, terminalId);
+    },
     onSuccess: (_result, terminalId) => {
       const key = terminalsQueryKey(conversationId);
       const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];

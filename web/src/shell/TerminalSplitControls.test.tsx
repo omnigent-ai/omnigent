@@ -147,6 +147,32 @@ it("splits right with the preferred shell from the keyboard, skipping the picker
   );
 });
 
+it("drops only the opened pane when its shell's create fails", async () => {
+  const zsh = { id: "terminal_zsh_u-2", name: "zsh", session: "u-2", running: true };
+  fixture.terminals = [AGENT, BASH];
+  fixture.createTerminal.mockImplementation((_shell: string, { onOpen, onError }) => {
+    onOpen(zsh);
+    onError(new Error("launch failed"), zsh);
+  });
+  writeSessionWorkspaceState("conv_controls_rollback", {
+    terminalSplit: {
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
+      focusedKey: BASH_KEY,
+    },
+  });
+  renderControls("conv_controls_rollback");
+
+  fireEvent.keyDown(window, { code: "Backslash", ctrlKey: true, altKey: true, shiftKey: true });
+
+  // The existing panes and layout survive; focus falls back to a remaining pane.
+  await waitFor(() =>
+    expect(readSessionWorkspaceState("conv_controls_rollback").terminalSplit).toEqual({
+      layout: { axis: "columns", ratio: 0.5, children: [AGENT_KEY, BASH_KEY] },
+      focusedKey: AGENT_KEY,
+    }),
+  );
+});
+
 it("claims the split chord without a second shell while one is being created", () => {
   fixture.createPending = true;
   renderControls("conv_controls_pending");

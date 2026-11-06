@@ -22,12 +22,14 @@ import {
   terminalsReconcileInterval,
   terminalTabKey,
   useCreateTerminal,
+  useDeleteTerminal,
   useTerminals,
   type TerminalInfo,
 } from "./useTerminals";
 import {
   clearDirectAttachCaches,
   directProbeUrl,
+  isClosedDuringLaunch,
   isTerminalLaunching,
   terminalLaunchMode,
   terminalResourceId,
@@ -461,6 +463,52 @@ describe("useCreateTerminal launch", () => {
     await vi.waitFor(() => expect(isTerminalLaunching(opened.id)).toBe(false));
     expect(onOpen).toHaveBeenCalledOnce();
     expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+  });
+
+  it("closes a shell the user closed before its create returned, without restoring its tab", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        requestBody = init.body as string;
+        return new Promise<Response>((resolve) => {
+          respond = resolve;
+        });
+      }
+      return Promise.resolve(mockResponse({ deleted: true }));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const create = renderHook(() => useCreateTerminal("conv_close_early"), { wrapper });
+    const remove = renderHook(() => useDeleteTerminal("conv_close_early"), { wrapper });
+    const cached = () => client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_close_early"));
+    const onOpen = vi.fn();
+
+    act(() => create.result.current.launch("zsh", { onOpen }));
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+
+    await act(async () => {
+      await remove.result.current.mutateAsync(opened.id);
+    });
+    // Nothing to DELETE yet: the terminal doesn't exist until the create returns.
+    expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(0);
+    expect(cached()).toEqual([]);
+
+    await act(async () => respond(createdResponse(requestBody)));
+
+    await vi.waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(1),
+    );
+    const [deleteUrl] = fetchMock.mock.calls.find(([, init]) => init?.method === "DELETE")!;
+    expect(deleteUrl).toBe(
+      `/v1/sessions/conv_close_early/resources/terminals/${encodeURIComponent(opened.id)}`,
+    );
+    expect(cached()).toEqual([]);
+    expect(onOpen).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(isClosedDuringLaunch(opened.id)).toBe(false));
   });
 
   it("removes the early-opened terminal and reports it when the create fails", async () => {

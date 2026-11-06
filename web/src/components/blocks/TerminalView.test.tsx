@@ -222,6 +222,45 @@ describe("control-mode terminal", () => {
     expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
   });
 
+  it("re-dials an attach refused during its launch once the create succeeds", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-retry1", "attach");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-retry1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    // An older runner (or a launch past the server's wait) refuses the early attach.
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 4404, reason: "not found" }),
+    );
+    expect(screen.getByText("Starting shell…")).toBeTruthy();
+
+    act(() => setTerminalLaunching("terminal_zsh_u-retry1", null));
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(terminalSessionMock.instances[1].url).not.toContain("await_launch");
+  });
+
+  it("keeps a 4404 outside a launch closed, and a live attach untouched when its launch ends", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-gone1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 4404, reason: "not found" }),
+    );
+    cleanup();
+    terminalSessionMock.instances = [];
+
+    setTerminalLaunching("terminal_zsh_u-live1", "attach");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-live1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
+    act(() => setTerminalLaunching("terminal_zsh_u-live1", null));
+    await act(async () => {});
+
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(terminalSessionMock.instances[0].dispose).not.toHaveBeenCalled();
+  });
+
   it("holds a new shell's attach until its create returns when the runner may be waking", async () => {
     vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
     setTerminalLaunching("terminal_zsh_u-wait1", "wait");
