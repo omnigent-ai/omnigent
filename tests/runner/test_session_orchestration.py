@@ -13,10 +13,23 @@ from omnigent.spec.types import AgentSpec
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
-def test_native_message_schema(spec):
+@pytest.mark.parametrize("runner_features", [None, "peer_session_messaging"])
+def test_native_message_schema(spec, runner_features, monkeypatch):
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     schemas = build_native_relay_tool_schemas(spec)
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
+
+
+@pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
+def test_runner_can_hide_native_message_tool(spec, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
+    names = {s["name"] for s in build_native_relay_tool_schemas(spec)}
+    assert "sys_session_message" not in names
+    assert "sys_session_get_info" in names
 
 
 @pytest.mark.asyncio

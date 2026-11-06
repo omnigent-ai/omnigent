@@ -26,6 +26,7 @@ class Feature(StrEnum):
     SANDBOX_PROFILES = "sandbox_profiles"
     SESSION_ORCHESTRATION = "session_orchestration"
     SIBLING_SESSIONS = "sibling_sessions"
+    PEER_SESSION_MESSAGING = "peer_session_messaging"
     CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
@@ -81,6 +82,17 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Create nested agents on shared or separate compute",
         owner="server",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PEER_SESSION_MESSAGING,
+        description=(
+            "sys_session_message to non-child sessions; both the server and the runner "
+            "must leave it enabled"
+        ),
+        owner="server",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,

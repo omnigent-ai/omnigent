@@ -9,7 +9,12 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.feature_flags import (
+    FEATURES_ENV_VAR,
+    Feature,
+    FeatureFlags,
+    resolve_feature_flags,
+)
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -99,6 +104,37 @@ async def test_private_sender_can_message_shared_receiver(
     store = SqlAlchemyConversationStore(db_uri)
     assert store.get_conversation(target["id"]).parent_conversation_id is None
     assert store.get_conversation(source["id"]).parent_conversation_id is None
+
+
+@pytest.mark.parametrize(
+    ("server_features", "runner_features", "refusal"),
+    [
+        ("-peer_session_messaging", None, "Messaging other sessions is disabled"),
+        ("peer_session_messaging", None, None),
+        (None, None, None),
+        (None, "-peer_session_messaging", "disabled on this runner"),
+        (
+            "-peer_session_messaging",
+            "peer_session_messaging",
+            "Messaging other sessions is disabled",
+        ),
+    ],
+)
+async def test_peer_messaging_needs_server_and_runner_flags(
+    auth_client, auth_app, peers, monkeypatch, server_features, runner_features, refusal
+):
+    source, target, captured = peers
+    auth_app.state.feature_flags = resolve_feature_flags(
+        {} if server_features is None else {FEATURES_ENV_VAR: server_features}
+    )
+    if runner_features is not None:
+        monkeypatch.setenv(FEATURES_ENV_VAR, runner_features)
+    result = await _send(auth_client, source, target)
+    if refusal is None:
+        assert result.get("queued") is True, result
+        return
+    assert refusal in result.get("detail", result.get("error", "")), result
+    assert not captured.get("posts")
 
 
 async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, peers, db_uri):

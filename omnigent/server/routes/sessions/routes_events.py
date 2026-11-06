@@ -112,6 +112,7 @@ from omnigent.server.failed_status_diagnostics import (
     bound_runner_connection,
     failed_status_intake_attributes,
 )
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -1363,6 +1364,10 @@ def register_events_routes(
             if not isinstance(request, Request):
                 raise OmnigentError(
                     "Session messages require a runner HTTP request", code=ErrorCode.FORBIDDEN
+                )
+            if not request.app.state.feature_flags.enabled(Feature.PEER_SESSION_MESSAGING):
+                raise OmnigentError(
+                    "Messaging other sessions is disabled", code=ErrorCode.FORBIDDEN
                 )
             source = await asyncio.to_thread(
                 require_orchestration_source,
