@@ -524,11 +524,8 @@ function AppShellImpl() {
   const [selectedTerminalKey, setSelectedTerminalKey] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedTerminalKey ?? null) : null,
   );
-  // The one shell key the user just opened by an explicit gesture (clicking a
-  // tab / creating a "+"→Shell). Its rail xterm may grab keyboard focus when it
-  // connects; a shell merely *restored* on a session switch may not — switching
-  // sessions keeps focus in the chat composer. Scoped to its session, since a
-  // switch restores the next session's shell before the effect clears this.
+  // A shell opened by an explicit gesture may grab focus on connect; a restored
+  // one may not. Scoped per session: a switch restores the next shell first.
   const autoFocusTerminalRef = useRef<{ conversationId: string; key: string } | null>(null);
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.

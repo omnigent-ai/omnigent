@@ -4116,6 +4116,7 @@ describe("AppShell URL sync — file param", () => {
   it("restores the file viewer from the ?file= URL param on load", () => {
     // A shared link like /c/conv_abc?file=README.md should open the viewer
     // immediately, without the user having to click the file in the panel.
+    writeSessionWorkspaceState("conv_abc", { openFiles: ["a.ts"] });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
 
     renderShell("/c/conv_abc?file=README.md");
@@ -4124,6 +4125,11 @@ describe("AppShell URL sync — file param", () => {
     expect(screen.queryByTestId("file-viewer")).toBeNull();
     expect(pushPanel).toHaveAttribute("data-state", "open");
     expect(pushPanel).toHaveAttribute("data-path", "README.md");
+    // The linked file is merged into the remembered tabs and saved on mount.
+    expect(readSessionWorkspaceState("conv_abc")).toMatchObject({
+      openFiles: ["a.ts", "README.md"],
+      selectedFilePath: "README.md",
+    });
   });
 
   it("restores the file viewer into the desktop rail on a ?file= reload", () => {
