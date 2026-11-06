@@ -681,8 +681,12 @@ def resolve_delivery_attempt(
     *,
     stable_id: str | None = None,
     hold: bool = False,
+    allow_restored: bool = True,
 ) -> DrainedInput | None:
-    """Resolve one receipt without using text or consuming older queued inputs."""
+    """Resolve one receipt without using text or consuming older queued inputs.
+
+    Disable restored matching when an action requires the exact live attempt.
+    """
     identity = {
         "pending_id": pending_id,
         **(
@@ -699,7 +703,8 @@ def resolve_delivery_attempt(
         if entry is None:
             return None
         restored_match = (
-            entry.restored
+            allow_restored
+            and entry.restored
             and entry.delivery_attempt_id is None
             and stable_id is not None
             and entry.stable_id == stable_id

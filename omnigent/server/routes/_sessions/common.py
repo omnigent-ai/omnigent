@@ -665,6 +665,11 @@ _runner_status_probe_inflight: WorkspaceScopedCache[str, asyncio.Task[str | None
 
 _session_active_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache()
 
+# Keep turn evidence after idle; a missing owner cannot authorize a delayed failure.
+_session_last_response_cache: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=3600.0, timer=time.monotonic)
+)
+
 
 _session_background_task_count_cache: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
@@ -1303,6 +1308,7 @@ __all__ = [
     "_session_background_task_count_cache",
     "_session_background_tasks_cache",
     "_session_blocked_on_cache",
+    "_session_last_response_cache",
     "_session_mcp_startup_cache",
     "_session_sandbox_status_cache",
     "_session_status_cache",

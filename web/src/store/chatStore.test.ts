@@ -86,6 +86,11 @@ import type {
 } from "@/lib/events";
 import type { TerminalInfo } from "@/hooks/useTerminals";
 import { terminalsQueryKey } from "@/hooks/useTerminals";
+import {
+  clearClosedDuringLaunch,
+  requestCloseDuringLaunch,
+  setTerminalLaunching,
+} from "@/lib/terminals";
 import { type ChildSessionInfo, childSessionsQueryKey } from "@/hooks/useChildSessions";
 import {
   ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
@@ -10911,6 +10916,22 @@ describe("chatStore — handleSessionEvent (resource events)", () => {
       expect(cached).toEqual([
         { id: "terminal_bash_s1", name: "bash", session: "s1", running: true },
       ]);
+    });
+
+    it("does not resurrect a shell the user closed while its create was in flight", () => {
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"), []);
+      setTerminalLaunching("terminal_bash_s1", "attach");
+      try {
+        expect(requestCloseDuringLaunch("terminal_bash_s1")).toBe(true);
+        handleSessionEvent({
+          type: "session_resource_created",
+          resource: makeTerminalResource("terminal_bash_s1") as never,
+        });
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_abc"))).toEqual([]);
+      } finally {
+        clearClosedDuringLaunch("terminal_bash_s1");
+        setTerminalLaunching("terminal_bash_s1", null);
+      }
     });
 
     it("is idempotent for duplicate resource ids", () => {

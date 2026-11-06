@@ -7747,6 +7747,18 @@
             "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
             "title": "Search Snippet"
           },
+          "shared_with_others": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the requesting user owns this session and has granted access to another user (the public link alone doesn't count). `None` when the requester isn't the owner or permissions are disabled, so the grant list never leaks to non-owners.",
+            "title": "Shared With Others"
+          },
           "status": {
             "description": "Derived session lifecycle status.",
             "enum": [
@@ -18597,6 +18609,81 @@
           }
         },
         "summary": "Create Session Github Comment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/commits": {
+      "get": {
+        "description": "List the PR's commits, oldest first, at the displayed head.\n\n**Returns:** `list` of `session.github.commit` objects with `has_more`.",
+        "operationId": "list_session_github_commits_v1_sessions__session_id__resources_github_commits_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
+          },
+          {
+            "description": "The full head commit id the panel shows; rejected when the PR moved.",
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Head Sha"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Commits",
         "tags": [
           "session_resources"
         ]

@@ -8,6 +8,10 @@ import re
 from collections.abc import Iterator, Mapping
 from contextvars import ContextVar
 
+# Failure code for a turn whose native terminal died on its own before any of the
+# message was typed. Nothing reached the agent, so the server may send it once more.
+TERMINAL_EXITED_BEFORE_DELIVERY_CODE = "terminal_exited_before_delivery"
+
 _IDENTIFIERS = {
     "input_stable_id": re.compile(r"[0-9a-f]{32}"),
     "pending_id": re.compile(r"pending_[0-9a-f]{32}"),
