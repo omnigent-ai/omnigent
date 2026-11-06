@@ -79,7 +79,9 @@ function ServiceConnection({
     <div className="space-y-2 rounded-md border border-border p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          {service.icon && <McpServiceIcon service={service} className="size-5" />}
+          {service.icon && (
+            <McpServiceIcon service={service} className="size-5 text-muted-foreground" />
+          )}
           <div>
             <p className="text-sm font-medium">{service.title}</p>
             <p className="text-sm text-muted-foreground">{service.description}</p>
