@@ -1,5 +1,5 @@
-// Which hosts' harness imports this device has already reviewed, so the
-// import modal opens on its own only the first time a host shows up.
+// Which hosts' harness imports this device has reviewed, and the host an
+// explicit caller (e.g. desktop onboarding) wants the import modal opened for.
 
 import { useSyncExternalStore } from "react";
 
@@ -24,12 +24,17 @@ export function markImportsReviewed(hostId: string): void {
   }
 }
 
-/** A host an explicit caller (e.g. onboarding's install step) wants reviewed. */
-export interface ImportReviewTarget {
-  hostId: string;
-  /** Where the host runs; words the loading copy until the host is listed. */
-  runner?: "remote" | "local";
-}
+/**
+ * A host an explicit caller wants reviewed: a known `hostId`, or only the
+ * `runner` onboarding picked, resolved to a host once it can be identified.
+ */
+export type ImportReviewTarget =
+  | {
+      hostId: string;
+      /** Where the host runs; words the loading copy until the host is listed. */
+      runner?: "remote" | "local";
+    }
+  | { hostId?: undefined; runner: "remote" | "local" };
 
 // While set, the gate shows only this host, waiting for it to connect.
 let requestedTarget: ImportReviewTarget | null = null;
@@ -54,7 +59,7 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** The requested target, or null when the gate picks hosts on its own. */
+/** The requested target, or null when nothing should be reviewed. */
 export function useImportReviewRequest(): ImportReviewTarget | null {
   return useSyncExternalStore(
     subscribe,
