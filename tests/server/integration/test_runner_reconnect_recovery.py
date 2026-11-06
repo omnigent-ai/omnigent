@@ -747,15 +747,19 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     assert not reconnect_recovery_deferred(store.get_conversation(interrupted.id))
 
 
-async def test_reconnect_recovers_a_child_messaged_after_its_parent_woke(
+@pytest.mark.parametrize("during_wake", [False, True], ids=["after-wake", "during-wake"])
+async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wake(
     app: FastAPI,
     agent: Agent,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    during_wake: bool,
 ) -> None:
-    """Work a user starts on a child after its parent's wake recovers when the runner drops."""
+    """Work started on a child during or after its parent's wake recovers when the runner drops."""
+    from omnigent.server import child_session_recovery
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes.sessions import routes_events
+    from omnigent.stores.conversation_store import RECONNECT_RECOVERY_HELD_LABEL_KEY
     from tests._helpers.polling import poll_until_async
 
     for module in (routes_events, orchestration):
@@ -764,11 +768,32 @@ async def test_reconnect_recovers_a_child_messaged_after_its_parent_woke(
     child = _create_session(
         app, agent.id, interrupted=False, kind="sub_agent", parent_conversation_id=parent.id
     )
-    wake = await client.post(
-        f"/v1/sessions/{parent.id}/events",
-        json={"type": "retry_session", "data": {"wake_only": True}},
+    holding = asyncio.Event()
+    work_requested = asyncio.Event()
+
+    async def to_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        if (
+            during_wake
+            and fn.__name__ == "set_labels"
+            and RECONNECT_RECOVERY_HELD_LABEL_KEY in args[1]
+        ):
+            holding.set()
+            # The wake's hold lands only after the child's message has released recovery.
+            await work_requested.wait()
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    _patch_to_thread(monkeypatch, child_session_recovery, to_thread)
+    wake = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{parent.id}/events",
+            json={"type": "retry_session", "data": {"wake_only": True}},
+        )
     )
-    assert wake.status_code == 503, wake.text
+    if during_wake:
+        await asyncio.wait_for(holding.wait(), budget(5))
+    else:
+        response = await wake
+        assert response.status_code == 503, response.text
     inits: list[tuple[str, bool]] = []
     forwarded: list[str] = []
 
@@ -790,6 +815,8 @@ async def test_reconnect_recovers_a_child_messaged_after_its_parent_woke(
             },
         )
         assert message.status_code == 202, message.text
+        work_requested.set()
+        await wake
     assert inits == []
     assert f"/v1/sessions/{child.id}/events" in forwarded
     # The runner drops during the child's turn.

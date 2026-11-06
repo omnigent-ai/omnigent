@@ -8248,7 +8248,7 @@ async def _dispatch_session_event_to_runner_impl(
 
         disconnect_outcome.note_user_turn(conv.id)
         if not keep_reconnect_deferral:
-            await release_reconnect_recovery(conv, conversation_store)
+            await release_reconnect_recovery(conv.id, conversation_store)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

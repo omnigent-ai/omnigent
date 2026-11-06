@@ -784,11 +784,11 @@ async def _recover_retry_session_once(
         skipped_resume_runner,
     )
 
+    if not wake_only:
+        await release_reconnect_recovery(session_id, conversation_store)
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
-    if not wake_only:
-        await release_reconnect_recovery(conv, conversation_store)
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)

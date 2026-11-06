@@ -12,7 +12,7 @@ from weakref import WeakValueDictionary
 import cachetools
 import httpx
 
-from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
 from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -27,6 +27,8 @@ from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
 RECOVERY_STORE_CONCURRENCY = 8
+# A release reads the session and its ancestors within the routing-host lookup budget.
+_RELEASE_MAX_READS = 16
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
@@ -39,6 +41,8 @@ _restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None
 
 
 _wake_only_retries: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+# Sessions given work while a wake-only retry was running, whose later hold must not stay.
+_released_during_wake: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 # Session -> runner a wake brought up without resuming its interrupted turn.
 _skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
     lambda: cachetools.LRUCache(maxsize=4096)
@@ -57,6 +61,7 @@ def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
             _wake_only_retries[session_id] = remaining
         else:
             _wake_only_retries.pop(session_id, None)
+            _released_during_wake.discard(session_id)
 
 
 async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
@@ -67,32 +72,34 @@ async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> 
     await asyncio.to_thread(
         store.set_labels, session_id, {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"}
     )
+    if session_id in _released_during_wake:
+        # Work requested during this wake already released recovery.
+        await asyncio.to_thread(store.delete_label, session_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
 
 
-async def end_reconnect_deferral(conv: Conversation, store: ConversationStore) -> None:
-    """End *conv*'s own hold on runner-connect recovery of its tree."""
-    if RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
-        await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-
-
-async def release_reconnect_recovery(conv: Conversation, store: ConversationStore) -> None:
-    """When work is requested of *conv*, end its hold and those of ancestors that recover it."""
-    seen = {conv.id}
-    while True:
-        await end_reconnect_deferral(conv, store)
-        parent_id = conv.parent_conversation_id
+async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
+    """When *session_id* is given work, end its hold and those of ancestors that recover it."""
+    seen: set[str] = set()
+    child: Conversation | None = None
+    next_id: str | None = session_id
+    for _ in range(_RELEASE_MAX_READS):
+        if next_id is None or next_id in seen:
+            return
+        conv = await asyncio.to_thread(store.get_conversation, next_id)
+        if conv is None or (child is not None and conv.runner_id != child.runner_id):
+            return
+        wake_running = conv.id in _wake_only_retries
+        if wake_running:
+            _released_during_wake.add(conv.id)
+        # A running wake can land its hold after the read above.
+        if wake_running or RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
+            await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
         # As on runner connect, a hosted child recovers as its own tree.
-        if (
-            parent_id is None
-            or parent_id in seen
-            or (conv.host_id is not None and not is_parent_owned_subagent(conv))
-        ):
+        if conv.host_id is not None and not is_parent_owned_subagent(conv):
             return
-        parent = await asyncio.to_thread(store.get_conversation, parent_id)
-        if parent is None or parent.runner_id != conv.runner_id:
-            return
-        seen.add(parent.id)
-        conv = parent
+        seen.add(conv.id)
+        child = conv
+        next_id = conv.parent_conversation_id
 
 
 def reconnect_recovery_deferred(conv: Conversation) -> bool:
@@ -271,7 +278,8 @@ async def restore_active_children(
         return
     # A woken child no longer holds back recovery of the tree restored here.
     for row in tree.values():
-        await end_reconnect_deferral(row, store)
+        if RECONNECT_RECOVERY_HELD_LABEL_KEY in row.labels:
+            await store_call(store.delete_label, row.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
     active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
     needed = set(active)
     for row in reversed(list(tree.values())):

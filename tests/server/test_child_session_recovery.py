@@ -17,6 +17,7 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
 from omnigent.server.child_session_recovery import (
     RECOVERY_STORE_CONCURRENCY,
+    defer_reconnect_recovery,
     hold_reconnect_recovery,
     reconnect_recovery_deferred,
     release_reconnect_recovery,
@@ -24,6 +25,7 @@ from omnigent.server.child_session_recovery import (
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+from omnigent.stores.conversation_store import RECONNECT_RECOVERY_HELD_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
@@ -486,11 +488,78 @@ async def test_requested_work_on_a_child_releases_the_ancestors_that_recover_it(
     for row in (parent, middle):
         await hold_reconnect_recovery(row.id, store)
 
-    await release_reconnect_recovery(store.get_conversation(leaf.id), store)  # type: ignore[arg-type]
+    await release_reconnect_recovery(leaf.id, store)
 
     assert not reconnect_recovery_deferred(store.get_conversation(middle.id))  # type: ignore[arg-type]
     held = reconnect_recovery_deferred(store.get_conversation(parent.id))  # type: ignore[arg-type]
     assert held is not parent_released
+
+
+@pytest.mark.asyncio
+async def test_requested_work_releases_a_bounded_ancestry(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Work on a deeply nested child reads at most 16 rows of its lineage."""
+    store, parent, _, _, _, _ = recovery_tree
+    lineage = [parent]
+    for _ in range(20):
+        lineage.append(
+            store.create_conversation(
+                kind="sub_agent",
+                parent_conversation_id=lineage[-1].id,
+                agent_id=parent.agent_id,
+                runner_id=parent.runner_id,
+            )
+        )
+    for row in lineage:
+        await hold_reconnect_recovery(row.id, store)
+    read = store.get_conversation
+    reads: list[str] = []
+
+    def counted_read(session_id: str) -> Conversation | None:
+        reads.append(session_id)
+        return read(session_id)
+
+    monkeypatch.setattr(store, "get_conversation", counted_read)
+    await release_reconnect_recovery(lineage[-1].id, store)
+    monkeypatch.setattr(store, "get_conversation", read)
+
+    assert reads == [row.id for row in reversed(lineage[-16:])]
+    held = [RECONNECT_RECOVERY_HELD_LABEL_KEY in read(row.id).labels for row in lineage]
+    assert held == [True] * 5 + [False] * 16
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold_lands", ["before", "during", "after"])
+async def test_work_requested_during_a_wake_ends_its_hold_whenever_it_lands(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, hold_lands: str
+) -> None:
+    """A wake's hold ends with the work requested while it ran, before or after it lands."""
+    store, parent, _, _, _, _ = recovery_tree
+    read = store.get_conversation
+
+    def held() -> bool:
+        return RECONNECT_RECOVERY_HELD_LABEL_KEY in read(parent.id).labels
+
+    def read_as_the_hold_lands(session_id: str) -> Conversation | None:
+        row = read(session_id)
+        store.set_labels(session_id, {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"})
+        return row
+
+    with defer_reconnect_recovery(parent.id):
+        if hold_lands == "before":
+            await hold_reconnect_recovery(parent.id, store)
+        if hold_lands == "during":
+            monkeypatch.setattr(store, "get_conversation", read_as_the_hold_lands)
+        await release_reconnect_recovery(parent.id, store)
+        monkeypatch.setattr(store, "get_conversation", read)
+        if hold_lands == "after":
+            await hold_reconnect_recovery(parent.id, store)
+        assert not held()
+    # A wake that starts after the work holds recovery again.
+    with defer_reconnect_recovery(parent.id):
+        await hold_reconnect_recovery(parent.id, store)
+    assert held()
 
 
 @pytest.mark.asyncio
