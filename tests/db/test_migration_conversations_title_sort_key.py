@@ -18,6 +18,7 @@ _PREVIOUS = "f1c7a9e2b406"
 _REVISION = "e413195738fb"
 _MIGRATION = "omnigent.db.migrations.versions.e413195738fb_add_conversations_title_sort_key"
 _INDEX = "ix_conversations_archived_title"
+_PG_INDEX_FILTER = "WHERE indexrelid = CAST(:index AS regclass)"
 
 
 def _migrate(
@@ -141,8 +142,22 @@ def test_title_sort_key_migration_keys_every_session(db_uri: str) -> None:
         ]
 
         # Stamping back and rerunning the revision keeps the column and index and fixes keys.
+        if engine.dialect.name == "postgresql":
+            # A failed concurrent build leaves the index INVALID; the rerun must rebuild it.
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.text(f"UPDATE pg_index SET indisvalid = false {_PG_INDEX_FILTER}"),
+                    {"index": _INDEX},
+                )
         _migrate(engine, _PREVIOUS, command.stamp)
         _migrate(engine, _REVISION)
+        if engine.dialect.name == "postgresql":
+            with engine.connect() as connection:
+                valid = connection.execute(
+                    sa.text(f"SELECT indisvalid FROM pg_index {_PG_INDEX_FILTER}"),
+                    {"index": _INDEX},
+                ).scalar_one()
+            assert valid
         assert _keys(engine) == {
             **expected,
             (0, legacy_id): "0legacy",
