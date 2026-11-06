@@ -995,10 +995,9 @@ def create_scheduled_tasks_router(
         if "permission_mode" in fields:
             new_mode = validate_scheduled_permission_mode(fields["permission_mode"])
             fields["permission_mode"] = new_mode
-            # Gate the mode on the agent's harness. Clearing to null falls back to
-            # the agent's own default, which must also be safe to run unattended;
-            # an agent switch revalidates that default with the launch inputs below.
-            if new_mode is not None or not agent_changed:
+            # Gate a newly-SET mode on the (immutable) agent's harness. Clearing
+            # to null needs no gate — the fire path injects nothing for null.
+            if new_mode is not None:
                 agent = await validate_session_agent(
                     user_id=owner_id,
                     agent_id=target_agent_id,

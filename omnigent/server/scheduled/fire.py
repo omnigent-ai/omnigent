@@ -79,10 +79,7 @@ from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
-from omnigent.native.permission_modes import (
-    PERMISSION_LAUNCH_ARGS,
-    UNATTENDED_DISALLOWED_PERMISSION_MODES,
-)
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
@@ -97,7 +94,6 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_agent,
     validate_session_model_metadata,
 )
-from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentity,
@@ -105,10 +101,7 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLease,
 )
 from omnigent.server.scheduled.harness_settings import (
-    UNATTENDED_PERMISSION_MODE_MESSAGE,
-    scheduled_agent_default_permission_mode,
     scheduled_agent_harness,
-    unattended_permission_mode_allowed,
     validate_scheduled_permission_mode,
 )
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
@@ -866,14 +859,6 @@ async def _continue_session(
         )
         return
     assert conv is not None
-    agent = await asyncio.to_thread(deps.agent_store.get, task.agent_id)
-    unsafe = await _unattended_permission_problem(deps, task, agent, task_mode=False)
-    if unsafe is not None:
-        reason, error_code = unsafe
-        await recorder.finish(
-            "failed", conversation_id=session_id, error=reason, error_code=error_code
-        )
-        return
 
     await recorder.check()
     start_fire_stage("budget_validation", session_id=session_id)
@@ -930,69 +915,6 @@ async def _continue_session(
 
 _NEW_SESSION_HINT = "edit the automation to start a new session on its next run"
 
-UNATTENDED_PERMISSION_ERROR_CODE = "permission_mode_not_allowed"
-
-# Launch flags that start a native CLI without an approval gate, for sessions
-# whose live mode has no label.
-_UNATTENDED_DISALLOWED_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
-    *(
-        tuple(args)
-        for modes in PERMISSION_LAUNCH_ARGS.values()
-        for mode, args in modes.items()
-        if mode in UNATTENDED_DISALLOWED_PERMISSION_MODES and args
-    ),
-    ("--dangerously-skip-permissions",),
-    # Codex's full bypass, which spec-derived launch args emit for ``yolo``, and
-    # any launch that turns off its approval prompts.
-    ("--dangerously-bypass-approvals-and-sandbox",),
-    ("--ask-for-approval", "never"),
-)
-
-
-def _contains_args(args: list[str], needle: tuple[str, ...]) -> bool:
-    width = len(needle)
-    return any(tuple(args[i : i + width]) == needle for i in range(len(args) - width + 1))
-
-
-def session_unattended_disallowed_mode(conv: Conversation) -> str | None:
-    """The disallowed permission mode *conv* is running in, or ``None``.
-
-    The Claude label tracks the live mode, including switches made inside the
-    CLI, so it wins over the launch flags it may have replaced.
-    """
-    claude_mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
-    if claude_mode:
-        return None if unattended_permission_mode_allowed(claude_mode) else claude_mode
-    if conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1":
-        return "bypass"
-    launch_args = list(getattr(conv, "terminal_launch_args", None) or [])
-    for needle in _UNATTENDED_DISALLOWED_LAUNCH_ARGS:
-        if _contains_args(launch_args, needle):
-            return " ".join(needle)
-    return None
-
-
-async def _unattended_permission_problem(
-    deps: FireDeps, task: ScheduledTask, agent: Any, *, task_mode: bool = True
-) -> tuple[str, str] | None:
-    """Why *task* may not run unattended with its saved mode or its agent's default.
-
-    ``task_mode=False`` checks only the agent default, for continued sessions,
-    which keep their own mode.
-    """
-    if task_mode and task.permission_mode is not None:
-        mode: str | None = task.permission_mode
-        source = "the automation's permission setting"
-    else:
-        mode = await scheduled_agent_default_permission_mode(agent, deps.agent_cache)
-        source = "the agent's default"
-    if unattended_permission_mode_allowed(mode):
-        return None
-    return (
-        f"{UNATTENDED_PERMISSION_MODE_MESSAGE.format(mode=mode)} ({source})",
-        UNATTENDED_PERMISSION_ERROR_CODE,
-    )
-
 
 async def continued_session_problem(
     task: ScheduledTask,
@@ -1019,14 +941,6 @@ async def continued_session_problem(
         return "the session is a sub-agent's session", "continued_session_incompatible"
     if conv.agent_id != task.agent_id:
         return "the session runs a different agent", "continued_session_incompatible"
-    session_mode = session_unattended_disallowed_mode(conv)
-    if session_mode is not None:
-        return (
-            f"the session is in permission mode {session_mode!r}, which automations cannot "
-            "use; switch the session to a mode that asks for approval or uses the auto "
-            "classifier",
-            UNATTENDED_PERMISSION_ERROR_CODE,
-        )
     # A pin the task changed since would otherwise be ignored silently: the
     # session keeps running where it was created.
     from omnigent.server.routes._host_worktree import (
@@ -1908,10 +1822,6 @@ async def _validate_fire_session_inputs(
             model_override=task.model_override,
             reasoning_effort=task.reasoning_effort,
         )
-        # Tasks saved before modes were restricted still hold them.
-        unsafe = await _unattended_permission_problem(deps, task, agent)
-        if unsafe is not None:
-            return unsafe
         validate_scheduled_permission_mode(task.permission_mode)
         # An unresolvable or incompatible mode fails session creation.
         if validate_workspace:

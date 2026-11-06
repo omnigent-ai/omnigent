@@ -64,10 +64,7 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
-import {
-  NEW_AUTOMATION_PERMISSION_MODES,
-  UNATTENDED_DISALLOWED_PERMISSION_MODES,
-} from "@/lib/nativeHarnessModes";
+import { NEW_AUTOMATION_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
   isInsidePopper,
@@ -113,14 +110,6 @@ interface AutomationTypeDraft {
   schedule: ScheduleModel;
   timezone: string;
   sessionMode: ScheduledTaskSessionMode;
-}
-
-/**
- * The saved mode to prefill when editing. A stored override may hold a mode
- * automations refuse; it reverts to the harness default so saving sends null.
- */
-function editablePermissionMode(mode: string | null | undefined): string {
-  return mode && !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(mode) ? mode : "";
 }
 
 export function CreateScheduledTaskDialog({
@@ -251,7 +240,7 @@ export function CreateScheduledTaskDialog({
     setPickedEffort(
       backToOriginal && originalTargetSelected ? (editingTask?.reasoningEffort ?? "") : "",
     );
-    setPickedPermission(backToOriginal ? editablePermissionMode(editingTask?.permissionMode) : "");
+    setPickedPermission(backToOriginal ? (editingTask?.permissionMode ?? "") : "");
     setPermissionPicked(false);
   }
 
@@ -414,7 +403,7 @@ export function CreateScheduledTaskDialog({
         // Prefill the model/effort/permission controls from the loaded task; null → "".
         setPickedModel(editingTask.modelOverride ?? "");
         setPickedEffort(editingTask.reasoningEffort ?? "");
-        setPickedPermission(editablePermissionMode(editingTask.permissionMode));
+        setPickedPermission(editingTask.permissionMode ?? "");
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
         setHostId(editingTask.hostId ?? "");
@@ -690,7 +679,7 @@ export function CreateScheduledTaskDialog({
     ? (editingTask?.reasoningEffort ?? "")
     : pickedEffort;
   const displayedPermission = reusesExistingSession
-    ? editablePermissionMode(editingTask?.permissionMode)
+    ? (editingTask?.permissionMode ?? "")
     : effectivePermission;
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
@@ -834,13 +823,9 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Continued-session edits omit launch settings, except to clear a stored
-        // permission override automations now refuse; new targets clear stale overrides.
+        // Continued-session edits omit launch settings; new targets clear stale overrides.
         const overrides = reusesExistingSession
-          ? editablePermissionMode(editingTask.permissionMode) !==
-            (editingTask.permissionMode ?? "")
-            ? { permissionMode: null }
-            : {}
+          ? {}
           : {
               ...(supportsModel || !originalTargetSelected
                 ? {
