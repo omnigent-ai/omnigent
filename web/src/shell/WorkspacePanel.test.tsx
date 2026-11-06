@@ -1,4 +1,3 @@
-import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import {
   act,
   cleanup,
@@ -18,7 +17,8 @@ import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
-import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { workspaceTabAriaShortcut, workspaceTabShortcutKeys } from "@/components/KeyboardShortcut";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -176,6 +176,15 @@ afterEach(() => {
   >);
 });
 
+/** Presses the chord that picks the Nth fixed workspace tab; returns whether nothing claimed it. */
+function pressTabNumber(digit: number): boolean {
+  return fireEvent.keyDown(document.body, {
+    key: String(digit),
+    code: `Digit${digit}`,
+    ...(isMacPlatform() ? { ctrlKey: true } : { altKey: true }),
+  });
+}
+
 /** File-viewer context whose guard stands in for the mounted viewer's unsaved-edits check. */
 function fileViewerContextWithGuard(guardFileNavigation: FileNavigationGuard) {
   return {
@@ -199,6 +208,7 @@ function renderWorkspace(
     conversationId?: string;
     contained?: boolean;
     width?: number;
+    keyboardTarget?: boolean;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
     selectedFilePath?: string | null;
@@ -245,6 +255,7 @@ function renderWorkspace(
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
         contained={overrides.contained}
+        keyboardTarget={overrides.keyboardTarget}
         width={overrides.width ?? 360}
         open={overrides.open}
         animateVisibility={overrides.animateVisibility}
@@ -338,7 +349,10 @@ describe("WorkspacePanel surface presentation", () => {
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: true });
 
     expect(screen.queryByRole("tab", { name: "Changes" })).toBeNull();
-    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "2");
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      workspaceTabAriaShortcut("2"),
+    );
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     expect(screen.getByRole("menuitem", { name: "Pull Requests" })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Files" })).toBeNull();
@@ -457,15 +471,21 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.click(searchMenuItem);
     expect(enabled.onRightRailTabChange).toHaveBeenCalledWith("content-search");
     const searchTab = screen.getByRole("tab", { name: "Content search" });
-    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 5"));
+    expect(searchTab).toHaveAttribute(
+      "aria-keyshortcuts",
+      expect.stringContaining(` ${workspaceTabAriaShortcut("5")}`),
+    );
     enabled.onRightRailTabChange.mockClear();
-    fireEvent.keyDown(searchTab, { key: "5" });
+    pressTabNumber(5);
     expect(enabled.onRightRailTabChange).toHaveBeenLastCalledWith("content-search");
 
     writePinnedWorkspaceTabs([]);
     enabled.rerender({ rightRailTab: "content-search" });
     expect(screen.getAllByRole("tab")).toHaveLength(1);
-    expect(searchTab).toHaveAttribute("aria-keyshortcuts", expect.stringContaining(" 1"));
+    expect(searchTab).toHaveAttribute(
+      "aria-keyshortcuts",
+      expect.stringContaining(` ${workspaceTabAriaShortcut("1")}`),
+    );
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("flex");
   });
 
@@ -535,63 +555,53 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
   });
 
-  it("keeps numbered tab picks in a focused strip while a question waits", () => {
+  it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {
     writeDefaultWorkspaceTab("changes");
-    const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "changes" });
-    render(
-      <AskUserQuestionForm
-        elicitationId="elic_strip"
-        questions={[
-          {
-            id: "pick",
-            question: "Pick one",
-            multiSelect: false,
-            options: [{ label: "First" }, { label: "Second" }],
-          },
-        ]}
-        onSubmit={vi.fn()}
-        onReject={vi.fn()}
-        keyboardActive
-      />,
-    );
-    const changes = screen.getByRole("tab", { name: "Changes" });
-    changes.focus();
-    fireEvent.keyDown(changes, { key: "2" });
-
-    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
-    expect(screen.getByLabelText("Second")).not.toBeChecked();
-  });
-
-  it("selects permanent tabs by their visible number while the tab strip is focused", () => {
-    writeDefaultWorkspaceTab("changes");
-    const { onRightRailTabChange } = renderWorkspace({
+    const { onRightRailTabChange, onReveal } = renderWorkspace({
       showGithubTab: true,
       showBrowserTab: true,
       rightRailTab: "changes",
     });
     const changes = screen.getByRole("tab", { name: "Changes" });
 
-    expect(changes).toHaveAttribute("aria-keyshortcuts", "1");
-    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute("aria-keyshortcuts", "2");
-    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "4");
+    expect(changes).toHaveAttribute("aria-keyshortcuts", workspaceTabAriaShortcut("1"));
+    expect(screen.getByRole("tab", { name: "Files" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      workspaceTabAriaShortcut("2"),
+    );
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      workspaceTabAriaShortcut("4"),
+    );
 
-    fireEvent.keyDown(changes, { key: "2" });
-    fireEvent.keyDown(changes, { key: "5" });
-    fireEvent.keyDown(changes, { key: "4" });
-
-    const windowKeyDown = vi.fn();
-    window.addEventListener("keydown", windowKeyDown);
-    try {
-      fireEvent.keyDown(changes, { key: "2", code: "Digit2", ctrlKey: true, altKey: true });
-      expect(windowKeyDown).toHaveBeenCalledOnce();
-      expect(windowKeyDown.mock.calls[0][0].defaultPrevented).toBe(false);
-    } finally {
-      window.removeEventListener("keydown", windowKeyDown);
-    }
+    expect(pressTabNumber(2)).toBe(false);
+    // No fifth fixed tab: the key passes through.
+    expect(pressTabNumber(5)).toBe(true);
+    expect(pressTabNumber(4)).toBe(false);
+    // A bare digit types as usual.
+    fireEvent.keyDown(changes, { key: "3", code: "Digit3" });
 
     expect(onRightRailTabChange).toHaveBeenNthCalledWith(1, "files");
     expect(onRightRailTabChange).toHaveBeenNthCalledWith(2, "subagents");
     expect(onRightRailTabChange).toHaveBeenCalledTimes(2);
+    expect(onReveal).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { cell: "selected", keyboardTarget: true, calls: 1 },
+    { cell: "unselected", keyboardTarget: false, calls: 0 },
+  ])("picks a fixed tab by number in a grid's $cell cell only", ({ keyboardTarget, calls }) => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange, onReveal } = renderWorkspace({
+      contained: true,
+      keyboardTarget,
+      open: false,
+      rightRailTab: "changes",
+    });
+
+    expect(pressTabNumber(2)).toBe(calls === 0);
+    expect(onRightRailTabChange).toHaveBeenCalledTimes(calls);
+    expect(onReveal).toHaveBeenCalledTimes(calls);
   });
 
   it("compresses numeric positions around unavailable permanent tabs", () => {
@@ -599,11 +609,17 @@ describe("WorkspacePanel surface presentation", () => {
     const { onRightRailTabChange } = renderWorkspace({ showGithubTab: false });
     const files = screen.getByRole("tab", { name: "Files" });
 
-    expect(files).toHaveAttribute("aria-keyshortcuts", "1");
-    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-keyshortcuts", "2");
-    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute("aria-keyshortcuts", "3");
+    expect(files).toHaveAttribute("aria-keyshortcuts", workspaceTabAriaShortcut("1"));
+    expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      workspaceTabAriaShortcut("2"),
+    );
+    expect(screen.getByRole("tab", { name: "Agents 1" })).toHaveAttribute(
+      "aria-keyshortcuts",
+      workspaceTabAriaShortcut("3"),
+    );
 
-    fireEvent.keyDown(files, { key: "3" });
+    pressTabNumber(3);
     expect(onRightRailTabChange).toHaveBeenCalledWith("subagents");
   });
 
@@ -670,8 +686,7 @@ describe("WorkspacePanel surface presentation", () => {
       expect(tip).toHaveTextContent(tooltip);
       expect(
         Array.from(tip.querySelectorAll('[data-slot="kbd"]')).map((key) => key.textContent),
-      ).toEqual([MOD_KEY, ALT_KEY, "]", shortcut]);
-      expect(tip.textContent?.match(/\+/g)).toHaveLength(1);
+      ).toEqual(workspaceTabShortcutKeys(shortcut));
     },
   );
 });

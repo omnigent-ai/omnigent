@@ -20,7 +20,6 @@ import {
 import { toast } from "sonner";
 import {
   type CSSProperties,
-  type KeyboardEvent,
   type ReactElement,
   type RefObject,
   lazy,
@@ -42,6 +41,8 @@ import {
   NEW_BROWSER_TAB_KEYS,
   NEW_TERMINAL_KEYS,
   SHIFT_KEY,
+  workspaceTabAriaShortcut,
+  workspaceTabShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -71,6 +72,7 @@ import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
+import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useQuery } from "@tanstack/react-query";
@@ -109,7 +111,6 @@ import { Button } from "../components/ui/button";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
-const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
 const workspacePanels = {
   "content-search": { label: "Content search", icon: SearchIcon },
@@ -147,7 +148,7 @@ function WorkspaceTabTooltip({
       </TooltipTrigger>
       <TooltipContent
         side="bottom"
-        shortcut={typeof shortcut === "string" ? [WORKSPACE_OPEN_KEYS, [shortcut]] : shortcut}
+        shortcut={typeof shortcut === "string" ? workspaceTabShortcutKeys(shortcut) : shortcut}
       >
         <span>{label}</span>
       </TooltipContent>
@@ -685,6 +686,8 @@ function RailTerminalView({
 interface WorkspacePanelProps {
   /** Keep the panel and its viewers inside an independently scoped grid workspace. */
   contained?: boolean;
+  /** Whether app-wide workspace hotkeys act here; a grid sets it on its selected cell. */
+  keyboardTarget?: boolean;
   sessionHarness?: ReturnType<typeof useChatStore.getState>["sessionHarness"];
   agentId?: string | null;
 
@@ -883,6 +886,7 @@ interface ReturnPoint {
 function WorkspacePanelImpl({
   conversationId,
   contained = false,
+  keyboardTarget = !contained,
   sessionHarness,
   agentId,
   pending = false,
@@ -1456,25 +1460,20 @@ function WorkspacePanelImpl({
   const selectPermanentTab = (tab: RightRailTab) => {
     onRightRailTabChange(tab);
   };
-  const handlePermanentTabNumber = (event: KeyboardEvent<HTMLDivElement>) => {
-    if (
-      !event.currentTarget.contains(event.target as Node) ||
-      pending ||
-      event.repeat ||
-      event.shiftKey ||
-      event.metaKey ||
-      event.ctrlKey ||
-      event.altKey ||
-      !/^[1-9]$/.test(event.key)
-    ) {
-      return;
-    }
-    const tab = visiblePermanentTabs[Number(event.key) - 1];
-    if (!tab) return;
-    event.preventDefault();
-    event.stopPropagation();
-    selectPermanentTab(tab);
+  const tabAriaShortcut = (tab: RightRailTab) => {
+    const digit = shortcutFor(tab);
+    return digit === undefined ? undefined : workspaceTabAriaShortcut(digit);
   };
+  // ⌃1–9 (Alt+1–9 off macOS) shows the Nth fixed tab from anywhere, opening the rail.
+  const workspaceTabHotkeyRef = useRef<(index: number) => boolean>(() => false);
+  workspaceTabHotkeyRef.current = (index) => {
+    const tab = visiblePermanentTabs[index];
+    if (!tab || pending || !keyboardTarget) return false;
+    selectPermanentTab(tab);
+    onReveal?.();
+    return true;
+  };
+  useWorkspaceTabHotkeys(workspaceTabHotkeyRef);
   const browserFallbackTab = visibleOpenPanels.at(-1) ?? visiblePermanentTabs[0] ?? null;
   useEffect(() => {
     if (
@@ -1561,7 +1560,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="content-search"
           aria-label="Content search"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Shift+F ${shortcutFor("content-search") ?? ""}`.trim()}
+          aria-keyshortcuts={`${ARIA_MOD_KEY}+Shift+F ${tabAriaShortcut("content-search") ?? ""}`.trim()}
           data-workspace-tab="content-search"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1576,7 +1575,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="files"
           aria-label="Files"
-          aria-keyshortcuts={shortcutFor("files")}
+          aria-keyshortcuts={tabAriaShortcut("files")}
           data-workspace-tab="files"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1591,7 +1590,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="changes"
           aria-label={changedCount > 0 ? `Changes ${changedCount} changed` : "Changes"}
-          aria-keyshortcuts={shortcutFor("changes")}
+          aria-keyshortcuts={tabAriaShortcut("changes")}
           data-workspace-tab="changes"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1607,7 +1606,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="github"
           aria-label="Pull Requests"
-          aria-keyshortcuts={shortcutFor("github")}
+          aria-keyshortcuts={tabAriaShortcut("github")}
           data-workspace-tab="github"
           disabled={pending}
           className="size-6 shrink-0 p-0 hover:border-1 hover:border-muted rounded-md!"
@@ -1622,7 +1621,7 @@ function WorkspacePanelImpl({
         <TabsTrigger
           value="subagents"
           disabled={pending}
-          aria-keyshortcuts={shortcutFor("subagents")}
+          aria-keyshortcuts={tabAriaShortcut("subagents")}
           data-workspace-tab="subagents"
           aria-label={
             subagentsWorking > 0
@@ -1911,7 +1910,6 @@ function WorkspacePanelImpl({
           role="toolbar"
           aria-label="Workspace tabs"
           tabIndex={-1}
-          onKeyDown={handlePermanentTabNumber}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
           {visiblePermanentTabs.length > 0 && (
