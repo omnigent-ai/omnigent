@@ -292,8 +292,9 @@ function ChangesToolbar({
   modeSwitch?: React.ReactNode;
 }) {
   return (
-    <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-      <div className="flex min-w-0 flex-1 items-center gap-0.5">
+    // Wraps when the mode switch, file controls and progress together outgrow a narrow rail.
+    <div className="flex w-full shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-1 border-b border-border px-2 py-1">
+      <div className="flex min-w-0 flex-auto items-center gap-0.5">
         {modeSwitch}
         {showFileControls && (
           <IconButton
@@ -422,6 +423,11 @@ function openUnavailableReason(
 
 const NO_HIDDEN_PATHS: ReadonlySet<string> = new Set();
 
+/** The message a failed read shows; a runner that went offline gets its own wording. */
+function readErrorText(error: Error): string {
+  return error instanceof RunnerOfflineError ? "Runner offline." : error.message;
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -489,6 +495,11 @@ export function PullRequestChangesTab({
   const previousCommit = commitIndex > 0 ? commitList[commitIndex - 1] : null;
   const nextCommit =
     commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
+  // The open commit left the loaded list (the head moved), so there is nothing to step from.
+  const { setMode } = view;
+  useEffect(() => {
+    if (commitView && commits.data && commitIndex < 0) setMode("commits");
+  }, [commitView, commits.data, commitIndex, setMode]);
   const baseRepoUrl = pullRequestRepoUrl(data.provider, pr.url);
   const providerLabel = gitProviderCopy(data.provider, undefined, data.provider_display).label;
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -548,12 +559,14 @@ export function PullRequestChangesTab({
       } catch {
         return {
           filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
+          parseError: commitView
+            ? "Couldn’t read this commit’s diff. Refresh or open it on its provider."
+            : "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
         };
       }
     }
     return { filesByPath: map, parseError: undefined };
-  }, [shownDiff.data]);
+  }, [shownDiff.data, commitView]);
   // A commit's list is the files its patch changes; the PR's list is the provider's.
   const commitFiles = useMemo(
     () => (commitView ? changedFilesFromPatch(filesByPath) : []),
@@ -604,9 +617,32 @@ export function PullRequestChangesTab({
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
+  // A commit has its own collapse set, starting empty for each commit, so the PR's viewed
+  // collapses never reach its patch and it never shows the PR's collapse state.
+  const [commitCollapse, setCommitCollapse] = useState<{
+    sha: string | null;
+    paths: ReadonlySet<string>;
+  }>({ sha: null, paths: NO_HIDDEN_PATHS });
+  const commitCollapsedPaths =
+    commitCollapse.sha === view.commitSha ? commitCollapse.paths : NO_HIDDEN_PATHS;
+  const modeCollapsedPaths = commitView ? commitCollapsedPaths : collapsedPaths;
+  // Writes go to the set the shown view reads; the viewed seed and mark keep writing the PR's.
+  const setModeCollapsedPaths = useCallback(
+    (update: (prev: ReadonlySet<string>) => ReadonlySet<string>) => {
+      if (!commitView) {
+        setCollapsedPaths(update);
+        return;
+      }
+      setCommitCollapse((prev) => ({
+        sha: view.commitSha,
+        paths: update(prev.sha === view.commitSha ? prev.paths : NO_HIDDEN_PATHS),
+      }));
+    },
+    [commitView, view.commitSha],
+  );
   const isCollapsed = useCallback(
-    (path: string) => collapsedPaths.has(path) && !revealedPaths.has(path),
-    [collapsedPaths, revealedPaths],
+    (path: string) => modeCollapsedPaths.has(path) && !revealedPaths.has(path),
+    [modeCollapsedPaths, revealedPaths],
   );
   // Viewed files start collapsed once per rendered head. A collapse that marks introduced
   // expands again on a new head, since its mark was reset; the reader's own collapses stay.
@@ -690,7 +726,7 @@ export function PullRequestChangesTab({
       const collapse = !isCollapsed(path);
       clearReveal(path);
       releaseMarkCollapse([path]);
-      setCollapsedPaths((prev) => {
+      setModeCollapsedPaths((prev) => {
         if (prev.has(path) === collapse) return prev;
         const next = new Set(prev);
         if (collapse) next.add(path);
@@ -698,14 +734,14 @@ export function PullRequestChangesTab({
         return next;
       });
     },
-    [isCollapsed, clearReveal, releaseMarkCollapse],
+    [isCollapsed, clearReveal, releaseMarkCollapse, setModeCollapsedPaths],
   );
 
   const allCollapsed = visibleFiles.length > 0 && visibleFiles.every((f) => isCollapsed(f.path));
   const toggleAll = useCallback(() => {
     for (const file of visibleFiles) clearReveal(file.path);
     releaseMarkCollapse(visibleFiles.map((file) => file.path));
-    setCollapsedPaths((prev) => {
+    setModeCollapsedPaths((prev) => {
       const next = new Set(prev);
       for (const file of visibleFiles) {
         if (allCollapsed) next.delete(file.path);
@@ -713,7 +749,7 @@ export function PullRequestChangesTab({
       }
       return next;
     });
-  }, [visibleFiles, allCollapsed, clearReveal, releaseMarkCollapse]);
+  }, [visibleFiles, allCollapsed, clearReveal, releaseMarkCollapse, setModeCollapsedPaths]);
 
   // Expand-context loader: fetch a file's full old/new content on demand when
   // the reader expands unchanged regions.
@@ -755,9 +791,9 @@ export function PullRequestChangesTab({
       disableFileHeader: true,
       // Expand unchanged context 10 lines at a time (default is 100). The
       // unchanged lines aren't in the patch, so expansion (and the exact
-      // trailing-region count) is served by loadDiffFiles on demand. A commit's
-      // unchanged lines would need its parent revision, so that view can't expand them.
+      // trailing-region count) is served by loadDiffFiles on demand.
       expansionLineCount: 10,
+      // A commit's unchanged lines need its parent revision, so its context can't expand.
       loadDiffFiles: commitView ? undefined : loadDiffFiles,
     }),
     [themeType, diffStyle, loadDiffFiles, commitView],
@@ -931,8 +967,10 @@ export function PullRequestChangesTab({
   const onTabKeyDown = (event: React.KeyboardEvent) => {
     // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.
     // IME composition keys confirm text, not find.
+    // The commit list has no find bar, so the shortcut stays with the browser there.
     if (
       !toolbarShown ||
+      commitsView ||
       event.nativeEvent.isComposing ||
       event.keyCode === 229 ||
       !hasCommandModifier(event) ||
@@ -951,8 +989,11 @@ export function PullRequestChangesTab({
   const withoutText = files.length - patchFileCount;
   // Counts are meaningless until the patch has loaded and parsed.
   const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
+  const emptyChangesMessage = commitView
+    ? "This commit has no file changes."
+    : "No changes vs base.";
   const coverageNote =
-    find.open && patchReady && (listing.data?.has_more || withoutText > 0)
+    find.open && !commitsView && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
@@ -1234,9 +1275,7 @@ export function PullRequestChangesTab({
               </div>
             ) : listing.error ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
-                {listing.error instanceof RunnerOfflineError
-                  ? "Runner offline."
-                  : listing.error.message}
+                {readErrorText(listing.error)}
               </p>
             ) : files.length === 0 ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
@@ -1244,9 +1283,7 @@ export function PullRequestChangesTab({
                 listing.data?.has_more ||
                 listing.data?.warning
                   ? "Changed files are unavailable."
-                  : commitView
-                    ? "This commit has no file changes."
-                    : "No changes vs base."}
+                  : emptyChangesMessage}
               </p>
             ) : (
               fileTree.map((node) => (
@@ -1258,7 +1295,7 @@ export function PullRequestChangesTab({
                   onSelectFile={jumpTo}
                   collapsedDirs={collapsedDirs}
                   onToggleDir={toggleDir}
-                  viewedPaths={viewedFiles.viewed}
+                  viewedPaths={viewedControls ? viewedFiles.viewed : NO_HIDDEN_PATHS}
                 />
               ))
             )}
@@ -1274,13 +1311,7 @@ export function PullRequestChangesTab({
               commits={commitList}
               hasMore={!!commits.data?.has_more}
               loading={commits.isLoading}
-              errorMessage={
-                commits.error
-                  ? commits.error instanceof RunnerOfflineError
-                    ? "Runner offline."
-                    : commits.error.message
-                  : null
-              }
+              errorMessage={commits.error ? readErrorText(commits.error) : null}
               onSelect={view.openCommit}
             />
           ) : listing.error || shownDiff.error || parseError ? (
@@ -1307,10 +1338,8 @@ export function PullRequestChangesTab({
                 listing.data?.has_more ||
                 listing.data?.warning ? (
                 "Changed files are unavailable."
-              ) : commitView ? (
-                "This commit has no file changes."
               ) : (
-                "No changes vs base."
+                emptyChangesMessage
               )}
             </PanelMessage>
           ) : allViewed ? (
@@ -1335,7 +1364,7 @@ export function PullRequestChangesTab({
                 fileDiff={filesByPath.get(file.path)}
                 options={diffOptions}
                 registerRef={registerRef}
-                collapsed={collapsedPaths.has(file.path)}
+                collapsed={modeCollapsedPaths.has(file.path)}
                 forceExpanded={revealedPaths.has(file.path)}
                 forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}

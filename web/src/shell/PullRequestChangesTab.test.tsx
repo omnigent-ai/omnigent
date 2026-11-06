@@ -34,6 +34,8 @@ const mocks = vi.hoisted(() => ({
   commitList: { object: "list", has_more: false, data: [] as unknown[] },
   /** Each commit's patch by sha, as the commit-diff query returns it. */
   commitPatches: new Map<string, string>(),
+  /** The commit-diff query's error, when a test wants a failed read. */
+  commitDiffError: null as Error | null,
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -59,7 +61,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
       ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
       : undefined,
     isLoading: false,
-    error: null,
+    error: mocks.commitDiffError,
   }),
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
@@ -1425,6 +1427,7 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.clear();
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
+    mocks.commitDiffError = null;
   });
 
   it("lists commits, opens one with its own files, and steps between commits", () => {
@@ -1449,22 +1452,117 @@ describe("PullRequestChangesTab commits", () => {
     expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
   });
 
-  it("hides the viewed controls in a commit view and restores them on Changes", () => {
+  it("hides the viewed controls and marks in a commit view, and keeps the marks for Changes", () => {
     render(viewedTab({ conversationId: "commits-viewed", commitHistory: true }));
-    expect(viewedBox("a.ts")).toBeInTheDocument();
+    fireEvent.click(viewedBox("a.ts"));
+    expect(screen.getAllByText(/^Viewed,/).length).toBeGreaterThan(0);
 
     fireEvent.click(screen.getByRole("button", { name: "Commits" }));
-    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: /^Viewed / })).toBeNull();
+    expect(screen.queryAllByText(/^Viewed,/)).toHaveLength(0);
+    expect(isCollapsed("a.ts")).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Changes" }));
-    expect(viewedBox("a.ts")).toBeInTheDocument();
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
   });
 
   it("offers no Commits view when the provider does not list commits", () => {
     renderTab({ conversationId: "commits-absent", listing: { head_sha: "head" } });
 
     expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+  });
+
+  it("offers no Commits view while the file list is not pinned to a head", () => {
+    renderTab({ conversationId: "commits-unpinned", commitHistory: true });
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("leaves Ctrl+F to the browser on the commit list, which has no find bar", () => {
+    renderTab({
+      conversationId: "commits-find",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+    const search = screen.getByRole("searchbox", { name: "Search commits" });
+    expect(fireEvent.keyDown(search, { key: "f", ctrlKey: true })).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Find in changes" })).toBeNull();
+  });
+
+  it("returns to the commit list when the open commit leaves the loaded list", () => {
+    const { rerender } = renderTab({
+      conversationId: "commits-gone",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    mocks.commitList = { object: "list", has_more: false, data: [commit(SHA_A, "Add a.ts")] };
+    rerender(B);
+
+    expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to commits" })).toBeNull();
+  });
+
+  it("shows a failed commit-diff read in place of the commit's files", () => {
+    mocks.commitDiffError = new Error("Commit diff unavailable");
+    renderTab({
+      conversationId: "commits-error",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Commit diff unavailable");
+  });
+
+  it("says a commit with no file changes has none, rather than the PR's list", () => {
+    const shaEmpty = "e".repeat(40);
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [commit(shaEmpty, "Empty commit")],
+    };
+    mocks.commitPatches.set(shaEmpty, "");
+    renderTab({
+      conversationId: "commits-empty",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Empty commit/ }));
+
+    expect(screen.getAllByText("This commit has no file changes.").length).toBeGreaterThan(0);
+    expect(screen.queryByText("No changes vs base.")).toBeNull();
+  });
+
+  it("disables a deleted file's Open in a commit view, since the commit has no page for it", () => {
+    const deletedPatch =
+      "diff --git a/gone.ts b/gone.ts\ndeleted file mode 100644\n--- a/gone.ts\n+++ /dev/null\n" +
+      "@@ -1 +0,0 @@\n-bye\n";
+    const shaC = "c".repeat(40);
+    mocks.commitList = { object: "list", has_more: false, data: [commit(shaC, "Remove gone.ts")] };
+    mocks.commitPatches.set(shaC, deletedPatch);
+    renderTab({
+      conversationId: "commits-deleted",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Remove gone\.ts/ }));
+    fireEvent.pointerDown(screen.getByRole("button", { name: "More actions for gone.ts" }), {
+      button: 0,
+    });
+
+    expect(screen.getByText("Deleted in this commit")).toBeInTheDocument();
   });
 });

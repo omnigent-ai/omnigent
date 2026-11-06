@@ -1594,19 +1594,29 @@ def test_changes_commits_view_lists_and_opens_a_commit(
         re.compile(r"/resources/github/changes"),
         lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
     )
-    page.route(
-        re.compile(r"/resources/github/commits"), lambda route: route.fulfill(json=_COMMITS)
-    )
+    list_urls: list[str] = []
+    patch_urls: list[str] = []
+
+    def commit_list(route: Route) -> None:
+        list_urls.append(route.request.url)
+        route.fulfill(json=_COMMITS)
 
     def commit_patch(route: Route) -> None:
+        patch_urls.append(route.request.url)
         sha = re.search(r"commit_sha=([0-9a-f]+)", route.request.url)
         assert sha is not None, route.request.url
         route.fulfill(
             json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[sha.group(1)]}
         )
 
-    # Registered after _stub_github, so the commit-specific match wins over the whole-PR diff.
-    page.route(re.compile(r"/resources/github/diff\?.*commit_sha="), commit_patch)
+    page.route(re.compile(r"/resources/github/commits"), commit_list)
+    # The whole-PR patch reports the head it describes, so viewed marks are available in Changes.
+    page.route(
+        re.compile(r"/resources/github/diff(?:\?|$)"),
+        lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
+    )
+    # Registered after _stub_github, so the commit route wins over the whole-PR diff stub.
+    page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
     panel = page.get_by_role("complementary", name="Workspace")
@@ -1614,6 +1624,8 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     files = panel.locator("[data-github-file]")
     expect(files).to_have_count(2, timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_be_visible()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_be_visible()
 
     panel.get_by_role("group", name="Show changes or commits").get_by_role(
         "button", name="Commits", exact=True
@@ -1630,6 +1642,11 @@ def test_changes_commits_view_lists_and_opens_a_commit(
     expect(files).to_have_count(1)
     expect(files).to_have_attribute("data-github-file", "src/app/main.py")
     expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).to_have_count(0)
+    # The list is pinned to the head the Changes list shows; the patch names the selected commit.
+    assert "head_sha=head" in list_urls[0], list_urls
+    assert "/resources/github/commit-diff?" in patch_urls[-1], patch_urls
+    assert f"commit_sha={_COMMIT_ONE}" in patch_urls[-1], patch_urls
     page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
 
     panel.get_by_role("button", name="Next commit").click()
