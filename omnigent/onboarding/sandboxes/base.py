@@ -558,6 +558,17 @@ class SandboxLifecycle(ABC):
             return False
         return self_method is not base_method
 
+    # Set by :meth:`start_host` implementations whose sandbox id is assigned by
+    # the provider AT START (not knowable at :meth:`provision` time, and not the
+    # workspace path start_host must return). The managed-launch framework reads
+    # this AFTER start_host returns and persists it onto the host row as the
+    # canonical ``sandbox_id`` for later :meth:`terminate` / :meth:`resume`.
+    # ``None`` means "no remapping" — the provision-time id stands (every
+    # exec-model and name-your-own-resource provider). Instance attribute, not a
+    # ClassVar: a launcher is built fresh per managed op and one instance runs
+    # provision + start_host together, so it is safe per-op state.
+    started_sandbox_id: str | None = None
+
     @abstractmethod
     def prepare(self) -> None:
         """
