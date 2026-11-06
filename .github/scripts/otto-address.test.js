@@ -25,7 +25,7 @@ async function run({ comment = {}, pull = {}, maintainers = "maintainer\n", apiF
         return { data: {
           state: "open", draft: false, user: { login: "omni-resolve-agent[bot]", type: "Bot" },
           head: { repo: { full_name: "omnigent-ai/omnigent" }, ref: "resolve-agent/fix" },
-          base: { ref: "main" }, ...pull,
+          ...pull,
         } };
       } },
       repos: { getContent: async ({ path, ref }) => {
@@ -53,6 +53,10 @@ test("maintainers do not need a duplicate allowlist entry", async () => {
 
 test("an unset variable does not authorize contributors", async () => {
   assert.deepEqual((await run({ reviewers: "" })).outputs, {});
+});
+
+test("accepts a command surrounded by whitespace", async () => {
+  assert.equal((await run({ comment: { body: "\n /address \t\n" } })).outputs.authorized, "true");
 });
 
 for (const login of ["second-reader", "third-reader"]) {
@@ -113,11 +117,11 @@ for (const scenario of [
   });
 }
 
-for (const [login, permitted] of [["maintainer", true], ["inline-comment", false], ["header", false]]) {
+for (const [login, permitted] of [["maintainer", true], ["second-maintainer", true], ["inline-comment", false], ["header", false]]) {
   test(`parses maintainer comments and CRLF: ${login}`, async () => {
     const { outputs } = await run({
       reviewers: "",
-      maintainers: "# header\r\n\r\n  Maintainer  # inline-comment\r\n",
+      maintainers: "# header\r\n\r\n  Maintainer\tSecond-Maintainer  # inline-comment\r\n",
       comment: { user: { login, type: "User" } },
     });
     assert.equal(outputs.authorized, permitted ? "true" : undefined);

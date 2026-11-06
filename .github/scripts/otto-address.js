@@ -15,8 +15,9 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
     owner, repo, path: ".github/MAINTAINER", ref: "main",
   });
   for (const line of Buffer.from(file.content, "base64").toString("utf8").split("\n")) {
-    const login = line.split("#")[0].trim().toLowerCase();
-    if (login) allowed.add(login);
+    for (const login of line.split("#")[0].split(/\s+/).filter(Boolean)) {
+      allowed.add(login.toLowerCase());
+    }
   }
   if (!allowed.has(comment.user.login.toLowerCase())) {
     core.info("/address is limited to maintainers and configured Otto reviewers.");
