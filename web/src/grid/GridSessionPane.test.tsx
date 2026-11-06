@@ -4,13 +4,14 @@ import type * as FilesPanelModule from "@/shell/FilesPanel";
 import { type ComponentProps, useContext, useState } from "react";
 import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, expect, it, onTestFinished, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { WorkspacePanel } from "@/shell/WorkspacePanel";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { RearrangeableGrid } from "./GridWorkspace";
 import { splitGrid } from "./gridLayout";
+import type { AgentsGrid } from "./GridSessionsContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { retrySession } from "@/lib/sessionsApi";
@@ -26,6 +27,7 @@ const fixture = vi.hoisted(() => ({
   failedChat: "",
   failedTerminal: "",
   renderError: new Error("Grid surface render failed"),
+  agentsGrid: undefined as AgentsGrid | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -91,7 +93,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
 vi.mock("./GridSessionsContext", () => ({
   useGridSessions: () => {
     const [selectedSessionId, selectSession] = useState("first");
-    return { closePane: vi.fn(), selectedSessionId, selectSession };
+    return { closePane: vi.fn(), selectedSessionId, selectSession, agentsGrid: fixture.agentsGrid };
   },
   gridTitle: () => "Test grid",
 }));
@@ -168,6 +170,7 @@ afterEach(() => {
   fixture.hostOnline = undefined;
   fixture.failedChat = "";
   fixture.failedTerminal = "";
+  fixture.agentsGrid = undefined;
   vi.restoreAllMocks();
 });
 
@@ -529,4 +532,27 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+it("heads a sub-agents grid with the way back and its pages, without removing panes", () => {
+  const layout = splitGrid("first", "first", "second", "right")!;
+  fixture.agentsGrid = { id: "agents:root", layout, rootSessionId: "root", page: 1, pageCount: 2 };
+  const Search = () => <output data-testid="search">{useLocation().search}</output>;
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid grid={fixture.agentsGrid} />
+        <Search />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  expect(screen.getByRole("link", { name: "Back to main agent" })).toHaveAttribute(
+    "href",
+    "/c/root",
+  );
+  expect(screen.queryByRole("button", { name: /from grid$/ })).toBeNull();
+  expect(screen.getByText("Page 1 of 2")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Previous sub-agents" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Next sub-agents" }));
+  expect(screen.getByTestId("search")).toHaveTextContent("?page=2");
 });

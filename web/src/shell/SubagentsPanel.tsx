@@ -31,6 +31,7 @@ import {
   EllipsisIcon,
   FileTextIcon,
   FlaskConicalIcon,
+  Grid2X2Icon,
   ListIcon,
   NetworkIcon,
   PauseIcon,
@@ -44,7 +45,13 @@ import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { Button } from "@/components/ui/button";
 import { RunningDot } from "@/components/RunningDot";
 import { shortModelName } from "@/components/CostRoutingControl";
-import { MAX_TREE_DEPTH, useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { agentsGridPath, useGridSessions } from "@/grid/GridSessionsContext";
+import {
+  MAX_TREE_DEPTH,
+  useChildSessions,
+  useDescendantSessions,
+  type ChildSessionInfo,
+} from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
 import type { SessionItem } from "@/lib/types";
@@ -94,7 +101,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   if (isLoading && children.length === 0) {
     return (
       <div className="flex h-full min-h-0 flex-col bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <ViewModeToggle
+          rootSessionId={rootSessionId}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+        />
         <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
           Loading…
         </div>
@@ -104,7 +115,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   if (error && children.length === 0) {
     return (
       <div className="flex h-full min-h-0 flex-col bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <ViewModeToggle
+          rootSessionId={rootSessionId}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+        />
         <div className="flex flex-1 items-center justify-center px-4 py-8 text-center text-sm text-muted-foreground">
           Failed to load agents.
         </div>
@@ -115,7 +130,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
   if (viewMode === "graph") {
     return (
       <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-        <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+        <ViewModeToggle
+          rootSessionId={rootSessionId}
+          viewMode={viewMode}
+          onViewModeChange={setViewMode}
+        />
         <Suspense
           fallback={
             <div className="flex h-full flex-1 items-center justify-center text-sm text-muted-foreground">
@@ -131,7 +150,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden bg-card">
-      <ViewModeToggle viewMode={viewMode} onViewModeChange={setViewMode} />
+      <ViewModeToggle
+        rootSessionId={rootSessionId}
+        viewMode={viewMode}
+        onViewModeChange={setViewMode}
+      />
       <button
         type="button"
         data-testid="add-agent-button"
@@ -165,9 +188,11 @@ export function SubagentsPanel({ conversationId, rootSessionId }: SubagentsPanel
 }
 
 function ViewModeToggle({
+  rootSessionId,
   viewMode,
   onViewModeChange,
 }: {
+  rootSessionId: string;
   viewMode: ViewMode;
   onViewModeChange: (mode: ViewMode) => void;
 }) {
@@ -175,6 +200,7 @@ function ViewModeToggle({
     <div className="flex h-11 shrink-0 items-center gap-0.5 border-b px-2">
       <h2 className="pl-1 font-medium text-ui">Agents</h2>
       <div className="ml-auto flex items-center gap-0.5">
+        {useGridSessions()?.enabled && <DisplayInGridButton rootSessionId={rootSessionId} />}
         <Button
           variant={viewMode === "list" ? "secondary" : "ghost"}
           size="icon-xs"
@@ -197,6 +223,23 @@ function ViewModeToggle({
         </Button>
       </div>
     </div>
+  );
+}
+
+function DisplayInGridButton({ rootSessionId }: { rootSessionId: string }) {
+  const { descendants } = useDescendantSessions(rootSessionId);
+  if (descendants.length < 2) return null;
+  return (
+    <Button asChild variant="ghost" size="icon-xs">
+      <Link
+        to={agentsGridPath(rootSessionId)}
+        aria-label="Display sub-agents in grid"
+        title="Display sub-agents in grid"
+        data-testid="display-subagents-in-grid"
+      >
+        <Grid2X2Icon className="size-3.5" />
+      </Link>
+    </Button>
   );
 }
 

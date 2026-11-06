@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useCallback, useSyncExternalStore } from "react";
 import { authenticatedFetch } from "@/lib/identity";
 import { setSessionParent } from "@/lib/sessionHost";
@@ -229,6 +229,12 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
   }));
 }
 
+const CHILD_SESSIONS_QUERY_DEFAULTS = {
+  staleTime: 60_000,
+  retry: false,
+  refetchOnMount: false,
+} as const;
+
 /**
  * Live child-session list for a conversation, served by
  * ``GET /v1/sessions/{id}/child_sessions``.
@@ -257,9 +263,7 @@ export function useChildSessions(
         : childSessionsQueryKey(sessionId),
     queryFn: () => fetchChildSessions(sessionId as string),
     enabled: sessionId !== null,
-    staleTime: 60_000,
-    retry: false,
-    refetchOnMount: false,
+    ...CHILD_SESSIONS_QUERY_DEFAULTS,
     refetchInterval: pollMs ?? false,
   });
   return {
@@ -301,4 +305,70 @@ export function useDescendantSession(
       ? null
       : findCachedDescendant(queryClient, ancestorId, targetId, MAX_TREE_DEPTH),
   );
+}
+
+/**
+ * Descendants of ``rootId`` down to ``maxDepth`` levels, in the Agents
+ * rail's order: each child followed by its own subtree.
+ *
+ * @param rootId - Session whose tree to flatten, e.g. ``"conv_root"``.
+ * @param childrenOf - Child list for a session, or ``undefined`` when unknown.
+ * @param maxDepth - Levels below the root to include, e.g. ``MAX_TREE_DEPTH``.
+ * @returns The flattened descendants; each session appears once.
+ */
+export function flattenSessionTree(
+  rootId: string,
+  childrenOf: (sessionId: string) => ChildSessionInfo[] | undefined,
+  maxDepth: number,
+): ChildSessionInfo[] {
+  const seen = new Set([rootId]);
+  const visit = (sessionId: string, depth: number): ChildSessionInfo[] =>
+    depth >= maxDepth
+      ? []
+      : (childrenOf(sessionId) ?? []).flatMap((child) => {
+          if (seen.has(child.id)) return [];
+          seen.add(child.id);
+          return [child, ...visit(child.id, depth + 1)];
+        });
+  return visit(rootId, 0);
+}
+
+/**
+ * Every sub-agent under ``rootId`` down to ``MAX_TREE_DEPTH``, flattened in
+ * Agents-rail order. Each fetched level discovers the next on re-render.
+ *
+ * @param rootId - Root session, e.g. ``"conv_root"``; ``null`` disables it.
+ */
+export function useDescendantSessions(rootId: string | null): {
+  descendants: ChildSessionInfo[];
+  isLoading: boolean;
+} {
+  const queryClient = useQueryClient();
+  const sessionId = isTempConvId(rootId) ? null : rootId;
+  const cachedChildren = (id: string) =>
+    queryClient.getQueryData<ChildSessionInfo[]>(childSessionsQueryKey(id));
+  const parentIds =
+    sessionId === null
+      ? []
+      : [
+          sessionId,
+          ...flattenSessionTree(sessionId, cachedChildren, MAX_TREE_DEPTH - 1).map(
+            (child) => child.id,
+          ),
+        ];
+  const results = useQueries({
+    queries: parentIds.map((id) => ({
+      queryKey: childSessionsQueryKey(id),
+      queryFn: () => fetchChildSessions(id),
+      ...CHILD_SESSIONS_QUERY_DEFAULTS,
+    })),
+  });
+  const childrenById = new Map(parentIds.map((id, index) => [id, results[index]?.data]));
+  return {
+    descendants:
+      sessionId === null
+        ? []
+        : flattenSessionTree(sessionId, (id) => childrenById.get(id), MAX_TREE_DEPTH),
+    isLoading: results.some((result) => result.isLoading),
+  };
 }

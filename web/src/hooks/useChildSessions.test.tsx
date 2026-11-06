@@ -4,7 +4,7 @@ import type { PropsWithChildren } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { useChildSessions, useDescendantSession } from "./useChildSessions";
+import { useChildSessions, useDescendantSession, useDescendantSessions } from "./useChildSessions";
 
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
@@ -62,5 +62,43 @@ describe("useDescendantSession", () => {
     expect(result.current).toBeNull();
     await waitFor(() => expect(result.current?.task_summary).toBe("Investigate auth flow"));
     expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/conv_parent/child_sessions");
+  });
+});
+
+describe("useDescendantSessions", () => {
+  it("fetches every level and flattens the tree in Agents-rail order", async () => {
+    // WHY: the sub-agents grid pages through grandchildren too, so nested
+    // levels must be discovered without the rail having expanded them.
+    const tree: Record<string, string[]> = {
+      conv_root: ["conv_a", "conv_b"],
+      conv_a: ["conv_a1"],
+      conv_a1: ["conv_a1x"],
+      conv_b: [],
+    };
+    vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+      const parent = String(url).split("/")[3]!;
+      const data = (tree[parent] ?? []).map((id) => ({
+        id,
+        title: null,
+        tool: null,
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+      }));
+      return new Response(JSON.stringify({ object: "list", data }));
+    });
+    const { result } = renderHook(() => useDescendantSessions("conv_root"), { wrapper });
+
+    await waitFor(() =>
+      expect(result.current.descendants.map((child) => child.id)).toEqual([
+        "conv_a",
+        "conv_a1",
+        "conv_a1x",
+        "conv_b",
+      ]),
+    );
+    expect(result.current.isLoading).toBe(false);
+    // The deepest level is listed but not expanded further.
+    expect(authenticatedFetch).not.toHaveBeenCalledWith("/v1/sessions/conv_a1x/child_sessions");
   });
 });

@@ -1,7 +1,9 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { toast } from "sonner";
+import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { GridWorkspace } from "./GridWorkspace";
@@ -36,7 +38,8 @@ function Probe() {
     <>
       <output data-testid="path">{location.pathname}</output>
       <output data-testid="order">
-        {grids?.activeGrid && gridSessionIds(grids?.activeGrid.layout).join(",")}
+        {(grids?.activeGrid ?? grids?.agentsGrid) &&
+          gridSessionIds((grids.activeGrid ?? grids.agentsGrid)!.layout).join(",")}
       </output>
       <button type="button" onClick={() => grids?.swapPanes("first", "second")}>
         Swap
@@ -66,20 +69,48 @@ function Probe() {
   );
 }
 
-function tree(path: string, enabled = true, children: ReactNode = <Probe />) {
+function tree(
+  path: string,
+  enabled = true,
+  children: ReactNode = <Probe />,
+  queryClient = new QueryClient(),
+) {
   const element = <GridSessionsProvider>{children}</GridSessionsProvider>;
   return (
-    <CapabilitiesProvider
-      info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
-    >
-      <MemoryRouter initialEntries={[path]}>
-        <Routes>
-          <Route path="/c/:conversationId" element={element} />
-          <Route path="/grid/:gridId" element={element} />
-        </Routes>
-      </MemoryRouter>
-    </CapabilitiesProvider>
+    <QueryClientProvider client={queryClient}>
+      <CapabilitiesProvider
+        info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: enabled } }}
+      >
+        <MemoryRouter initialEntries={[path]}>
+          <Routes>
+            <Route path="/c/:conversationId" element={element} />
+            <Route path="/grid/:gridId" element={element} />
+          </Routes>
+        </MemoryRouter>
+      </CapabilitiesProvider>
+    </QueryClientProvider>
   );
+}
+
+/** Caches a sub-agent tree so the agents grid renders without fetching. */
+function cachedTree(children: Record<string, string[]>) {
+  const queryClient = new QueryClient();
+  for (const [parent, ids] of Object.entries(children))
+    queryClient.setQueryData<ChildSessionInfo[]>(
+      childSessionsQueryKey(parent),
+      ids.map((id) => ({
+        id,
+        title: null,
+        task_summary: null,
+        tool: null,
+        session_name: null,
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      })),
+    );
+  return queryClient;
 }
 
 beforeEach(() => {
@@ -300,4 +331,47 @@ it("distinguishes loading identity, unavailable identity and a missing saved gri
   view.rerender(grid());
   expect(screen.getByText(/isn’t saved on this device/)).toBeVisible();
   expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+});
+
+it("pages a session's flattened sub-agents without saving, listing or editing a grid", () => {
+  const queryClient = cachedTree({
+    root: ["first", "third", "fourth", "fifth"],
+    first: ["second"],
+    second: [],
+    third: [],
+    fourth: [],
+    fifth: [],
+  });
+  const write = vi.spyOn(Storage.prototype, "setItem");
+  const view = render(tree("/grid/agents:root", true, <Probe />, queryClient));
+  expect(screen.getByTestId("order")).toHaveTextContent("first,second,third,fourth");
+  for (const action of ["Swap", "Close", "Add third", "Split"])
+    fireEvent.click(screen.getByText(action));
+  expect(screen.getByTestId("order")).toHaveTextContent("first,second,third,fourth");
+  expect(screen.getByTestId("path")).toHaveTextContent("/grid/agents:root");
+  fireEvent.click(screen.getByText("Select third"));
+  expect(screen.getByTestId("selected")).toHaveTextContent("third");
+  expect(screen.getByTestId("count")).toHaveTextContent("0");
+  expect(write).not.toHaveBeenCalled();
+  view.unmount();
+
+  render(tree("/grid/agents:root?page=2", true, <Probe />, queryClient));
+  expect(screen.getByTestId("order")).toHaveTextContent(/^fifth$/);
+});
+
+it("offers the way back when a session has no sub-agents to show", () => {
+  const queryClient = cachedTree({ lonely: [] });
+  render(
+    tree(
+      "/grid/agents:lonely",
+      true,
+      <GridWorkspace active={false}>{null}</GridWorkspace>,
+      queryClient,
+    ),
+  );
+  expect(screen.getByText("This session has no sub-agents.")).toBeVisible();
+  expect(screen.getByRole("link", { name: "Back to main agent" })).toHaveAttribute(
+    "href",
+    "/c/lonely",
+  );
 });

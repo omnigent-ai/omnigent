@@ -91,7 +91,7 @@ export function GridSessionPane({
     setNodeRef: setDragNodeRef,
     setActivatorNodeRef,
     isDragging,
-  } = useDraggable({ id: sessionId, data: { title } });
+  } = useDraggable({ id: sessionId, data: { title }, disabled: grids.agentsGrid !== undefined });
   const {
     setNodeRef: setDropNodeRef,
     active,
@@ -397,14 +397,16 @@ export function GridSessionPane({
                 <Maximize2Icon className="size-3.5" />
               </Link>
             </Button>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              aria-label={`Remove ${title} from grid`}
-              onClick={() => grids.closePane(sessionId)}
-            >
-              <XIcon className="size-4" />
-            </Button>
+            {!grids.agentsGrid && (
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label={`Remove ${title} from grid`}
+                onClick={() => grids.closePane(sessionId)}
+              >
+                <XIcon className="size-4" />
+              </Button>
+            )}
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
