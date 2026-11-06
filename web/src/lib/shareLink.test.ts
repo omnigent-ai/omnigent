@@ -43,3 +43,13 @@ describe("getShareableSessionLink", () => {
     );
   });
 });
+
+it("preserves shared automation routing through the managed host transform", async () => {
+  const { getShareableLink } = await import("./shareLink");
+  vi.mocked(host.getOmnigentTransformShareLink).mockReturnValue(
+    (path) => `https://host.example${path}`,
+  );
+  expect(getShareableLink("/tasks/shared/task1", embedded)).toBe(
+    "https://host.example/ml/omnigent-embed/tasks/shared/task1",
+  );
+});

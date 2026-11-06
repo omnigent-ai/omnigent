@@ -1655,6 +1655,27 @@ class SqlScheduledTask(OmnigentBase):
     )
 
 
+class SqlScheduledTaskPermission(OmnigentBase):
+    """A selected person's access to an automation definition, never its runs."""
+
+    __tablename__ = "scheduled_task_permissions"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    scheduled_task_id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    account_generation: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    __table_args__ = (
+        Index(
+            "ix_scheduled_task_permissions_recipient",
+            "workspace_id",
+            "user_id",
+            "scheduled_task_id",
+        ),
+    )
+
+
 class SqlScheduledTaskRun(OmnigentBase):
     """
     SQLAlchemy model for the ``scheduled_task_runs`` table.

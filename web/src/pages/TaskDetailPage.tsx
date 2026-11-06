@@ -19,6 +19,7 @@ import {
   ChevronLeftIcon,
   Loader2Icon,
   PencilIcon,
+  Share2Icon,
   PlayIcon,
   Trash2Icon,
   TriangleAlertIcon,
@@ -30,6 +31,7 @@ import { Switch } from "@/components/ui/switch";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ShareScheduledTaskDialog } from "@/components/scheduled/ShareScheduledTaskDialog";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import {
@@ -106,6 +108,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const runNowMutation = useRunScheduledTaskNow();
 
   const [editOpen, setEditOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
   // Clear the awaiting flag and its safety timer (shared by the effect and
   // the timer callback so neither leaks).
@@ -354,6 +357,16 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {task.name}
         </h1>
         <div className="flex shrink-0 items-center gap-2">
+          {info !== "loading" && info.scheduled_task_sharing && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label="Share automation"
+              onClick={() => setShareOpen(true)}
+            >
+              <Share2Icon className="size-4" />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="icon-sm"
@@ -562,6 +575,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
         </ul>
       )}
 
+      {shareOpen && <ShareScheduledTaskDialog task={task} onClose={() => setShareOpen(false)} />}
       <CreateScheduledTaskDialog open={editOpen} onOpenChange={setEditOpen} editingTask={task} />
     </PageScroll>
   );

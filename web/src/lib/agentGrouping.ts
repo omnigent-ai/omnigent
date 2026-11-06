@@ -152,7 +152,7 @@ export function partitionAgentsByKind<T extends AvailableAgent>(
 /**
  * Split agents the way the new-session picker's groups do: "Harnesses" are
  * harness-backed picks (native CLIs and generic-ACP harness agents), "agents"
- * are composed agents plus the user's own, which stay under "Agents" even on a
+ * are composed agents plus owned or shared agents, which stay under "Agents" even on a
  * native harness. Settings' per-entry visibility list shares this so an ACP
  * harness can't sit under a different heading there than in the picker.
  *
@@ -163,7 +163,7 @@ export function partitionPickerEntries<T extends AvailableAgent>(
   agents: readonly T[],
 ): { harnesses: T[]; agents: T[] } {
   const harnessBacked = (a: T): boolean =>
-    !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a));
+    !a.mine && !a.shared && (isNativeCodingAgent(a) || isAcpHarnessAgent(a));
   return {
     harnesses: agents.filter(harnessBacked),
     agents: agents.filter((a) => !harnessBacked(a)),

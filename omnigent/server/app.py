@@ -183,6 +183,7 @@ from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.stores.scheduled_task_permission_store import ScheduledTaskPermissionStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
 from omnigent.util.event_loop_watchdog import monitor_event_loop
@@ -306,6 +307,7 @@ class ServerInfoResponse(BaseModel):
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
+    scheduled_task_sharing: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
     branding: BrandingInfo
@@ -1153,7 +1155,8 @@ def _ensure_extra_builtin_agents(
     operator-supplied paths that may be wrong in a deployment (typo, stale
     mount). A bad entry is logged and skipped — one misconfigured extra
     agent must never block server startup (the packaged built-ins still
-    seed). Mirrors the best-effort spec-load in :func:`_to_agent_object`.
+    seed). Mirrors the best-effort spec-load in
+    :func:`~omnigent.server.routes.builtin_agents.agent_to_object`.
 
     :param agent_store: Store for agent metadata.
     :param artifact_store: Store for agent bundles.
@@ -1594,6 +1597,7 @@ def create_app(
     base_path: str | None = None,
     host_sharded: bool = False,
     *,
+    scheduled_task_permission_store: ScheduledTaskPermissionStore | None = None,
     automations: bool | Callable[[], bool] | None = None,
     default_agents_seeded: bool = False,
     suppressed_agent_names: frozenset[str] = frozenset(),
@@ -1633,6 +1637,8 @@ def create_app(
         CRUD endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
+    :param scheduled_task_permission_store: Optional definition-sharing grants. Managed
+        deployments inject this only after provisioning their sharing schema.
     :param scheduled_task_store: Store backing the recurring-task
         scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
@@ -3664,6 +3670,11 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
+                "scheduled_task_sharing": automations_enabled
+                and not single_user
+                and auth_provider is not None
+                and scheduled_task_permission_store is not None
+                and permission_store is not None,
                 "scheduled_task_inbox": automations_enabled,
                 "automations_enabled": automations_enabled,
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
@@ -3965,6 +3976,7 @@ def create_app(
         app.include_router(
             create_scheduled_tasks_router(
                 scheduled_task_store,
+                task_permissions=scheduled_task_permission_store,
                 agent_store=agent_store,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
