@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
+    read_accepted_steers,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
@@ -1034,6 +1035,10 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id
     assert "private prompt" not in json.dumps(attrs)
+    steered = active_turn_id is not None and rpc_reply is None
+    assert read_accepted_steers(tmp_path, thread_id="thread_123", turn_id="turn_steered") == (
+        ["c" * 32] if steered else []
+    )
 
 
 def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(

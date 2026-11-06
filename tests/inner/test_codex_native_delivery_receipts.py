@@ -15,6 +15,7 @@ import omnigent.inner.codex_native_executor as native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexParams
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
+    read_accepted_steers,
     read_bridge_startup_failure,
     read_bridge_state,
     write_bridge_state,
@@ -220,6 +221,9 @@ async def test_native_receipt_requires_exact_delivery_identity(
     assert state is not None
     assert state.active_turn_id == "turn_newer"
     assert read_bridge_startup_failure(tmp_path) is None
+    assert read_accepted_steers(tmp_path, thread_id="thread_receipt", turn_id="turn_accepted") == (
+        ["c" * 32] if confirmed and method == "turn/steer" else []
+    )
 
 
 def _lost_reply_setup(

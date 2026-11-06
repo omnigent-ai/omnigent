@@ -23,9 +23,11 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
     codex_terminal_interactive,
+    forget_accepted_steers,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
+    read_accepted_steers,
     read_bridge_startup_error,
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
@@ -38,6 +40,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
+    record_accepted_steer,
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
@@ -1142,6 +1145,31 @@ def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
         "Could not record inherited Codex child usage" in record.getMessage()
         for record in caplog.records
     )
+
+
+def test_accepted_steers_are_listed_per_turn_until_forgotten(bridge_dir: Path) -> None:
+    """Recent steers stay listed for their turn; a new thread drops the previous thread's."""
+    for index in range(34):
+        record_accepted_steer(
+            bridge_dir, thread_id="thread_old", turn_id="turn_a", client_message_id=f"old_{index}"
+        )
+    assert read_accepted_steers(bridge_dir, thread_id="thread_old", turn_id="turn_a") == [
+        f"old_{index}" for index in range(2, 34)
+    ]
+
+    record_accepted_steer(
+        bridge_dir, thread_id="thread_new", turn_id="turn_1", client_message_id="steer_1"
+    )
+    record_accepted_steer(
+        bridge_dir, thread_id="thread_new", turn_id="turn_2", client_message_id="steer_2"
+    )
+    forget_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_1")
+
+    assert read_accepted_steers(bridge_dir, thread_id="thread_old", turn_id="turn_a") == []
+    assert read_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_1") == []
+    assert read_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_2") == [
+        "steer_2"
+    ]
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────

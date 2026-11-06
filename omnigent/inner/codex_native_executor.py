@@ -53,6 +53,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
+    record_accepted_steer,
     update_active_turn_id,
 )
 from omnigent.harnesses.codex_native.shell_input import (
@@ -469,6 +470,13 @@ async def _native_delivery_request_once(
                         native_turn_id=confirmed_turn,
                         outcome="native_receipt_confirmed",
                     )
+                    if method == "turn/steer":
+                        record_accepted_steer(
+                            bridge_dir,
+                            thread_id=state.thread_id,
+                            turn_id=confirmed_turn,
+                            client_message_id=client_message_id,
+                        )
                     # The forwarder owns current turn state; this receipt can already be old.
                     return None
             raise InjectionDeliveryAmbiguous(str(exc)) from exc
@@ -493,6 +501,17 @@ async def _native_delivery_request_once(
         native_turn_id=native_turn_id,
         outcome="rpc_accepted" if accepted else "rpc_accepted_missing_turn_id",
     )
+    if (
+        method == "turn/steer"
+        and native_turn_id is not None
+        and isinstance(client_message_id, str)
+    ):
+        record_accepted_steer(
+            bridge_dir,
+            thread_id=state.thread_id,
+            turn_id=native_turn_id,
+            client_message_id=client_message_id,
+        )
     return response
 
 

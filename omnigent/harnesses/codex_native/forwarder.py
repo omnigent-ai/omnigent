@@ -47,7 +47,9 @@ from omnigent.harnesses.codex_native.bridge import (
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
+    forget_accepted_steers,
     pending_mcp_servers,
+    read_accepted_steers,
     read_bridge_state,
     read_certificate_failure,
     read_child_usage_baselines,
@@ -646,6 +648,9 @@ class _CodexForwarderState:
     posted_user_turns: set[str] = field(default_factory=set)
     user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
     resume_echo_thread_ids: set[str] = field(default_factory=set)
+    # ``(thread_id, clientId)`` of claimed user messages sent with a client id.
+    mirrored_user_client_ids: set[tuple[str, str]] = field(default_factory=set)
+    steer_recovery_checks: dict[str, int] = field(default_factory=dict)
     posted_tool_calls: set[str] = field(default_factory=set)
     # User shell commands whose input was mirrored at item start.
     started_user_shell_items: set[str] = field(default_factory=set)
@@ -1051,6 +1056,36 @@ class _CodexForwarderState:
         """
         for key in [key for key in self.user_message_copy_balance if key[1] == turn_id]:
             del self.user_message_copy_balance[key]
+
+    def note_user_client_id(self, thread_id: str, client_id: object) -> bool:
+        """
+        Record a claimed user message's ``clientId``.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
+        :param client_id: The item's ``clientId``; ``None`` for terminal input.
+        :returns: ``False`` when a message with this client id was already claimed.
+        """
+        if not isinstance(client_id, str) or not client_id:
+            return True
+        key = (thread_id, client_id)
+        if key in self.mirrored_user_client_ids:
+            return False
+        self.mirrored_user_client_ids.add(key)
+        return True
+
+    def steer_recovery_due(self, turn_id: str) -> bool:
+        """
+        Pace native transcript reads for a turn with an unmirrored accepted steer.
+
+        Codex records a steer at its next model step, so the first agent message
+        only arms the check; later reads back off exponentially.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_abc"``.
+        :returns: Whether this agent message should read the transcript.
+        """
+        checks = self.steer_recovery_checks.get(turn_id, 0) + 1
+        self.steer_recovery_checks[turn_id] = checks
+        return checks >= 2 and checks & (checks - 1) == 0
 
     def note_tool_call_posted(self, call_id: str) -> None:
         """Record that a command's live function-call item was posted."""
@@ -3608,6 +3643,16 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, event_state)
+            if event_bridge_dir is not None:
+                await _mirror_missed_steers(
+                    client,
+                    route_session_id,
+                    event_state,
+                    bridge_dir=event_bridge_dir,
+                    thread_id=_thread_id_from_params(params),
+                    turn_id=_turn_id_from_payload(params),
+                    turn_ended=False,
+                )
         elif isinstance(item, dict) and _user_shell_command(item) is not None:
             if await _post_user_shell_input(client, route_session_id, params, item):
                 if event_state is not None and isinstance(item_id := item.get("id"), str):
@@ -5057,6 +5102,16 @@ async def _handle_terminal_turn_boundary_inner(
         forwarder_state=forwarder_state,
     )
     terminal_turn_id = _terminal_turn_id_from_params(params)
+    if bridge_dir is not None:
+        await _mirror_missed_steers(
+            client,
+            session_id,
+            forwarder_state,
+            bridge_dir=bridge_dir,
+            thread_id=_thread_id_from_params(params),
+            turn_id=terminal_turn_id,
+            turn_ended=True,
+        )
     if forwarder_state is not None and terminal_turn_id is not None:
         forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
@@ -6281,9 +6336,11 @@ def _claim_completed_item(
         content = json.dumps(item["content"], sort_keys=True)
         content_digest = hashlib.sha256(content.encode()).hexdigest()
         resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
-        if forwarder_state.pair_user_message_copy(
+        paired = forwarder_state.pair_user_message_copy(
             (thread_id, turn_id, content_digest), resumed=resumed
-        ):
+        )
+        first_client_copy = forwarder_state.note_user_client_id(thread_id, item.get("clientId"))
+        if paired or not first_client_copy:
             _logger.info("Codex forwarder skipped duplicate user message: key=%s", item_key)
             return None
     return item_key
@@ -7348,25 +7405,136 @@ def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject
     :returns: The ``userMessage`` item dict, or ``None`` when the turn or
         its user message is absent.
     """
+    return next(iter(_turn_user_messages(response, turn_id)), None)
+
+
+def _turn_user_messages(response: CodexMessage, turn_id: str) -> list[_JsonObject]:
+    """
+    List a turn's ``userMessage`` items in a ``thread/resume`` or ``thread/read`` response.
+
+    :param response: Codex response envelope whose result holds the thread.
+    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+    :returns: The turn's ``userMessage`` items in transcript order.
+    """
     result = response.get("result")
-    if not isinstance(result, dict):
-        return None
-    thread = result.get("thread")
-    if not isinstance(thread, dict):
-        return None
-    turns = thread.get("turns")
+    thread = result.get("thread") if isinstance(result, dict) else None
+    turns = thread.get("turns") if isinstance(thread, dict) else None
     if not isinstance(turns, list):
-        return None
+        return []
+    messages: list[_JsonObject] = []
     for turn in turns:
         if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
             continue
         items = turn.get("items")
-        if not isinstance(items, list):
+        if isinstance(items, list):
+            messages.extend(
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("type") == "userMessage"
+            )
+    return messages
+
+
+async def _mirror_missed_steers(
+    client: httpx.AsyncClient,
+    session_id: str,
+    forwarder_state: _CodexForwarderState | None,
+    *,
+    bridge_dir: Path,
+    thread_id: str | None,
+    turn_id: str | None,
+    turn_ended: bool,
+) -> None:
+    """
+    Mirror accepted steers whose live ``userMessage`` notification never arrived.
+
+    The server settles a steered input only when its native message is mirrored,
+    so this finds the executor's recorded client ids in the native transcript.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Forwarder state tracking mirrored client ids.
+    :param bridge_dir: Native Codex bridge directory holding recorded steers.
+    :param thread_id: Parent Codex thread id, e.g. ``"thread_abc"``.
+    :param turn_id: Codex turn id, e.g. ``"turn_abc"``.
+    :param turn_ended: Whether the turn finished, forcing a last read.
+    :returns: None.
+    """
+    if forwarder_state is None or not thread_id or not turn_id:
+        return
+    recorded = read_accepted_steers(bridge_dir, thread_id=thread_id, turn_id=turn_id)
+    missed = {
+        client_id
+        for client_id in recorded
+        if (thread_id, client_id) not in forwarder_state.mirrored_user_client_ids
+    }
+    if missed and (turn_ended or forwarder_state.steer_recovery_due(turn_id)):
+        await _post_missed_steers(
+            client,
+            session_id,
+            forwarder_state,
+            thread_id=thread_id,
+            turn_id=turn_id,
+            client_ids=missed,
+        )
+    if turn_ended:
+        forwarder_state.steer_recovery_checks.pop(turn_id, None)
+        if recorded:
+            forget_accepted_steers(bridge_dir, thread_id=thread_id, turn_id=turn_id)
+
+
+async def _post_missed_steers(
+    client: httpx.AsyncClient,
+    session_id: str,
+    forwarder_state: _CodexForwarderState,
+    *,
+    thread_id: str,
+    turn_id: str,
+    client_ids: set[str],
+) -> None:
+    """
+    Post a turn's native user messages that carry one of ``client_ids``.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param forwarder_state: Forwarder state holding the app-server client.
+    :param thread_id: Parent Codex thread id, e.g. ``"thread_abc"``.
+    :param turn_id: Codex turn id, e.g. ``"turn_abc"``.
+    :param client_ids: Client message ids of steers not yet mirrored.
+    :returns: None.
+    """
+    codex_client = forwarder_state.codex_client
+    if codex_client is None:
+        return
+    try:
+        # Unlike a resume snapshot, a read keeps native ids for in-progress turns.
+        response = await codex_client.request(
+            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.warning(
+            "Codex forwarder could not read steered input: thread=%s turn=%s",
+            thread_id,
+            turn_id,
+            exc_info=True,
+        )
+        return
+    for item in _turn_user_messages(response, turn_id):
+        client_id = item.get("clientId")
+        if not isinstance(client_id, str) or client_id not in client_ids:
             continue
-        for item in items:
-            if isinstance(item, dict) and item.get("type") == "userMessage":
-                return item
-    return None
+        item_params: _JsonObject = {"threadId": thread_id, "turnId": turn_id, "item": item}
+        source_id = _claim_completed_item(item_params, item, forwarder_state)
+        if source_id is not None and await _post_user_message(
+            client, session_id, item_params, item, source_id=source_id
+        ):
+            _logger.info(
+                "Codex forwarder recovered steered user message: thread=%s turn=%s",
+                thread_id,
+                turn_id,
+            )
 
 
 async def _post_user_message(
