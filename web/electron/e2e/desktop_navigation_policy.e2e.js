@@ -13,8 +13,138 @@ const {
   saveRecording,
   spawnServer,
 } = require("./desktopHarness");
+const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
+const { escapeHtml } = require("../src/loopback-oauth");
 
 const deps = desktopDepsAvailable();
+
+const THIS_MACHINE_HOST_ID = "a".repeat(32);
+
+// Accept a WebSocket upgrade, echo one short masked text frame, then close.
+function echoOneWebSocketFrame(request, socket) {
+  const accept = createHash("sha1")
+    .update(request.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
+    .digest("base64");
+  socket.write(
+    `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
+  );
+  let buffered = Buffer.alloc(0);
+  socket.on("data", (chunk) => {
+    buffered = Buffer.concat([buffered, chunk]);
+    if (buffered.length < 2) return;
+    const length = buffered[1] & 0x7f;
+    if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
+      socket.destroy();
+      return;
+    }
+    if (buffered.length < length + 6) return;
+    const payload = Buffer.from(buffered.subarray(6, length + 6));
+    for (let index = 0; index < length; index++) payload[index] ^= buffered[2 + (index % 4)];
+    socket.end(Buffer.concat([Buffer.from([0x81, length]), payload]));
+  });
+  socket.on("error", () => {});
+}
+
+// Preload that records every response-guard decision in global.allowedNetworkResponses.
+function writeResponseObserver(scratch) {
+  const observer = path.join(scratch, "observe-allowed.cjs");
+  fs.writeFileSync(
+    observer,
+    `
+    const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
+    const create = mod.createBrowserViewRegistry;
+    global.allowedNetworkResponses = [];
+    mod.createBrowserViewRegistry = (opts) => {
+      const registry = create(opts);
+      const response = registry.shouldCancelAgentResponse.bind(registry);
+      registry.shouldCancelAgentResponse = async (details, partition) => {
+        const cancel = await response(details, partition);
+        global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
+          resourceType: details.resourceType, statusCode: details.statusCode, cancel });
+        return cancel;
+      };
+      return registry;
+    };
+  `,
+  );
+  return observer;
+}
+
+// Launch with a live daemon enrolled for this machine; only `backend.sessionId`
+// reports this host ID, every other session reports a remote host.
+async function launchThisMachineDesktop({ backend, scratch, recordDir, preload = [] }) {
+  const machineHome = path.join(scratch, "machine");
+  const stateDir = path.join(machineHome, ".omnigent");
+  fs.mkdirSync(path.join(stateDir, "daemons"), { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "config.yaml"),
+    `host:\n  host_id: ${THIS_MACHINE_HOST_ID}\n`,
+  );
+  // Disk-backed enrollment and a live PID exercise the production predicate.
+  fs.writeFileSync(
+    path.join(stateDir, "daemons", "local.json"),
+    JSON.stringify({
+      pid: process.pid,
+      target: backend.serverUrl,
+      server_url: backend.serverUrl,
+      mode: "server",
+      host_id: THIS_MACHINE_HOST_ID,
+    }),
+  );
+  const desktop = await launchDesktop({
+    serverUrl: backend.serverUrl,
+    recordDir,
+    env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
+    preload,
+  });
+  let sessionIsLocal = true;
+  try {
+    await desktop.window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
+      if (route.request().method() !== "GET") return route.continue();
+      const response = await route.fetch();
+      const body = await response.json();
+      const local = body.id === backend.sessionId && sessionIsLocal;
+      await route.fulfill({
+        response,
+        json: { ...body, host_id: local ? THIS_MACHINE_HOST_ID : "b".repeat(32) },
+      });
+    });
+  } catch (error) {
+    // The caller only cleans up a desktop this helper returns.
+    await desktop.electronApp.close().catch(() => {});
+    await desktop.stopDisplayCapture();
+    fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    desktop,
+    setSessionIsLocal: (value) => {
+      sessionIsLocal = value;
+    },
+  };
+}
+
+/** Open a session and add a Browser tab from the workspace rail's "Open new" menu. */
+async function openSessionBrowserTab(window, serverUrl, sessionId) {
+  await window.goto(`${serverUrl}/c/${sessionId}`);
+  await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
+  const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
+  if (await expand.isVisible()) await expand.click();
+  await window.getByRole("button", { name: "Open new", exact: true }).click();
+  await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+}
+
+/** POST the request the agent's browser_navigate tool makes, relayed to the desktop. */
+async function requestAgentNavigation(serverUrl, sessionId, url) {
+  const response = await fetch(`${serverUrl}/v1/sessions/${sessionId}/browser/action_request`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "navigate", args: { url } }),
+    signal: AbortSignal.timeout(30_000),
+  });
+  assert.equal(response.ok, true);
+  return response.json();
+}
 
 it(
   "guards documents, subresources, WebSockets, and worker network requests",
@@ -474,7 +604,6 @@ it(
   "opens this machine's loopback preview via the address bar and agent relay, denying a remote session",
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 120_000 },
   async () => {
-    const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
     const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-"));
     const recordDir =
       process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
@@ -499,99 +628,26 @@ it(
       if (request.method === "OPTIONS") response.writeHead(204).end();
       else response.end("cors-ok");
     });
-    corsFixture.on("upgrade", (request, socket) => {
-      const accept = createHash("sha1")
-        .update(request.headers["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
-        .digest("base64");
-      socket.write(
-        `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`,
-      );
-      let buffered = Buffer.alloc(0);
-      // This fixture echoes one short masked text frame, then closes the socket.
-      socket.on("data", (chunk) => {
-        buffered = Buffer.concat([buffered, chunk]);
-        if (buffered.length < 2) return;
-        const length = buffered[1] & 0x7f;
-        if (buffered[0] !== 0x81 || !(buffered[1] & 0x80) || length > 125) {
-          socket.destroy();
-          return;
-        }
-        if (buffered.length < length + 6) return;
-        const payload = Buffer.from(buffered.subarray(6, length + 6));
-        for (let index = 0; index < length; index++) payload[index] ^= buffered[2 + (index % 4)];
-        socket.end(Buffer.concat([Buffer.from([0x81, length]), payload]));
-      });
-      socket.on("error", () => {});
-    });
+    corsFixture.on("upgrade", echoOneWebSocketFrame);
     await new Promise((resolve) => {
       corsFixture.listen(0, "127.0.0.1", resolve);
     });
     const corsUrl = `http://127.0.0.1:${corsFixture.address().port}/allowed-cors`;
     const socketUrl = `ws://127.0.0.1:${corsFixture.address().port}/echo`;
-    const observeAllowed = path.join(scratch, "observe-allowed.cjs");
-    fs.writeFileSync(
-      observeAllowed,
-      `
-      const mod = require(${JSON.stringify(path.resolve(__dirname, "../src/browserViewRegistry.js"))});
-      const create = mod.createBrowserViewRegistry;
-      global.allowedNetworkResponses = [];
-      mod.createBrowserViewRegistry = (opts) => {
-        const registry = create(opts);
-        const response = registry.shouldCancelAgentResponse.bind(registry);
-        registry.shouldCancelAgentResponse = async (details, partition) => {
-          const cancel = await response(details, partition);
-          global.allowedNetworkResponses.push({ url: details.url, ip: details.ip,
-            resourceType: details.resourceType, statusCode: details.statusCode, cancel });
-          return cancel;
-        };
-        return registry;
-      };
-    `,
-    );
-    const hostId = "a".repeat(32);
+    const observeAllowed = writeResponseObserver(scratch);
     let backend;
     let desktop;
     try {
       backend = await startDesignBackend(scratch);
-      const machineHome = path.join(scratch, "machine");
-      const stateDir = path.join(machineHome, ".omnigent");
-      fs.mkdirSync(path.join(stateDir, "daemons"), { recursive: true });
-      fs.writeFileSync(path.join(stateDir, "config.yaml"), `host:\n  host_id: ${hostId}\n`);
-      // Disk-backed enrollment and a live PID exercise the production predicate.
-      fs.writeFileSync(
-        path.join(stateDir, "daemons", "local.json"),
-        JSON.stringify({
-          pid: process.pid,
-          target: backend.serverUrl,
-          server_url: backend.serverUrl,
-          mode: "server",
-          host_id: hostId,
-        }),
-      );
-      desktop = await launchDesktop({
-        serverUrl: backend.serverUrl,
+      const local = await launchThisMachineDesktop({
+        backend,
+        scratch,
         recordDir,
-        env: { HOME: machineHome, OMNIGENT_CONFIG_HOME: stateDir },
         preload: [observeAllowed],
       });
+      desktop = local.desktop;
       const { window, electronApp } = desktop;
-      let sessionIsLocal = true;
-      await window.route(/\/v1\/sessions\/[a-f0-9]+(?:\?.*)?$/, async (route) => {
-        if (route.request().method() !== "GET") return route.continue();
-        const response = await route.fetch();
-        const body = await response.json();
-        const local = body.id === backend.sessionId && sessionIsLocal;
-        await route.fulfill({
-          response,
-          json: { ...body, host_id: local ? hostId : "b".repeat(32) },
-        });
-      });
-      await window.goto(`${backend.serverUrl}/c/${backend.sessionId}`);
-      await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
-      const expand = window.getByRole("button", { name: "Expand right panel", exact: true });
-      if (await expand.isVisible()) await expand.click();
-      await window.getByRole("button", { name: "Open new", exact: true }).click();
-      await window.getByRole("menuitem", { name: "Browser", exact: true }).click();
+      await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
       const bar = window.getByRole("textbox", { name: "Address bar" });
       await bar.fill(previewUrl);
       await bar.press("Enter");
@@ -607,19 +663,8 @@ it(
           }, previewUrl),
         "address-bar loopback preview",
       );
-      const action = async (sessionId) => {
-        const response = await fetch(
-          `${backend.serverUrl}/v1/sessions/${sessionId}/browser/action_request`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "navigate", args: { url: previewUrl } }),
-            signal: AbortSignal.timeout(30_000),
-          },
-        );
-        assert.equal(response.ok, true);
-        return response.json();
-      };
+      const action = (sessionId) =>
+        requestAgentNavigation(backend.serverUrl, sessionId, previewUrl);
       assert.equal((await action(backend.sessionId)).ok, true);
       const content = await electronApp.evaluate(async (_electron, sessionId) => {
         const entry = global.omnigentTestBrowserRegistries[0].get(sessionId);
@@ -713,7 +758,7 @@ it(
         JSON.stringify({ allowed, corsRequests, responses }, null, 2),
       );
       const loadsBeforeMove = previewLoads;
-      sessionIsLocal = false;
+      local.setSessionIsLocal(false);
       const moved = await action(backend.sessionId);
       assert.equal(moved.ok, false, JSON.stringify(moved));
       assert.match(moved.error, /blocked/i);
@@ -749,6 +794,307 @@ it(
       fixture.closeAllConnections();
       await new Promise((resolve) => {
         fixture.close(resolve);
+      });
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  },
+);
+
+it(
+  "opens a *.localhost dev host from the address bar, a chat link and the agent, denying a remote session",
+  { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}`, timeout: 180_000 },
+  async () => {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-subdomain-"));
+    const recordDir =
+      process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+      fs.mkdtempSync(path.join(os.tmpdir(), "omni-localhost-subdomain-recordings-"));
+    const devRequests = [];
+    // A dev server that routes on the Host header, like a *.localhost reverse proxy.
+    const fixture = http.createServer((request, response) => {
+      devRequests.push({ url: request.url, host: request.headers.host });
+      response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
+      response.end(
+        `<title>spog dev</title><body style="font:20px system-ui;padding:24px">` +
+          `<h1>spog dev server</h1><p>Host header: <b>${escapeHtml(request.headers.host)}</b></p>` +
+          `<p>Path: <b>${escapeHtml(request.url)}</b></p></body>`,
+      );
+    });
+    const devUpgrades = [];
+    fixture.on("upgrade", (request, socket) => {
+      devUpgrades.push(request.headers.host);
+      echoOneWebSocketFrame(request, socket);
+    });
+    await new Promise((resolve) => {
+      fixture.listen(0, "127.0.0.1", resolve);
+    });
+    // An HTTP proxy that answers every request it receives.
+    const proxyRequests = [];
+    const proxyFixture = http.createServer((request, response) => {
+      proxyRequests.push(request.url);
+      response.writeHead(200, { "Content-Type": "text/plain" });
+      response.end("served by the proxy");
+    });
+    // Proxied WebSockets tunnel with CONNECT.
+    proxyFixture.on("connect", (request, socket) => {
+      proxyRequests.push(`CONNECT ${request.url}`);
+      socket.destroy();
+    });
+    await new Promise((resolve) => {
+      proxyFixture.listen(0, "127.0.0.1", resolve);
+    });
+    const devHost = `spog.dev.localhost:${fixture.address().port}`;
+    const devUrl = (view) => `http://${devHost}/one?view=${view}`;
+    const marks = [];
+    let backend;
+    let desktop;
+    // Marks are seconds from desktop launch, which starts the display capture.
+    let started = Date.now();
+    const mark = (label) => {
+      marks.push({ label, seconds: (Date.now() - started) / 1000 });
+      console.log(`[${((Date.now() - started) / 1000).toFixed(1)}s] ${label}`);
+    };
+    // Pauses and slow typing only pace the recording.
+    const recording = Boolean(process.env.OMNIGENT_DESKTOP_RECORD_DIR);
+    const typingDelay = recording ? 25 : 0;
+    const wait = (ms) =>
+      new Promise((resolve) => {
+        setTimeout(resolve, ms);
+      });
+    const hold = (ms) => (recording ? wait(ms) : Promise.resolve());
+    try {
+      backend = await startDesignBackend(scratch);
+      started = Date.now();
+      const local = await launchThisMachineDesktop({
+        backend,
+        scratch,
+        recordDir,
+        preload: [writeResponseObserver(scratch)],
+      });
+      desktop = local.desktop;
+      const { window, electronApp } = desktop;
+      const viewAt = (url) =>
+        electronApp.evaluate((_electron, wanted) => {
+          const found = [];
+          global.omnigentTestBrowserRegistries[0].forEach((entry, id) => {
+            if (entry.view.webContents.getURL() === wanted) {
+              found.push({ id, hostIsThisMachine: entry.agentContext?.hostIsThisMachine === true });
+            }
+          });
+          return found[0] ?? null;
+        }, url);
+      const pageText = (viewId) =>
+        electronApp.evaluate(async (_electron, id) => {
+          const entry = global.omnigentTestBrowserRegistries[0].get(id);
+          await new Promise((resolve) => {
+            if (!entry.view.webContents.isLoading()) resolve();
+            else {
+              entry.view.webContents.once("did-finish-load", resolve);
+              entry.view.webContents.once("did-fail-load", resolve);
+            }
+          });
+          return entry.view.webContents.executeJavaScript("document.body.innerText");
+        }, viewId);
+      const expectDevPage = async (url, label) => {
+        const view = await eventually(() => viewAt(url), label);
+        assert.equal(view.hostIsThisMachine, true, label);
+        const text = await pageText(view.id);
+        assert.match(text, new RegExp(`Host header: ${devHost.replaceAll(".", "\\.")}`));
+        return view;
+      };
+
+      mark("CUJ-1 address bar");
+      await openSessionBrowserTab(window, backend.serverUrl, backend.sessionId);
+      const bar = window.getByRole("textbox", { name: "Address bar" });
+      await bar.click();
+      await bar.pressSequentially(devUrl("address-bar"), { delay: typingDelay });
+      await bar.press("Enter");
+      const addressView = await expectDevPage(
+        devUrl("address-bar"),
+        "address-bar *.localhost preview",
+      );
+      // Dev servers push hot reloads over a WebSocket on the same host.
+      const socketUrl = `ws://${devHost}/hmr`;
+      const socketEcho = (viewId, url) =>
+        electronApp.evaluate(
+          async (_electron, { id, wanted }) =>
+            global.omnigentTestBrowserRegistries[0].get(id).view.webContents.executeJavaScript(`
+              new Promise((resolve) => {
+                const socket = new WebSocket(${JSON.stringify(wanted)});
+                const timeout = setTimeout(() => resolve("timed out"), 10000);
+                socket.onopen = () => socket.send("hmr-ping");
+                socket.onmessage = (event) => { clearTimeout(timeout); resolve(event.data); };
+                socket.onerror = () => { clearTimeout(timeout); resolve("failed"); };
+              })
+            `),
+          { id: viewId, wanted: url },
+        );
+      const echo = await socketEcho(addressView.id, socketUrl);
+      assert.equal(echo, "hmr-ping", "a *.localhost WebSocket upgrade completes");
+      assert.deepEqual(devUpgrades, [devHost]);
+      const upgrades = (await electronApp.evaluate(() => global.allowedNetworkResponses)).filter(
+        (response) => response.url === socketUrl,
+      );
+      assert.deepEqual(
+        upgrades.map(({ ip, statusCode, cancel }) => ({ ip, statusCode, cancel })),
+        [{ ip: undefined, statusCode: 101, cancel: false }],
+        "Chromium omits the upgrade's connected IP, so the direct-route check decides",
+      );
+      await hold(3000);
+
+      // Opt in to opening chat links in the in-app browser, then return to the session.
+      mark("settings");
+      await window.getByTestId("settings-button").first().click();
+      const toggle = window.getByTestId("open-links-in-app-toggle");
+      await toggle.scrollIntoViewIfNeeded();
+      await hold(1000);
+      await toggle.click();
+      assert.equal(await toggle.getAttribute("aria-checked"), "true");
+      await hold(1500);
+      await window.goto(`${backend.serverUrl}/c/${backend.sessionId}`);
+      await window.getByPlaceholder("Send a message…").waitFor();
+      await window.getByRole("textbox", { name: "Address bar" }).waitFor();
+      await hold(1000);
+
+      mark("CUJ-2 chat link");
+      const fallback = await fetch(`${backend.mockUrl}/mock/set_fallback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: "gpt-4o-mini",
+          text: `The dev server is up: [Open spog dev](${devUrl("chat-link")})`,
+          stream: true,
+        }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      assert.equal(fallback.ok, true, "the mock model accepts the scripted reply");
+      const composer = window.getByPlaceholder("Send a message…");
+      await composer.click();
+      await composer.pressSequentially("Where is the dev server?", { delay: typingDelay });
+      await composer.press("Enter");
+      const link = window.getByRole("link", { name: "Open spog dev", exact: true });
+      await link.waitFor({ timeout: 60_000 });
+      await hold(1500);
+      await link.click();
+      await expectDevPage(devUrl("chat-link"), "chat-link *.localhost preview");
+      await hold(3000);
+
+      mark("CUJ-3 agent navigation");
+      const agent = await requestAgentNavigation(
+        backend.serverUrl,
+        backend.sessionId,
+        devUrl("agent"),
+      );
+      assert.equal(agent.ok, true, JSON.stringify(agent));
+      await expectDevPage(devUrl("agent"), "agent *.localhost preview");
+      await hold(3000);
+      assert.deepEqual(
+        devRequests.map((request) => request.host),
+        [devHost, devHost, devHost],
+        "the dev server sees its *.localhost Host header",
+      );
+
+      mark("proxy routes");
+      // Chromium sends *.localhost around an ordinary proxy; only an explicit
+      // `<-loopback>` rule routes it through one, and the guard refuses that.
+      const agentView = await viewAt(devUrl("agent"));
+      const setViewProxy = (config) =>
+        electronApp.evaluate(
+          (_electron, { id, proxyConfig }) =>
+            global.omnigentTestBrowserRegistries[0]
+              .get(id)
+              .view.webContents.session.setProxy(proxyConfig),
+          { id: agentView.id, proxyConfig: config },
+        );
+      const proxyRules = `http://127.0.0.1:${proxyFixture.address().port}`;
+      await setViewProxy({ proxyRules });
+      const bypassed = await requestAgentNavigation(
+        backend.serverUrl,
+        backend.sessionId,
+        devUrl("system-proxy"),
+      );
+      assert.equal(bypassed.ok, true, JSON.stringify(bypassed));
+      await expectDevPage(devUrl("system-proxy"), "*.localhost beside a system proxy");
+      // Chromium proxies WebSockets by the `https=` rule even when `http=` has none.
+      await setViewProxy({
+        proxyRules: `https=127.0.0.1:${proxyFixture.address().port}`,
+        proxyBypassRules: "<-loopback>",
+      });
+      assert.equal(
+        await socketEcho(agentView.id, `ws://${devHost}/scheme-proxy`),
+        "failed",
+        "a WebSocket the https= rule would proxy is refused",
+      );
+      await setViewProxy({ proxyRules, proxyBypassRules: "<-loopback>" });
+      const forced = await requestAgentNavigation(
+        backend.serverUrl,
+        backend.sessionId,
+        devUrl("forced-proxy"),
+      );
+      assert.equal(forced.ok, true, "the IPC hop accepts the URL; the network guard cancels it");
+      // The relay answers before the load settles; wait for the cancelled attempt to finish.
+      await eventually(
+        () =>
+          electronApp.evaluate(
+            (_electron, { id, wanted }) => {
+              const { webContents } = global.omnigentTestBrowserRegistries[0].get(id).view;
+              return webContents.getURL() === wanted && !webContents.isLoading() ? true : null;
+            },
+            { id: agentView.id, wanted: devUrl("forced-proxy") },
+          ),
+        "forced-proxy navigation settles",
+      );
+      assert.equal(await pageText(agentView.id), "", "the proxied *.localhost page stays blank");
+      await setViewProxy({ mode: "direct" });
+      assert.equal(devRequests.length, 4, "the forced-proxy request never reaches the dev server");
+      assert.deepEqual(proxyRequests, [], "no *.localhost request is sent through the proxy");
+
+      mark("CUJ-4 remote session refused");
+      await window.goto(`${backend.serverUrl}/c/${backend.otherSessionId}`);
+      await window.getByRole("button", { name: /^(Expand|Collapse) right panel$/ }).waitFor();
+      const denied = await eventually(async () => {
+        const result = await requestAgentNavigation(
+          backend.serverUrl,
+          backend.otherSessionId,
+          devUrl("remote-agent"),
+        );
+        return result.error === "no browser renderer is connected" ? null : result;
+      }, "remote session browser relay");
+      assert.equal(denied.ok, false, JSON.stringify(denied));
+      assert.match(denied.error, /blocked/i);
+      await hold(1500);
+      await openSessionBrowserTab(window, backend.serverUrl, backend.otherSessionId);
+      const remoteBar = window.getByRole("textbox", { name: "Address bar" });
+      await remoteBar.click();
+      await remoteBar.pressSequentially(devUrl("remote"), { delay: typingDelay });
+      await remoteBar.press("Enter");
+      const refusal = window.getByRole("alert").filter({ hasText: "is a loopback/internal host" });
+      await refusal.waitFor();
+      assert.equal(devRequests.length, 4, "a remote session sends no *.localhost request");
+      await wait(recording ? 4000 : 1000);
+      assert.equal(await refusal.isVisible(), true, "the refusal stays on screen");
+      mark("end");
+      await desktop.stopDisplayCapture();
+    } finally {
+      fs.mkdirSync(recordDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(recordDir, "localhost-subdomain-evidence.json"),
+        JSON.stringify({ marks, devRequests, proxyRequests }, null, 2),
+      );
+      if (desktop) {
+        await desktop.window.unrouteAll({ behavior: "wait" });
+        await desktop.electronApp.close();
+        await desktop.stopDisplayCapture();
+        console.log(saveRecording(recordDir, "localhost-subdomain"));
+        fs.rmSync(desktop.userDataDir, { recursive: true, force: true });
+      }
+      if (backend) await backend.close();
+      fixture.closeAllConnections();
+      await new Promise((resolve) => {
+        fixture.close(resolve);
+      });
+      proxyFixture.closeAllConnections();
+      await new Promise((resolve) => {
+        proxyFixture.close(resolve);
       });
       fs.rmSync(scratch, { recursive: true, force: true });
     }
