@@ -181,7 +181,7 @@ RUN if [ -n "${OMNIGENT_EXTRAS}" ]; then \
 # image; contributes no layers of its own.
 FROM node:${NODE_VERSION}-slim AS node-runtime
 
-# ── Host runtime (`--target host`) ──────────────────────
+# ── Host runtime base (shared by the host targets) ─────
 # Prebaked Omnigent host for remote sandboxes: full omnigent install,
 # git + tmux for harness runtime needs, procps + lsof so the antigravity-native
 # executor can discover agy's connect-RPC port (antigravity_native_rpc.py uses
@@ -207,7 +207,7 @@ FROM node:${NODE_VERSION}-slim AS node-runtime
 #     literally named `sandbox` before running the agent (defense in depth)
 #     and fails closed if it is absent. The other providers run as root and
 #     never reference it.
-FROM python:${PYTHON_VERSION}-slim AS host
+FROM python:${PYTHON_VERSION}-slim AS host-base
 ARG NPM_CONFIG_REGISTRY=
 ENV NPM_CONFIG_REGISTRY=${NPM_CONFIG_REGISTRY}
 
@@ -390,22 +390,6 @@ RUN set -eu; \
     fi; \
     echo "gh ${GH_VERSION} pinned (sha256 verified)"
 
-# Copy the venv and source tree. The editable install's .pth files reference
-# /build/omnigent and /build/sdks/* -- both denied by the k8s Landlock LSM
-# policy. Re-install without -e so the package bytes land in the venv's
-# site-packages and imports no longer require /build at runtime.
-COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /build /build
-RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
- && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
-
-# Sandbox launchers exec commands through `bash -lc`, and Debian's
-# /etc/profile unconditionally resets PATH for login shells — the ENV
-# PATH above would silently drop off and `omnigent` / `pip` would
-# resolve to the system Python instead of the venv. profile.d snippets
-# are sourced after that reset, so this puts the venv back in front.
-RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
-
 # Optional extra harness CLIs, off by default: space-separated harness names
 # with optional @version pins, or npm:<pkg-spec> — see install-harness-cli.sh
 # and deploy/docker/README.md. Kept at the end of the stage so script churn
@@ -426,6 +410,46 @@ WORKDIR /root
 # would hijack it. The hold-open default mirrors what `omnigent
 # sandbox create` runs so a bare `docker run` behaves the same way.
 CMD ["sleep", "infinity"]
+
+# ── Host runtime (`--target host`) ──────────────────────
+# The venv stays out of host-base, so host-openshell carries only its own.
+FROM host-base AS host
+# Re-install without -e: the editable .pth files point into /build, which the
+# k8s Landlock policy denies. OpenShell's sandbox user installs wheels into this
+# venv; chowning at COPY avoids a second venv layer.
+COPY --from=builder --chown=sandbox:sandbox /opt/venv /opt/venv
+COPY --from=builder /build /build
+RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages \
+ && chown -R --from=root:root sandbox:sandbox /opt/venv
+
+# Sandbox launchers run `bash -lc`, whose /etc/profile resets PATH to the system
+# Python; profile.d snippets are sourced after that, so this restores the venv.
+RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+
+# ── OpenShell host venv builder ─────────────────────────
+# The host venv, built in place under /sandbox: console-script shebangs embed
+# the venv's absolute path, so /opt/venv cannot simply be copied there.
+FROM builder AS openshell-venv-builder
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+RUN python -m venv /sandbox/.venv \
+ && uv pip install --python /sandbox/.venv/bin/python --no-cache-dir \
+      --index-url ${PYPI_INDEX_URL} -e . \
+ && /sandbox/.venv/bin/pip install --no-cache-dir --index-url ${PYPI_INDEX_URL} \
+      /build /build/sdks/python-client /build/sdks/ui \
+ && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /sandbox/.venv/lib/python*/site-packages
+
+# ── OpenShell host runtime (`--target host-openshell`) ──
+# The Kubernetes driver seeds /sandbox into a PVC as UID 10001 without group 0,
+# and Landlock leaves only /sandbox and /tmp writable; any UID must read /sandbox.
+FROM host-base AS host-openshell
+RUN chmod 755 /sandbox
+COPY --from=builder /build /build
+COPY --from=openshell-venv-builder --chown=sandbox:sandbox /sandbox/.venv /sandbox/.venv
+ENV VIRTUAL_ENV=/sandbox/.venv \
+    PATH="/sandbox/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+RUN echo 'export PATH="/sandbox/.venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
+WORKDIR /sandbox
 
 # ── Server runtime (default target) ─────────────────────
 FROM python:${PYTHON_VERSION}-slim AS runtime
