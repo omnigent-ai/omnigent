@@ -3887,9 +3887,11 @@ def test_subagent_read_tools_are_runner_local() -> None:
         pytest.param({"input": "continue"}, id="object-input-contract"),
     ],
 )
+@pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
+    runner_features: str | None,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -3903,10 +3905,15 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param subagent_args: ``sys_session_send`` ``args`` payload.
+    :param runner_features: Local feature override; ``None`` uses defaults.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
     dispatch_stamps: list[dict[str, Any]] = []

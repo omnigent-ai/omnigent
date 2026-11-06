@@ -26,6 +26,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
             Feature.CUSTOM_AGENTS_SETTINGS_UI,
+            Feature.PEER_SESSION_MESSAGING,
             Feature.SESSION_ORCHESTRATION,
             Feature.SIDEBAR_GROUPING_UI,
         }
@@ -59,6 +60,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
         "harness_install",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
         "usage_page",
@@ -78,6 +80,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
     [
         "claude_osc_status",
         "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
     ],
@@ -90,6 +93,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
         "usage_page",
@@ -104,6 +108,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
     )
@@ -130,6 +135,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
     )
@@ -150,7 +156,7 @@ def test_sibling_sessions_can_be_enabled_without_other_opt_in_features() -> None
     assert flags.frontend_dict()["sibling_sessions"] is True
 
 
-@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS])
+@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.PEER_SESSION_MESSAGING])
 def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 

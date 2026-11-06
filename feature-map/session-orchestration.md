@@ -25,6 +25,12 @@ MCP independent creation.
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
+- `messaging-control`: Settings → Sharing → Agent messaging controls new peer
+  sends immediately and persists across restarts. `-peer_session_messaging` in
+  the server's `OMNIGENT_FEATURES` also refuses them and locks the admin switch;
+  in the host/runner environment it hides the tool and refuses calls locally.
+  Neither side can override a disable on the other. Child messaging and already
+  accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
@@ -53,6 +59,8 @@ MCP independent creation.
 
 ## How to get to it (user POV)
 
+- As an admin on desktop or mobile web, open Settings → Sharing → Agent
+  messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history.
 - In a native session's Chat or agent terminal, ask for the same operation;
@@ -131,6 +139,16 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
   task and no independent worker. Read history/info to confirm reads still work.
+- For `messaging-control`, turn the admin switch off, reload, and confirm a new
+  peer send is refused. Turn it back on and confirm delivery resumes. Check that
+  child work and a task accepted before disabling still finish. With the server
+  flag disabled, the switch stays off and unavailable; with only the runner flag
+  disabled, a new SDK/native session omits `sys_session_message`. Restart the
+  affected server or host/runner after environment changes. Component coverage is
+  in `web/src/pages/SharingPage.test.tsx`, `tests/tools/test_manager.py`,
+  `tests/runner/test_session_orchestration.py`, and
+  `tests/server/integration/test_session_orchestration.py`; persisted settings and
+  storage failures are covered by `tests/server/routes/test_sessions_sharing_mode.py`.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 

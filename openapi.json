@@ -10012,6 +10012,17 @@
             ],
             "title": "Default Public Sessions"
           },
+          "peer_session_messaging": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Peer Session Messaging"
+          },
           "public_sharing": {
             "anyOf": [
               {
@@ -20080,7 +20091,7 @@
         ]
       },
       "put": {
-        "description": "Set the sharing mode, public-access and/or default-public settings (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
+        "description": "Update sharing and peer-messaging settings (admin only).\n\nUpdates only the fields present in the body; requires at least one.\nRejects an unknown mode value with 400 (no fail-open coercion \u2014 an admin\nsetting a value should learn about a typo). Rejects a write to a setting\nthe deployment manages itself (not file-backed) with 403.",
         "operationId": "set_sharing_v1_sharing_put",
         "requestBody": {
           "content": {

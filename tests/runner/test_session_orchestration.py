@@ -13,10 +13,44 @@ from omnigent.spec.types import AgentSpec
 
 
 @pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
-def test_native_message_schema(spec):
+@pytest.mark.parametrize("runner_features", [None, "peer_session_messaging"])
+def test_native_message_schema(spec, runner_features, monkeypatch):
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     schemas = build_native_relay_tool_schemas(spec)
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
+
+
+@pytest.mark.parametrize("spec", [AgentSpec(spec_version=1), None])
+def test_runner_can_hide_native_message_tool(spec, monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
+    names = {s["name"] for s in build_native_relay_tool_schemas(spec)}
+    assert "sys_session_message" not in names
+    assert "sys_session_get_info" in names
+
+
+@pytest.mark.asyncio
+async def test_runner_disabled_message_never_contacts_server(monkeypatch):
+    monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
+
+    def unexpected(request):
+        pytest.fail("Disabled peer messaging must not send an HTTP request")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(unexpected), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": uuid4().hex, "message": "Work"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert result == {"error": "Messaging other sessions is disabled on this runner"}
 
 
 @pytest.mark.asyncio
@@ -242,8 +276,10 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [403, 502, "policy_denied"])
-async def test_same_host_first_task_failure_returns_created_session(status):
+@pytest.mark.parametrize("status", [403, 502, "policy_denied", "runner_disabled"])
+async def test_same_host_first_task_failure_returns_created_session(status, monkeypatch):
+    if status == "runner_disabled":
+        monkeypatch.setenv("OMNIGENT_FEATURES", "-peer_session_messaging")
     session_id = uuid4().hex
     requests = []
 
@@ -252,6 +288,7 @@ async def test_same_host_first_task_failure_returns_created_session(status):
             return httpx.Response(200, json={"sibling_sessions": True})
         requests.append(request)
         if request.url.path.endswith("/events"):
+            assert status != "runner_disabled", "Disabled messaging must not contact the server"
             if status == "policy_denied":
                 return httpx.Response(
                     202, json={"queued": False, "denied": True, "reason": "Task needs approval"}
@@ -280,7 +317,9 @@ async def test_same_host_first_task_failure_returns_created_session(status):
     if status == "policy_denied":
         assert "Task needs approval" in result["error"]
         assert result["initial_message"]["denied"] is True
-    assert len(requests) == 2
+    if status == "runner_disabled":
+        assert "disabled on this runner" in result["initial_message"]["error"]
+    assert len(requests) == (1 if status == "runner_disabled" else 2)
 
 
 @pytest.mark.asyncio
