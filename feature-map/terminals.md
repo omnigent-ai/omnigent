@@ -128,7 +128,10 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
-- **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
+- **`user-shell`, key encoding:**
+  `tests/e2e_ui/shells/test_terminal_cmd_line_editing.py::test_ctrl_slash_reaches_the_shell_as_ctrl_underscore`;
+  the same file covers Cmd+Backspace/Left/Right line editing.
+- **`agent-terminal-view`, `user-shell`, `split-panes`, hotkeys:** no e2e
   coverage; component tests `web/src/hooks/useViewModeToggleHotkey.test.tsx`,
   `web/src/hooks/useNewShellHotkey.test.tsx`,
   `web/src/hooks/useTerminalSplitHotkey.test.tsx`,
@@ -211,6 +214,9 @@ an Electron run; component tests cover the selection and confirmation paths.
   proof the terminal reattached; look for the new host's terminal content.
 - The ⌘/Ctrl+Alt chords use ⌘ on macOS and Ctrl elsewhere, and they match the
   physical key, so AltGr+T on an international layout must not open a shell.
+- A focused terminal sends Ctrl+/ to its program as `0x1F` (Codex's side-thread
+  toggle), so the Ctrl+/ shortcuts dialog does not open from a focused terminal
+  outside an IME composition.
 - Key bindings added for scrollback can change how full-screen harness terminals
   behave. After a scrollback change, drive the harness terminal itself, not only
   a plain shell.
