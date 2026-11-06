@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 
 CLIENT_SURFACE_LABEL_KEY = "omnigent.client_surface"
@@ -21,6 +22,14 @@ def resolve_client_surface(
         if inherited is not None and inherited in CLIENT_SURFACES:
             return inherited
     return classify_surface(headers.get("user-agent"))
+
+
+def harness_client_surface() -> str | None:
+    """Return the creating surface the runner recorded in this harness worker's environment.
+
+    Only harness worker processes read this; terminals inherit it but never trust it.
+    """
+    return os.environ.get(CLIENT_SURFACE_ENV_VAR)
 
 
 def classify_surface(user_agent: str | None) -> str:
