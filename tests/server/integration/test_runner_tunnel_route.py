@@ -2434,11 +2434,11 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
 
     monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
-    busy_reports: list[tuple[str, bool | None]] = []
+    busy_reports: list[tuple[str, bool | None, float | None]] = []
     monkeypatch.setattr(
         managed_host_keepalive,
         "record_pong",
-        lambda runner_id, busy, idle_s=None: busy_reports.append((runner_id, busy)),
+        lambda runner_id, busy, idle_s=None: busy_reports.append((runner_id, busy, idle_s)),
     )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
@@ -2448,7 +2448,10 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
         assert isinstance(ping, PingFrame)
         await communicator.send_input(
-            {"type": "websocket.receive", "text": encode_frame(PongFrame(ts=ping.ts, busy=True))}
+            {
+                "type": "websocket.receive",
+                "text": encode_frame(PongFrame(ts=ping.ts, busy=False, idle_s=42.0)),
+            }
         )
         session = route_app.registry.get(_RUNNER_ID)
         assert session is not None
@@ -2461,8 +2464,8 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         communicator.stop(exceptions=False)
         await asyncio.gather(communicator.future, return_exceptions=True)
 
-    # The pong's busy report reaches the managed-sandbox keepalive gate.
-    assert busy_reports == [(_RUNNER_ID, True)]
+    # The pong's busy report and idle time reach the managed-sandbox keepalive gate.
+    assert busy_reports == [(_RUNNER_ID, False, 42.0)]
     row = _tunnel_end_events(caplog)[0]
     assert row["connection_id"] == "conn-heartbeat"
     assert row["app_ping_rtt_s"] >= 0
