@@ -15,6 +15,7 @@
 // handshake, as with those sockets.
 
 import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+import { clientRoutingKey } from "@/lib/routingKey";
 import { modalHostId } from "@/lib/sessionHost";
 
 /**
@@ -30,16 +31,15 @@ import { modalHostId } from "@/lib/sessionHost";
  * concurrent-take cap ({@link DictationBusyError} / `OMNIGENT_DICTATION_MAX_STREAMS`).
  * {@link modalHostId} is per-user (the host backing most of THIS user's
  * sessions), so keying by it spreads a tenant's takes across many replicas —
- * finer-grained than per-tenant. Omitted on an unsharded server and until the
- * modal host resolves (→ no key → default route).
+ * finer-grained than per-tenant. Until the modal host resolves, or when there
+ * is none, the per-client key ({@link clientRoutingKey}) keeps takes off the
+ * default route. Omitted on an unsharded server.
  */
 function buildDictationUrl(): string {
   const path = "/v1/dictation/stream";
   if (!getOmnigentHostConfig().fetcher) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
-  return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
-  );
+  const sliceKey = modalHostId() ?? clientRoutingKey();
+  return resolveWebSocketUrl(`${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}`);
 }
 
 /** A transcript event pushed by the server over the dictation stream. */

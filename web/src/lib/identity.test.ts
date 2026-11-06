@@ -602,6 +602,75 @@ describe("authenticatedFetch", () => {
       },
     );
 
+    it.each(["/v1/sessions?limit=50", "/health?session_ids=a", "/v1/sessions/projects"])(
+      "keys host-less %s by the per-client key when there is no modal host",
+      async (url) => {
+        // Without a key the request would route by workspace id, putting every
+        // host-less read from the workspace on one replica.
+        vi.doUnmock("./sessionHost");
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
+        }));
+        const { authenticatedFetch, setSessionHostResolver } = await import("./identity");
+        const resolve = vi.fn(async () => {});
+        setSessionHostResolver(resolve);
+        fetchMock.mockResolvedValue(mockJsonResponse({}));
+
+        await authenticatedFetch(url);
+        await authenticatedFetch(url);
+
+        const keys = fetchMock.mock.calls.map(([, init]) =>
+          new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+        );
+        expect(keys[0]).toMatch(/^[0-9a-f]{32}$/);
+        expect(keys[1]).toBe(keys[0]);
+        expect(resolve).not.toHaveBeenCalled();
+      },
+    );
+
+    it("keys /v1/sessions/projects by the modal host, not as a session", async () => {
+      vi.doUnmock("./sessionHost");
+      const { resolveModalHost, setSessionHost } = await import("./sessionHost");
+      setSessionHost("session-a", "host_modal");
+      resolveModalHost();
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch } = await import("./identity");
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ projects: [] }));
+
+      await authenticatedFetch("/v1/sessions/projects");
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_modal");
+    });
+
+    it("sends a session sub-path with an unknown host unkeyed", async () => {
+      // Unkeyed is deliberate here: a session whose host is unknown may run on
+      // a host whose tunnel dialed in without a key, which the default route
+      // reaches.
+      vi.doUnmock("./sessionHost");
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      const { authenticatedFetch } = await import("./identity");
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      await authenticatedFetch("/v1/sessions/sess_unknown/items");
+
+      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBeNull();
+    });
+
     it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
       // The import reads the CHOSEN host's transcripts over that host's tunnel,
       // so it must route to the replica keyed by the body host_id — never the
