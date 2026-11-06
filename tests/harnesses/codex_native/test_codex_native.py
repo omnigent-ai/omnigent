@@ -38,7 +38,6 @@ from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
-_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 
 
 @pytest.fixture(autouse=True)
@@ -1186,7 +1185,7 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
 @pytest.mark.parametrize(
     ("permission_args", "expected_permissions"),
     [
-        ((), {"approvalsReviewer": "auto_review"}),
+        ((), {}),
         (
             ("-a", "on-failure", "-s=read-only"),
             {"approvalPolicy": "on-failure", "sandbox": "read-only"},
@@ -1807,7 +1806,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
+            ["--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
@@ -1826,7 +1825,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "ws://127.0.0.1:9876",
-            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
+            ["--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume an existing thread over a loopback ws endpoint: the
         # host-spawned runner path. The app-server listens on ws:// there
@@ -1893,7 +1892,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
-                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -2005,7 +2003,7 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
     approval/sandbox flags the approval-mode presets pass through.
 
-    The web "Full access" / "Read only" presets are sent as
+    The web "Full Access" / "Read Only" presets are sent as
     ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
     bypass off those must reach the TUI verbatim and the dangerous bypass
     flag must never appear — a regression here would either drop a user's
@@ -12817,9 +12815,9 @@ def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() 
     # The raw bwrap output and the exit code are preserved verbatim...
     assert "No permissions to create new namespace" in tool_call.output
     assert "[exit code: 1]" in tool_call.output
-    # ...with actionable recovery guidance appended (the "Full access" preset
+    # ...with actionable recovery guidance appended (the "Full Access" preset
     # and the config sandbox_mode workaround).
-    assert "Full access" in tool_call.output
+    assert "Full Access" in tool_call.output
     assert "danger-full-access" in tool_call.output
 
 
@@ -12830,7 +12828,7 @@ def test_command_execution_leaves_normal_output_untouched() -> None:
     tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
     assert tool_call is not None
     assert tool_call.output == "/repo\n"
-    assert "Full access" not in tool_call.output
+    assert "Full Access" not in tool_call.output
     assert "danger-full-access" not in tool_call.output
 
 

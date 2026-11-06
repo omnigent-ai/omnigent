@@ -204,7 +204,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
   harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
   expand it to check that only supported settings appear, model changes
-  clear unsupported effort choices, and saved selections survive reopening. Repeat
+  clear unsupported effort choices, and saved selections survive reopening. A new
+  automation starts Claude on Auto and Codex on Approve for me, because nobody
+  approves an unattended run; choosing Default saves no override. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
 - With a provider catalog, create an automation from New automation or a template,
   choose the sandbox and a repository, save, and reopen Edit. Change the repository,

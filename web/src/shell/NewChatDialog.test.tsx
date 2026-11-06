@@ -6818,7 +6818,14 @@ describe("NewChatLandingScreen", () => {
       within(menu)
         .getAllByRole("menuitemradio")
         .map((item) => item.textContent),
-    ).toEqual(["Default", "Full access", "Read only", "Bypass approvals & sandbox"]);
+    ).toEqual([
+      "Default",
+      "Ask for approval",
+      "Approve for me",
+      "Full Access",
+      "Read Only",
+      "Bypass approvals & sandbox",
+    ]);
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
@@ -7066,8 +7073,10 @@ describe("NewChatLandingScreen", () => {
 
   it.each([
     ["default", "Default"],
-    ["full-access", "Full access"],
-    ["read-only", "Read only"],
+    ["ask-for-approval", "Ask for approval"],
+    ["approve-for-me", "Approve for me"],
+    ["full-access", "Full Access"],
+    ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],
   ])("remembers Codex %s across harness switches and fresh visits", (mode, label) => {
     renderLanding();
@@ -7160,11 +7169,35 @@ describe("NewChatLandingScreen", () => {
   it.each([
     ["default", "Default", undefined],
     [
+      "ask-for-approval",
+      "Ask for approval",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="user"',
+      ],
+    ],
+    [
+      "approve-for-me",
+      "Approve for me",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
+      ],
+    ],
+    [
       "full-access",
-      "Full access",
+      "Full Access",
       ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     ],
-    ["read-only", "Read only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
+    ["read-only", "Read Only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
   ] as const)("clears bypass when the hand dropdown selects %s", async (mode, label, args) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
