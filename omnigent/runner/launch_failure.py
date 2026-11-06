@@ -113,6 +113,16 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- dbcert client certificate missing ----------------------------------------
+# dbcert launchers require certificate files, team membership and sufficient validity.
+_DBCERT_MARKERS = (
+    "noteamsfoundinyourcertificate",
+    "missingrequiredcredentialfiles",
+    "certificateexpirestoosoon",
+)
+# Each exception message starts its own line (lowercased output).
+_EXCEPTION_MESSAGE_START = re.compile(r"(?m)^(?=[\s│┃]*\w*(?:error|exception):)")
+
 # --- Claude Code install failed or left broken -------------------------------
 # A launcher that installs Claude Code before starting it reports npm's
 # ENOENT text, which also reads like a missing binary.
@@ -152,9 +162,8 @@ _BACKGROUND_SESSION_REFUSAL = re.compile(
 )
 
 
-# Ordered most-specific first: the root case also reads like a permission /
-# auth problem, and a broken install like a missing binary, so they must win
-# over the broader rules below them.
+# Specific root, certificate and install diagnoses precede the broader
+# auth and missing-binary rules.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -166,6 +175,18 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "--dangerously-skip-permissions when running as the root user."
             ),
             remediation="Run the host as a non-root user (uid != 0).",
+        ),
+    ),
+    _TerminalMatcher(
+        "dbcert_missing",
+        lambda s: _is_dbcert_certificate_failure(s.output),
+        FailureDiagnosis(
+            title="Client certificate missing or expired",
+            cause=(
+                "The agent's launcher exited before the agent started because this "
+                "machine has no usable dbcert client certificate."
+            ),
+            remediation="Run `dbcert` on this machine, then retry.",
         ),
     ),
     _TerminalMatcher(
@@ -267,6 +288,15 @@ def _claude_install_is_broken(output: str) -> bool:
     return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
         _EXEC_FORMAT_ERROR.search(compact)
     )
+
+
+def _is_dbcert_certificate_failure(output: str) -> bool:
+    # The dbcert reference and the marker must come from the same exception message.
+    for message in _EXCEPTION_MESSAGE_START.split(output):
+        compact = _PANE_WRAP.sub("", message)
+        if "dbcert" in compact and any(m in compact for m in _DBCERT_MARKERS):
+            return True
+    return False
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
