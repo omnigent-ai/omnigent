@@ -612,6 +612,8 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
+  stillSending?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -1676,15 +1678,11 @@ function snapshotModelPatch(
 async function adoptSnapshotModel(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
   let session: Session;
   try {
-    session = await getSessionSlim(conversationId, { signal: controller.signal });
+    session = await withReadTimeout((signal) => getSessionSlim(conversationId, { signal }));
   } catch {
     return;
-  } finally {
-    clearTimeout(timeout);
   }
   // A conversation reopened under the same id during the read is a different entry.
   if (entry.disposed) return;
@@ -1933,7 +1931,12 @@ const FLASH_DURATION_MS = 1500;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
-export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
+// A session snapshot or items read still unanswered after this counts as failed,
+// so its caller retries instead of waiting on a request the server never answers.
+export const SESSION_READ_TIMEOUT_MS = 15_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
+// A send whose POST is still open after this says so on its bubble.
+export const SEND_STILL_SENDING_AFTER_MS = 10_000;
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -1948,6 +1951,9 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 // of trusting them forever, so a truly deleted/invalid conversation still
 // gives up rather than polling it forever.
 const MAX_TRANSIENT_404_RETRIES = 10;
+// An auth layer answering the stream with its login page means the sign-in
+// expired, which no background retry can renew; give up after this many.
+const MAX_NON_SSE_STREAM_ANSWERS = 3;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -2925,17 +2931,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(
-        sessionId,
-        {
-          type: "message",
-          data: {
-            role: "user",
-            content: serverContent,
-            stable_id: stableId,
+      const postResult = await withStillSendingMark(sessionId, tempId, () =>
+        postEvent(
+          sessionId,
+          {
+            type: "message",
+            data: {
+              role: "user",
+              content: serverContent,
+              stable_id: stableId,
+            },
           },
-        },
-        { holdWhenHostOffline: true },
+          { holdWhenHostOffline: true },
+        ),
       );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
@@ -3213,17 +3221,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await postEvent(sessionId, {
-        type: "slash_command",
-        data: {
-          kind: "skill",
-          name,
-          arguments: args,
-          ...(setterForState(sessionId)?.startupPending
-            ? { stable_id: randomUUID().replace(/-/g, "") }
-            : {}),
-        },
-      });
+      const postResult = await withStillSendingMark(sessionId, tempId, () =>
+        postEvent(sessionId, {
+          type: "slash_command",
+          data: {
+            kind: "skill",
+            name,
+            arguments: args,
+            ...(setterForState(sessionId)?.startupPending
+              ? { stable_id: randomUUID().replace(/-/g, "") }
+              : {}),
+          },
+        }),
+      );
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -3998,6 +4008,27 @@ export function sendableQueuedHead(
   const head = queuedMessages.find((m) => m.conversationId === conversationId);
   if (head === undefined || head.requiresRetry) return null;
   return waitsForHost(queuedMessages, head.conversationId) ? null : head;
+}
+
+/** Await a send's POST, marking its pending bubble once the POST is slow to answer. */
+async function withStillSendingMark<T>(
+  sessionId: string,
+  tempId: string,
+  post: () => Promise<T>,
+): Promise<T> {
+  const timer = setTimeout(() => {
+    setterFor(sessionId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId && p.posted !== true ? { ...p, stillSending: true } : p,
+      ),
+    }));
+  }, SEND_STILL_SENDING_AFTER_MS);
+  try {
+    // Never cancelled: the server may already have accepted the send.
+    return await post();
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -5018,6 +5049,25 @@ async function refreshFailedInputs(id: string): Promise<void> {
 /** Retries of a snapshot load that failed in a way a retry can fix. */
 const SNAPSHOT_LOAD_RETRIES = 2;
 
+/** Run a session read, rejecting with a retryable timeout if the server never answers. */
+async function withReadTimeout<T>(read: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new DOMException("session read timed out", "TimeoutError");
+      controller.abort(error);
+      reject(error);
+    }, SESSION_READ_TIMEOUT_MS);
+  });
+  try {
+    // The race also bounds a read that is stuck before it reaches the signal.
+    return await Promise.race([read(controller.signal), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Run a conversation's snapshot load, repeating a failure a retry can fix (a
  * 5xx, or a dropped connection while the server restarts) while the
@@ -5175,14 +5225,27 @@ async function bindStream(
     // Each request retries on its own, so a failed one doesn't repeat the other.
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, () =>
-        client.fetchQuery({
-          queryKey: ["session", id],
-          queryFn: () => getSessionSlim(id, { refreshState: true }),
-          staleTime: 0,
-          retry: false,
+        withReadTimeout((signal) => {
+          // A timed-out attempt may have joined another caller's request; drop
+          // that request so the retry reads afresh instead of joining it again.
+          signal.addEventListener(
+            "abort",
+            () => void client.cancelQueries({ queryKey: ["session", id], exact: true }),
+            { once: true },
+          );
+          return client.fetchQuery({
+            queryKey: ["session", id],
+            queryFn: () => getSessionSlim(id, { refreshState: true, signal }),
+            staleTime: 0,
+            retry: false,
+          });
         }),
       ),
-      withSnapshotRetries(id, () => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS })),
+      withSnapshotRetries(id, () =>
+        withReadTimeout((signal) =>
+          fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+        ),
+      ),
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
@@ -6075,7 +6138,9 @@ async function rehydrateWindowOnReconnect(
   const generation = get().historyGeneration;
   let fresh: SessionItemsPage;
   try {
-    fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
+    fresh = await withReadTimeout((signal) =>
+      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+    );
   } catch {
     return "failed";
   }
@@ -6204,11 +6269,11 @@ async function reconcileOnReconnect(
       // Read fresh rather than join the shared ["session", id] request: one
       // started before an answered card's verdict POST returned can still list
       // that prompt as pending, and the reconcile would reopen the card.
-      getSessionSlim(id).then((fresh) => {
+      withReadTimeout((signal) => getSessionSlim(id, { signal })).then((fresh) => {
         client.setQueryData(["session", id], fresh);
         return fresh;
       }),
-      fetchSessionItemsPage(id),
+      withReadTimeout((signal) => fetchSessionItemsPage(id, { signal })),
     ]);
   } catch {
     return "failed";
@@ -6243,7 +6308,9 @@ async function reconcileOnReconnect(
     if (!cursor) break;
     let older: SessionItemsPage;
     try {
-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
+      older = await withReadTimeout((signal) =>
+        fetchSessionItemsPage(id, { olderThan: cursor, signal }),
+      );
     } catch (error) {
       // A cursor whose item was deleted can never be paged past. Stop the
       // backfill with the gap still uncovered so the full rehydrate below
@@ -6522,6 +6589,8 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
+  // Login-page answers since the last successful open.
+  let nonSseAnswers = 0;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
@@ -6637,10 +6706,20 @@ export async function startStreamPump(
         // text/html login page. Pumping that body would end instantly
         // without `[DONE]` and reconnect with no backoff — a hot loop that
         // leaves the transcript silently frozen. Treat a non-SSE content
-        // type as a failed open so it backs off like any other bad answer.
+        // type as a failed open so it backs off, and give up like a 401 once
+        // it repeats so the chat says the connection is gone.
         const contentType = streamRes.headers.get("content-type") ?? "";
         if (!contentType.toLowerCase().includes("text/event-stream")) {
           void streamRes.body.cancel().catch(() => {});
+          nonSseAnswers += 1;
+          if (nonSseAnswers >= MAX_NON_SSE_STREAM_ANSWERS) {
+            console.warn(
+              `Session ${id}: stream open returned '${contentType}' ${nonSseAnswers} times, giving up`,
+            );
+            failUnavailableStream(set, "stream unavailable (sign-in required)");
+            set({ status: "idle" });
+            break;
+          }
           console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
           failedOpens += 1;
           continue;
@@ -6653,6 +6732,7 @@ export async function startStreamPump(
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
+        nonSseAnswers = 0;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
         maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
@@ -9691,13 +9771,14 @@ function finalizeActive(
 
 const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
 
-/** Fail the active turn and surface one fallback when no bubble can show it. */
+/** Fail a live turn and surface one fallback when no bubble can show it. */
 function failUnavailableStream(set: Setter, error: string): void {
   set((s) => {
+    // A turn that already settled keeps its outcome; the fallback reports the lost connection.
     const activeResponse =
-      s.activeResponse === null
-        ? null
-        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+      s.activeResponse?.state === "streaming"
+        ? { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() }
+        : null;
     const blocks = s.blocks.filter(
       (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
     );
@@ -9713,10 +9794,10 @@ function failUnavailableStream(set: Setter, error: string): void {
       ...(activeResponse !== null ? { activeResponse } : {}),
       blocks: [
         ...blocks,
-        makeClientErrorBlock(
-          "The live connection to the assistant is unavailable. Reload the page to reconnect.",
-          STREAM_UNAVAILABLE_CODE,
-        ),
+        {
+          ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
+          title: "The live connection to the assistant is unavailable",
+        },
       ],
     };
   });
