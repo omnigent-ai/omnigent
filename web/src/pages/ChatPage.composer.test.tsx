@@ -3894,13 +3894,7 @@ describe("Composer background tasks", () => {
   it.each([false, true])(
     "keeps a running monitor reachable after foreground work ends (mobile=%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 767.98px)");
-      const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
-        ...mediaQuery,
-        media: query,
-        matches: mobile && query === "(max-width: 767.98px)",
-      }));
-      onTestFinished(() => matchMedia.mockRestore());
+      onTestFinished(stubMatchMedia({ width: mobile ? 390 : 1280 }));
       useChatStore.setState({
         backgroundTaskCount: 1,
         backgroundTasks: [
