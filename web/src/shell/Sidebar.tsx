@@ -2063,11 +2063,13 @@ function ConversationList({
   const serverInfo = useServerInfo();
   // Host metadata is shared by every row tooltip. Resolve it once at the list
   // owner so ordinary rows do not each create their own polling observer.
-  const { data: hosts = [] } = useHosts({ includeSandbox: true });
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts({ includeSandbox: true });
   const hostsById = useMemo(
     () => new Map(hosts.map((host) => [host.host_id, host] as const)),
     [hosts],
   );
+  const defaultProjectHostId =
+    hosts.find((host) => host.status === "online" && !host.sandbox_provider)?.host_id ?? null;
   // Grouping / ordering / show options from the filter menu, seeded from the
   // persisted per-device preference. With the release flag off the sidebar
   // keeps its default layout and ignores any stored choice.
@@ -3244,6 +3246,8 @@ function ConversationList({
                         !selectionMode ? (
                           <>
                             <ProjectHeaderActions
+                              hostId={defaultProjectHostId}
+                              hostsLoading={hostsLoading}
                               onOrderChange={(manual) => {
                                 const ranks = new Map(
                                   projectOrder.data?.ordered_project_ids?.map((id, index) => [
@@ -3966,6 +3970,8 @@ function SessionFilterMenu({
 }
 
 function ProjectHeaderActions({
+  hostId,
+  hostsLoading,
   onOrderChange,
   manualOrder,
   orderDisabled,
@@ -3978,6 +3984,8 @@ function ProjectHeaderActions({
   onProjectCreated,
   onEnterSelectionMode,
 }: {
+  hostId: string | null;
+  hostsLoading: boolean;
   onOrderChange: (manual: boolean) => void;
   manualOrder: boolean;
   orderDisabled: boolean;
@@ -4001,7 +4009,7 @@ function ProjectHeaderActions({
 
   return (
     <div className="flex items-center gap-0.5">
-      <NewProjectButton onCreated={onProjectCreated} />
+      <NewProjectButton onCreated={onProjectCreated} hostId={hostId} hostsLoading={hostsLoading} />
       {showMenu && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
