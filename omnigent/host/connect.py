@@ -198,6 +198,7 @@ from omnigent.process_logging import (
 )
 from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 from omnigent.runner.identity import (
+    RUNNER_AUTH_REJECTED_CAUSE,
     RUNNER_AUTH_REJECTED_EXIT_CODE,
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -2769,8 +2770,8 @@ class HostProcess:
             )
             if auth_rejected:
                 error = (
-                    "The server rejected this host's credentials, so the runner could not "
-                    f"connect. Sign in again with `{cli_invocation()} login "
+                    f"{RUNNER_AUTH_REJECTED_CAUSE} Sign in again with "
+                    f"`{cli_invocation()} login "
                     f"{self._login_hint_url()}` "
                     f"on this host, then retry. Details: {error}"
                 )
