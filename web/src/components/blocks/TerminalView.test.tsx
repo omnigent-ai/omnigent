@@ -77,6 +77,7 @@ const terminalSessionMock = vi.hoisted(() => ({
     onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void;
     onFileLink?: (uri: string) => boolean;
     onState: (state: ConnectionState) => void;
+    onActivity?: () => void;
     dispose: ReturnType<typeof vi.fn>;
     setTheme: ReturnType<typeof vi.fn>;
     setClipboardEnabled: ReturnType<typeof vi.fn>;
@@ -99,7 +100,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
       url: string,
       onState: (state: ConnectionState) => void,
       _isDark?: boolean,
-      _onActivity?: () => void,
+      onActivity?: () => void,
       _onInput?: () => void,
       clipboardEnabled = true,
       onClipboardRequest?: (text: string, copyEvent?: ClipboardEvent) => void,
@@ -115,6 +116,7 @@ vi.mock("./TerminalSession", async (importOriginal) => ({
         onClipboardRequest,
         onFileLink,
         onState,
+        onActivity,
         dispose: this.dispose,
         setTheme: this.setTheme,
         setClipboardEnabled: this.setClipboardEnabled,
@@ -305,6 +307,30 @@ describe("control-mode terminal", () => {
 
     expect(terminalSessionMock.instances).toHaveLength(1);
     expect(terminalSessionMock.instances[0].dispose).not.toHaveBeenCalled();
+
+    // A deliberate detach after the launch is not a launch refusal.
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 4405, reason: "detached" }),
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("does not re-dial a launch-time attach that already reached its shell", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-used1", "attach");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-used1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    act(() => terminalSessionMock.instances[0].onState({ kind: "connected" }));
+    // Output arrived: the attach reached the live shell.
+    act(() => terminalSessionMock.instances[0].onActivity?.());
+    act(() => setTerminalLaunching("terminal_zsh_u-used1", null));
+
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 4500, reason: "bridge" }),
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
   });
 
   it("holds a new shell's attach until its create returns when the runner may be waking", async () => {

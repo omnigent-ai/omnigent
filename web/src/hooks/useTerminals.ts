@@ -334,9 +334,9 @@ export interface TerminalLaunchCallbacks {
  * id and opens its tab at once. With the runner online the attach WebSocket
  * (``await_launch``) runs alongside the create; otherwise (runner asleep or
  * unknown, where the create may wake it) the tab shows "Starting shell…"
- * and attaches once the create returns. Only one launch runs at a time
- * across all entry points: ``isPending`` covers any launch in flight, and
- * ``launch`` ignores a request while one is.
+ * and attaches once the create returns. Only one launch per conversation
+ * runs at a time across its entry points: ``isPending`` covers any launch in
+ * flight there, and ``launch`` ignores a request while one is.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name, plus ``launch``.
@@ -368,11 +368,13 @@ export function useCreateTerminal(conversationId: string) {
     },
   });
   // Every entry point (rail menu, shortcut, split controls) has its own hook
-  // instance; this shared flag keeps their launches from overlapping, so a
-  // failed create's rollback never races another launch.
-  const launchInFlight = useSyncExternalStore(subscribeTerminalLaunches, anyTerminalLaunching);
+  // instance; this per-conversation flag keeps their launches from
+  // overlapping, so a failed create's rollback never races another launch.
+  const launchInFlight = useSyncExternalStore(subscribeTerminalLaunches, () =>
+    anyTerminalLaunching(conversationId),
+  );
   const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
-    if (anyTerminalLaunching()) return;
+    if (anyTerminalLaunching(conversationId)) return;
     const sessionKey = newTerminalSessionKey();
     const predicted: TerminalInfo = {
       id: terminalResourceId(terminal, sessionKey),
@@ -380,7 +382,7 @@ export function useCreateTerminal(conversationId: string) {
       session: sessionKey,
       running: true,
     };
-    setTerminalLaunching(predicted.id, runnerOnline === true ? "attach" : "wait");
+    setTerminalLaunching(predicted.id, runnerOnline === true ? "attach" : "wait", conversationId);
     addToCache(predicted);
     callbacks.onOpen?.(predicted);
     mutation
