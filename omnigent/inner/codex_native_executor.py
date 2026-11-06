@@ -53,6 +53,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
+    record_codex_interrupt,
     update_active_turn_id,
 )
 from omnigent.harnesses.codex_native.shell_input import (
@@ -990,7 +991,18 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when an interrupt or a startup cancel was sent.
         """
         del session_key
-        state = read_bridge_state(self._bridge_dir)
+        observed = read_bridge_state(self._bridge_dir)
+        if observed is None or not _session_is_active(
+            observed.session_id, self._request_session_id
+        ):
+            return False
+        try:
+            state = record_codex_interrupt(self._bridge_dir, expected=observed)
+        except OSError:
+            # Stop must still reach a running native turn when its local fence
+            # cannot be saved (for example, a full disk).
+            _logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            state = observed
         if state is None:
             return False
         # Flip the local map first: the cancelled record is what the web
@@ -1016,7 +1028,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except Exception:  # Local cancellation already took effect.
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
@@ -1036,7 +1048,11 @@ class CodexNativeExecutor(Executor):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.
-                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                    clear_active_turn_id_if_matches(
+                        self._bridge_dir,
+                        state.active_turn_id,
+                        expected_owner=state,
+                    )
                     _logger.info(
                         "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
                         state.active_turn_id,
