@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import threading
@@ -35,6 +36,92 @@ _UCODE_AGENT_NAMES: tuple[str, ...] = ("claude", "codex", "pi")
 # defeat a mutable branch's stale cache.
 _UCODE_GIT_REF = "304e4a29c5ca73b3bfaaf1911e38d0080833fda4"
 _UCODE_UVX_SOURCE = f"git+https://github.com/databricks/ucode@{_UCODE_GIT_REF}"
+
+
+def _refresh_ucode_auth_argv(argv: list[str]) -> list[str]:
+    """Replace only a missing generated token helper from an evicted uv archive."""
+    if len(argv) < 2 or argv[1] != "auth-token":
+        return argv
+    executable = Path(argv[0])
+    if (
+        not executable.is_absolute()
+        or executable.name not in {"ug", "ucode"}
+        or executable.parent.name != "bin"
+        or executable.parent.parent.parent.name != "archive-v0"
+        or executable.exists()
+    ):
+        return argv
+    index = 2
+    while index < len(argv):
+        if argv[index] in {"--host", "--profile"} and index + 1 < len(argv):
+            index += 2
+        elif argv[index] in {"--use-pat", "--browser-login"}:
+            index += 1
+        else:
+            return argv
+    for directory in os.get_exec_path():
+        if not Path(directory).is_absolute():
+            continue
+        candidate = shutil.which(executable.name, path=directory)
+        if candidate is None or "archive-v0" in Path(candidate).resolve().parts:
+            continue
+        if executable.name == "ug":
+            # ugrep also installs an unrelated ug executable.
+            try:
+                with open(candidate, "rb") as launcher:
+                    if b"from ucode." not in launcher.read(4096):
+                        continue
+            except OSError:
+                continue
+        return [candidate, *argv[1:]]
+    try:
+        prefix = find_ucode_command()
+    except click.ClickException:
+        return argv
+    if not Path(prefix[0]).is_absolute() or "archive-v0" in Path(prefix[0]).resolve().parts:
+        return argv
+    return [*prefix, *argv[1:]]
+
+
+def refresh_ucode_auth_command(command: str) -> str:
+    """Recover a generated token command without interpreting arbitrary shell syntax.
+
+    :param command: Shell command from ucode's reusable agent configuration.
+    :returns: Rebound literal command, or the original when recovery is unavailable.
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    # The generated literal form round-trips even with quoted profile punctuation.
+    if shlex.join(argv) != command:
+        return command
+    repaired = _refresh_ucode_auth_argv(argv)
+    return shlex.join(repaired) if repaired != argv else command
+
+
+def refresh_ucode_auth_config(auth: dict[str, object]) -> dict[str, object]:
+    """Recover structured auth while retaining refresh cadence and timeout.
+
+    :param auth: Direct argv or shell auth configuration supplied by ucode.
+    :returns: Repaired copy, or the original if it is not a recoverable helper.
+    """
+    command = auth.get("command")
+    args = auth.get("args")
+    if not (
+        isinstance(command, str)
+        and isinstance(args, list)
+        and all(isinstance(arg, str) for arg in args)
+    ):
+        return auth
+    if command in {"sh", "/bin/sh"} and len(args) == 2 and args[0] == "-c":
+        repaired = refresh_ucode_auth_command(args[1])
+        return {**auth, "args": ["-c", repaired]} if repaired != args[1] else auth
+    argv = [command, *args]
+    repaired_argv = _refresh_ucode_auth_argv(argv)
+    if repaired_argv == argv:
+        return auth
+    return {**auth, "command": repaired_argv[0], "args": repaired_argv[1:]}
 
 
 def model_gateway_workspace_urls() -> list[str]:

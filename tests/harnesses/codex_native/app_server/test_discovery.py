@@ -348,6 +348,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     ambient = NativeCodexLaunch(
         config_overrides=['model_provider="openai"'], model=None, profile=None
     )

@@ -443,12 +443,17 @@ def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str
     ],
 )
 @pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
-def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
+@pytest.mark.parametrize(
+    "trailer", ["", "\n(See https://github.com/pex-tool/pex/issues/1027 for known breaks.)"]
+)
+def test_codex_provider_auth_diagnosis_explains_exhausted_storage(
+    failure: str, hint: str, trailer: str
+) -> None:
     message = (
         "provider auth command `isaac` exited with status exit status: 1: "
         "Traceback (most recent call last):\n"
         '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
-        f"    tempfile.mkdtemp()\n{failure}{hint}"
+        f"    tempfile.mkdtemp()\n{failure}{trailer}{hint}"
     )
 
     diagnosis = diagnose_codex_provider_auth_failure(message)
