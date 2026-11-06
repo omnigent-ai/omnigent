@@ -186,6 +186,33 @@ def test_pending_payload_and_options_use_item_encoding_hooks(db_uri):
         assert "chosen-model" not in encoded
     restarted = EncodedStore(db_uri)
     assert restarted.list_pending_inputs(session.id) == [saved]
+    runner_wait = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=uuid4().hex, deadline=1000.0
+    )
+    assert runner_wait is not None
+    saved = restarted.get_item(session.id, saved.id)
+    assert saved.data.startup_options.runner_wait == runner_wait
+    assert saved.data.startup_options.model_override == "chosen-model"
+    with store._conv_session("test_encoded_runner_wait") as db:
+        encoded = db.scalar(select(SqlConversationItem.data))
+        assert runner_wait.runner_id not in encoded
+        assert "chosen-model" not in encoded
+    assert restarted.transition_pending_input(
+        session.id,
+        saved.id,
+        expected="in_progress",
+        status="failed",
+        expected_runner_wait=runner_wait,
+    )
+    assert restarted.transition_pending_input(
+        session.id, saved.id, expected="failed", status="in_progress"
+    )
+    saved = restarted.get_item(session.id, saved.id)
+    assert saved.data.startup_options.runner_wait is None
+    assert saved.data.startup_options.model_override == "chosen-model"
+    with store._conv_session("test_encoded_retry") as db:
+        encoded = db.scalar(select(SqlConversationItem.data))
+        assert "chosen-model" not in encoded
     assert restarted.transition_pending_input(
         session.id, saved.id, expected="in_progress", status="incomplete"
     )
@@ -221,3 +248,225 @@ def test_pending_input_pages_continue_in_submission_order(db_uri):
     assert [item.id for item in store.list_pending_inputs(session.id)] == [
         item.id for item in saved
     ]
+
+
+def test_runner_claim_is_immutable_across_restart_and_competing_workers(db_uri):
+    first, second = [SqlAlchemyConversationStore(db_uri) for _ in range(2)]
+    session = first.create_conversation()
+    pending = _input("one retained input")
+    pending.data.startup_options = StartupInputOptions(model_override="chosen", tools=[])
+    [saved] = first.append(session.id, [pending])
+    requests = [(first, uuid4().hex, 1000.0), (second, uuid4().hex, 2000.0)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(
+            pool.map(
+                lambda request: request[0].claim_pending_input_runner(
+                    session.id, saved.id, runner_id=request[1], deadline=request[2]
+                ),
+                requests,
+            )
+        )
+    assert claims[0] is not None and claims[0] == claims[1]
+    assert (claims[0].runner_id, claims[0].deadline) in {(r[1], r[2]) for r in requests}
+    restarted = SqlAlchemyConversationStore(db_uri)
+    assert (
+        restarted.claim_pending_input_runner(
+            session.id, saved.id, runner_id=uuid4().hex, deadline=9999.0
+        )
+        == claims[0]
+    )
+    [current] = restarted.list_pending_inputs(session.id)
+    assert current.status == "in_progress"
+    assert current.data.content == saved.data.content
+    assert current.data.startup_options.model_override == "chosen"
+    assert current.data.startup_options.tools == []
+    assert current.data.startup_options.runner_wait == claims[0]
+    retained = claims[0]
+    assert not restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=uuid4().hex, deadline=retained.deadline, connected=True
+    ).connected
+    assert not restarted.claim_pending_input_runner(
+        session.id,
+        saved.id,
+        runner_id=retained.runner_id,
+        deadline=retained.deadline + 100,
+        connected=True,
+    ).connected
+    connected = restarted.claim_pending_input_runner(
+        session.id,
+        saved.id,
+        runner_id=retained.runner_id,
+        deadline=retained.deadline,
+        connected=True,
+    )
+    assert connected.connected and connected.deadline == retained.deadline
+    assert not restarted.transition_pending_input(
+        session.id,
+        saved.id,
+        expected="in_progress",
+        status="incomplete",
+        expected_runner_wait=retained,
+    )
+    assert restarted.transition_pending_input(
+        session.id,
+        saved.id,
+        expected="in_progress",
+        status="failed",
+        expected_runner_wait=connected,
+    )
+    assert restarted.transition_pending_input(
+        session.id, saved.id, expected="failed", status="in_progress"
+    )
+    assert restarted.get_item(session.id, saved.id).data.startup_options.runner_wait is None
+    retried = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=uuid4().hex, deadline=9999.0
+    )
+    assert retried.deadline == 9999.0 and retried.runner_id != retained.runner_id
+    with workspace_scope(17):
+        assert (
+            restarted.claim_pending_input_runner(
+                session.id, saved.id, runner_id=uuid4().hex, deadline=9999.0
+            )
+            is None
+        )
+
+
+def test_host_age_only_narrows_the_existing_runner_claim(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    [saved] = store.append(session.id, [_input()])
+    runner_id = uuid4().hex
+    original = store.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=1000.0
+    )
+    restarted = SqlAlchemyConversationStore(db_uri)
+    narrowed = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=800.0, tighten_deadline=True
+    )
+    assert narrowed.runner_id == original.runner_id and narrowed.deadline == 800.0
+    for candidate_runner, deadline in [(runner_id, 1200.0), (uuid4().hex, 700.0)]:
+        assert (
+            restarted.claim_pending_input_runner(
+                session.id,
+                saved.id,
+                runner_id=candidate_runner,
+                deadline=deadline,
+                tighten_deadline=True,
+            )
+            == narrowed
+        )
+    connected = restarted.claim_pending_input_runner(
+        session.id, saved.id, runner_id=runner_id, deadline=800.0, connected=True
+    )
+    assert (
+        restarted.claim_pending_input_runner(
+            session.id, saved.id, runner_id=runner_id, deadline=700.0, tighten_deadline=True
+        )
+        == connected
+    )
+
+
+@pytest.mark.parametrize("race", ["cancelled", "submitted", "discarded", "receipt", "claimed"])
+def test_runner_claim_rechecks_queued_input_after_encoding(db_uri, monkeypatch, race):
+    store, concurrent = [SqlAlchemyConversationStore(db_uri) for _ in range(2)]
+    session = store.create_conversation()
+    [saved] = store.append(session.id, [_input()])
+    winner = None
+    encode = store._encode_item_data_batch
+
+    def encode_with_race(payloads):
+        nonlocal winner
+        monkeypatch.setattr(store, "_encode_item_data_batch", encode)
+        if race == "cancelled":
+            concurrent.set_labels(session.id, {"omnigent.startup": "cancelled"})
+        elif race in {"submitted", "discarded"}:
+            assert concurrent.transition_pending_input(
+                session.id,
+                saved.id,
+                expected="in_progress",
+                status="incomplete" if race == "submitted" else None,
+            )
+        elif race == "receipt":
+            concurrent.append(
+                session.id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="native-turn",
+                        stable_id=uuid4().hex,
+                        replaces_pending_id=saved.id,
+                        data=saved.data,
+                    )
+                ],
+            )
+        else:
+            winner = concurrent.claim_pending_input_runner(
+                session.id, saved.id, runner_id=uuid4().hex, deadline=1000.0
+            )
+        return encode(payloads)
+
+    monkeypatch.setattr(store, "_encode_item_data_batch", encode_with_race)
+    result = store.claim_pending_input_runner(
+        session.id, saved.id, runner_id=uuid4().hex, deadline=2000.0
+    )
+    assert result == winner
+    current = store.get_item(session.id, saved.id)
+    if current is not None:
+        assert (
+            current.data.startup_options.runner_wait if current.data.startup_options else None
+        ) == winner
+    if race == "claimed":
+        assert winner is not None and winner.deadline == 1000.0
+
+
+def test_unsubmitted_claim_rollback_discards_input_when_stop_won(db_uri):
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    [saved] = store.append(session.id, [_input()])
+    retained = store.claim_pending_input_runner(
+        session.id, saved.id, runner_id=uuid4().hex, deadline=1000.0
+    )
+    assert store.transition_pending_input(
+        session.id,
+        saved.id,
+        expected="in_progress",
+        status="incomplete",
+        expected_runner_wait=retained,
+    )
+    store.set_labels(session.id, {"omnigent.startup": "cancelled"})
+    assert store.transition_pending_input(
+        session.id,
+        saved.id,
+        expected="incomplete",
+        status="in_progress",
+        expected_runner_wait=retained,
+        rollback=True,
+    )
+    assert store.list_pending_inputs(session.id) == []
+
+
+@pytest.mark.parametrize(
+    "successor", [None, "idle", "running", "waiting", "failed", "rebound", "cancelled"]
+)
+def test_startup_failure_only_changes_the_original_idle_runner(db_uri, successor):
+    store = SqlAlchemyConversationStore(db_uri)
+    session = store.create_conversation()
+    runner_id = uuid4().hex
+    store.replace_runner_id(session.id, runner_id)
+    if successor == "rebound":
+        store.replace_runner_id(session.id, uuid4().hex)
+    elif successor is not None:
+        store.set_session_live_status(
+            session.id, "idle" if successor == "cancelled" else successor
+        )
+    before = store.get_conversation(session.id)
+    expected = successor in (None, "idle")
+    assert (
+        store.fail_session_startup(
+            session.id, runner_id, cancelled=lambda: successor == "cancelled"
+        )
+        is expected
+    )
+    after = store.get_conversation(session.id)
+    assert after.runner_id == before.runner_id
+    assert after.live_status == ("failed" if expected else before.live_status)

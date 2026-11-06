@@ -1355,7 +1355,7 @@ def materialize_codex_provider_config(
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :param effective_providers: Provider tables resolved by Codex's ``config/read``.
-        Only attribution headers are copied from inherited providers.
+        Only display names and attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1406,11 +1406,16 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
-    for provider_name in gateway_providers:
-        if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
+    for provider_name, effective_provider in gateway_providers.items():
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
-        # A partial table adds metadata; Codex still owns routing and auth.
-        providers[provider_name] = tomlkit.inline_table()
+        if provider_name not in providers:
+            providers[provider_name] = tomlkit.inline_table()
+        provider_config = providers[provider_name]
+        name = effective_provider.get("name")
+        # Codex validates names when persisting hook trust, even for inherited providers.
+        if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
+            provider_config.setdefault("name", name)
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):

@@ -6,8 +6,10 @@ import asyncio
 import contextlib
 import logging
 import re
+import threading
+import time
 import weakref
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -23,6 +25,7 @@ from omnigent.entities.conversation import (
     NewConversationItem,
     SlashCommandData,
     StartupInputOptions,
+    StartupRunnerWait,
 )
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import pending_inputs
@@ -38,13 +41,15 @@ from omnigent.server.scheduled.telemetry import (
 from omnigent.server.schemas import SessionEventInput, SessionStartupInput
 from omnigent.stores.conversation_store import (
     PENDING_INPUT_RESPONSE_ID,
+    STARTUP_LABEL,
     ConversationNotFoundError,
     ConversationStore,
+    PendingRunnerWaitCheck,
 )
 from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
-STARTUP_LABEL = "omnigent.startup"
+STARTUP_RUNNER_CONNECT_TIMEOUT_S = 600.0
 
 
 def initial_input_id(session_id: str) -> str:
@@ -95,24 +100,202 @@ class StartupInputContext:
     user_id: str | None
     input_id: str
     submitted: bool = False
+    runner_wait: StartupRunnerWait | None = None
 
     async def is_disconnected(self) -> bool:
         return False
 
-    async def claim(self, store: ConversationStore, session_id: str) -> bool:
-        # Leave the row queued throughout launch, authorization and policy checks.
-        # A submitted native input is never replayed without its transcript receipt.
-        start_fire_stage("input_claim", session_id=session_id)
-        self.submitted = await asyncio.to_thread(
-            store.transition_pending_input,
+    async def validate_pending(
+        self,
+        store: ConversationStore,
+        session_id: str,
+        *,
+        expected_status: str = "in_progress",
+        check_deadline: bool = True,
+        expected_runner_wait: StartupRunnerWait | None = None,
+        expected_host_id: str | None = None,
+    ) -> bool:
+        """Refuse a retired input or a changed runner before waiting or submitting."""
+        current, item = await asyncio.gather(
+            asyncio.to_thread(store.get_conversation, session_id),
+            asyncio.to_thread(store.get_item, session_id, self.input_id),
+        )
+        if (
+            current is None
+            or current.labels.get(STARTUP_LABEL) == "cancelled"
+            or item is None
+            or item.response_id != PENDING_INPUT_RESPONSE_ID
+            or item.status != expected_status
+        ):
+            return False
+        options = (
+            item.data.startup_options
+            if isinstance(item.data, (MessageData, SlashCommandData))
+            else None
+        )
+        retained = options.runner_wait if options else None
+        if expected_runner_wait is not None and retained != expected_runner_wait:
+            return False
+        self.runner_wait = retained
+        if expected_host_id is not None and current.host_id != expected_host_id:
+            raise OmnigentError(
+                "The host changed while this saved message was waiting; send it again.",
+                code=ErrorCode.WRONG_REPLICA,
+            )
+        if self.runner_wait is not None:
+            if current.runner_id != self.runner_wait.runner_id:
+                raise OmnigentError(
+                    "The runner changed while this saved message was waiting; send it again.",
+                    code=ErrorCode.WRONG_REPLICA,
+                )
+            if (
+                check_deadline
+                and not self.runner_wait.connected
+                and time.time() >= self.runner_wait.deadline
+            ):
+                raise OmnigentError(
+                    "The runner did not connect before this saved message's startup deadline; "
+                    "check the host and send the message again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+        return True
+
+    async def retain_runner(
+        self,
+        store: ConversationStore,
+        session_id: str,
+        runner_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> float:
+        """Retain or narrow the original live launch without extending its deadline."""
+        retained = await asyncio.to_thread(
+            store.claim_pending_input_runner,
             session_id,
             self.input_id,
-            expected="in_progress",
-            status="incomplete",
+            runner_id=runner_id,
+            deadline=deadline
+            if deadline is not None
+            else time.time() + STARTUP_RUNNER_CONNECT_TIMEOUT_S,
+            tighten_deadline=deadline is not None,
         )
-        if self.submitted:
-            start_fire_stage("prompt_send", session_id=session_id)
-        return self.submitted
+        if retained is None or not await self.validate_pending(store, session_id):
+            raise asyncio.CancelledError
+        if retained.runner_id != runner_id:
+            raise OmnigentError(
+                "The runner changed while this saved message was waiting; send it again.",
+                code=ErrorCode.WRONG_REPLICA,
+            )
+        return max(0.0, retained.deadline - time.time())
+
+    async def confirm_connected(
+        self,
+        store: ConversationStore,
+        session_id: str,
+        runner_id: str,
+        *,
+        within_deadline: bool = False,
+    ) -> None:
+        """End the connection budget while retaining the input's runner ownership."""
+        retained = self.runner_wait
+        if retained is None:
+            retained = await asyncio.to_thread(
+                store.claim_pending_input_runner,
+                session_id,
+                self.input_id,
+                runner_id=runner_id,
+                deadline=time.time() + STARTUP_RUNNER_CONNECT_TIMEOUT_S,
+            )
+            if retained is None:
+                raise asyncio.CancelledError
+            self.runner_wait = retained
+        if not within_deadline and not await self.validate_pending(store, session_id):
+            raise asyncio.CancelledError
+        connected = await asyncio.to_thread(
+            store.claim_pending_input_runner,
+            session_id,
+            self.input_id,
+            runner_id=runner_id,
+            deadline=retained.deadline,
+            connected=True,
+        )
+        if (
+            connected is None
+            or not connected.connected
+            or connected.runner_id != runner_id
+            or connected.runner_id != retained.runner_id
+            or connected.deadline != retained.deadline
+        ):
+            raise asyncio.CancelledError
+        self.runner_wait = connected
+        if not await self.validate_pending(store, session_id, check_deadline=False):
+            raise asyncio.CancelledError
+
+    async def fail_unconnected(self, store: ConversationStore, session_id: str) -> None:
+        """End a retained launch without handing its saved input to a replacement."""
+        if not await self.validate_pending(store, session_id):
+            raise asyncio.CancelledError
+        raise OmnigentError(
+            "The original runner did not become available for this saved message; "
+            "check the host and send the message again.",
+            code=ErrorCode.RUNNER_UNAVAILABLE,
+        )
+
+    async def claim(self, store: ConversationStore, session_id: str) -> bool:
+        # A submitted native input is never replayed without its transcript receipt.
+        start_fire_stage("input_claim", session_id=session_id)
+        if not await self.validate_pending(store, session_id):
+            return False
+        retained = self.runner_wait
+
+        async def release_claim() -> None:
+            await asyncio.shield(
+                asyncio.to_thread(
+                    store.transition_pending_input,
+                    session_id,
+                    self.input_id,
+                    expected="incomplete",
+                    status="in_progress",
+                    expected_runner_wait=retained,
+                    rollback=True,
+                )
+            )
+
+        claim_task = asyncio.create_task(
+            asyncio.to_thread(
+                store.transition_pending_input,
+                session_id,
+                self.input_id,
+                expected="in_progress",
+                status="incomplete",
+                expected_runner_wait=retained,
+            )
+        )
+        claimed = False
+        try:
+            claimed = await asyncio.shield(claim_task)
+            if not claimed:
+                return False
+            if not await self.validate_pending(
+                store,
+                session_id,
+                expected_status="incomplete",
+                expected_runner_wait=retained,
+            ):
+                await release_claim()
+                return False
+        except BaseException:
+            # The AP claim and metadata binding live in different databases.
+            # No send occurred; return only this unchanged claim to the queue.
+            if not claim_task.done():
+                with contextlib.suppress(Exception):
+                    claimed = await asyncio.shield(claim_task)
+            if claimed:
+                await release_claim()
+            raise
+        self.submitted = True
+        start_fire_stage("prompt_send", session_id=session_id)
+        return True
 
 
 StartupDispatch = Callable[
@@ -209,35 +392,42 @@ class ManagedStartupInputs:
                 )
         return saved[0]
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(
+        self, session_id: str, reason: str | Callable[[], Awaitable[str]]
+    ) -> str:
         """
         Mark a failed create launch on the session, for replicas without its tracker.
 
         No sandbox is left to deliver the saved inputs, so they are failed and
-        the transcript says why.
+        the transcript says why. A deferred reason is resolved only after queued
+        inputs are failed, so diagnostic I/O cannot race their delivery. Returns
+        the resolved reason for callers recording the same failure elsewhere.
         """
-        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
-            return
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
-            )
         undelivered = False
-        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
-            if item.status == "in_progress":
-                undelivered |= await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    item.id,
-                    expected="in_progress",
-                    status="failed",
+        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is not None:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
                 )
+            for item in await asyncio.to_thread(
+                self.conversations.list_pending_inputs, session_id
+            ):
+                if item.status == "in_progress":
+                    undelivered |= await asyncio.to_thread(
+                        self.conversations.transition_pending_input,
+                        session_id,
+                        item.id,
+                        expected="in_progress",
+                        status="failed",
+                    )
+        reason = await reason() if callable(reason) else reason
         if undelivered:
             await self._report_failure(
                 session_id,
                 "launch_failed",
                 f"The message could not be delivered: {reason[:1000]}",
             )
+        return reason
 
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
@@ -250,10 +440,7 @@ class ManagedStartupInputs:
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and launch.error is not None:
             return False
-        if any(
-            item.status in ("in_progress", "incomplete")
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-        ):
+        if await self.has_undelivered(conv.id):
             return True
         if state != "pending":
             return False
@@ -270,19 +457,36 @@ class ManagedStartupInputs:
         )
         return host is not None and host_is_live(host)
 
-    async def pending_snapshot(self, session_id: str) -> list[dict[str, Any]]:
+    async def has_undelivered(self, session_id: str) -> bool:
+        """Whether a saved input is still to be delivered (or confirmed) here."""
+        return any(
+            item.status in ("in_progress", "incomplete")
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        )
+
+    async def snapshot(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """
+        Render the session's saved inputs for its snapshot.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(queued, failed)``, each a list of
+            ``{"pending_id", "content", "created_by"?}`` in submission order.
+            ``failed`` holds inputs no launch or delivery could hand over, so
+            clients can show them as undelivered instead of dropping them.
+        """
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
-            return []
-        return [
-            {
+            return [], []
+        queued: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            entry = {
                 "pending_id": pending_inputs.make_pending_id(session_id, item.id),
                 "content": input_content(item),
                 **({"created_by": item.created_by} if item.created_by else {}),
             }
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
-            if item.status != "failed"
-        ]
+            (failed if item.status == "failed" else queued).append(entry)
+        return queued, failed
 
     def host_changed(self, app: Any, host_id: str) -> None:
         key = (current_workspace_id(), host_id)
@@ -424,8 +628,8 @@ class ManagedStartupInputs:
             ):
                 return
             options = (
-                item.data.startup_options
-                if isinstance(item.data, (MessageData, SlashCommandData))
+                current.data.startup_options
+                if isinstance(current.data, (MessageData, SlashCommandData))
                 else None
             )
             context = StartupInputContext(
@@ -439,6 +643,7 @@ class ManagedStartupInputs:
                 ),
                 item.created_by,
                 item.id,
+                runner_wait=options.runner_wait if options else None,
             )
             event = SessionEventInput(
                 type=item.type,
@@ -495,6 +700,21 @@ class ManagedStartupInputs:
             )
             raise
         except Exception as exc:
+            if await self._waits_out_session_move(session_id, exc):
+                return
+            retained = context.runner_wait if context is not None else None
+            if context is None or not context.submitted:
+                settled = await asyncio.to_thread(
+                    self.conversations.transition_pending_input,
+                    session_id,
+                    item.id,
+                    expected="in_progress",
+                    status="failed",
+                    expected_runner_wait=retained,
+                )
+                if not settled:
+                    return
+
             log_delivery(
                 "scheduled_run_stage_failed",
                 session_id=session_id,
@@ -508,15 +728,19 @@ class ManagedStartupInputs:
                 else "not_sent",
                 exception_type=type(exc).__name__,
             )
-            _logger.exception("Unable to deliver saved message for session %s", session_id)
-            if context is None or not context.submitted:
-                await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
+            harness_refusal = (
+                isinstance(exc, OmnigentError)
+                and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+                and not (context and context.submitted)
+            )
+            if harness_refusal:
+                _logger.warning(
+                    "Saved message for session %s is waiting for harness setup: %s",
                     session_id,
-                    item.id,
-                    expected="in_progress",
-                    status="failed",
+                    exc,
                 )
+                return
+            _logger.exception("Unable to deliver saved message for session %s", session_id)
             uncertain = bool(context and context.submitted)
             await self._report_failure(
                 session_id,
@@ -529,9 +753,28 @@ class ManagedStartupInputs:
                     else "The message is saved but could not be delivered. "
                 )
                 + str(exc)[:1000],
+                expected_runner_wait=retained,
+                require_failed_input=not uncertain,
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
+        """Whether *exc* refused delivery only while ``/clear`` moves the session.
+
+        The input stays queued; the host worker delivers it once the move
+        ends, as after any other transient wait.
+        """
+        from omnigent.server.routes._sessions.orchestration import _session_is_moving
+
+        if not (
+            isinstance(exc, OmnigentError)
+            and exc.code == ErrorCode.CONFLICT
+            and _session_is_moving(session_id)
+        ):
+            return False
+        _logger.info("Saved message for session %s waits for /clear to finish", session_id)
+        return True
 
     async def retry(self, session_id: str) -> bool:
         changed = False
@@ -573,11 +816,48 @@ class ManagedStartupInputs:
                     status=None,
                 )
 
-    async def _report_failure(self, session_id: str, failure_id: str, message: str) -> None:
+    async def _report_failure(
+        self,
+        session_id: str,
+        failure_id: str,
+        message: str,
+        *,
+        expected_runner_wait: StartupRunnerWait
+        | PendingRunnerWaitCheck
+        | None = PendingRunnerWaitCheck.UNCHECKED,
+        require_failed_input: bool = True,
+    ) -> None:
         """Record a startup failure in the transcript and the session's status."""
-        from omnigent.server.routes.sessions import _publish_sandbox_status, _publish_status
+        from omnigent.server.routes.sessions import (
+            _publish_sandbox_status,
+            _publish_status,
+            _session_active_response_cache,
+            _session_status_cache,
+        )
 
         if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
+            return
+
+        async def still_failed_input() -> bool:
+            current = await asyncio.to_thread(self.conversations.get_item, session_id, failure_id)
+            options = (
+                current.data.startup_options
+                if current is not None
+                and isinstance(current.data, (MessageData, SlashCommandData))
+                else None
+            )
+            return bool(
+                current is not None
+                and current.response_id == PENDING_INPUT_RESPONSE_ID
+                and current.status == "failed"
+                and (options.runner_wait if options else None) == expected_runner_wait
+            )
+
+        if (
+            expected_runner_wait is not PendingRunnerWaitCheck.UNCHECKED
+            and require_failed_input
+            and not await still_failed_input()
+        ):
             return
 
         await asyncio.to_thread(
@@ -596,8 +876,59 @@ class ManagedStartupInputs:
                 )
             ],
         )
+        if expected_runner_wait is None:
+            # This refusal owns an input but has no evidence authorizing a runtime status change.
+            return
+        if isinstance(expected_runner_wait, StartupRunnerWait):
+            if (
+                (require_failed_input and not await still_failed_input())
+                or _session_status_cache.get(session_id) in {"running", "waiting"}
+                or _session_active_response_cache.get(session_id) is not None
+            ):
+                return
+            abandoned = threading.Event()
+            settlement = asyncio.create_task(
+                asyncio.to_thread(
+                    self.conversations.fail_session_startup,
+                    session_id,
+                    expected_runner_wait.runner_id,
+                    cancelled=abandoned.is_set,
+                )
+            )
+            try:
+                applied = await asyncio.shield(settlement)
+            except asyncio.CancelledError:
+                abandoned.set()
+                # Stop must retire and drain a thread that may already be waiting on a DB lock.
+                while not settlement.done():
+                    try:
+                        await asyncio.shield(settlement)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:  # noqa: BLE001 -- preserve Stop cancellation after cleanup
+                        break
+                raise
+            finally:
+                abandoned.set()
+            if not applied:
+                return
+            current = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+            if (
+                current is None
+                or current.runner_id != expected_runner_wait.runner_id
+                or current.live_status != "failed"
+                or current.labels.get(STARTUP_LABEL) == "cancelled"
+                or _session_status_cache.get(session_id) in {"running", "waiting"}
+                or _session_active_response_cache.get(session_id) is not None
+            ):
+                return
         _publish_sandbox_status(session_id, "failed", message)
-        _publish_status(session_id, "failed", failure_origin="startup_input_failed")
+        _publish_status(
+            session_id,
+            "failed",
+            failure_origin="startup_input_failed",
+            persist_live_status=expected_runner_wait is PendingRunnerWaitCheck.UNCHECKED,
+        )
 
     async def shutdown(self) -> None:
         tasks = [task for _, task, _ in self._workers.values()] + list(self._deliveries.values())

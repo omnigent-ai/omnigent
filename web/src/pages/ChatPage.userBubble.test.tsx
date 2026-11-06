@@ -11,7 +11,10 @@ import { BubbleView, buildPendingBubbles } from "./ChatPage";
 // pin that wiring: if the text path reverts to a raw `{text}` string, the
 // markdown syntax would render literally and these assertions would fail.
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 const FILE_VIEWER_NOOP = {
   openFile: () => {},
@@ -385,25 +388,41 @@ describe("UserBubble entrance motion", () => {
 describe("UserBubble awaiting-agent marker", () => {
   const content: MessageContentBlock[] = [{ type: "input_text", text: "steer" }];
 
-  it("shares the timestamp row without adding a separate waiting line", () => {
-    const [pending] = buildPendingBubbles([{ tempId: "pend_1", content, sentMidTurn: true }], null);
-    if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
-    renderBubble({ ...pending, createdAtS: 1_762_000_000 });
-    const explanation = screen.getByTestId("message-awaiting-agent");
-    expect(explanation).toHaveTextContent("The agent will read this after its current step");
-    const footer = screen.getByTestId("message-timestamp").parentElement;
-    expect(explanation.parentElement).toBe(footer);
-    expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
-    expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
-    expect(footer).toHaveClass(
-      "pt-1",
-      "md:opacity-0",
-      "md:group-hover:opacity-100",
-      "md:group-focus-within:opacity-100",
-    );
-    expect(explanation).toHaveClass("truncate");
-    expect(explanation.querySelector("svg")).toBeNull();
-  });
+  it.each([false, true])(
+    "shares the timestamp row while keeping mobile pending status visible (mobile=%s)",
+    (mobile) => {
+      vi.stubGlobal("matchMedia", () => ({
+        matches: mobile,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      }));
+      const [pending] = buildPendingBubbles(
+        [{ tempId: "pend_1", content, sentMidTurn: true }],
+        null,
+      );
+      if (pending.kind !== "user") throw new Error("Expected a pending user bubble");
+      renderBubble({ ...pending, createdAtS: 1_762_000_000 });
+      const explanation = screen.getByTestId("message-awaiting-agent");
+      expect(explanation).toHaveTextContent("The agent will read this after its current step");
+      const footer = screen.getByTestId("message-timestamp").parentElement;
+      expect(explanation.parentElement).toBe(footer);
+      expect(explanation.nextElementSibling).toBe(screen.getByTestId("message-timestamp"));
+      expect(footer).toContainElement(screen.getByRole("button", { name: "Copy" }));
+      expect(footer).toHaveClass("pt-1");
+      if (mobile) {
+        expect(footer).toHaveClass("opacity-100");
+        expect(footer).not.toHaveClass("invisible");
+      } else {
+        expect(footer).toHaveClass(
+          "md:opacity-0",
+          "md:group-hover:opacity-100",
+          "md:group-focus-within:opacity-100",
+        );
+      }
+      expect(explanation).toHaveClass("truncate");
+      expect(explanation.querySelector("svg")).toBeNull();
+    },
+  );
 
   it("keeps an attachment-only explanation visible without a focusable footer control", () => {
     const [pending] = buildPendingBubbles(
@@ -445,11 +464,13 @@ describe("UserBubble copy button", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses a compact action button with an 8px content gap", () => {
+  it("uses a compact action button", () => {
     renderBubble(userBubble("copy me please"));
 
-    expect(screen.getByTestId("message-bubble")).toHaveClass("gap-2");
     expect(screen.getByRole("button", { name: "Copy" })).toHaveAttribute("data-size", "icon-xxs");
+    expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
+      "[@media(pointer:coarse)]:size-8",
+    );
   });
 
   it("copies the message text to the clipboard when clicked", async () => {

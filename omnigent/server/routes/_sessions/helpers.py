@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -81,7 +82,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
-from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.host.frames import HARNESS_NOT_CONFIGURED_ERROR_CODE, RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import (
@@ -100,6 +101,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
@@ -143,6 +145,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
+    validate_session_model_metadata,
 )
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
@@ -307,6 +310,7 @@ from omnigent.server.schemas import (
     SessionTerminalPendingEvent,
     SessionTitleEvent,
     SessionTodosEvent,
+    SupersessionReason,
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
@@ -339,6 +343,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -4403,6 +4408,8 @@ async def _create_and_publish_codex_child(
                 else None
             ),
             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
+            # Lists the /side fork in its parent's Workspace rail on every device.
+            side_chat_parent_id=parent_conv.id if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5723,7 +5730,12 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
-def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+def _publish_session_superseded(
+    session_id: str,
+    target_conversation_id: str,
+    *,
+    reason: SupersessionReason = "clear",
+) -> None:
     """
     Publish a ``session.superseded`` event to the live stream.
 
@@ -5738,12 +5750,13 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         should receive the event, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to redirect to, e.g.
         ``"conv_new"``.
+    :param reason: The command that moved the session, e.g. ``"clear"``.
     """
     event = SessionSupersededEvent(
         type="session.superseded",
         conversation_id=session_id,
         target_conversation_id=target_conversation_id,
-        reason="clear",
+        reason=reason,
     )
     session_stream.publish(session_id, event.model_dump())
     # Discard any unconsumed pending inputs on the superseded session — notably
@@ -5888,6 +5901,8 @@ async def _query_host_runner_status(
     host_conn: HostConnection,
     host_registry: HostRegistry,
     runner_id: str,
+    *,
+    on_launch_age: Callable[[float], None] | None = None,
 ) -> str | None:
     """
     Ask the host for this runner's liveness or bounded pending-sign-in state.
@@ -5901,17 +5916,24 @@ async def _query_host_runner_status(
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
     :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
+    :param on_launch_age: Optional observer for valid age on an alive process.
     :returns: ``"alive"``, ``"sign_in_pending"``, ``"dead"``, or ``"unknown"``; or
         ``None`` when the host didn't reply in time, the connection
         dropped, or the host is too old to support the query. ``None``
         means "no authoritative answer" — the caller falls back to the
         plain connect grace, preserving the prior blind-wait behavior.
     """
-    from omnigent.host.frames import HostRunnerStatusFrame, encode_host_frame
+    from omnigent.host.frames import (
+        HostRunnerStatusFrame,
+        encode_host_frame,
+        parse_runner_launch_age,
+    )
     from omnigent.server.routes import sessions as _facade
 
     request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+    future: asyncio.Future[dict[str, str | float | None]] = (
+        asyncio.get_running_loop().create_future()
+    )
     host_conn.pending_runner_status[request_id] = future
     frame = encode_host_frame(HostRunnerStatusFrame(request_id=request_id, runner_id=runner_id))
     try:
@@ -5939,7 +5961,11 @@ async def _query_host_runner_status(
         return None
     finally:
         host_conn.pending_runner_status.pop(request_id, None)
-    return result.get("status")
+    status = result.get("status")
+    age = parse_runner_launch_age(result.get("launch_age_s"))
+    if status == "alive" and age is not None and on_launch_age is not None:
+        on_launch_age(age)
+    return status if isinstance(status, str) else None
 
 
 async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
@@ -6623,15 +6649,23 @@ async def _launch_runner_on_host_locked(
                 mapped = category_for_code(refusal_code)
                 if mapped is not ErrorCategory.UNKNOWN:
                     refusal_category = mapped.value
-            _logger.error(
+            harness_refusal = refusal_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+            _logger.log(
+                logging.WARNING if harness_refusal else logging.ERROR,
                 "Host refused runner launch",
                 extra=debug_event(
                     "runner_launch_failed",
                     stage="runner_launch",
                     error_code=refusal_code,
                     error_category=refusal_category,
-                    error_impact=ErrorImpact.BLOCKING.value,
-                    error_phase=ErrorPhase.RUNNER_LAUNCH.value,
+                    error_impact=(
+                        ErrorImpact.BENIGN.value if harness_refusal else ErrorImpact.BLOCKING.value
+                    ),
+                    error_phase=(
+                        ErrorPhase.HARNESS_SETUP.value
+                        if harness_refusal
+                        else ErrorPhase.RUNNER_LAUNCH.value
+                    ),
                 ),
             )
             return _HostLaunchAttempt(
@@ -6832,6 +6866,7 @@ async def _provision_managed_sandbox(
                 agent_name=agent_name,
                 on_stage=_on_stage,
                 slice_key_enabled=relaunch_slice_key_enabled,
+                launch_state=tracker.get(session_id),
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -6842,6 +6877,7 @@ async def _provision_managed_sandbox(
             agent_name=agent_name,
             on_stage=_on_stage,
             host_id=host_id,
+            launch_state=tracker.get(session_id),
         )
     except HTTPException as exc:
         _logger.warning(
@@ -7934,9 +7970,18 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
-    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
-    request_payload = item.data.model_dump(mode="json", by_alias=True)
-    return persisted.type == item.type and persisted_payload == request_payload
+    # Runner retention is delivery lifecycle state, not the caller's payload.
+    payloads = []
+    for data in (persisted.data, item.data):
+        payload = data.model_dump(mode="json", by_alias=True, exclude={"startup_options"})
+        if isinstance(data, (MessageData, SlashCommandData)) and data.startup_options is not None:
+            options = data.startup_options.model_dump(
+                mode="json", by_alias=True, exclude={"runner_wait"}, exclude_defaults=True
+            )
+            if options:
+                payload["startup_options"] = options
+        payloads.append(payload)
+    return persisted.type == item.type and payloads[0] == payloads[1]
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
@@ -10144,15 +10189,16 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     try:
         parsed = SessionCreateMetadata.model_validate_json(metadata)
-        reasoning_effort = validate_effort(
-            parsed.reasoning_effort,
-            "session metadata",
-            EFFORT_VALUES,
+        model_override, reasoning_effort = validate_session_model_metadata(
+            model_override=parsed.model_override,
+            reasoning_effort=parsed.reasoning_effort,
         )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={"reasoning_effort": reasoning_effort, "model_override": model_override}
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -11270,6 +11316,9 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    conversation: Conversation | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -11284,24 +11333,47 @@ async def _notify_runner_of_bundled_child(
         e.g. ``"ag_abc123"``.
     :param runner_router: Router used to resolve the bound runner's
         client; ``None`` falls back to the in-process runner.
+    :param conversation: The created child row. When given, the runner gets
+        the full session-init envelope, so it seeds the requested model and
+        effort instead of fetching them back; ``None`` sends the id-only body.
+    :param conversation_store: Store to read the child row from when
+        *conversation* is not given. The read is best-effort like the envelope
+        build: the session is already persisted, so a failed read sends the
+        id-only body instead of failing the create.
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+    }
+    if conversation is not None or conversation_store is not None:
+        try:
+            if conversation is None and conversation_store is not None:
+                conversation = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if conversation is not None:
+                # The route forwards any initial input itself right after
+                # this notify, so a recovery turn would run it twice.
+                body = build_runner_session_init_payload(
+                    conversation,
+                    server_version=VERSION,
+                    suppress_recovery_turn=True,
+                )
+        except Exception:  # noqa: BLE001 — must not fail the create, as on the JSON path.
+            # The runner falls back to fetching the row.
+            _logger.warning(
+                "session-init envelope build failed for bundled session %s; "
+                "sending the id-only body",
+                session_id,
+                exc_info=True,
+            )
     try:
-        # Bundled children keep the legacy id-only body: bundle creation plumbs
-        # no harness/model override for a session-init envelope to seed. The
-        # create and rebind notifies send the full envelope instead.
-        await runner_client.post(
-            "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
-            timeout=10.0,
-        )
+        await runner_client.post("/v1/sessions", json=body, timeout=10.0)
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Failed to notify runner about bundled session %s",

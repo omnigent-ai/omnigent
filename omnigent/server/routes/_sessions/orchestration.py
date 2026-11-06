@@ -1606,6 +1606,7 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
+        side_chat_parent_id=conv.side_chat_parent_id,
     )
 
 
@@ -2819,6 +2820,8 @@ async def _persist_external_codex_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    allow_side_chat: bool = False,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -2831,6 +2834,7 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
+    :param allow_side_chat: Whether the caller is the owner or bound runner.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -2851,6 +2855,12 @@ async def _persist_external_codex_subagent_start(
         _find_codex_native_subagent_child, conversation_store, parent_id, thread_id
     )
     labels = _codex_subagent_labels_from_body(thread_id, body)
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if is_side_chat_child(labels) and not allow_side_chat:
+        raise OmnigentError(
+            "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+        )
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         await record_subagent_activity(
@@ -2858,7 +2868,11 @@ async def _persist_external_codex_subagent_start(
         )
         return existing.id
     return await _create_and_publish_codex_child(
-        parent_id, parent_conv, thread_id, labels, conversation_store
+        parent_id,
+        parent_conv,
+        thread_id,
+        labels,
+        conversation_store,
     )
 
 
@@ -4397,6 +4411,7 @@ async def _wait_for_host_bound_runner_client(
     host_conn: HostConnection,
     host_registry: HostRegistry,
     conversation_store: ConversationStore | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> httpx.AsyncClient | None:
     """Resolve a host-bound runner client through its bounded credential wait."""
 
@@ -4419,6 +4434,7 @@ async def _wait_for_host_bound_runner_client(
         host_conn=host_conn,
         host_registry=host_registry,
         conversation_store=conversation_store,
+        startup_input=startup_input,
     )
 
 
@@ -4432,34 +4448,77 @@ async def _wait_for_host_bound_runner[Connection](
     host_conn: HostConnection,
     host_registry: HostRegistry,
     conversation_store: ConversationStore | None = None,
+    startup_input: StartupInputContext | None = None,
 ) -> Connection | None:
-    """Wait for a runner tunnel or client, extending startup for pending credentials.
+    """Wait for a live runner within its input's retained startup or sign-in budget.
 
-    Host liveness can end the ordinary grace early for a dead or untracked
-    process. A bounded sign-in wait keeps the same binding and input until
-    authentication finishes; old hosts retain the ordinary startup budget.
+    Saved startup inputs retain an alive launch and its persisted deadline.
+    Other sends extend ordinary grace only for an explicit pending sign-in.
     Stop, rebind, cancellation and process exit still end the wait promptly.
 
-    :param conversation_store: Optional exact runner and host binding check.
+    :param conversation_store: Optional binding check while startup is pending.
+    :param startup_input: Durable input whose original live launch must be retained.
     """
     from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
+    from omnigent.server.startup_inputs import STARTUP_RUNNER_CONNECT_TIMEOUT_S
+
+    started = time.monotonic()
+    started_wall = time.time() if startup_input is not None else 0.0
+    ordinary_deadline = started + timeout_s
+    startup_ceiling = started + STARTUP_RUNNER_CONNECT_TIMEOUT_S
+    age_deadline: float | None = None
+
+    def start_connection_wait(budget_s: float) -> asyncio.Future[Connection | None]:
+        return asyncio.ensure_future(wait_for_connection(budget_s))
 
     async def query_status(*, pause: bool = False) -> str | None:
+        nonlocal age_deadline
         if pause:
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
-        query_connection = host_registry.get(host_conn.host_id)
-        if query_connection is None:
+        current_connection = host_registry.get(host_conn.host_id)
+        if current_connection is None:
             return None
-        status = await _query_host_runner_status(query_connection, host_registry, runner_id)
-        return status if host_registry.get(host_conn.host_id) is query_connection else None
+        if startup_input is None:
+            status = await _query_host_runner_status(current_connection, host_registry, runner_id)
+            return status if host_registry.get(host_conn.host_id) is current_connection else None
+        query_started = time.monotonic()
+        launch_age: float | None = None
 
-    async def check_pending_owner() -> None:
+        def observe_launch_age(age: float) -> None:
+            nonlocal launch_age
+            launch_age = age
+
+        status = await _query_host_runner_status(
+            current_connection, host_registry, runner_id, on_launch_age=observe_launch_age
+        )
+        if host_registry.get(host_conn.host_id) is not current_connection:
+            return None
+        if launch_age is not None:
+            age_deadline = max(
+                ordinary_deadline,
+                min(
+                    startup_ceiling, query_started + STARTUP_RUNNER_CONNECT_TIMEOUT_S - launch_age
+                ),
+            )
+        return status
+
+    async def check_pending_owner(*, check_deadline: bool = True) -> None:
         if _intentional_stop_sessions.get(session_id) == runner_id:
+            if startup_input is not None:
+                raise asyncio.CancelledError
             raise OmnigentError(
                 "The session was stopped while waiting for host sign-in; send the message again.",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
-        if conversation_store is not None:
+        if startup_input is not None and conversation_store is not None:
+            if not await startup_input.validate_pending(
+                conversation_store,
+                session_id,
+                check_deadline=check_deadline,
+                expected_host_id=host_conn.host_id,
+            ):
+                raise asyncio.CancelledError
+        elif conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if (
                 current is None
@@ -4471,7 +4530,16 @@ async def _wait_for_host_bound_runner[Connection](
                     code=ErrorCode.WRONG_REPLICA,
                 )
 
-    connect_task = asyncio.ensure_future(wait_for_connection(timeout_s))
+    retained_deadline: float | None = None
+    if startup_input is not None and startup_input.runner_wait is not None:
+        assert conversation_store is not None
+        remaining = await startup_input.retain_runner(conversation_store, session_id, runner_id)
+        if startup_input.runner_wait is not None and startup_input.runner_wait.connected:
+            remaining = timeout_s
+        retained_deadline = time.monotonic() + remaining
+    connect_task = start_connection_wait(
+        timeout_s if retained_deadline is None else max(0.0, retained_deadline - time.monotonic())
+    )
     status_task = asyncio.create_task(query_status())
     sign_in_deadline: float | None = None
     waiting_for_sign_in = False
@@ -4480,21 +4548,41 @@ async def _wait_for_host_bound_runner[Connection](
             done, _pending = await asyncio.wait(
                 {connect_task, status_task}, return_when=asyncio.FIRST_COMPLETED
             )
-            if sign_in_deadline is not None or conversation_store is not None:
-                await check_pending_owner()
+            connected_client = connect_task.result() if connect_task in done else None
+            if connected_client is not None and retained_deadline is not None:
+                if time.monotonic() >= retained_deadline:
+                    assert startup_input is not None and conversation_store is not None
+                    await startup_input.fail_unconnected(conversation_store, session_id)
+            if (
+                startup_input is not None
+                or sign_in_deadline is not None
+                or conversation_store is not None
+            ):
+                await check_pending_owner(check_deadline=connected_client is None)
             if connect_task in done:
-                client = connect_task.result()
-                if client is not None:
-                    return client
-                if waiting_for_sign_in:
+                if connected_client is not None:
+                    if startup_input is not None:
+                        assert conversation_store is not None
+                        await startup_input.confirm_connected(
+                            conversation_store, session_id, runner_id, within_deadline=True
+                        )
+                    return connected_client
+                if waiting_for_sign_in and startup_input is None:
                     return None
                 if (
                     runner_exit_reports is not None
                     and runner_exit_reports.get(runner_id) is not None
                 ):
                     return None
+                if retained_deadline is not None:
+                    connect_task = start_connection_wait(
+                        max(0.0, retained_deadline - time.monotonic())
+                    )
+                    if status_task not in done:
+                        continue
                 if (
-                    sign_in_deadline is None
+                    startup_input is None
+                    and sign_in_deadline is None
                     and host_registry.get(host_conn.host_id) is not host_conn
                 ):
                     return None
@@ -4504,18 +4592,56 @@ async def _wait_for_host_bound_runner[Connection](
                     await asyncio.gather(status_task, return_exceptions=True)
                     status_task = asyncio.create_task(query_status())
                     await status_task
-                if status_task.result() != "sign_in_pending":
+                if status_task.result() != "sign_in_pending" and not (
+                    startup_input is not None and status_task.result() == "alive"
+                ):
                     return None
             status = status_task.result()
             if status in ("dead", "unknown"):
                 return None
             if (
                 sign_in_deadline is None
+                and retained_deadline is None
                 and status not in {"alive", "sign_in_pending"}
-                and host_registry.get(host_conn.host_id) is host_conn
             ):
-                return await connect_task
-            if status == "sign_in_pending" and not waiting_for_sign_in:
+                if host_registry.get(host_conn.host_id) is not host_conn:
+                    status_task = asyncio.create_task(query_status(pause=True))
+                    continue
+                client = await connect_task
+                if client is not None and startup_input is not None:
+                    await check_pending_owner(check_deadline=False)
+                    assert conversation_store is not None
+                    await startup_input.confirm_connected(
+                        conversation_store, session_id, runner_id, within_deadline=True
+                    )
+                return client
+            if startup_input is not None and status in {"alive", "sign_in_pending"}:
+                if startup_input.runner_wait is None or not startup_input.runner_wait.connected:
+                    assert conversation_store is not None
+                    limit = age_deadline if age_deadline is not None else startup_ceiling
+                    previous_wait = startup_input.runner_wait
+                    remaining = await startup_input.retain_runner(
+                        conversation_store,
+                        session_id,
+                        runner_id,
+                        deadline=started_wall + (limit - started),
+                    )
+                    if (
+                        startup_input.runner_wait is not None
+                        and startup_input.runner_wait.connected
+                    ):
+                        remaining = timeout_s
+                    narrowed_deadline = min(limit, time.monotonic() + remaining)
+                    if retained_deadline is None or previous_wait != startup_input.runner_wait:
+                        previous_deadline = retained_deadline or ordinary_deadline
+                        retained_deadline = narrowed_deadline
+                        if narrowed_deadline != previous_deadline:
+                            connect_task.cancel()
+                            await asyncio.gather(connect_task, return_exceptions=True)
+                            connect_task = start_connection_wait(
+                                max(0.0, narrowed_deadline - time.monotonic())
+                            )
+            elif status == "sign_in_pending" and not waiting_for_sign_in:
                 if sign_in_deadline is None:
                     sign_in_deadline = time.monotonic() + RUNNER_SIGN_IN_PENDING_WAIT_S
                 await check_pending_owner()
@@ -4524,7 +4650,7 @@ async def _wait_for_host_bound_runner[Connection](
                     return None
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = asyncio.ensure_future(wait_for_connection(budget_s))
+                connect_task = start_connection_wait(budget_s)
                 waiting_for_sign_in = True
             elif status == "alive" and waiting_for_sign_in:
                 # Sign-in finished; normal startup must now make progress.
@@ -4532,7 +4658,7 @@ async def _wait_for_host_bound_runner[Connection](
                 budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = asyncio.ensure_future(wait_for_connection(budget_s))
+                connect_task = start_connection_wait(budget_s)
                 waiting_for_sign_in = False
             status_task = asyncio.create_task(query_status(pause=True))
     finally:
@@ -6183,19 +6309,20 @@ async def _ensure_native_terminal_ready(
     Ask the runner to create or return the native terminal for a message.
 
     The runner's explicit ``ensure_native_terminal`` endpoint is the
-    authoritative readiness check for native user messages. Any non-2xx
-    response or transport failure fails this user turn quickly with a
-    durable error item; a 2xx response preserves the normal boot grace
+    authoritative readiness check for native user messages. Definitive failures
+    return a durable error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
 
-    A runner tunnel that drops while the request is in flight is the one
-    transport failure that is not definitive: the runner is usually alive
-    but stalled and re-registers shortly. With a *runner_router* the probe
-    waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
+    A runner tunnel that drops while the request is in flight is not definitive:
+    the runner is usually alive but stalled and re-registers shortly. With a
+    *runner_router*, the probe waits up to
+    ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
     session's runner to reconnect and asks once more; the runner-side ensure
     is idempotent, so a terminal created before the drop is simply returned.
     If the tunnel is still lost, a host-bound session's send is refused
     with ``RUNNER_UNAVAILABLE`` rather than recorded as a boot failure.
+    A timed-out readiness request also leaves its input unconsumed: terminal
+    creation may still finish, but no message has reached the native agent.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
@@ -6209,7 +6336,7 @@ async def _ensure_native_terminal_ready(
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when a host-bound session's
-        runner tunnel is lost and the probe cannot reach it.
+        readiness request times out or its runner tunnel remains unreachable.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
@@ -6246,6 +6373,12 @@ async def _ensure_native_terminal_ready(
             exc_info=exc,
             extra={"session_id": session_id},
         )
+        if conv.host_id is not None and isinstance(exc, httpx.TimeoutException):
+            raise OmnigentError(
+                "The terminal readiness check timed out before your message was sent. "
+                "Retry your message.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         if conv.host_id is not None and _is_tunnel_loss(exc):
             # A lost tunnel doesn't show the terminal failed to boot; refuse the send
             # so the client keeps the message, instead of consuming it into a failed turn.
@@ -7034,6 +7167,16 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
         :func:`_emit_server_routing_decision`.
     """
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
+
+
+def _opens_codex_side_chat(harness: str | None, body: SessionEventInput) -> bool:
+    """Whether this is a Codex ``/side`` command, using the runner's parser."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_content
+
+    return (
+        harness == "codex-native"
+        and side_chat_question_from_content(body.data.get("content")) is not None
+    )
 
 
 def _native_pane_harness(
@@ -7966,22 +8109,49 @@ async def _record_create_route_prompt(
 _dispatch_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
+# Sessions whose work a slash command (e.g. claude-sdk ``/clear``) is moving
+# into another session; messages to them are refused until the move ends.
+# Process-local like ``_dispatch_in_flight``.
+_session_moves_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 @contextlib.contextmanager
-def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
+def _count_in_flight(
+    counts: WorkspaceScopedCache[str, int], conversation_id: str
+) -> Iterator[None]:
+    """Count *conversation_id* in *counts* until the block exits."""
+    counts[conversation_id] = counts.get(conversation_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = counts.get(conversation_id, 1) - 1
+        if remaining > 0:
+            counts[conversation_id] = remaining
+        else:
+            counts.pop(conversation_id, None)
+
+
+def _mark_dispatch_in_flight(conversation_id: str) -> contextlib.AbstractContextManager[None]:
     """
     Count a message as in flight for *conversation_id* until the block exits.
 
     :param conversation_id: Session/conversation identifier.
     """
-    _dispatch_in_flight[conversation_id] = _dispatch_in_flight.get(conversation_id, 0) + 1
-    try:
-        yield
-    finally:
-        remaining = _dispatch_in_flight.get(conversation_id, 1) - 1
-        if remaining > 0:
-            _dispatch_in_flight[conversation_id] = remaining
-        else:
-            _dispatch_in_flight.pop(conversation_id, None)
+    return _count_in_flight(_dispatch_in_flight, conversation_id)
+
+
+def _mark_session_moving(conversation_id: str) -> contextlib.AbstractContextManager[None]:
+    """
+    Hold *conversation_id* as moving to another session until the block exits.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    return _count_in_flight(_session_moves_in_flight, conversation_id)
+
+
+def _session_is_moving(conversation_id: str) -> bool:
+    """Whether a slash command is moving *conversation_id*'s work elsewhere."""
+    return _session_moves_in_flight.get(conversation_id, 0) > 0
 
 
 def _session_is_starting(conversation_id: str) -> bool:
@@ -8226,6 +8396,7 @@ async def _dispatch_session_event_to_runner_impl(
         if side_result is not None:
             return side_result
     if body.type == "message" and _is_native_terminal_session(conv):
+        native_harness = await asyncio.to_thread(_native_pane_harness, conv)
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
@@ -8276,11 +8447,7 @@ async def _dispatch_session_event_to_runner_impl(
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.
-        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
-
-        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
-            _extract_user_text_for_routing(body)
-        )
+        opens_side_chat = _opens_codex_side_chat(native_harness, body)
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.
@@ -8299,7 +8466,7 @@ async def _dispatch_session_event_to_runner_impl(
         # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
         # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
         is_btw = (
-            _native_pane_harness(conv) == "claude-native"
+            native_harness == "claude-native"
             and isinstance(content, list)
             and all(
                 isinstance(block, dict) and block.get("type") == "input_text" for block in content
@@ -12576,7 +12743,7 @@ def _create_session_from_bundle(
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
-        _validate_acp_spec_models(spec)
+        _validate_acp_spec_models(spec, inference_model)
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
@@ -14002,7 +14169,7 @@ async def _get_session_snapshot(
     response.usage_included = include_usage
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
-        queued = await startup.pending_snapshot(session_id)
+        queued, response.failed_inputs = await startup.snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response
