@@ -1560,7 +1560,7 @@ class HostProcess:
                 self._reap_orphans_once(child_pids)
             except asyncio.CancelledError:
                 raise
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:  # a reaper must never die on a stray error
                 _logger.debug("orphan reaper sweep failed", exc_info=True)
 
     def _reap_orphans_once(self, child_pids: Iterable[int] | None = None) -> int:
@@ -2487,7 +2487,7 @@ class HostProcess:
             if isinstance(proc, ZygoteRunnerProc):
                 # No watcher owns an abandoned spawn's retained exit status.
                 await asyncio.to_thread(proc.wait, timeout=5.0)
-        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+        except Exception:  # detached cleanup must be observed
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
                 proc.pid,
@@ -2555,7 +2555,7 @@ class HostProcess:
                     runner_id,
                     session_id,
                 )
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:  # must never die unobserved
                 _logger.warning(
                     "Failed to stop superseded runner %s for session %s; "
                     "the process may linger until it exits on its own",
@@ -2831,7 +2831,7 @@ class HostProcess:
             try:
                 await self._send_text(ws, self._encode_frame(report))
                 return
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:  # any send failure parks the report
                 _logger.debug(
                     "Could not send runner_exited for %s; queueing for reconnect",
                     runner_id,
@@ -4065,7 +4065,7 @@ class HostProcess:
 
         try:
             rows = await codex_launch_catalog()
-        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+        except Exception:  # no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4092,7 +4092,7 @@ class HostProcess:
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
             rows = await claude_launch_catalog(config)
-        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+        except Exception:  # no catalog, never a crash
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4141,7 +4141,7 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:  # no catalog, never a crash
                 _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4171,7 +4171,7 @@ class HostProcess:
                     status="failed",
                     error=str(exc),
                 )
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:  # no catalog, never a crash
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4692,7 +4692,7 @@ class HostProcess:
                     explicit_refresh=explicit_refresh,
                 )
                 return harness, account
-            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+            except Exception:
                 _logger.warning("Host %s account probe failed", harness, exc_info=True)
                 return harness, {"kind": "unknown"}
 
@@ -5534,7 +5534,7 @@ class HostProcess:
                     self._auth_token_factory_resolved = True
             if self._auth_token_factory is not None:
                 return self._auth_token_factory()
-        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
+        except Exception:
             _logger.debug("Could not obtain auth token", exc_info=True)
         return None
 
