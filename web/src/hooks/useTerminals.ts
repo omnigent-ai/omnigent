@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "../lib/identity";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isTempConvId } from "@/lib/tempConversationId";
+import { randomUUID } from "@/lib/randomUUID";
 import {
   setTerminalLaunching,
   terminalInfoFromResource,
@@ -297,7 +298,7 @@ export async function createTerminal(
  * return the same terminal every time.
  */
 function newTerminalSessionKey(): string {
-  return `u-${Math.random().toString(36).slice(2, 8)}`;
+  return `u-${randomUUID().replace(/-/g, "").slice(0, 6)}`;
 }
 
 interface TerminalCreateRequest {
@@ -307,7 +308,7 @@ interface TerminalCreateRequest {
 
 /** Callbacks for {@link useCreateTerminal}'s ``launch``. */
 export interface TerminalLaunchCallbacks {
-  /** The shell's tab can open (before the create returns when the runner is online). */
+  /** The shell's tab can open; called at once, before the create returns. */
   onOpen?: (info: TerminalInfo) => void;
   /**
    * The create failed. *opened* is the terminal handed to ``onOpen`` early, if
@@ -324,11 +325,11 @@ export interface TerminalLaunchCallbacks {
  * waiting for the ``session.resource.created`` SSE round-trip — which
  * still arrives and dedupes as a no-op.
  *
- * ``launch`` is the UI entry point. With the runner online it adds the
- * terminal under its predicted id and opens it at once, so the attach
- * WebSocket (``await_launch``) runs alongside the create instead of after
- * it. Otherwise (runner asleep or unknown, where the create may wake it)
- * the tab opens once the create returns.
+ * ``launch`` is the UI entry point. It adds the terminal under its predicted
+ * id and opens its tab at once. With the runner online the attach WebSocket
+ * (``await_launch``) runs alongside the create; otherwise (runner asleep or
+ * unknown, where the create may wake it) the tab shows "Starting shell…"
+ * and attaches once the create returns.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name, plus ``launch``.
@@ -357,13 +358,6 @@ export function useCreateTerminal(conversationId: string) {
     onSuccess: addToCache,
   });
   const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
-    if (runnerOnline !== true) {
-      mutation.mutate(terminal, {
-        onSuccess: (info) => callbacks.onOpen?.(info),
-        onError: (error) => callbacks.onError?.(error),
-      });
-      return;
-    }
     const sessionKey = newTerminalSessionKey();
     const predicted: TerminalInfo = {
       id: terminalResourceId(terminal, sessionKey),
@@ -371,7 +365,7 @@ export function useCreateTerminal(conversationId: string) {
       session: sessionKey,
       running: true,
     };
-    setTerminalLaunching(predicted.id, true);
+    setTerminalLaunching(predicted.id, runnerOnline === true ? "attach" : "wait");
     addToCache(predicted);
     callbacks.onOpen?.(predicted);
     mutation
@@ -393,7 +387,7 @@ export function useCreateTerminal(conversationId: string) {
         removeFromCache(predicted.id);
         callbacks.onError?.(error instanceof Error ? error : new Error(String(error)), predicted);
       })
-      .finally(() => setTerminalLaunching(predicted.id, false));
+      .finally(() => setTerminalLaunching(predicted.id, null));
   };
   return { ...mutation, launch };
 }

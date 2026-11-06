@@ -269,13 +269,26 @@ export function terminalResourceId(terminalName: string, sessionKey: string): st
   return `terminal_${safeResourceComponent(terminalName)}_${safeResourceComponent(sessionKey)}`;
 }
 
-/** Terminal ids whose create request is still in flight. */
-const launchingTerminalIds = new Set<string>();
+/**
+ * How a terminal whose create request is still in flight attaches: ``"attach"``
+ * dials now with ``await_launch`` (runner online); ``"wait"`` holds the attach
+ * until the create returns (the create may be waking the runner).
+ */
+export type TerminalLaunchMode = "attach" | "wait";
 
-/** Record whether *terminalId*'s create request is in flight. */
-export function setTerminalLaunching(terminalId: string, launching: boolean): void {
-  if (launching) launchingTerminalIds.add(terminalId);
-  else launchingTerminalIds.delete(terminalId);
+const launchingTerminals = new Map<string, TerminalLaunchMode>();
+const launchListeners = new Set<() => void>();
+
+/** Record *terminalId*'s in-flight create, or clear it with ``null``. */
+export function setTerminalLaunching(terminalId: string, mode: TerminalLaunchMode | null): void {
+  if (mode === null) launchingTerminals.delete(terminalId);
+  else launchingTerminals.set(terminalId, mode);
+  for (const listener of launchListeners) listener();
+}
+
+/** The in-flight create's attach mode for *terminalId*, or ``null`` when none. */
+export function terminalLaunchMode(terminalId: string): TerminalLaunchMode | null {
+  return launchingTerminals.get(terminalId) ?? null;
 }
 
 /**
@@ -283,5 +296,11 @@ export function setTerminalLaunching(terminalId: string, launching: boolean): vo
  * launch (``?await_launch=true``) rather than close as not found.
  */
 export function isTerminalLaunching(terminalId: string): boolean {
-  return launchingTerminalIds.has(terminalId);
+  return launchingTerminals.get(terminalId) === "attach";
+}
+
+/** Subscribe to launch-state changes (for ``useSyncExternalStore``). */
+export function subscribeTerminalLaunches(listener: () => void): () => void {
+  launchListeners.add(listener);
+  return () => launchListeners.delete(listener);
 }

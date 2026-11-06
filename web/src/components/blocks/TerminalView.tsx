@@ -7,7 +7,14 @@
 // returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -33,6 +40,8 @@ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import {
   isTerminalLaunching,
   resolveInitialAttachUrl,
+  subscribeTerminalLaunches,
+  terminalLaunchMode,
   watchDirectUpgrade,
   withAttachParams,
 } from "@/lib/terminals";
@@ -528,6 +537,13 @@ export function TerminalView({
     }
   }, [onResume, disposeActiveSession, resumeTarget, resumeGeneration]);
 
+  // A new shell whose create may be waking the runner opens its tab at once
+  // but attaches only once the create returns.
+  const waitingForCreate = useSyncExternalStore(
+    subscribeTerminalLaunches,
+    () => terminalLaunchMode(terminalId) === "wait",
+  );
+
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
       if (node === null) return;
@@ -547,6 +563,7 @@ export function TerminalView({
       // handshake. The session's WS ``open`` handler transitions us
       // to ``connected``.
       notifyState({ kind: "connecting" });
+      if (waitingForCreate) return;
 
       // Defer the actual session construction by one microtask so
       // React 19 StrictMode's synchronous attach → cleanup → attach
@@ -641,6 +658,7 @@ export function TerminalView({
       notifyClipboardRequest,
       notifyFileLink,
       disposeActiveSession,
+      waitingForCreate,
     ],
   );
 
@@ -807,6 +825,7 @@ export function TerminalView({
         {state.kind !== "connected" && (
           <StatusOverlay
             state={state}
+            startingShell={waitingForCreate}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
             resumeTarget={resumeTarget}
@@ -821,6 +840,7 @@ export function TerminalView({
 
 function StatusOverlay({
   state,
+  startingShell,
   reconnectPending,
   onResume,
   resumeTarget,
@@ -828,6 +848,8 @@ function StatusOverlay({
   resumeError,
 }: {
   state: ConnectionState;
+  /** True while a new shell waits for its create before attaching. */
+  startingShell: boolean;
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
@@ -842,7 +864,7 @@ function StatusOverlay({
       {state.kind === "connecting" && (
         <span className="flex items-center gap-2">
           <Loader2Icon className="size-4 animate-spin" />
-          Connecting…
+          {startingShell ? "Starting shell…" : "Connecting…"}
         </span>
       )}
       {state.kind === "closed" && reconnectPending && (
