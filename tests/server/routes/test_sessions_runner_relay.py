@@ -1836,14 +1836,11 @@ async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
         gate.set()
         await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
-        statuses = []
-        while not collector.queue.empty():
-            statuses.append(await collector.queue.get())
-        running_reasons = [e.get("blocked_on") for e in statuses if e.get("status") == "running"]
         if server_status == "running":
-            assert running_reasons == [blocked_on]
+            event = await collector.next_event()
+            assert (event.get("status"), event.get("blocked_on")) == ("running", blocked_on)
         else:
-            assert running_reasons == [], f"a {server_status} turn was reopened; saw {statuses}"
+            await collector.assert_no_event(within=0.2)
             assert sessions_module._session_status_cache.get(session_id) == server_status
         if server_status == "failed":
             persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])

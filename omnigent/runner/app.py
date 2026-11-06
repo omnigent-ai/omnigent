@@ -383,7 +383,8 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
-# Whether the server's init envelope said it accepts pane-inferred status edges.
+# Whether the server on the current connection said, in an init envelope, that
+# it accepts pane-inferred status edges. A reconnect clears it.
 _server_accepts_inferred_status = False
 
 
@@ -2337,8 +2338,6 @@ def create_runner_app(
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
-        global _server_accepts_inferred_status
-        _server_accepts_inferred_status = False
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
 
@@ -3501,6 +3500,9 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                # Drop inferred edges queued before a reconnect until the new server accepts them.
+                if event.get("inferred") is True and not _server_accepts_inferred_status:
+                    continue
                 frame = "data: " + json.dumps(event) + "\n\n"
                 try:
                     yield frame.encode("utf-8")
@@ -8430,6 +8432,9 @@ def create_runner_app(
     )
 
     async def _catch_up_scan() -> None:
+        global _server_accepts_inferred_status
+        # The new connection may reach an older server; it must accept inferred status anew.
+        _server_accepts_inferred_status = False
         recreated_prompts = pending_approvals.notify_server_reconnect()
         if recreated_prompts:
             _logger.info(

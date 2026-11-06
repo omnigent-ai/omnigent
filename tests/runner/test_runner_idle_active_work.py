@@ -623,38 +623,84 @@ async def test_only_pane_inferred_status_is_marked_inferred() -> None:
 
 
 @pytest.mark.asyncio
-async def test_pane_inference_waits_for_a_server_that_accepts_it(
+async def test_pane_inference_is_scoped_to_the_server_connection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a server whose init envelope says so receives pane-inferred status."""
+    """
+    A current server's init envelope enables pane-inferred status until a reconnect.
+
+    An id-only init for another session leaves it on. After a reconnect, an
+    inferred edge still queued is dropped until the new server accepts them.
+    """
     from omnigent.entities import Conversation
-    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from omnigent.runner.session_init_protocol import (
+        SESSION_INIT_PAYLOAD_KEY,
+        build_runner_session_init_payload,
+    )
     from tests.runner.conftest import _runner_client
 
+    def envelope_init(session_id: str) -> dict[str, object]:
+        conversation = Conversation(
+            id=session_id,
+            created_at=1,
+            updated_at=1,
+            agent_id="ag",
+            root_conversation_id=session_id,
+        )
+        return build_runner_session_init_payload(conversation, server_version="0.22.0")
+
+    async def streamed_statuses(session_id: str) -> list[tuple[str, str | None, bool]]:
+        app.state.session_event_queues[session_id].put_nowait(None)
+        response = await client.get(f"/v1/sessions/{session_id}/stream")
+        events = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        return [
+            (event["status"], event.get("blocked_on"), event.get("inferred") is True)
+            for event in events
+            if event.get("type") == "session.status"
+        ]
+
+    conv_id = "conv_native_current_server"
     monkeypatch.setattr("omnigent.runner.app._server_accepts_inferred_status", False)
-    app = await _native_app_with_session("conv_native_current_server")
-    accepts_inferred_status = app.state.session_resource_registry._accepts_inferred_status
+    app = await _native_app_with_session(conv_id)
+    registry = app.state.session_resource_registry
+    accepts_inferred_status = registry._accepts_inferred_status
+    publish = registry._session_status_publisher
+    assert publish is not None
     assert accepts_inferred_status() is False
-    current = Conversation(
-        id="conv_native_current_server",
-        created_at=1,
-        updated_at=1,
-        agent_id="ag",
-        root_conversation_id="conv_native_current_server",
-    )
     async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json=envelope_init(conv_id))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        # A current server falls back to this body when it cannot build an envelope.
         created = await client.post(
-            "/v1/sessions",
-            json=build_runner_session_init_payload(current, server_version="0.22.0"),
+            "/v1/sessions", json={"session_id": "conv_native_id_only_init", "agent_id": "ag"}
         )
         assert created.status_code == 201, created.text
         assert accepts_inferred_status() is True
-        # An older server sends no envelope.
-        created = await client.post(
-            "/v1/sessions", json={"session_id": "conv_native_older_server", "agent_id": "ag"}
-        )
+        await streamed_statuses(conv_id)
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
+
+        publish(conv_id, "running", None, inferred=True)
+        await app.state.catch_up_scan()
+        assert accepts_inferred_status() is False
+        publish(conv_id, "running", None)
+        assert await streamed_statuses(conv_id) == [("running", None, False)]
+
+        older_init = envelope_init("conv_native_older_server")
+        older_envelope = older_init[SESSION_INIT_PAYLOAD_KEY]
+        assert isinstance(older_envelope, dict)
+        older_envelope.pop("accepts_inferred_status")
+        created = await client.post("/v1/sessions", json=older_init)
         assert created.status_code == 201, created.text
         assert accepts_inferred_status() is False
+        created = await client.post("/v1/sessions", json=envelope_init("conv_native_new_server"))
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
 
 
 @pytest.mark.asyncio
