@@ -1117,3 +1117,34 @@ def test_spawn_scan_streams_large_transcripts_and_tolerates_partial_records(
         expected.add("toolu_child")
     assert tool_use_ids == expected
     assert peak_bytes < 4 * 1024 * 1024, "spawn discovery retained the whole 16 MiB transcript"
+
+
+def test_spawn_scan_leaves_concurrent_appends_for_the_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(_spawn_record("toolu_first", "first", sidechain=False)) + "\n",
+        encoding="utf-8",
+    )
+    real_loads = json.loads
+    appended = False
+
+    def append_during_parse(value: str, *args: Any, **kwargs: Any) -> Any:
+        nonlocal appended
+        if not appended:
+            appended = True
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(_spawn_record("toolu_later", "later", sidechain=False)) + "\n"
+                )
+        return real_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(forwarder.json, "loads", append_during_parse)
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first"
+    }
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_first",
+        "toolu_later",
+    }

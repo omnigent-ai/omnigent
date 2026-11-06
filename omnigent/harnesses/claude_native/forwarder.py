@@ -2605,9 +2605,15 @@ def _tool_use_ids_in_transcript(
     """
     tool_use_ids: set[str] = set()
     try:
-        # Stream records so a large tool result does not copy the whole transcript.
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
+        # Stream a finite snapshot; Claude can append more records while we parse.
+        with transcript_path.open("rb") as handle:
+            remaining_bytes = os.fstat(handle.fileno()).st_size
+            while remaining_bytes > 0:
+                raw_line = handle.readline(remaining_bytes)
+                if not raw_line:
+                    break
+                remaining_bytes -= len(raw_line)
+                line = raw_line.decode("utf-8", errors="replace")
                 try:
                     record = json.loads(line)
                 except (json.JSONDecodeError, TypeError):
