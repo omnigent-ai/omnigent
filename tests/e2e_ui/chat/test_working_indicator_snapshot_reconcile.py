@@ -132,6 +132,7 @@ def _install_stream_silenced_after_turn_opens(page: Page, session_id: str) -> No
                   for (;;) {
                     const { value, done } = await reader.read();
                     if (done) return;
+                    if (window.__streamSilenced) continue;
                     buffered += decoder.decode(value, { stream: true });
                     let end;
                     while (!window.__streamSilenced && (end = buffered.indexOf("\\n\\n")) >= 0) {
