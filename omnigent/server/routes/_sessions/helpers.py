@@ -7950,8 +7950,12 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
-    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
-    request_payload = item.data.model_dump(mode="json", by_alias=True)
+    # Runner retention is delivery lifecycle state, not the caller's payload.
+    lifecycle_fields = {"startup_options": {"runner_wait"}}
+    persisted_payload = persisted.data.model_dump(
+        mode="json", by_alias=True, exclude=lifecycle_fields
+    )
+    request_payload = item.data.model_dump(mode="json", by_alias=True, exclude=lifecycle_fields)
     return persisted.type == item.type and persisted_payload == request_payload
 
 

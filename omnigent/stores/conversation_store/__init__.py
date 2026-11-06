@@ -4,8 +4,9 @@ import hashlib
 import math
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from omnigent.entities import (
@@ -15,11 +16,20 @@ from omnigent.entities import (
     NewConversationItem,
     PagedList,
 )
+from omnigent.entities.conversation import StartupRunnerWait
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
 
 # Pending inputs share the item store, but are not harness transcript history yet.
 PENDING_INPUT_RESPONSE_ID = "pending_input"
+STARTUP_LABEL = "omnigent.startup"
 MAX_PENDING_INPUTS = 100
+
+
+class PendingRunnerWaitCheck(Enum):
+    """An omitted ownership comparison differs from an expected absent runner wait."""
+
+    UNCHECKED = 0
+
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
@@ -508,8 +518,31 @@ class ConversationStore(ABC):
         *,
         expected: str,
         status: str | None,
+        expected_runner_wait: StartupRunnerWait
+        | PendingRunnerWaitCheck
+        | None = PendingRunnerWaitCheck.UNCHECKED,
+        rollback: bool = False,
     ) -> bool:
-        """Compare-and-set delivery state; None discards a canceled, unsent input."""
+        """Compare-and-set delivery state; explicit retry clears the prior runner wait."""
+        raise NotImplementedError
+
+    def claim_pending_input_runner(
+        self,
+        conversation_id: str,
+        item_id: str,
+        *,
+        runner_id: str,
+        deadline: float,
+        connected: bool = False,
+        tighten_deadline: bool = False,
+    ) -> StartupRunnerWait | None:
+        """Retain one queued input's first runner/deadline; refuse settled or canceled inputs."""
+        raise NotImplementedError
+
+    def fail_session_startup(
+        self, conversation_id: str, runner_id: str, *, cancelled: Callable[[], bool] | None = None
+    ) -> bool:
+        """Fail only this runner's idle/unset session, preserving successor work."""
         raise NotImplementedError
 
     def list_host_conversation_ids(

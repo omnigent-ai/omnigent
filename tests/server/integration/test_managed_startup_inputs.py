@@ -997,12 +997,12 @@ async def test_saved_input_retains_the_slow_starting_runner(
             await asyncio.gather(delivery, return_exceptions=True)
             ordinary_finished.clear()
             extended.clear()
+            previous_wait_count = len(waits)
             restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
             restarted.dispatch = startup.dispatch
             delivery = asyncio.create_task(restarted._deliver(env.app, session_id, saved))
-            await asyncio.wait_for(ordinary_finished.wait(), budget(5))
             await asyncio.wait_for(extended.wait(), budget(5))
-            assert len(waits) == 4
+            assert waits[previous_wait_count] > grace, "restart reused ordinary grace"
             assert waits[-1] < waits[1], "restarting the worker renewed the startup deadline"
             assert launch.await_count == 0
         elif outcome == "stop":
@@ -1595,3 +1595,317 @@ async def test_saved_delivery_identifies_failed_boundary(
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
     ) == int(reported_stage == "post_delivery")
+
+
+@pytest.mark.parametrize("name", ["startup-probe", CODEX_NATIVE_CODING_AGENT.agent_name])
+@pytest.mark.parametrize("boundary", ["submission_claim", "resolved_client"])
+async def test_retained_startup_rebind_during_submission_claim_sends_nothing(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, boundary: str
+) -> None:
+    """A completed ownership read cannot authorize a later claim on a retired runner."""
+    import time
+
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    env = startup_env
+    session_id = await _create(env, name=name)
+    entry = _bind(env, session_id)
+    original_runner, replacement_runner = uuid4().hex, uuid4().hex
+    env.conv_store.replace_runner_id(session_id, original_runner)
+    if boundary == "submission_claim":
+        env.conv_store.claim_pending_input_runner(
+            session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+        )
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    transition = env.conv_store.transition_pending_input
+    rebound = False
+
+    def rebind() -> None:
+        nonlocal rebound
+        assert not rebound
+        rebound = True
+        env.conv_store.replace_runner_id(session_id, replacement_runner)
+        env.conv_store.set_session_live_status(session_id, "running")
+        sessions._session_status_cache[session_id] = "running"
+        sessions._session_active_response_cache[session_id] = "replacement-turn"
+
+    def claim_after_rebind(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("status") == "incomplete" and not rebound:
+            rebind()
+        return transition(*args, **kwargs)
+
+    async def resolve_then_rebind(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        if not rebound:
+            current = env.conv_store.get_conversation(session_id)
+            assert current is not None and current.runner_id == original_runner
+            rebind()
+        return runner
+
+    if boundary == "submission_claim":
+        monkeypatch.setattr(env.conv_store, "transition_pending_input", claim_after_rebind)
+    else:
+        monkeypatch.setattr(sessions, "_get_runner_client", resolve_then_rebind)
+    try:
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        await asyncio.wrap_future(
+            session_live_state.submit("test_startup_claim_barrier", lambda: None)
+        )
+        assert rebound
+        assert not [event for event in forwarded if event.get("type") == "message"]
+        current = env.conv_store.get_conversation(session_id)
+        assert current is not None and current.runner_id == replacement_runner
+        assert current.live_status == sessions._session_status_cache[session_id] == "running"
+        assert sessions._session_active_response_cache[session_id] == "replacement-turn"
+        [unsent] = env.conv_store.list_pending_inputs(session_id)
+        assert unsent.id == entry.id and unsent.status == "failed"
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    ("race", "boundary"),
+    [
+        ("replacement", "failure_cas"),
+        ("retention", "failure_cas"),
+        ("same_running", "failure_cas"),
+        ("same_waiting", "failure_cas"),
+        ("receipt", "failure_cas"),
+        ("stop", "failure_cas"),
+        ("replacement", "error_append"),
+        ("same_running", "error_append"),
+    ],
+)
+async def test_retained_startup_failure_preserves_newer_outcomes(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, race: str, boundary: str
+) -> None:
+    """A late refusal belongs to its pending input, not a successor or a settled receipt."""
+    import time
+
+    from omnigent.entities.conversation import NewConversationItem
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    original_runner, replacement_runner = uuid4().hex, uuid4().hex
+    env.conv_store.replace_runner_id(session_id, original_runner)
+    if race != "retention":
+        env.conv_store.claim_pending_input_runner(
+            session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+        )
+    env.conv_store.set_session_live_status(session_id, "idle")
+    sessions._session_status_cache[session_id] = "idle"
+    transition, append = env.conv_store.transition_pending_input, env.conv_store.append
+    injected = False
+    expected_status = (
+        "waiting"
+        if race == "same_waiting"
+        else "idle"
+        if race in {"receipt", "stop"}
+        else "running"
+    )
+
+    def overtake_failure() -> None:
+        nonlocal injected
+        if injected:
+            return
+        injected = True
+        if race == "replacement":
+            env.conv_store.replace_runner_id(session_id, replacement_runner)
+        elif race == "retention":
+            assert (
+                env.conv_store.claim_pending_input_runner(
+                    session_id, entry.id, runner_id=original_runner, deadline=time.time() + 120
+                )
+                is not None
+            )
+        elif race == "receipt":
+            append(
+                session_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="native-receipt",
+                        stable_id=uuid4().hex,
+                        replaces_pending_id=entry.id,
+                        data=entry.data,
+                    )
+                ],
+            )
+        elif race == "stop":
+            env.conv_store.set_labels(session_id, {STARTUP_LABEL: "cancelled"})
+            current = env.conv_store.get_item(session_id, entry.id)
+            assert current is not None
+            assert transition(session_id, entry.id, expected=current.status, status=None)
+        env.conv_store.set_session_live_status(session_id, expected_status)
+        sessions._session_status_cache[session_id] = expected_status
+        if expected_status in {"running", "waiting"}:
+            sessions._session_active_response_cache[session_id] = "successor-turn"
+
+    def fail_after_newer_outcome(*args: Any, **kwargs: Any) -> bool:
+        if kwargs.get("status") == "failed" and boundary == "failure_cas":
+            overtake_failure()
+        return transition(*args, **kwargs)
+
+    def append_after_newer_outcome(conversation_id: str, items: Any, **kwargs: Any) -> Any:
+        if boundary == "error_append" and any(isinstance(item.data, ErrorData) for item in items):
+            overtake_failure()
+        return append(conversation_id, items, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "transition_pending_input", fail_after_newer_outcome)
+    monkeypatch.setattr(env.conv_store, "append", append_after_newer_outcome)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(side_effect=RuntimeError("synthetic pre-delivery refusal")),
+    )
+    await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+    await asyncio.wrap_future(
+        session_live_state.submit("test_startup_failure_barrier", lambda: None)
+    )
+    assert injected
+    current = env.conv_store.get_conversation(session_id)
+    assert current is not None
+    assert current.runner_id == (replacement_runner if race == "replacement" else original_runner)
+    assert current.live_status == sessions._session_status_cache[session_id] == expected_status
+    if expected_status in {"running", "waiting"}:
+        assert sessions._session_active_response_cache[session_id] == "successor-turn"
+    else:
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert not [
+            item for item in env.conv_store.list_items(session_id).data if item.type == "error"
+        ]
+
+    if race == "retention":
+        [pending] = env.conv_store.list_pending_inputs(session_id)
+        assert (
+            pending.status == "in_progress"
+            and pending.data.startup_options.runner_wait is not None
+        )
+
+
+async def test_retained_startup_connection_outlives_its_connect_deadline(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Preparation after a timely connection must not become a connection-timeout failure."""
+    from types import SimpleNamespace
+
+    from omnigent.server import startup_inputs
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    runner_id = uuid4().hex
+    env.conv_store.replace_runner_id(session_id, runner_id)
+    current = env.conv_store.get_conversation(session_id)
+    assert current is not None and current.host_id is not None
+    _connect_host(env, current.host_id)
+    deadline, clock = 1010.0, [1000.0]
+    env.conv_store.claim_pending_input_runner(
+        session_id, entry.id, runner_id=runner_id, deadline=deadline
+    )
+    monkeypatch.setattr(startup_inputs, "time", SimpleNamespace(time=lambda: clock[0]))
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    connected = False
+
+    async def connect(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        nonlocal connected
+        assert kwargs["runner_id"] == runner_id
+        assert clock[0] < deadline
+        connected = True
+        return runner
+
+    async def prepare(*args: Any, **kwargs: Any) -> None:
+        assert connected
+        clock[0] = deadline + 1
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", connect)
+    monkeypatch.setattr(
+        orchestration, "_query_host_runner_status", AsyncMock(return_value="alive")
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", prepare)
+    try:
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        assert connected
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 1 and turns[0]["persisted_item_id"] == entry.id
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert not [
+            item for item in env.conv_store.list_items(session_id).data if item.type == "error"
+        ]
+    finally:
+        await runner.aclose()
+
+
+@pytest.mark.parametrize("repeat_cancel", [False, True])
+async def test_stop_retires_a_dispatched_startup_failure_write(
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    repeat_cancel: bool,
+) -> None:
+    import threading
+    import time
+
+    from omnigent.server.routes import sessions
+    from tests._helpers.polling import poll_until_async
+
+    env = startup_env
+    session_id = await _create(env)
+    entry = _bind(env, session_id)
+    runner_id = uuid4().hex
+    env.conv_store.replace_runner_id(session_id, runner_id)
+    env.conv_store.claim_pending_input_runner(
+        session_id, entry.id, runner_id=runner_id, deadline=time.time() + 120
+    )
+    env.conv_store.set_session_live_status(session_id, "idle")
+    sessions._session_status_cache[session_id] = "idle"
+    entered, release, drained = threading.Event(), threading.Event(), threading.Event()
+    failure_write = env.conv_store.fail_session_startup
+    cancellation: list[Any] = []
+
+    def blocked_write(*args: Any, **kwargs: Any) -> bool:
+        cancellation.append(kwargs.get("cancelled"))
+        entered.set()
+        try:
+            assert release.wait(5)
+            return failure_write(*args, **kwargs)
+        finally:
+            drained.set()
+
+    monkeypatch.setattr(env.conv_store, "fail_session_startup", blocked_write)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(side_effect=RuntimeError("synthetic policy refusal")),
+    )
+    startup = env.app.state.startup_inputs
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, entry))
+    stop = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        stop = asyncio.create_task(startup.cancel(session_id))
+        await poll_until_async(
+            lambda: (
+                stop.done()
+                or (bool(cancellation) and cancellation[0] is not None and cancellation[0]())
+            ),
+            timeout_s=3,
+        )
+        if repeat_cancel:
+            delivery.cancel()
+        release.set()
+        await asyncio.wait_for(stop, 3)
+        assert await asyncio.to_thread(drained.wait, 3)
+        assert env.conv_store.get_conversation(session_id).live_status == "idle"
+        assert env.conv_store.list_pending_inputs(session_id) == []
+    finally:
+        release.set()
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        if stop is not None:
+            await asyncio.gather(stop, return_exceptions=True)

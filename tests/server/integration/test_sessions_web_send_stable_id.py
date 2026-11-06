@@ -15,7 +15,12 @@ import httpx
 import pytest
 
 from omnigent.entities import NewConversationItem
-from omnigent.entities.conversation import ConversationItem
+from omnigent.entities.conversation import (
+    ConversationItem,
+    MessageData,
+    StartupInputOptions,
+    StartupRunnerWait,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.routes._sessions.helpers import _stable_id_reuse_is_exact_retry
 from omnigent.server.routes.sessions import _build_new_item
@@ -106,6 +111,16 @@ def test_stable_id_reuse_by_the_same_author_is_a_retry_only_when_the_body_matche
     assert _stable_id_reuse_is_exact_retry(_persisted(), _resend(f"{_TEXT}, but edited")) is False
     # Single-user mode: both sides carry no identity and still compare equal.
     assert _stable_id_reuse_is_exact_retry(_persisted(created_by=None), _resend(created_by=None))
+    saved, resend = _persisted(), _resend()
+    assert isinstance(saved.data, MessageData) and isinstance(resend.data, MessageData)
+    options = StartupInputOptions(model_override="chosen", tools=[])
+    saved.data.startup_options = options.model_copy(
+        update={"runner_wait": StartupRunnerWait(runner_id="runner-owned", deadline=1000.0)}
+    )
+    resend.data.startup_options = options
+    assert _stable_id_reuse_is_exact_retry(saved, resend)
+    resend.data.startup_options = options.model_copy(update={"model_override": "different"})
+    assert not _stable_id_reuse_is_exact_retry(saved, resend)
 
 
 def test_stable_id_reuse_by_another_author_is_refused() -> None:

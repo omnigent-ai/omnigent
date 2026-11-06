@@ -21,6 +21,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.errors import ErrorCode
 from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes import sessions as sessions_facade
 from omnigent.server.routes._sessions import helpers
@@ -591,6 +592,7 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
         "exit_report",
         "saved_cancelled",
         "unsupported",
+        "unsupported_connected",
         "expired_process",
         "short_budget",
         "late_connect",
@@ -609,26 +611,63 @@ async def test_explicit_sign_in_wait_is_bounded_and_owned(monkeypatch, outcome) 
     ],
 )
 async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, outcome) -> None:
+    from starlette.datastructures import Headers
+
+    from omnigent.entities.conversation import MessageData, StartupInputOptions, StartupRunnerWait
     from omnigent.errors import OmnigentError
+    from omnigent.server import startup_inputs
     from omnigent.server.routes._sessions import orchestration
+    from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 
     clock = _VirtualTime()
-    monkeypatch.setattr(orchestration, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(
+        orchestration, "time", SimpleNamespace(monotonic=clock.monotonic, time=clock.monotonic)
+    )
+    monkeypatch.setattr(startup_inputs, "time", SimpleNamespace(time=clock.monotonic))
     monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0)
     current = SimpleNamespace(runner_id="runner-owned", host_id="host-owned", labels={})
     connection = SimpleNamespace(host_id="host-owned")
     registered = connection
     registry = SimpleNamespace(get=lambda _host_id: registered)
     owner_reads = 0
+    cross_owner_deadline = False
 
     def current_binding(_session_id):
         nonlocal owner_reads
         owner_reads += 1
-        if outcome == "late_owner_read" and owner_reads >= 2:
+        if outcome == "late_owner_read" and cross_owner_deadline:
             clock.now = 150.0
         return current
 
-    store = SimpleNamespace(get_conversation=current_binding)
+    retained = None
+
+    def pending_item(_session_id, _input_id):
+        return SimpleNamespace(
+            response_id=PENDING_INPUT_RESPONSE_ID,
+            status="in_progress",
+            data=MessageData(
+                role="user", content=[], startup_options=StartupInputOptions(runner_wait=retained)
+            ),
+        )
+
+    def claim_runner(
+        _session_id, _input_id, *, runner_id, deadline, connected=False, tighten_deadline=False
+    ):
+        nonlocal retained
+        if retained is None:
+            retained = StartupRunnerWait(runner_id=runner_id, deadline=deadline)
+        elif tighten_deadline and deadline < retained.deadline and not retained.connected:
+            retained = retained.model_copy(update={"deadline": deadline})
+        if connected:
+            retained = retained.model_copy(update={"connected": True})
+        return retained
+
+    store = SimpleNamespace(
+        get_conversation=current_binding,
+        get_item=pending_item,
+        claim_pending_input_runner=claim_runner,
+    )
+    saved_input = startup_inputs.StartupInputContext(None, Headers(), None, "input-owned")
     extended = asyncio.Event()
     polled = asyncio.Event()
     initial_status = asyncio.Event()
@@ -662,7 +701,7 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
         if status_calls == 1:
             if outcome in {"fresh_expired", "fresh_latency"}:
                 await asyncio.Future()
-            if outcome == "unsupported":
+            if outcome in {"unsupported", "unsupported_connected"}:
                 return None
             if outcome == "fixed_ceiling":
                 clock.now = 100.0
@@ -676,16 +715,18 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
                 "response_consumed": 599.0,
                 "auth_deadline": 0.0,
             }.get(outcome, 450.0)
-            on_launch_age(age)
+            if on_launch_age is not None:
+                on_launch_age(age)
             return "alive"
         if outcome in {"fresh_expired", "fresh_latency"}:
             if outcome == "fresh_latency":
                 clock.now = 90.0
-            on_launch_age(600.0 if outcome == "fresh_expired" else 550.0)
+            if on_launch_age is not None:
+                on_launch_age(600.0 if outcome == "fresh_expired" else 550.0)
             return "alive"
         polled.set()
         verdict, age = await next_status.get()
-        if age is not None:
+        if age is not None and on_launch_age is not None:
             on_launch_age(age)
         return verdict
 
@@ -703,19 +744,28 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
             host_conn=connection,
             host_registry=registry,
             conversation_store=store,
-            retain_startup=True,
+            startup_input=saved_input,
         )
     )
     try:
         async with asyncio.timeout(budget(5)):
             await initial_status.wait()
-            if outcome in {"unsupported", "fresh_expired", "fresh_latency"}:
-                clock.now = 30.0
-                initial_results.put_nowait(None)
-                if outcome == "unsupported":
+            if outcome in {
+                "unsupported",
+                "unsupported_connected",
+                "fresh_expired",
+                "fresh_latency",
+            }:
+                clock.now = 20.0 if outcome == "unsupported_connected" else 30.0
+                initial_results.put_nowait(client if outcome == "unsupported_connected" else None)
+                if outcome == "unsupported_connected":
+                    assert await task is client
+                    assert saved_input.runner_wait.connected
+                elif outcome == "unsupported":
                     assert await task is None
                 else:
-                    assert await task is None
+                    with pytest.raises(OmnigentError, match="startup deadline"):
+                        await task
                 assert waits == [30.0]
                 return
             if outcome in {
@@ -764,8 +814,13 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
                 else:
                     current.host_id = "host-replacement"
                 next_status.put_nowait(("alive", None))
-                with pytest.raises(OmnigentError, match=r"was stopped|binding changed"):
-                    await task
+                if outcome == "stopped":
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    with pytest.raises(OmnigentError) as error:
+                        await task
+                    assert error.value.code == ErrorCode.WRONG_REPLICA
             elif outcome == "host_lost":
                 registered = None
                 next_status.put_nowait((None, None))
@@ -798,8 +853,9 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
                 assert len(waits) == 2
             elif outcome in {"before_deadline", "after_deadline", "late_owner_read"}:
                 clock.now = 151.0 if outcome == "after_deadline" else 149.0
+                cross_owner_deadline = outcome == "late_owner_read"
                 connection_results.put_nowait(client)
-                if outcome == "before_deadline":
+                if outcome != "after_deadline":
                     assert await task is client
                 else:
                     with pytest.raises(OmnigentError, match="startup deadline"):
@@ -815,25 +871,27 @@ async def test_accepted_startup_uses_only_the_owned_process_budget(monkeypatch, 
                     await task
             elif outcome in {"sign_in", "sign_in_resumed", "auth_deadline"}:
                 clock.now = {"sign_in": 140.0, "auth_deadline": 30.0}.get(outcome, 50.0)
+                polled.clear()
                 next_status.put_nowait(("sign_in_pending", None))
-                await poll_until_async(lambda: len(waits) == 3, timeout_s=budget(5))
+                await polled.wait()
+                assert waits == [timeout, allowance], "sign-in must reuse the durable budget"
+                assert saved_input.runner_wait.deadline == allowance
                 if outcome == "auth_deadline":
-                    assert waits[-1] == 150.0
-                    clock.now = 180.0
+                    clock.now = 600.0
                     connection_results.put_nowait(None)
-                    assert await task is None
-                    assert len(waits) == 3
+                    with pytest.raises(OmnigentError, match="startup deadline"):
+                        await task
                 elif outcome == "sign_in":
-                    assert waits[-1] == 10.0
                     clock.now = 150.0
                     connection_results.put_nowait(None)
                     with pytest.raises(OmnigentError, match="startup deadline"):
                         await task
                 else:
                     clock.now = 60.0
+                    polled.clear()
                     next_status.put_nowait(("alive", None))
-                    await poll_until_async(lambda: len(waits) == 4, timeout_s=budget(5))
-                    assert waits[-1] == 90.0
+                    await polled.wait()
+                    assert waits == [timeout, allowance]
                     connection_results.put_nowait(client)
                     assert await task is client
             elif outcome == "resolution_retry":
