@@ -523,7 +523,7 @@ describe("quick pin/unpin hover button", () => {
       "fine-hover:md:pointer-events-none",
       "fine-hover:md:group-hover:pointer-events-auto",
       "fine-hover:md:group-has-[:focus-visible]:pointer-events-auto",
-      "fine-hover:md:group-has-[[aria-expanded=true]]:pointer-events-auto",
+      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:pointer-events-auto",
     );
     expect(cluster).not.toHaveClass("pointer-events-none", "md:pointer-events-none");
   });
@@ -545,7 +545,7 @@ describe("quick pin/unpin hover button", () => {
     expect(kebab).toHaveClass(
       "fine-hover:md:opacity-0",
       "fine-hover:md:group-hover:opacity-100",
-      "fine-hover:md:group-has-[[aria-expanded=true]]:opacity-100",
+      "fine-hover:md:group-has-[[data-testid=conversation-actions][aria-expanded=true]]:opacity-100",
     );
     expect(kebab).not.toHaveClass("md:opacity-0");
   });
