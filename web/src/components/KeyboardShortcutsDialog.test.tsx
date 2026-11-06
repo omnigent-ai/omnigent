@@ -141,7 +141,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     isNativeShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList variant="settings" />);
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
   });
 
   it("renders nothing until opened", () => {
@@ -165,9 +165,9 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Previous session")).toBeTruthy();
-    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    expect(screen.getByText("Go back")).toBeTruthy();
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
@@ -248,9 +248,11 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.queryByText("Close tab, or leave the session")).toBeNull();
     expect(screen.queryByText("Quit Omnigent")).toBeNull();
     expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
 
     supportsDesktopCommands.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", ","]);
     expect(keysFor("Close tab, or leave the session")).toEqual(["Ctrl", "W"]);
     expect(keysFor("Close window")).toEqual(["Ctrl", "⇧", "W"]);
     expect(keysFor("Pin or unpin current session")).toEqual(["Ctrl", "Alt", "P"]);

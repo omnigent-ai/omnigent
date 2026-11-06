@@ -188,7 +188,10 @@ _TRACK_PARAGRAPH_TOPS = """(text) => {
     const record = () => {
         const paragraph = [...document.querySelectorAll('[role="log"] p')]
             .find((element) => element.textContent.includes(text));
-        if (paragraph) window.__paragraphTops.push(paragraph.getBoundingClientRect().top);
+        if (paragraph) {
+            const top = paragraph.getBoundingClientRect().top;
+            window.__paragraphTops.push({ top, time: performance.now() });
+        }
     };
     const sample = () => {
         const observer = new ResizeObserver(() => {
@@ -259,11 +262,19 @@ def test_turn_end_eases_a_transcript_at_its_end_down(
         "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
     )
 
-    tops = page.evaluate("() => window.__paragraphTops")
-    steps = [round(after - before, 1) for before, after in pairwise(tops) if after != before]
+    samples = page.evaluate("() => window.__paragraphTops")
+    moves = [
+        (after["time"], round(after["top"] - before["top"], 1))
+        for before, after in pairwise(samples)
+        if after["top"] != before["top"]
+    ]
+    steps = [step for _, step in moves]
     assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
-    assert len(steps) >= 3, f"the transcript dropped in {len(steps)} frame(s): {steps}"
-    assert max(steps) < 0.9 * row["height"], f"one frame moved it by the row's height: {steps}"
+    # Timed rather than counted per frame: a slow runner paints few frames of the 180 ms
+    # ease, and the sampler only records frames whose layout changed, so the slow tail can
+    # go unrecorded (84 ms was seen). Removing the row at once moves it in one frame (0 ms).
+    span = moves[-1][0] - moves[0][0]
+    assert span >= 40, f"the transcript moved within {span:.0f} ms ({steps}), not eased"
 
 
 # Pauses the indicator's animations and steps them through 3.4s, recording what moves.

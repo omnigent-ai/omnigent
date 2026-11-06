@@ -43,7 +43,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors");
+const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -76,7 +77,7 @@ const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
-const { registerBrowserIpc } = require("./browserIpc");
+const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -2782,6 +2783,11 @@ function createWindow(targetUrl, opts = {}) {
     state.desktopCommands = null;
     if (BrowserWindow.getFocusedWindow() === win) buildMenu();
   });
+  // macOS trackpad swipes step back and forward, like a browser.
+  win.on("swipe", (_event, direction) => {
+    if (direction === "left") goInHistory(win, "go-back");
+    else if (direction === "right") goInHistory(win, "go-forward");
+  });
 
   // Databricks workspace-hosted Omnigent renders inside the workspace's
   // top-nav chrome (the SPA is a workspace page). On a dedicated desktop
@@ -3764,6 +3770,25 @@ function buildMenu() {
     ],
   });
   template.push({
+    label: "Go",
+    submenu: [
+      {
+        id: "go_back",
+        label: "Back",
+        accelerator: "CmdOrCtrl+[",
+        enabled: canRun("go-back"),
+        click: () => goInHistory(desktopCommandTarget("go-back"), "go-back"),
+      },
+      {
+        id: "go_forward",
+        label: "Forward",
+        accelerator: "CmdOrCtrl+]",
+        enabled: canRun("go-forward"),
+        click: () => goInHistory(desktopCommandTarget("go-forward"), "go-forward"),
+      },
+    ],
+  });
+  template.push({
     label: "Session",
     submenu: [
       {
@@ -4050,7 +4075,7 @@ function guardAgentPartitionRequests(partition, registry) {
 function arcaPreviewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
-    !isLocalhostUrl(url) ||
+    !isLoopbackPreviewUrl(url) ||
     !isPinnedOriginSender(event) ||
     !win ||
     win.isDestroyed() ||
@@ -5583,6 +5608,24 @@ function closeFocused() {
     return;
   }
   focused.close();
+}
+
+/**
+ * Back/Forward. A focused embedded web page steps its own history, as in a
+ * browser; otherwise the page steps in-app history.
+ *
+ * @param {BrowserWindow | null} win
+ * @param {"go-back" | "go-forward"} command
+ */
+function goInHistory(win, command) {
+  if (!win || !windows.get(win)?.desktopCommands?.commands.has(command)) return;
+  const viewId = focusedBrowserViewId(win);
+  const view = viewId ? windows.get(win).browserRegistry.get(viewId)?.view : null;
+  if (view) {
+    (command === "go-back" ? goBack : goForward)(view.webContents);
+    return;
+  }
+  sendDesktopCommand(win, command);
 }
 
 /**

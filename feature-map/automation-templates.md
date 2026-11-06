@@ -106,14 +106,15 @@ to customize.
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
   fixed; other tasks expose schedule controls. Name comes first, followed by
   Trigger type during creation. The modal opens with Instructions focused.
-  Run on and session mode precede Repeat and
-  Time because both determine the minimum interval. Time and timezone are separate
-  controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
+  Agent sits directly below Run on, outside Advanced. When editing a recognized
+  trigger, Harness for matching sessions appears there instead. Run on and session
+  mode precede Repeat and Time because both determine the minimum interval. Time
+  and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
-  Repository, Project, agent settings, and Ends. Name remains required and editable
-  without opening Advanced; changing instructions preserves it. Configured overrides
-  are summarized beside Advanced, and invalid
+  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  required and editable without opening Advanced; changing instructions preserves
+  it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
@@ -127,9 +128,9 @@ to customize.
 - **Creation modal:** click New automation on either tab. Schedule is selected
   by default; use Trigger type to select an integration and reveal its conditions
   and session instructions. Returning to Schedule restores the schedule draft.
-  Choose Run on and session mode above Repeat. Expand Advanced to change agent
-  settings or an ending. With `automations_v2` on a server supporting sub-hour
-  schedules, use Repeat → Interval
+  Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
+  model, effort, permissions, or an ending. With `automations_v2` on a server
+  supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
@@ -200,8 +201,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
-- In create and edit setup, expand Advanced, then select Claude Code, Codex, Pi, and a permission-only
-  harness such as Cursor. Check that only supported settings appear, model changes
+- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+  harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
+  expand it to check that only supported settings appear, model changes
   clear unsupported effort choices, and saved selections survive reopening. A new
   automation starts Claude on Auto and Codex on Approve for me, because nobody
   approves an unattended run; choosing Default saves no override. Repeat
