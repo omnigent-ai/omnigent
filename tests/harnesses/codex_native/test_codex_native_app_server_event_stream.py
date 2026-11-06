@@ -110,8 +110,9 @@ async def test_reconnected_client_streams_live_events() -> None:
 
 @pytest.mark.parametrize("stop", [False, True])
 @pytest.mark.parametrize("failure", ["output_limit", "stream_disconnect"])
+@pytest.mark.parametrize("lost_ack", [False, True])
 async def test_recoverable_turn_continuation_over_loopback_rpc(
-    tmp_path: Path, stop: bool, failure: str
+    tmp_path: Path, stop: bool, failure: str, lost_ack: bool
 ) -> None:
     """Real client transport proves delivery and keeps Stop distinct from completion."""
     requests: list[dict] = []
@@ -132,6 +133,7 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
     }
 
     async def handle(websocket: ServerConnection) -> None:
+        subscribed = False
         async for raw in websocket:
             message = json.loads(raw)
             method = message.get("method")
@@ -149,6 +151,7 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
             elif method == "probe/source":
                 await websocket.send(json.dumps(source))
             elif method == "probe/complete":
+                assert subscribed, "live events require thread start or resume on this connection"
                 await websocket.send(
                     json.dumps(
                         {
@@ -182,11 +185,13 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
             elif method in {
                 "turn/start",
                 "thread/read",
+                "thread/resume",
                 "turn/interrupt",
                 "thread/backgroundTerminals/list",
             }:
                 requests.append(message)
                 if method == "turn/start":
+                    subscribed = True
                     receipt.update(
                         {
                             "id": "native-input",
@@ -194,8 +199,13 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
                             "clientId": message["params"]["clientUserMessageId"],
                         }
                     )
+                    if lost_ack:
+                        await websocket.close()
+                        continue
                     result = {"turn": {"id": "ack-is-not-proof"}}
-                elif method == "thread/read":
+                elif method in {"thread/read", "thread/resume"}:
+                    if method == "thread/resume":
+                        subscribed = True
                     result = {
                         "thread": {
                             "id": "thread",
@@ -249,10 +259,30 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
         try:
             await native.notify("probe/source")
             await forward_next()
+            if lost_ack:
+                owner = read_bridge_state(tmp_path)
+                assert owner.automatic_input_outcome == "uncertain"
+                with pytest.raises(StopAsyncIteration):
+                    await asyncio.wait_for(anext(stream), 2)
+                await stream.aclose()
+                await native.close()
+                await native.connect()
+                response = await native.request("thread/resume", {"threadId": "thread"})
+                await fwd._replay_resume_response(
+                    client,
+                    session_id="conv",
+                    bridge_dir=tmp_path,
+                    response=response,
+                    usage_coalescer=fwd._SessionUsageCoalescer(client, "conv"),
+                    elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+                    forwarder_state=state,
+                    codex_client=native,
+                )
+                stream = native.iter_events()
             owner = read_bridge_state(tmp_path)
             assert owner is not None and owner.active_turn_id == "automatic"
             assert owner.automatic_input_client_message_id == receipt["clientId"]
-            assert owner.automatic_input_outcome == "accepted"
+            assert owner.automatic_input_outcome == ("uncertain" if lost_ack else "accepted")
             if stop:
                 assert await CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("conv")
                 assert read_bridge_state(tmp_path).active_turn_id == "automatic"
@@ -265,11 +295,12 @@ async def test_recoverable_turn_continuation_over_loopback_rpc(
                 continuation = requests[0]["params"]["input"][0]["text"]
                 assert "stream disconnected" in continuation
                 assert "Do not repeat completed tool calls" in continuation
-            assert [request["method"] for request in requests] == (
-                ["turn/start", "thread/read", "turn/interrupt", "thread/backgroundTerminals/list"]
-                if stop
-                else ["turn/start", "thread/read", "thread/backgroundTerminals/list"]
-            )
+            assert [request["method"] for request in requests] == [
+                "turn/start",
+                "thread/resume" if lost_ack else "thread/read",
+                *(["turn/interrupt"] if stop else []),
+                "thread/backgroundTerminals/list",
+            ]
             assert read_bridge_state(tmp_path).active_turn_id is None
             answers = [
                 body

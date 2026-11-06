@@ -3395,7 +3395,7 @@ async def _replay_resume_response(
             if not turn_id or not isinstance(items, list):
                 continue
             if (
-                _is_completed_automatic_input_source(bridge_dir, turn_id)
+                _is_completed_automatic_input_source(read_bridge_state(bridge_dir), turn_id)
                 and not _is_recovered_output_limit_source(bridge_dir, turn_id)
                 and (source_error := _terminal_error_from_turn({"turn": turn})) is not None
             ):
@@ -3528,7 +3528,7 @@ def _resume_turn_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        if _is_completed_automatic_input_source(bridge_dir, turn_id):
+        if _is_completed_automatic_input_source(state, turn_id):
             return None
         if (
             state.automatic_input_turn_id == turn_id
@@ -3550,15 +3550,18 @@ def _resume_turn_status_edge_for_latest_turn(
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
         if state.automatic_input_turn_id == turn_id and status != "running":
-            settle_codex_automatic_input(
-                bridge_dir,
-                expected=state,
-                outcome=(
-                    "cancel_completed"
-                    if codex_automatic_input_was_interrupted(state)
-                    else "completed"
-                ),
-            )
+            try:
+                settle_codex_automatic_input(
+                    bridge_dir,
+                    expected=state,
+                    outcome=(
+                        "cancel_completed"
+                        if codex_automatic_input_was_interrupted(state)
+                        else "completed"
+                    ),
+                )
+            except OSError:
+                _logger.warning("Could not settle the resumed Codex continuation", exc_info=True)
         if _is_recovered_output_limit_source(bridge_dir, turn_id):
             return _CodexTurnStatusEdge(status="idle", turn_id=turn_id, source="thread/resume")
         return _CodexTurnStatusEdge(
@@ -3718,7 +3721,7 @@ async def _handle_event(
         delta_coalescer = child_stream.delta_coalescer
         child_usage_baseline = forwarder_state.child_usage_baselines.get(child_thread_id)
     if not is_child:
-        control = read_bridge_state(bridge_dir)
+        control = await asyncio.to_thread(read_bridge_state, bridge_dir)
         if control is not None and (
             control.session_id != route_session_id
             or (
@@ -3734,7 +3737,7 @@ async def _handle_event(
             event_bridge_dir = None
         elif control is not None:
             observed_turn = _terminal_turn_id_from_params(params)
-            if _is_completed_automatic_input_source(bridge_dir, observed_turn) and (
+            if _is_completed_automatic_input_source(control, observed_turn) and (
                 method == "turn/started" or method in _CODEX_STREAMING_DELTA_METHODS
             ):
                 return
@@ -4881,11 +4884,12 @@ def _is_recovered_output_limit_source(bridge_dir: Path | None, turn_id: str | No
     )
 
 
-def _is_completed_automatic_input_source(bridge_dir: Path | None, turn_id: str | None) -> bool:
+def _is_completed_automatic_input_source(
+    state: CodexNativeBridgeState | None, turn_id: str | None
+) -> bool:
     """The durable claim proves source completion before delivery is known."""
-    if bridge_dir is None or turn_id is None:
+    if state is None or turn_id is None:
         return False
-    state = read_bridge_state(bridge_dir)
     return bool(
         state is not None
         and state.automatic_input_source_turn_id == turn_id
@@ -5155,20 +5159,16 @@ async def _auto_continue_after_output_limit(
         return True
     receipt: tuple[str, str] | None = None
     try:
-        # Start, reconnect, and receipt read share this one deadline.
+        # The supervisor owns reconnect and resume of this shared event transport.
         async with asyncio.timeout(max(0, deadline - time.time())):
-            try:
-                await codex_client.request(
-                    "turn/start",
-                    {
-                        "threadId": completed.thread_id,
-                        "clientUserMessageId": client_message_id,
-                        "input": [{"type": "text", "text": continuation_text}],
-                    },
-                )
-            except (OSError, ConnectionClosed):
-                await codex_client.close()
-                await codex_client.connect()
+            await codex_client.request(
+                "turn/start",
+                {
+                    "threadId": completed.thread_id,
+                    "clientUserMessageId": client_message_id,
+                    "input": [{"type": "text", "text": continuation_text}],
+                },
+            )
             while _same_native_owner(read_bridge_state(bridge_dir), completed):
                 response = await codex_client.request(
                     "thread/read", {"threadId": completed.thread_id, "includeTurns": True}
@@ -5422,7 +5422,9 @@ async def _maybe_handle_turn_event(
                         turn_id,
                     )
                     return True
-                if _is_completed_automatic_input_source(bridge_dir, turn_id):
+                if _is_completed_automatic_input_source(
+                    read_bridge_state(bridge_dir) if bridge_dir is not None else None, turn_id
+                ):
                     assert turn_id is not None
                     forwarder_state.surfaced_terminal_error_turns.add(turn_id)
                     forwarder_state.presented_output_limit_error_turns.add(turn_id)
@@ -5704,7 +5706,9 @@ async def _maybe_handle_delta_event(
             # is mirrored whole when the item completes.
             return True
         turn_id = _turn_id_from_payload(params)
-        if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
+        if bridge_dir is not None and not await asyncio.to_thread(
+            _is_active_turn_delta, bridge_dir, turn_id
+        ):
             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
             return True
         await delta_coalescer.append_tool_output(delta, call_id=call_id)
@@ -5827,7 +5831,7 @@ async def _handle_terminal_turn_boundary_inner(
         pending.error if pending is not None else None
     )
     interrupted = _turn_status_is_interrupted(_turn_status_from_params(params))
-    retired_source = _is_completed_automatic_input_source(bridge_dir, terminal_turn_id)
+    retired_source = _is_completed_automatic_input_source(completed, terminal_turn_id)
     source_flushed = False
 
     async def flush_source() -> None:
@@ -5941,7 +5945,10 @@ async def _handle_terminal_turn_boundary_inner(
                 in {"cancel_requested", "cancel_acknowledged", "cancel_unconfirmed"}
                 else "completed"
             )
-            settle_codex_automatic_input(bridge_dir, expected=current, outcome=outcome)
+            try:
+                settle_codex_automatic_input(bridge_dir, expected=current, outcome=outcome)
+            except OSError:
+                _logger.warning("Could not settle the completed Codex continuation", exc_info=True)
     await flush_source()
     if (
         retired_source
@@ -8111,7 +8118,9 @@ async def _handle_agent_message_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex agentMessage delta missing string delta: turn_id=%s", turn_id)
         return
-    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
+    if bridge_dir is not None and not await asyncio.to_thread(
+        _is_active_turn_delta, bridge_dir, turn_id
+    ):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
@@ -8180,7 +8189,9 @@ async def _handle_plan_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex plan delta missing string delta: turn_id=%s", turn_id)
         return
-    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
+    if bridge_dir is not None and not await asyncio.to_thread(
+        _is_active_turn_delta, bridge_dir, turn_id
+    ):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)

@@ -11,7 +11,6 @@ import json
 import logging
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -2113,51 +2112,47 @@ async def test_output_limit_reconnect_uses_one_fixed_budget_and_one_send(
     )
     _seed_active_turn(tmp_path, "turn_a")
     normal = codex.request
-    guards: list[asyncio.Timeout] = []
-    rpc_guard: asyncio.Timeout | None = None
-    deadline: float | None = None
-    persisted_deadline: float | None = None
-
-    def timeout(delay: float | None) -> asyncio.Timeout:
-        guard = asyncio.timeout(delay)
-        guards.append(guard)
-        return guard
-
-    monkeypatch.setattr(fwd, "asyncio", SimpleNamespace(**{**vars(asyncio), "timeout": timeout}))
+    resets: list[str] = []
 
     async def request(method: str, params: dict) -> dict:
-        nonlocal rpc_guard, deadline, persisted_deadline
+        result = await normal(method, params)
         if method == "turn/start":
-            rpc_guard = guards[-1]
-            deadline = rpc_guard.when()
-            assert deadline is not None
-            persisted_deadline = read_bridge_state(tmp_path).automatic_input_deadline
-            await normal(method, params)
             raise ConnectionError("ack lost")
-        assert guards[-1] is rpc_guard
-        assert rpc_guard is not None and rpc_guard.when() == deadline
-        return await normal(method, params)
+        return result
+
+    async def close() -> None:
+        resets.append("close")
 
     async def connect() -> None:
-        assert guards[-1] is rpc_guard
-        assert rpc_guard is not None and rpc_guard.when() == deadline
-        if not receipt_after_reconnect:
-            rpc_guard.reschedule(asyncio.get_running_loop().time())
-            await asyncio.Event().wait()
+        resets.append("connect")
 
     monkeypatch.setattr(codex, "request", request)
+    monkeypatch.setattr(codex, "close", close)
     monkeypatch.setattr(codex, "connect", connect)
     await _forward_output_limit_event(
         client, codex, state, tmp_path, "turn/completed", _output_limit_completion()
     )
-    assert [method for method, _ in codex.requests].count("turn/start") == 1
     owner = read_bridge_state(tmp_path)
-    assert owner.automatic_input_deadline == persisted_deadline
-    assert rpc_guard is not None and rpc_guard.expired() is not receipt_after_reconnect
-    assert owner.automatic_input_outcome == (
-        "accepted" if receipt_after_reconnect else "uncertain"
-    )
-    assert ("thread/read" in [method for method, _ in codex.requests]) is receipt_after_reconnect
+    assert resets == []
+    assert owner.automatic_input_outcome == "uncertain"
+    assert owner.automatic_input_deadline is not None
+    assert [method for method, _ in codex.requests] == ["turn/start"]
+    if receipt_after_reconnect:
+        await fwd._replay_resume_response(
+            client,
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            response=codex.snapshot(),
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            forwarder_state=state,
+            codex_client=codex,
+        )
+        resumed = read_bridge_state(tmp_path)
+        assert resumed.active_turn_id == resumed.automatic_input_turn_id == "turn_auto"
+        assert resumed.automatic_input_deadline == owner.automatic_input_deadline
+        assert client.posts[-1][1]["data"]["status"] == "running"
+        assert [method for method, _ in codex.requests] == ["turn/start"]
 
 
 @pytest.mark.parametrize(
@@ -2756,3 +2751,109 @@ async def test_output_limit_deadline_before_send_settles_uncertainty(
     assert read_bridge_state(tmp_path).active_turn_id is None
     assert any(_OUTPUT_LIMIT_ERROR["message"] in json.dumps(body) for _, body in client.posts)
     assert any("Ask it to continue" in json.dumps(body) for _, body in client.posts)
+
+
+@pytest.mark.parametrize("delivery", ["live", "resume"])
+async def test_continuation_settlement_io_failure_preserves_output_and_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, delivery: str
+) -> None:
+    client, codex = _RecordingClient(), _ContinuingCodexClient()
+    state = fwd._CodexForwarderState(
+        background_terminals_supported=False, background_work_unsupported=True
+    )
+    _seed_active_turn(tmp_path, "turn_a")
+    await _forward_output_limit_event(
+        client, codex, state, tmp_path, "turn/completed", _output_limit_completion()
+    )
+    assert read_bridge_state(tmp_path).automatic_input_outcome == "accepted"
+
+    def fail_settlement(*args: Any, **kwargs: Any) -> None:
+        raise OSError("synthetic bridge write failure")
+
+    monkeypatch.setattr(fwd, "settle_codex_automatic_input", fail_settlement)
+    turn = {
+        "id": "turn_auto",
+        "status": "completed",
+        "items": [{"type": "agentMessage", "id": "partial", "text": "Preserved answer."}],
+    }
+    coalescer = fwd._OutputTextDeltaCoalescer(client, "conv_x")
+    try:
+        if delivery == "live":
+            await _forward_output_limit_event(
+                client,
+                codex,
+                state,
+                tmp_path,
+                "item/agentMessage/delta",
+                {
+                    "threadId": "thread_123",
+                    "turnId": "turn_auto",
+                    "itemId": "partial",
+                    "delta": "Preserved answer.",
+                },
+                delta_coalescer=coalescer,
+            )
+            await _forward_output_limit_event(
+                client,
+                codex,
+                state,
+                tmp_path,
+                "turn/completed",
+                {"threadId": "thread_123", "turn": turn},
+                delta_coalescer=coalescer,
+            )
+        else:
+            await fwd._replay_resume_response(
+                client,
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                response={"result": {"thread": {"id": "thread_123", "turns": [turn]}}},
+                usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),
+                elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+                forwarder_state=state,
+                codex_client=codex,
+            )
+        assert "Preserved answer." in json.dumps(client.posts)
+        assert client.posts[-1][1]["data"]["status"] == "idle"
+        assert read_bridge_state(tmp_path).active_turn_id is None
+    finally:
+        await coalescer.close()
+
+
+async def test_parent_delta_owner_reads_stay_off_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    _seed_active_turn(tmp_path, "turn_a")
+    loop_thread = threading.get_ident()
+    reads: list[int] = []
+    normal = fwd.read_bridge_state
+
+    def read(path: Path):
+        reads.append(threading.get_ident())
+        assert reads[-1] != loop_thread, "bridge I/O blocks the forwarding event loop"
+        return normal(path)
+
+    monkeypatch.setattr(fwd, "read_bridge_state", read)
+    client, codex = _RecordingClient(), _ContinuingCodexClient()
+    state = fwd._CodexForwarderState(mcp_startup_settled=True)
+    coalescer = fwd._OutputTextDeltaCoalescer(client, "conv_x")
+    try:
+        await _forward_output_limit_event(
+            client,
+            codex,
+            state,
+            tmp_path,
+            "item/agentMessage/delta",
+            {
+                "threadId": "thread_123",
+                "turnId": "turn_a",
+                "itemId": "partial",
+                "delta": "Live answer.",
+            },
+            delta_coalescer=coalescer,
+        )
+        assert len(reads) == 2
+    finally:
+        await coalescer.close()
