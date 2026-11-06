@@ -72,3 +72,13 @@ jobs:
                 comment_id: String(context.payload.comment.id),
               },
             });
+      - name: Report dispatch failure to authorized requester
+        if: failure() && steps.authorize.outputs.authorized == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: context.payload.issue.number,
+              body: `/address (#issuecomment-${context.payload.comment.id}): Otto could not dispatch this request. A maintainer can inspect the [relay run](${runUrl}) and retry.`,
+            });

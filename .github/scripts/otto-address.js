@@ -7,7 +7,7 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
   const { data: comment } = await github.rest.issues.getComment({ owner, repo, comment_id });
   if (
     comment.body.trim() !== "/address" ||
-    comment.user.type !== "User" ||
+    comment.user?.type !== "User" ||
     comment.issue_url !== `https://api.github.com/repos/${owner}/${repo}/issues/${issue_number}`
   ) return;
   const allowed = new Set(reviewers.toLowerCase().split(/[,\s]+/).filter(Boolean));
@@ -29,9 +29,9 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
   const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
   if (
     pull.state !== "open" || pull.draft ||
-    pull.user.login !== "omni-resolve-agent[bot]" || pull.user.type !== "Bot" ||
+    pull.user?.login !== "omni-resolve-agent[bot]" || pull.user.type !== "Bot" ||
     pull.head.repo?.full_name !== `${owner}/${repo}` ||
-    !pull.head.ref.startsWith("resolve-agent/") || pull.head.ref === pull.base.ref
+    !pull.head.ref.startsWith("resolve-agent/")
   ) {
     core.setOutput("reason", "/address requires an open, non-draft Resolve-authored PR on its own branch.");
     return;

@@ -64,16 +64,20 @@ for (const login of ["second-reader", "third-reader"]) {
 for (const comment of [
   { body: "/address anything" }, { body: "quoted /address" },
   { user: { login: "reader", type: "Bot" } },
+  { user: null },
   { issue_url: "https://api.github.com/repos/omnigent-ai/omnigent/issues/8" },
 ]) {
   test(`rejects unsupported or unauthorized command ${JSON.stringify(comment)}`, async () => {
-    assert.equal((await run({ comment })).outputs.authorized, undefined);
+    const { outputs, pullReads } = await run({ comment });
+    assert.deepEqual(outputs, {});
+    assert.equal(pullReads, 0);
   });
 }
 
 for (const pull of [
   { state: "closed" }, { draft: true },
   { user: { login: "human", type: "User" } },
+  { user: null },
   { head: { repo: { full_name: "other/omnigent" }, ref: "resolve-agent/fix" } },
   { head: { repo: { full_name: "omnigent-ai/omnigent" }, ref: "main" } },
 ]) {
