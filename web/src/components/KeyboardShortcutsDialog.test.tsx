@@ -64,11 +64,12 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
+    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -166,9 +167,9 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Go back")).toBeTruthy();
-    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
+    // A browser tab keeps its own Back and Forward.
+    expect(screen.queryByText("Go back")).toBeNull();
+    expect(screen.queryByText("Go forward")).toBeNull();
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
     expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
@@ -230,7 +231,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(within(row!).getByText("1…0")).toBeTruthy();
   });
 
-  it("shows the recent-session switcher only in Electron", () => {
+  it("shows the recent-session switcher and Back/Forward only in Electron", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Switch recent sessions")).toBeNull();
 
@@ -238,6 +239,8 @@ describe("KeyboardShortcutsDialog", () => {
     isElectronShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
     expect(keysFor("Switch recent sessions")).toEqual(["Ctrl", "Tab"]);
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(
       screen.getByRole("heading", { name: "Navigation" }).closest("section")?.querySelector("li"),
     ).toHaveTextContent("Switch recent sessions");
