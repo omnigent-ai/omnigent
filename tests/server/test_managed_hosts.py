@@ -345,8 +345,8 @@ def test_parse_valid_modal_config_builds_image_parameterized_factory(
     cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == MODAL_MANAGED_TOKEN_TTL_S
-    # Only agent_sandbox keeps refreshing after work; modal's own window is the grace.
-    assert cfg.keep_warm_after_work_s == 0.0
+    # Every provider stays warm for the runner idle timeout after its last work.
+    assert cfg.keep_warm_after_work_s == 3600.0
     # modal is in PROVIDERS_WITH_MANAGED_LAUNCH, so the parsed config
     # advertises managed launch (drives /v1/info's capability flag).
     assert cfg.managed_launch_supported is True
@@ -6169,7 +6169,7 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
 
 
 def test_keep_warm_after_work_is_the_runner_idle_timeout() -> None:
-    """agent_sandbox stays warm keep_warm_s after its last work (else the runner default)."""
+    """A sandbox stays warm for the runner idle timeout after its last work."""
     from omnigent.server.managed_hosts import _keep_warm_after_work_s
 
     assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": 300}}) == 300.0

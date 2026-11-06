@@ -739,10 +739,11 @@ class ManagedSandboxConfig:
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
     manages_profiles: bool = False
-    # Seconds the server keeps refreshing a sandbox after its runner last reported
-    # busy (see managed_host_keepalive). Zero leaves the platform's own idle window
-    # as the only grace; agent_sandbox sets it to keep_warm_s.
-    keep_warm_after_work_s: float = 0.0
+    # Seconds the server keeps refreshing a sandbox after its runner's last work
+    # (see managed_host_keepalive): the runner idle timeout, so a sandbox stays
+    # warm as long as an idle runner would stay alive. Zero leaves the platform's
+    # own idle window as the only grace.
+    keep_warm_after_work_s: float = float(DEFAULT_RUNNER_IDLE_TIMEOUT_S)
 
 
 class NoReachableModels(Exception):
@@ -1316,11 +1317,12 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
 
 
 def _keep_warm_after_work_s(host_config: dict[str, object] | None) -> float:
-    """Seconds an agent_sandbox stays warm after its last work: the runner idle timeout.
+    """Seconds a sandbox stays warm after its runner's last work: the runner idle timeout.
 
-    ``keep_warm_s`` has already been folded into ``host_config.runner.idle_timeout_s``
-    by :func:`_apply_keep_warm`. An explicit ``0`` disables the runner's idle
-    shutdown, so the sandbox stays warm for as long as the runner is connected.
+    For agent_sandbox, ``keep_warm_s`` has already been folded into
+    ``host_config.runner.idle_timeout_s`` by :func:`_apply_keep_warm`. An explicit
+    ``0`` disables the runner's idle shutdown, so the sandbox stays warm for as
+    long as the runner is connected.
     """
     runner = (host_config or {}).get("runner")
     idle = runner.get("idle_timeout_s") if isinstance(runner, dict) else None
@@ -1698,10 +1700,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     from omnigent.inference_config import validate_inference_credentials
 
     validate_inference_credentials({}, model_discovery)
-    keep_warm_after_work_s = 0.0
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
-        keep_warm_after_work_s = _keep_warm_after_work_s(host_config)
     manages_profiles = False
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
@@ -2003,7 +2003,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         manages_profiles=manages_profiles,
-        keep_warm_after_work_s=keep_warm_after_work_s,
+        keep_warm_after_work_s=_keep_warm_after_work_s(host_config),
     )
 
 

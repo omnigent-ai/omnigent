@@ -352,7 +352,11 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
 
 
 class _BusyGate:
-    """Drive touch()/record_pong() with a fake clock and a recording executor."""
+    """Drive touch()/record_pong() with a fake clock and a recording executor.
+
+    The refresh interval is 600s, so with no grace a runner's window is
+    600 + 2 * 30 = 660s after its last work.
+    """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.submitted: list[str] = []
@@ -365,8 +369,6 @@ class _BusyGate:
         for name in (
             "_last_kept",
             "_runner_interval_s",
-            "_last_pong_busy",
-            "_busy_since_kept",
             "_last_busy_at",
             "_runner_warm_grace_s",
             "_last_report_at",
@@ -388,6 +390,12 @@ class _BusyGate:
         managed_host_keepalive.touch(runner_id)
 
 
+def test_pong_interval_matches_the_runner_tunnel() -> None:
+    from omnigent.server.routes import runner_tunnel
+
+    assert managed_host_keepalive._PONG_INTERVAL_S == runner_tunnel.PING_INTERVAL_S
+
+
 def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -401,15 +409,31 @@ def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
 def test_idle_runner_is_not_refreshed_until_work_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")  # connect: nothing reported yet
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.tick()
     gate.tick()
     assert gate.submitted == ["r1"], "an idle runner must let its sandbox stop"
 
-    # The first busy pong after idle refreshes at once, not at the next tick.
+    # Work after the window ran out refreshes at once, not at the next tick.
     gate.now += 30.0
     managed_host_keepalive.record_pong("r1", True)
     assert gate.submitted == ["r1", "r1"]
+
+
+def test_runner_with_no_work_yet_counts_its_window_from_its_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Like the runner's own idle timeout: a runner that has not worked yet stays
+    # warm for its grace after it starts reporting.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
+    managed_host_keepalive.touch("r1")
+    gate.now += 30.0
+    managed_host_keepalive.record_pong("r1", False)  # first pong, idle_s None
+    gate.tick()  # 570s after start
+    gate.tick()  # 1170s
+    gate.tick()  # 1770s: past the grace
+    assert gate.submitted == ["r1"] * 3
 
 
 def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,7 +453,7 @@ def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A 5s refresh interval with 30s pongs: a runner still busy at its last pong
-    # must be refreshed on every tick until a pong says otherwise, or a short
+    # must be refreshed on every tick until well past the next pong, or a short
     # platform window expires between pongs.
     gate = _BusyGate(monkeypatch)
     monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 5.0)
@@ -440,12 +464,10 @@ def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
         managed_host_keepalive.touch("r1")
     assert gate.submitted == ["r1"] * 6
 
-    managed_host_keepalive.record_pong("r1", False)
-    gate.now += 5.0
+    managed_host_keepalive.record_pong("r1", False, idle_s=25.0)
+    gate.now = 1000.0 + 5.0 + 60.0  # the window: one interval plus two pongs
     managed_host_keepalive.touch("r1")
-    gate.now += 5.0
-    managed_host_keepalive.touch("r1")
-    assert len(gate.submitted) == 6, "an idle pong stops refreshes after its pending one"
+    assert len(gate.submitted) == 6, "refreshes stop once the window after the last work ends"
 
 
 def test_pongs_record_nothing_without_managed_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -453,8 +475,8 @@ def test_pongs_record_nothing_without_managed_keepalive(monkeypatch: pytest.Monk
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", None)
     managed_host_keepalive.record_pong("r1", True)
     managed_host_keepalive.record_pong("r1", False)
-    assert managed_host_keepalive._last_pong_busy == {}
-    assert managed_host_keepalive._busy_since_kept == {}
+    assert managed_host_keepalive._last_busy_at == {}
+    assert managed_host_keepalive._last_report_at == {}
     assert gate.submitted == []
 
 
@@ -464,7 +486,7 @@ def test_work_that_ended_inside_an_interval_is_refreshed_once(
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", True)
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
     gate.tick()
     gate.tick()
     assert gate.submitted == ["r1", "r1"]
@@ -474,15 +496,15 @@ def test_unreported_pong_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> Non
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.record_pong("r1", None)
     assert gate.submitted == []
-    assert "r1" not in managed_host_keepalive._busy_since_kept
+    assert "r1" not in managed_host_keepalive._last_report_at
 
 
 def test_forced_refresh_keeps_the_periodic_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An idle-to-busy refresh between ticks must not push the next periodic
-    # refresh a whole interval later.
+    # Work resuming between ticks must not push the next periodic refresh a
+    # whole interval later.
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")  # t=1000
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.now += 61.0
     managed_host_keepalive.record_pong("r1", True)  # forced at t=1061
     gate.now += 539.0
@@ -493,11 +515,10 @@ def test_forced_refresh_keeps_the_periodic_schedule(monkeypatch: pytest.MonkeyPa
 def test_dispatched_work_refreshes_before_the_next_pong(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.now += 1.0
     managed_host_keepalive.record_work_dispatched("r1")  # a message right after an idle pong
     assert gate.submitted == ["r1", "r1"], "new work must not wait for the next pong"
-    # It counts as busy until the runner's next pong says otherwise.
     gate.tick()
     assert gate.submitted == ["r1"] * 3
 
@@ -505,13 +526,13 @@ def test_dispatched_work_refreshes_before_the_next_pong(monkeypatch: pytest.Monk
 def test_runner_stays_warm_for_its_grace_after_the_last_busy_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # agent_sandbox: keep_warm_s (here 1500s) after the runner stops being busy.
+    # A 1500s grace (the runner idle timeout, e.g. agent_sandbox keep_warm_s).
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
     managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", True)  # last busy at t=1000
-    managed_host_keepalive.record_pong("r1", False)
-    gate.tick()  # t=1600: refreshed for the busy interval
+    managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
+    gate.tick()  # t=1600
     gate.tick()  # t=2200: idle, but within the grace
     gate.tick()  # t=2800: grace over
     assert gate.submitted == ["r1", "r1", "r1"]
@@ -554,12 +575,11 @@ def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
     assert gate.submitted == ["r1", "r1"]
 
 
-@pytest.mark.parametrize(("configured", "expected"), [(1500.0, 1500.0), (None, 0.0)])
+@pytest.mark.parametrize(("configured", "expected"), [(1500.0, 1500.0), (None, 3600.0)])
 def test_provider_grace_reaches_the_runner_cache(
     monkeypatch: pytest.MonkeyPatch, configured: float | None, expected: float
 ) -> None:
-    # agent_sandbox configs carry keep_warm_after_work_s; others (or duck-typed
-    # configs without the field) get no grace beyond their platform window.
+    # Duck-typed configs without the field get the default runner idle timeout.
     launcher = _Launcher()
     _wire(
         monkeypatch,
@@ -586,10 +606,10 @@ def test_a_fresh_server_resumes_the_remaining_grace_from_the_runner(
     managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
     managed_host_keepalive.touch("r1")  # the new server's first touch
     managed_host_keepalive.record_pong("r1", False, idle_s=300.0)  # last work 5 min ago
+    assert managed_host_keepalive._last_busy_at["r1"] == 700.0, "idle time is not new work"
     gate.tick()  # 900s after the last work: inside the 1500s grace
     gate.tick()  # 1500s after: grace over
     assert gate.submitted == ["r1", "r1"]
-    assert managed_host_keepalive._busy_since_kept["r1"] is False, "idle time is not new work"
 
 
 def test_an_unlimited_grace_keeps_an_idle_runner_warm(monkeypatch: pytest.MonkeyPatch) -> None:

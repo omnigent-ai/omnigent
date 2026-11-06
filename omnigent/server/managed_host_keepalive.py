@@ -3,16 +3,16 @@
 A runner reports on each tunnel pong whether it did work since its previous
 pong (``PongFrame.busy``, decided by
 :class:`~omnigent.runner.busy_check.RunnerBusyCheck`). A live tunnel alone is not
-enough: a runner stays connected until its idle timeout
-(``runner.idle_timeout_s``) runs out, long after the session went quiet. So a
-reporting runner is refreshed only for intervals in which a pong said busy, and
-the first busy pong after an idle one refreshes at once, because a platform idle
-timer does not see the work itself. Work the server sends to the runner (a
-session event) counts as a busy report right away, so a message sent just after
-an idle pong does not wait for the next one. A provider can keep refreshing for a
-grace period after the last busy report (``keep_warm_after_work_s``; agent_sandbox
-uses ``keep_warm_s``). A runner that never reports (an older runner) keeps the
-previous behaviour: refreshed for as long as its tunnel is up.
+enough: viewing a session keeps a runner connected without any work. So a
+reporting runner is refreshed only while it was busy within its window: one
+refresh interval plus two pong intervals, or its provider's keep-warm grace if
+longer (``keep_warm_after_work_s``, by default the runner idle timeout,
+so a sandbox stays warm as long as an idle runner would stay alive). A busy
+report after the window ran out refreshes at once, because the platform's idle
+timer has been running since the last refresh. Work the server sends to the
+runner (a session event) counts as a busy report right away. A runner that
+never reports (an older runner) keeps the previous behaviour: refreshed for as
+long as its tunnel is up.
 
 This module turns that signal into a provider
 :meth:`~omnigent.onboarding.sandboxes.base.SandboxHostLauncher.keep_alive` call,
@@ -46,6 +46,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxCapabilityError,
     resolve_managed_keepalive_interval_s,
 )
+from omnigent.runner.busy_check import DEFAULT_RUNNER_IDLE_TIMEOUT_S
 
 if TYPE_CHECKING:
     from omnigent.server.managed_hosts import ManagedSandboxDeployment
@@ -84,21 +85,20 @@ _last_kept: dict[str, float] = {}
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
 
-# runner_id -> busy value of its latest pong.
-# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
-_last_pong_busy: dict[str, bool] = {}
-# runner_id -> whether any pong since the last refresh reported busy. Absent for
-# runners that do not report.
-# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
-_busy_since_kept: dict[str, bool] = {}
-# runner_id -> monotonic seconds of its last busy report (pong or dispatched work).
+# Seconds between runner pongs (runner_tunnel.PING_INTERVAL_S; not imported, as
+# that module imports this one). The window adds two of them, so a runner still
+# working at its last pong is refreshed on every tick until the next one.
+_PONG_INTERVAL_S = 30.0
+
+# runner_id -> monotonic seconds of its last work: a busy pong, dispatched work,
+# or the idle time an idle pong reports.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_busy_at: dict[str, float] = {}
 # runner_id -> its provider's keep_warm_after_work_s, cached with the cadence.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _runner_warm_grace_s: dict[str, float] = {}
-# runner_id -> monotonic seconds of its latest busy report, busy or idle. An idle
-# reporting runner is no longer refreshed, so pruning must also look at this.
+# runner_id -> monotonic seconds of its latest busy report, busy or idle. Marks a
+# runner as reporting; an idle one is no longer refreshed, so pruning reads it too.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_report_at: dict[str, float] = {}
 
@@ -148,10 +148,10 @@ def keepalive_interval_s(runner_id: str) -> float:
 def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = None) -> None:
     """Note whether *runner_id* is doing work, from one of its tunnel pongs.
 
-    Once a runner reports, :func:`touch` skips it for any interval in which no
-    pong said busy. The first busy pong after an idle one refreshes right away:
-    a platform idle timer does not see the work itself, so a turn that starts
-    late in a long idle stretch must not wait up to an interval for its refresh.
+    Once a runner reports, :func:`touch` refreshes it only while it was busy
+    within its window (see :func:`_recently_busy`). A busy report after that
+    window ran out refreshes right away: the platform's idle timer has been
+    running since the last refresh, so new work must not wait for the next tick.
 
     :param runner_id: Runner that sent the pong.
     :param busy: The pong's busy report; ``None`` when the runner does not report.
@@ -166,21 +166,23 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
         # from an older runner): fall back to tunnel-lifetime refreshes.
         forget_reports(runner_id)
         return
-    was_busy = _last_pong_busy.get(runner_id)
-    _last_pong_busy[runner_id] = busy
     now = time.monotonic()
+    was_reporting = runner_id in _last_report_at
     _last_report_at[runner_id] = now
-    if not busy:
-        _busy_since_kept.setdefault(runner_id, False)
-        if idle_s is not None:
-            reported = now - idle_s
-            if reported > _last_busy_at.get(runner_id, float("-inf")):
-                _last_busy_at[runner_id] = reported
+    if busy:
+        resumed = was_reporting and not _recently_busy(runner_id, now)
+        _last_busy_at[runner_id] = now
+        if resumed:
+            touch(runner_id, force=True)
         return
-    _busy_since_kept[runner_id] = True
-    _last_busy_at[runner_id] = time.monotonic()
-    if was_busy is False:
-        touch(runner_id, force=True)
+    if idle_s is not None:
+        last_work = now - idle_s
+    elif runner_id not in _last_busy_at:
+        # No work yet: like the runner's own idle timeout, count from its start.
+        last_work = now
+    else:
+        return
+    _last_busy_at[runner_id] = max(_last_busy_at.get(runner_id, last_work), last_work)
 
 
 def forget_reports(runner_id: str) -> None:
@@ -192,7 +194,7 @@ def forget_reports(runner_id: str) -> None:
 
     :param runner_id: Runner whose reports to drop.
     """
-    for state in (_last_pong_busy, _busy_since_kept, _last_busy_at, _last_report_at):
+    for state in (_last_busy_at, _last_report_at):
         state.pop(runner_id, None)
 
 
@@ -237,15 +239,9 @@ def touch(runner_id: str, *, force: bool = False) -> None:
     last = _last_kept.get(runner_id)
     if not force and last is not None and now - last < _interval_for(runner_id):
         return
-    # A reporting runner idle for the whole interval, and past its provider's
-    # keep-warm grace, is left alone so the platform's idle stop can reclaim its
-    # sandbox. The latest report still counts: with an interval shorter than the
-    # ping cadence, several ticks fall between two pongs from a runner still working.
-    if (
-        _busy_since_kept.get(runner_id) is False
-        and not _last_pong_busy.get(runner_id)
-        and not _within_warm_grace(runner_id, now)
-    ):
+    # A reporting runner that has not been busy within its window is left alone,
+    # so the platform's idle stop can reclaim its sandbox.
+    if runner_id in _last_report_at and not _recently_busy(runner_id, now):
         return
     with _inflight_lock:
         if runner_id in _inflight:
@@ -256,22 +252,28 @@ def touch(runner_id: str, *, force: bool = False) -> None:
         _inflight.add(runner_id)
     if not force:
         _last_kept[runner_id] = now
-    if runner_id in _busy_since_kept:
-        _busy_since_kept[runner_id] = False
     if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
         _prune_throttle(now)
     ctx = contextvars.copy_context()
     _executor.submit(ctx.run, _keep_alive_for_runner, runner_id)
 
 
-def _within_warm_grace(runner_id: str, now: float) -> bool:
-    """Whether *runner_id* last reported busy within its provider's keep-warm grace."""
+def _recently_busy(runner_id: str, now: float) -> bool:
+    """Whether *runner_id* did work within its keepalive window.
+
+    The window is one refresh interval (so work anywhere since the last tick
+    counts) plus two pong intervals (so ticks between pongs keep refreshing a
+    runner busy at its last one), or the provider's keep-warm grace if longer.
+    """
     grace = _runner_warm_grace_s.get(runner_id, 0.0)
     if math.isinf(grace):
         # The runner never idles out (runner.idle_timeout_s 0): warm while connected.
         return True
     last_busy = _last_busy_at.get(runner_id)
-    return last_busy is not None and now - last_busy < grace
+    if last_busy is None:
+        return False
+    window = max(_interval_for(runner_id) + 2 * _PONG_INTERVAL_S, grace)
+    return now - last_busy < window
 
 
 def _prune_throttle(now: float) -> None:
@@ -333,7 +335,9 @@ def _keep_alive_for_runner(runner_id: str) -> None:
                 host.sandbox_provider
             )
             # getattr: embedding deployments may build duck-typed configs.
-            _runner_warm_grace_s[runner_id] = float(getattr(config, "keep_warm_after_work_s", 0.0))
+            _runner_warm_grace_s[runner_id] = float(
+                getattr(config, "keep_warm_after_work_s", DEFAULT_RUNNER_IDLE_TIMEOUT_S)
+            )
             try:
                 # Owner-identity launchers (e.g. Databricks) refresh with the
                 # host owner's own credential, never a server identity.
