@@ -2733,7 +2733,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
-      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({
+        status: "streaming",
+        activeResponse: null,
+        sendLatchedAt: Date.now(),
+        sendLatchSeenRunning: null,
+      });
     }
 
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
@@ -2890,6 +2895,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
           status: "streaming",
           sendLatchedAt: Date.now(),
+          sendLatchSeenRunning: null,
         }));
         initialDispatched = true;
       }
@@ -3133,7 +3139,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // See `send`: latch and status on one entry, in one patch.
-      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({
+        status: "streaming",
+        activeResponse: null,
+        sendLatchedAt: Date.now(),
+        sendLatchSeenRunning: null,
+      });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
     // the chat shows nothing until the server's `slash_command` receipt
@@ -5375,7 +5386,8 @@ function launchSnapshotPatch(
  * token/context/cost counters, the MCP startup band, and — when the turn
  * ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
- * event would have applied, so "Working…" clears.
+ * event would have applied, so "Working…" clears. `settleTurn: false` leaves
+ * the turn lifecycle (`sessionStatus`, `activeResponse`, `status`, latch) alone.
  *
  * The inverse also matters: when the snapshot shows a turn STILL running and
  * carries its in-flight `activeResponseId`, reopen the streaming
@@ -5390,9 +5402,9 @@ function reconnectStatusPatch(
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
   latchBeforeFetch: SendLatchEvidence,
+  settleTurn = true,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
-    sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
     ...launchSnapshotPatch(session, s),
     // A `session.model` missed in the gap would otherwise hold a first
@@ -5407,6 +5419,8 @@ function reconnectStatusPatch(
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (!settleTurn) return patch;
+  patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
   // NOT reopen a streaming response. The server keeps `active_response_id`
@@ -5937,8 +5951,8 @@ type ReconnectBackfill = "applied" | "failed" | "skipped";
  * state (`hasMoreHistory` / `oldestItemId`) untouched — a reconnect is not a
  * re-hydrate. Swallows fetch errors, resolving "failed" so the caller can
  * retry. All writes are `historyGeneration`-guarded so a window reset
- * mid-fetch voids them. `settleStatus: false` skips the status patch, as
- * does a live turn edge that arrives during the reads.
+ * mid-fetch voids them. `settleStatus: false` skips the status patch; a live
+ * turn edge that arrives during the reads skips only its turn lifecycle.
  */
 async function reconcileOnReconnect(
   id: string,
@@ -5986,10 +6000,16 @@ async function reconcileOnReconnect(
   }
   if (stale()) return "skipped";
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
-  // A turn edge the live stream delivered during these reads is newer than the snapshot.
+  // A turn edge the live stream delivered during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
-    settleStatus && (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch
-      ? reconnectStatusPatch(session, s, launchBeforeFetch, stateBeforeFetch)
+    settleStatus
+      ? reconnectStatusPatch(
+          session,
+          s,
+          launchBeforeFetch,
+          stateBeforeFetch,
+          (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch,
+        )
       : {};
 
   // Page backwards until the fetched window reaches the pre-gap transcript

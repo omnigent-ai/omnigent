@@ -14871,13 +14871,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
   /**
    * Pump a native conversation mid-turn on `resp_live` with one posted send,
-   * over fresh stream sinks, answering status snapshots with `snapshotStatus`
-   * and `pendingInputs`, and failing item reads while `itemsDown()`.
+   * over fresh stream sinks, answering status snapshots with `snapshotStatus`,
+   * `pendingInputs` and `snapshotFields`, and failing item reads while `itemsDown()`.
    */
   async function startMissedEventPump(
     id: string,
     snapshotStatus: string,
-    { pendingInputs = [] as unknown[], itemsDown = (): boolean | Promise<boolean> => false } = {},
+    {
+      pendingInputs = [] as unknown[],
+      itemsDown = (): boolean | Promise<boolean> => false,
+      snapshotFields = {} as Record<string, unknown>,
+    } = {},
   ) {
     const before = userMessage(`${id}_pre`, "before the gap");
     seedSession(id, [before]);
@@ -14910,6 +14914,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           created_at: 0,
           labels: {},
           pending_inputs: pendingInputs,
+          ...snapshotFields,
         });
       }
       return defaultFetchHandler(input, init);
@@ -15134,7 +15139,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       releaseItems = resolve;
     });
     let itemsDown: () => boolean | Promise<boolean> = () => false;
-    const pump = await startMissedEventPump(id, "idle", { itemsDown: () => itemsDown() });
+    const pump = await startMissedEventPump(id, "idle", {
+      itemsDown: () => itemsDown(),
+      snapshotFields: { last_total_tokens: 4321 },
+    });
     pump.bound.set({ pendingUserMessages: [], boundAgentId: "agent_xyz" });
     const reply = assistantMessage("resp_live", "It's published now");
     seedSessionItems(id, [pump.before, reply]);
@@ -15162,6 +15170,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     });
     expect(pump.bound.get().status).toBe("streaming");
     expect(pump.bound.get().sessionStatus).toBe("running");
+    expect(pump.bound.get().tokensUsed).toBe(4321);
     useChatStore.getState().maybeFlushQueuedHead();
     expect(useChatStore.getState().queuedMessages.map((m) => m.queueId)).toEqual(["q_follow_up"]);
 
@@ -15290,11 +15299,13 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       return base(input, init);
     });
 
+    // A new latch in the previous latch's millisecond must not inherit its running edge.
+    vi.setSystemTime(previousLatch);
     void useChatStore.getState().send("now update the changelog", "agent_xyz");
     await drainAsync();
     const latchedAt = pump.bound.get().sendLatchedAt;
-    expect(latchedAt).not.toBeNull();
-    expect(pump.bound.get().sendLatchSeenRunning).toBe(previousLatch);
+    expect(latchedAt).toBe(previousLatch);
+    expect(pump.bound.get().sendLatchSeenRunning).toBeNull();
     await advanceWithHeartbeats(
       () => pump.sinks.at(-1)!,
       2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
