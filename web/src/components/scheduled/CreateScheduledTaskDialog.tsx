@@ -31,7 +31,6 @@ import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/compone
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
-import { NEW_AUTOMATION_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import { TriggerWorkerSettingsFields } from "./TriggerWorkerSettingsFields";
@@ -61,7 +60,10 @@ import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isFeatureEnabled, pickerCuration, sandboxOptionLabel } from "@/lib/capabilities";
 import { useCreateScheduledTask, useUpdateScheduledTask } from "@/hooks/useScheduledTasks";
 import { partitionPickerEntries, selectableSessionAgents } from "@/lib/agentGrouping";
-import { UNATTENDED_DISALLOWED_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
+import {
+  NEW_AUTOMATION_PERMISSION_MODES,
+  UNATTENDED_DISALLOWED_PERMISSION_MODES,
+} from "@/lib/nativeHarnessModes";
 import {
   isBackdropOverlay,
   isInsidePopper,
