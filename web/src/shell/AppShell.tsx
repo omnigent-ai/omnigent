@@ -16,7 +16,15 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
@@ -26,6 +34,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
@@ -40,6 +49,7 @@ import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/fil
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  closeDesktopWindow,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -109,6 +119,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentTabId } from "@/lib/subagentTabs";
 import {
@@ -119,6 +130,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
@@ -132,6 +144,7 @@ import { revealFolderInFilesPanel } from "./FilesPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { PullRequestPanel } from "./PullRequestPanel";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
+import { ContentSearchPanel } from "./ContentSearchPanel";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
@@ -139,7 +152,6 @@ import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -152,6 +164,7 @@ import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { CloseWindowDialog } from "./CloseWindowDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -228,7 +241,9 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 export function AppShell() {
   return (
     <GridSessionsProvider>
-      <AppShellImpl />
+      <MobileHeaderControlsProvider>
+        <AppShellImpl />
+      </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
 }
@@ -283,6 +298,7 @@ function AppShellImpl() {
     gridId: string;
   }>();
   const location = useLocation();
+  const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
   const canvasMode =
@@ -524,6 +540,7 @@ function AppShellImpl() {
   const [subagentsPanelOpen, setSubagentsPanelOpen] = useState(false);
   const [shellsPanelOpen, setShellsPanelOpen] = useState(false);
   const [githubPanelOpen, setGithubPanelOpen] = useState(false);
+  const [contentSearchPanelOpen, setContentSearchPanelOpen] = useState(false);
   const [sideChatsPanelOpen, setSideChatsPanelOpen] = useState(false);
   // The right "Workspace" rail (WorkspacePanel) remembers its open/closed
   // state per session. A brand-new session (no saved `open`) follows the
@@ -842,10 +859,7 @@ function AppShellImpl() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    serverConversationId,
-    activeConv,
-  );
+  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -1171,6 +1185,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
     // Drop shell interaction state carried from the outgoing session: a
@@ -1377,6 +1392,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false);
     setShellsPanelOpen(false);
     setGithubPanelOpen(false);
+    setContentSearchPanelOpen(false);
     selectRightRailTab("subagents");
     setRightPanelOpenImmediately(true);
     setSubagentsPanelOpen(isMobileViewport());
@@ -1438,6 +1454,7 @@ function AppShellImpl() {
       // A side chat's reply can link into the workspace: close its full-screen
       // drawer so the file viewer the tap just opened is what the user sees.
       setSideChatsPanelOpen(false); // close mobile side-chats drawer
+      setContentSearchPanelOpen(false); // close mobile content-search drawer
       // Pull the rail to the Files tab when parked on a tab where the viewer
       // won't render (Subagents). The Files tab surfaces the
       // FileViewer inline, so leave it undisturbed.
@@ -1480,7 +1497,7 @@ function AppShellImpl() {
     };
   }, []);
   const guardFileNavigation = useCallback(
-    (path: string, options: OpenFileOptions | undefined, commit: () => void) => {
+    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
       const guards = [...fileNavigationGuardsRef.current];
       const navigate = (index: number) => {
         const guard = guards[index];
@@ -1491,10 +1508,24 @@ function AppShellImpl() {
     },
     [],
   );
+  // Mobile Back returns to Content search only for the conversation and file
+  // its result committed; any other file navigation clears it.
+  const contentSearchFileRef = useRef<string | null>(null);
   const openFileViewer = useCallback(
     (path: string, options?: OpenFileOptions) =>
-      guardFileNavigation(path, options, () => commitFileNavigation(path, options)),
+      guardFileNavigation(path, options, () => {
+        contentSearchFileRef.current = null;
+        commitFileNavigation(path, options);
+      }),
     [guardFileNavigation, commitFileNavigation],
+  );
+  const openContentSearchResult = useCallback(
+    (path: string, options?: OpenFileOptions) =>
+      guardFileNavigation(path, options, () => {
+        commitFileNavigation(path, options);
+        contentSearchFileRef.current = `${conversationId}\n${path}`;
+      }),
+    [guardFileNavigation, commitFileNavigation, conversationId],
   );
 
   useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
@@ -1803,6 +1834,7 @@ function AppShellImpl() {
   );
   useNewSessionHotkey();
   useSettingsHotkey();
+  useHistoryNavigation();
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -1815,7 +1847,12 @@ function AppShellImpl() {
     setSelectedFilePath(null);
     setFileViewerCommentsOpen(false);
     clearFileViewerUrl();
-    setFilesPanelOpen(true);
+    if (contentSearchFileRef.current === `${conversationId}\n${selectedFilePath}`) {
+      setContentSearchPanelOpen(true);
+    } else {
+      setFilesPanelOpen(true);
+    }
+    contentSearchFileRef.current = null;
   }
 
   // Deselect the active file tab to reveal the scope view (Changed/All list
@@ -1950,6 +1987,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
 
@@ -1969,7 +2007,11 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
-  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
+  const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
+  const showSideChats = supportsSideChat(
+    useChatStore((s) => s.sessionHarness),
+    canStartSideChat,
+  );
   // With the panel setting on, sub-agent links open a rail tab beside this chat,
   // revealing the rail if another panel covers it. Ancestors still navigate.
   const parentSessionId = activeSession?.parentSessionId;
@@ -2004,9 +2046,9 @@ function AppShellImpl() {
       revealRightPanel,
     ],
   );
-  // Sub-agent tabs opened on desktop must stay reachable from a phone's
-  // drawer even when this harness can't start side chats.
-  const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
+  // Side-chat and sub-agent tabs opened elsewhere must stay reachable from a
+  // phone's drawer even where this viewer or harness can't start side chats.
+  const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2044,8 +2086,9 @@ function AppShellImpl() {
     [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
   );
 
-  // ⌘⌥T (Ctrl+Alt+T) opens a new shell — the keyboard path for the tab-strip
-  // "+" menu, launching the remembered default type via the same create +
+  // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
+  // Terminal — the keyboard path for the tab-strip "+" menu, launching the
+  // remembered default type via the same create +
   // focus path the menu uses (mark-start snapshot, then focus the tab). Gated
   // on the session declaring shell access and being reachable: an offline
   // session can't be reconnected from the browser, so the chord is inert there,
@@ -2074,7 +2117,25 @@ function AppShellImpl() {
     clearShellCreatePending,
     openTerminalTab,
   ]);
-  useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  // A new shell replaces the file on screen, so its viewer confirms unsaved edits first.
+  const launchShellFromShortcut = useCallback(
+    () => guardFileNavigation(null, undefined, launchDefaultShell),
+    [guardFileNavigation, launchDefaultShell],
+  );
+  useNewShellHotkey(launchShellFromShortcut, shellLaunchable);
+  useDesktopCommand("new-terminal", shellLaunchable ? launchShellFromShortcut : null);
+
+  // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
+  // leave the open session or page for the new-session page; from the
+  // new-session page itself, confirm, then close the window.
+  const atNewSessionPage =
+    location.pathname.replace(/\/$/, "") === rebasePath("/").replace(/\/$/, "");
+  const [closeWindowPrompt, setCloseWindowPrompt] = useState<{ quits: boolean } | null>(null);
+  useDesktopCommand("close", (event) => {
+    if (atNewSessionPage) setCloseWindowPrompt({ quits: event.closingQuits });
+    // An open file with unsaved edits asks before the session (and its viewer) goes away.
+    else guardFileNavigation(null, undefined, () => navigateTo("/"));
+  });
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -2135,6 +2196,7 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setExecutionLogsKey(key);
   }
@@ -2150,6 +2212,7 @@ function AppShellImpl() {
       setSubagentsPanelOpen(false); // close mobile agents drawer
       setShellsPanelOpen(false); // close mobile shells drawer
       setGithubPanelOpen(false); // close mobile github drawer
+      setContentSearchPanelOpen(false); // close mobile content-search drawer
       setSideChatsPanelOpen(false); // close mobile side-chats drawer
       setFilesDrawerFlatView(flatView);
       setFilesPanelOpen(true);
@@ -2169,6 +2232,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false); // close files drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setSubagentsPanelOpen(true);
   }
@@ -2185,6 +2249,7 @@ function AppShellImpl() {
     setFilesPanelOpen(false); // close files drawer
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setGithubPanelOpen(false); // close mobile github drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
     setShellsPanelOpen(true);
   }
@@ -2201,8 +2266,24 @@ function AppShellImpl() {
     setSubagentsPanelOpen(false); // close mobile agents drawer
     setShellsPanelOpen(false); // close mobile shells drawer
     setSideChatsPanelOpen(false); // close mobile side-chats drawer
+    setContentSearchPanelOpen(false); // close mobile content-search drawer
     setGithubPanelOpen(true);
   }, [clearFileViewerUrl, setPanelInitialKey]);
+
+  // Mobile FAB → "Content search" opens the desktop rail's Content search tab
+  // as a full-screen drawer.
+  function openContentSearchPanel() {
+    setSelectedFilePath(null); // close file viewer
+    clearFileViewerUrl();
+    setPanelInitialKey(null); // close terminals panel
+    setExecutionLogsKey(null); // close execution-logs panel
+    setFilesPanelOpen(false); // close files drawer
+    setSubagentsPanelOpen(false); // close mobile agents drawer
+    setShellsPanelOpen(false); // close mobile shells drawer
+    setGithubPanelOpen(false); // close mobile github drawer
+    setSideChatsPanelOpen(false); // close mobile side-chats drawer
+    setContentSearchPanelOpen(true);
+  }
 
   // Composer links open the mobile drawer or reveal the desktop Pull Requests tab.
   // Deselect files/shells so the chosen panel owns its content slot.
@@ -2276,6 +2357,7 @@ function AppShellImpl() {
     () => ({
       openFile: openFileViewer,
       registerNavigationGuard,
+      guardFileNavigation,
       openGithubTab,
       openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
@@ -2287,6 +2369,7 @@ function AppShellImpl() {
     [
       openFileViewer,
       registerNavigationGuard,
+      guardFileNavigation,
       openGithubTab,
       showFilesPanel,
       openFolderInFiles,
@@ -2459,7 +2542,6 @@ function AppShellImpl() {
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
-      workspaceRecoveryDisabledReason: workspaceRecoveryDisabledReason(forkSandboxProvider),
       openForkDialog: (opts) => {
         const sourceSessionId =
           opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
@@ -2481,7 +2563,7 @@ function AppShellImpl() {
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, forkSandboxProvider, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2640,6 +2722,7 @@ function AppShellImpl() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
                     createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
@@ -2673,8 +2756,9 @@ function AppShellImpl() {
                       subagentsPanelOpen,
                       shellsPanelOpen,
                       githubPanelOpen,
+                      contentSearchPanelOpen,
                       sideChatsPanelOpen,
-                      showSideChats: showSideChats || hasSubagentTabs,
+                      showSideChats: showSideChats || hasSideChatTabs,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2692,6 +2776,8 @@ function AppShellImpl() {
                       onOpenShells: openShellsPanel,
                       onOpenSubagents: openSubagentsPanel,
                       onOpenGithub: openGithubPanel,
+                      showContentSearch: railTabsAvailable["content-search"],
+                      onOpenContentSearch: openContentSearchPanel,
                       onOpenSideChats: openSideChatsPanel,
                       onOpenMainExecutionLog: openMainExecutionLog,
                     }}
@@ -2753,6 +2839,7 @@ function AppShellImpl() {
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
+                    onHide={rightPanelOpen ? toggleRightPanel : undefined}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
@@ -2787,7 +2874,7 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
-                    onHasSubagentTabsChange={setHasSubagentTabs}
+                    onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
                   />
                 )}
@@ -2872,6 +2959,20 @@ function AppShellImpl() {
                   </RenderErrorBoundary>
                 </MobilePanelDrawer>
               )}
+              {conversationId && mobileViewport && railTabsAvailable["content-search"] && (
+                <MobilePanelDrawer
+                  open={contentSearchPanelOpen}
+                  title="Content search"
+                  onClose={() => setContentSearchPanelOpen(false)}
+                  testId="content-search-panel-drawer"
+                >
+                  <ContentSearchPanel
+                    key={conversationId}
+                    conversationId={conversationId}
+                    onFileSelect={openContentSearchResult}
+                  />
+                </MobilePanelDrawer>
+              )}
               <div ref={setMobileFileTarget} className="md:hidden" />
             </GridWorkspace>
           </div>
@@ -2928,6 +3029,14 @@ function AppShellImpl() {
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}
           />
+          <CloseWindowDialog
+            prompt={closeWindowPrompt}
+            onConfirm={() => {
+              setCloseWindowPrompt(null);
+              void closeDesktopWindow();
+            }}
+            onCancel={() => setCloseWindowPrompt(null)}
+          />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
@@ -2971,6 +3080,7 @@ function AppShellImpl() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            rightSidebarShortcutEnabled={!gridRoute}
           />
           <RecentSessionsSwitcher
             conversations={allConversations}

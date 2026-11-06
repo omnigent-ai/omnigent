@@ -15,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -30,7 +30,8 @@ import {
 import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
-import { useFileViewer } from "./FileViewerContext";
+import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -76,6 +77,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -272,7 +274,7 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+import { useCreateTerminal, useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
 
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -413,6 +415,21 @@ function LocationDisplay() {
  * what AppShell keys the /settings sidebar pin off, so the tests need a real
  * router transition rather than a re-render.
  */
+/** A file viewer holding unsaved edits: file navigation waits until "allow leaving". */
+function DirtyFileViewerProbe() {
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
+  useLayoutEffect(
+    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
+    [registerNavigationGuard],
+  );
+  return allowLeaving ? (
+    <button type="button" onClick={allowLeaving}>
+      allow leaving
+    </button>
+  ) : null;
+}
+
 function NavProbe() {
   const navigate = useNavigate();
   return (
@@ -530,7 +547,7 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string } = {},
+  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -556,6 +573,7 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
+            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
             <LocationDisplay />
           </>
         }
@@ -2203,6 +2221,35 @@ describe("Sidebar across the md breakpoint", () => {
         }
       });
   }
+
+  it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
+    const resize = mockViewportWidth(1280);
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
+    });
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    renderShell("/c/conv_abc?file=README.md");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+
+    resize(740);
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.getByText("home", { exact: true })).toBeInTheDocument();
+    expect(readSessionWorkspaceState("conv_abc").openFiles).toContain("README.md");
+  });
 
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
     const resize = mockViewportWidth(1280);
@@ -4436,8 +4483,8 @@ describe("Mobile session menu", () => {
 
 describe("AppShell clone/fork action", () => {
   it.each([false, true])(
-    "resolves a scoped recovery source's own restrictions under a blocked parent (child blocked=%s)",
-    (childBlocked) => {
+    "opens a scoped recovery under a managed parent (child managed=%s)",
+    (childManaged) => {
       const parent = sessionSnapshot({
         id: "conv_parent",
         labels: { "omnigent.host_type": "managed" },
@@ -4446,7 +4493,7 @@ describe("AppShell clone/fork action", () => {
         id: "conv_side_child",
         workspace: "/missing/child",
         hostId: "host_a",
-        labels: childBlocked ? { "omnigent.host_type": "managed" } : {},
+        labels: childManaged ? { "omnigent.host_type": "managed" } : {},
       });
       mockConversations([{ id: "conv_parent", permission_level: 4 }]);
       useSessionMock.mockImplementation((sessionId) => ({
@@ -4471,70 +4518,12 @@ describe("AppShell clone/fork action", () => {
       fireEvent.click(screen.getByRole("button", { name: "Continue in another directory…" }));
 
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      if (childBlocked) {
-        expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-          "Forking this sandbox session is not supported yet.",
-        );
-        expect(screen.queryByTestId("workspace-path-input")).not.toBeInTheDocument();
-        expect(screen.getByTestId("fork-session-submit")).toBeDisabled();
-      } else {
-        expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
-        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
-      }
+      expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Host A");
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
-
-  it("disables directory recovery for an Arclet session that forks only onto a new Arclet", async () => {
-    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
-    useSessionMock.mockReturnValue({
-      session: sessionSnapshot({
-        id: "conv_arclet",
-        workspace: "/missing/repo",
-        hostId: "host_arclet",
-        labels: { "omnigent.host_type": "managed" },
-      }),
-      isLoading: false,
-      error: null,
-    });
-    useHostsMock.mockReturnValue({
-      data: [
-        {
-          host_id: "host_arclet",
-          name: "Arclet",
-          owner: "owner",
-          status: "online",
-          sandbox_provider: "arclet",
-        },
-      ],
-    } as ReturnType<typeof useHosts>);
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <CapabilitiesProvider
-        info={serverInfo({ managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] })}
-      >
-        {sessionShellTree(
-          client,
-          "/c/conv_arclet",
-          <ConversationScopeContext.Provider value="conv_arclet">
-            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
-          </ConversationScopeContext.Provider>,
-        )}
-      </CapabilitiesProvider>,
-    );
-
-    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
-    expect(recover).toBeDisabled();
-    fireEvent.focus(screen.getByRole("group", { name: "Continue in another directory…" }));
-    await waitFor(() =>
-      expect(screen.getByRole("tooltip")).toHaveTextContent(
-        "This sandbox session can only be cloned onto a new sandbox.",
-      ),
-    );
-    fireEvent.click(recover);
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
-  });
 
   it("opens workspace recovery and resets it before a later normal fork", async () => {
     const source = sessionSnapshot({
@@ -4568,7 +4557,7 @@ describe("AppShell clone/fork action", () => {
     );
   });
 
-  it("blocks direct current-session fork openers for an unsupported managed session", () => {
+  it("opens direct current-session fork openers for a managed session", () => {
     mockConversations([{ id: "conv_managed", permission_level: 4 }]);
     useSessionMock.mockReturnValue({
       session: sessionSnapshot({
@@ -4580,7 +4569,63 @@ describe("AppShell clone/fork action", () => {
     });
     renderShell("/c/conv_managed");
     fireEvent.click(screen.getByTestId("fork-probe-open"));
-    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Fork from this response/ })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+  });
+
+  it("offers directory recovery for an Arclet session onto a connected host", () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    const hosts = [
+      {
+        host_id: "host_arclet",
+        name: "Arclet",
+        owner: "owner",
+        status: "online",
+        sandbox_provider: "arclet",
+      },
+      { host_id: "host_laptop", name: "Laptop", owner: "owner", status: "online" },
+    ];
+    // Pickers never see server-managed sandbox hosts, as in fetchHosts.
+    useHostsMock.mockImplementation(
+      (options) =>
+        ({
+          data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        }) as ReturnType<typeof useHosts>,
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        client,
+        "/c/conv_arclet",
+        <ConversationScopeContext.Provider value="conv_arclet">
+          <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+        </ConversationScopeContext.Provider>,
+      ),
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeEnabled();
+    fireEvent.click(recover);
+    expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
+    expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
+    const hostSelect = screen.getByTestId("fork-session-host-select");
+    fireEvent.pointerDown(hostSelect, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+    fireEvent.click(hostSelect);
+    // Recovery continues in an existing directory, so it offers connected hosts only.
+    expect(screen.getByTestId("fork-session-host-option-host_laptop")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-host-option-host_arclet")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
+    expect(forkSessionMock).not.toHaveBeenCalled();
   });
 
   it("exposes canFork to a read-only collaborator on a top-level session", () => {
@@ -5927,5 +5972,57 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell desktop Close", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits: boolean;
+  }) => void;
+  let sendCommand: CommandListener = () => {};
+
+  beforeEach(() => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: CommandListener) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resetDesktopCommandsForTests();
+  });
+
+  it("opens New Terminal over an open file only once its viewer allows it", () => {
+    const createShell = vi.fn();
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      mutate: createShell,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    mockConversations([{ id: "conv_shell", permission_level: null }]);
+    renderShell("/c/conv_shell", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    expect(createShell).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
+  });
+
+  it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {
+    mockConversations([{ id: "conv_close", permission_level: null }]);
+    renderShell("/c/conv_close", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.queryByText("home")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.getByText("home")).toBeInTheDocument();
   });
 });

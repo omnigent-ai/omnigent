@@ -16,13 +16,28 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-@custom-variant mobile-app (&:where([data-mobile-app="true"], [data-mobile-app="true"] *));
+/* Native shells and browsers whose primary input is touch share this layout. */
+@custom-variant mobile-app {
+  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
+    @slot;
+  }
+  @media (pointer: coarse) and (hover: none) {
+    @slot;
+  }
+}
 
-/* CSS-pixel floor, independent of viewport width and pointer capability. */
+/* CSS-pixel floor for native shells and touch browsers, independent of width. */
 @utility mobile-touch-target {
   &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
     min-width: 44px;
     min-height: 44px;
+  }
+  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
+  @media (pointer: coarse) and (hover: none) {
+    &:is(:root, :root *) {
+      min-width: 44px;
+      min-height: 44px;
+    }
   }
 }
 
@@ -128,18 +143,20 @@
   --shadow-dialog: 0 16px 48px rgb(var(--ui-shadow-neutral-rgb) / 0.2);
 }
 
-/* The two body text steps. Keep these non-inline: `@theme inline` bakes the
- * literal value into each utility, which would make the runtime typography
- * mapping below a no-op. Line heights are unitless so both tiers keep their
- * 1.6 rhythm at every size the Appearance setting allows. */
+/* Keep these non-inline: `@theme inline` bakes values into utilities and
+ * bypasses the runtime typography mapping. Unitless line heights scale with
+ * font size: 1.8 for body text and 1.4 for captions. */
 @theme {
   /* App-default interface/body text — every control, label, and menu item. */
+  --font-weight-normal: 450;
   --text-ui: 1rem;
-  --text-ui--line-height: 1.6;
-  /* Caption tier: captions, descriptions, sub/group titles. Always 0.9 of the
-   * body step, mapped below so it tracks the Appearance setting. */
-  --text-sm: 0.9rem;
-  --text-sm--line-height: 1.6;
+  --text-ui--line-height: 1.8;
+  --text-message: var(--text-ui);
+  --text-message--line-height: 1.8;
+  /* Captions, descriptions, and sub/group titles stay 1px below body text
+   * as the Appearance font size changes. */
+  --text-sm: calc(var(--text-ui) - 1px);
+  --text-sm--line-height: 1.4;
   /* `text-xs` is retired in favour of `text-sm`. Aliased rather than left on
    * Tailwind's 0.75rem, which against the fixed 16px root is a hard 12px that
    * ignores the Appearance setting — the same trap the ramp test guards. Keeps
@@ -148,16 +165,11 @@
   --text-xs--line-height: var(--text-sm--line-height);
 }
 
-/* Apple system-blue accent (hue 256, matches iOS / macOS systemBlue —
- * ~#007AFF light, ~#0A84FF dark). Reserved for focus rings, charts,
- * unread state, and the active sidebar highlight; surfaces and primary
- * buttons stay neutral grey (hue 240). See designs/UI/WEB_UI.md (still
- * describes the older cobalt direction). */
 :root {
   /* User-controlled UI font size (see Appearance settings /
    * lib/uiFontPreferences.ts). Stored as a discrete px value and overridden at
    * runtime on documentElement. It feeds typography tokens only. */
-  --desktop-ui-font-size: 13px;
+  --desktop-ui-font-size: 14px;
   --icon-size-default: 14px;
   --icon-container-default: 16px;
   --ui-shadow-neutral-rgb: 0 0 0;
@@ -206,7 +218,7 @@
    * that already clears the header also clears the switcher — its size is
    * tracked here for symmetry/introspection but is intentionally NOT added to
    * the content top inset to avoid double-counting the header band. */
-  --omnigent-header-height: 3.5rem; /* web ChatHeader (h-14) */
+  --omnigent-header-height: 3.5rem; /* Default content clearance. */
   --omnigent-safe-top: max(
     env(safe-area-inset-top, 0px),
     var(--omnigent-android-safe-area-top, 0px)
@@ -381,7 +393,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 2px 6px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -390,7 +402,7 @@
   gap: 4px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -426,7 +438,7 @@
   gap: 8px;
   border-radius: 8px;
   padding: 4px 12px 4px 8px;
-  font-size: 13px;
+  font-size: var(--text-ui);
   line-height: 20px;
 }
 
@@ -486,6 +498,24 @@
   min-height: 28px;
 }
 
+/* Density rules above are unlayered, so opted-in app targets need the same cascade priority. */
+:is(.composer-add-menu, .composer-host-menu, .composer-agent-menu) .mobile-touch-target {
+  @apply mobile-touch-target;
+}
+
+@media (width < 48rem) {
+  .composer-add-menu [role="menuitem"].mobile-touch-target {
+    @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
+    min-height: 28px;
+    @apply mobile-touch-target;
+  }
+
+  .composer-add-menu [role="menuitem"] svg {
+    width: 16px;
+    height: 16px;
+  }
+}
+
 .composer-agent-menu [role="menuitem"] > svg:last-child {
   margin-left: 0;
 }
@@ -502,13 +532,200 @@
   background-color: var(--composer-surface-bg);
 }
 
+@media (width < 48rem) {
+  [data-mobile-composer] {
+    --composer-compact-start: 8px;
+    --composer-compact-end: 8px;
+    --composer-morph-duration: 280ms;
+    --composer-morph-easing: cubic-bezier(0.22, 1, 0.36, 1);
+    transition:
+      border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+      box-shadow 150ms ease;
+
+    > [aria-hidden="true"] > .glass-surface {
+      transition:
+        border-radius var(--composer-morph-duration) var(--composer-morph-easing),
+        opacity 260ms ease-out;
+    }
+
+    > .px-3 {
+      padding-inline: 8px;
+    }
+
+    > .mx-3 {
+      margin-inline: 8px;
+    }
+
+    svg:not(.glass-surface *) {
+      width: 20px !important;
+      height: 20px !important;
+      padding: 0;
+    }
+
+    [data-composer-action="microphone"] > span[aria-hidden="true"] {
+      width: 20px;
+      height: 20px;
+    }
+
+    &:has([data-composer-action="add"]) {
+      --composer-compact-start: 56px;
+    }
+
+    &:has([data-composer-action="send"], [data-composer-action="microphone"]) {
+      --composer-compact-end: 56px;
+    }
+
+    &:has([data-composer-action="send"]):has([data-composer-action="microphone"]) {
+      --composer-compact-end: 104px;
+    }
+
+    > [data-composer-input-area] {
+      min-height: 0;
+      padding: 16px 16px 8px;
+      margin-bottom: 0;
+      transition:
+        margin-bottom var(--composer-morph-duration) var(--composer-morph-easing),
+        padding var(--composer-morph-duration) var(--composer-morph-easing);
+    }
+
+    > [data-composer-input-area] > textarea {
+      display: block;
+      min-height: 1lh;
+    }
+
+    > [data-composer-actions] {
+      min-height: 60px;
+      flex-wrap: wrap;
+      padding-block: 8px;
+    }
+
+    [data-composer-action-group="left"] {
+      flex: 1 1 0;
+      flex-wrap: wrap;
+    }
+
+    @media (prefers-reduced-motion: no-preference) {
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])),
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        animation: mobile-composer-controls-enter 220ms var(--composer-morph-easing) 60ms backwards;
+      }
+    }
+
+    [data-composer-action]:is(
+      [data-composer-action="add"],
+      [data-composer-action="microphone"],
+      [data-composer-action="send"],
+      [data-composer-action="permission"]
+    ) {
+      width: 44px;
+      min-width: 44px;
+      height: 44px;
+      min-height: 44px;
+      border-radius: 100%;
+    }
+
+    [data-composer-action="permission"] {
+      gap: 0;
+      padding: 0;
+    }
+
+    [data-composer-permission-label],
+    [data-composer-action="permission"] > svg:last-child {
+      display: none;
+    }
+
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+      color: transparent;
+    }
+
+    /* Add opens independently of the compact input layout. */
+    &[data-mobile-composer="collapsed"]:not(
+        :has([data-state="open"]:not([data-composer-action="add"]))
+      ) {
+      border-radius: 30px;
+
+      > [aria-hidden="true"] > .glass-surface {
+        border-radius: 30px !important;
+      }
+
+      > [data-composer-input-area] {
+        z-index: 1;
+        margin-bottom: -60px;
+        padding-block: calc((60px - 1lh) / 2);
+        padding-inline: var(--composer-compact-start) var(--composer-compact-end);
+        pointer-events: none;
+      }
+
+      > [data-composer-input-area] > textarea {
+        min-height: 1lh;
+        height: 1lh !important;
+        overflow: hidden;
+        white-space: nowrap;
+        pointer-events: auto;
+      }
+
+      > [data-composer-input-area] > :not(textarea) {
+        visibility: hidden;
+      }
+
+      > [data-composer-input-area] > textarea::placeholder {
+        color: var(--muted-foreground);
+      }
+
+      [data-composer-action-group="left"] {
+        flex: none;
+      }
+
+      [data-composer-action-group="left"]
+        > :not([data-composer-action="add"], :has([data-composer-action="add"])) {
+        display: none;
+      }
+
+      [data-composer-action-group="right"]
+        > :not(
+          [data-composer-action="microphone"],
+          [data-composer-action="send"],
+          :has([data-composer-action="microphone"], [data-composer-action="send"])
+        ) {
+        display: none;
+      }
+    }
+  }
+}
+
+@keyframes mobile-composer-controls-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (width < 48rem) and (prefers-reduced-motion: reduce) {
+  [data-mobile-composer],
+  [data-mobile-composer] > [aria-hidden="true"] > .glass-surface,
+  [data-mobile-composer] > [data-composer-input-area] {
+    transition: none;
+  }
+}
+
 .composer-context-bar {
   position: relative;
   z-index: 20;
   width: calc(100% - 24px);
   margin-inline: 12px;
   margin-bottom: -0.5px;
-  padding: 6px 8px;
+  padding: var(--composer-context-padding-block, 6px) 8px;
   background-color: var(--composer-header-bg);
   border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
   border-bottom: none;
@@ -521,10 +738,52 @@
   border-top-right-radius: 0;
 }
 
+@media (width < 48rem) {
+  .new-chat-workspace-controls .composer-context-bar {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    min-height: 44px;
+    margin: 0;
+    padding: 0 0.5rem;
+    flex-wrap: wrap;
+    background: transparent;
+    border: 0;
+    border-radius: 20px;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar > * {
+    max-width: 100%;
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button {
+    min-height: 44px;
+    height: auto;
+    max-width: 100%;
+    justify-content: flex-start;
+    gap: 0.5rem;
+    padding: 0.5rem 0.25rem;
+    font-size: var(--text-ui);
+    line-height: var(--text-ui--line-height);
+    color: var(--muted-foreground);
+  }
+
+  .new-chat-workspace-controls .composer-context-bar button:hover {
+    background-color: transparent;
+    color: var(--foreground);
+  }
+}
+
 /* Queued rows and workspace metadata form one continuous composer surface. */
 .composer-queued-surface {
   background-color: var(--composer-header-bg);
   background-image: none;
+}
+
+@media (width < 48rem) {
+  .composer-queued-surface {
+    --icon-container-default: 20px;
+  }
 }
 
 .composer-subagent-surface {
@@ -582,6 +841,88 @@
   width: 24px;
   height: 24px;
   padding: 0;
+}
+
+/* Keep glass readable when the browser cannot diffuse the content behind it. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .omni-glass-surface {
+    --omni-glass-background: var(--card-solid);
+  }
+}
+
+/* Mobile icon controls change the glyph's opacity while the surface stays still. */
+@media (width < 48rem) {
+  [data-slot="button"][data-size^="icon"],
+  [data-mobile-icon-button] {
+    --mobile-icon-button-background: transparent;
+    --mobile-icon-button-foreground: var(--foreground);
+    --mobile-icon-button-border: transparent;
+    background-color: var(--mobile-icon-button-background) !important;
+    color: var(--mobile-icon-button-foreground) !important;
+    border-color: var(--mobile-icon-button-border) !important;
+    outline: none !important;
+    box-shadow: none !important;
+
+    &:focus-visible {
+      outline: 2px solid var(--ring) !important;
+      outline-offset: 2px;
+    }
+
+    &[data-variant="default"] {
+      --mobile-icon-button-background: var(--primary-cta);
+      --mobile-icon-button-foreground: var(--primary-cta-foreground);
+    }
+
+    &[data-variant="default"]:disabled {
+      --mobile-icon-button-background: var(--muted);
+      --mobile-icon-button-foreground: var(--muted-foreground);
+    }
+
+    &[data-variant="secondary"] {
+      --mobile-icon-button-background: var(--secondary);
+      --mobile-icon-button-foreground: var(--secondary-foreground);
+    }
+
+    &[data-variant="outline"] {
+      --mobile-icon-button-background: var(--background);
+      --mobile-icon-button-border: var(--border);
+
+      .dark & {
+        --mobile-icon-button-background: var(--input);
+        --mobile-icon-button-border: var(--input);
+      }
+    }
+
+    &[data-variant="destructive"] {
+      --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 10%, transparent);
+      --mobile-icon-button-foreground: var(--destructive);
+
+      .dark & {
+        --mobile-icon-button-background: color-mix(in srgb, var(--destructive) 20%, transparent);
+      }
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(:hover, :focus, :active) {
+      opacity: 1 !important;
+    }
+
+    :is(svg, img):not(.glass-surface *) {
+      opacity: 0.7;
+      transition: opacity 150ms ease;
+    }
+
+    &:not(:disabled, [aria-disabled="true"]):is(
+        :hover,
+        :focus,
+        :active,
+        [aria-expanded="true"],
+        [aria-pressed="true"],
+        [data-state="open"]
+      )
+      :is(svg, img):not(.glass-surface *) {
+      opacity: 1;
+    }
+  }
 }
 
 /* The desktop workspace rail stays mounted through its exit so its content
@@ -690,11 +1031,11 @@
 /* Edge treatment is mode-specific but palette-independent. */
 html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-right: none;
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 .dark .conversations-sidebar {
   border-right: 1px solid var(--sidebar-edge-border);
-  box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
+  box-shadow: inset -4px 0 6px -4px rgb(0 0 0 / 5%);
 }
 
 .dark .workspace-panel-motion {
@@ -711,12 +1052,22 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   border-color: var(--workspace-panel-border);
 }
 
-/* Below md the sidebar is a full-screen overlay on top of the chat, so every
- * palette and mode needs an opaque base. */
+/* Mobile drawers use the shared glass layer behind their content. */
 @media (width < 48rem) {
-  :root:not([data-theme]) .conversations-sidebar,
-  :root[data-theme] .conversations-sidebar {
-    background-color: var(--card-solid);
+  :root:not(.dark) .sidebar-glass-surface {
+    --omni-glass-blur: 16px;
+    --omni-glass-brightness: 1;
+  }
+
+  .conversations-sidebar {
+    margin-top: -1px;
+    margin-bottom: -1px;
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
   }
 }
 
@@ -731,6 +1082,28 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 .chat-scroll-composer-fade {
   mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+}
+
+@media (width < 48rem) {
+  .session-chat-transcript > [role="log"] {
+    --chat-edge-fade: linear-gradient(
+      to bottom,
+      transparent 0,
+      black max(64px, var(--omnigent-safe-top)),
+      black calc(100% - max(64px, var(--omnigent-safe-bottom))),
+      transparent 100%
+    );
+    -webkit-mask-image: var(--chat-edge-fade);
+    mask-image: var(--chat-edge-fade);
+  }
+
+  [data-chat-surface] .session-chat-transcript {
+    margin-bottom: calc(-1 * var(--session-composer-height, 0px));
+  }
+
+  [data-chat-surface] .chat-conversation-content {
+    padding-bottom: calc(var(--session-composer-height, 0px) + 1.5rem);
+  }
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
@@ -846,6 +1219,23 @@ aside[aria-label="Workspace"][data-maximized] {
   border: 1px solid var(--menu-surface-border);
   -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
   backdrop-filter: var(--menu-surface-backdrop-filter);
+}
+
+@media (width < 48rem) {
+  .mobile-menu-glass,
+  .mobile-menu-glass-layer,
+  .dark [data-radix-popper-content-wrapper] > :is(.mobile-menu-glass, .mobile-menu-glass-layer) {
+    isolation: isolate;
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+  }
+
+  .mobile-menu-glass [data-slot="command"] {
+    background: transparent;
+  }
 }
 
 /* Native clearance uses window pixels, independent of rem and page zoom.
@@ -1058,9 +1448,10 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* Native shells render beneath the status bar at every width. Keep floating
- * chat controls and the pinned Plan tracker below its safe area. */
+ * chat controls and the pinned Plan tracker below its safe area. Wide headers
+ * have too little space around 44px controls to overlap the status-bar inset. */
 :is([data-ios-native], [data-android-native]) .chat-header {
-  top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
+  top: max(0px, calc(var(--omnigent-safe-top) - var(--omnigent-header-top-overlap, 0px)));
 }
 :is([data-ios-native], [data-android-native]) .chat-plan-accordion {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
@@ -1103,6 +1494,10 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
 @media (width < 48rem) {
+  :is([data-ios-native], [data-android-native]) .chat-header {
+    --omnigent-header-top-overlap: 0.5rem;
+  }
+
   /* Slide animation for the mobile drawer. Covers BOTH paths that move the
      panel: the edge-swipe drag settles via an inline `transform`, while the
      button toggle (and the drag's resting open/closed state) is driven by
@@ -1206,7 +1601,7 @@ html[data-electron-mac] .breadcrumb-folder {
 
   [data-ios-native] .chat-composer-form,
   [data-android-native] .chat-composer-form {
-    padding-bottom: calc(0.75rem + var(--omnigent-safe-bottom));
+    padding-bottom: max(16px, var(--omnigent-safe-bottom));
   }
 }
 
@@ -1313,6 +1708,9 @@ html[data-electron-mac] .breadcrumb-folder {
      * documentElement by the Appearance setting / lib/uiFontPreferences.ts)
      * with the system stack as the fallback when it's unset. */
     font-family: var(--ui-font-family, var(--font-sans));
+    font-weight: var(--font-weight-normal);
+    letter-spacing: 0em;
+    -webkit-font-smoothing: antialiased;
     /* Keep the desktop rem grid fixed so font preferences cannot resize icons,
      * controls, spacing, or radii. Typography is mapped separately below. */
     font-size: 16px;
@@ -1339,14 +1737,12 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (width >= 48rem) {
   :root {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
-     * they need the preference on that scale. Multiplying the raw 13px shrinks
-     * the ramp ~19%, dragging every `font-size: 1em` <code> down with it. */
-    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 13));
-    /* Body and caption tiers come off the raw preference, not the anchor: the
-     * anchor is the 16px-equivalent grid the title ratios need, and running the
-     * caption factor through it put text-sm at 14.4px against a 13px body —
-     * a caption step larger than the text it captions. */
-    --text-sm: calc(var(--desktop-ui-font-size) * 0.9);
+     * they need the preference on that scale. The default 14px body maps to
+     * the 16px title grid without resizing the fixed rem layout. */
+    --ui-ramp-anchor: calc(var(--desktop-ui-font-size) * (16 / 14));
+    /* Body and caption sizes use the raw preference; the anchor is only
+     * for title ratios. Captions stay 1px below body text. */
+    --text-sm: calc(var(--desktop-ui-font-size) - 1px);
     --text-ui: var(--desktop-ui-font-size);
     --text-base: var(--desktop-ui-font-size);
     /* Title steps keep the anchor so each stays on its Tailwind ratio. */
@@ -1363,13 +1759,14 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
 @media (width < 48rem) {
-  /* Mobile defaults to 14px when no preference is saved. An inline value from
+  /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
-    --desktop-ui-font-size: 14px;
+    --desktop-ui-font-size: 15px;
     --mobile-ui-font-size: var(--desktop-ui-font-size);
+    --omnigent-header-height: 76px;
     --ui-ramp-anchor: var(--mobile-ui-font-size);
-    --text-sm: calc(var(--mobile-ui-font-size) * 0.9);
+    --text-sm: calc(var(--mobile-ui-font-size) - 1px);
     --text-ui: var(--mobile-ui-font-size);
     --text-base: var(--mobile-ui-font-size);
     --text-lg: calc(var(--ui-ramp-anchor) * 1.125);
@@ -1392,6 +1789,17 @@ html[data-electron-mac] .breadcrumb-folder {
     width: var(--sidebar-icon-size-mobile);
     height: var(--sidebar-icon-size-mobile);
     padding: 0;
+  }
+}
+
+.plain-text-fallback.text-message {
+  font-size: var(--text-sm);
+}
+
+/* Plain-text message fallbacks use the body tier on touch and narrow screens. */
+@media (width < 48rem), (pointer: coarse) {
+  .plain-text-fallback.text-message {
+    font-size: var(--text-message);
   }
 }
 
@@ -1477,6 +1885,10 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"],
 [data-streamdown="heading-6"] {
+  font-size: 1em;
+}
+
+.text-message [data-streamdown="heading-5"] {
   font-size: 1em;
 }
 
@@ -1567,6 +1979,12 @@ html[data-electron-mac] .breadcrumb-folder {
 [data-streamdown="table-cell"],
 [data-streamdown="table-header-cell"] {
   overflow-wrap: break-word;
+}
+
+/* Mermaid sizes each label box before the diagram joins the chat prose; an
+ * inherited `wrap-anywhere` re-wraps long words inside it and clips the extra lines. */
+[data-streamdown="mermaid-block"] svg {
+  overflow-wrap: normal;
 }
 
 /* KaTeX lays out radicals/fractions with positioned spans. Wide display math
@@ -1899,19 +2317,9 @@ html[data-electron-mac] .breadcrumb-folder {
   animation: shimmer-sweep var(--shimmer-duration, 2s) linear infinite;
 }
 
-/* Otto working indicator: gentle bob + periodic blink (see OttoIcon.tsx).
+/* Otto working indicator: periodic blink (see OttoIcon.tsx).
  * Opt-in via .otto-working so the mascot can also render static. The global
- * reduced-motion gate below freezes both animations. */
-@keyframes otto-bob {
-  0%,
-  100% {
-    transform: translateY(5%);
-  }
-  50% {
-    transform: translateY(-5%);
-  }
-}
-
+ * reduced-motion gate below freezes the blink. */
 @keyframes otto-blink {
   0%,
   88%,
@@ -1922,10 +2330,6 @@ html[data-electron-mac] .breadcrumb-folder {
   92% {
     transform: scaleY(0.1);
   }
-}
-
-.otto-working {
-  animation: otto-bob 1.6s ease-in-out infinite;
 }
 
 .otto-working .otto-eye {

@@ -16,7 +16,8 @@ import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { useOmnigentAnalytics } from "@/lib/analytics";
+import { showToast } from "@/components/ui/toast";
+import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { AutomationsIntro } from "@/components/scheduled/AutomationsIntro";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
@@ -33,7 +34,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
-import type { ScheduledTask } from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -70,6 +71,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const view = templatesOnly || searchParams.get("view") === "templates" ? "templates" : "yours";
+  useOmnigentPageView(view === "templates" ? "tasks.templates" : "tasks");
   const requestedView = useRef<string>(view);
   useEffect(() => {
     requestedView.current = view;
@@ -100,6 +102,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function openFromTemplate(id: string) {
+    trackClick(`tasks.template.${id}`, "button");
     setTemplateId(id);
     setEditingTask(null);
     setManualOpen(true);
@@ -169,7 +172,20 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleRunNow(task: ScheduledTask) {
-    runNowMutation.mutate(task.id);
+    runNowMutation.mutate(task.id, {
+      onSuccess: () => {
+        showToast(
+          "Run triggered, it will start shortly. Open automation details to check run history.",
+        );
+      },
+      onError: (err) => {
+        if (err instanceof ScheduledTaskApiError && err.status === 409) {
+          showToast("This run is already in progress");
+        } else {
+          showToast("Couldn't start the run");
+        }
+      },
+    });
   }
 
   function handleEdit(task: ScheduledTask) {
@@ -187,6 +203,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       initialName={selectedTemplate?.prefill.name}
       initialPrompt={selectedTemplate?.prefill.prompt}
       initialTrigger={selectedTemplate?.trigger}
+      initialTemplateId={selectedTemplate?.id}
       sessionLink={sessionLink}
       editingTask={editingTask}
     />
@@ -339,12 +356,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               Loading automations…
             </div>
           ) : filtered.length === 0 ? (
-            <EmptyState
-              hasAny={hasAnyTasks}
-              showSuggestions={filter === "all"}
-              onPickTemplate={openFromTemplate}
-              triggersSupported={triggersSupported}
-            />
+            <EmptyState hasAny={hasAnyTasks} />
           ) : (
             <div className="flex flex-col gap-2" data-testid="tasks-list">
               {filtered.map((task) => (
@@ -361,6 +373,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
               ))}
             </div>
           )}
+          {!isError && !isLoading && filter === "all" && !search.trim() && triggersSupported && (
+            <TemplateGallery onPick={openFromTemplate} preview />
+          )}
         </TabsContent>
         <TabsContent value="templates" className="mt-4">
           {triggersSupported ? (
@@ -376,34 +391,19 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   );
 }
 
-function EmptyState({
-  hasAny,
-  showSuggestions,
-  onPickTemplate,
-  triggersSupported,
-}: {
-  hasAny: boolean;
-  showSuggestions: boolean;
-  onPickTemplate: (id: string) => void;
-  triggersSupported: boolean;
-}) {
+function EmptyState({ hasAny }: { hasAny: boolean }) {
   return (
     <div className="py-8" data-testid="tasks-empty-state">
       {hasAny ? (
         <div className="py-10 text-center text-ui text-muted-foreground">No automations found</div>
       ) : (
-        <>
-          <div className="flex flex-col items-center gap-2 py-8 text-center">
-            <ClockIcon className="size-8 text-muted-foreground/50" />
-            <p className="text-ui font-medium">No automations yet</p>
-            <p className="max-w-sm text-sm text-muted-foreground">
-              Create an automation to run an agent session automatically on a recurring schedule.
-            </p>
-          </div>
-          {showSuggestions && triggersSupported && (
-            <TemplateGallery onPick={onPickTemplate} preview />
-          )}
-        </>
+        <div className="flex flex-col items-center gap-2 py-8 text-center">
+          <ClockIcon className="size-8 text-muted-foreground/50" />
+          <p className="text-ui font-medium">No automations yet</p>
+          <p className="max-w-sm text-sm text-muted-foreground">
+            Create an automation to run an agent session automatically on a recurring schedule.
+          </p>
+        </div>
       )}
     </div>
   );
@@ -432,7 +432,7 @@ function TemplateGallery({
               key={template.id}
               type="button"
               aria-label={template.title}
-              aria-describedby={`${detailsId}-description ${detailsId}-schedule ${detailsId}-requirements`}
+              aria-describedby={`${detailsId}-description ${detailsId}-requirements`}
               onClick={() => onPick(template.id)}
               data-testid={template.testId}
               className="flex cursor-pointer items-start gap-4 rounded-xl p-4 text-left text-ui transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
@@ -444,13 +444,6 @@ function TemplateGallery({
                 <span className="font-medium">{template.title}</span>
                 <span id={`${detailsId}-description`} className="text-muted-foreground">
                   {template.description}
-                </span>
-                <span
-                  id={`${detailsId}-schedule`}
-                  className="flex items-center gap-2 text-muted-foreground"
-                >
-                  <ClockIcon className="size-4 shrink-0" />
-                  Checks every hour
                 </span>
                 <span id={`${detailsId}-requirements`} className="text-xs text-muted-foreground">
                   {template.needs}

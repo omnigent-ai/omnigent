@@ -88,6 +88,39 @@ def test_classifies_rejected_arguments(command: str, exit_status: int, output: s
     assert diagnosis.category is ErrorCategory.CONFIG
 
 
+@pytest.mark.parametrize("exit_status", [0, 1, None])
+def test_classifies_background_session_refusal_even_when_wrapper_exits_zero(
+    exit_status: int | None,
+) -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=exit_status,
+        output=(
+            "That session is running in the\nbackground (abcd1234). "
+            "Run `claude attach abcd1234` to open it, or `claude stop abcd1234` "
+            "first to resume it here.\nAdd --fork-session to branch off a copy instead.\n"
+            "Claude Code exited with code 1\nPane is dead (status 0)"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude session is already running in the background"
+    assert diagnosis.remediation is not None
+    assert "claude attach <session-id>" in diagnosis.remediation
+    assert "claude stop <session-id>" in diagnosis.remediation
+    assert "abcd1234" not in str(diagnosis)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Background task running; use claude attach or claude stop to manage sessions.",
+        "That session is running in the background; waiting for tool results.",
+    ],
+)
+def test_background_work_alone_does_not_diagnose_a_resume_refusal(output: str) -> None:
+    assert classify_terminal_failure(command="claude", exit_status=None, output=output) is None
+
+
 @pytest.mark.parametrize(
     "output",
     [
@@ -117,6 +150,49 @@ def test_classifies_missing_binary_by_output() -> None:
     )
     assert diagnosis is not None
     assert diagnosis.title == "Agent command not found"
+
+
+@pytest.mark.parametrize(
+    ("exit_status", "output"),
+    [
+        # npm's ENOENT text from a launcher's failed install also says "no such file".
+        (
+            0,
+            "npm error code ENOENT\n"
+            "npm error syscall rename\n"
+            "npm error enoent ENOENT: no such file or directory, rename "
+            "'/home/dev/.local/lib/node_modules/@anthropic-ai/claude-code'\n"
+            "Failed to install Claude Code version 2.1.400.\n"
+            "Claude Code exited with code 127",
+        ),
+        (1, "Error: claude native binary not installed.\nClaude Code exited with code 1"),
+        # Pane wrapping and borders can split the marker mid-word.
+        (
+            0,
+            "│ An error occurred while running Claude Code: [Errno 8] Exec form │\n"
+            "│ at error: '/home/dev/.local/bin/claude'                          │",
+        ),
+    ],
+)
+def test_classifies_broken_claude_install(exit_status: int, output: str) -> None:
+    diagnosis = classify_terminal_failure(command="env", exit_status=exit_status, output=output)
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code's install is broken"
+    assert diagnosis.remediation is not None
+    assert "reinstall Claude Code" in diagnosis.remediation
+
+
+def test_exec_format_error_of_another_program_is_not_a_broken_claude_install() -> None:
+    # The launcher's exit box names Claude Code right after the other program's path.
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=1,
+        output=(
+            "OSError: [Errno 8] Exec format error: '/home/dev/bin/helper'\n"
+            "│ Claude Code exited with code 1 │"
+        ),
+    )
+    assert diagnosis is None
 
 
 def test_classifies_gateway_claude_version_failure() -> None:
@@ -462,6 +538,7 @@ def test_codex_provider_auth_diagnosis_ignores_unrelated_errors(message: str) ->
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        "Selected model is at capacity. Please try a different model.",
         # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
         _GATEWAY_499_OUTPUT,
         "API Error: 499",
@@ -514,6 +591,12 @@ def test_transient_messages_do_not_override_specific_failure_codes(code: str) ->
         classify_native_turn_error(
             code,
             "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
+    assert (
+        classify_native_turn_error(
+            code, "Selected model is at capacity. Please try a different model."
         )
         == code
     )
@@ -810,6 +893,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("prompt_blocked_by_hook", "hook blocked this message"),
         ("codex_compaction_model_failed", "previous model"),
         ("codex_provider_auth_failed", "model provider's sign-in command"),
+        ("harness_not_configured", "isn't set up on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
