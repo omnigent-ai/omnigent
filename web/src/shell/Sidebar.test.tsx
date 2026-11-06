@@ -430,7 +430,7 @@ describe("Sidebar session list", () => {
       selectSessionFilter(filter);
       const pinned = screen.getByText("Pinned").closest("section")!;
       expect(within(pinned).getByText("shared_pin")).toBeInTheDocument();
-      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+      expect(screen.queryByRole("img", { name: "Shared with others" })).toBeNull();
     }
     selectSessionFilter("all");
     const row = screen.getByText("shared_running").closest("li")!;
@@ -466,12 +466,12 @@ describe("Sidebar session list", () => {
       selectSessionFilter("all");
 
       const sharedRow = screen.getByText("owned_shared").closest("li")!;
-      const icon = within(sharedRow).getByRole("img", { name: "Shared session" });
-      expect(icon).toHaveAttribute("title", "Shared with others");
-      expect(icon).toHaveClass("right-1");
+      expect(within(sharedRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
+        "right-1",
+      );
       // The icon sits left of the session state, which keeps the rightmost slot.
       const runningRow = screen.getByText("owned_shared_running").closest("li")!;
-      expect(within(runningRow).getByRole("img", { name: "Shared session" })).toHaveClass(
+      expect(within(runningRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
         "right-8",
       );
       expect(within(runningRow).getByTestId("session-state-badge").parentElement).toHaveClass(
@@ -480,14 +480,14 @@ describe("Sidebar session list", () => {
       // The natural-width "Needs response" pill reserves pr-29, so the icon sits
       // at that edge and the title reserve grows to cover both.
       const awaitingRow = screen.getByText("owned_shared_awaiting").closest("li")!;
-      expect(within(awaitingRow).getByRole("img", { name: "Shared session" })).toHaveClass(
+      expect(within(awaitingRow).getByRole("img", { name: "Shared with others" })).toHaveClass(
         "right-29",
       );
       expect(awaitingRow.querySelector("a")).toHaveClass("pr-36");
       const privateRow = screen.getByText("owned_private").closest("li")!;
-      expect(within(privateRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+      expect(within(privateRow).queryByRole("img", { name: "Shared with others" })).toBeNull();
       const legacyRow = screen.getByText("owned_legacy").closest("li")!;
-      expect(within(legacyRow).queryByRole("img", { name: "Shared session" })).toBeNull();
+      expect(within(legacyRow).queryByRole("img", { name: "Shared with others" })).toBeNull();
     } finally {
       viewer.mockRestore();
     }
@@ -498,17 +498,61 @@ describe("Sidebar session list", () => {
     try {
       const row = (shared: boolean) =>
         conv("owned", "Claude Code", { owner: "viewer@example.com", shared_with_others: shared });
+      // A stable projects array keeps context churn from bypassing the memo comparator.
+      projectRowsRef.current = [];
       mockConversations([row(false)]);
       const { refresh } = renderSidebar();
-      expect(screen.queryByRole("img", { name: "Shared session" })).toBeNull();
+      expect(screen.queryByRole("img", { name: "Shared with others" })).toBeNull();
 
       mockConversations([row(true)]);
       refresh();
-      expect(screen.getByRole("img", { name: "Shared session" })).toBeInTheDocument();
+      expect(screen.getByRole("img", { name: "Shared with others" })).toBeInTheDocument();
     } finally {
       viewer.mockRestore();
     }
   });
+
+  describe.each(["legacy", "grouping", "pinned"] as const)(
+    "%s hover surface sharing explanation",
+    (surface) => {
+      it.each([true, false])("says shared with others only when shared is %s", async (shared) => {
+        const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("viewer@example.com");
+        try {
+          const id = `conv_shared_hint_${surface}`;
+          const pinned = surface === "pinned";
+          if (pinned) {
+            projectsMock.push("Customer X");
+            seedPins([id]);
+          }
+          mockConversations([
+            conv(id, "Codex", {
+              owner: "viewer@example.com",
+              shared_with_others: shared,
+              labels: pinned ? { omni_project: "Customer X" } : {},
+            }),
+          ]);
+          if (surface === "grouping") renderGroupingSidebar();
+          else renderSidebar();
+
+          const link = screen.getByRole("link", { name: id });
+          if (pinned) fireEvent.focus(link);
+          else fireEvent.pointerMove(link, { pointerType: "mouse" });
+          const content = await screen.findByTestId(
+            pinned ? "pinned-project-flyout" : "session-tooltip-content",
+          );
+          if (shared) {
+            expect(within(content).getByTestId("session-shared-hint")).toHaveTextContent(
+              "Shared with others",
+            );
+          } else {
+            expect(within(content).queryByTestId("session-shared-hint")).toBeNull();
+          }
+        } finally {
+          viewer.mockRestore();
+        }
+      });
+    },
+  );
 
   it("uses the interface text token for the empty session-list state", () => {
     mockConversations([]);

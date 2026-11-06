@@ -55,8 +55,8 @@ export function useSessionOwner(sessionId: string | null) {
 }
 
 /**
- * Refetch the grants and every session list after a share change, so rows pick up
- * the server's `shared_with_others`. Invalidation also restarts in-flight reads.
+ * Mark the grants and every session list stale after a share change, so active
+ * lists refetch and pick up the server's `shared_with_others`.
  */
 function invalidateAfterShareChange(qc: QueryClient, sessionId: string): void {
   void qc.invalidateQueries({ queryKey: permissionsKey(sessionId) });
