@@ -4289,7 +4289,7 @@
           },
           "user_authored": {
             "default": false,
-            "description": "Confirmed or conservatively preserved user input; prevents legacy content cleanup from hiding literal agent markup.",
+            "description": "Originated from an explicit user action; may be server-expanded, e.g. skill instructions. Independent of `is_meta`; client-settable by convention, not a trust signal.",
             "title": "User Authored",
             "type": "boolean"
           }
