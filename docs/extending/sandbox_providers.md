@@ -249,9 +249,10 @@ chats: automations do not override timeouts or terminate a sandbox when a run
 finishes. Server owners must choose provider lifetime, idle, and cleanup settings
 appropriate for their automation frequency and resource budget.
 
-For `agent_sandbox`, `sandbox.keep_warm_s` controls the runner idle timeout;
-the existing keepalive renews the sandbox deadline while the runner is alive.
-Once renewal stops, expiry suspends compute while retaining storage. Other
+For `agent_sandbox`, `sandbox.keep_warm_s` sets how long the sandbox stays warm
+after its runner stops doing work: the keepalive renews the sandbox deadline while
+the runner reports work and for `keep_warm_s` afterwards (it is also the runner
+idle timeout). Once renewal stops, expiry suspends compute while retaining storage. Other
 providers have different lifetime behavior, so enabling managed sandboxes alone
 does not guarantee a short shutdown time.
 

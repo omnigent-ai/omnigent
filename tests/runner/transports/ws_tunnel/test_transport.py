@@ -260,3 +260,53 @@ async def test_transport_aclose_is_noop() -> None:
     reg = TunnelRegistry()
     transport = WSTunnelTransport(reg, "r1")
     await transport.aclose()  # Should not raise.
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "reported"),
+    [
+        pytest.param("POST", "/v1/sessions/conv_1/events", True, id="session-event"),
+        pytest.param("GET", "/v1/sessions/conv_1/events", False, id="read"),
+        pytest.param("POST", "/v1/sessions/conv_1/resources", False, id="other-post"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_session_event_sends_report_work_dispatched(
+    method: str, path: str, reported: bool
+) -> None:
+    """Only a session event sent to the runner counts as new work for keepalive."""
+    dispatched: list[str] = []
+    reg = TunnelRegistry(on_work_dispatched=dispatched.append)
+    reg.register("r1", _NoopWS(), _hello())
+    task = asyncio.create_task(
+        WSTunnelTransport(reg, "r1").handle_async_request(_make_request(method, path))
+    )
+    try:
+        async with asyncio.timeout(1):
+            while not (session := reg.get("r1")) or not session.in_flight:
+                await asyncio.sleep(0.001)
+        assert dispatched == (["r1"] if reported else [])
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_failing_work_dispatched_hook_does_not_fail_the_request() -> None:
+    def _boom(_runner_id: str) -> None:
+        raise RuntimeError("keepalive down")
+
+    reg = TunnelRegistry(on_work_dispatched=_boom)
+    reg.register("r1", _NoopWS(), _hello())
+    task = asyncio.create_task(
+        WSTunnelTransport(reg, "r1").handle_async_request(
+            _make_request("POST", "/v1/sessions/conv_1/events")
+        )
+    )
+    async with asyncio.timeout(1):
+        while not (session := reg.get("r1")) or not session.in_flight:
+            await asyncio.sleep(0.001)
+    req_id = next(iter(session.in_flight))
+    reg.route_response_frame("r1", ResponseHeadFrame(id=req_id, status=202, headers=[]))
+    reg.route_response_frame("r1", ResponseEndFrame(id=req_id))
+    assert (await task).status_code == 202

@@ -6164,6 +6164,15 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
         _parse_keep_warm_s({"keep_warm_s": -5})
 
 
+def test_keep_warm_after_work_is_the_runner_idle_timeout() -> None:
+    """agent_sandbox stays warm keep_warm_s after its last work (else the runner default)."""
+    from omnigent.server.managed_hosts import _keep_warm_after_work_s
+
+    assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": 300}}) == 300.0
+    assert _keep_warm_after_work_s(None) == 3600.0
+    assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": True}}) == 3600.0
+
+
 @pytest.mark.parametrize("relaunch", [False, True])
 async def test_account_deleted_after_provision_terminates_unregistered_sandbox(db_uri, relaunch):
     from omnigent.db.account_authority import account_authority_scope
