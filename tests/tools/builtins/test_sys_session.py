@@ -1305,6 +1305,7 @@ def test_close_same_named_child_does_not_close_another_parent_tree(
             "agent": "researcher",
             "title": "auth",
             "conversation_id": other_child.id,
+            "task_summary": None,
         }
     ]
     assert other_stored is not None
@@ -1390,6 +1391,10 @@ def test_session_list_returns_open_children_and_filters_non_resumable_rows(
         labelled_closed.id,
         {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
     )
+    # The surviving child carries the generated label the Subagents panel shows.
+    session_fixture.conv_store.set_task_summary(
+        session_fixture.child_conv_id, "Audit the auth flow"
+    )
 
     payload = json.loads(SysSessionListTool().invoke("{}", session_fixture.ctx))
 
@@ -1399,6 +1404,7 @@ def test_session_list_returns_open_children_and_filters_non_resumable_rows(
                 "agent": "researcher",
                 "title": "auth",
                 "conversation_id": session_fixture.child_conv_id,
+                "task_summary": "Audit the auth flow",
             }
         ],
         "sessions": [],

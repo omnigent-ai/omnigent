@@ -224,14 +224,16 @@ def test_subagent_rail_prefers_task_summary_over_structured_name(
     page: Page,
     labelled_subagent: tuple[str, str],
 ) -> None:
-    """The rail labels a sub-agent by its task, not its spawn key.
+    """The rail leads a sub-agent's label with its task, then its spawn key.
 
     Sub-agents are named ``"{agent}-{ordinal}"`` so the parent has a stable
     key to spawn-or-continue against, but that key says nothing about what
     the sub-agent is doing. ``task_summary`` carries the task-derived label,
     and both the list and graph views resolve it ahead of the structured
     name — otherwise the rail reads as a row of ``researcher-1``,
-    ``researcher-2`` with no way to tell them apart.
+    ``researcher-2`` with no way to tell them apart. The structured name
+    still follows the summary on the row: it is the handle the parent is
+    given and refers to, so a person pointed at ``researcher-1`` can find it.
     """
     base_url, parent_id = labelled_subagent
 
@@ -246,10 +248,12 @@ def test_subagent_rail_prefers_task_summary_over_structured_name(
     row = rail.locator(_SUBAGENT_ROW).first
     expect(row).to_be_visible(timeout=30_000)
 
-    # List view: the task label wins, and the structured key it beat is
-    # nowhere in the row (a fallback regression would surface it here).
+    # List view: the task label leads (a fallback regression would put the
+    # structured key first) and the structured key follows it.
     expect(row).to_contain_text(_TASK_SUMMARY, timeout=30_000)
-    assert _STRUCTURED_NAME not in row.inner_text()
+    row_text = row.inner_text()
+    assert row_text.startswith(_TASK_SUMMARY), row_text
+    assert _STRUCTURED_NAME in row_text, row_text
 
     # Graph view resolves the label through its own layout code, so it gets
     # its own assertion rather than riding on the list's.
