@@ -409,7 +409,18 @@ describe("useCreateTerminal launch", () => {
         createElement(QueryClientProvider, { client }, children),
     });
     const cached = () => client.getQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId));
-    return { hook, cached };
+    return { hook, cached, client };
+  }
+
+  function createdResponseBody(body: string): string {
+    const { session_key: sessionKey, terminal } = JSON.parse(body) as {
+      session_key: string;
+      terminal: string;
+    };
+    return JSON.stringify({
+      id: `terminal_${terminal}_${sessionKey}`,
+      metadata: { terminal_name: terminal, session_key: sessionKey, running: true },
+    });
   }
 
   function createdResponse(body: string): Response {
@@ -469,6 +480,7 @@ describe("useCreateTerminal launch", () => {
     runnerOnlineMock.mockReturnValue(true);
     let respond: (response: Response) => void = () => {};
     let requestBody = "";
+    let listed: unknown[] = [];
     fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
       if (init?.method === "POST") {
         requestBody = init.body as string;
@@ -476,6 +488,7 @@ describe("useCreateTerminal launch", () => {
           respond = resolve;
         });
       }
+      if (!init?.method) return Promise.resolve(mockResponse({ data: listed }));
       return Promise.resolve(mockResponse({ deleted: true }));
     });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -495,6 +508,15 @@ describe("useCreateTerminal launch", () => {
     });
     // Nothing to DELETE yet: the terminal doesn't exist until the create returns.
     expect(fetchMock.mock.calls.filter(([, init]) => init?.method === "DELETE")).toHaveLength(0);
+    expect(cached()).toEqual([]);
+
+    // The runner has registered the shell, so a list refresh now returns it.
+    listed = [JSON.parse(createdResponseBody(requestBody))];
+    renderHook(() => useTerminals("conv_close_early"), { wrapper });
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: terminalsQueryKey("conv_close_early") });
+    });
+    expect(fetchMock.mock.calls.some(([, init]) => !init?.method)).toBe(true);
     expect(cached()).toEqual([]);
 
     await act(async () => respond(createdResponse(requestBody)));
@@ -547,6 +569,35 @@ describe("useCreateTerminal launch", () => {
     expect(isClosedDuringLaunch(opened.id)).toBe(false);
   });
 
+  it("keeps a direct-attach URL a list refresh added while the create was in flight", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+      requestBody = init.body as string;
+      return new Promise<Response>((resolve) => {
+        respond = resolve;
+      });
+    });
+    const onOpen = vi.fn();
+    const { hook, cached, client } = renderLaunch("conv_direct_kept");
+
+    act(() => hook.result.current.launch("zsh", { onOpen }));
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+    const directAttachUrl = "ws://127.0.0.1:4100/v1/attach?token=t";
+    act(() =>
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_direct_kept"), [
+        { ...opened, directAttachUrl },
+      ]),
+    );
+
+    await act(async () => respond(createdResponse(requestBody)));
+
+    await vi.waitFor(() => expect(isTerminalLaunching(opened.id)).toBe(false));
+    expect(cached()).toEqual([{ ...opened, directAttachUrl }]);
+  });
+
   it("removes the early-opened terminal and reports it when the create fails", async () => {
     runnerOnlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValueOnce(
@@ -569,35 +620,38 @@ describe("useCreateTerminal launch", () => {
     expect(isTerminalLaunching(opened.id)).toBe(false);
   });
 
-  it("opens at once but holds the attach when runner liveness is unknown", async () => {
-    runnerOnlineMock.mockReturnValue(undefined);
-    let respond: (response: Response) => void = () => {};
-    let requestBody = "";
-    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
-      requestBody = init.body as string;
-      return new Promise<Response>((resolve) => {
-        respond = resolve;
+  it.each([undefined, false])(
+    "opens at once but holds the attach when runner liveness is %s",
+    async (online) => {
+      runnerOnlineMock.mockReturnValue(online);
+      let respond: (response: Response) => void = () => {};
+      let requestBody = "";
+      fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+        requestBody = init.body as string;
+        return new Promise<Response>((resolve) => {
+          respond = resolve;
+        });
       });
-    });
-    const onOpen = vi.fn();
-    const { hook, cached } = renderLaunch("conv_waking");
+      const onOpen = vi.fn();
+      const { hook, cached } = renderLaunch("conv_waking");
 
-    act(() => hook.result.current.launch("bash", { onOpen }));
+      act(() => hook.result.current.launch("bash", { onOpen }));
 
-    // The tab opens before the create returns, but the attach waits for it:
-    // the create may be waking the runner.
-    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
-    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
-    expect(terminalLaunchMode(opened.id)).toBe("wait");
-    expect(isTerminalLaunching(opened.id)).toBe(false);
+      // The tab opens before the create returns, but the attach waits for it:
+      // the create may be waking the runner.
+      const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+      expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+      expect(terminalLaunchMode(opened.id)).toBe("wait");
+      expect(isTerminalLaunching(opened.id)).toBe(false);
 
-    await vi.waitFor(() => expect(requestBody).not.toBe(""));
-    await act(async () => respond(createdResponse(requestBody)));
+      await vi.waitFor(() => expect(requestBody).not.toBe(""));
+      await act(async () => respond(createdResponse(requestBody)));
 
-    await vi.waitFor(() => expect(terminalLaunchMode(opened.id)).toBeNull());
-    expect(onOpen).toHaveBeenCalledOnce();
-    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
-  });
+      await vi.waitFor(() => expect(terminalLaunchMode(opened.id)).toBeNull());
+      expect(onOpen).toHaveBeenCalledOnce();
+      expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+    },
+  );
 });
 
 describe("deleteTerminal", () => {

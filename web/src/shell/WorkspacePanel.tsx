@@ -91,6 +91,7 @@ import {
   terminalTabKey,
   useCreateTerminal,
   useTerminals,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
@@ -223,7 +224,8 @@ function NewTabMenu({
   onCreateStart?: () => void;
   /** Called when the shell create POST fails, so the caller can disarm the
    *  focus snapshot armed by ``onCreateStart``. */
-  onCreateError?: () => void;
+  /** The create failed; *opened* is the shell tab opened early, if any. */
+  onCreateError?: (opened?: TerminalInfo) => void;
   /** Open session's derived liveness — drives the "Shell" item's connect
    *  affordance. Absent is treated as ready. */
   liveness?: SessionLiveness;
@@ -261,7 +263,7 @@ function NewTabMenu({
     onCreateStart?.();
     create.launch(name, {
       onOpen: (info) => onOpenTerminal(terminalTabKey(info)),
-      onError: () => onCreateError?.(),
+      onError: (_error, opened) => onCreateError?.(opened),
     });
   };
 
@@ -802,7 +804,7 @@ interface WorkspacePanelProps {
   onShellCreateStart?: () => void;
   /** Called when the shell create POST fails, so the focus snapshot armed by
    *  ``onShellCreateStart`` is disarmed and can't grab an unrelated shell. */
-  onShellCreateFailed?: () => void;
+  onShellCreateFailed?: (opened?: TerminalInfo) => void;
   /** Whether the mobile side-chats drawer is open. The rail is hidden on
    *  phones, so side chats render in this drawer instead. */
   mobileSideChatsOpen?: boolean;

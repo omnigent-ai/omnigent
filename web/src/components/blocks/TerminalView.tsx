@@ -680,11 +680,8 @@ export function TerminalView({
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // An early attach can be refused (4404) before its own create registers the
-  // terminal: an older runner ignores ``await_launch``, or the launch outlasted
-  // the server's wait. The refusal and the create's response arrive in either
-  // order, so re-dial once both have happened. The re-dial is a plain attach,
-  // so a 4404 outside a launch stays a deliberate close.
+  // An early attach may get 4404 before registration. After the create
+  // succeeds, retry once without ``await_launch``.
   useEffect(() => {
     if (!dialedDuringLaunchRef.current || launchMode !== null) return;
     if (state.kind !== "closed" || state.code !== WS_CLOSE_TERMINAL_NOT_FOUND) return;
