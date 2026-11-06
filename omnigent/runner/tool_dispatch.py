@@ -7357,6 +7357,7 @@ async def dispatch_tool_locally(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -7380,6 +7381,8 @@ async def dispatch_tool_locally(
         observe tool-launched terminals.
     :param effective_harness: Harness the session actually runs, forwarded to
         ``execute_tool`` for the granted-surface check.
+    :param wake_on_async_result: Forwarded to ``execute_tool`` so a
+        ``sys_call_async`` result can wake the session after its turn ends.
     :returns: The tool output string.
     """
     if not conversation_id:
@@ -7407,6 +7410,7 @@ async def dispatch_tool_locally(
         filesystem_registry=filesystem_registry,
         publish_event=publish_event,
         effective_harness=effective_harness,
+        wake_on_async_result=wake_on_async_result,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

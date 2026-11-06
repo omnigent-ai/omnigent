@@ -6771,6 +6771,7 @@ def create_runner_app(
                                                     effective_harness=_session_harness_name(
                                                         conv_id
                                                     ),
+                                                    wake_on_async_result=_wake_on_async_result,
                                                 )
                                             )
                                         )

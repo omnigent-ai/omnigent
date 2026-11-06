@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, subagent_work, tool_dispatch
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
     _BlockingHarnessClient,
@@ -1595,21 +1596,6 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
     assert "sys_read_inbox" in followup_text
 
 
-async def _wait_for_turn_end(app: Any, session_id: str) -> None:
-    """
-    Wait until the runner no longer tracks an active turn for *session_id*.
-
-    :param app: Runner app under test.
-    :param session_id: Session whose turn is ending.
-    :returns: None.
-    """
-    deadline = asyncio.get_running_loop().time() + 5.0
-    while session_id in app.state.active_turns:
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError(f"turn for {session_id} did not end within 5s")
-        await asyncio.sleep(0.01)
-
-
 class _PolicyAllowingWakeRecordingServerClient(_WakeRecordingServerClient):
     """Allows the ``PHASE_TOOL_CALL`` check a background task makes before it runs."""
 
@@ -1627,15 +1613,21 @@ class _PolicyAllowingWakeRecordingServerClient(_WakeRecordingServerClient):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("finishes", "drained_mid_turn", "wakes"),
+    ("finishes", "drained_mid_turn", "subagent_finishes", "wakes"),
     [
-        pytest.param("after_turn", False, True, id="finishes-after-turn-end"),
-        pytest.param("mid_turn", False, True, id="finishes-mid-turn-undrained"),
-        pytest.param("mid_turn", True, False, id="finishes-mid-turn-drained"),
+        pytest.param("after_turn", False, None, True, id="finishes-after-turn-end"),
+        pytest.param("mid_turn", False, None, True, id="finishes-mid-turn-undrained"),
+        pytest.param("mid_turn", True, None, False, id="finishes-mid-turn-drained"),
+        pytest.param("mid_turn", False, "before", True, id="newer-than-subagent-result"),
+        pytest.param("mid_turn", False, "after", True, id="older-than-subagent-result"),
     ],
 )
 async def test_background_task_result_wakes_session_whose_turn_ended(
-    monkeypatch: pytest.MonkeyPatch, finishes: str, drained_mid_turn: bool, wakes: bool
+    monkeypatch: pytest.MonkeyPatch,
+    finishes: str,
+    drained_mid_turn: bool,
+    subagent_finishes: str | None,
+    wakes: bool,
 ) -> None:
     """
     A finished ``sys_call_async`` task wakes its session once no turn can collect it.
@@ -1645,9 +1637,11 @@ async def test_background_task_result_wakes_session_whose_turn_ended(
     session inbox, and the runner must post a wake notice to the session's own
     ``/events`` so it takes a turn and calls ``sys_read_inbox``. A result that
     lands mid-turn defers that decision to turn end: the turn may drain it
-    itself, in which case a wake would only start an empty extra turn.
+    itself, in which case a wake would only start an empty extra turn. When a
+    sub-agent result is also waiting, the turn-end notice names the newer one.
     """
     session_id = "b7e0c4a1d2f34e5a9c8b7a6f5e4d3c2b"
+    child_id = "5d4c3b2a1f0e4d9c8b7a6f5e4d3c2b1a"
     agent_id = "0c1d2e3f4a5b4c6d8e9f0a1b2c3d4e5f"
     spec = AgentSpec(spec_version=1, name="background-agent", async_enabled=True)
     server_client = _PolicyAllowingWakeRecordingServerClient(session_id)
@@ -1680,6 +1674,24 @@ async def test_background_task_result_wakes_session_whose_turn_ended(
         assert resp.status_code == 200, resp.text
         return str(resp.json()["result"]["output"])
 
+    async def _finish_subagent(client: Any) -> None:
+        subagent_work.register_subagent_work(
+            parent_session_id=session_id,
+            child_session_id=child_id,
+            agent="researcher",
+            title="check",
+        )
+        resp = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "external_session_status",
+                "data": {"status": "idle", "output": "SUBAGENT_DONE"},
+            },
+        )
+        assert resp.status_code == 204, resp.text
+        await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+        server_client.wake_seen.clear()
+
     try:
         async with _runner_client(app) as client:
             init = await client.post(
@@ -1704,42 +1716,58 @@ async def test_background_task_result_wakes_session_whose_turn_ended(
                 await _call(client, "sys_call_async", {"tool": "sys_session_list", "args": "{}"})
             )
             inbox = subagent_work._session_inboxes_ref[session_id]
+            pending = 1 if subagent_finishes is None else 2
 
             if finishes == "after_turn":
                 gate.set()
-                await _wait_for_turn_end(app, session_id)
+                await poll_until_async(
+                    lambda: session_id not in app.state.active_turns, timeout_s=5.0
+                )
                 release.set()
             else:
+                if subagent_finishes == "before":
+                    await _finish_subagent(client)
                 release.set()
-                while inbox.empty():
-                    await asyncio.sleep(0.01)
+                await poll_until_async(
+                    lambda: inbox.qsize() == (2 if subagent_finishes == "before" else 1),
+                    timeout_s=5.0,
+                )
+                if subagent_finishes == "after":
+                    await _finish_subagent(client)
                 if drained_mid_turn:
                     assert "BACKGROUND_DONE" in await _call(client, "sys_read_inbox", {})
                 # The turn is still active, so it could collect the result itself.
-                assert server_client.wake_posts == []
+                assert len(server_client.wake_posts) == (0 if subagent_finishes is None else 1)
                 gate.set()
-                await _wait_for_turn_end(app, session_id)
+                await poll_until_async(
+                    lambda: session_id not in app.state.active_turns, timeout_s=5.0
+                )
 
             if wakes:
                 await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
             else:
-                for _ in range(20):
-                    await asyncio.sleep(0)
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(server_client.wake_seen.wait(), timeout=0.5)
     finally:
         gate.set()
         release.set()
+        subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(session_id, None)
 
     if not wakes:
         assert server_client.wake_posts == []
         return
-    [wake] = server_client.wake_posts
-    wake_text = wake["data"]["content"][0]["text"]
-    assert (
-        f"background task {handle['handle_id']} (sys_session_list) finished (completed)"
-        in wake_text
-    )
-    assert "1 result waiting in inbox" in wake_text
+    assert len(server_client.wake_posts) == pending
+    wake_text = server_client.wake_posts[-1]["data"]["content"][0]["text"]
+    if subagent_finishes == "after":
+        assert "sub-agent researcher/check finished" in wake_text
+    else:
+        assert (
+            f"background task {handle['handle_id']} (sys_session_list) finished (completed)"
+            in wake_text
+        )
+    noun = "result" if pending == 1 else "results"
+    assert f"{pending} {noun} waiting in inbox" in wake_text
     assert "sys_read_inbox" in wake_text
 
 

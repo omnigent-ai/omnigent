@@ -8408,7 +8408,8 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_spawns_child_under_caller() -> None:
+@pytest.mark.parametrize("message_sent", [True, False], ids=["message-sent", "message-failed"])
+async def test_sys_session_create_spawns_child_under_caller(message_sent: bool) -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
     ``parent_session_id`` forced to the caller (child-only), passes the
@@ -8417,7 +8418,8 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     create top-level/sibling sessions — so the asserted request body is the
     security-critical check. The initial message is sent like a by-id
     ``sys_session_send`` so the child's completion is tracked as sub-agent
-    work that reaches the caller's inbox and wakes it.
+    work that reaches the caller's inbox and wakes it. A failed send leaves
+    no tracked work and reports the error with the created child's id.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
@@ -8452,6 +8454,8 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
             return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             posted.append(json.loads(request.content))
+            if not message_sent:
+                return httpx.Response(500, json={"error": "events unavailable"})
             return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
@@ -8476,16 +8480,20 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
     assert "initial_items" not in captured
-    [first_message] = posted
-    assert first_message["data"]["content"][0]["text"] == "start"
+    assert posted[0]["data"]["content"][0]["text"] == "start"
+    handle = json.loads(output)
+    assert handle["conversation_id"] == "conv_child"
+    if not message_sent:
+        assert handle["error"].startswith("child session created but message failed"), output
+        assert entry is None
+        return
+    assert len(posted) == 1
     assert entry is not None, output
     assert (entry.parent_session_id, entry.agent, entry.title) == (
         "conv_caller",
         "researcher",
         "auth",
     )
-    handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
     assert handle["handle_id"] == "conv_child"
