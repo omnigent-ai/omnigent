@@ -33,7 +33,8 @@ browser only and reset when the pull request gets a new head.
   filter still matches is viewed, the list reads `All N files viewed` with
   **Show viewed**.
 - `head-reset`: A new head starts with no marks. A notice reads `New commits since
-  you last viewed — viewed marks were reset.` until **Dismiss**. Files collapsed by
+  you last viewed — viewed marks were reset.` until **Dismiss** or until you mark a
+  file on the new head. Files collapsed by
   the previous head's marks open again once the new diff renders.
 
 ## How to get to it (user POV)
@@ -49,8 +50,10 @@ browser only and reset when the pull request gets a new head.
 The Changes tab is the same on every entry. Its toolbar holds the find button,
 the thread navigation buttons, the filter button when the file list is hidden,
 and the progress row. The toolbar appears once the list has files or an unresolved
-conversation exists. The progress row and Hide viewed also need a pinned list (see
-the gotchas).
+conversation exists. The viewed controls need a pinned list and a fetched diff that
+reports the same head as that list (see the gotchas). While the two heads differ
+during a refresh, the Viewed checkboxes, the progress row, Hide viewed and the reset
+notice are hidden.
 
 ## Driving it with the repro environment
 
@@ -148,8 +151,9 @@ Component coverage for these helpers and views lives in
   data removes them. If the browser refuses storage, marks stay in memory and a
   reload drops them, with the toast `Viewed files can’t be saved on this device.`
 - **New head, new marks.** Marks from an older head never appear on the new one. The
-  notice shows while the pull request has marks recorded on another head and none on
-  the current one, until dismissed.
+  notice shows while the pull request has marks recorded on another head and nothing
+  recorded on the current one. It ends when you dismiss it or mark a file on the new
+  head; unmarking everything afterwards does not bring it back.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.
 - **Thread navigation can clear a filter.** Previous and Next unresolved
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
