@@ -54,7 +54,7 @@ vi.mock("./WorkspacePickerDialog", () => ({
 function renderButton() {
   render(
     <TooltipProvider>
-      <NewProjectButton onCreated={vi.fn()} />
+      <NewProjectButton onCreated={vi.fn()} hostId="host_1" hostsLoading={false} />
     </TooltipProvider>,
   );
   fireEvent.click(screen.getByRole("button", { name: "New project" }));

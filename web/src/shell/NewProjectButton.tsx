@@ -16,7 +16,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
-import { useHosts } from "@/hooks/useHosts";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
@@ -77,7 +76,15 @@ function friendlyProjectError(error: unknown): string {
  * the legacy label model can't express. On success the new folder is expanded
  * (via `onCreated`) so the user can immediately file sessions into it.
  */
-export function NewProjectButton({ onCreated }: { onCreated: (name: string) => void }) {
+export function NewProjectButton({
+  onCreated,
+  hostId,
+  hostsLoading,
+}: {
+  onCreated: (name: string) => void;
+  hostId: string | null;
+  hostsLoading: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
@@ -88,10 +95,8 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
   const [submitError, setSubmitError] = useState<string | null>(null);
   const createProject = useCreateProject();
   const createDirectory = useCreateHostDirectory();
-  const hosts = useHosts({ enabled: open });
-  const hostId = (hosts.data ?? []).find((host) => host.status === "online")?.host_id ?? null;
   const isPending = createProject.isPending || createDirectory.isPending;
-  const folderCreationDisabled = isPending || (!hosts.isLoading && hostId === null);
+  const folderCreationDisabled = isPending || (!hostsLoading && hostId === null);
 
   const submit = async () => {
     const trimmed = name.trim();
@@ -305,7 +310,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
                   <span className="truncate">
                     {createWorkspaceFolder
                       ? joinPath("~", name.trim() || "Project name")
-                      : workspace || (hosts.isLoading ? "Loading hosts…" : "Choose a folder…")}
+                      : workspace || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
                   </span>
                 </span>
                 <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
