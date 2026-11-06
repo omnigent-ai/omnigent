@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
@@ -396,6 +397,21 @@ def encode_frame(frame: Frame) -> str:
     raise TypeError(f"unknown frame type: {type(frame).__name__}")
 
 
+def _optional_seconds(value: object) -> float | None:
+    """A finite, non-negative number of seconds, else ``None`` (unreported).
+
+    An optional field must never fail the frame: ``float()`` of a huge JSON
+    integer raises ``OverflowError``, which would end the tunnel's receive loop.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        seconds = float(value)
+    except OverflowError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds >= 0 else None
+
+
 def decode_frame(text: str) -> Frame:
     """Parse a JSON wire frame back into its dataclass.
 
@@ -469,15 +485,10 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
             busy = msg.get("busy")
-            idle_s = msg.get("idle_s")
             return PongFrame(
                 ts=_required_int(msg, "ts"),
                 busy=busy if isinstance(busy, bool) else None,
-                idle_s=float(idle_s)
-                if isinstance(idle_s, (int, float))
-                and not isinstance(idle_s, bool)
-                and idle_s >= 0
-                else None,
+                idle_s=_optional_seconds(msg.get("idle_s")),
             )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)

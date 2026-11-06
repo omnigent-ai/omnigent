@@ -1033,11 +1033,10 @@ async def _keepalive_loop(runner_id: str) -> None:
     Separate from :func:`_ping_loop` (fixed ``PING_INTERVAL_S``) so a deployment
     can refresh a managed sandbox faster than the 30s liveness ping (which is
     what lets the sandbox's shutdown window be short) or slower to save calls.
-    Fires once immediately so a freshly connected (or reconnected) runner
-    extends its sandbox right away, then every
-    :func:`managed_host_keepalive.keepalive_interval_s`; a runner that reports
-    busy on its pongs is refreshed only while busy (see
-    :func:`managed_host_keepalive.record_pong`). Best-effort:
+    Ticks immediately, then every
+    :func:`managed_host_keepalive.keepalive_interval_s`; a runner is refreshed
+    from its first pong on, and one that reports busy on its pongs only while it
+    works (see :func:`managed_host_keepalive.record_pong`). Best-effort:
     :func:`managed_host_keepalive.touch` swallows its own errors and no-ops when
     the host has no extendable sandbox, so this loop only ever ends when it is
     cancelled at tunnel teardown.

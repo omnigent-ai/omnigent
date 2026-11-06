@@ -1655,12 +1655,10 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
-    # Monotonic time of the newest published session event. Every turn publishes
-    # through _publish_event, so this records work even when it starts and ends
-    # between two reads of has_active_work. ``session.*`` events are left out: they
-    # are resource and UI notifications (status edges, plain-shell terminal output,
-    # resource changes), not agent work, and a tunnel reconnect republishes every
-    # session's status (resync_session_statuses), which must not look like new work.
+    # Monotonic time of the newest published agent-work event, so a turn that
+    # starts and ends between two busy checks still counts. ``session.*`` events
+    # (status edges, plain-shell output, resource changes) are notifications, and
+    # a tunnel reconnect republishes every status, so they are left out.
     _last_event_published_at: list[float | None] = [None]
     app.state.last_event_published_at = lambda: _last_event_published_at[0]
 

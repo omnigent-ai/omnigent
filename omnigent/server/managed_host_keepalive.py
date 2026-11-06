@@ -10,9 +10,11 @@ longer (``keep_warm_after_work_s``, by default the runner idle timeout,
 so a sandbox stays warm as long as an idle runner would stay alive). A busy
 report after the window ran out refreshes at once, because the platform's idle
 timer has been running since the last refresh. Work the server sends to the
-runner (a session event) counts as a busy report right away. A runner that
+runner (a session event) counts as a busy report right away. Nothing is
+refreshed before a runner's first pong says whether it reports, so reconnecting
+to a replica without its history cannot extend an idle sandbox. A runner that
 never reports (an older runner) keeps the previous behaviour: refreshed for as
-long as its tunnel is up.
+long as its tunnel is up, from its first pong.
 
 This module turns that signal into a provider
 :meth:`~omnigent.onboarding.sandboxes.base.SandboxHostLauncher.keep_alive` call,
@@ -101,6 +103,12 @@ _runner_warm_grace_s: dict[str, float] = {}
 # runner as reporting; an idle one is no longer refreshed, so pruning reads it too.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _last_report_at: dict[str, float] = {}
+# Runners whose pongs carry no busy report (older builds): refreshed for as long
+# as their tunnel is up. A runner in neither this set nor _last_report_at has not
+# answered a ping yet, and is not refreshed until it does: refreshing it on
+# connect would let every reconnect to a fresh replica extend an idle sandbox.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_unreporting_runners: set[str] = set()
 
 
 def configure(
@@ -162,27 +170,37 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
     if _sandbox_config is None or _host_store is None:
         return
     if busy is None:
-        # A runner build that does not report took over this id (a reconnect
-        # from an older runner): fall back to tunnel-lifetime refreshes.
-        forget_reports(runner_id)
+        # An older runner build: refresh for its tunnel's lifetime, starting now.
+        if runner_id not in _unreporting_runners:
+            forget_reports(runner_id)
+            _unreporting_runners.add(runner_id)
+            touch(runner_id)
         return
+    _unreporting_runners.discard(runner_id)
     now = time.monotonic()
-    was_reporting = runner_id in _last_report_at
+    first_report = runner_id not in _last_report_at
     _last_report_at[runner_id] = now
     if busy:
-        resumed = was_reporting and not _recently_busy(runner_id, now)
+        resumed = first_report or not _recently_busy(runner_id, now)
         _last_busy_at[runner_id] = now
         if resumed:
-            touch(runner_id, force=True)
+            # A first report starts the periodic schedule; a resume between
+            # ticks must not move it.
+            touch(runner_id, force=not first_report)
         return
     if idle_s is not None:
         last_work = now - idle_s
     elif runner_id not in _last_busy_at:
-        # No work yet: like the runner's own idle timeout, count from its start.
+        # No idle time reported: count from now rather than never.
         last_work = now
     else:
-        return
-    _last_busy_at[runner_id] = max(_last_busy_at.get(runner_id, last_work), last_work)
+        last_work = None
+    if last_work is not None:
+        _last_busy_at[runner_id] = max(_last_busy_at.get(runner_id, last_work), last_work)
+    if first_report:
+        # Refreshes only if the runner is still within its window (a fresh
+        # replica resuming the grace); an expired one is left to stop.
+        touch(runner_id)
 
 
 def forget_reports(runner_id: str) -> None:
@@ -196,6 +214,7 @@ def forget_reports(runner_id: str) -> None:
     """
     for state in (_last_busy_at, _last_report_at):
         state.pop(runner_id, None)
+    _unreporting_runners.discard(runner_id)
 
 
 def record_work_dispatched(runner_id: str) -> None:
@@ -207,6 +226,8 @@ def record_work_dispatched(runner_id: str) -> None:
 
     :param runner_id: Runner the server forwarded a session event to.
     """
+    if runner_id in _unreporting_runners:
+        return  # already refreshed for its tunnel's lifetime
     record_pong(runner_id, True)
 
 
@@ -239,10 +260,11 @@ def touch(runner_id: str, *, force: bool = False) -> None:
     last = _last_kept.get(runner_id)
     if not force and last is not None and now - last < _interval_for(runner_id):
         return
-    # A reporting runner that has not been busy within its window is left alone,
-    # so the platform's idle stop can reclaim its sandbox.
-    if runner_id in _last_report_at and not _recently_busy(runner_id, now):
-        return
+    if runner_id not in _unreporting_runners:
+        # Wait for the runner's first pong to say whether it reports; then leave
+        # one that has not worked within its window to the platform's idle stop.
+        if runner_id not in _last_report_at or not _recently_busy(runner_id, now):
+            return
     with _inflight_lock:
         if runner_id in _inflight:
             # Previous attempt for this runner has not finished; skip rather than

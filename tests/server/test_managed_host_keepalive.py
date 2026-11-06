@@ -114,6 +114,8 @@ def test_touch_is_rate_limited_per_runner(monkeypatch: pytest.MonkeyPatch) -> No
     )
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    # Runners whose pongs carry no busy report, so touch() refreshes them.
+    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
 
     managed_host_keepalive.touch("r1")
     managed_host_keepalive.touch("r1")  # inside the window: dropped
@@ -158,6 +160,8 @@ def test_worker_runs_inside_the_callers_workspace_scope(
     monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    # Runners whose pongs carry no busy report, so touch() refreshes them.
+    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
     with ThreadPoolExecutor(max_workers=1) as pool:
         monkeypatch.setattr(managed_host_keepalive, "_executor", pool)
         with workspace_scope(4242):
@@ -209,6 +213,8 @@ def test_a_runner_already_in_flight_is_not_queued_twice(
     )
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    # Runners whose pongs carry no busy report, so touch() refreshes them.
+    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
 
     managed_host_keepalive.touch("r1")
     # Past the throttle window, but the first attempt has not finished.
@@ -375,6 +381,7 @@ class _BusyGate:
         ):
             monkeypatch.setattr(managed_host_keepalive, name, {})
         monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+        monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", set())
         monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 600.0)
         monkeypatch.setattr(managed_host_keepalive.time, "monotonic", lambda: self.now)
 
@@ -396,43 +403,67 @@ def test_pong_interval_matches_the_runner_tunnel() -> None:
     assert managed_host_keepalive._PONG_INTERVAL_S == runner_tunnel.PING_INTERVAL_S
 
 
+def test_nothing_is_refreshed_before_the_first_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The connect-time tick cannot yet tell a reporting runner from an older one.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    assert gate.submitted == []
+
+
 def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.touch("r1")  # connect
+    managed_host_keepalive.record_pong("r1", None)  # first pong: refreshed from now on
+    managed_host_keepalive.record_pong("r1", None)
     gate.tick()
     gate.tick()
     assert gate.submitted == ["r1", "r1", "r1"]
 
 
+def test_reconnect_to_a_fresh_replica_does_not_renew_an_expired_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A replica without this runner's history: an idle reconnect alone must not
+    # extend the sandbox, but dispatched work must renew it at once.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive._runner_warm_grace_s["r1"] = 300.0
+    managed_host_keepalive.touch("r1")  # the new tunnel's first tick
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
+    gate.tick()
+    assert gate.submitted == [], "an idle reconnect must let the sandbox stop"
+    gate.now += 5.0
+    managed_host_keepalive.record_work_dispatched("r1")
+    assert gate.submitted == ["r1"]
+
+
 def test_idle_runner_is_not_refreshed_until_work_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")  # connect: nothing reported yet
+    managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.tick()
     gate.tick()
-    assert gate.submitted == ["r1"], "an idle runner must let its sandbox stop"
+    assert gate.submitted == [], "an idle runner must let its sandbox stop"
 
     # Work after the window ran out refreshes at once, not at the next tick.
     gate.now += 30.0
     managed_host_keepalive.record_pong("r1", True)
-    assert gate.submitted == ["r1", "r1"]
+    assert gate.submitted == ["r1"]
 
 
-def test_runner_with_no_work_yet_counts_its_window_from_its_start(
+def test_runner_with_no_work_yet_stays_warm_for_its_grace_after_its_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Like the runner's own idle timeout: a runner that has not worked yet stays
-    # warm for its grace after it starts reporting.
+    # Its pongs report the idle time since it started, like its own idle timeout.
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
-    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.touch("r1")  # t=1000, the runner starts
     gate.now += 30.0
-    managed_host_keepalive.record_pong("r1", False)  # first pong, idle_s None
-    gate.tick()  # 570s after start
-    gate.tick()  # 1170s
-    gate.tick()  # 1770s: past the grace
+    managed_host_keepalive.record_pong("r1", False, idle_s=30.0)  # refreshed: in its grace
+    gate.tick()  # 630s after start
+    gate.tick()  # 1230s
+    gate.tick()  # 1830s: past the grace
     assert gate.submitted == ["r1"] * 3
 
 
@@ -440,7 +471,7 @@ def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPa
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")
     for _ in range(3):
-        managed_host_keepalive.record_pong("r1", True)
+        managed_host_keepalive.record_pong("r1", True)  # the first one refreshes
         gate.tick()
     assert gate.submitted == ["r1"] * 4
 
@@ -457,7 +488,6 @@ def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
     # platform window expires between pongs.
     gate = _BusyGate(monkeypatch)
     monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 5.0)
-    managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", True)
     for _ in range(5):
         gate.now += 5.0
@@ -474,93 +504,74 @@ def test_pongs_record_nothing_without_managed_keepalive(monkeypatch: pytest.Monk
     gate = _BusyGate(monkeypatch)
     monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", None)
     managed_host_keepalive.record_pong("r1", True)
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", None)
     assert managed_host_keepalive._last_busy_at == {}
     assert managed_host_keepalive._last_report_at == {}
+    assert managed_host_keepalive._unreporting_runners == set()
     assert gate.submitted == []
 
 
-def test_work_that_ended_inside_an_interval_is_refreshed_once(
+def test_runner_stays_warm_for_its_grace_after_the_last_busy_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", True)
-    managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
-    gate.tick()
-    gate.tick()
-    assert gate.submitted == ["r1", "r1"]
-
-
-def test_unreported_pong_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", None)
-    assert gate.submitted == []
-    assert "r1" not in managed_host_keepalive._last_report_at
+    # Work that ended inside an interval is refreshed at the next tick; a 1500s
+    # grace (the runner idle timeout, e.g. agent_sandbox keep_warm_s) keeps
+    # refreshing after it, and with no grace the window ends a tick later.
+    for grace, expected in ((0.0, 2), (1500.0, 3)):
+        gate = _BusyGate(monkeypatch)
+        managed_host_keepalive._runner_warm_grace_s["r1"] = grace
+        managed_host_keepalive.record_pong("r1", True)  # t=1000: refreshed
+        managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
+        gate.tick()  # t=1600: work since the last refresh
+        gate.tick()  # t=2200: only within the grace
+        gate.tick()  # t=2800: past both
+        assert gate.submitted == ["r1"] * expected, grace
 
 
 def test_forced_refresh_keeps_the_periodic_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
     # Work resuming between ticks must not push the next periodic refresh a
     # whole interval later.
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")  # t=1000
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
+    managed_host_keepalive.record_pong("r1", True)  # t=1000: refreshed
+    gate.tick()  # t=1600: refreshed
+    gate.tick()  # t=2200: idle, skipped
     gate.now += 61.0
-    managed_host_keepalive.record_pong("r1", True)  # forced at t=1061
+    managed_host_keepalive.record_pong("r1", True)  # forced at t=2261
     gate.now += 539.0
-    managed_host_keepalive.touch("r1")  # periodic tick at t=1600
-    assert gate.submitted == ["r1", "r1", "r1"]
+    managed_host_keepalive.touch("r1")  # periodic tick at t=2800 still refreshes
+    assert gate.submitted == ["r1"] * 4
 
 
 def test_dispatched_work_refreshes_before_the_next_pong(monkeypatch: pytest.MonkeyPatch) -> None:
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.now += 1.0
     managed_host_keepalive.record_work_dispatched("r1")  # a message right after an idle pong
-    assert gate.submitted == ["r1", "r1"], "new work must not wait for the next pong"
+    assert gate.submitted == ["r1"], "new work must not wait for the next pong"
     gate.tick()
-    assert gate.submitted == ["r1"] * 3
-
-
-def test_runner_stays_warm_for_its_grace_after_the_last_busy_report(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A 1500s grace (the runner idle timeout, e.g. agent_sandbox keep_warm_s).
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", True)  # last busy at t=1000
-    managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
-    gate.tick()  # t=1600
-    gate.tick()  # t=2200: idle, but within the grace
-    gate.tick()  # t=2800: grace over
-    assert gate.submitted == ["r1", "r1", "r1"]
+    assert gate.submitted == ["r1"] * 2
 
 
 def test_pruning_preserves_live_idle_reporting_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An idle reporting runner is no longer refreshed, so its refresh time goes
-    # stale while its pongs keep coming; pruning must not turn it back into a
-    # never-reporting runner that gets refreshed.
+    # An idle reporting runner is not refreshed, while its pongs keep coming;
+    # pruning must not turn it back into a runner that gets refreshed.
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.now += 5000.0
-    managed_host_keepalive.record_pong("r1", False)  # still connected and reporting
+    managed_host_keepalive.record_pong("r1", False, idle_s=5900.0)
     managed_host_keepalive._prune_throttle(gate.now)
     managed_host_keepalive.touch("r1")
-    assert gate.submitted == ["r1"]
+    assert gate.submitted == []
 
 
 def test_an_idle_runner_stays_idle_across_a_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The new tunnel's immediate first touch must not refresh a runner that
+    # The new tunnel's immediate first tick must not refresh a runner that
     # reported idle, or every tunnel reconnect would extend its sandbox.
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     gate.now += 900.0
     managed_host_keepalive.touch("r1")  # reconnect: _keepalive_loop's first touch
-    assert gate.submitted == ["r1"]
+    assert gate.submitted == []
 
 
 def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
@@ -568,9 +579,10 @@ def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
 ) -> None:
     # An older runner build may reconnect under the same id; its pongs carry no busy.
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
     managed_host_keepalive.record_pong("r1", None)
+    managed_host_keepalive.record_work_dispatched("r1")
+    assert "r1" not in managed_host_keepalive._last_report_at, "it stays a non-reporting runner"
     gate.tick()
     assert gate.submitted == ["r1", "r1"]
 
@@ -604,9 +616,10 @@ def test_a_fresh_server_resumes_the_remaining_grace_from_the_runner(
     # time restores the keep-warm grace without counting as new work.
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
-    managed_host_keepalive.touch("r1")  # the new server's first touch
+    managed_host_keepalive.touch("r1")  # the new server's first tick
     managed_host_keepalive.record_pong("r1", False, idle_s=300.0)  # last work 5 min ago
     assert managed_host_keepalive._last_busy_at["r1"] == 700.0, "idle time is not new work"
+    assert gate.submitted == ["r1"], "refreshed at once: still within the grace"
     gate.tick()  # 900s after the last work: inside the 1500s grace
     gate.tick()  # 1500s after: grace over
     assert gate.submitted == ["r1", "r1"]
@@ -616,8 +629,7 @@ def test_an_unlimited_grace_keeps_an_idle_runner_warm(monkeypatch: pytest.Monkey
     # runner.idle_timeout_s 0: the runner never idles out, so neither does its sandbox.
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive._runner_warm_grace_s["r1"] = float("inf")
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", False, idle_s=5000.0)
     gate.tick()
     gate.tick()
     assert gate.submitted == ["r1"] * 3

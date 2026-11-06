@@ -31,12 +31,14 @@ def test_report_gives_seconds_since_the_last_work(monkeypatch) -> None:
     monkeypatch.setattr(busy_check.time, "monotonic", lambda: clock[0])
     active = False
     busy = RunnerBusyCheck(lambda: active)
-    assert busy.report() == (False, None), "no work yet, so no idle time to report"
+    clock[0] = 110.0
+    # No work yet: idle since the check was created, like the runner idle timeout.
+    assert busy.report() == (False, 10.0)
     active = True
     assert busy.report() == (True, 0.0)
     active = False
     clock[0] = 130.0
-    assert busy.report() == (False, 30.0)
+    assert busy.report() == (False, 20.0)
 
 
 def test_each_consumer_tracks_progress_independently() -> None:

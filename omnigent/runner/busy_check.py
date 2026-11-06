@@ -45,6 +45,7 @@ class RunnerBusyCheck:
         self._get_last_activity = get_last_activity
         self._last_activity_at: float | None = None
         self._last_busy_at: float | None = None
+        self._started_at = time.monotonic()
 
     def check(self) -> bool:
         """Return whether the runner is busy now or made progress since the last call.
@@ -68,10 +69,14 @@ class RunnerBusyCheck:
 
         The idle time lets a server that lost its own history (a restart, or a
         reconnect to another replica) resume a keep-warm grace where it was.
+        Before any work it counts from this check's creation, as the runner's own
+        idle timeout does, so a reconnect cannot restart an expired grace.
 
-        :returns: ``(busy, idle_s)``; ``idle_s`` is ``None`` before any work.
+        :returns: ``(busy, idle_s)``.
         """
         busy = self.check()
-        if self._last_busy_at is None:
-            return busy, None
-        return busy, 0.0 if busy else time.monotonic() - self._last_busy_at
+        if busy:
+            return busy, 0.0
+        return busy, time.monotonic() - (
+            self._started_at if self._last_busy_at is None else self._last_busy_at
+        )

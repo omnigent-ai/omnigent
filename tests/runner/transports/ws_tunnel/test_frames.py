@@ -273,7 +273,8 @@ def test_non_boolean_pong_busy_is_treated_as_unreported() -> None:
 def test_pong_idle_seconds_round_trip_and_reject_invalid_values() -> None:
     frame = PongFrame(ts=7, busy=False, idle_s=12.34)
     assert decode_frame(encode_frame(frame)) == PongFrame(ts=7, busy=False, idle_s=12.3)
-    for raw in ('"x"', "-1", "true"):
+    # Oversized and non-finite values must not fail the frame (and so the tunnel).
+    for raw in ('"x"', "-1", "true", "1" + "0" * 400, "1e999", "NaN", "Infinity"):
         decoded = decode_frame('{"kind": "pong", "ts": 7, "busy": false, "idle_s": ' + raw + "}")
         assert decoded == PongFrame(ts=7, busy=False, idle_s=None)
 
