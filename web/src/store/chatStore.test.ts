@@ -16646,9 +16646,12 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       // Rejected as a failed open → retried WITH backoff. Pumping the HTML
       // instead would read as a clean drop and reconnect with no delay.
       expect(opens).toBe(1);
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(opens).toBeGreaterThan(1);
+      expect(opens).toBeLessThan(10);
       // A maintenance page during a restart answers the same way, so a short
       // run of them keeps retrying without a notice.
-      await vi.advanceTimersByTimeAsync(30_000);
+      await vi.advanceTimersByTimeAsync(24_000);
       expect(opens).toBeGreaterThan(3);
       expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
 
