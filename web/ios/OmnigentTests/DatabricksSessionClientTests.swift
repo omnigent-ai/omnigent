@@ -252,3 +252,27 @@ final class DatabricksSessionClientTests: XCTestCase {
     XCTAssertEqual(verdict, expected)
   }
 }
+
+func webContext(_ raw: String, clientID: String = "test-client") throws -> DatabricksWebContext {
+  try DatabricksWebContext(
+    url: URL(string: raw)!,
+    configuration: DatabricksOAuthConfiguration(
+      clientID: clientID, redirectURL: "https://login.databricks.com/mobile-redirect"))
+}
+
+func sessionCookieHeader(
+  domain: String? = nil, path: String = "/", value: String = "synthetic-session"
+) -> String {
+  "DBAUTH=\(value); Path=\(path); Secure; HttpOnly; SameSite=Lax; Max-Age=3600"
+    + (domain.map { "; Domain=" + $0 } ?? "")
+}
+
+@MainActor
+func testSessionCookie(url: URL, path: String = "/", value: String = "synthetic-session") throws
+  -> HTTPCookie
+{
+  let response = HTTPURLResponse(
+    url: url, statusCode: 200, httpVersion: nil,
+    headerFields: ["Set-Cookie": sessionCookieHeader(path: path, value: value)])!
+  return try XCTUnwrap(DatabricksSessionClient.cookies(from: response).first)
+}
