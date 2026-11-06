@@ -12,6 +12,8 @@ import {
   MaximizeIcon,
   MessagesSquareIcon,
   MinimizeIcon,
+  PanelLeftCloseIcon,
+  PanelLeftIcon,
   PlusIcon,
   SearchIcon,
   TerminalIcon,
@@ -46,7 +48,9 @@ import {
   type DefaultWorkspaceTab,
   defaultWorkspaceTabs,
   readDefaultWorkspaceTab,
+  readFileTreePinned,
   readPinnedWorkspaceTabs,
+  writeFileTreePinned,
 } from "@/lib/workspaceTabPreferences";
 import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
@@ -1037,6 +1041,14 @@ function WorkspacePanelImpl({
   // `pending:` tab has no child yet; its first send creates the fork.
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  // Full screen keeps an IDE-style file tree beside the content unless the user hides it.
+  const [fileTreePinned, setFileTreePinned] = useState(readFileTreePinned);
+  const toggleFileTreePinned = () => {
+    writeFileTreePinned(!fileTreePinned);
+    setFileTreePinned(!fileTreePinned);
+  };
+  const canPinFileTree = maximized && showFilesPanel && !pending && !isMobile;
+  const showPinnedFileTree = canPinFileTree && fileTreePinned;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1477,7 +1489,12 @@ function WorkspacePanelImpl({
                 ? "content-search"
                 : "files";
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
-  const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
+  // The pinned tree replaces the Files tab's tree; Changes still renders here.
+  const filesPanelMounted =
+    showFilesPanel &&
+    !pending &&
+    scopeView === "files" &&
+    !(showPinnedFileTree && rightRailTab !== "changes");
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
   const rail = (
     <aside
@@ -1796,6 +1813,25 @@ function WorkspacePanelImpl({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
+            {canPinFileTree && (
+              <WorkspaceTabTooltip label={fileTreePinned ? "Hide file tree" : "Show file tree"}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  aria-label={fileTreePinned ? "Hide file tree" : "Show file tree"}
+                  aria-pressed={fileTreePinned}
+                  onClick={toggleFileTreePinned}
+                  size="icon-xs"
+                  className="flex size-6 text-muted-foreground hover:text-foreground"
+                >
+                  {fileTreePinned ? (
+                    <PanelLeftCloseIcon className="size-4" />
+                  ) : (
+                    <PanelLeftIcon className="size-4" />
+                  )}
+                </Button>
+              </WorkspaceTabTooltip>
+            )}
             <WorkspaceTabTooltip label={maximized ? "Exit full screen" : "Full screen"}>
               <Button
                 type="button"
@@ -1816,43 +1852,17 @@ function WorkspacePanelImpl({
             </WorkspaceTabTooltip>
           </div>
         </div>
-        {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
-        <div
-          data-workspace-panel-content
-          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
-        >
-          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
-          {showContentSearch && showFilesPanel && !pending && !isMobile && (
+        <div className="flex min-h-0 flex-1">
+          {showPinnedFileTree && (
             <div
-              className={cn(
-                "min-h-0 flex-1 flex-col",
-                rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
-                  ? "flex"
-                  : "hidden",
-              )}
-            >
-              <ContentSearchPanel
-                inputRef={contentSearchInputRef}
-                key={conversationId}
-                conversationId={conversationId}
-                onFileSelect={openFileViewer}
-              />
-            </div>
-          )}
-          {filesPanelMounted && (
-            <div
-              className={cn(
-                "flex min-h-0 flex-1 flex-col",
-                // Not display:none: hidden rows would measure 0px and collapse
-                // the virtualized tree's height, losing its scroll position.
-                !filesPanelActive && "invisible absolute inset-0",
-              )}
+              data-testid="pinned-file-tree"
+              className="flex w-72 shrink-0 flex-col border-r border-border"
             >
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
                 onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
+                flatView={false}
                 showHidden={filesPanelShowHidden}
                 onShowHiddenChange={onShowHiddenChange}
                 sort={filesPanelSort}
@@ -1860,72 +1870,122 @@ function WorkspacePanelImpl({
               />
             </div>
           )}
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : terminalShown ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : selectedFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
+          {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
+          <div
+            data-workspace-panel-content
+            className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
+          >
+            {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+            {showContentSearch && showFilesPanel && !pending && !isMobile && (
+              <div
+                className={cn(
+                  "min-h-0 flex-1 flex-col",
+                  rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
+                    ? "flex"
+                    : "hidden",
+                )}
+              >
+                <ContentSearchPanel
+                  inputRef={contentSearchInputRef}
+                  key={conversationId}
+                  conversationId={conversationId}
+                  onFileSelect={openFileViewer}
+                />
+              </div>
+            )}
+            {filesPanelMounted && (
+              <div
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  // Not display:none: hidden rows would measure 0px and collapse
+                  // the virtualized tree's height, losing its scroll position.
+                  !filesPanelActive && "invisible absolute inset-0",
+                )}
+              >
+                <FilesPanel
+                  conversationId={contained ? conversationId : undefined}
+                  frameless
+                  onFileSelect={openFileViewer}
+                  flatView={rightRailTab === "changes"}
+                  showHidden={filesPanelShowHidden}
+                  onShowHiddenChange={onShowHiddenChange}
+                  sort={filesPanelSort}
+                  onSortChange={onSortChange}
+                />
+              </div>
+            )}
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
+              </div>
+            ) : terminalShown ? (
+              // Show the selected shell's xterm only while its terminal is actually
+              // present. The selection is sticky (AppShell never prunes it off the
+              // list), so during a transient terminals-list churn this falls back to
+              // the default view and the xterm reappears when the terminal returns.
+              <RailTerminalView
                 conversationId={conversationId}
-                path={selectedFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                closeTabRef={closeFileTabRef}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                sort={filesPanelSort}
+                terminalKey={selectedTerminalKey}
+                readOnly={!isOwnerLevel(permissionLevel)}
+                autoFocus={autoFocusSelectedTerminal}
               />
-            </ResponsiveViewerSlot>
-          ) : scopeView === "sidechat" ? (
-            // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. Phones show it
-            // in the side-chats drawer instead, so it never mounts twice.
-            selectedSideChatPane
-          ) : scopeView === "browser" ? (
-            // Browser soft tab — BrowserPane self-gates and measures this rail
-            // slot to position the native view over it.
-            <BrowserPane
-              key={browsers.viewId}
-              conversationId={browsers.viewId!}
-              agentBrowser={browsers.agentBrowser}
-              active={open}
-              className="min-h-0 flex-1"
-            />
-          ) : scopeView === "github" ? (
-            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "subagents" && rootSessionId ? (
-            <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-            </SubagentPanelOpenerContext.Provider>
-          ) : scopeView === "empty" ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-              <PlusIcon className="size-6" />
-              <p className="text-sm">Open a Workspace tab from the + menu.</p>
-            </div>
-          ) : null}
+            ) : selectedFilePath !== null ? (
+              <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+                <FileViewer
+                  syncUrl={!contained}
+                  agentId={agentId}
+                  mobileOverlay={isMobile}
+                  frameless
+                  open
+                  mediaActive={isMobile ? mobileFileTarget != null : open}
+                  conversationId={conversationId}
+                  path={selectedFilePath}
+                  position={filePosition}
+                  onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                  onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  closeTabRef={closeFileTabRef}
+                  onNavigateTo={openFileViewer}
+                  permissionLevel={permissionLevel}
+                  onCommentsOpenChange={onCommentsOpenChange}
+                  sort={filesPanelSort}
+                />
+              </ResponsiveViewerSlot>
+            ) : scopeView === "sidechat" ? (
+              // A side chat: a forked child conversation streamed here in its own
+              // scoped surface, beside the still-active main chat. Phones show it
+              // in the side-chats drawer instead, so it never mounts twice.
+              selectedSideChatPane
+            ) : scopeView === "browser" ? (
+              // Browser soft tab — BrowserPane self-gates and measures this rail
+              // slot to position the native view over it.
+              <BrowserPane
+                key={browsers.viewId}
+                conversationId={browsers.viewId!}
+                agentBrowser={browsers.agentBrowser}
+                active={open}
+                className="min-h-0 flex-1"
+              />
+            ) : scopeView === "github" ? (
+              <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+              </RenderErrorBoundary>
+            ) : scopeView === "subagents" && rootSessionId ? (
+              <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
+                <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+              </SubagentPanelOpenerContext.Provider>
+            ) : scopeView === "empty" ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <PlusIcon className="size-6" />
+                <p className="text-sm">Open a Workspace tab from the + menu.</p>
+              </div>
+            ) : scopeView === "files" && showPinnedFileTree && !filesPanelMounted ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <FileIcon className="size-6" />
+                <p className="text-sm">Select a file from the tree.</p>
+              </div>
+            ) : null}
+          </div>
         </div>
       </div>
     </aside>

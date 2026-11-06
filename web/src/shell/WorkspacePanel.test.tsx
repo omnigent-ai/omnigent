@@ -1293,6 +1293,40 @@ describe("WorkspacePanel maximize", () => {
   });
 });
 
+describe("WorkspacePanel pinned file tree", () => {
+  it("keeps the tree beside full-screen content and remembers when it is hidden", () => {
+    renderWorkspace({ maximized: true, selectedFilePath: "/ws/a.ts" });
+
+    const tree = within(screen.getByTestId("pinned-file-tree")).getByTestId("files-panel-stub");
+    expect(tree).toHaveAttribute("data-flat-view", "false");
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("/ws/a.ts");
+    // The Files tab's own tree yields to the pinned one, so only one tree mounts.
+    expect(screen.getAllByTestId("files-panel-stub")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide file tree" }));
+    expect(screen.queryByTestId("pinned-file-tree")).toBeNull();
+    cleanup();
+
+    renderWorkspace({ maximized: true });
+    expect(screen.queryByTestId("pinned-file-tree")).toBeNull();
+    expect(screen.getByRole("button", { name: "Show file tree" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("keeps the Changes list in the content slot and omits the toggle when docked", () => {
+    renderWorkspace({ maximized: true, rightRailTab: "changes" });
+    const panels = screen.getAllByTestId("files-panel-stub");
+    expect(panels.map((panel) => panel.dataset.flatView)).toEqual(["false", "true"]);
+    cleanup();
+
+    renderWorkspace();
+    expect(screen.queryByRole("button", { name: /file tree/ })).toBeNull();
+    expect(screen.queryByTestId("pinned-file-tree")).toBeNull();
+  });
+});
+
 describe("WorkspacePanel tab-strip layout (regression)", () => {
   const declaresShell = () =>
     useSessionAgentMock.mockReturnValue({ data: { terminals: ["zsh"] } } as unknown as ReturnType<

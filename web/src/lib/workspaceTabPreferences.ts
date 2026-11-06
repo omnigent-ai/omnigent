@@ -93,3 +93,22 @@ export function readInitialWorkspaceTab(): DefaultWorkspaceTab | null {
   const preferred = readDefaultWorkspaceTab();
   return pinned.includes(preferred) ? preferred : (pinned[0] ?? null);
 }
+
+const FILE_TREE_PINNED_STORAGE_KEY = "omnigent:workspace-file-tree-pinned";
+
+/** Whether a full-screen Workspace keeps the file tree open on the left; on by default. */
+export function readFileTreePinned(): boolean {
+  try {
+    return window.localStorage.getItem(FILE_TREE_PINNED_STORAGE_KEY) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function writeFileTreePinned(pinned: boolean): void {
+  try {
+    window.localStorage.setItem(FILE_TREE_PINNED_STORAGE_KEY, String(pinned));
+  } catch {
+    // Storage failures keep the in-memory choice for this mount.
+  }
+}

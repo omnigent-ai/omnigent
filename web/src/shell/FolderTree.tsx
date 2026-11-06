@@ -737,6 +737,10 @@ function FolderTreeInner({
     overscan: 12,
     getItemKey: (index) => flatRows[index]?.key ?? index,
   });
+  // A parent scroller's ref attaches after this tree's layout effects, so the
+  // virtualizer misses it on mount; with cached data nothing else re-renders.
+  const [, setScrollParentAttached] = useState(false);
+  useEffect(() => setScrollParentAttached(true), []);
 
   // Once a revealed directory's row exists in the flat tree (its ancestors'
   // lazy listings have landed), smooth-scroll it into view and start the
