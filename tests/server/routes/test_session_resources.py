@@ -4644,6 +4644,43 @@ async def test_filesystem_write_proxies_to_runner(
 
 
 @pytest.mark.asyncio
+async def test_filesystem_write_reroutes_when_host_is_live_on_another_replica(
+    client: httpx.AsyncClient, app: FastAPI, db_uri: str
+) -> None:
+    """A save on the wrong replica keeps the response that triggers client rerouting."""
+    from omnigent.runner.routing import RunnerRouter
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server.routes.sessions import set_server_runner_router
+
+    session_id = "79b22ebd2309e48fdeb450c65611d51b"
+    store = app.state.test_conversation_store
+    conv = store._conversations[session_id]
+    conv.host_id = uuid.uuid4().hex
+    conv.runner_id = "runner_remote"
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(conv.host_id, "remote-host", "local")
+    app.state.host_registry = app.state.test_host_registry
+    app.state.host_store = hosts
+    router = RunnerRouter(
+        registry=TunnelRegistry(),
+        conversation_store=store,
+        host_registry=app.state.host_registry,
+        host_store=hosts,
+    )
+    set_runner_router(router)
+    set_server_runner_router(router)
+
+    response = await client.put(
+        f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt",
+        json={"content": "hello", "encoding": "utf-8"},
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+    assert store.appended_items == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
 @pytest.mark.parametrize("operation", ["save", "download"])
 async def test_filesystem_operation_reconnects_runner_on_live_host(

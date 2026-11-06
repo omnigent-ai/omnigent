@@ -287,6 +287,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _handle_advise_models_mcp,
+    _HostLaunchAttempt,
     _HostRunnerStopAttempt,
     _invalidate_runner_backed_snapshot_state,
     _is_codex_native_subagent,
@@ -5095,6 +5096,7 @@ async def ensure_runner_connected(
     conversation_store: ConversationStore,
     runner_router: RunnerRouter | None,
     raise_host_refusal: bool = False,
+    on_host_launch: Callable[[_HostLaunchAttempt | None], None] | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Bring a wakeable session's runner online for out-of-band resource access.
@@ -5132,8 +5134,10 @@ async def ensure_runner_connected(
     :param raise_host_refusal: Raise typed, non-persisting errors when the
         host rejects launch because the harness is unavailable or the
         workspace is gone, or no host could take the launch and no runner
-        exit is known. Resource callers keep the legacy ``False``
-        behavior; retry recovery opts in because it has no message to persist.
+        exit is known. Callers opt in to handle refusals without persisting
+        a failed turn; wrong-replica routing errors remain distinguishable.
+    :param on_host_launch: Observe the host launch verdict. Called with ``None``
+        first so a new recovery cannot retain a previous attempt's verdict.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
         any wake/relaunch so the caller sees the rebound row.
@@ -5142,6 +5146,9 @@ async def ensure_runner_connected(
     """
 
     from omnigent.server.routes import sessions as _facade
+
+    if on_host_launch is not None:
+        on_host_launch(None)
 
     async def _reread() -> Conversation:
         refreshed = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -5215,6 +5222,8 @@ async def ensure_runner_connected(
                 host_registry,
                 host_conn,
             )
+            if on_host_launch is not None:
+                on_host_launch(launch_attempt)
             # A harness-not-configured or workspace-missing refusal means the
             # runner will never appear — don't set relaunched_runner_id or the
             # caller will wait out the full connect timeout for nothing.
@@ -5301,6 +5310,15 @@ async def ensure_runner_connected(
                 )
             conv = await _reread()
         if runner_client is None and launch_unavailable and raise_host_refusal:
+            if (
+                runner_router is not None
+                and conv.host_id is not None
+                and await asyncio.to_thread(runner_router.host_is_on_another_replica, conv.host_id)
+            ):
+                raise OmnigentError(
+                    "The host for this session is connected to another server replica.",
+                    code=ErrorCode.WRONG_REPLICA,
+                )
             reports = getattr(app_state, "runner_exit_reports", None)
             if conv.runner_id is None or reports is None or not reports.get(conv.runner_id):
                 raise OmnigentError(
@@ -5361,6 +5379,7 @@ async def _recover_side_chat_runner_via_source(
     user_id: str | None,
     permission_store: PermissionStore | None,
     raise_host_refusal: bool = False,
+    on_host_launch: Callable[[_HostLaunchAttempt | None], None] | None = None,
 ) -> tuple[httpx.AsyncClient | None, Conversation]:
     """
     Rebind a side chat whose shared runner is gone to its source's live runner.
@@ -5406,6 +5425,7 @@ async def _recover_side_chat_runner_via_source(
             conversation_store=conversation_store,
             runner_router=runner_router,
             raise_host_refusal=raise_host_refusal,
+            on_host_launch=on_host_launch,
         )
         if source_client is None or source.runner_id is None:
             return None, side_chat

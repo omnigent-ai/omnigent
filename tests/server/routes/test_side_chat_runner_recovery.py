@@ -20,6 +20,7 @@ from omnigent.server.routes.sessions import routes_events
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.budgets import budget
 from tests.server.helpers import create_test_agent
@@ -524,7 +525,17 @@ async def test_side_chat_recovery_redirects_when_source_host_is_on_another_repli
     assert saved is not None and saved.runner_id == "runner-exited"
 
 
-@pytest.mark.parametrize("source_state", ["no-launch", "replacement", "exited"])
+@pytest.mark.parametrize(
+    "source_state",
+    [
+        "no-launch",
+        "replacement",
+        "replacement-disconnected",
+        "exited",
+        "offline-shared-binding",
+        "offline-stale-binding",
+    ],
+)
 async def test_side_chat_unavailable_send_uses_source_host(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -546,13 +557,30 @@ async def test_side_chat_unavailable_send_uses_source_host(
         extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
     )
     store.set_runner_id(side.id, "runner-shared")
+    replacement = source_state.startswith("replacement")
+    host_connected = replacement
+    offline_hold = (
+        source_state.startswith("offline-") or source_state == "replacement-disconnected"
+    )
+    if source_state == "offline-stale-binding":
+        store.replace_runner_id(source.id, "runner-advanced")
+    if offline_hold:
+        host_store = HostStore(db_uri)
+        host_store.upsert_on_connect(_HOST_ID, "offline-host", _OWNER)
+        if not replacement:
+            host_store.set_offline(_HOST_ID)
+        monkeypatch.setattr(app.state, "host_store", host_store)
     if source_state == "exited":
         app.state.runner_exit_reports.record(
             "runner-shared", "runner process exited with code 1", owner=None
         )
 
     async def _launch(*_args: object):
+        nonlocal host_connected
         store.replace_runner_id(source.id, "runner-replacement")
+        if source_state == "replacement-disconnected":
+            host_connected = False
+            app.state.host_store.set_offline(_HOST_ID)
         return SimpleNamespace(
             runner_id="runner-replacement", error=None, error_code=None, acknowledged=True
         )
@@ -565,35 +593,46 @@ async def test_side_chat_unavailable_send_uses_source_host(
         orchestration, "_wait_for_host_bound_runner_client", AsyncMock(return_value=None)
     )
     monkeypatch.setattr(app.state.runner_router, "host_is_on_another_replica", lambda _host: False)
-    # A saved source binding can outlive its host's registration.
-    monkeypatch.setattr(
-        app.state, "host_store", SimpleNamespace(get_host=lambda _host: None), raising=False
-    )
-    if source_state == "replacement":
+    if not offline_hold:
+        # A saved source binding can outlive its host's registration.
         monkeypatch.setattr(
-            app.state.host_registry, "get", lambda _host: SimpleNamespace(owner=None)
+            app.state, "host_store", SimpleNamespace(get_host=lambda _host: None), raising=False
+        )
+    if replacement:
+        monkeypatch.setattr(
+            app.state.host_registry,
+            "get",
+            lambda _host: SimpleNamespace(owner=None) if host_connected else None,
         )
 
     response = await client.post(
         f"/v1/sessions/{side.id}/events",
+        headers={"x-omnigent-hold-when-host-offline": "on"} if offline_hold else {},
         json={
             "type": "message",
             "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
         },
     )
     items = store.list_items(side.id).data
-    assert launch.await_count == (1 if source_state == "replacement" else 0)
+    assert launch.await_count == (1 if replacement else 0)
     assert store.list_items(source.id).data == []
     assert store.list_pending_inputs(side.id) == []
-    if source_state != "no-launch":
+    if replacement or source_state == "exited":
         assert response.status_code == 202, response.text
         assert [item.data.code for item in items if item.type == "error"] == [
             "runner_failed_to_start"
         ]
     else:
         assert response.status_code == 503, response.text
-        assert response.json()["error"]["code"] == "runner_unavailable"
-        assert "not responding" in response.json()["error"]["message"]
+        if offline_hold:
+            assert response.json()["error"]["code"] == "host_offline"
+            assert "when it reconnects" in response.json()["error"]["message"]
+            if source_state == "offline-stale-binding":
+                assert store.get_conversation(source.id).runner_id == "runner-advanced"
+                assert store.get_conversation(side.id).runner_id == "runner-shared"
+        else:
+            assert response.json()["error"]["code"] == "runner_unavailable"
+            assert "not responding" in response.json()["error"]["message"]
         assert items == []
         assert (await client.get(f"/v1/sessions/{side.id}")).json()["status"] != "failed"
 
