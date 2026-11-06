@@ -373,9 +373,11 @@ describe("PermissionsModal", () => {
 
     await waitFor(() => expect(screen.getByText("mallory@example.com")).toBeInTheDocument());
 
-    // Manage remains a fixed label and is never a grantable role.
-    const triggers = [screen.getByRole("combobox", { name: "What can they do?" })];
+    // Manage remains a fixed label and is never a grantable role. Per-person
+    // rows render no level selectors, so the shared role is the only one.
+    const triggers = screen.getAllByRole("combobox", { name: "What can they do?" });
     expect(triggers).toHaveLength(1);
+    expect(screen.getAllByRole("combobox")).toHaveLength(2);
     // The manage grant's level is still visible to the viewer as static text.
     expect(screen.getByText("Manage")).toBeInTheDocument();
 
@@ -937,10 +939,18 @@ describe("PermissionsModal", () => {
       await waitFor(() => expect(listMock).toHaveBeenCalledWith("conv_abc"));
       // The user-grant UI stays; only the public toggle is gone.
       expect(screen.getByRole("button", { name: /^add$/i })).toBeInTheDocument();
-      expect(screen.getByRole("combobox", { name: "Who can access" })).toHaveTextContent(
-        "Only added people",
-      );
+      const access = screen.getByRole("combobox", { name: "Who can access" });
+      expect(access).toHaveTextContent("Only added people");
       expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+      await waitFor(() => expect(access).toBeEnabled());
+      access.focus();
+      fireEvent.keyDown(access, { key: "Enter" });
+      const listbox = await screen.findByRole("listbox");
+      expect(
+        within(listbox)
+          .getAllByRole("option")
+          .map((o) => o.textContent),
+      ).toEqual(["Only added people"]);
     });
 
     it("shows the Public access toggle when public sharing is enabled", async () => {
@@ -1161,21 +1171,29 @@ describe("PermissionsModal", () => {
       );
     });
 
-    it("turns sharing off when it is already on", async () => {
+    it.each([
+      { label: "a project workspace", workspace: "/repo", mode: "on" as SharingMode },
+      {
+        label: "a blocked home directory",
+        workspace: "/home/alice",
+        mode: "restricted_read_only" as SharingMode,
+      },
+    ])("turns sharing off when it is already on for $label", async ({ workspace, mode }) => {
       listMock.mockResolvedValue([]);
       useSessionMock.mockReturnValue({
-        session: sessionWith({ workspace: "/repo", shareWorkspaceFiles: true }),
+        session: sessionWith({ workspace, shareWorkspaceFiles: true }),
         isLoading: false,
         error: null,
       });
 
       render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
-        wrapper: createInfoWrapper({}),
+        wrapper: createSharingWrapper(mode),
       });
 
       await waitFor(() => expect(listMock).toHaveBeenCalled());
       const toggle = within(screen.getByTestId("share-workspace-files")).getByRole("switch");
       expect(toggle).toHaveAttribute("aria-checked", "true");
+      expect(toggle).toBeEnabled();
       expect(screen.getByText(/People with Read access can browse files/)).toBeInTheDocument();
       expect(toggle).toHaveAccessibleDescription(/People with Read access can browse files/);
 
@@ -1183,6 +1201,24 @@ describe("PermissionsModal", () => {
       await waitFor(() =>
         expect(updateSessionMock).toHaveBeenCalledWith("conv_abc", { shareWorkspaceFiles: false }),
       );
+    });
+
+    it("blocks turning sharing on for a blocked home directory", async () => {
+      listMock.mockResolvedValue([]);
+      useSessionMock.mockReturnValue({
+        session: sessionWith({ workspace: "/home/alice", shareWorkspaceFiles: false }),
+        isLoading: false,
+        error: null,
+      });
+
+      render(<PermissionsModal sessionId="conv_abc" open={true} onOpenChange={() => {}} />, {
+        wrapper: createSharingWrapper("restricted_read_only"),
+      });
+
+      await waitFor(() => expect(listMock).toHaveBeenCalled());
+      const toggle = within(screen.getByTestId("share-workspace-files")).getByRole("switch");
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+      expect(toggle).toBeDisabled();
     });
   });
 });

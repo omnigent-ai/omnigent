@@ -422,7 +422,9 @@ export function PermissionsModal({
                   setError(null);
                   shareWorkspace.mutate(checked);
                 }}
-                disabled={shareWorkspace.isPending || workspaceBlocked}
+                disabled={
+                  shareWorkspace.isPending || (workspaceBlocked && !session.shareWorkspaceFiles)
+                }
                 componentId="diagnostics.permissions.share_workspace_toggle"
               />
             </div>
