@@ -631,7 +631,8 @@ def _run_steered_turn(
     during_read: Callable[[], Awaitable[None]] | None = None,
     live_next_prompt: bool = True,
     late_live_steer_id: str | None = None,
-    lagging_first_read: bool = False,
+    follow_up_ahead_of_steer: bool = False,
+    first_read_items: int | None = None,
 ) -> list[str]:
     """
     Run one turn that a web send steers, returning posts and forwarder reads in order.
@@ -647,7 +648,8 @@ def _run_steered_turn(
     :param during_read: Awaited while each transcript read is in flight.
     :param live_next_prompt: Whether the following turn's live ``userMessage`` arrives.
     :param late_live_steer_id: Item id of a live steer copy arriving after the replies.
-    :param lagging_first_read: Whether the first transcript read predates the steers.
+    :param follow_up_ahead_of_steer: Whether Codex records the follow-up steer first.
+    :param first_read_items: Steered-turn items the first transcript read holds, if it lags.
     :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
@@ -656,7 +658,9 @@ def _run_steered_turn(
     follow_up = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
     next_prompt = _native_user_message("item_next", "run the tests", "client-next")
     steered_items = [first, steer] if steer_in_transcript else [first]
-    if live_follow_up_steer:
+    if live_follow_up_steer and follow_up_ahead_of_steer:
+        steered_items.insert(1, follow_up)
+    elif live_follow_up_steer:
         steered_items.append(follow_up)
     turns = [
         {"id": "turn_123", "items": steered_items},
@@ -671,7 +675,7 @@ def _run_steered_turn(
     )
     posted: list[dict[str, Any]] = []
     read_thread = fake_client.request
-    lagging_turns = [{"id": "turn_123", "items": [first]}]
+    lagging_turns = [{"id": "turn_123", "items": steered_items[:first_read_items]}]
     requests_answered = 0
 
     async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -680,7 +684,7 @@ def _run_steered_turn(
         if during_read is not None:
             await during_read()
         requests_answered += 1
-        if lagging_first_read and requests_answered == 1:
+        if first_read_items is not None and requests_answered == 1:
             return {"result": {"thread": {"id": "thread_123", "turns": lagging_turns}}}
         return await read_thread(method, params)
 
@@ -815,46 +819,39 @@ def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    ("lagging_first_read", "expected_steer"),
-    [(False, [_RECOVERED_STEER]), (True, [])],
-    ids=["read_holds_later_steer", "read_lags_later_steer"],
+    ("follow_up_ahead_of_steer", "first_read_items", "fail_first_read", "expected_steer"),
+    [
+        (False, None, False, [_RECOVERED_STEER]),
+        (False, 1, False, []),
+        (False, None, True, []),
+        (True, None, False, []),
+        (True, 2, False, []),
+    ],
+    ids=[
+        "read_holds_later_steer",
+        "read_lags_later_steer",
+        "read_fails",
+        "later_steer_recorded_first",
+        "read_lags_missed_steer",
+    ],
 )
 def test_forwarder_mirrors_missed_steer_ahead_of_later_steer(
-    tmp_path: Path, lagging_first_read: bool, expected_steer: list[str]
+    tmp_path: Path,
+    follow_up_ahead_of_steer: bool,
+    first_read_items: int | None,
+    fail_first_read: bool,
+    expected_steer: list[str],
 ) -> None:
     """
-    A missed steer is mirrored before a later steer seen live, in transcript order.
+    A missed steer is mirrored before a later steer seen live, or not at all.
 
-    The server reports inputs queued ahead of a mirrored message as undelivered.
-    A read predating the later steer cannot order the missed one, so it is dropped.
-    """
-    transcript = _run_steered_turn(
-        tmp_path,
-        live_steer_copy=False,
-        replies_after_steer=0,
-        live_follow_up_steer=True,
-        lagging_first_read=lagging_first_read,
-    )
-
-    assert transcript == [
-        "user: fix the bug",
-        _TRANSCRIPT_READ,
-        *expected_steer,
-        "user: and the changelog",
-        "status: idle",
-    ]
-    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
-
-
-def test_forwarder_drops_missed_steer_when_read_before_later_steer_fails(tmp_path: Path) -> None:
-    """
-    A missed steer is dropped, not mirrored late, once a later steer is mirrored ahead of it.
-
-    A server ignoring the delivery a late copy names would settle it against another input.
+    The server reports inputs queued ahead of a mirrored message as undelivered, and
+    one ignoring the delivery a late copy names would settle it against another input.
+    A steer the read before the later steer cannot place ahead of it is dropped.
     """
     reads_started = 0
 
-    async def fail_first_read() -> None:
+    async def fail_read() -> None:
         nonlocal reads_started
         reads_started += 1
         if reads_started == 1:
@@ -865,12 +862,15 @@ def test_forwarder_drops_missed_steer_when_read_before_later_steer_fails(tmp_pat
         live_steer_copy=False,
         replies_after_steer=2,
         live_follow_up_steer=True,
-        during_read=fail_first_read,
+        during_read=fail_read if fail_first_read else None,
+        follow_up_ahead_of_steer=follow_up_ahead_of_steer,
+        first_read_items=first_read_items,
     )
 
     assert transcript == [
         "user: fix the bug",
         _TRANSCRIPT_READ,
+        *expected_steer,
         "user: and the changelog",
         "assistant: reply 1",
         "assistant: reply 2",

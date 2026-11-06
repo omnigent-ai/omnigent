@@ -7468,10 +7468,10 @@ async def _mirror_missed_steers(
     so this finds the executor's recorded client ids in the native transcript.
     A steer whose ended turn could not be read is retried on a later read. The
     server reports inputs queued ahead of a mirrored user message as undelivered,
-    so steers Codex recorded before ``before`` are mirrored ahead of it. A steer
-    a later user message was mirrored ahead of, or that a read could not place
-    relative to ``before``, is dropped: a server ignoring ``delivery_attempt_id``
-    would settle its late copy against another input.
+    so steers Codex recorded before ``before`` are mirrored ahead of it. Any other
+    unmirrored steer is dropped, as is one a later user message was already
+    mirrored ahead of: a server ignoring ``delivery_attempt_id`` would settle its
+    late copy against another input.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7512,8 +7512,10 @@ async def _mirror_missed_steers(
         transcript_read = await _post_missed_steers(
             client, session_id, forwarder_state, thread_id=thread_id, steers=missed, before=before
         )
-    if before is not None and not transcript_read:
-        overtaken.extend(missed)
+    if before is not None:
+        overtaken.extend(
+            steer for steer in missed if (thread_id, steer.client_message_id) not in mirrored
+        )
     if overtaken:
         _logger.warning(
             "Codex forwarder dropped steered input a later message overtook: thread=%s count=%d",
