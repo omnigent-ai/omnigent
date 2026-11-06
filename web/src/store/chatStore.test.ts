@@ -4534,20 +4534,30 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
       onTestFinished(clearSessionDrafts);
       seedSession("conv_real");
       failManagedLaunch("conv_real", "saved on server");
-      await useChatStore.getState().switchTo("conv_real");
-      await settle();
-      expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
-      setSessionDraft("conv_real", { text: "", files: [] });
       const posts: unknown[] = [];
-      fetchMock.mockImplementation((input, init) => {
-        if (String(input).endsWith("/v1/sessions/conv_real/events") && init?.method === "POST") {
+      fetchMock.mockImplementation(async (input, init) => {
+        const path = String(input).split("?")[0]!;
+        if (path === "/v1/sessions/conv_real/events" && init?.method === "POST") {
           posts.push(JSON.parse(String(init.body)));
           if (ran) sessionFailedInputs.delete("conv_real");
           if (!answered) return Promise.reject(new TypeError("Failed to fetch"));
           if (denied) return mockResponse({ queued: false, denied: true });
         }
+        // The snapshot also lists the failed inputs, which the transcript shows as not delivered.
+        if (path === "/v1/sessions/conv_real" && (init?.method ?? "GET") === "GET") {
+          const session = await defaultFetchHandler(input, init).json();
+          return mockResponse({
+            ...session,
+            failed_inputs: sessionFailedInputs.get("conv_real") ?? [],
+          });
+        }
         return defaultFetchHandler(input, init);
       });
+      await useChatStore.getState().switchTo("conv_real");
+      await settle();
+      expect(useChatStore.getState().failedInputs).toHaveLength(1);
+      expect(takeFailedSendDraft("conv_real", false, true)?.text).toBe("saved on server");
+      setSessionDraft("conv_real", { text: "", files: [] });
 
       if (command)
         await useChatStore
@@ -4576,6 +4586,10 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
             },
       );
       expect(useChatStore.getState().returnedStartupInputs).toEqual(ran ? [] : ["pending_first"]);
+      if (answered)
+        expect(useChatStore.getState().failedInputs.map((input) => input.pendingId)).toEqual(
+          denied ? ["pending_first"] : [],
+        );
       if (!ran) return;
       await useChatStore.getState().send("and another thing", "agent_xyz");
       expect(posts.at(-1)).not.toHaveProperty("replaces_failed_inputs");

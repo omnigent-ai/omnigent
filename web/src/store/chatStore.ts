@@ -8359,7 +8359,8 @@ function forgetReturnedStartupInputs(
 
 /**
  * Settle the failed startup inputs a send named once the server answered it:
- * accepted, it dropped them; denied, it kept them, so they come back now.
+ * accepted, it dropped them, so they no longer show as undelivered; denied, it
+ * kept them, so they come back now.
  */
 function settleReplacedStartupInputs(
   sessionId: string,
@@ -8371,7 +8372,10 @@ function settleReplacedStartupInputs(
     ...forgetReturnedStartupInputs(s, ids),
     ...(denied
       ? {}
-      : { replacedStartupInputs: [...new Set([...s.replacedStartupInputs, ...ids])] }),
+      : {
+          replacedStartupInputs: [...new Set([...s.replacedStartupInputs, ...ids])],
+          failedInputs: s.failedInputs.filter((input) => !ids.includes(input.pendingId)),
+        }),
   }));
   if (denied) void restoreFailedStartupInputs(sessionId);
 }
