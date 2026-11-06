@@ -1244,7 +1244,7 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
     assert (await auth_client.get("/v1/sharing", headers=admin_headers)).status_code == 200
     assert (await auth_client.get(session_url, headers=admin_headers)).json()[
         "permission_level"
-    ] == 4
+    ] == LEVEL_OWNER
     assert (
         await auth_client.post(
             "/v1/me/admin-mode", headers=admin_headers, json={"enabled": "false"}

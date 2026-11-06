@@ -15,7 +15,7 @@ vi.mock("./host", () => ({
 }));
 
 const reload = vi.fn();
-const events = new Map<string, EventListener>();
+let stopWatching: (() => void) | undefined;
 
 beforeEach(() => {
   vi.resetModules();
@@ -23,7 +23,7 @@ beforeEach(() => {
   mocks.cookiePath = undefined;
   mocks.fetch.mockReset();
   reload.mockReset();
-  events.clear();
+  stopWatching = undefined;
   localStorage.clear();
   document.cookie = "omnigent_admin_mode=; Path=/; Max-Age=0";
   document.cookie = "omnigent_admin_mode=; Path=/proxy/6767; Max-Age=0";
@@ -31,13 +31,11 @@ beforeEach(() => {
   document.cookie = "omnigent_admin_mode_server_b=; Path=/; Max-Age=0";
   delete window.__OMNIGENT_BASE_PATH__;
   vi.stubGlobal("location", { protocol: "http:", reload });
-  vi.spyOn(window, "addEventListener").mockImplementation((event, listener) => {
-    events.set(event, listener as EventListener);
-  });
 });
 
 afterEach(() => {
   cleanup();
+  stopWatching?.();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -45,6 +43,7 @@ afterEach(() => {
 async function eligibleAdmin(enabled = false) {
   const mode = await import("./adminMode");
   mode.initializeAdminMode();
+  stopWatching = mode.subscribeAdminModeChanges();
   mode.resolveAdminMode({
     user_id: "admin@example.test",
     can_enable_admin_mode: true,
@@ -120,6 +119,7 @@ describe("browser admin mode", () => {
 
   it("signals the current server and account then reloads immediately after an accepted change", async () => {
     const mode = await eligibleAdmin();
+    vi.stubGlobal("crypto", { getRandomValues: crypto.getRandomValues.bind(crypto) });
     mocks.fetch.mockResolvedValue(new Response("{}", { status: 200 }));
     await mode.setAdminMode(true);
 
@@ -131,7 +131,19 @@ describe("browser admin mode", () => {
     expect(localStorage.key(0)).toBe(
       'omnigent:admin-mode-change:["server-a","/","omnigent_admin_mode_server_a","admin@example.test"]',
     );
+    expect(localStorage.getItem(localStorage.key(0)!)).toBeTruthy();
     expect(reload).toHaveBeenCalledOnce();
+  });
+
+  it("shows a friendly message when changing mode fails before receiving a response", async () => {
+    const mode = await eligibleAdmin();
+    mocks.fetch.mockRejectedValue(new TypeError("Failed to fetch"));
+
+    await expect(mode.setAdminMode(true)).rejects.toThrow(
+      "Could not change admin mode. Try again.",
+    );
+    expect(reload).not.toHaveBeenCalled();
+    expect(localStorage.length).toBe(0);
   });
 
   it("keeps the current view after a rejected change", async () => {
@@ -144,22 +156,21 @@ describe("browser admin mode", () => {
 
   it("reloads other views for this account, but not another server or account", async () => {
     await eligibleAdmin(true);
-    const storage = events.get("storage")!;
-    storage(
+    window.dispatchEvent(
       new StorageEvent("storage", {
         key: 'omnigent:admin-mode-change:["server-b","/","omnigent_admin_mode_server_b","admin@example.test"]',
         newValue: "changed",
       }),
     );
     expect(reload).not.toHaveBeenCalled();
-    storage(
+    window.dispatchEvent(
       new StorageEvent("storage", {
         key: 'omnigent:admin-mode-change:["server-a","/","omnigent_admin_mode_server_a","member@example.test"]',
         newValue: "changed",
       }),
     );
     expect(reload).not.toHaveBeenCalled();
-    storage(
+    window.dispatchEvent(
       new StorageEvent("storage", {
         key: 'omnigent:admin-mode-change:["server-a","/","omnigent_admin_mode_server_a","admin@example.test"]',
         newValue: "changed",
@@ -170,13 +181,37 @@ describe("browser admin mode", () => {
 
   it("refreshes a restored view and catches cookie changes when returning to a tab", async () => {
     await eligibleAdmin(true);
-    events.get("pageshow")!(new PageTransitionEvent("pageshow", { persisted: true }));
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
     expect(reload).toHaveBeenCalledTimes(1);
     document.cookie = "omnigent_admin_mode_server_b=changed; Path=/";
-    events.get("focus")!(new Event("focus"));
+    window.dispatchEvent(new Event("focus"));
     expect(reload).toHaveBeenCalledTimes(1);
     document.cookie = "omnigent_admin_mode_server_a=changed; Path=/";
-    events.get("focus")!(new Event("focus"));
+    window.dispatchEvent(new Event("focus"));
+    expect(reload).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops reloads on unmount and restores guards with cached identity on remount", async () => {
+    document.cookie = "omnigent_admin_mode_server_a=accepted-user-hash; Path=/";
+    const mode = await eligibleAdmin(true);
+    const changed = new StorageEvent("storage", {
+      key: 'omnigent:admin-mode-change:["server-a","/","omnigent_admin_mode_server_a","admin@example.test"]',
+      newValue: "changed",
+    });
+    stopWatching!();
+    window.dispatchEvent(changed);
+    window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    document.cookie = "omnigent_admin_mode_server_a=changed; Path=/";
+    window.dispatchEvent(new Event("focus"));
+    expect(reload).not.toHaveBeenCalled();
+    expect(mode.getAdminMode()).toBe(true);
+
+    mode.initializeAdminMode();
+    expect(document.cookie).toContain("omnigent_admin_mode_server_a=changed");
+    stopWatching = mode.subscribeAdminModeChanges();
+    expect(mode.getAdminMode()).toBe(true);
+    expect(reload).toHaveBeenCalledTimes(1);
+    window.dispatchEvent(changed);
     expect(reload).toHaveBeenCalledTimes(2);
   });
 });

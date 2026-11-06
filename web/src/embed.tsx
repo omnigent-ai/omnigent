@@ -26,7 +26,7 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
-import { initializeAdminMode } from "./lib/adminMode";
+import { initializeAdminMode, subscribeAdminModeChanges } from "./lib/adminMode";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { useResolvedThemeMode } from "./components/theme/useResolvedThemeMode";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
@@ -282,6 +282,7 @@ export function OmnigentApp({
     initializeAdminMode();
     return null;
   });
+  useEffect(subscribeAdminModeChanges, []);
 
   const routingApi = useMemo<RoutingApi>(() => {
     // Host overrides compose UNDER the basename wrapper: merge the host's

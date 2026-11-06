@@ -72,7 +72,9 @@ function currentServerId(): string {
 
 function sessionCachePrefix(serverId: string = currentServerId()): string {
   const mode = getAdminMode();
-  return `${SESSION_CACHE_KEY_PREFIX}:${serverId}${mode === null ? "" : mode ? ":admin" : ":member"}`;
+  let modeSuffix = "";
+  if (mode !== null) modeSuffix = mode ? ":admin" : ":member";
+  return `${SESSION_CACHE_KEY_PREFIX}:${serverId}${modeSuffix}`;
 }
 
 function sessionCacheKey(viewerId: string, serverId: string = currentServerId()): string {

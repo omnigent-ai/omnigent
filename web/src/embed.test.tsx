@@ -10,6 +10,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { scopeCss } from "../vite.embed.config";
 import { OmnigentApp } from "./embed";
 import { getEmbedRoot } from "./lib/host";
+import * as adminMode from "./lib/adminMode";
 
 // Exercise the embed's real providers and native detection without loading
 // routed pages, editors, or terminals unrelated to the window chrome.
@@ -42,6 +43,25 @@ vi.mock("./App", () => ({
 
 // Keep the backend discovery pending: the root must be marked before it resolves.
 const fetcher = () => new Promise<Response>(() => {});
+
+it("cleans up admin mode guards and reattaches them on remount", () => {
+  const stopWatching = vi.fn();
+  const watch = vi.spyOn(adminMode, "subscribeAdminModeChanges").mockReturnValue(stopWatching);
+  const app = (
+    <MemoryRouter>
+      <OmnigentApp fetcher={fetcher} />
+    </MemoryRouter>
+  );
+  const first = render(app);
+  expect(watch).toHaveBeenCalledTimes(1);
+  first.unmount();
+  expect(stopWatching).toHaveBeenCalledTimes(1);
+
+  const second = render(app);
+  expect(watch).toHaveBeenCalledTimes(2);
+  second.unmount();
+  expect(stopWatching).toHaveBeenCalledTimes(2);
+});
 
 const compiledCss = transform({
   filename: "index.css",
