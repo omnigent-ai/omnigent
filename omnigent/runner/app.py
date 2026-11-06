@@ -1274,6 +1274,7 @@ def create_runner_app(
         resolving host credentials again for every terminal launch.
     :param native_pane_idle_timeout_s: Resolved native-pane idle timeout. ``0``
         disables reaping; ``None`` uses the pane environment override or default.
+        Sub-agent panes are capped at the native-pane default window.
     """
     import hmac
 
@@ -8625,7 +8626,16 @@ def create_runner_app(
                     resource_registry.terminal_resource_role(conv_id, terminal_id)
                 ):
                     instance = _pane_reaper_registry.get(conv_id, name, "main")
-                    panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
+                    panes.append(
+                        PaneRef(
+                            conv_id,
+                            terminal_id,
+                            name,
+                            socket_path,
+                            instance,
+                            sub_agent=_is_sub_agent_session(conv_id),
+                        )
+                    )
             return panes
 
         async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
