@@ -482,6 +482,27 @@ def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPa
     assert len(gate.submitted) == 4, "busy pongs inside an interval must not refresh on their own"
 
 
+@pytest.mark.parametrize(
+    ("busy", "idle_s", "grace"),
+    [(True, None, 0.0), (None, None, 0.0), (False, 30.0, 1500.0)],
+    ids=["busy", "legacy", "idle-within-grace"],
+)
+def test_a_first_pong_refresh_keeps_the_periodic_schedule(
+    monkeypatch: pytest.MonkeyPatch, busy: bool | None, idle_s: float | None, grace: float
+) -> None:
+    # The keepalive loop ticks at connect and every interval after; a first pong
+    # lands between ticks. Its refresh must not push the next tick's refresh out
+    # by almost an interval.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive._runner_warm_grace_s["r1"] = grace
+    managed_host_keepalive.touch("r1")  # t=1000: connect tick, no pong yet
+    gate.now += 1.0
+    managed_host_keepalive.record_pong("r1", busy, idle_s=idle_s)  # t=1001: refreshed
+    gate.now = 1600.0
+    managed_host_keepalive.touch("r1")  # the loop's next tick
+    assert gate.submitted == ["r1", "r1"]
+
+
 def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

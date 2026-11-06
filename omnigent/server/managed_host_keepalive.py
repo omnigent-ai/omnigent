@@ -174,12 +174,14 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
     """
     if _sandbox_config is None or _host_store is None:
         return
+    # Refreshes from here are forced: they happen between the keepalive loop's
+    # ticks and must not move its throttle clock, or the next tick is skipped.
     if busy is None:
         # An older runner build: refresh for its tunnel's lifetime, starting now.
         if runner_id not in _unreporting_runners:
             forget_reports(runner_id)
             _unreporting_runners.add(runner_id)
-            touch(runner_id)
+            touch(runner_id, force=True)
         return
     _unreporting_runners.discard(runner_id)
     now = time.monotonic()
@@ -192,9 +194,7 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
         resumed = first_report or not _recently_busy(runner_id, now)
         _last_busy_at[runner_id] = now
         if resumed:
-            # A first report starts the periodic schedule; a resume between
-            # ticks must not move it.
-            touch(runner_id, force=not first_report)
+            touch(runner_id, force=True)
         return
     if idle_s is not None:
         last_work = now - idle_s
@@ -208,7 +208,7 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
     if first_report:
         # Refreshes only if the runner is still within its window (a fresh
         # replica resuming the grace); an expired one is left to stop.
-        touch(runner_id)
+        touch(runner_id, force=True)
 
 
 def forget_reports(runner_id: str) -> None:
@@ -230,7 +230,8 @@ def record_work_dispatched(runner_id: str) -> None:
 
     Pongs sample busy only every ping interval, so a message sent right after an
     idle pong would otherwise wait up to that long for its refresh, which can be
-    past a short platform deadline. Counts until the runner's next pong.
+    past a short platform deadline. It counts as work at this moment, so the
+    runner's window (and keep-warm grace) runs from here.
 
     :param runner_id: Runner the server forwarded a session event to.
     """
@@ -258,9 +259,9 @@ def touch(runner_id: str, *, force: bool = False) -> None:
     on the other side of this ping loop.
 
     :param runner_id: Runner with a live tunnel, e.g. ``"runner_token_abc"``.
-    :param force: Skip the interval throttle (an idle-to-busy edge from
-        :func:`record_pong`). A forced refresh leaves the periodic schedule alone,
-        so the next tick still refreshes on time.
+    :param force: Skip the interval throttle (a refresh from
+        :func:`record_pong`, between ticks). A forced refresh leaves the periodic
+        schedule alone, so the next tick still refreshes on time.
     """
     if _sandbox_config is None or _host_store is None or _executor is None:
         return
