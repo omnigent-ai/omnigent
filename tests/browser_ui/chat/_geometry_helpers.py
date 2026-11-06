@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from itertools import pairwise
 
 import pytest
-from playwright.sync_api import FloatRect, Locator, Page, expect
+from playwright.sync_api import CDPSession, FloatRect, Locator, Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
@@ -152,6 +154,10 @@ GEOMETRY_PROBE = """() => {
         lastMessageBottom: Math.round(sections.at(-1).getBoundingClientRect().bottom),
         composerHeight: Math.round(ta.getBoundingClientRect().height),
         composerTop,
+        mobileOverlay: card.hasAttribute('data-mobile-composer'),
+        overlayHeight: Math.round(parseFloat(getComputedStyle(
+            form.closest('[data-chat-surface]')
+        ).getPropertyValue('--session-composer-height')) || 0),
         transcriptBottom,
         overlap: transcriptBottom - composerTop,
         formMarginTop: Math.round(parseFloat(getComputedStyle(form).marginTop) || 0),
@@ -195,56 +201,76 @@ def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
     ).json_value()
 
 
-def scroll_with_native_touch(page: Page) -> dict:
+@contextmanager
+def native_touch_emulation(page: Page) -> Iterator[CDPSession]:
+    """Emulate touch input until the block exits.
+
+    Ending emulation re-evaluates pointer/hover media, which resizes touch-sized
+    targets; measurements that must share one layout belong inside the block.
+    """
     session = page.context.new_cdp_session(page)
     try:
         session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})
-        target = page.evaluate(
-            """() => {
-              const ta = document.querySelector('textarea[aria-label="Message the agent"]');
-              const form = ta.closest('form');
-              const scroller = form.parentElement.querySelector('[role="log"] > div');
-              const rect = scroller.getBoundingClientRect();
-              const events = [];
-              const record = event => events.push(event.type);
-              for (const type of ['pointerdown', 'pointermove', 'pointercancel'])
-                window.addEventListener(type, record, {capture: true});
-              scroller.addEventListener('scroll', record);
-              scroller.addEventListener('scrollend', record);
-              window.__nativeTouchProbe = {events, scroller};
-              return {x: Math.round(rect.left + rect.width * .75),
-                y: Math.round(rect.top + Math.min(rect.height * .2, 140)),
-                initialScrollTop: Math.round(scroller.scrollTop)};
-            }"""
-        )
-        point = {
-            "x": target["x"],
-            "y": target["y"],
-            "id": 1,
-            "radiusX": 2,
-            "radiusY": 2,
-            "force": 1,
-        }
-        session.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
-        page.wait_for_timeout(50)
-        for offset in (35, 75, 120, 170, 225, 280):
-            session.send(
-                "Input.dispatchTouchEvent",
-                {"type": "touchMove", "touchPoints": [{**point, "y": point["y"] + offset}]},
-            )
-            page.wait_for_timeout(16)
-        session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
-        page.wait_for_timeout(600)
-        return page.evaluate(
-            """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
-              events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),
-              settledDistance: Math.round(scroller.scrollHeight - scroller.clientHeight
-                - scroller.scrollTop)}; }""",
-            target["initialScrollTop"],
-        )
+        yield session
     finally:
         session.send("Emulation.setTouchEmulationEnabled", {"enabled": False})
         session.detach()
+
+
+def scroll_with_native_touch(page: Page, session: CDPSession | None = None) -> dict:
+    """Drag the transcript with native touch, inside ``session``'s emulation when given."""
+    if session is None:
+        with native_touch_emulation(page) as owned:
+            return scroll_with_native_touch(page, owned)
+    target = page.evaluate(
+        """() => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const form = ta.closest('form');
+          const scroller = form.parentElement.querySelector('[role="log"] > div');
+          const rect = scroller.getBoundingClientRect();
+          const events = [];
+          const record = event => events.push(event.type);
+          for (const type of ['pointerdown', 'pointermove', 'pointercancel'])
+            window.addEventListener(type, record, {capture: true});
+          scroller.addEventListener('scroll', record);
+          scroller.addEventListener('scrollend', record);
+          window.__nativeTouchProbe = {events, scroller};
+          return {x: Math.round(rect.left + rect.width * .75),
+            y: Math.round(rect.top + Math.min(rect.height * .2, 140)),
+            initialScrollTop: Math.round(scroller.scrollTop)};
+        }"""
+    )
+    point = {
+        "x": target["x"],
+        "y": target["y"],
+        "id": 1,
+        "radiusX": 2,
+        "radiusY": 2,
+        "force": 1,
+    }
+    session.send("Input.dispatchTouchEvent", {"type": "touchStart", "touchPoints": [point]})
+    page.wait_for_timeout(50)
+    for offset in (35, 75, 120, 170, 225, 280):
+        session.send(
+            "Input.dispatchTouchEvent",
+            {"type": "touchMove", "touchPoints": [{**point, "y": point["y"] + offset}]},
+        )
+        page.wait_for_timeout(16)
+    session.send("Input.dispatchTouchEvent", {"type": "touchEnd", "touchPoints": []})
+    # Native momentum can outlast a fixed delay; measure after the gesture and
+    # any virtual-row remeasurement have both finished.
+    page.wait_for_function(
+        "() => window.__nativeTouchProbe.events.at(-1) === 'scrollend'",
+        timeout=15_000,
+    )
+    settled_geometry(page)
+    return page.evaluate(
+        """initial => { const {events, scroller} = window.__nativeTouchProbe; return {
+          events, initialScrollTop: initial, settledScrollTop: Math.round(scroller.scrollTop),
+          settledDistance: Math.round(scroller.scrollHeight - scroller.clientHeight
+            - scroller.scrollTop)}; }""",
+        target["initialScrollTop"],
+    )
 
 
 def append_streamed_output(page: Page, height: int) -> dict:

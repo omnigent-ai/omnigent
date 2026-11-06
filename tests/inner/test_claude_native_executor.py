@@ -12,6 +12,7 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 
@@ -26,7 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorConfig, ExecutorError, TextChunk, TurnComplete
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -302,18 +303,17 @@ async def test_run_turn_points_auth_commands_at_a_remedy_reachable_from_the_host
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("free_bytes", "delivered"), [(4096, False), (512 * 1024 * 1024, True)])
-async def test_run_turn_does_not_type_into_a_full_transcript_disk(
+@pytest.mark.parametrize("free_bytes", [4096, 512 * 1024 * 1024])
+async def test_run_turn_holds_a_message_until_the_transcript_disk_has_space(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     free_bytes: int,
-    delivered: bool,
 ) -> None:
     """
-    A full disk under Claude's transcript fails the turn before typing.
+    A full disk holds the message before typing and delivers once space returns.
 
-    Claude Code would run the message but could not record it, so the web would
-    show nothing and later report the message as never recorded.
+    Claude Code would otherwise run the message without recording it, leaving
+    the web transcript missing and later reporting a delivery failure.
     """
     transcript = tmp_path / "projects" / "session.jsonl"
     (tmp_path / claude_bridge._STATE_FILE).write_text(
@@ -324,7 +324,8 @@ async def test_run_turn_does_not_type_into_a_full_transcript_disk(
 
     def fake_disk_usage(path: Path) -> SimpleNamespace:
         checked.append(Path(path))
-        return SimpleNamespace(total=1 << 40, used=(1 << 40) - free_bytes, free=free_bytes)
+        available = free_bytes if len(checked) == 1 else 512 * 1024 * 1024
+        return SimpleNamespace(total=1 << 40, used=(1 << 40) - available, free=available)
 
     def fake_inject_user_message(
         bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0
@@ -334,6 +335,7 @@ async def test_run_turn_does_not_type_into_a_full_transcript_disk(
 
     monkeypatch.setattr(shutil, "disk_usage", fake_disk_usage)
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fake_inject_user_message)
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0.0, raising=False)
 
     executor = ClaudeNativeExecutor(tmp_path)
     events = [
@@ -345,16 +347,51 @@ async def test_run_turn_does_not_type_into_a_full_transcript_disk(
         )
     ]
 
-    if delivered:
-        assert typed == ["hello from web"]
-        assert events == [TurnComplete(response=None)]
-    else:
-        assert typed == []
-        [error] = events
-        assert isinstance(error, ExecutorError)
-        assert error.code == "host_disk_full"
-        assert error.undelivered is True
-    assert checked == [transcript.parent]
+    assert typed == ["hello from web"]
+    assert events == (
+        [
+            TextChunk(text=claude_native_executor._HOST_DISK_WAIT_MESSAGE),
+            TurnComplete(response=None),
+        ]
+        if free_bytes == 4096
+        else [TurnComplete(response=None)]
+    )
+    assert checked == [transcript.parent] if free_bytes > 4096 else [transcript.parent] * 2
+
+
+@pytest.mark.asyncio
+async def test_run_turn_cancels_a_full_disk_hold_without_failing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Closing a full-disk turn releases the wait without an error or keystrokes."""
+    transcript = tmp_path / "projects" / "session.jsonl"
+    (tmp_path / claude_bridge._STATE_FILE).write_text(
+        json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_transcript_disk_full",
+        Mock(return_value=True),
+    )
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+    turn = executor.run_turn(
+        messages=[{"role": "user", "content": "hello from web"}],
+        tools=[],
+        system_prompt="ignored",
+    )
+
+    assert isinstance(await turn.__anext__(), TextChunk)
+    pending_next = asyncio.create_task(turn.__anext__())
+    await asyncio.sleep(0)
+    pending_next.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await pending_next
+    await turn.aclose()
+
+    injected.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2098,65 +2135,6 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     assert (records[0].levelno == logging.ERROR) is expect_error_level
     # A traceback only earns its place when something actually broke.
     assert bool(records[0].exc_info) is expect_error_level
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("launcher_output", "expected_code"),
-    [
-        (
-            "ERROR Could not parse Databricks CLI version from `databricks --version` "
-            "output: 'Databricks CLI v1.22.1'\n│ Claude Code exited with code 1 │",
-            "required_terminal_exited",
-        ),
-        ("│ Claude Code exited with code 1 │", None),
-    ],
-)
-async def test_run_turn_explains_a_launcher_that_exited_before_the_prompt(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    launcher_output: str,
-    expected_code: str | None,
-) -> None:
-    """A launcher's known fatal error reaches the card as its diagnosis, not a bare exit."""
-
-    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
-        del bridge_dir_arg, content, timeout_s
-        raise ClaudeTerminalExited(
-            "The Claude Code terminal has exited (status 0), so the message was not "
-            f"delivered. Last terminal output:\n{launcher_output}",
-            exit_status="0",
-        )
-
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
-    monkeypatch.setattr(
-        claude_native_executor,
-        "kill_session",
-        lambda bridge_dir_arg, *, timeout_s, expected_close=False: None,
-    )
-
-    events = [
-        event
-        async for event in ClaudeNativeExecutor(tmp_path / "bridge").run_turn(
-            messages=[{"role": "user", "content": "hi"}],
-            tools=[],
-            system_prompt="",
-        )
-    ]
-
-    assert len(events) == 1
-    error = events[0]
-    assert isinstance(error, ExecutorError)
-    assert error.undelivered is True
-    assert error.code == expected_code
-    if expected_code is None:
-        assert error.title is None
-        return
-    assert error.title == "The Databricks gateway launcher couldn't check the Databricks CLI"
-    assert error.remediation is not None
-    assert "databricks --version" in error.remediation
-    # The pane's own text stays in the message for the person to read.
-    assert "Databricks CLI v1.22.1" in error.message
 
 
 @pytest.mark.asyncio

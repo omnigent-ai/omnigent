@@ -113,6 +113,19 @@ _AUTH_MARKERS = (
     "not authenticated",
 )
 
+# --- Claude Code install failed or left broken -------------------------------
+# A launcher that installs Claude Code before starting it reports npm's
+# ENOENT text, which also reads like a missing binary.
+_BROKEN_CLAUDE_INSTALL_MARKERS = (
+    "failedtoinstallclaudecode",
+    "claudenativebinarynotinstalled",
+)
+# The launcher's exec of a half-written binary, "Exec format error: '<path>/claude'";
+# matched on compacted text, so only the quoted path may name claude.
+_EXEC_FORMAT_ERROR = re.compile(r"execformaterror:'[^']*claude'")
+# Pane captures wrap long lines and draw borders, which can split a marker.
+_PANE_WRAP = re.compile(r"[\s│┃]+")
+
 # --- binary missing -----------------------------------------------------------
 _MISSING_MARKERS = (
     "command not found",
@@ -133,28 +146,15 @@ _REJECTED_ARGUMENT_MARKERS = (
     "usage: codex",
 )
 
-
-# --- gateway launcher's Databricks CLI version check -------------------------
-# A capture can keep only the end of the launcher's error: the quoted version
-# (``... output: 'Databricks CLI v1.2.3'``) or the timed-out probe. Those
-# fragments count only beside the launcher's own "Claude Code exited" box.
-_CLI_VERSION_UNREAD_PHRASE = "could not parse databricks cli version"
-_CLI_VERSION_UNREAD_FRAGMENT = re.compile(
-    r"(?m)\bcli v\d+\.\d+\.\d+'$|'--version'\]' timed out after \d+\s+seconds>"
+_BACKGROUND_SESSION_REFUSAL = re.compile(
+    r"that session is running in the\s+background.*?claude attach.*?claude stop",
+    re.DOTALL,
 )
-_LAUNCHER_EXIT_BOX = "claude code exited with code"
-
-
-def _cli_version_unread(signal: _Signal) -> bool:
-    if _CLI_VERSION_UNREAD_PHRASE in signal.output:
-        return True
-    return _LAUNCHER_EXIT_BOX in signal.output and bool(
-        _CLI_VERSION_UNREAD_FRAGMENT.search(signal.output)
-    )
 
 
 # Ordered most-specific first: the root case also reads like a permission /
-# auth problem, so it must win over the broader rules below it.
+# auth problem, and a broken install like a missing binary, so they must win
+# over the broader rules below them.
 _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     _TerminalMatcher(
         "root_permission",
@@ -168,39 +168,35 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             remediation="Run the host as a non-root user (uid != 0).",
         ),
     ),
-    # The Databricks gateway launcher checks `databricks --version` before it
-    # starts Claude Code; a probe that times out or fails ends the launch with
-    # this error, even when the version it then prints is valid.
     _TerminalMatcher(
-        "gateway_databricks_cli_version_unread",
-        _cli_version_unread,
+        "claude_install_broken",
+        lambda s: _claude_install_is_broken(s.output),
         FailureDiagnosis(
-            title="The Databricks gateway launcher couldn't check the Databricks CLI",
+            title="Claude Code's install is broken",
             cause=(
-                "The launcher exited before starting Claude Code because "
-                "`databricks --version` failed or answered too slowly on the host."
+                "Claude Code could not start because its install failed or is incomplete. "
+                "Launches that update Claude Code at the same time can leave it this way."
             ),
             remediation=(
-                "Run `databricks --version` on the host. If it is slow or fails, reinstall "
-                "or update the Databricks CLI. Then send your message again."
+                "Send your message again. If it fails again, reinstall Claude Code on the "
+                "host with the installer you used, then retry."
             ),
-            category=ErrorCategory.UPSTREAM,
         ),
     ),
-    # The same launcher upgrades a too-old Databricks CLI itself; when the
-    # installer fails (e.g. an older CLI already holds its target path) it exits.
     _TerminalMatcher(
-        "gateway_databricks_cli_install_failed",
-        lambda s: "failed to install/upgrade databricks cli automatically" in s.output,
+        "background_session_running",
+        lambda s: _BACKGROUND_SESSION_REFUSAL.search(s.output) is not None,
         FailureDiagnosis(
-            title="The Databricks gateway launcher couldn't install the Databricks CLI",
+            title="Claude session is already running in the background",
             cause=(
-                "The launcher exited before starting Claude Code because it couldn't "
-                "install or upgrade the Databricks CLI on the host."
+                "Claude Code refused to resume this session because it is already "
+                "running in another background process."
             ),
             remediation=(
-                "Install a current Databricks CLI on the host, removing an older one first "
-                "if the terminal output names it. Then send your message again."
+                "Send your message again to resume a copy of the session here. To "
+                "resume the original instead, inspect the background session on the "
+                "host with `claude attach <session-id>` (the ID is in the terminal "
+                "output), stop it with `claude stop <session-id>`, then retry."
             ),
         ),
     ),
@@ -264,6 +260,13 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
         ),
     ),
 )
+
+
+def _claude_install_is_broken(output: str) -> bool:
+    compact = _PANE_WRAP.sub("", output)
+    return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
+        _EXEC_FORMAT_ERROR.search(compact)
+    )
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
@@ -332,6 +335,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
@@ -697,6 +701,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "host, then start a new session."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
+    "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 
