@@ -3278,6 +3278,21 @@ describe("chatStore — send (first-send ordering)", () => {
       });
     });
 
+    it("leaves another caller's read in flight when a load that joined it times out", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_joined_load", []);
+      // Another caller's read of the same session, which the server never answers.
+      void client.fetchQuery({
+        queryKey: ["session", "conv_joined_load"],
+        queryFn: () => new Promise(() => {}),
+      });
+
+      void useChatStore.getState().switchTo("conv_joined_load");
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS + 100);
+
+      expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
+    });
+
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
       const { gets } = failSnapshots("conv_missing", [404, 404, 404]);

@@ -1956,10 +1956,8 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 // of trusting them forever, so a truly deleted/invalid conversation still
 // gives up rather than polling it forever.
 const MAX_TRANSIENT_404_RETRIES = 10;
-// An auth layer answering the stream with its login page means the sign-in
-// expired, which no retry can renew. A maintenance page during a restart looks
-// the same, so give up only once those answers outlast a restart with no
-// successful stream open in between.
+// A login page means the sign-in expired, which no retry renews. A maintenance
+// page during a restart looks the same, so give up only after one outlasts a restart.
 const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
 
 /**
@@ -5246,16 +5244,21 @@ async function bindStream(
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout((signal) => {
-          // A timed-out attempt may have joined another caller's request; drop
-          // that request so the retry reads afresh instead of joining it again.
-          signal.addEventListener(
-            "abort",
-            () => void client.cancelQueries({ queryKey: ["session", id], exact: true }),
-            { once: true },
-          );
+          // An attempt that starts the request drops it on timeout, so the retry reads
+          // afresh instead of joining it. One that joins another caller's request leaves
+          // its cancellation to that caller.
+          const startsRequest = client.isFetching({ queryKey: ["session", id], exact: true }) === 0;
+          if (startsRequest) {
+            signal.addEventListener(
+              "abort",
+              () => void client.cancelQueries({ queryKey: ["session", id], exact: true }),
+              { once: true },
+            );
+          }
           return client.fetchQuery({
             queryKey: ["session", id],
-            queryFn: () => getSessionSlim(id, { refreshState: true, signal }),
+            queryFn: ({ signal: querySignal }) =>
+              getSessionSlim(id, { refreshState: true, signal: querySignal }),
             staleTime: 0,
             retry: false,
           });
