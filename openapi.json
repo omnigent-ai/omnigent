@@ -6291,6 +6291,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_bundle_model_override": {
+            "default": true,
+            "title": "Session Bundle Model Override",
+            "type": "boolean"
+          },
           "session_claude_sdk_clear": {
             "default": false,
             "title": "Session Claude Sdk Clear",
@@ -7742,6 +7747,18 @@
             "description": "Excerpt of the chat content that matched the request's `search_query`, centered on the match with `\u2026` marking elided ends, so the search UI can show *where* a session matched in its body. Present whenever the query hit an item body (even if the title also matched); `None` on non-search reads and when only the title matched.",
             "title": "Search Snippet"
           },
+          "shared_with_others": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the requesting user owns this session and has granted access to another user (the public link alone doesn't count). `None` when the requester isn't the owner or permissions are disabled, so the grant list never leaks to non-owners.",
+            "title": "Shared With Others"
+          },
           "status": {
             "description": "Derived session lifecycle status.",
             "enum": [
@@ -9040,6 +9057,28 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_allowed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Allowed"
+          },
+          "side_chat_parent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Side Chat Parent Id"
+          },
           "side_chat_settings_supported": {
             "default": false,
             "title": "Side Chat Settings Supported",
@@ -9906,6 +9945,94 @@
           }
         },
         "title": "SetSharingRequest",
+        "type": "object"
+      },
+      "SideChatList": {
+        "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/SideChatSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "first_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Id"
+          },
+          "has_more": {
+            "default": false,
+            "title": "Has More",
+            "type": "boolean"
+          },
+          "last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Id"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SideChatList",
+        "type": "object"
+      },
+      "SideChatSummary": {
+        "description": "A side chat listed in its parent session's Workspace rail.",
+        "properties": {
+          "created_at": {
+            "description": "Unix epoch seconds when the side chat was created.",
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "description": "Side-chat session id, e.g. `\"conv_side123\"`.",
+            "title": "Id",
+            "type": "string"
+          },
+          "object": {
+            "const": "side_chat",
+            "default": "side_chat",
+            "description": "Fixed resource type, always `\"side_chat\"`.",
+            "title": "Object",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The side chat's title, when available.",
+            "title": "Title"
+          }
+        },
+        "required": [
+          "id",
+          "created_at"
+        ],
+        "title": "SideChatSummary",
         "type": "object"
       },
       "SkillContentResponse": {
@@ -18487,6 +18614,81 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/commits": {
+      "get": {
+        "description": "List the PR's commits, oldest first, at the displayed head.\n\n**Returns:** `list` of `session.github.commit` objects with `has_more`.",
+        "operationId": "list_session_github_commits_v1_sessions__session_id__resources_github_commits_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "pr_url",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Pr Url"
+            }
+          },
+          {
+            "description": "The full head commit id the panel shows; rejected when the PR moved.",
+            "in": "query",
+            "name": "head_sha",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Head Sha"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Commits",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/details": {
       "post": {
         "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",
@@ -19449,6 +19651,80 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/side_chats": {
+      "get": {
+        "description": "List the side chats available in a session's Workspace rail.\n\nOnly the owner of the session's root starts side chats there, so only\nthat owner gets any, in id order; anyone else, admins included, gets an\nempty page. Opening and closing tabs is local to each device.\n\n**Returns:** A `PaginatedList` of `SideChatSummary`.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 if the caller lacks READ on `session_id`; 404 if no session exists there.",
+        "operationId": "list_side_chats_v1_sessions__session_id__side_chats_get",
+        "parameters": [
+          {
+            "description": "Parent session id, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum side chats to return (1-20, default 20).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 20,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: the previous page's `last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SideChatList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Side Chats",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/sign-in-link": {
       "get": {
         "description": "Return the sign-in link the session's terminal is waiting on right now.\n\nAsked by the error card at click time, so the user opens the live\nprompt rather than a link saved earlier that its launcher process has\nsince abandoned.\n\n**Returns:** The runner's `{\"pending\", \"url\", \"code\", \"terminal_id\"}` payload.",
@@ -19604,7 +19880,7 @@
     },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 403 for a side chat unless the caller owns the source's root session; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

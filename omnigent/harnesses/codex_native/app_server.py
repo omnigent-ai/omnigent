@@ -4117,6 +4117,8 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    # The --remote TUI's launch args do not configure this app-server's MCP tools.
+    config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -4959,39 +4961,22 @@ def normalize_codex_permission_launch_args(
 ) -> list[str]:
     """Complete permission launch args into their effective stance.
 
-    Two normalizations:
-
-    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
-      profile with no approval policy) gain ``approval_policy="never"``.
-    - The bare default stance — no approval policy, sandbox, permission
-      profile, reviewer, or bypass flag — gains
-      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
-      escalated approvals (e.g. an out-of-workspace write) to the human,
-      which parks web turns on an approval card even though the default
-      permission mode is presented as automatic. ``auto_review`` keeps the
-      workspace-write sandbox and approval boundaries but lets Codex's
-      automatic reviewer settle eligible requests instead of prompting.
-      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
+    Legacy Full Access args (a ``default_permissions=":danger-full-access"``
+    profile with no approval policy) gain ``approval_policy="never"``. Every
+    other stance passes through unchanged, so the bare default runs Codex's own
+    default (or the user's Codex config).
     """
     args = canonical_codex_launch_args(terminal_launch_args or ())
     full_access = False
-    has_permission_profile = codex_config_profile(args) is not None
-    has_reviewer = False
-    has_sandbox = False
     has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
-    explicit_bypass = has_approval_policy
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--":
             break
         assignment: str | None = None
-        if arg == "--approve-for-me":
-            has_reviewer = True
-        elif arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
             has_approval_policy = True
-        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
-            has_sandbox = True
         elif arg in {"--config", "-c"} and index + 1 < len(args):
             index += 1
             assignment = args[index]
@@ -5002,25 +4987,11 @@ def normalize_codex_permission_launch_args(
             key = key.strip()
             if key == "approval_policy":
                 has_approval_policy = True
-            elif key == "sandbox_mode":
-                has_sandbox = True
-            elif key == "approvals_reviewer":
-                has_reviewer = True
             elif key == "default_permissions":
-                has_permission_profile = True
                 full_access = _codex_config_string(raw_value) == ":danger-full-access"
         index += 1
     if full_access and not has_approval_policy:
         args.extend(["-c", 'approval_policy="never"'])
-        has_approval_policy = True
-    if not (
-        explicit_bypass
-        or has_approval_policy
-        or has_sandbox
-        or has_reviewer
-        or has_permission_profile
-    ):
-        args.extend(["-c", 'approvals_reviewer="auto_review"'])
     return args
 
 
@@ -5030,6 +5001,46 @@ def _codex_config_string(raw_value: str) -> str:
     except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
         value = raw_value.strip().strip('"').strip("'")
     return value if isinstance(value, str) else ""
+
+
+def codex_mcp_tool_approval_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
+
+    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
+    also reach the app-server that runs web-chat turns. Other MCP servers,
+    config keys, and the global approval policy are left untouched.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
+    """
+    args = canonical_codex_launch_args(terminal_launch_args or ())
+    modes: dict[str, str | None] = {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg == "--":
+            break
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            key = key.strip()
+            # Codex applies overrides in order: a later key or parent-table assignment wins.
+            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+                del modes[tracked_key]
+            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+                modes[key] = _codex_config_string(raw_value)
+        index += 1
+    # Only explicit grants and prompts are carried; Codex rejects "deny" at startup.
+    return [
+        f"{key}={json.dumps(mode)}" for key, mode in modes.items() if mode in {"approve", "prompt"}
+    ]
 
 
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
@@ -5418,8 +5429,8 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 _CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
-# Granular approval/sandbox flags to drop when bypass is on. The "Full
-# access" / "Read only" approval presets emit the long ``--flag value`` form
+# Granular approval/sandbox flags to drop when bypass is on. The web
+# approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
 # client-supplied (validated only for count/length), so the short aliases
 # (``-a`` / ``-s``) are included too: ``-a`` triggers the same startup abort

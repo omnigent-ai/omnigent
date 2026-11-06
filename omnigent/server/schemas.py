@@ -1766,6 +1766,11 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         ``"xhigh"``, ``"max"``, and ``"ultra"``. Provider-specific support is
         validated when a turn executes. ``None`` means use the agent
         default.
+    :param model_override: Optional per-session LLM model override, e.g.
+        ``"databricks-claude-sonnet-4-6"``; the same session-level field as
+        the JSON create's ``model_override``, so the bundle's model stays
+        its default. Validated against the shared model-id charset.
+        ``None`` means use the agent default.
     :param host_id: Optional host to launch the runner on, e.g.
         ``"host_a1b2c3d4..."``. When set, the server generates a
         binding token, writes the expected runner_id to the session
@@ -1810,6 +1815,7 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     project_id: str | None = None
     labels: dict[str, str] = Field(default_factory=dict)
     reasoning_effort: str | None = None
+    model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
     terminal_launch_args: list[str] | None = None
@@ -2289,6 +2295,12 @@ class SessionResponse(BaseModel):
     # ``labels``); set/cleared via ``PATCH /v1/sessions/{id}`` and filtered on
     # ``GET /v1/sessions?project=``.
     project_id: str | None = None
+    # The session whose Workspace rail lists this one as a side chat; ``None``
+    # otherwise, including side chats from before the rail was server-listed.
+    side_chat_parent_id: str | None = None
+    # Whether the viewer may start side chats here: only the owner of the
+    # session's root can. ``None`` where the response doesn't compute it.
+    side_chat_allowed: bool | None = None
 
 
 class UpdateSessionRequest(BaseModel):
@@ -2905,6 +2917,11 @@ class SessionListItem(BaseModel):
         ``omnigent claude`` sessions. ``None`` for regular
         AP-only conversations. Lets the sidebar / picker render
         a runtime badge without a follow-up GET.
+    :param shared_with_others: Whether the requesting user owns this
+        session and has granted access to another user (the public link
+        alone doesn't count). ``None`` when the requester isn't the owner
+        or permissions are disabled, so the grant list never leaks to
+        non-owners.
     :param pending_elicitations_count: Number of approval prompts
         currently waiting on this session. Powers the sidebar's
         "needs attention" badge so a user with several sessions
@@ -2994,6 +3011,7 @@ class SessionListItem(BaseModel):
     permission_level: int | None = None
     owner: str | None = None
     external_session_id: str | None = None
+    shared_with_others: bool | None = None
     pending_elicitations_count: int = 0
     background_work_running: bool = False
     blocked_on: str | None = None
@@ -3029,6 +3047,32 @@ class ChildSessionList(BaseModel):
 
     object: Literal["list"] = "list"
     data: list[ChildSessionSummary] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+
+
+class SideChatSummary(BaseModel):
+    """
+    A side chat listed in its parent session's Workspace rail.
+
+    :param id: Side-chat session id, e.g. ``"conv_side123"``.
+    :param object: Fixed resource type, always ``"side_chat"``.
+    :param created_at: Unix epoch seconds when the side chat was created.
+    :param title: The side chat's title, when available.
+    """
+
+    id: str
+    object: Literal["side_chat"] = "side_chat"
+    created_at: int
+    title: str | None = None
+
+
+class SideChatList(BaseModel):
+    """Paginated list of side chats; ``data`` is a page of ``SideChatSummary``."""
+
+    object: Literal["list"] = "list"
+    data: list[SideChatSummary] = Field(default_factory=list)
     first_id: str | None = None
     last_id: str | None = None
     has_more: bool = False

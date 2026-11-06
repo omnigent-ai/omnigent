@@ -100,6 +100,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
@@ -143,6 +144,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
+    validate_session_model_metadata,
 )
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
@@ -340,6 +342,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -4404,6 +4407,8 @@ async def _create_and_publish_codex_child(
                 else None
             ),
             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
+            # Lists the /side fork in its parent's Workspace rail on every device.
+            side_chat_parent_id=parent_conv.id if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -10142,15 +10147,16 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     try:
         parsed = SessionCreateMetadata.model_validate_json(metadata)
-        reasoning_effort = validate_effort(
-            parsed.reasoning_effort,
-            "session metadata",
-            EFFORT_VALUES,
+        model_override, reasoning_effort = validate_session_model_metadata(
+            model_override=parsed.model_override,
+            reasoning_effort=parsed.reasoning_effort,
         )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={"reasoning_effort": reasoning_effort, "model_override": model_override}
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -11268,6 +11274,9 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    conversation: Conversation | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -11282,24 +11291,47 @@ async def _notify_runner_of_bundled_child(
         e.g. ``"ag_abc123"``.
     :param runner_router: Router used to resolve the bound runner's
         client; ``None`` falls back to the in-process runner.
+    :param conversation: The created child row. When given, the runner gets
+        the full session-init envelope, so it seeds the requested model and
+        effort instead of fetching them back; ``None`` sends the id-only body.
+    :param conversation_store: Store to read the child row from when
+        *conversation* is not given. The read is best-effort like the envelope
+        build: the session is already persisted, so a failed read sends the
+        id-only body instead of failing the create.
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+    }
+    if conversation is not None or conversation_store is not None:
+        try:
+            if conversation is None and conversation_store is not None:
+                conversation = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if conversation is not None:
+                # The route forwards any initial input itself right after
+                # this notify, so a recovery turn would run it twice.
+                body = build_runner_session_init_payload(
+                    conversation,
+                    server_version=VERSION,
+                    suppress_recovery_turn=True,
+                )
+        except Exception:  # noqa: BLE001 — must not fail the create, as on the JSON path.
+            # The runner falls back to fetching the row.
+            _logger.warning(
+                "session-init envelope build failed for bundled session %s; "
+                "sending the id-only body",
+                session_id,
+                exc_info=True,
+            )
     try:
-        # Bundled children keep the legacy id-only body: bundle creation plumbs
-        # no harness/model override for a session-init envelope to seed. The
-        # create and rebind notifies send the full envelope instead.
-        await runner_client.post(
-            "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
-            timeout=10.0,
-        )
+        await runner_client.post("/v1/sessions", json=body, timeout=10.0)
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Failed to notify runner about bundled session %s",

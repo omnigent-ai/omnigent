@@ -174,6 +174,74 @@ def test_fork_drops_per_user_pin_labels(
     assert pinned_label_key("bob") not in fork.labels
 
 
+def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
+    """A parent's side chats, generic and Codex, page in id order and nothing else is listed."""
+    # Split databases: the listing must read only the Omnigent side.
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path}/omnigent.db", f"sqlite:///{tmp_path}/conversations.db"
+    )
+    parent = store.create_conversation()
+    generic = [store.create_conversation(side_chat_parent_id=parent.id) for _ in range(2)]
+    codex = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, side_chat_parent_id=parent.id
+    )
+    store.create_conversation(side_chat_parent_id=store.create_conversation().id)
+    store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    store.set_labels(codex.id, {"omnigent.closed": "true"})
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        first = store.list_side_chat_ids(parent.id, limit=2)
+        rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+
+    side_chats = [*generic, codex]
+    assert first + rest == sorted(side_chat.id for side_chat in side_chats)
+    assert len(queries) == 2
+    with store._engine.connect() as conn:
+        for statement, parameters in queries:
+            plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            assert "ix_conversation_metadata_side_chat_parent_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
+
+
+def test_fork_lists_a_side_chat_and_marks_what_it_copied(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A side chat records its parent and its copies carry its id prefix; a fork of it doesn't."""
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+            for index in range(3)
+        ],
+    )
+
+    side_chat = conversation_store.fork_conversation(source.id, side_chat_parent_id=source.id)
+
+    stored = conversation_store.get_conversation(side_chat.id)
+    assert stored is not None and stored.side_chat_parent_id == source.id
+    copied = [item.id for item in conversation_store.list_items(side_chat.id).data]
+    assert len(copied) == 3
+    assert all(item_id.startswith(side_chat.id[:12]) for item_id in copied)
+    ordinary = conversation_store.fork_conversation(side_chat.id)
+    assert ordinary.side_chat_parent_id is None
+    recopied = [item.id for item in conversation_store.list_items(ordinary.id).data]
+    assert not any(item_id.startswith(ordinary.id[:12]) for item_id in recopied)
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32

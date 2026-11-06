@@ -97,7 +97,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
-  marked and the choice persists.
+  marked and the choice persists. For Codex, New Chat offers Default (Codex's own
+  default or the user's Codex config), Ask for approval, Approve for me, Full
+  Access, Read Only, and Bypass approvals & sandbox; a running session offers
+  Ask for approval, Approve for me, and Full Access.
 - `permissions-command`: in Codex native sessions, `/permissions` opens the
   composer's approval-mode menu instead of Codex's own popup. Other sessions,
   including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
@@ -190,8 +193,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
-  opens and focuses the new-session composer in browsers. Native shells retain
-  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+  opens and focuses the new-session composer in browsers. Native shells use
+  ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
@@ -247,7 +250,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - Hover the host chip (status dot and machine icon) to see the host and whether
-  it is connected; click it to open the host menu.
+  it is connected; click it to open the host menu. The status indicator remains
+  visible while connecting or without a selected host; the label describes
+  those states without claiming Online or Offline.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
 - With focus in the prompt, press Shift+Tab to step the permission mode without
@@ -407,12 +412,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
 
-**Mobile** (either composer on a phone-sized viewport): the same controls with
-collapsed labels.
+**Mobile** (either composer on a phone-sized viewport): host and harness/model
+controls live in the top-right glass group. The composer starts as one row with
+Add, hint text, microphone, and Send; focusing the textarea expands it into a
+stacked layout with permission controls. Add alone does not expand it. On the
+landing page, choose the working directory below the headline; in a session,
+find the current directory in the session-actions menu. Running background
+tasks remain accessible from the session header.
 
-**Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
-text. For native Codex, send the first message before using its model/effort
+**Side chat** (from an existing session you own): choose **+ → Start a new side
+chat** in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on
+selected text. Editors and viewers of a shared session don't get these. For native Codex, send the first message before using its model/effort
 pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)

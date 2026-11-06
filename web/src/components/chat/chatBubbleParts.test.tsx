@@ -2,15 +2,19 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Bubble } from "@/lib/renderItems";
+import type { Bubble, RenderItem } from "@/lib/renderItems";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
+import { type ReactNode, useLayoutEffect } from "react";
+import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import {
   BubbleView,
   buildUndeliveredBubbles,
+  ConversationScrollRefBridge,
   containsMermaidDiagram,
+  keyboardActiveQuestionId,
   placeUndeliveredBubbles,
 } from "./chatBubbleParts";
 
@@ -837,5 +841,78 @@ describe("undelivered startup messages", () => {
     expect(notes?.name).toBe("notes.txt");
     expect(await notes?.text()).toBe("meeting notes");
     expect(toasts).toEqual(["Couldn't copy chart.png. Attach again before you send."]);
+  });
+});
+
+describe("keyboardActiveQuestionId", () => {
+  type Elicitation = Extract<RenderItem, { kind: "elicitation" }>;
+  const question = (elicitationId: string, extra: Partial<Elicitation> = {}): Elicitation => ({
+    kind: "elicitation",
+    itemId: null,
+    elicitationId,
+    message: "Claude has questions",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: "",
+    requestedSchema: {},
+    status: "pending",
+    response: null,
+    askUserQuestion: {
+      questions: [
+        { question: "Which framework?", options: [{ label: "React" }], multiSelect: false },
+      ],
+    },
+    ...extra,
+  });
+  const approval = (elicitationId: string): Elicitation => ({
+    ...question(elicitationId),
+    askUserQuestion: null,
+    contentPreview: "Bash({})",
+  });
+
+  it("picks the newest pending question", () => {
+    expect(keyboardActiveQuestionId([question("q_old"), question("q_new")])).toBe("q_new");
+  });
+
+  it("looks past newer approvals to the newest question", () => {
+    expect(keyboardActiveQuestionId([question("q_1"), approval("bash_2")])).toBe("q_1");
+  });
+
+  it("returns null when no question is pending", () => {
+    expect(keyboardActiveQuestionId([])).toBeNull();
+    expect(keyboardActiveQuestionId([approval("bash_1")])).toBeNull();
+  });
+
+  it("holds the keys while the newest question awaits delivery", () => {
+    const awaiting = question("q_new", {
+      nativeDelivery: { state: "sending", attempt: "attempt_1", action: "accept" },
+    });
+    expect(keyboardActiveQuestionId([question("q_old"), awaiting])).toBeNull();
+  });
+});
+
+describe("ConversationScrollRefBridge", () => {
+  it("hands over the scroll element before paint when rendered after the content", () => {
+    const onScroller = vi.fn();
+    let seenBeforePaint: unknown = "not run";
+    // A parent's layout effect runs after its children's and before paint.
+    function BeforePaint({ children }: { children: ReactNode }) {
+      useLayoutEffect(() => {
+        seenBeforePaint = onScroller.mock.lastCall?.[0]?.el;
+      }, []);
+      return <div>{children}</div>;
+    }
+    render(
+      <BeforePaint>
+        <Conversation>
+          <ConversationContent>
+            <p>row</p>
+          </ConversationContent>
+          <ConversationScrollRefBridge onScroller={onScroller} />
+        </Conversation>
+      </BeforePaint>,
+    );
+    expect(seenBeforePaint).toBeInstanceOf(HTMLElement);
+    expect(seenBeforePaint).toBe(screen.getByText("row").parentElement?.parentElement);
   });
 });
