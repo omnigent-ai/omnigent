@@ -5041,6 +5041,9 @@ def create_runner_app(
             if not _stranded_wake_parents:
                 return
             for parent_id in list(_stranded_wake_parents):
+                if parent_id in _held_wake_parents:
+                    # Stays stranded; the next unheld init or parent turn wakes it.
+                    continue
                 _stranded_wake_parents.discard(parent_id)
                 inbox = _session_inboxes.get(parent_id)
                 if inbox is None or inbox.empty():

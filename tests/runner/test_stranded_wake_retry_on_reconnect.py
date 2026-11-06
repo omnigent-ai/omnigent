@@ -19,6 +19,13 @@ import httpx
 import pytest
 
 from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner.session_init_protocol import (
+    SESSION_INIT_PAYLOAD_KEY,
+    SESSION_INIT_PROTOCOL_VERSION,
+    RunnerSessionInitEnvelope,
+    RunnerSessionInitSnapshot,
+)
+from omnigent.spec.types import AgentSpec
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
 
@@ -102,9 +109,41 @@ async def _strand_a_completion(
     assert not server_client.delivered_posts, "no wake should be delivered while down"
 
 
+def _parent_init_body(parent_id: str, *, hold_subagent_wakes: bool) -> dict[str, Any]:
+    """Build the server's session handshake for *parent_id*.
+
+    :param parent_id: Parent session to initialize.
+    :param hold_subagent_wakes: Whether the handshake is a passive wake's.
+    :returns: ``POST /v1/sessions`` body.
+    """
+    envelope = RunnerSessionInitEnvelope(
+        protocol_version=SESSION_INIT_PROTOCOL_VERSION,
+        server_version="0.16.0",
+        session_id=parent_id,
+        agent_id="ag_orchestrator",
+        suppress_recovery_turn=True,
+        hold_subagent_wakes=hold_subagent_wakes,
+        snapshot=RunnerSessionInitSnapshot(created_at=1, updated_at=1),
+    )
+    return {
+        "session_id": parent_id,
+        "agent_id": "ag_orchestrator",
+        SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
+    }
+
+
+async def _resolve_orchestrator(agent_id: str, session_id: str | None = None) -> AgentSpec:
+    """Resolve the parent's agent for :func:`_parent_init_body` handshakes."""
+    del agent_id, session_id
+    return AgentSpec(spec_version=1, name="orchestrator")
+
+
 @pytest.mark.asyncio
+@pytest.mark.parametrize("held", [False, True], ids=["idle", "held-by-passive-init"])
 async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     _no_wake_backoff: list[float],
+    monkeypatch: pytest.MonkeyPatch,
+    held: bool,
 ) -> None:
     """The catch-up scan must re-POST a wake that failed during an outage.
 
@@ -112,7 +151,8 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     parent's inbox but the wake POST exhausts its bounded retries. When the
     tunnel reconnects (server back up), the catch-up scan must re-attempt the
     wake so the idle parent learns its child finished — without this, the
-    completion is stranded until the next user message.
+    completion is stranded until the next user message. A passive init that
+    arrives before the retry round holds that wake until the next handshake.
     """
 
     parent_id = "5f0d5a5f7f2a4be7b6a13f6a9f1c2d3e"
@@ -122,6 +162,7 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
     pm = _FakeProcessManager(_ScriptedHarnessClient([]))
     app = create_runner_app(
         process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolve_orchestrator,
         server_client=server_client,  # type: ignore[arg-type]
     )
 
@@ -139,7 +180,32 @@ async def test_reconnect_redelivers_wake_stranded_by_server_outage(
 
             # Recovery: the server is back and the tunnel reconnected.
             server_client.down = False
+            retry_round = asyncio.Event()
+            if held:
+
+                async def _await_retry_round(seconds: float) -> None:
+                    del seconds
+                    await retry_round.wait()
+
+                monkeypatch.setattr(subagent_work, "_wake_retry_sleep", _await_retry_round)
             await app.state.catch_up_scan()
+            if held:
+                response = await client.post(
+                    "/v1/sessions", json=_parent_init_body(parent_id, hold_subagent_wakes=True)
+                )
+                assert response.status_code == 201, response.text
+                retry_round.set()
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                assert not server_client.delivered_posts, (
+                    f"The reconnect retry woke a parent held by a passive init: "
+                    f"{server_client.delivered_posts}."
+                )
+                assert session_inbox.qsize() == 1
+                response = await client.post(
+                    "/v1/sessions", json=_parent_init_body(parent_id, hold_subagent_wakes=False)
+                )
+                assert response.status_code == 201, response.text
             try:
                 await asyncio.wait_for(server_client.delivered_seen.wait(), timeout=5.0)
             except TimeoutError:
