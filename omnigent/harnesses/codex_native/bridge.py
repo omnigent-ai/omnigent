@@ -57,6 +57,7 @@ _CODEX_DISABLED_COMPOSER_TEXT = frozenset(
 
 _STATE_FILE = "state.json"
 _STATE_LOCK_FILE = "state.lock"
+_INTERRUPT_GENERATIONS_FILE = "interrupt_generations.json"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
@@ -194,6 +195,7 @@ class CodexNativeBridgeState:
     :param pending_shell_command_id: Submission awaiting authoritative turn reconciliation.
     :param pending_shell_parent_turn_id: Turn that was active before that submission.
     :param active_shell_turn_id: Standalone shell turn that cannot process prompts.
+    :param interrupt_generation: Stop requests recorded for this Omnigent session.
     """
 
     session_id: str
@@ -205,6 +207,7 @@ class CodexNativeBridgeState:
     pending_shell_command_id: str | None = None
     pending_shell_parent_turn_id: str | None = None
     active_shell_turn_id: str | None = None
+    interrupt_generation: int = 0
 
 
 @dataclass(frozen=True)
@@ -1073,6 +1076,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "pending_shell_command_id": state.pending_shell_command_id,
                     "pending_shell_parent_turn_id": state.pending_shell_parent_turn_id,
                     "active_shell_turn_id": state.active_shell_turn_id,
+                    "interrupt_generation": state.interrupt_generation,
                 },
                 handle,
                 sort_keys=True,
@@ -1093,6 +1097,11 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        generation = _read_interrupt_generations(bridge_dir).get(state.session_id, 0)
+        if current is not None and current.session_id == state.session_id:
+            generation = max(generation, current.interrupt_generation)
+        state = replace(state, interrupt_generation=max(state.interrupt_generation, generation))
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
@@ -1168,9 +1177,18 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     state.
 
     :param bridge_dir: Native Codex bridge directory.
+    The Stop checkpoint survives relaunch so an older held input cannot revive.
+
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if current is not None and current.interrupt_generation:
+            generations = _read_interrupt_generations(bridge_dir)
+            generations[current.session_id] = max(
+                generations.get(current.session_id, 0), current.interrupt_generation
+            )
+            _replace_bridge_record(bridge_dir, _INTERRUPT_GENERATIONS_FILE, generations)
         for name in (
             _STATE_FILE,
             _STARTUP_ERROR_FILE,
@@ -1639,8 +1657,11 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
     cwd = raw.get("cwd")
+    interrupt_generation = raw.get("interrupt_generation", 0)
     if (
-        not isinstance(session_id, str)
+        type(interrupt_generation) is not int
+        or interrupt_generation < 0
+        or not isinstance(session_id, str)
         or not session_id
         or not isinstance(socket_path, str)
         or not socket_path
@@ -1660,6 +1681,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
             thread_id=thread_id,
             codex_home=codex_home,
             active_turn_id=parsed_active_turn_id,
+            interrupt_generation=interrupt_generation,
             cwd=cwd if isinstance(cwd, str) and cwd else None,
             pending_shell_command_id=(
                 value if isinstance(value := raw.get("pending_shell_command_id"), str) else None
@@ -1724,6 +1746,66 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
                 ),
             ),
         )
+
+
+def _bridge_owner_matches(
+    current: CodexNativeBridgeState, expected: CodexNativeBridgeState
+) -> bool:
+    """Match the session, native thread, transport and credential owner."""
+    return all(
+        getattr(current, name) == getattr(expected, name)
+        for name in ("session_id", "thread_id", "socket_path", "codex_home")
+    )
+
+
+def _read_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
+    """Read durable session Stop counters; corrupt checkpoints cannot authorize input."""
+    try:
+        generations = json.loads(
+            (bridge_dir / _INTERRUPT_GENERATIONS_FILE).read_text(encoding="utf-8")
+        )
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise OSError("Invalid Codex Stop checkpoint") from exc
+    if not isinstance(generations, dict) or any(
+        not isinstance(session_id, str) or not session_id or type(value) is not int or value < 0
+        for session_id, value in generations.items()
+    ):
+        raise OSError("Invalid Codex Stop checkpoint")
+    return generations
+
+
+def codex_input_was_interrupted(bridge_dir: Path, expected: CodexNativeBridgeState) -> bool:
+    """Check the session Stop fence even while native state is absent during relaunch."""
+    return (
+        _read_interrupt_generations(bridge_dir).get(expected.session_id, 0)
+        > expected.interrupt_generation
+    )
+
+
+def record_codex_interrupt(
+    bridge_dir: Path, *, expected: CodexNativeBridgeState
+) -> CodexNativeBridgeState | None:
+    """Retire session input durably; target only the native owner observed by Stop."""
+    with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        generations = _read_interrupt_generations(bridge_dir)
+        generation = max(generations.get(expected.session_id, 0), expected.interrupt_generation)
+        if current is not None and current.session_id == expected.session_id:
+            generation = max(generation, current.interrupt_generation)
+        generations[expected.session_id] = generation + 1
+        _replace_bridge_record(bridge_dir, _INTERRUPT_GENERATIONS_FILE, generations)
+        if current is None or current.session_id != expected.session_id:
+            return None
+        updated = replace(current, interrupt_generation=generation + 1)
+        _write_bridge_state_unlocked(bridge_dir, updated)
+        if (
+            not _bridge_owner_matches(current, expected)
+            or current.active_turn_id != expected.active_turn_id
+        ):
+            return None
+        return updated
 
 
 def mark_shell_command_pending(
@@ -1832,6 +1914,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 codex_home=state.codex_home,
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
+                interrupt_generation=state.interrupt_generation,
             ),
         )
 

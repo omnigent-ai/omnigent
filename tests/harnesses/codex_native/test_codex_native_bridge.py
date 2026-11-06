@@ -1602,3 +1602,154 @@ def test_clear_bridge_state_removes_egress_certificate_failure(tmp_path: Path) -
     clear_bridge_state(bridge_dir)
 
     assert read_certificate_failure(bridge_dir) is None
+
+
+@pytest.mark.parametrize("completed", [False, True])
+def test_codex_interrupt_generation_survives_stale_state_writes(
+    tmp_path: Path, completed: bool
+) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    if completed:
+        clear_active_turn_id_if_matches(tmp_path, "turn_original")
+    stopped = codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed)
+    if completed:
+        assert stopped is None
+    else:
+        assert stopped is not None and stopped.interrupt_generation == 1
+    write_bridge_state(tmp_path, replace(observed, active_turn_id=None))
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.interrupt_generation == 1
+
+
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_codex_interrupt_does_not_retire_another_owner(tmp_path: Path, changed_field: str) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    replacement = replace(observed, **{changed_field: "replacement"})
+    write_bridge_state(tmp_path, replacement)
+    assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is None
+    if changed_field != "session_id":
+        replacement = replace(replacement, interrupt_generation=1)
+    assert read_bridge_state(tmp_path) == replacement
+
+
+def test_codex_interrupt_retires_held_input_without_retargeting_a_newer_turn(
+    tmp_path: Path,
+) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    replacement = replace(observed, active_turn_id="turn_newer")
+    write_bridge_state(tmp_path, replacement)
+    target = codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed)
+    current = read_bridge_state(tmp_path)
+    assert target is None
+    assert current is not None and current.active_turn_id == "turn_newer"
+    assert current.interrupt_generation == 1
+
+
+@pytest.mark.parametrize("invalid", [None, -1, True, 1.5, "1"])
+def test_bridge_rejects_invalid_interrupt_generation(tmp_path: Path, invalid: object) -> None:
+    _seed_active_turn(tmp_path, "turn_original")
+    path = tmp_path / "state.json"
+    raw = json.loads(path.read_text())
+    raw["interrupt_generation"] = invalid
+    path.write_text(json.dumps(raw))
+    assert read_bridge_state(tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "changed_field", ["thread_id", "socket_path", "codex_home", "native-thread-helper"]
+)
+def test_codex_stop_generation_survives_native_owner_rotation(
+    tmp_path: Path, changed_field: str
+) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is not None
+    if changed_field == "native-thread-helper":
+        codex_native_bridge.update_thread_id(tmp_path, "replacement")
+        codex_native_bridge.update_thread_id(tmp_path, observed.thread_id)
+    else:
+        write_bridge_state(tmp_path, replace(observed, **{changed_field: "replacement"}))
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.interrupt_generation == 1
+
+
+def test_codex_stop_checkpoint_survives_clear_and_identical_owner_relaunch(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is not None
+    clear_bridge_state(tmp_path)
+    write_bridge_state(tmp_path, observed)
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.interrupt_generation == 1
+    assert current.socket_path == observed.socket_path and current.thread_id == observed.thread_id
+
+
+def test_codex_stop_after_clear_retires_input_without_a_native_rpc_target(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    clear_bridge_state(tmp_path)
+    assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is None
+    write_bridge_state(tmp_path, observed)
+    current = read_bridge_state(tmp_path)
+    assert current is not None and current.interrupt_generation == 1
+
+
+def test_codex_stop_checkpoint_cannot_cancel_another_omnigent_session(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is not None
+    clear_bridge_state(tmp_path)
+    replacement = replace(observed, session_id="another_session")
+    write_bridge_state(tmp_path, replacement)
+    assert read_bridge_state(tmp_path) == replacement
+    assert codex_native_bridge.codex_input_was_interrupted(tmp_path, replacement) is False
+
+
+def test_codex_stop_checkpoint_write_failure_preserves_existing_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+
+    def unavailable(*_args: object) -> None:
+        raise OSError("Synthetic unavailable bridge storage")
+
+    monkeypatch.setattr(codex_native_bridge, "_replace_bridge_record", unavailable)
+    with pytest.raises(OSError):
+        codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed)
+    assert read_bridge_state(tmp_path) == observed
+
+
+@pytest.mark.parametrize("contents", ["{", '{"session":true}', '{"session":-1}'])
+def test_invalid_codex_stop_checkpoint_does_not_reset_the_counter(
+    tmp_path: Path, contents: str
+) -> None:
+    _seed_active_turn(tmp_path, "turn_original")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    clear_bridge_state(tmp_path)
+    (tmp_path / codex_native_bridge._INTERRUPT_GENERATIONS_FILE).write_text(contents)
+    with pytest.raises(OSError):
+        write_bridge_state(tmp_path, observed)
+    assert read_bridge_state(tmp_path) is None

@@ -720,9 +720,24 @@ class NativeInterruptRunner:
             cancel_pending_mcp_startup,
             clear_active_turn_id_if_matches,
             read_mcp_startup,
+            record_codex_interrupt,
         )
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
+        if state is None or state.session_id != conv_id:
+            return Response(status_code=204)
+        try:
+            state = record_codex_interrupt(bridge_dir, expected=state)
+        except OSError as exc:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "codex_native_interrupt_failed",
+                    "detail": self._client_safe_error_detail(
+                        exc, context="codex-native interrupt"
+                    ),
+                },
+            )
         if state is None:
             return Response(status_code=204)
         pending_mcp = cancel_pending_mcp_startup(bridge_dir)

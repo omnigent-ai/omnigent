@@ -2514,10 +2514,14 @@ async def test_events_codex_native_plan_mode_requires_loaded_bridge(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stalled_close", [False, True])
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("fence_writable", [True, False])
 async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_marker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     stalled_close: bool,
+    event_type: str,
+    fence_writable: bool,
 ) -> None:
     """
     POST ``/events`` interrupt on a codex-native session calls
@@ -2557,6 +2561,12 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    if not fence_writable:
+
+        def refuse_fence(*_args: object, **_kwargs: object) -> None:
+            raise OSError("Synthetic unavailable bridge storage")
+
+        monkeypatch.setattr(codex_native_bridge, "record_codex_interrupt", refuse_fence)
     close_cancelled: list[bool] = []
     if stalled_close:
         from omnigent.runner.native import interrupt as native_interrupt
@@ -2585,6 +2595,8 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
             ``"omnigent-codex-native-runner"``.
         :returns: Fake client that records JSON-RPC calls.
         """
+        current = codex_native_bridge.read_bridge_state(bridge_dir)
+        assert current is not None and current.interrupt_generation == 1
         assert transport == fake_client.transport
         assert client_name == fake_client.client_name
         return fake_client
@@ -2621,11 +2633,18 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         async with asyncio.timeout(budget(5)):
             int_resp = await client.post(
                 f"/v1/sessions/{conv_id}/events",
-                json={"type": "interrupt"},
+                json={"type": event_type},
             )
 
         captured_history = list(_session_histories_ref.get(conv_id, []))
         flagged = conv_id in app.state.interrupted_sessions
+
+    if not fence_writable:
+        assert int_resp.status_code == 503, int_resp.text
+        assert int_resp.json()["error"] == "codex_native_interrupt_failed"
+        assert fake_client.requests == []
+        assert fake_client.connected is False
+        return
 
     assert int_resp.status_code == 204, (
         f"codex-native interrupt must return 204; got {int_resp.status_code}: {int_resp.text}"
