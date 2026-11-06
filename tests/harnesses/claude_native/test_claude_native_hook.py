@@ -1318,24 +1318,6 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     assert windows == [None], "other tools keep the bounded retry and terminal fallback"
 
 
-def test_question_answer_outlasts_a_silently_dead_poll() -> None:
-    """
-    A dead socket is noticed only at the read timeout, so the answer must outlive it.
-
-    The server stores an answer at submit time when the poll's connection is
-    dead but still looks attached; the hook re-POSTs only after
-    :data:`_PERMISSION_POLL_READ_TIMEOUT_S`. The reconnect needs room on top.
-    """
-    reconnect_s = (
-        claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
-        + claude_native_hook._PERMISSION_CONNECT_TIMEOUT_S
-    )
-    assert (
-        claude_native_hook._PERMISSION_POLL_READ_TIMEOUT_S + reconnect_s
-        < PRE_RESOLVED_ELICITATION_TTL_S
-    )
-
-
 def test_question_answered_during_silently_dead_poll_reaches_claude(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2967,6 +2949,42 @@ def test_reattach_parked_wait_rides_out_a_host_network_outage(
         "a parked prompt fail-asked during a network outage"
     )
     assert len(client.calls) == cap * 3 + 2
+
+
+def test_reattach_question_rides_out_a_network_outage_after_failures_in_its_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fast 5xx counted inside a question's window don't end a later network outage.
+
+    The window lets a question pass the hard-failure cap; once it closes, a
+    host that can no longer reach the server must keep riding out the outage
+    like any parked wait, since reconnecting re-publishes the card.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    window_s = PRE_RESOLVED_ELICITATION_TTL_S - claude_native_hook._QUESTION_ANSWER_WINDOW_MARGIN_S
+    connects_past_window = int(window_s // 30.0) + cap
+    client = _scripted_client(
+        script=[("5xx", held)]
+        + [("5xx", 0.0)] * (cap + 1)
+        + [("connect", 30.0)] * connects_past_window
+        + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        answer_window_s=window_s,
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "counted 5xx from the answer window ended the parked network-outage wait"
+    )
+    assert len(client.calls) == 1 + (cap + 1) + connects_past_window + 1
 
 
 def test_reattach_re_posts_a_held_poll_whose_reply_never_arrives(

@@ -1025,7 +1025,11 @@ def _post_hook_with_reattach(
                     file=sys.stderr,
                 )
                 return None
-            elif consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
+            elif consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES and not (
+                # Failures counted inside a question's window must not end a
+                # parked wait that then rides out an unreachable server.
+                parked and never_connected
+            ):
                 print(
                     f"omnigent {hook_label} hook: giving up after "
                     f"{consecutive_hard_failures} consecutive hard failures "
