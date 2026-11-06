@@ -1081,6 +1081,52 @@ def test_forwarder_mirrors_steers_one_read_recovers_in_transcript_order(tmp_path
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
+@pytest.mark.parametrize(
+    "read_holds_newer_steer", [False, True], ids=["newer_steer_unwritten", "newer_steer_after"]
+)
+def test_forwarder_keeps_newer_steer_sent_before_live_steer_arrives(
+    tmp_path: Path, read_holds_newer_steer: bool
+) -> None:
+    """
+    A steer sent before an earlier steer's live message arrives is still recovered after it.
+
+    The server keeps inputs sent after a mirrored message queued, so the newer steer's
+    record survives the read before that message, whether Codex wrote it yet or not.
+    """
+    first = _native_user_message("item_first", "fix the bug", "client-first")
+    steer = _native_user_message("item_steer", "also update the docs", _STEER_CLIENT_ID)
+    newer = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
+    turn_items = [first, steer, newer] if read_holds_newer_steer else [first, steer]
+
+    async def events(deliver: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        await deliver(_turn_item_event("item/completed", first))
+        await _accept_web_steer(tmp_path, "also update the docs")
+        await _accept_web_steer(
+            tmp_path, "and the changelog", client_id=_FOLLOW_UP_CLIENT_ID, stable_id="e" * 32
+        )
+        await deliver(_turn_item_event("item/completed", steer))
+        if newer not in turn_items:
+            turn_items.append(newer)
+        for index in (1, 2):
+            agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
+            await deliver(_turn_item_event("item/started", agent_item))
+            await deliver(_agent_message_event("turn_123", f"msg_{index}", f"reply {index}"))
+        await deliver(_completed_event("turn_123", thread_id="thread_123"))
+
+    transcript, requests = _run_forwarder_turn(tmp_path, turn_items, events)
+
+    assert requests == ["thread/read"] * 2
+    assert transcript == [
+        "user: fix the bug",
+        "user: also update the docs",
+        "assistant: reply 1",
+        f"user: and the changelog [delivery {_FOLLOW_UP_CLIENT_ID}] [input {'e' * 32}]",
+        "assistant: reply 2",
+        "status: idle",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
 def test_forwarder_keeps_steer_recorded_under_new_turn_during_read(tmp_path: Path) -> None:
     """A steer the executor re-records under a later turn while its ended turn is read stays."""
 

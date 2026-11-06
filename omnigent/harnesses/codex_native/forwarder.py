@@ -7469,9 +7469,10 @@ async def _mirror_missed_steers(
     A steer whose ended turn could not be read is retried on a later read. The
     server reports inputs queued ahead of a mirrored user message as undelivered,
     so steers Codex recorded before ``before`` are mirrored ahead of it. Any other
-    unmirrored steer is dropped, as is one a later user message was already
-    mirrored ahead of: a server ignoring ``delivery_attempt_id`` would settle its
-    late copy against another input.
+    steer sent before ``before`` is dropped, as is one a later user message was
+    already mirrored ahead of: a server ignoring ``delivery_attempt_id`` would
+    settle its late copy against another input. Steers sent after a ``before``
+    steer stay queued behind it, so they are kept for a later read.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7512,8 +7513,11 @@ async def _mirror_missed_steers(
             client, session_id, forwarder_state, thread_id=thread_id, steers=missed, before=before
         )
     if before is not None:
+        newer = _steers_sent_after(steers, before)
         overtaken.extend(
-            steer for steer in missed if (thread_id, steer.client_message_id) not in mirrored
+            steer
+            for steer in missed
+            if (thread_id, steer.client_message_id) not in mirrored and steer not in newer
         )
     if overtaken:
         _logger.warning(
@@ -7539,6 +7543,26 @@ async def _mirror_missed_steers(
             steers=settled,
             ended_turn_id=turn_id if turn_ended else None,
         )
+
+
+def _steers_sent_after(steers: list[SentSteer], message: _JsonObject) -> list[SentSteer]:
+    """
+    Return the steers recorded after the one ``message`` carried, if it is a sent steer.
+
+    :param steers: Recorded steers, oldest first.
+    :param message: Native ``userMessage`` item, matched by its ``clientId``.
+    :returns: Later steers; empty when ``message`` carries no recorded steer.
+    """
+    client_id = message.get("clientId")
+    index = next(
+        (
+            index
+            for index, steer in enumerate(steers)
+            if isinstance(client_id, str) and steer.client_message_id == client_id
+        ),
+        None,
+    )
+    return [] if index is None else steers[index + 1 :]
 
 
 async def _post_missed_steers(
