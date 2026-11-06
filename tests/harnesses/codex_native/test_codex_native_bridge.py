@@ -498,6 +498,9 @@ def test_automatic_settlement_cannot_regress_or_rearm_automatic_turn(tmp_path: P
     ("field", "value"),
     [
         ("automatic_input_outcome", "unknown"),
+        ("automatic_input_outcome", 5),
+        ("automatic_input_outcome", ""),
+        ("automatic_input_outcome", []),
         ("automatic_input_deadline", True),
         ("automatic_input_deadline", -1),
         ("automatic_input_deadline", "never"),
@@ -519,6 +522,7 @@ def test_invalid_automatic_lifecycle_metadata_fails_closed(
     payload[field] = value
     path.write_text(json.dumps(payload))
     assert read_bridge_state(tmp_path) is None
+    assert codex_native_bridge.read_bridge_state_result(tmp_path).status == "invalid_state"
 
 
 @pytest.mark.parametrize("conflict", ["claim", "receipt"])

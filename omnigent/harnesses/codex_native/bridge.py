@@ -1834,6 +1834,7 @@ def read_bridge_state_result(bridge_dir: Path) -> CodexNativeBridgeStateRead:
         or not _optional_string_is_valid(raw.get("automatic_input_source_turn_id"))
         or not _optional_string_is_valid(raw.get("automatic_input_client_message_id"))
         or not _optional_string_is_valid(raw.get("automatic_input_turn_id"))
+        or not _optional_string_is_valid(raw.get("automatic_input_outcome"))
         or automatic_outcome not in _AUTOMATIC_INPUT_OUTCOMES | {None}
         or (
             automatic_deadline is not None
