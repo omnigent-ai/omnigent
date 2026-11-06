@@ -112,14 +112,12 @@ def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
 
 
 def read_turn_chat_id(bridge_dir: Path, turn_end: int) -> str | None:
-    """Return the chat id the stop hook reported for a marker, or ``None``.
+    """Return the chat id the stop hook reported for a marker.
 
-    Legacy, unreadable, or corrupt markers yield ``None``; never raises.
+    Legacy markers without a chat id yield ``None``. Unreadable or corrupt
+    markers raise, like :func:`read_turn_outcome`, so ownership stays pending.
     """
-    try:
-        chat_id = _read_marker(bridge_dir, turn_end).get("chat_id")
-    except (OSError, ValueError, IndexError):
-        return None
+    chat_id = _read_marker(bridge_dir, turn_end).get("chat_id")
     return chat_id if isinstance(chat_id, str) and chat_id else None
 
 

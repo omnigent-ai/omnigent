@@ -50,6 +50,10 @@ _logger = logging.getLogger(__name__)
 #: tailed by the poller. One JSON object per line (per completed turn).
 USAGE_FILE = "cursor_usage.jsonl"
 
+#: Set on each cursor-agent process so its hooks reach that session's bridge
+#: dir; the workspace ``hooks.json`` names only the last session launched there.
+HOOK_BRIDGE_DIR_ENV_VAR = "OMNIGENT_CURSOR_HOOK_BRIDGE_DIR"
+
 #: Durable poller state (cumulative totals + processed generation ids), so a
 #: supervisor restart resumes without double-counting already-posted turns.
 _USAGE_STATE_FILE = "cursor_usage_forwarder.json"
@@ -388,7 +392,8 @@ def _main(argv: list[str] | None = None) -> int:
     rec.add_argument("--bridge-dir", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "record-usage":
-        return _cli_record_usage(args.bridge_dir)
+        env_bridge_dir = os.environ.get(HOOK_BRIDGE_DIR_ENV_VAR)
+        return _cli_record_usage(Path(env_bridge_dir) if env_bridge_dir else args.bridge_dir)
     return 1
 
 

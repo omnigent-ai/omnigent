@@ -1076,7 +1076,7 @@ async def forward_cursor_store_to_session(
                         confirmed = persisted.confirmed
                         persist()
                         persisted = _ForwardState()  # consumed
-                        if not chat_id_patched:
+                        if confirmed and not chat_id_patched:
                             chat_id_val = store_path.parent.name
                             await _patch_external_session_id(
                                 client, session_id=session_id, chat_id=chat_id_val
@@ -1115,28 +1115,49 @@ async def forward_cursor_store_to_session(
                                 model_state = _ModelMirrorState()
                             persist()
                             persisted = _ForwardState()  # consumed
-                            # Persist the cursor chat id as external_session_id so
-                            # a later cold resume can pass ``--resume <chatId>``
-                            # to the cursor-agent TUI.
-                            if not chat_id_patched:
-                                chat_id_val = store_path.parent.name
-                                await _patch_external_session_id(
-                                    client, session_id=session_id, chat_id=chat_id_val
+                # Parse the marker before its chat id so a partial write stays pending.
+                turn_outcome: str | None = None
+                if pending_turn_end is not None:
+                    try:
+                        turn_outcome = await asyncio.to_thread(
+                            cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
+                        )
+                    except (ValueError, IndexError):
+                        outcome_parse_failures += 1
+                        if outcome_parse_failures >= _TURN_OUTCOME_PARSE_ATTEMPTS:
+                            if outcome_parse_failures == _TURN_OUTCOME_PARSE_ATTEMPTS:
+                                _logger.error(
+                                    "cursor stop marker %s is damaged; reporting failure; "
+                                    "session=%s bridge_dir=%s",
+                                    pending_turn_end,
+                                    session_id,
+                                    bridge_dir,
                                 )
-                                chat_id_patched = True
+                            turn_outcome = "failed"
+                    else:
+                        outcome_parse_failures = 0
                 # The stop hook names the chat that ran this turn; bind to it
                 # before reading so the transcript precedes the outcome.
-                if pending_turn_end is not None and not confirmed:
+                if pending_turn_end is not None and outcome_parse_failures == 0 and not confirmed:
                     hook_store = await asyncio.to_thread(
                         _hook_named_store, bridge_dir, workspace, pending_turn_end
                     )
                     if hook_store is not None:
                         if hook_store != store_path:
+                            if store_path is not None:
+                                _logger.warning(
+                                    "cursor stop hook named chat %s, not guessed chat %s; "
+                                    "items mirrored from the guess remain; session=%s",
+                                    hook_store,
+                                    store_path,
+                                    session_id,
+                                )
                             store_path = hook_store
                             last_rowid = 0
                             model_state = _ModelMirrorState()
                         confirmed = True
                         persist()
+                        # external_session_id is write-once, so only a confirmed chat sets it.
                         if not chat_id_patched:
                             await _patch_external_session_id(
                                 client, session_id=session_id, chat_id=hook_store.parent.name
@@ -1298,32 +1319,16 @@ async def forward_cursor_store_to_session(
                     persist()
                 # Deliver the hook outcome after its transcript, even without a
                 # bound store. Failed posts retain this snapshot for the next poll.
-                if not retrying_items and pending_turn_end is not None:
-                    try:
-                        outcome = await asyncio.to_thread(
-                            cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
-                        )
-                    except (ValueError, IndexError):
-                        outcome_parse_failures += 1
-                        if outcome_parse_failures < _TURN_OUTCOME_PARSE_ATTEMPTS:
-                            await asyncio.sleep(poll_interval_s)
-                            continue
-                        if outcome_parse_failures == _TURN_OUTCOME_PARSE_ATTEMPTS:
-                            _logger.error(
-                                "cursor stop marker %s is damaged; reporting failure; "
-                                "session=%s bridge_dir=%s",
-                                pending_turn_end,
-                                session_id,
-                                bridge_dir,
-                            )
-                        outcome = "failed"
-                    else:
-                        outcome_parse_failures = 0
+                if (
+                    not retrying_items
+                    and pending_turn_end is not None
+                    and turn_outcome is not None
+                ):
                     await _post_external_session_status(
                         client,
                         session_id=session_id,
-                        status="failed" if outcome == "failed" else "idle",
-                        turn_outcome=outcome,
+                        status="failed" if turn_outcome == "failed" else "idle",
+                        turn_outcome=turn_outcome,
                     )
                     await asyncio.to_thread(
                         cursor_native_status.write_posted_count, bridge_dir, pending_turn_end

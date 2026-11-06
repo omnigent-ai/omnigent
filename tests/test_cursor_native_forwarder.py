@@ -1201,36 +1201,17 @@ class TestForwardLoopPreseedResume:
 
 
 class TestForwardLoopExternalSessionId:
-    """The poll loop patches external_session_id once when the store is found."""
+    """The poll loop patches external_session_id once the stop hook confirms the chat."""
 
     @staticmethod
     def _seed(store: Path, text: str = "hello") -> None:
+        store.parent.mkdir(parents=True)
         writer = _make_store(store, [("u", _user(f"<user_query>\n{text}\n</user_query>"))])
         writer.close()
 
-    @pytest.mark.asyncio
-    async def test_patches_chat_id_on_first_store_discovery(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The forwarder PATCHes external_session_id with the cursor chat_id."""
-        store = tmp_path / _CHAT_ID / "store.db"
-        store.parent.mkdir(parents=True)
-        self._seed(store)
-
-        patches: list[tuple[str, dict]] = []
-
-        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
-            patches.append((session_id, chat_id))
-
-        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
-        monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
-
-        bridge_dir = tmp_path / "cursor-native" / "sess"
-        bridge_dir.mkdir(parents=True)
-        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
-        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
-
-        task = asyncio.create_task(
+    @staticmethod
+    def _start(bridge_dir: Path) -> asyncio.Task[None]:
+        return asyncio.create_task(
             fwd.forward_cursor_store_to_session(
                 base_url="http://test",
                 headers={},
@@ -1242,21 +1223,62 @@ class TestForwardLoopExternalSessionId:
                 poll_interval_s=0.001,
             )
         )
+
+    @staticmethod
+    async def _wait_for(condition, *, extra_polls: int = 0) -> None:
+        for _ in range(2000):
+            if condition():
+                break
+            await asyncio.sleep(0.001)
+        else:
+            raise AssertionError("forwarder never reached the expected state")
+        for _ in range(extra_polls):
+            await asyncio.sleep(0.001)
+
+    @pytest.mark.asyncio
+    async def test_patches_the_hook_confirmed_chat_not_the_discovery_guess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest()
+        guessed, owned = chat_dir / _CHAT_ID / "store.db", chat_dir / _CHAT_ID_2 / "store.db"
+        self._seed(guessed, "guess")
+        self._seed(owned, "mine")
+        patches: list[tuple[str, str]] = []
+
+        async def _fake_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
+        poster = _FakePoster(lambda _: None)
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _fake_patch)
+        monkeypatch.setattr(fwd, "_post_conversation_item", poster)
+        monkeypatch.setattr(fwd, "_post_external_session_status", AsyncMock())
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: guessed)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        bridge_dir.mkdir(parents=True)
+
+        def mirrored() -> list[str]:
+            return [item.item_data["content"][0]["text"] for item in poster.delivered]
+
+        task = self._start(bridge_dir)
         try:
-            for _ in range(2000):
-                if patches:
-                    break
-                await asyncio.sleep(0.001)
-            else:
-                raise AssertionError("external_session_id patch was never called")
+            with caplog.at_level(logging.WARNING, logger=fwd._logger.name):
+                await self._wait_for(lambda: mirrored() == ["guess"], extra_polls=20)
+                assert patches == []
+                status.record_turn_end(
+                    bridge_dir, {"conversation_id": _CHAT_ID_2, "status": "completed"}
+                )
+                await self._wait_for(lambda: status.read_posted_count(bridge_dir) == 1)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        assert len(patches) == 1
-        session_id, chat_id = patches[0]
-        assert session_id == "conv_1"
-        assert chat_id == _CHAT_ID
+        assert patches == [("conv_1", _CHAT_ID_2)]
+        assert mirrored() == ["guess", "mine"]
+        assert any("not guessed chat" in rec.getMessage() for rec in caplog.records)
+        persisted = fwd._read_state(bridge_dir)
+        assert (persisted.store_path, persisted.confirmed) == (str(owned), True)
 
     @pytest.mark.asyncio
     async def test_patches_only_once_across_multiple_polls(
@@ -1264,9 +1286,7 @@ class TestForwardLoopExternalSessionId:
     ) -> None:
         """external_session_id is patched exactly once, not on every poll tick."""
         store = tmp_path / _CHAT_ID_2 / "store.db"
-        store.parent.mkdir(parents=True)
         self._seed(store)
-
         patch_count = 0
 
         async def _count_patches(client: object, *, session_id: str, chat_id: str) -> None:
@@ -1275,37 +1295,19 @@ class TestForwardLoopExternalSessionId:
 
         monkeypatch.setattr(fwd, "_patch_external_session_id", _count_patches)
         monkeypatch.setattr(fwd, "_post_conversation_item", _FakePoster(lambda _: None))
-
-        bridge_dir = tmp_path / "cursor-native" / "sess"
-        bridge_dir.mkdir(parents=True)
+        monkeypatch.setattr(fwd, "_post_external_session_status", AsyncMock())
         monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
-        monkeypatch.setattr(fwd, "_chat_claimed_by_other", lambda *a, **k: False)
+        monkeypatch.setattr(fwd, "_hook_named_store", lambda *args: store)
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID_2})
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID_2})
 
-        task = asyncio.create_task(
-            fwd.forward_cursor_store_to_session(
-                base_url="http://test",
-                headers={},
-                session_id="conv_2",
-                bridge_dir=bridge_dir,
-                agent_name="cursor-native-ui",
-                workspace="/ws",
-                launch_epoch_ms=1_000,
-                poll_interval_s=0.001,
-            )
-        )
+        task = self._start(bridge_dir)
         try:
-            # Let the loop run for several ticks after the patch fires.
-            for _ in range(2000):
-                if patch_count >= 1:
-                    break
-                await asyncio.sleep(0.001)
-            # Extra ticks to confirm it doesn't re-patch.
-            for _ in range(50):
-                await asyncio.sleep(0.001)
+            await self._wait_for(lambda: status.read_posted_count(bridge_dir) == 2, extra_polls=50)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-
         assert patch_count == 1
 
 
@@ -1519,7 +1521,10 @@ class TestSiblingSessionsInOneWorkspace:
             )
         ]
         try:
-            await asyncio.sleep(0.05)
+            for _ in range(2000):
+                if all(fwd._read_state(d).workspace == "/ws" for d in (signed_out, reviewer)):
+                    break
+                await asyncio.sleep(0.001)
             staged = tmp_path / "staged"
             staged.mkdir()
             (staged / "meta.json").write_text(json.dumps({"createdAtMs": now_ms + 1_000}))
@@ -1556,3 +1561,64 @@ class TestSiblingSessionsInOneWorkspace:
         ]
         assert second[1]["data"]["item_data"]["content"][0]["text"] == "REVIEW-DONE"
         assert events("first") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failure", ["marker-read", "chat-id-read"])
+    async def test_failed_ownership_read_keeps_the_turn_pending(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        store = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID / "store.db"
+        store.parent.mkdir(parents=True)
+        _make_store(store, [("a", _assistant([{"type": "text", "text": "REVIEW-DONE"}]))]).close()
+        bridge_dir = tmp_path / "cursor-native" / "sess"
+        status.record_turn_end(bridge_dir, {"conversation_id": _CHAT_ID, "status": "completed"})
+        events: list[str] = []
+
+        async def post_item(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
+            events.append(item.item_data["content"][0]["text"])
+
+        async def post_status(client: object, *, session_id: str, **kwargs: str) -> None:
+            events.append(kwargs["turn_outcome"])
+
+        name = "_read_marker" if failure == "marker-read" else "read_turn_chat_id"
+        real_read = getattr(status, name)
+        reads = 0
+
+        def fail_first_read(bridge: Path, turn_end: int) -> object:
+            nonlocal reads
+            reads += 1
+            if reads == 1:
+                raise OSError(errno.EIO, "marker unavailable")
+            return real_read(bridge, turn_end)
+
+        monkeypatch.setattr(status, name, fail_first_read)
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_discover_store", lambda ws, launch_ms: store)
+        monkeypatch.setattr(fwd, "_chat_contested_by_unbound_sibling", lambda *args: True)
+        monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", AsyncMock())
+        monkeypatch.setattr(fwd, "_post_conversation_item", post_item)
+        monkeypatch.setattr(fwd, "_post_external_session_status", post_status)
+        task = asyncio.create_task(
+            fwd.forward_cursor_store_to_session(
+                base_url="http://test",
+                headers={},
+                session_id="reviewer",
+                bridge_dir=bridge_dir,
+                agent_name="cursor-native-ui",
+                workspace="/ws",
+                launch_epoch_ms=int(time.time() * 1000),
+                poll_interval_s=0.001,
+            )
+        )
+        try:
+            for _ in range(2000):
+                if status.read_posted_count(bridge_dir) == 1:
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert reads >= 2
+        assert events == ["REVIEW-DONE", "completed"]

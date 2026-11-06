@@ -57,8 +57,10 @@ def test_turn_end_records_the_hook_chat_id(tmp_path: Path) -> None:
         handle.write("{damaged\n")
     assert status.read_turn_chat_id(tmp_path, 1) is None
     assert status.read_turn_chat_id(tmp_path, 2) == chat_id
-    assert status.read_turn_chat_id(tmp_path, 3) is None
-    assert status.read_turn_chat_id(tmp_path, 4) is None
+    with pytest.raises(ValueError):
+        status.read_turn_chat_id(tmp_path, 3)
+    with pytest.raises(IndexError):
+        status.read_turn_chat_id(tmp_path, 4)
 
 
 def test_posted_count_roundtrip_and_clear(tmp_path: Path) -> None:

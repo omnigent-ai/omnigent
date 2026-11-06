@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from omnigent.harnesses.cursor_native import usage
+from omnigent.harnesses.cursor_native import bridge, status, usage
 
 # A representative cursor ``stop``-hook payload (live-captured field set).
 _TURN1 = {
@@ -140,6 +141,27 @@ class TestRecordUsageCli:
         assert proc.returncode == 0, proc.stderr
         assert proc.stdout == "{}"
         assert (tmp_path / usage.USAGE_FILE).read_text().strip()
+
+    def test_shared_hook_routes_to_the_launching_session(self, tmp_path: Path) -> None:
+        # hooks.json is per workspace, so it names the last session launched there.
+        workspace, first, second = tmp_path / "ws", tmp_path / "first", tmp_path / "second"
+        for bridge_dir in (first, second):
+            bridge_dir.mkdir()
+            bridge.write_hooks_config(workspace, bridge_dir, python_executable=sys.executable)
+        hooks = json.loads((workspace / ".cursor" / "hooks.json").read_text())
+        command = shlex.split(hooks["hooks"]["stop"][0]["command"])
+        command.remove("-I")
+        env = {
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+            usage.HOOK_BRIDGE_DIR_ENV_VAR: str(first),
+        }
+        payload = {**_TURN1, "conversation_id": "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"}
+        proc = subprocess.run(
+            command, input=json.dumps(payload), capture_output=True, text=True, env=env
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert status.read_turn_chat_id(first, 1) == payload["conversation_id"]
+        assert not (second / status.TURN_END_FILE).exists()
 
 
 class TestUsageAccumulator:
