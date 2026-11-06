@@ -53,7 +53,8 @@ from omnigent.harnesses.codex_native.bridge import (
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
-    record_accepted_steer,
+    record_sent_steer,
+    settle_sent_steers,
     update_active_turn_id,
 )
 from omnigent.harnesses.codex_native.shell_input import (
@@ -411,6 +412,15 @@ async def _native_delivery_request_once(
         params = {**params, "clientUserMessageId": client_message_id}
     else:
         client_message_id = None
+    steer_client_id = client_message_id if method == "turn/steer" else None
+    if steer_client_id is not None and requested_turn_id is not None:
+        # Recorded before sending so a late reply cannot miss the forwarder's turn-end recovery.
+        record_sent_steer(
+            bridge_dir,
+            thread_id=state.thread_id,
+            turn_id=requested_turn_id,
+            client_message_id=steer_client_id,
+        )
     log_input_event(
         _logger,
         "codex_native_delivery_attempt",
@@ -449,6 +459,10 @@ async def _native_delivery_request_once(
             exception_type=type(exc).__name__,
             rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
         )
+        if steer_client_id is not None and isinstance(exc, CodexAppServerResponseError):
+            settle_sent_steers(
+                bridge_dir, thread_id=state.thread_id, client_message_ids=[steer_client_id]
+            )
         if isinstance(exc, (OSError, WebSocketException)):
             if isinstance(client_message_id, str):
                 confirmed_turn = await _read_native_delivery_receipt(
@@ -470,12 +484,12 @@ async def _native_delivery_request_once(
                         native_turn_id=confirmed_turn,
                         outcome="native_receipt_confirmed",
                     )
-                    if method == "turn/steer":
-                        record_accepted_steer(
+                    if steer_client_id is not None and confirmed_turn != requested_turn_id:
+                        record_sent_steer(
                             bridge_dir,
                             thread_id=state.thread_id,
                             turn_id=confirmed_turn,
-                            client_message_id=client_message_id,
+                            client_message_id=steer_client_id,
                         )
                     # The forwarder owns current turn state; this receipt can already be old.
                     return None
@@ -502,15 +516,15 @@ async def _native_delivery_request_once(
         outcome="rpc_accepted" if accepted else "rpc_accepted_missing_turn_id",
     )
     if (
-        method == "turn/steer"
+        steer_client_id is not None
         and native_turn_id is not None
-        and isinstance(client_message_id, str)
+        and native_turn_id != requested_turn_id
     ):
-        record_accepted_steer(
+        record_sent_steer(
             bridge_dir,
             thread_id=state.thread_id,
             turn_id=native_turn_id,
-            client_message_id=client_message_id,
+            client_message_id=steer_client_id,
         )
     return response
 

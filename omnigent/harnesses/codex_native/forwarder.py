@@ -41,15 +41,14 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS,
     MCP_STARTUP_STARTING,
     MCP_STARTUP_STATES,
-    AcceptedSteer,
     CodexNativeBridgeState,
     DeveloperInstructionsReadState,
+    SentSteer,
     clear_active_turn_id_if_matches,
     clear_certificate_failure,
     codex_config_revision,
     codex_home_for_bridge_dir,
     pending_mcp_servers,
-    read_accepted_steers,
     read_bridge_state,
     read_certificate_failure,
     read_child_usage_baselines,
@@ -57,9 +56,10 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    read_sent_steers,
     record_child_usage_baseline,
-    settle_accepted_steers,
     settle_pending_mcp_startup,
+    settle_sent_steers,
     update_active_turn_id,
     update_mcp_server_startup,
     update_thread_id,
@@ -1076,7 +1076,7 @@ class _CodexForwarderState:
 
     def steer_recovery_due(self, turn_id: str) -> bool:
         """
-        Pace native transcript reads for a turn with an unmirrored accepted steer.
+        Pace native transcript reads for a turn with an unmirrored sent steer.
 
         Codex records a steer at its next model step, so the first agent message
         only arms the check; later reads back off exponentially.
@@ -7447,7 +7447,7 @@ async def _mirror_missed_steers(
     turn_ended: bool,
 ) -> None:
     """
-    Mirror accepted steers whose live ``userMessage`` notification never arrived.
+    Mirror sent steers whose live ``userMessage`` notification never arrived.
 
     The server settles a steered input only when its native message is mirrored,
     so this finds the executor's recorded client ids in the native transcript.
@@ -7468,7 +7468,7 @@ async def _mirror_missed_steers(
         forwarder_state.steer_recovery_checks.pop(turn_id, None)
     steers = [
         steer
-        for steer in read_accepted_steers(bridge_dir, thread_id=thread_id)
+        for steer in read_sent_steers(bridge_dir, thread_id=thread_id)
         if steer.turn_id == turn_id or steer.turn_ended
     ]
     if not steers:
@@ -7488,7 +7488,7 @@ async def _mirror_missed_steers(
         or (transcript_read and (turn_ended or steer.turn_ended))
     ]
     if settled or turn_ended:
-        settle_accepted_steers(
+        settle_sent_steers(
             bridge_dir,
             thread_id=thread_id,
             client_message_ids=settled,
@@ -7502,7 +7502,7 @@ async def _post_missed_steers(
     forwarder_state: _CodexForwarderState,
     *,
     thread_id: str,
-    steers: list[AcceptedSteer],
+    steers: list[SentSteer],
 ) -> bool:
     """
     Post the native user messages of steers not yet mirrored.

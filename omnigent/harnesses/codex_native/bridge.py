@@ -74,10 +74,10 @@ _MCP_STARTUP_FILE = "mcp_startup.json"
 # across forwarder restarts because resumed threads report their totals again.
 _CHILD_USAGE_BASELINES_FILE = "child_usage_baselines.json"
 _CHILD_USAGE_BASELINES_LOCK_FILE = "child_usage_baselines.lock"
-# Steers Codex accepted, so the forwarder can mirror one whose live event it missed.
-_ACCEPTED_STEERS_FILE = "accepted_steers.json"
-_ACCEPTED_STEERS_LOCK_FILE = "accepted_steers.lock"
-_MAX_ACCEPTED_STEERS = 32
+# Steers sent to Codex, so the forwarder can mirror one whose live event it missed.
+_SENT_STEERS_FILE = "sent_steers.json"
+_SENT_STEERS_LOCK_FILE = "sent_steers.lock"
+_MAX_SENT_STEERS = 32
 
 # Startup states mirrored from Codex's ``McpServerStartupState`` enum.
 MCP_STARTUP_STARTING = "starting"
@@ -1322,9 +1322,9 @@ def record_child_usage_baseline(
 
 
 @dataclass(frozen=True)
-class AcceptedSteer:
+class SentSteer:
     """
-    A steer Codex accepted, kept until the forwarder settles it.
+    A steer sent to Codex, kept until the forwarder settles it.
 
     :param turn_id: Steered Codex turn id, e.g. ``"turn_abc"``.
     :param client_message_id: ``clientUserMessageId`` sent with the steer.
@@ -1336,10 +1336,10 @@ class AcceptedSteer:
     turn_ended: bool = False
 
 
-def _load_accepted_steers(bridge_dir: Path) -> tuple[str | None, list[AcceptedSteer]]:
+def _load_sent_steers(bridge_dir: Path) -> tuple[str | None, list[SentSteer]]:
     """Load the recorded thread id and its steers, raising ``OSError``."""
     try:
-        raw = json.loads((bridge_dir / _ACCEPTED_STEERS_FILE).read_bytes())
+        raw = json.loads((bridge_dir / _SENT_STEERS_FILE).read_bytes())
     except (FileNotFoundError, ValueError):
         return None, []
     thread_id = raw.get("thread_id") if isinstance(raw, dict) else None
@@ -1347,9 +1347,7 @@ def _load_accepted_steers(bridge_dir: Path) -> tuple[str | None, list[AcceptedSt
     if not isinstance(thread_id, str) or not isinstance(records, list):
         return None, []
     steers = [
-        AcceptedSteer(
-            record["turn_id"], record["client_message_id"], record.get("turn_ended") is True
-        )
+        SentSteer(record["turn_id"], record["client_message_id"], record.get("turn_ended") is True)
         for record in records
         if isinstance(record, dict)
         and isinstance(record.get("turn_id"), str)
@@ -1358,23 +1356,23 @@ def _load_accepted_steers(bridge_dir: Path) -> tuple[str | None, list[AcceptedSt
     return thread_id, steers
 
 
-def _write_accepted_steers(bridge_dir: Path, thread_id: str, steers: list[AcceptedSteer]) -> None:
+def _write_sent_steers(bridge_dir: Path, thread_id: str, steers: list[SentSteer]) -> None:
     """Replace the recorded steers, removing the file when none remain."""
     if not steers:
-        (bridge_dir / _ACCEPTED_STEERS_FILE).unlink(missing_ok=True)
+        (bridge_dir / _SENT_STEERS_FILE).unlink(missing_ok=True)
         return
     _replace_bridge_record(
         bridge_dir,
-        _ACCEPTED_STEERS_FILE,
+        _SENT_STEERS_FILE,
         {"thread_id": thread_id, "steers": [asdict(steer) for steer in steers]},
     )
 
 
-def record_accepted_steer(
+def record_sent_steer(
     bridge_dir: Path, *, thread_id: str, turn_id: str, client_message_id: str
 ) -> None:
     """
-    Record a steer Codex accepted (best-effort; it already holds the input).
+    Record a steer before it is sent, replacing an earlier record of it (best-effort).
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
@@ -1383,32 +1381,33 @@ def record_accepted_steer(
     :returns: None.
     """
     try:
-        with _bridge_state_lock(bridge_dir, _ACCEPTED_STEERS_LOCK_FILE):
-            recorded_thread_id, steers = _load_accepted_steers(bridge_dir)
+        with _bridge_state_lock(bridge_dir, _SENT_STEERS_LOCK_FILE):
+            recorded_thread_id, steers = _load_sent_steers(bridge_dir)
             if recorded_thread_id != thread_id:
                 steers = []
-            steers.append(AcceptedSteer(turn_id, client_message_id))
-            _write_accepted_steers(bridge_dir, thread_id, steers[-_MAX_ACCEPTED_STEERS:])
+            steers = [steer for steer in steers if steer.client_message_id != client_message_id]
+            steers.append(SentSteer(turn_id, client_message_id))
+            _write_sent_steers(bridge_dir, thread_id, steers[-_MAX_SENT_STEERS:])
     except OSError:
-        _logger.warning("Could not record accepted Codex steer in %s", bridge_dir, exc_info=True)
+        _logger.warning("Could not record sent Codex steer in %s", bridge_dir, exc_info=True)
 
 
-def read_accepted_steers(bridge_dir: Path, *, thread_id: str) -> list[AcceptedSteer]:
+def read_sent_steers(bridge_dir: Path, *, thread_id: str) -> list[SentSteer]:
     """
-    Return the unsettled steers Codex accepted on one thread.
+    Return the unsettled steers sent on one thread.
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
     :returns: Recorded steers, oldest first; empty when unreadable.
     """
     try:
-        recorded_thread_id, steers = _load_accepted_steers(bridge_dir)
+        recorded_thread_id, steers = _load_sent_steers(bridge_dir)
     except OSError:
         return []
     return steers if recorded_thread_id == thread_id else []
 
 
-def settle_accepted_steers(
+def settle_sent_steers(
     bridge_dir: Path,
     *,
     thread_id: str,
@@ -1420,13 +1419,13 @@ def settle_accepted_steers(
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
-    :param client_message_ids: Steers mirrored, or absent from their ended turn.
+    :param client_message_ids: Steers mirrored, rejected, or absent from their ended turn.
     :param ended_turn_id: Turn that just ended, e.g. ``"turn_abc"``.
     :returns: None.
     """
     try:
-        with _bridge_state_lock(bridge_dir, _ACCEPTED_STEERS_LOCK_FILE):
-            recorded_thread_id, steers = _load_accepted_steers(bridge_dir)
+        with _bridge_state_lock(bridge_dir, _SENT_STEERS_LOCK_FILE):
+            recorded_thread_id, steers = _load_sent_steers(bridge_dir)
             if recorded_thread_id != thread_id:
                 return
             remaining = [
@@ -1435,9 +1434,9 @@ def settle_accepted_steers(
                 if steer.client_message_id not in client_message_ids
             ]
             if remaining != steers:
-                _write_accepted_steers(bridge_dir, thread_id, remaining)
+                _write_sent_steers(bridge_dir, thread_id, remaining)
     except OSError:
-        _logger.warning("Could not settle accepted Codex steers in %s", bridge_dir, exc_info=True)
+        _logger.warning("Could not settle sent Codex steers in %s", bridge_dir, exc_info=True)
 
 
 def clear_bridge_startup_error(bridge_dir: Path) -> None:

@@ -22,7 +22,7 @@ parameterization produces additional collected cases.
 | [test_terminal_attach.py](test_terminal_attach.py) | Terminal attach | 9 |
 | [test_terminal_prepare.py](test_terminal_prepare.py) | Terminal prepare | 13 |
 | [test_tools.py](test_tools.py) | Tools | 19 |
-| [test_transcript_delivery.py](test_transcript_delivery.py) | Transcript delivery | 10 |
+| [test_transcript_delivery.py](test_transcript_delivery.py) | Transcript delivery | 13 |
 | [test_transport.py](test_transport.py) | Transport | 5 |
 | [test_usage.py](test_usage.py) | Usage | 11 |
 

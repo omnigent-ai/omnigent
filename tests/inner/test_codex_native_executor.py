@@ -21,13 +21,13 @@ import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
-    AcceptedSteer,
     CodexNativeBridgeState,
+    SentSteer,
     clear_active_turn_id_if_matches,
-    read_accepted_steers,
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
+    read_sent_steers,
     update_active_turn_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
@@ -1036,10 +1036,12 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert attrs["outcome"] == "rpc_accepted_missing_turn_id"
         assert state.active_turn_id == active_turn_id
     assert "private prompt" not in json.dumps(attrs)
-    steered = active_turn_id is not None and rpc_reply is None
-    assert read_accepted_steers(tmp_path, thread_id="thread_123") == (
-        [AcceptedSteer("turn_steered", "c" * 32)] if steered else []
-    )
+    expected_steers = []
+    if active_turn_id is not None:
+        # Recorded under the expected turn, then the turn Codex reports.
+        steered_turn_id = "turn_steered" if rpc_reply is None else active_turn_id
+        expected_steers = [SentSteer(steered_turn_id, "c" * 32)]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == expected_steers
 
 
 def test_web_started_codex_turn_returns_without_waiting_for_terminal_event(

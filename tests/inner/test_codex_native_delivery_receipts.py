@@ -14,11 +14,11 @@ from websockets.asyncio.server import ServerConnection, serve
 import omnigent.inner.codex_native_executor as native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient, CodexParams
 from omnigent.harnesses.codex_native.bridge import (
-    AcceptedSteer,
     CodexNativeBridgeState,
-    read_accepted_steers,
+    SentSteer,
     read_bridge_startup_failure,
     read_bridge_state,
+    read_sent_steers,
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
@@ -222,8 +222,13 @@ async def test_native_receipt_requires_exact_delivery_identity(
     assert state is not None
     assert state.active_turn_id == "turn_newer"
     assert read_bridge_startup_failure(tmp_path) is None
-    assert read_accepted_steers(tmp_path, thread_id="thread_receipt") == (
-        [AcceptedSteer("turn_accepted", "c" * 32)] if confirmed and method == "turn/steer" else []
+    # A steer stays recorded unless Codex refused it; the forwarder settles the rest.
+    recorded = method == "turn/steer" and receipt_kind not in {
+        "no-server-id",
+        "explicit-rejection",
+    }
+    assert read_sent_steers(tmp_path, thread_id="thread_receipt") == (
+        [SentSteer("turn_accepted", "c" * 32)] if recorded else []
     )
 
 
