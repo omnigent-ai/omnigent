@@ -1865,7 +1865,12 @@ async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
 async def test_completion_racing_an_inferred_reason_stays_final(
     monkeypatch: pytest.MonkeyPatch, completion: str, blocked_on: str | None
 ) -> None:
-    """A hook closing the turn while the relay handles an inferred reason keeps the last word."""
+    """
+    A hook closing the turn after the relay handles an inferred reason keeps the last word.
+
+    The ordinary path's failure-label write is gated, so an inferred edge sent down that
+    path lets the hook land mid-write and is then published over the completion.
+    """
     from omnigent.runtime import session_stream
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
@@ -1912,7 +1917,7 @@ async def test_completion_racing_an_inferred_reason_stays_final(
             return_when=asyncio.FIRST_COMPLETED,
         )
         write_started.cancel()
-        # The Stop or StopFailure hook lands at the relay's first await.
+        # The hook lands during a gated label write, or after the relay ends without one.
         sessions_module._publish_status(
             session_id,
             completion,

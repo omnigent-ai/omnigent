@@ -1800,6 +1800,18 @@ async def test_hidden_input_box_without_structured_status_publishes_no_alert(
 
 
 @pytest.mark.asyncio
+async def test_blank_pane_capture_raises_no_hidden_input_box_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blank or missing capture says nothing about the input box."""
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, "conv_hidden_blank_capture")
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, "")
+    assert session.published == [("running", None)]
+
+
+@pytest.mark.asyncio
 async def test_server_without_inferred_status_support_gets_no_terminal_alert(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1987,7 +1999,7 @@ async def test_status_change_before_queued_alert_delivery_is_not_overwritten(
 async def test_next_turn_clears_a_hidden_input_box_alert_applied_late(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An alert sent as a turn ends can reach chat during the next turn, which clears it."""
+    """An alert sent as a turn ends can reach chat in the next turn, which clears it at once."""
     session_id = "conv_hidden_late_alert"
     session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
     session.write_claude_status("busy")
@@ -1995,15 +2007,23 @@ async def test_next_turn_clears_a_hidden_input_box_alert_applied_late(
     await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)
     assert session.inferred_edges == [("running", "terminal prompt")]
 
+    # A box still hidden in the new turn waits for that turn's own delay.
     _change_session_status(session.registry, session_id, "new-turn")
-    for now in (117.0, 118.0):
-        await session.tick_at(now, _CLAUDE_WORKING_PANE)
-    assert session.inferred_edges == [("running", "terminal prompt"), ("running", None)]
+    for now in (117.0, 131.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges[1:] == [("running", None)]
+    await session.tick_at(132.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(133.0, _CLAUDE_WORKING_PANE)
+    assert session.inferred_edges[1:] == [
+        ("running", None),
+        ("running", "terminal prompt"),
+        ("running", None),
+    ]
 
     # Once a clear is sent, later turns have nothing left to clear.
     _change_session_status(session.registry, session_id, "new-turn")
-    await session.tick_at(119.0, _CLAUDE_WORKING_PANE)
-    assert session.inferred_edges == [("running", "terminal prompt"), ("running", None)]
+    await session.tick_at(134.0, _CLAUDE_NOTICE_PANE)
+    assert len(session.inferred_edges) == 4
     assert session.registry.session_turn_is_active(session_id)
 
 
@@ -2026,6 +2046,36 @@ async def test_hidden_input_box_delay_restarts_after_inferred_status_support_ret
     assert session.published == [("running", None)]
     await session.tick_at(131.0, _CLAUDE_NOTICE_PANE)
     assert session.published[-1] == ("running", "terminal prompt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alert", ["delivered", "queued"])
+async def test_hidden_input_box_alert_is_raised_again_after_a_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, alert: str
+) -> None:
+    """A new server never sees an alert from before a reconnect, so the watcher raises it again."""
+    session_id = "conv_hidden_reconnect"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    supported = {"value": True}
+    session.registry._accepts_inferred_status = lambda: supported["value"]
+    session.write_claude_status("busy")
+    await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(116.0, _CLAUDE_NOTICE_PANE, drain=alert == "delivered")
+
+    supported["value"] = False
+    if alert == "delivered":
+        session.registry.resync_session_statuses()
+    await session.tick_at(117.0, _CLAUDE_NOTICE_PANE)
+    # The new server holds plain running: the resync republished it, or the alert never left.
+    assert session.published[-1] == ("running", None)
+    assert session.registry._published_status_edge(session_id) == ("running", None)
+
+    supported["value"] = True
+    raised = len(session.inferred_edges)
+    await session.tick_at(118.0, _CLAUDE_NOTICE_PANE)
+    assert ("running", "terminal prompt") not in session.inferred_edges[raised:]
+    await session.tick_at(133.0, _CLAUDE_NOTICE_PANE)
+    assert session.inferred_edges[-1] == ("running", "terminal prompt")
 
 
 @pytest.mark.asyncio

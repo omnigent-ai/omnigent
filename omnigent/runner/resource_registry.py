@@ -1865,7 +1865,7 @@ class SessionResourceRegistry:
             if status_poller is not None
             else None
         )
-        # A sent alert can reach chat after the next turn starts, so that turn clears it.
+        # A sent alert can reach chat after the next turn starts, so that turn clears it at once.
         inferred_alert_sent = False
 
         def _publish_inferred_running(
@@ -1879,6 +1879,11 @@ class SessionResourceRegistry:
 
             def deliver() -> None:
                 nonlocal inferred_alert_sent
+                if not self._accepts_inferred_status():
+                    # A reconnect since the claim means the stream would drop this edge.
+                    if expected is not None:
+                        self._claim_inferred_status_edge(session_id, claimed, turn, expected)
+                    return
                 # Completion, failure or a reported reason may land while this is queued.
                 if (
                     status_publisher is not None
@@ -1901,8 +1906,11 @@ class SessionResourceRegistry:
                 if (edge == ("running", None) or alerting) and _structured_status_active()
                 else None
             )
+            pane = instance.last_pane_text()
+            if pane is None:
+                return  # A blank or missing capture says nothing about the input box.
             # Shell mode and the history search count: the person is typing there.
-            input_box_visible = claude_pane_input_box_shown(instance.last_pane_text() or "")
+            input_box_visible = claude_pane_input_box_shown(pane)
             hidden_too_long = watch.observe(
                 input_box_visible=input_box_visible, running_turn=running_turn
             )
@@ -1917,10 +1925,9 @@ class SessionResourceRegistry:
                     ),
                 )
                 _publish_inferred_running(edge, running_turn, NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
-            elif (
-                input_box_visible
-                and turn is not None
-                and (alerting or (inferred_alert_sent and edge == ("running", None)))
+            elif turn is not None and (
+                (alerting and input_box_visible)
+                or (inferred_alert_sent and edge == ("running", None))
             ):
                 _publish_inferred_running(edge, turn, None)
 
