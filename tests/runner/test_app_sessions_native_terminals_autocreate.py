@@ -2077,7 +2077,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_under_w
         _no_op_forwarder,
     )
 
-    class _UnreachedResourceRegistry:
+    class _UnreachedResourceRegistry(SessionResourceRegistry):
         """Fails the test if the launch reaches actual terminal spawn."""
 
         terminal_registry = None
@@ -2140,7 +2140,7 @@ async def test_auto_create_claude_terminal_rejects_windows_native_claude_env_ove
         _no_op_forwarder,
     )
 
-    class _UnreachedResourceRegistry:
+    class _UnreachedResourceRegistry(SessionResourceRegistry):
         """Fails the test if the launch reaches actual terminal spawn."""
 
         terminal_registry = None
@@ -3360,14 +3360,15 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
     config paths are checked where Claude runs: under an ``env --chdir``
     wrapper that is the wrapper's directory, not the workspace.
 
-    :param env_chdir: Whether config wraps the launch in ``env --chdir=sub``.
+    :param env_chdir: Whether user config wraps the launch in ``env --chdir=sub``.
     """
     workspace = tmp_path / "workspace"
     launch_dir = workspace / "sub" if env_chdir else workspace
     launch_dir.mkdir(parents=True)
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
     if env_chdir:
-        (workspace / ".omnigent").mkdir()
-        (workspace / ".omnigent" / "config.yaml").write_text(
+        (config_home / "config.yaml").write_text(
             "harness:\n  claude-native:\n    command: env\n    args: ['--chdir=sub', 'claude']\n"
         )
     (launch_dir / "servers.json").write_text('{"mcpServers": {}}', encoding="utf-8")
@@ -3376,7 +3377,7 @@ async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config-home"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
     monkeypatch.delenv("OMNIGENT_CLAUDE_PATH", raising=False)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
     monkeypatch.setattr(
