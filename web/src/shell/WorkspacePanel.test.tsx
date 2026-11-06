@@ -26,7 +26,8 @@ import type * as UsePermissionsModule from "@/hooks/usePermissions";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
-import { browserViewId } from "@/lib/browserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
+import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import { type FileNavigationGuard, FileViewerContext } from "./FileViewerContext";
@@ -2055,9 +2056,13 @@ describe("WorkspacePanel desktop menu commands", () => {
   type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
   let sendCommand: CommandListener = () => {};
   const browserClose = vi.fn();
+  const browserHasView = vi.fn();
+  const browserOpenOrNavigate = vi.fn();
 
   beforeEach(() => {
     browserClose.mockResolvedValue({ ok: true });
+    browserHasView.mockResolvedValue({ exists: false });
+    browserOpenOrNavigate.mockResolvedValue({ ok: true });
     Object.assign(window, {
       omnigentDesktop: {
         kind: "electron",
@@ -2067,6 +2072,8 @@ describe("WorkspacePanel desktop menu commands", () => {
         },
         setDesktopCommandState: () => {},
         browserClose,
+        browserHasView,
+        browserOpenOrNavigate,
       },
     });
   });
@@ -2264,5 +2271,601 @@ describe("WorkspacePanel desktop menu commands", () => {
     sendCommand({ command: "new-browser-tab", browserViewId: null });
     expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
     expect(onReveal).toHaveBeenCalled();
+  });
+
+  it("steps through the tabs in strip order, wrapping at either end, and shows the rail", () => {
+    writePinnedWorkspaceTabs(["files"]);
+    const { openFileViewer, openTerminalTab, onReveal } = renderWorkspace({
+      open: false,
+      openFiles: ["src/a.ts"],
+      openTerminals: ["terminal:zsh"],
+    });
+    sendCommand({ command: "next-tab", browserViewId: null });
+    sendCommand({ command: "previous-tab", browserViewId: null });
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+    expect(onReveal).toHaveBeenCalledTimes(2);
+  });
+
+  it("steps from a file with unsaved edits to another tab only once its viewer allows it", () => {
+    const allow: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allow.push(commit);
+    });
+    const { openTerminalTab, onReveal } = renderWorkspace({
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+      openTerminals: ["terminal:zsh"],
+      fileGuard,
+    });
+    // Keep editing: the file stays on screen.
+    sendCommand({ command: "next-tab", browserViewId: null });
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    expect(openTerminalTab).not.toHaveBeenCalled();
+    expect(onReveal).not.toHaveBeenCalled();
+
+    act(() => allow[0]!());
+    expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh");
+    expect(onReveal).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a reopened browser tab when a later reopen fails", async () => {
+    writeSessionWorkspaceState("conv_two", {
+      openBrowsers: ["browser-1", "browser-2"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockImplementation(async (viewId: string) => ({
+      exists: true,
+      url: viewId.endsWith("browser-1") ? "https://one.example/" : "https://two.example/",
+    }));
+    const { onRightRailTabChange } = renderWorkspace({
+      conversationId: "conv_two",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+    });
+    const closeTab = async (name: string) => {
+      await screen.findByRole("tab", { name });
+      fireEvent.click(screen.getByRole("button", { name: `Close ${name}` }));
+      await waitFor(() => expect(screen.queryByRole("tab", { name })).not.toBeInTheDocument());
+    };
+    await closeTab("one.example");
+    await closeTab("two.example");
+    const settle: ((result: { ok: boolean; error?: string }) => void)[] = [];
+    browserOpenOrNavigate.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settle.push(resolve);
+        }),
+    );
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    await waitFor(() => expect(settle).toHaveLength(2));
+    onRightRailTabChange.mockClear();
+
+    await act(async () => settle[1]!({ ok: false, error: "browser view cap reached" }));
+    await act(async () => settle[0]!({ ok: true }));
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    expect(await screen.findByRole("tab", { name: "two.example" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("keeps a browser tab it couldn't reopen in its place, so Reopen Closed Tab can try again", async () => {
+    writeSessionWorkspaceState("conv_retry", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { onRightRailTabChange, openFileViewer } = renderWorkspace({
+      conversationId: "conv_retry",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+
+    let failReopen: (result: { ok: boolean; error?: string }) => void = () => {};
+    browserOpenOrNavigate.mockReturnValueOnce(
+      new Promise((resolve) => {
+        failReopen = resolve;
+      }),
+    );
+    reopen();
+    // A file closed while the page is still loading is the newest closed tab.
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    await act(async () => failReopen({ ok: false, error: "browser view cap reached — close one" }));
+    expect(toast.error).toHaveBeenCalledWith(
+      "Couldn't reopen the browser tab: browser view cap reached — close one",
+    );
+    expect(screen.queryAllByRole("tab", { name: /^Browser|example\.com/ })).toHaveLength(0);
+
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    reopen();
+    await waitFor(() => expect(onRightRailTabChange).toHaveBeenCalledWith("browser"));
+    expect(browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      expect.stringMatching(/^browser-tab:conv_retry:/),
+      "https://example.com/",
+      undefined,
+      { force: true },
+    );
+  });
+
+  it.each(["rerender", "remount"] as const)(
+    "leaves the next session's rail alone when a reopen finishes after switching (%s)",
+    async (switching) => {
+      writeSessionWorkspaceState("conv_first", {
+        openBrowsers: ["browser-1"],
+        selectedBrowserId: "browser-1",
+      });
+      browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+      const { onRightRailTabChange, rerender, view } = renderWorkspace({
+        conversationId: "conv_first",
+        showBrowserTab: true,
+        rightRailTab: "browser",
+      });
+      await screen.findByRole("tab", { name: "example.com" });
+      fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+      await waitFor(() =>
+        expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+      );
+      let finish: (result: { ok: boolean }) => void = () => {};
+      browserOpenOrNavigate.mockReturnValueOnce(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+      // The shell can unmount the rail on the way (through Home) and keep its handlers.
+      if (switching === "rerender") rerender({ conversationId: "conv_second" });
+      else view.unmount();
+      const callsBefore = onRightRailTabChange.mock.calls.length;
+      await act(async () => finish({ ok: true }));
+
+      expect(onRightRailTabChange.mock.calls.slice(callsBefore)).not.toContainEqual(["browser"]);
+    },
+  );
+
+  it("remembers a browser tab's page when it closes before the strip has loaded it", async () => {
+    writeSessionWorkspaceState("conv_meta", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    // The strip's lookup never answers; the view still knows its page when the tab closes.
+    browserHasView
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValue({ exists: true, url: "https://example.com/" });
+    renderWorkspace({ conversationId: "conv_meta", showBrowserTab: true, rightRailTab: "browser" });
+    await screen.findByRole("tab", { name: "Browser 1" });
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+    );
+
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    await waitFor(() =>
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        expect.stringMatching(/^browser-tab:conv_meta:/),
+        "https://example.com/",
+        undefined,
+        { force: true },
+      ),
+    );
+  });
+
+  it("records nothing when an agent navigation keeps the agent tab during its close", async () => {
+    writeSessionWorkspaceState("conv_agent_kept", {
+      openBrowsers: [AGENT_BROWSER_TAB_ID],
+      selectedBrowserId: AGENT_BROWSER_TAB_ID,
+    });
+    let finishLookup: (page: { exists: boolean; url: string }) => void = () => {};
+    // The strip's lookup never answers, so the close asks the view for its page.
+    browserHasView
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          finishLookup = resolve;
+        }),
+      );
+    const { openFileViewer } = renderWorkspace({
+      conversationId: "conv_agent_kept",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts"],
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    const agentTab = await screen.findByRole("tab", { name: "Browser 1" });
+    fireEvent.click(screen.getByRole("button", { name: "Close Browser 1" }));
+    await waitFor(() => expect(browserHasView).toHaveBeenCalledTimes(2));
+    act(() =>
+      emitBrowserActionRequest(
+        { type: "browser_action_request", actionId: "navigate-2", action: "navigate", args: {} },
+        "conv_agent_kept",
+      ),
+    );
+    await act(async () => finishLookup({ exists: true, url: "https://example.com/" }));
+
+    expect(browserClose).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(agentTab).toBeInTheDocument();
+    // Reopen Closed Tab goes to the file; the kept tab was never recorded as closed.
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+  });
+
+  it("reopens tabs in the order they were closed, even if a browser close finishes last", async () => {
+    writeSessionWorkspaceState("conv_order", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { openFileViewer } = renderWorkspace({
+      conversationId: "conv_order",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    let finishClose: (result: { ok: boolean }) => void = () => {};
+    browserClose.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishClose = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    // The file closes after the browser tab, while the browser close is still pending.
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    await act(async () => finishClose({ ok: true }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    expect(browserOpenOrNavigate).not.toHaveBeenCalled();
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+  });
+
+  describe("Reopen Closed Tab with an open file's edits", () => {
+    function guardedFile() {
+      const allow: (() => void)[] = [];
+      const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+        allow.push(commit);
+      });
+      return { allow, fileGuard };
+    }
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+
+    it("keeps a closed file in the history while the open file's edits are kept", () => {
+      const { allow, fileGuard } = guardedFile();
+      const { openFileViewer } = renderWorkspace({
+        conversationId: "conv_keep_file",
+        openFiles: ["src/a.ts", "src/b.ts"],
+        selectedFilePath: "src/b.ts",
+        fileGuard,
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+
+      reopen();
+      expect(fileGuard).toHaveBeenLastCalledWith("src/a.ts", undefined, expect.any(Function));
+      expect(openFileViewer).not.toHaveBeenCalled();
+      // Keep editing never commits, so the next Reopen Closed Tab asks about a.ts again.
+      reopen();
+      expect(fileGuard).toHaveBeenCalledTimes(2);
+      act(() => allow[1]!());
+      expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    });
+
+    it.each([
+      ["a blank tab", { exists: false }],
+      ["its last page", { exists: true, url: "https://example.com/" }],
+    ] as const)(
+      "shows a reopened browser tab, %s, only once the open file allows it",
+      async (_name, page) => {
+        writeSessionWorkspaceState("conv_keep_browser", {
+          openBrowsers: ["browser-1"],
+          selectedBrowserId: "browser-1",
+        });
+        browserHasView.mockResolvedValue(page);
+        const { allow, fileGuard } = guardedFile();
+        const { onRightRailTabChange, rerender } = renderWorkspace({
+          conversationId: "conv_keep_browser",
+          showBrowserTab: true,
+          rightRailTab: "browser",
+          fileGuard,
+        });
+        const tabName = page.exists ? "example.com" : "Browser 1";
+        await screen.findByRole("tab", { name: tabName });
+        fireEvent.click(screen.getByRole("button", { name: `Close ${tabName}` }));
+        await waitFor(() =>
+          expect(screen.queryByRole("tab", { name: tabName })).not.toBeInTheDocument(),
+        );
+        // A file with unsaved edits is on screen now.
+        rerender({
+          conversationId: "conv_keep_browser",
+          showBrowserTab: true,
+          rightRailTab: "browser",
+          openFiles: ["src/a.ts"],
+          selectedFilePath: "src/a.ts",
+          fileGuard,
+        });
+        onRightRailTabChange.mockClear();
+
+        reopen();
+        expect(fileGuard).toHaveBeenCalledTimes(1);
+        // Keep editing: nothing reopens, and the next Reopen Closed Tab asks again.
+        reopen();
+        expect(fileGuard).toHaveBeenCalledTimes(2);
+        expect(browserOpenOrNavigate).not.toHaveBeenCalled();
+        expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+
+        act(() => allow[1]!());
+        if (page.exists) {
+          // The page reopens once, then the rail asks again before leaving the file.
+          await waitFor(() => expect(fileGuard).toHaveBeenCalledTimes(3));
+          expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1);
+          act(() => allow[2]!());
+        }
+        expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+      },
+    );
+  });
+
+  it("records a browser tab closed twice while its close is pending only once", async () => {
+    writeSessionWorkspaceState("conv_twice", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { openFileViewer } = renderWorkspace({
+      conversationId: "conv_twice",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    let finishClose: (result: { ok: boolean }) => void = () => {};
+    browserClose.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishClose = resolve;
+      }),
+    );
+    const closeBrowser = screen.getByRole("button", { name: "Close example.com" });
+    fireEvent.click(closeBrowser);
+    fireEvent.click(closeBrowser);
+    await act(async () => finishClose({ ok: true }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    reopen();
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+    // The next reopen goes to the file closed before it, not to the same page again.
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("records a browser tab closed again from a remounted rail only once", async () => {
+    writeSessionWorkspaceState("conv_twice_remount", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const props = {
+      conversationId: "conv_twice_remount",
+      showBrowserTab: true,
+      rightRailTab: "browser" as const,
+      openFiles: ["src/a.ts"],
+    };
+    const first = renderWorkspace(props);
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    let finishClose: (result: { ok: boolean }) => void = () => {};
+    browserClose.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishClose = resolve;
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() => expect(browserClose).toHaveBeenCalledTimes(1));
+    // Leaving and coming back mounts a new rail, which still lists the tab.
+    first.view.unmount();
+    const { openFileViewer } = renderWorkspace(props);
+    fireEvent.click(await screen.findByRole("button", { name: "Close example.com" }));
+    await act(async () => finishClose({ ok: true }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    reopen();
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    expect(browserOpenOrNavigate).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a reopened file that was already on screen ahead of an earlier browser reopen", async () => {
+    writeSessionWorkspaceState("conv_ahead", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { onRightRailTabChange, openFileViewer, rerender } = renderWorkspace({
+      conversationId: "conv_ahead",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+    // The file is opened again from the file tree, so it's the tab on screen.
+    rerender({ openFiles: ["src/a.ts"], selectedFilePath: "src/a.ts" });
+    let finishReopen: (result: { ok: boolean }) => void = () => {};
+    browserOpenOrNavigate.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishReopen = resolve;
+      }),
+    );
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    reopen();
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalled());
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledWith("src/a.ts");
+    onRightRailTabChange.mockClear();
+
+    await act(async () => finishReopen({ ok: true }));
+    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+  });
+
+  it("keeps a file picked again while a browser tab reopens, after picking another", async () => {
+    writeSessionWorkspaceState("conv_aba", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { onRightRailTabChange, rerender } = renderWorkspace({
+      conversationId: "conv_aba",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/a.ts", "src/b.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+    rerender({ selectedFilePath: "src/a.ts" });
+    let finish: (result: { ok: boolean }) => void = () => {};
+    browserOpenOrNavigate.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    rerender({ selectedFilePath: "src/b.ts" });
+    rerender({ selectedFilePath: "src/a.ts" });
+    const callsBefore = onRightRailTabChange.mock.calls.length;
+    await act(async () => finish({ ok: true }));
+    expect(onRightRailTabChange.mock.calls.slice(callsBefore)).not.toContainEqual(["browser"]);
+  });
+
+  it("keeps the browser on screen when a file was shown and closed while another tab reopens", async () => {
+    writeSessionWorkspaceState("conv_file_between", {
+      openBrowsers: ["browser-1", "browser-2"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockImplementation(async (viewId: string) => ({
+      exists: true,
+      url: viewId.endsWith("browser-1") ? "https://one.example/" : "https://two.example/",
+    }));
+    const { rerender } = renderWorkspace({
+      conversationId: "conv_file_between",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openFiles: ["src/f.ts"],
+    });
+    await screen.findByRole("tab", { name: "two.example" });
+    fireEvent.click(screen.getByRole("button", { name: "Close two.example" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "two.example" })).not.toBeInTheDocument(),
+    );
+    let finish: (result: { ok: boolean }) => void = () => {};
+    browserOpenOrNavigate.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    await waitFor(() => expect(browserOpenOrNavigate).toHaveBeenCalled());
+    // The user shows a file and closes it again, back on the first browser tab.
+    rerender({ openFiles: ["src/f.ts"], selectedFilePath: "src/f.ts" });
+    rerender({ openFiles: [], selectedFilePath: null });
+    await act(async () => finish({ ok: true }));
+
+    expect(await screen.findByRole("tab", { name: "one.example" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
+  it("leaves a file its viewer kept open out of the reopen history", () => {
+    const { openFileViewer } = renderWorkspace({
+      conversationId: "conv_kept_open",
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+      // The viewer's unsaved-changes dialog was answered with Keep editing.
+      fileGuard: () => {},
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    expect(openFileViewer).not.toHaveBeenCalled();
+  });
+
+  it("reopens closed tabs newest first, loading a browser tab's last page", async () => {
+    writePinnedWorkspaceTabs(["files"]);
+    writeSessionWorkspaceState("conv_reopen", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    browserHasView.mockResolvedValue({ exists: true, url: "https://example.com/" });
+    const { openFileViewer, onRightRailTabChange, onReveal, rerender } = renderWorkspace({
+      conversationId: "conv_reopen",
+      showBrowserTab: true,
+      rightRailTab: "browser",
+      openPanels: ["changes"],
+      openFiles: ["src/a.ts"],
+    });
+    await screen.findByRole("tab", { name: "example.com" });
+    fireEvent.click(screen.getByRole("button", { name: "Close a.ts" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
+    fireEvent.click(screen.getByRole("button", { name: "Close example.com" }));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "example.com" })).not.toBeInTheDocument(),
+    );
+
+    const reopen = () => sendCommand({ command: "reopen-closed-tab", browserViewId: null });
+    let finishBrowser: (result: { ok: boolean }) => void = () => {};
+    browserOpenOrNavigate.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishBrowser = resolve;
+      }),
+    );
+    reopen();
+    // The view opens once the session's host is looked up.
+    await waitFor(() =>
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        expect.stringMatching(/^browser-tab:conv_reopen:/),
+        "https://example.com/",
+        undefined,
+        { force: true },
+      ),
+    );
+    reopen();
+    expect(onRightRailTabChange).toHaveBeenLastCalledWith("changes");
+    // Changes is on screen when the slower browser tab finishes, so it stays there.
+    rerender({ rightRailTab: "changes" });
+    await act(async () => finishBrowser({ ok: true }));
+    expect(onRightRailTabChange).toHaveBeenLastCalledWith("changes");
+    expect(await screen.findByRole("tab", { name: "example.com" })).toBeInTheDocument();
+    reopen();
+    reopen();
+    expect(openFileViewer).toHaveBeenCalledExactlyOnceWith("src/a.ts");
+    expect(onReveal).toHaveBeenCalledTimes(3);
   });
 });

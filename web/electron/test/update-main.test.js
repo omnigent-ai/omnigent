@@ -486,6 +486,7 @@ describe("application menu layout", () => {
       "new_terminal",
       "new_browser_tab",
       "focus_address_bar",
+      "reopen_closed_tab",
       "separator",
       "close",
       "close_window",
@@ -528,6 +529,7 @@ describe("application menu layout", () => {
       "new_terminal",
       "new_browser_tab",
       "focus_address_bar",
+      "reopen_closed_tab",
       "separator",
       "open_settings",
       "separator",
@@ -749,6 +751,45 @@ describe("desktop command menu items", () => {
     findMenuItem(menu, "reload").click();
     assert.equal(harness.calls.reloads, 2);
     assert.equal(harness.calls.sent.length, 2);
+  });
+
+  it("hands tab switching and Reopen Closed Tab to the app with keyboard focus", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    const ids = ["previous_tab", "next_tab", "reopen_closed_tab"];
+    const menu = reportState(harness, {
+      commands: ["previous-tab", "next-tab", "reopen-closed-tab"],
+    });
+
+    for (const id of ids) findMenuItem(menu, id).click();
+
+    assert.deepEqual(
+      ids.map((id) => findMenuItem(menu, id).accelerator),
+      ["CmdOrCtrl+Shift+[", "CmdOrCtrl+Shift+]", "CmdOrCtrl+Shift+T"],
+    );
+    assert.equal(harness.calls.webContentsFocuses, 3);
+    assert.deepEqual(
+      plain(harness.calls.sent).map(({ payload }) => payload.command),
+      ["previous-tab", "next-tab", "reopen-closed-tab"],
+    );
+  });
+
+  it("gives no two menu items the same shortcut", (t) => {
+    for (const platform of ["darwin", "linux"]) {
+      const harness = loadMainHarness({ platform });
+      t.after(harness.cleanup);
+      harness.api.buildMenu();
+      const accelerators = [];
+      const collect = (items) => {
+        for (const item of items) {
+          if (item.accelerator) accelerators.push(item.accelerator);
+          collect(item.submenu ?? []);
+        }
+      };
+      collect(harness.calls.setApplicationMenu.at(-1).template);
+      const repeats = accelerators.filter((key, index) => accelerators.indexOf(key) !== index);
+      assert.deepEqual(repeats, [], platform);
+    }
   });
 
   it("ignores command state from a page off the pinned server", (t) => {
