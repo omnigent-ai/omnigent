@@ -144,18 +144,35 @@ describe("desktop command bridge", () => {
       closingQuits: true,
     });
     h.emit("omnigent:desktop-command", { command: "new-terminal", browserViewId: 7 });
+    h.emit("omnigent:desktop-command", {
+      command: "quit",
+      quitDetail: "The local server will stop.",
+    });
+    h.emit("omnigent:desktop-command", { command: "quit", quitDetail: 1 });
     h.emit("omnigent:desktop-command", { command: 5 });
     h.emit("omnigent:desktop-command", null);
     assert.deepEqual(JSON.parse(JSON.stringify(received)), [
-      { command: "close", browserViewId: "browser-tab:s:t", closingQuits: true },
-      { command: "new-terminal", browserViewId: null, closingQuits: false },
+      {
+        command: "close",
+        browserViewId: "browser-tab:s:t",
+        closingQuits: true,
+        quitDetail: null,
+      },
+      { command: "new-terminal", browserViewId: null, closingQuits: false, quitDetail: null },
+      {
+        command: "quit",
+        browserViewId: null,
+        closingQuits: false,
+        quitDetail: "The local server will stop.",
+      },
+      { command: "quit", browserViewId: null, closingQuits: false, quitDetail: null },
     ]);
 
     unsubscribe();
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
-  it("reports command state as plain values and asks main to close the window", async () => {
+  it("reports command state as plain values and asks main to close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({
       commands: ["close", 3],
@@ -176,6 +193,12 @@ describe("desktop command bridge", () => {
 
     await h.desktop.closeWindow();
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
+
+    await h.desktop.confirmQuit({ dontAskAgain: "yes" });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
+      channel: "omnigent:confirm-quit",
+      args: { dontAskAgain: false },
+    });
   });
 });
 
