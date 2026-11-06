@@ -8,16 +8,22 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
   if (
     comment.body.trim() !== "/address" ||
     comment.user.type !== "User" ||
-    comment.issue_url !== `https://api.github.com/repos/${owner}/${repo}/issues/${issue_number}` ||
-    comment.created_at !== comment.updated_at
+    comment.issue_url !== `https://api.github.com/repos/${owner}/${repo}/issues/${issue_number}`
   ) return;
+  if (comment.created_at !== comment.updated_at) {
+    core.setOutput("reason", "Edited commands are not accepted. Post a new /address comment.");
+    return;
+  }
   const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: issue_number });
   if (
     pull.state !== "open" || pull.draft ||
     pull.user.login !== "omni-resolve-agent[bot]" || pull.user.type !== "Bot" ||
     pull.head.repo?.full_name !== `${owner}/${repo}` ||
     !pull.head.ref.startsWith("resolve-agent/") || pull.head.ref === pull.base.ref
-  ) return;
+  ) {
+    core.setOutput("reason", "/address requires an open, non-draft Resolve-authored PR on its own branch.");
+    return;
+  }
   const allowed = new Set(reviewers.toLowerCase().split(/[,\s]+/).filter(Boolean));
   for (const path of [".github/MAINTAINER"]) {
     const { data: file } = await github.rest.repos.getContent({ owner, repo, path, ref: "main" });
@@ -28,6 +34,7 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
   }
   if (!allowed.has(comment.user.login.toLowerCase())) {
     core.info("/address is limited to maintainers and configured Otto reviewers.");
+    core.setOutput("reason", "/address is limited to maintainers and contributors listed in OTTO_ADDRESS_REVIEWERS.");
     return;
   }
   core.setOutput("authorized", "true");

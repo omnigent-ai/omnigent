@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
-  issues: read
+  issues: write
 
 concurrency:
   group: otto-address-${{ github.event.comment.id }}
@@ -47,6 +47,17 @@ jobs:
           owner: omnigent-ai
           repositories: omnigent-internal
           permission-actions: write
+      - name: Explain rejected command
+        if: steps.authorize.outputs.reason != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          REASON: ${{ steps.authorize.outputs.reason }}
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              ...context.repo, issue_number: context.payload.issue.number,
+              body: `/address (#issuecomment-${context.payload.comment.id}): ${process.env.REASON}`,
+            });
       - name: Dispatch Otto review
         if: steps.authorize.outputs.authorized == 'true'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0

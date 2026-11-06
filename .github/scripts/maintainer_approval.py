@@ -61,6 +61,12 @@ def approval_decision(
     maintainers = {login.casefold() for login in maintainers}
     trusted_authors = {login.casefold() for login in trusted_authors}
     trusted_successors = {login.casefold() for login in trusted_successors}
+    # Removing a label must not restore the trusted-author or stale-approval bypass.
+    require_current_head = require_current_head or any(
+        event.get("event") == "labeled"
+        and (event.get("label") or {}).get("name") == "otto-address"
+        for event in timeline or []
+    )
     if not require_current_head and author.casefold() in maintainers:
         return ApprovalDecision(True, f"Author @{author} is a maintainer.")
     if not require_current_head and author.casefold() in trusted_authors:

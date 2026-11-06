@@ -48,7 +48,7 @@ test("maintainers do not need a duplicate allowlist entry", async () => {
 });
 
 test("an unset variable does not authorize contributors", async () => {
-  assert.deepEqual((await run({ reviewers: "" })).outputs, {});
+  assert.match((await run({ reviewers: "" })).outputs.reason, /OTTO_ADDRESS_REVIEWERS/);
 });
 
 for (const login of ["second-reader", "third-reader"]) {
@@ -65,7 +65,7 @@ for (const comment of [
   { updated_at: "2026-11-06T02:00:00Z" },
 ]) {
   test(`rejects unsupported or unauthorized command ${JSON.stringify(comment)}`, async () => {
-    assert.deepEqual((await run({ comment })).outputs, {});
+    assert.equal((await run({ comment })).outputs.authorized, undefined);
   });
 }
 
@@ -76,10 +76,21 @@ for (const pull of [
   { head: { repo: { full_name: "omnigent-ai/omnigent" }, ref: "main" } },
 ]) {
   test(`rejects ineligible target ${JSON.stringify(pull)}`, async () => {
-    assert.deepEqual((await run({ pull })).outputs, {});
+    const { outputs } = await run({ pull });
+    assert.equal(outputs.authorized, undefined);
+    assert.match(outputs.reason, /Resolve-authored PR/);
   });
 }
 
 test("authorization fails closed when the trusted configuration cannot be read", async () => {
   await assert.rejects(run({ apiFailure: true }), /API unavailable/);
 });
+
+for (const [comment, reason] of [
+  [{ user: { login: "outsider", type: "User" } }, /OTTO_ADDRESS_REVIEWERS/],
+  [{ updated_at: "2026-11-06T02:00:00Z" }, /Edited commands/],
+]) {
+  test(`explains rejection: ${reason}`, async () => {
+    assert.match((await run({ comment })).outputs.reason, reason);
+  });
+}

@@ -269,3 +269,25 @@ def test_maintainer_authored_pr_still_passes():
         pushers=lambda _sha: set(),
     )
     assert decision.approved
+
+
+def test_removed_address_label_still_requires_current_head_approval():
+    timeline = [
+        {"event": "labeled", "label": {"name": "otto-address"}},
+        {"event": "unlabeled", "label": {"name": "otto-address"}, "actor": {"login": "triager"}},
+    ]
+    for reviews, expected in (
+        ([], False),
+        ([review("APPROVED", "old")], False),
+        ([review("DISMISSED", "new")], False),
+        ([review("APPROVED", "new")], True),
+    ):
+        assert (
+            decide(
+                author="omni-resolve-agent[bot]",
+                reviews=reviews,
+                commits=[commit("old"), commit("new")],
+                timeline=timeline,
+            ).approved
+            is expected
+        )
