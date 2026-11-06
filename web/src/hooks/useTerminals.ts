@@ -391,11 +391,17 @@ export function useCreateTerminal(conversationId: string) {
           return;
         }
         if (info.id === predicted.id) {
-          // Keep the tab's slot; take the server's fields over the prediction.
+          // Keep the tab's slot and take the server's fields over the
+          // prediction, without dropping list-only fields (the direct-attach
+          // URL) a list refresh may have added meanwhile.
           const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
           queryClient.setQueryData<TerminalInfo[]>(
             key,
-            current.map((t) => (t.id === info.id ? info : t)),
+            current.map((t) =>
+              t.id === info.id
+                ? { ...t, ...info, directAttachUrl: info.directAttachUrl ?? t.directAttachUrl }
+                : t,
+            ),
           );
           return;
         }
@@ -534,7 +540,9 @@ export function useTerminals(
       const byId = new Map<string, TerminalInfo>();
       for (const t of queryClient.getQueryData<TerminalInfo[]>(key) ?? []) byId.set(t.id, t);
       for (const t of fetched) byId.set(t.id, t);
-      return [...byId.values()];
+      // A shell closed while its create was in flight stays closed; its
+      // launch deletes it once the create returns.
+      return [...byId.values()].filter((t) => !isClosedDuringLaunch(t.id));
     },
     enabled: conversationId !== null,
     staleTime: Infinity,
