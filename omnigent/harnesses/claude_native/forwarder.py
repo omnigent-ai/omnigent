@@ -189,9 +189,6 @@ _SUBAGENT_FORWARD_CONCURRENCY = 8
 # source-keyed individual posts. Individual transient failures stay pending
 # at the durable cursor so a temporary outage cannot lose child history.
 _SUBAGENT_BATCH_MAX_TRANSIENT_ATTEMPTS = 12
-# Queue records only keep queued bubbles in sync, so an outage drops them
-# after a few backed-off attempts instead of holding up the transcript.
-_QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS = 6
 _CURSOR_FINGERPRINT_BYTES = 256
 _FORK_COMMAND_NAMES = frozenset({"/branch", "/fork"})
 _HTTP_POST_MAX_PERMANENT_FAILURES = 3
@@ -6443,7 +6440,7 @@ async def _post_external_queue_operations(
     :param retry_key: Key for this transcript region, e.g. ``"queue:1024:2026-…Z"``.
     :param dedupe: Per-session forwarder state; records an unsupported server.
     :returns: ``False`` while this region should be retried on a later poll;
-        ``True`` once posted or given up on.
+        ``True`` once posted, permanently rejected, or unsupported.
     """
     if dedupe.queue_operations_unsupported:
         return True
@@ -6480,7 +6477,6 @@ async def _post_external_queue_operations(
             retry_key,
             exc,
             session_id=session_id,
-            max_transient_attempts=_QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS,
         )
         _logger.warning(
             "Failed to forward Claude queue operations; session=%s http_status=%s "

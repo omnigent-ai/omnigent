@@ -17,6 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     record_hook_event,
 )
+from omnigent.runtime import pending_inputs
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.claude_native.forwarder._support import (
@@ -857,28 +858,45 @@ async def test_forwarder_retries_user_item_on_connect_error(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("failure", "failed_posts", "queue_posts"),
+    ("failure", "failed_posts", "queue_posts", "mirrored"),
     [
-        ("connect", 1, 2),
-        ("connect", None, forwarder._QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS),
-        (422, None, forwarder._HTTP_POST_MAX_PERMANENT_FAILURES),
+        ("connect", 1, 2, True),
+        ("connect", 8, 9, True),
+        ("lost-ack", 8, 9, True),
+        ("lost-ack-restart", 8, 9, True),
+        ("connect", None, 9, False),
+        (422, None, forwarder._HTTP_POST_MAX_PERMANENT_FAILURES, True),
     ],
-    ids=["transient-retried", "outage-dropped", "permanent-dropped"],
+    ids=[
+        "transient-retried",
+        "long-outage-recovered",
+        "lost-ack-idempotent",
+        "lost-ack-after-restart",
+        "outage-held",
+        "permanent-dropped",
+    ],
 )
 async def test_forwarder_posts_queue_operations_before_the_items_after_them(
-    tmp_path: Path, failure: str | int, failed_posts: int | None, queue_posts: int
+    tmp_path: Path,
+    failure: str | int,
+    failed_posts: int | None,
+    queue_posts: int,
+    mirrored: bool,
 ) -> None:
-    """
-    Queue records reach the server before the user item read with them.
-
-    An edited queued prompt must update its pending entry before Claude's
-    user record consumes it. A failed post holds the cursor so both are
-    reported again; records that keep failing are dropped so the item still
-    gets through.
-    """
+    """An edited native input keeps its pending identity through an unavailable server."""
+    pending_inputs.reset_for_tests()
+    pending_id = pending_inputs.record(
+        "conv_abc", [{"type": "input_text", "text": "Then summarize"}], stable_id="a" * 32
+    )
     transcript_path = tmp_path / "session.jsonl"
     state = _transcript_state(
         transcript_path,
+        {
+            "type": "queue-operation",
+            "operation": "popAll",
+            "content": "Then summarize",
+            "timestamp": "2026-11-05T09:45:20.000Z",
+        },
         _ENQUEUE_RECORD,
         {
             "type": "user",
@@ -886,49 +904,77 @@ async def test_forwarder_posts_queue_operations_before_the_items_after_them(
             "message": {"role": "user", "content": "Then summarize the logs"},
         },
     )
+    bridge_dir = tmp_path / "bridge"
+    forwarder._write_forward_state(bridge_dir, state)
     requests: list[dict[str, Any]] = []
+    matched_pending_ids: list[str] = []
 
-    def _handle_request(request: httpx.Request) -> httpx.Response:
+    def handle(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content.decode("utf-8"))
         requests.append(payload)
         queue_attempt = sum(1 for r in requests if r["type"] == "external_queue_operations")
-        failing = payload["type"] == "external_queue_operations" and (
-            failed_posts is None or queue_attempt <= failed_posts
-        )
+        queue_post = payload["type"] == "external_queue_operations"
+        failing = queue_post and (failed_posts is None or queue_attempt <= failed_posts)
         if failing and failure == "connect":
             raise httpx.ConnectError("connection refused", request=request)
+        if queue_post and (
+            not failing or (isinstance(failure, str) and failure.startswith("lost-ack"))
+        ):
+            pending_inputs.apply_queue_operations(
+                "conv_abc",
+                [pending_inputs.QueueOperation(**op) for op in payload["data"]["operations"]],
+            )
+        if failing and isinstance(failure, str) and failure.startswith("lost-ack"):
+            raise httpx.ReadTimeout("receipt response lost", request=request)
         if failing:
             return httpx.Response(failure, json={"error": "invalid_input"})
+        if payload["type"] == "external_conversation_item" and failure != 422:
+            text = "".join(block["text"] for block in payload["data"]["item_data"]["content"])
+            match = pending_inputs.resolve_matching_text("conv_abc", text)
+            assert match.matched is not None
+            assert match.skipped == []
+            assert match.matched.stable_id == "a" * 32
+            matched_pending_ids.append(match.matched.pending_id)
         return httpx.Response(202, json={})
 
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(_handle_request), base_url="http://test"
-    ) as client:
-        dedupe = forwarder._ForwardDedupeState()
-        retry_tracker = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
-        for _ in range(forwarder._QUEUE_OPERATIONS_MAX_TRANSIENT_ATTEMPTS + 2):
-            state = await forwarder._forward_available_items(
-                client=client,
-                session_id="conv_abc",
-                bridge_dir=tmp_path / "bridge",
-                agent_name="claude-native-ui",
-                state=state,
-                retry_tracker=retry_tracker,
-                dedupe=dedupe,
-            )
-
-    posted = [r["type"] for r in requests if r["type"] != "external_session_status"]
-    assert posted == ["external_queue_operations"] * queue_posts + ["external_conversation_item"]
-    assert requests[0]["data"] == {
-        "operations": [
-            {
-                "operation": "enqueue",
-                "content": "Then summarize the logs",
-                "timestamp": "2026-11-05T09:45:21.000Z",
-            }
-        ]
-    }
-    assert state.byte_offset == transcript_path.stat().st_size
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handle), base_url="http://test"
+        ) as client:
+            dedupe = forwarder._ForwardDedupeState()
+            retries = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+            for attempt in range(9):
+                if attempt == 7 and failure == "lost-ack-restart":
+                    restored = forwarder._read_forward_state(bridge_dir)
+                    assert restored is not None
+                    state = restored
+                    dedupe = forwarder._ForwardDedupeState()
+                    retries = forwarder._PostRetryTracker(base_delay_s=0.0, max_delay_s=0.0)
+                state = await forwarder._forward_available_items(
+                    client=client,
+                    session_id="conv_abc",
+                    bridge_dir=bridge_dir,
+                    agent_name="claude-native-ui",
+                    state=state,
+                    retry_tracker=retries,
+                    dedupe=dedupe,
+                )
+        posted = [r["type"] for r in requests if r["type"] != "external_session_status"]
+        assert posted == ["external_queue_operations"] * queue_posts + (
+            ["external_conversation_item"] if mirrored else []
+        )
+        if mirrored:
+            assert state.byte_offset == transcript_path.stat().st_size
+            if failure != 422:
+                assert matched_pending_ids == [pending_id]
+        else:
+            assert state.byte_offset == 0
+            assert state.seen_source_ids == ()
+            assert pending_inputs.snapshot_for("conv_abc")[0]["content"] == [
+                {"type": "input_text", "text": "Then summarize"}
+            ]
+    finally:
+        pending_inputs.reset_for_tests()
 
 
 @pytest.mark.asyncio
