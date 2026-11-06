@@ -383,8 +383,9 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
-# Whether the server on the current connection said, in an init envelope, that
-# it accepts pane-inferred status edges. A reconnect clears it.
+# Whether the server on the current connection said, in an init envelope or a
+# session stream request, that it accepts pane-inferred status edges. A
+# reconnect clears it.
 _server_accepts_inferred_status = False
 
 
@@ -3482,7 +3483,14 @@ def create_runner_app(
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
-    async def stream_session(session_id: str) -> StreamingResponse:
+    async def stream_session(
+        session_id: str, accepts_inferred_status: bool = False
+    ) -> StreamingResponse:
+        global _server_accepts_inferred_status
+        # A reconnecting server reopens every bound session's stream, idle ones included.
+        if accepts_inferred_status:
+            _server_accepts_inferred_status = True
+
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:

@@ -630,7 +630,8 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
     A current server's init envelope enables pane-inferred status until a reconnect.
 
     An id-only init for another session leaves it on. After a reconnect, an
-    inferred edge still queued is dropped until the new server accepts them.
+    inferred edge still queued is dropped until the new server accepts them,
+    either in an init envelope or when its relay reopens the session stream.
     """
     from omnigent.entities import Conversation
     from omnigent.runner.session_init_protocol import (
@@ -649,9 +650,12 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
         )
         return build_runner_session_init_payload(conversation, server_version="0.22.0")
 
-    async def streamed_statuses(session_id: str) -> list[tuple[str, str | None, bool]]:
+    async def streamed_statuses(
+        session_id: str, *, relay_accepts_inferred: bool = False
+    ) -> list[tuple[str, str | None, bool]]:
         app.state.session_event_queues[session_id].put_nowait(None)
-        response = await client.get(f"/v1/sessions/{session_id}/stream")
+        params = {"accepts_inferred_status": "true"} if relay_accepts_inferred else None
+        response = await client.get(f"/v1/sessions/{session_id}/stream", params=params)
         events = [
             json.loads(line.removeprefix("data: "))
             for line in response.text.splitlines()
@@ -690,7 +694,13 @@ async def test_pane_inference_is_scoped_to_the_server_connection(
         assert accepts_inferred_status() is False
         publish(conv_id, "running", None)
         assert await streamed_statuses(conv_id) == [("running", None, False)]
+        # A reconnect while every session is idle reopens the relay before any init.
+        assert await streamed_statuses(conv_id, relay_accepts_inferred=True) == []
+        assert accepts_inferred_status() is True
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        assert await streamed_statuses(conv_id) == [("running", "terminal prompt", True)]
 
+        await app.state.catch_up_scan()
         older_init = envelope_init("conv_native_older_server")
         older_envelope = older_init[SESSION_INIT_PAYLOAD_KEY]
         assert isinstance(older_envelope, dict)

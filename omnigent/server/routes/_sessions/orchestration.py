@@ -9335,9 +9335,11 @@ async def _relay_runner_stream_once(
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     heartbeat_seen = False
     try:
+        # Every connection reopens this stream, so the runner relearns that inferred
+        # status edges are handled below; an older runner ignores the parameter.
         async with runner_client.stream(
             "GET",
-            f"/v1/sessions/{session_id}/stream",
+            f"/v1/sessions/{session_id}/stream?accepts_inferred_status=true",
             timeout=_relay_timeout,
         ) as resp:
             resp.raise_for_status()

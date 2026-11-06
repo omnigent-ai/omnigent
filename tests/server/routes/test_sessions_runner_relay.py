@@ -185,6 +185,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     [request] = requests
     assert request.method == "GET"
     assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+    assert request.url.params["accepts_inferred_status"] == "true"
     assert SCHEDULED_RUN_HEADER not in request.headers
 
 
