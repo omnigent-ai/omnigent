@@ -153,6 +153,20 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
+        """Record a successful sign-in on an existing user row.
+
+        Sets ``last_login_at``, which the admin user list shows. The
+        accounts provider bumps it through its own store; identity
+        providers that only reach the permission store (OIDC) call
+        this after :meth:`ensure_user`. No-op if the row does not exist.
+
+        :param user_id: The signed-in user, e.g. ``"alice@example.com"``.
+        :param when_epoch_seconds: Login timestamp in Unix epoch seconds.
+        """
+        ...
+
+    @abstractmethod
     def get_user(self, user_id: str) -> Account | None:
         """Read the target account and generation before an operation on another user."""
         ...

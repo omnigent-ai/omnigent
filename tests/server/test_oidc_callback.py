@@ -26,6 +26,7 @@ import json
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -202,6 +203,7 @@ def callback_client(
     )
     app.state.pending_id_token = pending_id_token
     app.state.auth_provider = provider
+    app.state.permission_store = perm_store
 
     with TestClient(app) as client:
         yield client, keys
@@ -295,6 +297,29 @@ def test_callback_verified_email_mints_session(
     # sub is the normalized (lowercased) verified email — proves the
     # decoded claim flowed all the way into the minted session.
     assert decoded["sub"] == "alice@example.com"
+
+
+def test_callback_records_last_login(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A successful OIDC sign-in stamps ``last_login_at`` on the user row.
+
+    The admin Members page reads that column; without the stamp every
+    OIDC user showed "Never" however often they signed in.
+    """
+    client, keys = callback_client
+    store = cast(SqlAlchemyPermissionStore, cast(FastAPI, client.app).state.permission_store)
+    before = int(time.time())
+
+    resp = _do_callback(
+        client, keys.sign_id_token({"email": "Alice@Example.com", "email_verified": True})
+    )
+
+    assert resp.status_code == 302, resp.text
+    account = store.get_user("alice@example.com")
+    assert account is not None
+    assert account.last_login_at is not None
+    assert account.last_login_at >= before
 
 
 @pytest.mark.parametrize(
