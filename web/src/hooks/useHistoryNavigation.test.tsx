@@ -44,6 +44,7 @@ function setHistoryIndex(idx: number): void {
 beforeEach(() => {
   navigate.mockClear();
   setHistoryIndex(1);
+  installDesktop();
 });
 
 afterEach(() => {
@@ -99,7 +100,6 @@ describe("useHistoryNavigation", () => {
   });
 
   it("maps the mouse back/forward buttons and the Go menu in the desktop app", () => {
-    installDesktop();
     renderHook(() => useHistoryNavigation(true));
     window.dispatchEvent(new MouseEvent("mouseup", { button: 3 }));
     window.dispatchEvent(new MouseEvent("mouseup", { button: 4 }));
@@ -108,8 +108,11 @@ describe("useHistoryNavigation", () => {
     expect(navigate.mock.calls).toEqual([[-1], [1], [-1], [1]]);
   });
 
-  it("leaves the mouse buttons to the browser outside the desktop app", () => {
+  it("leaves Cmd+[ / Cmd+] and the mouse buttons to the browser outside the desktop app", () => {
+    Reflect.deleteProperty(window, "omnigentDesktop");
     renderHook(() => useHistoryNavigation(true));
+    expect(pressBracket("BracketLeft").defaultPrevented).toBe(false);
+    pressBracket("BracketRight");
     window.dispatchEvent(new MouseEvent("mouseup", { button: 3 }));
     expect(navigate).not.toHaveBeenCalled();
   });
