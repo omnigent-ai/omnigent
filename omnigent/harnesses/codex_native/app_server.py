@@ -3548,6 +3548,21 @@ async def _persist_hook_trust(request: CodexRequestFn, untrusted: Sequence[_Json
     )
 
 
+def _missing_hook_declarations(
+    expected: Sequence[_JsonObject], reloaded: Sequence[_JsonObject]
+) -> list[_JsonObject]:
+    """Find declarations lost or changed by a trust-state-only config reload."""
+    return [
+        original
+        for original in expected
+        if not any(
+            hook.get("key") == original.get("key")
+            and hook.get("currentHash") == original.get("currentHash")
+            for hook in reloaded
+        )
+    ]
+
+
 async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list[str]:
     """
     Trust the generated subagent-routing hooks so codex runs them.
@@ -3568,7 +3583,7 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         ``client.request`` (or the SDK executor's ``_request``).
     :param cwd: The session cwd the hooks are scoped to, e.g.
         ``"/home/user/repo"``.
-    :returns: Keys of routing hooks still untrusted afterwards; empty when
+    :returns: Keys of routing hooks not verified afterwards; empty when
         every routing hook is trusted (or none are registered).
     """
     listed = await request("hooks/list", {"cwds": [cwd]})
@@ -3588,18 +3603,17 @@ async def trust_codex_router_hooks(request: CodexRequestFn, *, cwd: str) -> list
         return []
     await _persist_hook_trust(request, untrusted)
     relisted = await request("hooks/list", {"cwds": [cwd]})
-    still_untrusted = [
-        h
-        for h in _our_hooks_from_list(relisted, cwd, _CODEX_ROUTER_HOOK_MODULE)
-        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    reloaded = _our_hooks_from_list(relisted, cwd, _CODEX_ROUTER_HOOK_MODULE)
+    unverified = _missing_hook_declarations(ours, reloaded) + [
+        h for h in reloaded if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
     ]
-    if still_untrusted:
+    if unverified:
         _logger.warning(
-            "codex subagent-routing hooks still untrusted after config/batchWrite; "
+            "codex subagent-routing hooks not verified after config/batchWrite; "
             "native subagent routing will NOT be enforced: %s",
-            _untrusted_hook_detail(still_untrusted),
+            _untrusted_hook_detail(unverified),
         )
-        return [str(h.get("key")) for h in still_untrusted]
+        return list(dict.fromkeys(str(h.get("key")) for h in unverified))
     _logger.info(
         "codex subagent-routing hooks trusted (%d of %d newly): %s",
         len(untrusted),
@@ -3639,7 +3653,7 @@ async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[st
         ``client.request``.
     :param cwd: The session cwd the hooks are scoped to, e.g.
         ``"/home/user/repo"``.
-    :returns: Keys of hooks still untrusted afterwards; empty when every
+    :returns: Keys of hooks not verified afterwards; empty when every
         discovered hook is trusted (or none are).
     """
     listed = await request("hooks/list", {"cwds": [cwd]})
@@ -3649,13 +3663,12 @@ async def trust_all_codex_hooks(request: CodexRequestFn, *, cwd: str) -> list[st
         return []
     await _persist_hook_trust(request, untrusted)
     relisted = await request("hooks/list", {"cwds": [cwd]})
-    still_untrusted = [
-        h
-        for h in _our_hooks_from_list(relisted, cwd, None)
-        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
+    reloaded = _our_hooks_from_list(relisted, cwd, None)
+    unverified = _missing_hook_declarations(all_hooks, reloaded) + [
+        h for h in reloaded if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
     ]
-    if still_untrusted:
-        return [str(h.get("key")) for h in still_untrusted]
+    if unverified:
+        return list(dict.fromkeys(str(h.get("key")) for h in unverified))
     _logger.info("codex hook trust-all: trusted %d hook(s) for cwd %s", len(untrusted), cwd)
     return []
 
@@ -3692,11 +3705,13 @@ async def trust_native_policy_hooks(client: CodexAppServerClient, *, cwd: str) -
         return
     await _persist_hook_trust(client.request, untrusted)
     relisted = await client.request("hooks/list", {"cwds": [cwd]})
-    still_untrusted = [
-        h
-        for h in _our_policy_hooks_from_list(relisted, cwd)
-        if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES
-    ]
+    reloaded = _our_policy_hooks_from_list(relisted, cwd)
+    if _missing_hook_declarations(ours, reloaded):
+        raise RuntimeError(
+            "Omnigent policy hooks disappeared after config/batchWrite or their "
+            "declarations changed; tool-call policy enforcement could not be verified."
+        )
+    still_untrusted = [h for h in reloaded if h.get("trustStatus") not in _TRUSTED_HOOK_STATUSES]
     if still_untrusted:
         missing_protocol = any(
             h.get("currentHash") is None or h.get("trustStatus") is None for h in still_untrusted

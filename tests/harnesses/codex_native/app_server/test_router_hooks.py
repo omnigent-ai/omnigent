@@ -177,6 +177,48 @@ async def test_trust_all_codex_hooks_reports_still_untrusted_without_raising() -
     assert await trust_all_codex_hooks(client.request, cwd=_CWD) == ["theirs"]
 
 
+@pytest.mark.parametrize("trust_all", [False, True], ids=["router", "trust-all"])
+@pytest.mark.parametrize(
+    "change, expected",
+    [
+        ("all-missing", ["gate", "retained"]),
+        ("subset-missing", ["retained"]),
+        ("replacement", ["gate", "retained"]),
+        ("hash-changed", ["gate"]),
+    ],
+)
+async def test_best_effort_hook_trust_reports_missing_declarations(
+    monkeypatch: pytest.MonkeyPatch, trust_all: bool, change: str, expected: list[str]
+) -> None:
+    """Best-effort trust reports every lost declaration instead of success."""
+    command = _USER_COMMAND if trust_all else _ROUTER_GATE_COMMAND
+    client = _FakeCodexClient(
+        hooks=[_hook("gate", command, "untrusted"), _hook("retained", command, "trusted")]
+    )
+    request = client.request
+
+    async def reload_hooks(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        response = await request(method, params)
+        if method == "config/batchWrite":
+            if change == "all-missing":
+                client.hooks = []
+            elif change == "subset-missing":
+                client.hooks = [_hook("gate", command, "trusted")]
+            elif change == "replacement":
+                client.hooks = [_hook("replacement", command, "trusted")]
+            else:
+                client.hooks = [
+                    _hook("gate", command, "trusted", "sha256:changed"),
+                    _hook("retained", command, "trusted"),
+                ]
+        return response
+
+    monkeypatch.setattr(client, "request", reload_hooks)
+    trust = trust_all_codex_hooks if trust_all else trust_codex_router_hooks
+    assert await trust(client.request, cwd=_CWD) == expected
+    assert len(_batchwrite_calls(client)) == 1
+
+
 async def test_trust_step_trusts_user_hooks_only_when_trust_all_enabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
