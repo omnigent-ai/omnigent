@@ -107,6 +107,7 @@ def test_cancellation_before_dispatch_preserves_the_draft(tmp_path, monkeypatch)
 
 def test_unreadable_empty_capture_never_gets_edit_keys(monkeypatch):
     calls = scenarios._fake_tmux(monkeypatch, [""])
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(True))
     monkeypatch.setattr(bridge, "_request_claude_repaint", lambda *_: False)
     with pytest.raises(bridge.ClaudeComposerNotCleared):
         bridge._prepare_empty_composer("synthetic.sock", "main", bridge_dir=Path("/tmp/bridge"))
@@ -121,3 +122,36 @@ def test_matching_web_text_does_not_own_the_human_draft(tmp_path, monkeypatch):
         bridge.inject_user_message(bridge_dir, content="same synthetic text")
     assert composer.text == "same synthetic text"
     assert composer.submitted == []
+
+
+@pytest.mark.parametrize("exit_status", [None, "0", "7"])
+def test_an_unreadable_gone_target_is_an_exit_before_any_edit(monkeypatch, exit_status):
+    calls = scenarios._fake_tmux(monkeypatch, [""])
+    targets = []
+
+    def target_state(socket_path, target):
+        targets.append((socket_path, target))
+        return bridge._ClaudePaneState(
+            False, exited=exit_status is not None, exit_status=exit_status
+        )
+
+    monkeypatch.setattr(bridge, "_claude_pane_state", target_state)
+    with pytest.raises(bridge.ClaudeTerminalExited) as raised:
+        bridge._prepare_empty_composer(
+            "synthetic.sock", "exact:0.1", bridge_dir=Path("/tmp/bridge")
+        )
+    assert raised.value.exit_status == exit_status
+    assert targets == [("synthetic.sock", "exact:0.1")]
+    assert calls == []
+
+
+@pytest.mark.parametrize("alive", [True, None])
+def test_an_unreadable_live_or_unknown_target_stays_failclosed(monkeypatch, alive):
+    calls = scenarios._fake_tmux(monkeypatch, [""])
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(alive))
+    monkeypatch.setattr(bridge, "_request_claude_repaint", lambda *_: False)
+    with pytest.raises(bridge.ClaudeComposerNotCleared):
+        bridge._prepare_empty_composer(
+            "synthetic.sock", "exact:0.1", bridge_dir=Path("/tmp/bridge")
+        )
+    assert calls == []

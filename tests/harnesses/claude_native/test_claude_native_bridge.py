@@ -12478,6 +12478,11 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
 ) -> None:
     """Retry a transient unreadable box; refuse when it stays unreadable."""
     bridge_dir = _picker_bridge_dir(tmp_path)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(True),
+    )
     composer = _EditableComposer(
         _STALE_MULTILINE_DRAFT,
         cursor=0,

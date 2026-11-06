@@ -17,6 +17,7 @@ import pytest
 
 from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge
+from tests._helpers.polling import poll_until
 
 _TERMINAL = r"""
 import json
@@ -49,6 +50,12 @@ box = _InputBox("bash" if startup == "stale-shell-frame" else "prompt", draft)
 
 
 def render(*_args):
+    state = delivered.with_suffix(".state.json")
+    temporary = state.with_suffix(".pending")
+    temporary.write_text(
+        json.dumps({"mode": box.mode, "draft": box.draft, "submitted": box.submitted})
+    )
+    temporary.replace(state)
     screen = box.pane()
     if startup.startswith("stale-"):
         screen = "─" * 30 + "\n❯ previous message\n" + screen
@@ -207,6 +214,37 @@ def test_first_message_survives_slow_terminal_startup(
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
             elif startup.startswith("stale-"):
+                refusal = (
+                    bridge.ClaudeInputBoxOccupied
+                    if startup == "stale-shell-frame"
+                    else bridge.ClaudeComposerNotCleared
+                )
+                with pytest.raises(refusal):
+                    bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)
+                state_path = delivered.with_suffix(".state.json")
+                state = json.loads(state_path.read_text())
+                assert state["draft"] == "\n".join(f"OLD {index}" for index in range(8))
+                assert state["submitted"] == []
+                assert not delivered.exists()
+                # Only the terminal owner releases the draft before another web attempt.
+                keys = (
+                    bridge._COMPOSER_KILL_TO_LINE_END * 20
+                    + bridge._COMPOSER_KILL_TO_LINE_START * 20
+                )
+                subprocess.run(
+                    [*tmux, "send-keys", "-l", "-t", "main", keys],
+                    check=True,
+                    capture_output=True,
+                    timeout=5,
+                )
+                poll_until(
+                    lambda: (
+                        json.loads(state_path.read_text())["draft"] == ""
+                        and json.loads(state_path.read_text())["mode"] == "prompt"
+                    ),
+                    timeout_s=5.0,
+                    interval_s=0.01,
+                )
                 bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)
                 assert json.loads(delivered.read_text()) == [["prompt", "ONLY_NEW_INPUT"]]
                 bridge.inject_slash_command(bridge_dir, command="/effort high", timeout_s=2.0)
@@ -224,7 +262,7 @@ def test_first_message_survives_slow_terminal_startup(
                 assert geometry.stdout.strip() == "6"
             elif startup == "exit-after-ready":
                 caplog.set_level(logging.WARNING)
-                with pytest.raises(RuntimeError, match="tmux command failed"):
+                with pytest.raises(bridge.ClaudeTerminalExited) as raised:
                     bridge.inject_user_message(
                         bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
                     )
@@ -234,8 +272,12 @@ def test_first_message_survives_slow_terminal_startup(
                     if getattr(r, "event_name", None) == "claude_native_delivery_finished"
                 )
                 row = record_to_row(record, source="runner")
-                assert row["attributes"]["tmux_operation"] == "send-keys"
-                assert row["attributes"]["tmux_returncode"] == "1"
+                assert raised.value.exit_status is None
+                assert "is no longer running (exit status unknown)" in str(raised.value)
+                assert row["attributes"]["stage"] == "pasting"
+                assert row["attributes"]["error_type"] == "ClaudeTerminalExited"
+                assert "paste_sent" not in row["attributes"]
+                assert row["attributes"]["submit_sent"] == "False"
                 assert "MUST_NOT_DELIVER" not in json.dumps(row)
                 assert str(socket_path) not in json.dumps(row)
                 assert not delivered.exists()

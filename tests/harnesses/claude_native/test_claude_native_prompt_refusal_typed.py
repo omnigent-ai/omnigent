@@ -115,7 +115,21 @@ def test_a_prompt_after_the_paste_is_not_retryable(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The draft is in the box by then; a retry could append to it."""
-    _show(monkeypatch, f"{_RULE}\n❯ hi\n{_RULE}\n  ? for shortcuts\n")
+    pasted = False
+    commands = []
+
+    def run_tmux(_socket_path, *args):
+        nonlocal pasted
+        commands.append(args)
+        if args[0] == "paste-buffer":
+            pasted = True
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *_args: f"{_RULE}\n❯ {'hi' if pasted else ''}\n{_RULE}\n  ? for shortcuts\n",
+    )
     checks = iter([False, True])
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _dir: next(checks))
 
@@ -125,6 +139,8 @@ def test_a_prompt_after_the_paste_is_not_retryable(
         )
 
     assert raised.value.nothing_typed is False
+    assert pasted
+    assert not any(command[-1] == "Enter" for command in commands)
 
 
 def test_the_readiness_gate_dialog_refusal_awaits_an_answer(

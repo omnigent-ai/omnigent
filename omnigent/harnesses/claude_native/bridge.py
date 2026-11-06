@@ -7017,6 +7017,19 @@ def _require_clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: P
     while True:
         _check_injection_cancelled()
         pane = _capture_pane(socket_path, tmux_target)
+        if not pane.strip():
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.alive is False:
+                gone = (
+                    "is no longer running (exit status unknown)"
+                    if state.exit_status is None
+                    else f"has exited (status {state.exit_status})"
+                )
+                raise ClaudeTerminalExited(
+                    f"The Claude Code terminal {gone}, so the message was not delivered. "
+                    "Relaunch the terminal to continue this conversation.",
+                    exit_status=state.exit_status,
+                )
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = _composer_reads_clear(box)
