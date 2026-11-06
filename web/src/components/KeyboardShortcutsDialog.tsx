@@ -250,6 +250,8 @@ function shortcutGroupsFor(
               {
                 label: "New line in message",
                 keys: composerNewLineShortcutKeys(submitWithModEnter),
+                // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
+                alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
               },
               ...chatItems,
             ],
@@ -259,8 +261,10 @@ function shortcutGroupsFor(
       return {
         ...group,
         items: [
-          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
-          ...group.items,
+          // A browser tab keeps its own Back and Forward.
+          ...(electron
+            ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }, ...group.items]
+            : []),
           sessionNumberShortcut(native),
         ],
       };
