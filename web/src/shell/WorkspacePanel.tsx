@@ -250,6 +250,13 @@ function NewTabMenu({
   // access is available; the menu can also contain just built-in pages.
   const defaultShell = resolveDefaultShell(declaredTerminals, preferred) as string;
 
+  // Radix runs onSelect before closing; close first so the menu's focus trap
+  // doesn't pull focus back from a tab that takes it as it opens.
+  const closeThen = (action: () => void) => () => {
+    setMenuOpen(false);
+    action();
+  };
+
   const launchShell = (name: string) => {
     setMenuOpen(false);
     // Signal the create is starting so the shell gets focused the moment its
@@ -339,7 +346,7 @@ function NewTabMenu({
           return (
             <DropdownMenuItem
               key={tab}
-              onSelect={() => onOpenPanel(tab)}
+              onSelect={closeThen(() => onOpenPanel(tab))}
               className="cursor-pointer"
             >
               <Icon className="size-4" />
@@ -351,7 +358,7 @@ function NewTabMenu({
           <DropdownMenuSeparator />
         )}
         {onOpenBrowser && (
-          <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
+          <DropdownMenuItem onSelect={closeThen(onOpenBrowser)} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
             {/* ⌘T is the desktop menu's New Browser Tab; older shells have no chord. */}
@@ -361,7 +368,7 @@ function NewTabMenu({
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
-          <DropdownMenuItem onSelect={onOpenSideChat} className="cursor-pointer">
+          <DropdownMenuItem onSelect={closeThen(onOpenSideChat)} className="cursor-pointer">
             <MessagesSquareIcon className="size-4" />
             Side chat
           </DropdownMenuItem>
