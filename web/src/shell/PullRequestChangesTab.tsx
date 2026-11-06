@@ -71,6 +71,7 @@ import {
   pullRequestRepoUrl,
   refreshedMatchIndex,
   selectVisibleFiles,
+  unquoteGitPath,
   type Match,
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
@@ -449,7 +450,7 @@ function parsePatchByPath(
   if (!patch) return { filesByPath, parseError: undefined };
   try {
     for (const parsed of parsePatchFiles(patch)) {
-      for (const file of parsed.files) filesByPath.set(file.name, file);
+      for (const file of parsed.files) filesByPath.set(unquoteGitPath(file.name), file);
     }
   } catch {
     return { filesByPath, parseError };
@@ -981,7 +982,8 @@ export function PullRequestChangesTab({
   };
   const showHidden = () => {
     view.setPathFilter("");
-    view.setHideViewed(false);
+    // Hide viewed belongs to the whole-PR view, so a commit view leaves it as it is.
+    if (reviewing) view.setHideViewed(false);
   };
   const onTabKeyDown = (event: React.KeyboardEvent) => {
     // The platform's command modifier only: Ctrl+F stays the caret-forward key on macOS.

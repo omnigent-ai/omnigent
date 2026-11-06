@@ -158,7 +158,7 @@ describe("patchFileHashes", () => {
   });
 
   it("does not let a quoted path's hunks change the file before it", () => {
-    // The parser keeps git's octal escapes in the name, so this file never matches a list path.
+    // The parser keeps git's quoting in this file's name; its hunks must still stay its own.
     const quoted = [
       'diff --git "a/caf\\303\\251.ts" "b/caf\\303\\251.ts"',
       "index 1111111..2222222 100644",

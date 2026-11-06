@@ -206,15 +206,56 @@ function patchFileStatus(
   return previousPath ? "renamed" : "modified";
 }
 
-/** The files one commit's patch changes, in patch order, with their line counts. */
+const GIT_QUOTE_ESCAPES: Record<string, number> = {
+  a: 7,
+  b: 8,
+  t: 9,
+  n: 10,
+  v: 11,
+  f: 12,
+  r: 13,
+  '"': 34,
+  "\\": 92,
+};
+
+/**
+ * A patch path as the repository names it. Git quotes paths with special or non-ASCII
+ * characters (`"caf\303\251.ts"`), escaping bytes in octal; anything else is returned as is.
+ */
+export function unquoteGitPath(path: string): string {
+  if (path.length < 2 || !path.startsWith('"') || !path.endsWith('"')) return path;
+  const bytes: number[] = [];
+  const body = path.slice(1, -1);
+  for (let index = 0; index < body.length; index++) {
+    const char = body[index];
+    if (char !== "\\") {
+      bytes.push(...new TextEncoder().encode(char));
+      continue;
+    }
+    const octal = /^[0-7]{3}/.exec(body.slice(index + 1));
+    if (octal) {
+      bytes.push(parseInt(octal[0], 8));
+      index += 3;
+      continue;
+    }
+    const escaped = GIT_QUOTE_ESCAPES[body[index + 1]];
+    if (escaped === undefined) return path;
+    bytes.push(escaped);
+    index += 1;
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/** The files one commit's patch changes, in patch order, keyed and named by repository path. */
 export function changedFilesFromPatch(
   diffs: ReadonlyMap<string, FileDiffMetadata>,
 ): PullRequestChangedFile[] {
-  return [...diffs.values()].map((diff) => {
-    const previousPath = diff.prevName && diff.prevName !== diff.name ? diff.prevName : null;
+  return [...diffs].map(([path, diff]) => {
+    const prevName = diff.prevName ? unquoteGitPath(diff.prevName) : null;
+    const previousPath = prevName && prevName !== path ? prevName : null;
     return {
-      path: diff.name,
-      name: diff.name.split("/").pop() ?? diff.name,
+      path,
+      name: path.split("/").pop() ?? path,
       status: patchFileStatus(diff, previousPath),
       lines_added: diff.hunks.reduce((sum, hunk) => sum + hunk.additionLines, 0),
       lines_removed: diff.hunks.reduce((sum, hunk) => sum + hunk.deletionLines, 0),

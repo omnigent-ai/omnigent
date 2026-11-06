@@ -1500,6 +1500,24 @@ describe("PullRequestChangesTab commits", () => {
     expect(isCollapsed("a.ts")).toBe(true);
   });
 
+  it("keeps the PR's Hide viewed when Find shows a commit file the path filter hides", () => {
+    render(viewedTab({ conversationId: "commits-hide-viewed", commitHistory: true }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "nothing-matches" },
+    });
+    openFind("a.ts");
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).toBeChecked();
+  });
+
   it("keeps the PR's collapse and reveal state through commit toggles, and resets it on a new head", () => {
     const { rerender } = render(
       viewedTab({ conversationId: "commits-isolated", commitHistory: true }),
