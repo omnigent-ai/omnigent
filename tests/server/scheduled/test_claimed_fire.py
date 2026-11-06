@@ -1474,6 +1474,22 @@ async def test_recovery_waits_out_another_replicas_shutdown_drain(store, monkeyp
     assert [session for session, _ in startup.launch_failures] == [_CONV_ID]
 
 
+async def test_recovery_assumes_the_owner_inside_the_recovered_run(store) -> None:
+    task = _saved_task(store)
+    run = _expired_run(task, conversation_id=None)
+    seen: list[telemetry.ScheduledRunLogContext | None] = []
+
+    @contextlib.asynccontextmanager
+    async def identity(task: ScheduledTask) -> AsyncIterator[None]:
+        seen.append(telemetry.current_scheduled_run())
+        yield
+
+    executor = ClaimedRunExecutor(_deps(store), fire_identity=identity)
+
+    assert await executor.recover(run) == "failed"
+    assert seen == [telemetry.run_log_context(task, run)]
+
+
 async def test_recovery_with_a_revoked_identity_fails_without_inspecting(store) -> None:
     task = _saved_task(store)
     conversations = AsyncMock()
