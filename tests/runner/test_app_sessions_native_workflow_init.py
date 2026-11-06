@@ -50,7 +50,7 @@ from tests.runner.conftest import (
     _spec_resolver_returning,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, history_items_page
 
 
 @pytest.mark.asyncio
@@ -1270,7 +1270,6 @@ class _HistoryFileServerClient(_FakeFileServerClient):
                     "content": [{"type": "output_text", "text": "A photo."}],
                 },
             ],
-            "has_more": False,
         }
 
     async def get(self, url: str, **kwargs: Any) -> Any:
@@ -1279,7 +1278,8 @@ class _HistoryFileServerClient(_FakeFileServerClient):
             raise httpx.ConnectError("file resource endpoint unreachable")
         response = await super().get(url, **kwargs)
         if url.endswith("/items"):
-            response.json = lambda: self._items_payload
+            page = history_items_page(self._items_payload["data"], kwargs.get("params", {}))
+            response.json = lambda: page
         return response
 
 

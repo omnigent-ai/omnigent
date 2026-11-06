@@ -39,7 +39,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, history_items_page
 
 
 @pytest.mark.asyncio
@@ -1558,25 +1558,13 @@ class _FakeServerClient:
 
             return _SnapshotResp()
 
-        after = params.get("after")
-        limit = int(params.get("limit", "100"))
-        items = self._items[::-1] if params.get("order") == "desc" else self._items
-
-        # Find start index based on after cursor.
-        start = 0
-        if after:
-            for i, item in enumerate(items):
-                if item.get("id") == after:
-                    start = i + 1
-                    break
-        page = items[start : start + limit]
-        has_more = (start + limit) < len(items)
+        payload = history_items_page(self._items, params)
 
         class _Resp:
             status_code = 200
 
             def json(self) -> dict[str, Any]:
-                return {"data": page, "has_more": has_more}
+                return payload
 
         return _Resp()
 
