@@ -37,7 +37,7 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
-import { SIGN_IN_EXPIRED_CODE } from "@/lib/identity";
+import { SIGN_IN_EXPIRED_CODE } from "@/lib/signInExpired";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";

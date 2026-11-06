@@ -169,9 +169,9 @@ import {
   getCurrentUserId,
   isSignInExpired,
   resolveSessionHost,
-  SIGN_IN_EXPIRED_CODE,
   subscribeIdentity,
 } from "@/lib/identity";
+import { SIGN_IN_EXPIRED_CODE } from "@/lib/signInExpired";
 import { isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).

@@ -715,9 +715,6 @@ export async function authenticatedFetch(
   return res;
 }
 
-/** Error code for a request answered by a sign-in page instead of the API. */
-export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
-
 // A light authenticated read the SPA already makes at boot. It reaches the same
 // auth edge as the stream and the sends, so its answer speaks for them.
 const SIGN_IN_PROBE_PATH = "/v1/me";
