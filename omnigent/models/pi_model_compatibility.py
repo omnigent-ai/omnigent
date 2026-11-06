@@ -83,6 +83,12 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 # through the Responses API instead and do not need it.
 PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
 
+# Databricks' Gemini translation rejects ``reasoning_effort`` with a 400, on every
+# chat surface. Google's own OpenAI-compatible endpoint accepts it, so match only
+# Databricks-served ids.
+_DATABRICKS_ID_PREFIXES: tuple[str, ...] = ("system.ai.", "databricks-")
+PI_NO_REASONING_EFFORT_FRAGMENTS: tuple[str, ...] = ("gemini",)
+
 # Claude models support extended thinking; reasoning:true enables Pi's controls.
 # Adaptive versus budget-based thinking is configured per model.
 PI_CLAUDE_THINKING_MODEL_FRAGMENTS: tuple[str, ...] = ("claude",)
@@ -168,6 +174,11 @@ def pi_model_json_entry(model: ModelEntry) -> PiModelEntry:
         entry["maxTokens"] = model.metadata.max_output_tokens
     if pi_model_entry_is_reasoning(model):
         entry["reasoning"] = True
+        lower = model.id.lower()
+        if lower.startswith(_DATABRICKS_ID_PREFIXES) and any(
+            fragment in lower for fragment in PI_NO_REASONING_EFFORT_FRAGMENTS
+        ):
+            entry["compat"] = {"supportsReasoningEffort": False}
     return entry
 
 

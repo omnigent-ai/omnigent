@@ -53,6 +53,23 @@ def test_catalog_reasoning_capability_sets_pi_reasoning_flag(
     assert entry.get("reasoning") is True
 
 
+@pytest.mark.parametrize(
+    ("model_id", "suppressed"),
+    [
+        ("system.ai.gemini-3-8-flash", True),
+        ("databricks-gemini-4-argon", True),
+        ("gemini-3-pro", False),
+        ("system.ai.grok-5", False),
+    ],
+)
+def test_databricks_gemini_omits_reasoning_effort(model_id: str, suppressed: bool) -> None:
+    """Databricks-served Gemini rejects ``reasoning_effort``; others keep effort control."""
+    entry = pi_model_json_entry(_entry(model_id, reasoning=True, wire=ModelWireAPI.OPENAI_CHAT))
+
+    assert entry.get("reasoning") is True
+    assert (entry.get("compat", {}).get("supportsReasoningEffort") is False) is suppressed
+
+
 def test_unknown_capability_keeps_vendor_fallbacks() -> None:
     """Without catalog capability data, only DeepSeek and Claude get the flag."""
     deepseek = pi_model_json_entry(

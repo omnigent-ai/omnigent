@@ -1596,6 +1596,36 @@ def test_openai_chat_wire_api_resolves_to_completions(monkeypatch: pytest.Monkey
     assert provider.auth_header is False
 
 
+def test_openai_chat_gateway_sends_system_role_for_reasoning_models() -> None:
+    """A chat-wire gateway renders system instructions, not the ``developer`` role.
+
+    Pi defaults ``supportsDeveloperRole`` to true for unrecognized base URLs and
+    sends ``developer`` for reasoning models, which Gemini and other non-OpenAI
+    servers behind a passthrough proxy reject with a 400.
+    """
+    config = {
+        "providers": {
+            "proxy": {
+                "kind": "gateway",
+                "default": ["pi"],
+                "openai": {
+                    "base_url": "http://127.0.0.1:8399/serving-endpoints/v1",
+                    "api_key": "local",
+                    "wire_api": "chat",
+                    "models": {"default": "databricks-gemini-3-1-pro"},
+                },
+            }
+        }
+    }
+    provider = creds.resolve_pi_native_provider(config_loader=lambda: config)
+    assert provider is not None
+
+    rendered = provider.to_models_config()["providers"][provider.provider_id]
+
+    assert rendered["api"] == "openai-completions"
+    assert rendered.get("compat", {}).get("supportsDeveloperRole") is False
+
+
 def test_openai_responses_wire_api_default() -> None:
     """An OpenAI family without wire_api (or wire_api: responses) → openai-responses API.
 
