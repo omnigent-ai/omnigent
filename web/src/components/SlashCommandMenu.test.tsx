@@ -429,8 +429,18 @@ describe("/mcp panel connection state", () => {
   it("labels connected and sign-in-required rows and leaves stateless rows unlabeled", () => {
     renderPanel({
       mcpServers: [
-        { name: "github", description: "GitHub tools", connection: "connected" },
-        { name: "tracker", connection: "sign-in-required", signIn: { kind: "inline" } },
+        {
+          name: "github",
+          description: "GitHub tools",
+          connection: "connected",
+          icon: "/icons/github.svg",
+        },
+        {
+          name: "tracker",
+          connection: "sign-in-required",
+          signIn: { kind: "inline" },
+          icon: "/icons/tracker.svg",
+        },
         { name: "gone", connection: "unavailable" },
         { name: "local-files" },
       ],
@@ -442,6 +452,12 @@ describe("/mcp panel connection state", () => {
       "Not available to your account",
     );
     expect(screen.getByTestId("mcp-server-row-local-files")).toHaveTextContent(/^local-files$/);
+    // A configured icon stands in for the plug, but never hides a warning.
+    expect(screen.getByTestId("mcp-server-row-github").querySelector("img")).toHaveAttribute(
+      "src",
+      "/icons/github.svg",
+    );
+    expect(screen.getByTestId("mcp-server-row-tracker").querySelector("img")).toBeNull();
     // Only the row that needs it offers the action.
     expect(screen.getAllByRole("button", { name: "Sign in" })).toHaveLength(1);
   });

@@ -8,6 +8,7 @@ import hashlib
 import logging
 import math
 import os
+import re
 import secrets
 import time
 from builtins import ExceptionGroup
@@ -28,6 +29,36 @@ from omnigent.stores.credential_store.secret_cipher import SecretTooLargeError
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
 
 _logger = logging.getLogger(__name__)
+
+# Icons render through <img>, which never runs SVG scripts; keep the catalog response small.
+_MAX_ICON_LENGTH = 32 * 1024
+_DATA_ICON = re.compile(
+    r"data:image/(?:svg\+xml|png|webp)(?:;charset=[\w-]+)?(;base64)?,(.*)", re.IGNORECASE
+)
+
+
+def _valid_icon(icon: str, *, allow_http: bool) -> bool:
+    if len(icon) > _MAX_ICON_LENGTH:
+        return False
+    if data := _DATA_ICON.fullmatch(icon):
+        if data.group(1):
+            try:
+                base64.b64decode(data.group(2), validate=True)
+            except ValueError:
+                return False
+        return True
+    # Browsers drop tabs/newlines and read a backslash as "/", so "/\t/x" would become "//x".
+    if any(c <= " " or c in "\x7f\\" for c in icon):
+        return False
+    if icon.startswith("/"):
+        return not icon.startswith("//")
+    parsed = urlsplit(icon)
+    return (
+        parsed.scheme in ({"http", "https"} if allow_http else {"https"})
+        and bool(parsed.hostname)
+        and not parsed.username
+        and not parsed.password
+    )
 
 
 class McpUpstreamError(ConnectionError):
@@ -99,6 +130,7 @@ class McpService(BaseModel):
     tools: list[str] = Field(min_length=1)
     allow_http: bool = False
     timeout: int = Field(default=60, ge=1, le=300)
+    icon: str | None = None
 
     @model_validator(mode="after")
     def validate_service(self) -> McpService:
@@ -121,6 +153,11 @@ class McpService(BaseModel):
                 raise ValueError(
                     "MCP/OAuth URLs require HTTPS (allow_http is for local development)"
                 )
+        if self.icon is not None and not _valid_icon(self.icon, allow_http=self.allow_http):
+            raise ValueError(
+                "MCP service icon must be an https:// URL, a same-origin /path, or a base64 or "
+                "URL-encoded data:image/svg+xml, png or webp URI of at most 32 KB"
+            )
         return self
 
     def permits(self, user_id: str) -> bool:

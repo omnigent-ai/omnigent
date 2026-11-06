@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { PlugIcon } from "lucide-react";
+import { McpServiceIcon } from "@/components/McpServiceIcon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -78,9 +78,12 @@ function ServiceConnection({
   return (
     <div className="space-y-2 rounded-md border border-border p-3">
       <div className="flex items-center justify-between gap-2">
-        <div>
-          <p className="text-sm font-medium">{service.title}</p>
-          <p className="text-sm text-muted-foreground">{service.description}</p>
+        <div className="flex items-center gap-2">
+          {service.icon && <McpServiceIcon service={service} className="size-5" />}
+          <div>
+            <p className="text-sm font-medium">{service.title}</p>
+            <p className="text-sm text-muted-foreground">{service.description}</p>
+          </div>
         </div>
         <span className="text-xs text-muted-foreground">
           {service.connected ? "Connected" : "Not connected"}
@@ -264,7 +267,7 @@ export function McpRegistryPicker({
             <li key={service.id} className="px-3 py-1.5">
               <label className="flex items-center gap-3" title={service.description}>
                 <span className="flex min-w-0 flex-1 items-center gap-2">
-                  <PlugIcon className="size-4 shrink-0 text-muted-foreground" />
+                  <McpServiceIcon service={service} className="size-4 text-muted-foreground" />
                   <span className="min-w-0">
                     <span className="block truncate text-sm text-foreground">{service.title}</span>
                     <span

@@ -3,6 +3,8 @@ services:
   - id: tracker
     title: Demo work tracker
     description: Connect a fictional account and read tickets from any sandbox.
+    # Optional: https:// URL, same-origin /path, or a small data:image/{svg+xml,png,webp} URI.
+    icon: "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='3' y='5' width='18' height='14' rx='2' fill='%2310b981'/></svg>"
     url: http://127.0.0.1:18782/mcp
     auth: oauth
     allow_http: true # Local demo only. Production defaults to HTTPS.

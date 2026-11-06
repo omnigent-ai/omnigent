@@ -3858,6 +3858,7 @@ function ComposerImpl(
         const service = registryCatalog.services.find((s) => s.id === server.name);
         if (service) {
           row.description = service.description || row.description;
+          row.icon = service.icon;
           row.connection = service.connected ? "connected" : "sign-in-required";
           if (!service.connected) {
             // A token or workspace URL has to be typed, which the panel has no room for.

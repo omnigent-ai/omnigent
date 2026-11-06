@@ -295,6 +295,11 @@ admin database/UI. Settings shows users only the entries they can access.
 | `oauth` | Authorization/token URLs, client ID, scopes, optional `resource` and `client_secret_env`. |
 | `timeout` | Overall MCP request timeout in seconds; default 60, maximum 300. |
 | `allow_http` | Explicit local-development opt-in for upstream HTTP URLs. |
+| `icon` | Optional list icon: an `https://` URL (`http://` only with `allow_http`), a same-origin `/path`, or a `data:image/svg+xml`, `image/png` or `image/webp` URI (base64 or URL-encoded, at most 32 KB). Other values fail startup; unset or unloadable icons show the default plug. |
+
+Browsers fetch `icon` URLs directly, without a referrer. The web app sets no
+`img-src` Content-Security-Policy, so any HTTPS host works; a proxy that adds one
+must allow the icon hosts (or `data:`).
 
 For generic OAuth, register the callback
 `<public_url>/v1/connections/mcp-<service-id>/callback` with the provider.

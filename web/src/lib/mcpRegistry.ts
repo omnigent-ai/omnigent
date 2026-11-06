@@ -10,6 +10,8 @@ export interface RegistryService {
   connected: boolean;
   tools: string[];
   connect_provider: string;
+  /** Operator-configured image URL or data URI; null shows the default icon. */
+  icon?: string | null;
 }
 
 export async function registryRequest<T>(path = "", init?: RequestInit): Promise<T> {
