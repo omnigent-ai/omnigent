@@ -8,6 +8,7 @@ import errno
 import io
 import itertools
 import json
+import logging
 import os
 import queue
 import select
@@ -2037,6 +2038,63 @@ def test_read_transcript_items_from_offset_skips_existing_prefix(
         "agent": "claude-native-ui",
         "content": [{"type": "output_text", "text": "new output"}],
     }
+
+
+def test_read_transcript_items_from_offset_warns_on_unmirrored_human_prompt(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A human-typed prompt that yields no user message is logged by shape.
+
+    A web message whose pasted text quotes Claude's shell markup parses as a
+    terminal command, so the server never sees its user message and later
+    reports it as never recorded. Plain prompts and real command echoes stay
+    quiet, and the warning never carries the prompt text.
+    """
+    pasted_logs = (
+        '\n\n<pasted_content id="a1">\nwhy did this fail?\n'
+        "<bash-input>make test</bash-input><bash-stdout>secret-output</bash-stdout>\n"
+        '</pasted_content id="a1">\n'
+    )
+    records = [
+        {
+            "type": "user",
+            "uuid": "lost",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": pasted_logs},
+        },
+        {
+            "type": "user",
+            "uuid": "plain",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "fix the bug"},
+        },
+        {
+            "type": "user",
+            "uuid": "command",
+            "origin": {"kind": "human"},
+            "message": {"role": "user", "content": "<command-name>/model</command-name>"},
+        },
+    ]
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        result = read_transcript_items_from_offset(
+            transcript_path, 0, start_line=0, agent_name="claude-native-ui"
+        )
+
+    lost_types = {item.item_type for item in result.items if item.source_id.startswith("lost:")}
+    assert lost_types == {"terminal_command"}
+    warnings = [r.getMessage() for r in caplog.records if "human prompt record" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "line=1 " in warnings[0]
+    assert "has_shell_markup=True" in warnings[0]
+    assert "item_types=['terminal_command']" in warnings[0]
+    assert "secret-output" not in warnings[0]
 
 
 def test_read_transcript_items_from_offset_preserves_partial_trailing_line(
