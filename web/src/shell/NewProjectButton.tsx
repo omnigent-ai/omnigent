@@ -22,6 +22,7 @@ import { EmojiPicker } from "@/components/ProjectIconPicker";
 import { useCloneHostRepository } from "@/hooks/useCloneHostRepository";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { deriveRepoName } from "@/lib/sandboxRepositories";
 import {
   CloneRepositoryFields,
@@ -31,12 +32,9 @@ import {
 } from "./CloneRepository";
 
 /**
- * "New project" control in the Projects group header. Opens a dialog that
- * creates a first-class project (`POST /v1/projects`) — the capability the
- * legacy label model can't express. The optional clone section first clones a
- * repository onto a host and stores that checkout as the project's default
- * host and working directory. On success the new folder is expanded (via
- * `onCreated`) so the user can immediately file sessions into it.
+ * "New project" control in the Projects group header. Creates a project,
+ * optionally cloning a repository as its default workspace, then expands it
+ * via `onCreated`.
  */
 export function NewProjectButton({ onCreated }: { onCreated: (name: string) => void }) {
   const [open, setOpen] = useState(false);
@@ -46,22 +44,28 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
   const [cloneOpen, setCloneOpen] = useState(false);
   const [cloneHostId, setCloneHostId] = useState<string | null>(null);
   const [cloneUrl, setCloneUrl] = useState("");
-  const [cloneParent, setCloneParent] = useState("~");
+  // ``null`` until the user edits the folder; until then it follows the host.
+  const [cloneParentDraft, setCloneParentDraft] = useState<string | null>(null);
   const createProject = useCreateProject();
   const cloneRepository = useCloneHostRepository();
+  const info = useServerInfo();
+  const cloneSupported = info !== "loading" && info.host_repository_clone === true;
   const { data: hosts } = useHosts({ enabled: open });
+  // An explicitly chosen host stays listed while offline, so it is never swapped silently.
   const cloneHosts = (hosts ?? []).filter(
-    (host) => host.status === "online" && host.sandbox_provider == null,
+    (host) =>
+      host.sandbox_provider == null && (host.status === "online" || host.host_id === cloneHostId),
   );
-  // Default to the first online host until the user picks one.
   const selectedCloneHostId =
-    cloneHostId !== null && cloneHosts.some((host) => host.host_id === cloneHostId)
-      ? cloneHostId
-      : (cloneHosts[0]?.host_id ?? null);
+    cloneHostId ?? cloneHosts.find((host) => host.status === "online")?.host_id ?? null;
+  const selectedCloneHost = cloneHosts.find((host) => host.host_id === selectedCloneHostId);
+  const selectedCloneHostOnline = selectedCloneHost?.status === "online";
+  const cloneParent = cloneParentDraft ?? readLastCloneParent(selectedCloneHostId);
   const cloneRequested = cloneOpen && cloneUrl.trim() !== "";
   const cloneReady =
     cloneRequested &&
     selectedCloneHostId !== null &&
+    selectedCloneHostOnline &&
     cloneDestination(cloneUrl, cloneParent) !== null;
   const projectName = name.trim() || (cloneReady ? (deriveRepoName(cloneUrl) ?? "") : "");
   const pending = createProject.isPending || cloneRepository.isPending;
@@ -72,6 +76,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
     setIcon(undefined);
     setCloneOpen(false);
     setCloneUrl("");
+    setCloneParentDraft(null);
     createProject.reset();
     cloneRepository.reset();
   };
@@ -96,7 +101,7 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
         parentDirectory: cloneParent,
       }));
     } catch {
-      return; // Shown inline from the mutation's error state.
+      return;
     }
     rememberCloneParent(selectedCloneHostId, cloneParent);
     createProject.mutate(
@@ -105,10 +110,10 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
     );
   };
 
-  const openCloneSection = () => {
-    const nextOpen = !cloneOpen;
-    setCloneOpen(nextOpen);
-    if (nextOpen) setCloneParent(readLastCloneParent(selectedCloneHostId));
+  const toggleCloneSection = () => {
+    setCloneOpen(!cloneOpen);
+    setCloneParentDraft(null);
+    cloneRepository.reset();
   };
 
   return (
@@ -229,69 +234,86 @@ export function NewProjectButton({ onCreated }: { onCreated: (name: string) => v
               }}
             />
           </div>
-          <div className="flex flex-col gap-3">
-            <button
-              type="button"
-              className="flex w-fit items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground"
-              aria-expanded={cloneOpen}
-              data-testid="new-project-clone-toggle"
-              disabled={pending}
-              onClick={openCloneSection}
-            >
-              {cloneOpen ? (
-                <ChevronDownIcon className="size-4" />
-              ) : (
-                <ChevronRightIcon className="size-4" />
-              )}
-              Clone a repository
-            </button>
-            {cloneOpen && (
-              <div className="flex flex-col gap-3" data-testid="new-project-clone-section">
-                <div className="flex flex-col gap-1.5">
-                  <label className="text-sm font-medium text-muted-foreground">Host</label>
-                  {cloneHosts.length === 0 ? (
-                    <p className="text-sm text-muted-foreground" data-testid="new-project-no-host">
-                      Connect a host to clone a repository onto it.
-                    </p>
-                  ) : (
-                    <Select
-                      value={selectedCloneHostId ?? undefined}
-                      onValueChange={(hostId) => {
-                        setCloneHostId(hostId);
-                        setCloneParent(readLastCloneParent(hostId));
-                      }}
-                      disabled={pending}
-                    >
-                      <SelectTrigger
-                        aria-label="Host"
-                        data-testid="new-project-clone-host"
-                        className="w-full"
+          {cloneSupported && (
+            <div className="flex flex-col gap-3">
+              <button
+                type="button"
+                className="flex w-fit items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground"
+                aria-expanded={cloneOpen}
+                data-testid="new-project-clone-toggle"
+                disabled={pending}
+                onClick={toggleCloneSection}
+              >
+                {cloneOpen ? (
+                  <ChevronDownIcon className="size-4" />
+                ) : (
+                  <ChevronRightIcon className="size-4" />
+                )}
+                Clone a repository
+              </button>
+              {cloneOpen && (
+                <div className="flex flex-col gap-3" data-testid="new-project-clone-section">
+                  <div className="flex flex-col gap-1.5">
+                    <label className="text-sm font-medium text-muted-foreground">Host</label>
+                    {cloneHosts.length === 0 ? (
+                      <p
+                        className="text-sm text-muted-foreground"
+                        data-testid="new-project-no-host"
                       >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {cloneHosts.map((host) => (
-                          <SelectItem key={host.host_id} value={host.host_id}>
-                            {host.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  )}
+                        Connect a host to clone a repository onto it.
+                      </p>
+                    ) : (
+                      <Select
+                        value={selectedCloneHostId ?? undefined}
+                        onValueChange={(hostId) => {
+                          setCloneHostId(hostId);
+                          setCloneParentDraft(null);
+                          cloneRepository.reset();
+                        }}
+                        disabled={pending}
+                      >
+                        <SelectTrigger
+                          aria-label="Host"
+                          data-testid="new-project-clone-host"
+                          className="w-full"
+                        >
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {cloneHosts.map((host) => (
+                            <SelectItem key={host.host_id} value={host.host_id}>
+                              {host.status === "online" ? host.name : `${host.name} (offline)`}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    )}
+                    {selectedCloneHost && !selectedCloneHostOnline && (
+                      <p
+                        className="text-sm text-destructive"
+                        data-testid="new-project-clone-host-offline"
+                      >
+                        {selectedCloneHost.name} is offline. Reconnect it or choose another host.
+                      </p>
+                    )}
+                  </div>
+                  <CloneRepositoryFields
+                    hostId={selectedCloneHostId}
+                    url={cloneUrl}
+                    onUrlChange={(url) => {
+                      setCloneUrl(url);
+                      cloneRepository.reset();
+                    }}
+                    parentDirectory={cloneParent}
+                    onParentDirectoryChange={setCloneParentDraft}
+                    onSubmit={() => void submit()}
+                    disabled={pending}
+                  />
                 </div>
-                <CloneRepositoryFields
-                  hostId={selectedCloneHostId}
-                  url={cloneUrl}
-                  onUrlChange={setCloneUrl}
-                  parentDirectory={cloneParent}
-                  onParentDirectoryChange={setCloneParent}
-                  onSubmit={() => void submit()}
-                  disabled={pending}
-                />
-              </div>
-            )}
-          </div>
-          {cloneRepository.isError && (
+              )}
+            </div>
+          )}
+          {cloneOpen && cloneRepository.isError && (
             <p
               className="text-ui break-words text-destructive"
               role="alert"

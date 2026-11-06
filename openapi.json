@@ -6194,6 +6194,11 @@
             "title": "Harness Install Enabled",
             "type": "boolean"
           },
+          "host_repository_clone": {
+            "default": true,
+            "title": "Host Repository Clone",
+            "type": "boolean"
+          },
           "installable_harnesses": {
             "items": {
               "type": "string"

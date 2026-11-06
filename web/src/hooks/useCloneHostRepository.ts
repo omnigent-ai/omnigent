@@ -1,7 +1,15 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "@/lib/identity";
-import { apiErrorFromResponse } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
+
+/** The route's own 404 detail; any other 404 means the route itself is missing. */
+const HOST_NOT_FOUND_DETAIL = "host not found";
+
+/** Shown when the server predates the clone route, e.g. after a rollback. */
+export const CLONE_UNSUPPORTED_MESSAGE =
+  "This Omnigent server can't clone repositories yet. Update the server, or clone the " +
+  "repository on the host and choose its folder instead.";
 
 /** A checkout returned by ``POST /v1/hosts/{id}/repositories``. */
 export interface ClonedHostRepository {
@@ -31,7 +39,8 @@ interface CloneHostRepositoryResponse {
  * @param parentDirectory Absolute or ``~`` folder that will hold the checkout.
  * @returns The checkout's path and name.
  * @throws ApiError carrying the server's reason, e.g. a 409 when the
- *   destination folder already exists or a 422 when git fails.
+ *   destination folder already exists or a 422 when git fails, or
+ *   {@link CLONE_UNSUPPORTED_MESSAGE} when the server has no clone route.
  */
 export async function cloneHostRepository(
   hostId: string,
@@ -43,7 +52,13 @@ export async function cloneHostRepository(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url: url.trim(), parent_directory: parentDirectory.trim() }),
   });
-  if (!res.ok) throw await apiErrorFromResponse(res);
+  if (!res.ok) {
+    const error = await apiErrorFromResponse(res);
+    const routeMissing =
+      res.status === 405 || (res.status === 404 && error.message !== HOST_NOT_FOUND_DETAIL);
+    if (routeMissing) throw new ApiError(CLONE_UNSUPPORTED_MESSAGE, res.status, error.code);
+    throw error;
+  }
   const body = (await res.json()) as CloneHostRepositoryResponse;
   return { path: body.path, name: body.name, reusedExisting: body.reused_existing };
 }

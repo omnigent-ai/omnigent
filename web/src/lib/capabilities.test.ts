@@ -309,6 +309,16 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
   });
 });
 
+describe("resolveServerInfo host_repository_clone", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ host_repository_clone: true })).host_repository_clone).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).host_repository_clone).toBe(false);
+  });
+});
+
 describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   it.each([
     [true, true],

@@ -268,6 +268,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_worktrees: bool = True
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
     archive_worktree_cleanup: bool = True
+    # POST /v1/hosts/{id}/repositories exists; older servers have no clone route.
+    host_repository_clone: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
@@ -3648,6 +3650,7 @@ def create_app(
                 "dictation_available": dictation_available,
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
+                "host_repository_clone": True,
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,

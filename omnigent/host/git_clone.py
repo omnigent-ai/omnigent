@@ -15,8 +15,10 @@ import shutil
 import subprocess
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+
+from omnigent.inner._proc import kill_tree, spawn_kwargs
 
 _logger = logging.getLogger(__name__)
 
@@ -25,6 +27,9 @@ CLONE_REPOSITORY_BUDGET_S: float = 1800.0
 
 # Metadata probes on an existing checkout finish well within this.
 _PROBE_TIMEOUT_S: float = 30.0
+
+# How long to wait for a killed git to be reaped before giving up on it.
+_REAP_TIMEOUT_S: float = 5.0
 
 # Mirrors the server's accepted repository URL forms. Checked again here so a
 # frame can never smuggle a git transport such as ``ext::`` or a local path.
@@ -94,20 +99,29 @@ def _run_git(args: list[str], *, timeout_s: float) -> subprocess.CompletedProces
     :param timeout_s: Seconds before git is killed.
     :returns: The completed process with captured text output.
     :raises FileNotFoundError: If git is not installed.
-    :raises subprocess.TimeoutExpired: If git exceeds ``timeout_s``.
+    :raises subprocess.TimeoutExpired: If git exceeds ``timeout_s``; git and
+        its transport helpers have been killed by then.
     """
-    return subprocess.run(
+    process = subprocess.Popen(
         ["git", *args],
         env=_git_env(),
         stdin=subprocess.DEVNULL,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout_s,
-        check=False,
         # A new session has no controlling terminal, so ssh cannot stop to ask
         # for a passphrase or host-key confirmation on the daemon's tty.
-        start_new_session=True,
+        **spawn_kwargs(),
     )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        # Helpers such as ssh or git-remote-https share git's group; stop them all.
+        kill_tree(process)
+        with suppress(subprocess.TimeoutExpired):
+            process.communicate(timeout=_REAP_TIMEOUT_S)
+        raise
+    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
 
 
 def _normalize_remote(url: str) -> str:
@@ -146,6 +160,26 @@ def _existing_checkout_matches(destination: str, url: str) -> bool:
     except (OSError, subprocess.TimeoutExpired):
         return False
     return origin.returncode == 0 and _normalize_remote(origin.stdout) == _normalize_remote(url)
+
+
+def _has_commit_checked_out(destination: str) -> bool:
+    """Return whether ``destination``'s ``HEAD`` resolves to a commit.
+
+    ``git clone`` records the remote before fetching, so a clone killed
+    mid-fetch leaves a checkout of the right remote with no commit.
+
+    :param destination: Absolute path of an existing checkout.
+    :returns: ``False`` for an unfinished clone (or a clone of an empty
+        repository).
+    """
+    try:
+        head = _run_git(
+            ["-C", destination, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"],
+            timeout_s=_PROBE_TIMEOUT_S,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return head.returncode == 0
 
 
 def _summarize_git_error(stderr: str) -> str:
@@ -191,8 +225,8 @@ def clone_repository(
 ) -> ClonedRepository:
     """Clone ``url`` into ``parent_directory/directory_name`` on this host.
 
-    A destination that already holds a checkout of the same remote is
-    returned as-is, so retrying after a dropped request links the finished
+    A destination that already holds a finished checkout of the same remote
+    is returned as-is, so retrying after a dropped request links the finished
     clone instead of failing. Any other existing path is a conflict.
 
     :param url: ``https://`` or ``git@`` clone URL, e.g.
@@ -218,6 +252,12 @@ def clone_repository(
     with _claim_destination(destination):
         if os.path.lexists(destination):
             if _existing_checkout_matches(destination, url):
+                if not _has_commit_checked_out(destination):
+                    raise CloneError(
+                        f"{destination} holds an unfinished clone of this repository. "
+                        "Delete it, then try again.",
+                        conflict=True,
+                    )
                 _logger.info("Reusing existing checkout of %s at %s", url, destination)
                 return ClonedRepository(path=destination, reused_existing=True)
             raise CloneError(

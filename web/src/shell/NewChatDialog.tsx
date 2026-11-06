@@ -2455,6 +2455,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const hostRepositoryCloneSupported = info !== "loading" && info.host_repository_clone === true;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
@@ -6641,25 +6642,27 @@ export function NewChatLandingScreen() {
                   Open folder
                 </button>
               </MenuItem>
-              <MenuItem
-                asChild
-                density="compact"
-                className="max-md:hover:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-2 max-md:focus-visible:ring-ring/50"
-              >
-                <button
-                  type="button"
-                  className="w-full text-left"
-                  disabled={selectedHostId === null}
-                  onClick={() => {
-                    setWorkspacePopoverOpen(false);
-                    setCloneRepositoryOpen(true);
-                  }}
-                  data-testid="new-chat-landing-workspace-clone-repository"
+              {hostRepositoryCloneSupported && (
+                <MenuItem
+                  asChild
+                  density="compact"
+                  className="max-md:hover:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-2 max-md:focus-visible:ring-ring/50"
                 >
-                  <FolderGit2Icon className="size-4 shrink-0 text-muted-foreground" />
-                  Clone repository…
-                </button>
-              </MenuItem>
+                  <button
+                    type="button"
+                    className="w-full text-left"
+                    disabled={selectedHostId === null}
+                    onClick={() => {
+                      setWorkspacePopoverOpen(false);
+                      setCloneRepositoryOpen(true);
+                    }}
+                    data-testid="new-chat-landing-workspace-clone-repository"
+                  >
+                    <FolderGit2Icon className="size-4 shrink-0 text-muted-foreground" />
+                    Clone repository…
+                  </button>
+                </MenuItem>
+              )}
             </PopoverContent>
           </Popover>
           {/* Worktree selection stays a separate real action from the directory picker. */}

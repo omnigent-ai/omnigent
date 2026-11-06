@@ -152,11 +152,13 @@ async def _post(app: FastAPI, body: dict[str, Any], route: str = _ROUTE) -> Any:
         return await client.post(route, json=body)
 
 
+@pytest.mark.parametrize("reused_existing", [False, True])
 async def test_clone_forwards_parsed_repository_and_returns_checkout(
-    clone_host: tuple[FastAPI, _FakeHost],
+    clone_host: tuple[FastAPI, _FakeHost], reused_existing: bool
 ) -> None:
-    """The host receives the parsed name and budget; the route returns its path."""
+    """The host receives the parsed name and budget; the route returns its result."""
     app, fake = clone_host
+    fake.reply = {"status": "ok", "path": "~/code/widgets", "reused_existing": reused_existing}
     response = await _post(
         app, {"url": " git@github.com:acme/widgets.git ", "parent_directory": "~/code"}
     )
@@ -166,25 +168,13 @@ async def test_clone_forwards_parsed_repository_and_returns_checkout(
         "object": "repository_clone",
         "path": "~/code/widgets",
         "name": "widgets",
-        "reused_existing": False,
+        "reused_existing": reused_existing,
     }
     [frame] = fake.frames
     assert frame.url == "git@github.com:acme/widgets.git"
     assert frame.parent_directory == "~/code"
     assert frame.directory_name == "widgets"
     assert frame.timeout_s == CLONE_REPOSITORY_BUDGET_S
-
-
-async def test_clone_reports_reused_checkout(clone_host: tuple[FastAPI, _FakeHost]) -> None:
-    """A retry that finds the same remote already checked out reports reuse."""
-    app, fake = clone_host
-    fake.reply = {"status": "ok", "path": "/work/widgets", "reused_existing": True}
-    response = await _post(
-        app, {"url": "https://github.com/acme/widgets", "parent_directory": "/work"}
-    )
-
-    assert response.status_code == 200, response.text
-    assert response.json()["reused_existing"] is True
 
 
 @pytest.mark.parametrize(

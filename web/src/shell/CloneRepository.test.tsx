@@ -3,7 +3,13 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CloneRepositoryDialog, cloneDestination, readLastCloneParent } from "./CloneRepository";
+import { CLONE_UNSUPPORTED_MESSAGE } from "@/hooks/useCloneHostRepository";
+import {
+  CloneRepositoryDialog,
+  cloneDestination,
+  readLastCloneParent,
+  rememberCloneParent,
+} from "./CloneRepository";
 
 const HOST_ID = "host_abc";
 
@@ -31,6 +37,20 @@ describe("cloneDestination", () => {
     ["https://github.com/acme/widgets", "code"],
   ])("is null for unusable input %s into %s", (url, parent) => {
     expect(cloneDestination(url, parent)).toBeNull();
+  });
+});
+
+describe("remembered clone folders", () => {
+  beforeEach(() => localStorage.clear());
+
+  it.each(['"abc"', "[1, 2]", "null", "{not json"])("ignores and replaces stored %s", (stored) => {
+    localStorage.setItem("omnigent:clone-repository-parent", stored);
+
+    expect(readLastCloneParent(HOST_ID)).toBe("~");
+    rememberCloneParent(HOST_ID, "~/code");
+    expect(JSON.parse(localStorage.getItem("omnigent:clone-repository-parent") ?? "")).toEqual({
+      [HOST_ID]: "~/code",
+    });
   });
 });
 
@@ -105,8 +125,14 @@ describe("CloneRepositoryDialog", () => {
       ),
     );
     const onCloned = vi.fn();
+    const onOpenChange = vi.fn();
     renderWithClient(
-      <CloneRepositoryDialog open onOpenChange={vi.fn()} hostId={HOST_ID} onCloned={onCloned} />,
+      <CloneRepositoryDialog
+        open
+        onOpenChange={onOpenChange}
+        hostId={HOST_ID}
+        onCloned={onCloned}
+      />,
     );
 
     fireEvent.change(screen.getByTestId("clone-repository-url"), {
@@ -118,6 +144,25 @@ describe("CloneRepositoryDialog", () => {
       "Permission denied (publickey).",
     );
     expect(onCloned).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+  });
+
+  it.each([
+    [404, "Not Found", CLONE_UNSUPPORTED_MESSAGE],
+    [405, "Method Not Allowed", CLONE_UNSUPPORTED_MESSAGE],
+    [404, "host not found", "host not found"],
+  ])("explains a %i %s response", async (status, detail, shown) => {
+    fetchMock.mockResolvedValue(jsonResponse({ detail }, status));
+    renderWithClient(
+      <CloneRepositoryDialog open onOpenChange={vi.fn()} hostId={HOST_ID} onCloned={vi.fn()} />,
+    );
+
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "https://github.com/acme/widgets" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+
+    expect(await screen.findByTestId("clone-repository-error")).toHaveTextContent(shown);
   });
 
   it("flags a URL with an embedded token without sending it", () => {

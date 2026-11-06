@@ -7,9 +7,13 @@ that bare repository so the accepted-URL check stays in force without network.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
+import sys
+import time
 from pathlib import Path
 
+import psutil  # type: ignore[import-untyped]
 import pytest
 
 from omnigent.host import git_clone
@@ -104,6 +108,20 @@ def test_retry_reuses_checkout_of_same_remote(
     assert (Path(first.path) / "local-change.txt").read_text() == "keep me"
 
 
+def test_unfinished_clone_of_same_remote_is_a_conflict(remote: Path, tmp_path: Path) -> None:
+    """A checkout of the remote with no commit (a killed clone) is not reused."""
+    unfinished = tmp_path / "widgets"
+    unfinished.mkdir()
+    _git(unfinished, "init", "-q")
+    _git(unfinished, "remote", "add", "origin", _URL)
+
+    with pytest.raises(CloneError, match="unfinished clone") as raised:
+        clone_repository(url=_URL, parent_directory=str(tmp_path), directory_name="widgets")
+
+    assert raised.value.conflict is True
+    assert (unfinished / ".git").is_dir()
+
+
 def test_existing_unrelated_folder_is_a_conflict_and_untouched(
     remote: Path, tmp_path: Path
 ) -> None:
@@ -162,6 +180,38 @@ def test_timeout_removes_partial_checkout(tmp_path: Path, monkeypatch: pytest.Mo
         )
 
     assert not (tmp_path / "widgets").exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fake git is a POSIX shell script")
+def test_timeout_kills_git_transport_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out git takes its helper processes (ssh, remote-https) down with it."""
+    helper_pid_file = tmp_path / "helper.pid"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    sleep = shutil.which("sleep")
+    fake_git.write_text(f"#!/bin/sh\n{sleep} 60 &\necho $! > {helper_pid_file}\nwait\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        git_clone._run_git(["clone"], timeout_s=1)
+
+    assert time.monotonic() - started < 30
+    helper_pid = int(helper_pid_file.read_text())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            if psutil.Process(helper_pid).status() == psutil.STATUS_ZOMBIE:
+                break
+        except psutil.NoSuchProcess:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail(f"git helper {helper_pid} outlived the timed-out clone")
 
 
 def test_concurrent_clone_into_same_destination_is_a_conflict(tmp_path: Path) -> None:

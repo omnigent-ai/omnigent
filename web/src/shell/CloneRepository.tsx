@@ -27,15 +27,31 @@ const DEFAULT_CLONE_PARENT = "~";
 export function readLastCloneParent(hostId: string | null): string {
   if (hostId === null) return DEFAULT_CLONE_PARENT;
   try {
-    const stored = JSON.parse(localStorage.getItem(CLONE_PARENT_STORAGE_KEY) ?? "{}") as Record<
-      string,
-      unknown
-    >;
-    const parent = stored[hostId];
+    const parent = readStoredCloneParents()[hostId];
     return typeof parent === "string" && isNavigablePath(parent) ? parent : DEFAULT_CLONE_PARENT;
   } catch {
     return DEFAULT_CLONE_PARENT;
   }
+}
+
+/**
+ * The remembered per-host clone folders, or ``{}`` when storage holds anything
+ * other than a JSON object.
+ *
+ * @returns Stored values keyed by host id.
+ * @throws When storage is unavailable.
+ */
+function readStoredCloneParents(): Record<string, unknown> {
+  const raw = localStorage.getItem(CLONE_PARENT_STORAGE_KEY);
+  let stored: unknown;
+  try {
+    stored = JSON.parse(raw ?? "{}");
+  } catch {
+    return {};
+  }
+  return typeof stored === "object" && stored !== null && !Array.isArray(stored)
+    ? (stored as Record<string, unknown>)
+    : {};
 }
 
 /**
@@ -46,10 +62,7 @@ export function readLastCloneParent(hostId: string | null): string {
  */
 export function rememberCloneParent(hostId: string, parent: string): void {
   try {
-    const stored = JSON.parse(localStorage.getItem(CLONE_PARENT_STORAGE_KEY) ?? "{}") as Record<
-      string,
-      string
-    >;
+    const stored = readStoredCloneParents();
     localStorage.setItem(
       CLONE_PARENT_STORAGE_KEY,
       JSON.stringify({ ...stored, [hostId]: parent.trim() }),
@@ -72,6 +85,19 @@ export function cloneDestination(url: string, parent: string): string | null {
   const trimmedParent = parent.trim();
   if (name === null || !isNavigablePath(trimmedParent)) return null;
   return joinPath(trimmedParent, name);
+}
+
+/**
+ * Helper text under the destination field.
+ *
+ * @param parentInvalid Whether the parent folder is unusable.
+ * @param destination Checkout path from {@link cloneDestination}, or ``null``.
+ * @returns The hint to show.
+ */
+function destinationHint(parentInvalid: boolean, destination: string | null): string {
+  if (parentInvalid) return "Use an absolute folder or one under ~.";
+  if (destination) return `Clones into ${destination} using this host's git credentials.`;
+  return "Uses this host's git credentials, such as its SSH keys.";
 }
 
 export interface CloneRepositoryFieldsProps {
@@ -164,11 +190,7 @@ export function CloneRepositoryFields({
           </Button>
         </div>
         <p className="text-sm text-muted-foreground" data-testid="clone-repository-destination">
-          {parentInvalid
-            ? "Use an absolute folder or one under ~."
-            : destination
-              ? `Clones into ${destination} using this host's git credentials.`
-              : "Uses this host's git credentials, such as its SSH keys."}
+          {destinationHint(parentInvalid, destination)}
         </p>
       </div>
       <WorkspacePickerDialog

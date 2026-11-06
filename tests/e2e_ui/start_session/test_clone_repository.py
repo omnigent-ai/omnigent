@@ -55,7 +55,7 @@ def _make_remote(forge: Path, slug: str) -> None:
 
 
 def _hello_world_agent_id(base_url: str) -> str:
-    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0).json()["data"]
+    agents = httpx.get(f"{base_url}/v1/agents", timeout=10.0, trust_env=False).json()["data"]
     return next(agent["id"] for agent in agents if agent["name"] == "hello_world")
 
 
@@ -139,7 +139,9 @@ def _send_first_message(page: Page, mock_url: str, text: str) -> str:
 
 
 def _assert_session_in(base_url: str, session_id: str, host_id: str, workspace: Path) -> None:
-    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0).json()
+    snapshot = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}", timeout=10.0, trust_env=False
+    ).json()
     assert snapshot.get("host_id") == host_id, snapshot
     assert snapshot.get("workspace") == str(workspace), snapshot
 
@@ -147,7 +149,17 @@ def _assert_session_in(base_url: str, session_id: str, host_id: str, workspace: 
 def _delete_sessions(base_url: str, session_ids: list[str]) -> None:
     for session_id in session_ids:
         with contextlib.suppress(httpx.HTTPError):
-            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
+            httpx.delete(f"{base_url}/v1/sessions/{session_id}", timeout=10.0, trust_env=False)
+
+
+def _delete_projects_named(base_url: str, name: str) -> None:
+    with (
+        contextlib.suppress(httpx.HTTPError),
+        httpx.Client(base_url=base_url, trust_env=False, timeout=10.0) as client,
+    ):
+        for project in client.get("/v1/projects").json()["data"]:
+            if project["name"] == name:
+                client.delete(f"/v1/projects/{project['id']}")
 
 
 def test_clone_repository_from_composer_workspace_menu(
@@ -199,6 +211,7 @@ def test_new_project_clones_repository_as_its_default_workspace(
     page: Page = request.getfixturevalue("page")
     _seed_composer(page, clone_host)
     request.addfinalizer(lambda: _delete_sessions(clone_host.base_url, sessions))
+    request.addfinalizer(lambda: _delete_projects_named(clone_host.base_url, "billing-api"))
     page.goto(f"{clone_host.base_url}/")
     expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=30_000)
     _pause(page, 1500)

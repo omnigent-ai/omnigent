@@ -5554,7 +5554,7 @@ describe("NewChatLandingScreen", () => {
       name: "widgets",
       reusedExisting: false,
     });
-    renderLanding();
+    renderLanding({ host_repository_clone: true });
 
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     fireEvent.click(workspace);
@@ -5576,6 +5576,17 @@ describe("NewChatLandingScreen", () => {
     expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1).toContain(
       "/Users/corey/code/widgets",
     );
+  });
+
+  it("hides Clone repository on a server without the clone route", () => {
+    renderLanding();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+
+    expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("new-chat-landing-workspace-clone-repository"),
+    ).not.toBeInTheDocument();
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {
