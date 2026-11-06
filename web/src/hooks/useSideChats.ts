@@ -46,11 +46,15 @@ export function useSideChats(conversationId: string) {
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
   // WorkspacePanel isn't remounted when the user navigates to another
   // conversation (conversationId is a prop, not a key), so reload this
-  // conversation's own tabs on change — otherwise the previous conversation's
-  // side-chat tabs would linger in the new one's rail.
+  // conversation's own tabs on change — during render, so the previous
+  // conversation's side-chat tabs never reach the new one's first frame.
+  const [stateConversationId, setStateConversationId] = useState(conversationId);
+  if (stateConversationId !== conversationId) {
+    setStateConversationId(conversationId);
+    setState(readSideChatTabsState(conversationId));
+  }
   useEffect(() => {
     unsaved.current = null;
-    setState(readSideChatTabsState(conversationId));
   }, [conversationId]);
   const update = useCallback(
     (mutate: TabsChange) => {

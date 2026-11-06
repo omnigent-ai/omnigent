@@ -545,9 +545,6 @@ function AppShellImpl() {
   // to, so the persist effect targets the right session even before a switch's
   // restore has re-rendered. Set by the conversation-restore effect.
   const stateConvRef = useRef<string | null>(conversationId ?? null);
-  // Skips the first persist run so mount can't write default state over the
-  // values the restore effect is about to apply.
-  const workspacePersistHydrated = useRef(false);
   // Hidden (dot-prefixed) files are shown by default; the eye toggle hides them.
   const [filesPanelShowHidden, setFilesPanelShowHidden] = useState(true);
   // Lifted so the Changes list order and the FileViewer prev/next order
@@ -585,16 +582,6 @@ function AppShellImpl() {
   const rightPanelOpenRef = useRef(rightPanelOpen);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
-  // Take the incoming session's rail open-state during render, so its first frame
-  // doesn't show the outgoing session's rail. The restore effect applies the rest.
-  const [railOpenConversationId, setRailOpenConversationId] = useState(conversationId);
-  if (railOpenConversationId !== conversationId) {
-    setRailOpenConversationId(conversationId);
-    setRightPanelOpen(
-      conversationId ? restoredRailOpen(conversationId, canvasMode, searchParams) : false,
-    );
-    setRightPanelVisibilityAnimating(false);
-  }
   const rightPanelMotionTimerRef = useRef<number | null>(null);
   const cancelRightPanelVisibilityMotion = useCallback(() => {
     if (rightPanelMotionTimerRef.current !== null) {
@@ -959,7 +946,6 @@ function AppShellImpl() {
   // root's cached tree, we hold that root until the authoritative
   // resolution lands (a no-op transition once it does).
   const stickyRootRef = useRef<string | null>(null);
-  const previousRootSessionIdRef = useRef<string | null>(null);
   const queryClient = useQueryClient();
   // Derive the root from `serverConversationId` (undefined for a temp id) so the
   // fallback below never yields `temp:*` — otherwise `useChildSessions` would
@@ -1210,12 +1196,25 @@ function AppShellImpl() {
     [conversationId, setSearchParams, terminalFirst],
   );
 
-  // Restore the per-session workspace state when switching conversations:
-  // rail open-state, selected tab, and the open file tabs. The Chat/TUI toggle
-  // is restored from sessionStorage; with no per-tab choice, terminal-first
-  // sessions use the Appearance default. The Files scope and the active file
-  // also honor URL search params so shared links open to the right view.
-  useEffect(() => {
+  // Restore the per-session workspace state when switching conversations (and
+  // on mount): rail open-state, selected tab, and the open file tabs. Done
+  // during render so the incoming session's first frame shows its own state.
+  // The Chat/TUI toggle is restored from sessionStorage; with no per-tab choice,
+  // terminal-first sessions use the Appearance default. The Files scope and the
+  // active file also honor URL search params so shared links open to the right view.
+  const [restoredWorkspace, setRestoredWorkspace] = useState<{
+    conversationId: string | undefined;
+    canvasMode: boolean;
+    exitedMaximized: boolean;
+  } | null>(null);
+  // The root as of the previous render, so restoration can tell whether the
+  // switch stays inside the visible Agents tree.
+  const [previousRootSessionId, setPreviousRootSessionId] = useState<string | null>(null);
+  if (
+    restoredWorkspace === null ||
+    restoredWorkspace.conversationId !== conversationId ||
+    restoredWorkspace.canvasMode !== canvasMode
+  ) {
     setExecutionLogsKey(null);
     setFilesPanelOpen(false);
     setSubagentsPanelOpen(false);
@@ -1224,130 +1223,130 @@ function AppShellImpl() {
     setContentSearchPanelOpen(false);
     setSideChatsPanelOpen(false);
     setFilesPanelShowHidden(true);
-    // Drop shell interaction state carried from the outgoing session: a
-    // still-armed create ref would otherwise auto-focus an unrelated shell in
-    // the new session, and an open "Close shell?" dialog would target a
-    // terminal absent from the new session's list.
-    pendingShellCreateRef.current = null;
+    // An open "Close shell?" dialog would target a terminal absent from the
+    // new session's list.
     setTerminalPendingClose(null);
     setFileNavigation(undefined);
+    setRightPanelVisibilityAnimating(false);
     if (!conversationId) {
       // No session → no rail; false (not the open default) so rail-gated
       // effects stay quiet on non-session routes.
-      setRightPanelOpenImmediately(false);
+      setRestoredWorkspace({ conversationId, canvasMode, exitedMaximized: false });
+      setRightPanelOpen(false);
       setRightRailTab(null);
       setOpenPanels([]);
       setSelectedFilePath(null);
       setOpenFiles([]);
-      autoFocusTerminalKeyRef.current = null;
       setSelectedTerminalKey(null);
       setPanelInitialKeyState(null);
-      stateConvRef.current = null;
-      return;
+    } else {
+      const persisted = readSessionWorkspaceState(conversationId);
+      const showAgents = searchParams.get("panel") === "agents";
+
+      const storageKey = `omnigent.web.panel-key:${conversationId}`;
+      const stored = sessionStorage.getItem(storageKey);
+      const requestedView = terminalFirst ? searchParams.get("view") : null;
+      const terminalKey =
+        agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
+      const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
+      setPanelInitialKeyState(
+        showAgents || requestedView === "chat"
+          ? null
+          : requestedView === "terminal"
+            ? resolveTerminalViewKey(stored, terminalKey)
+            : stored === CHAT_VIEW_STORAGE_VALUE
+              ? null
+              : (stored ?? (defaultToTerminal ? terminalKey : null)),
+      );
+
+      // A remembered per-session tab wins; otherwise use the Appearance default.
+      // Navigating within the visible Agents tree is one continuous rail action,
+      // so keep that tab while moving between its root and descendants.
+      const keepAgentsAcrossTreeNavigation =
+        rightRailTab === "subagents" &&
+        rootSessionId !== null &&
+        previousRootSessionId === rootSessionId;
+      let nextTab: RightRailTab | null =
+        persisted.rightRailTab ??
+        (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
+      // Browser is a dynamic soft-tab mode, not a permanent nav destination.
+      // A stale pre-soft-tab selection (or a closed last tab) restores to the
+      // configured static default instead of showing an unselected rail.
+      const persistedBrowsers = persisted.openBrowsers ?? [];
+      if (
+        nextTab === "browser" &&
+        (persisted.selectedBrowserId === null ||
+          persisted.selectedBrowserId === undefined ||
+          !persistedBrowsers.includes(persisted.selectedBrowserId))
+      ) {
+        nextTab = readInitialWorkspaceTab();
+      }
+
+      // Restore the open file tabs from the per-session store, then merge the
+      // URL ?file= param: a deep-link selects (and, if absent, opens) that file
+      // without discarding the other remembered tabs.
+      const fileParam = searchParams.get("file");
+      const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
+      const persistedFiles = persisted.openFiles ?? [];
+      const nextOpenFiles =
+        urlFile && !persistedFiles.includes(urlFile)
+          ? [...persistedFiles, urlFile]
+          : persistedFiles;
+      const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
+      setOpenFiles(nextOpenFiles);
+      setSelectedFilePath(nextSelected);
+      // The tab strip derives from the live terminal list, so there's nothing to
+      // restore for the tabs themselves — only which shell was focused. The prune
+      // effect clears that selection if its terminal no longer exists once this
+      // session's list loads. A restored shell selection must not coexist with a
+      // file selection (one content slot).
+      setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
+      // A maximized rail is transient too — the incoming session starts docked.
+      // The effect below restores the sidebar collapsed on entry.
+      setRightPanelMaximized(false);
+      setRestoredWorkspace({ conversationId, canvasMode, exitedMaximized: rightPanelMaximized });
+      // A selected file must be visible in the rail. The Files and Changes tabs
+      // both surface the inline viewer; the Agents/Browser tabs don't, so
+      // pull the rail to Files unless it's already on a files scope.
+      if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
+        nextTab = "files";
+      }
+      if (showAgents) {
+        nextTab = "subagents";
+        setSelectedTerminalKey(null);
+        setSubagentsPanelOpen(isMobileViewport());
+      }
+      setRightRailTab(nextTab);
+      const restoredPanels = persisted.openPanels ?? [];
+      setOpenPanels(
+        isDefaultWorkspaceTab(nextTab) &&
+          !readPinnedWorkspaceTabs().includes(nextTab) &&
+          !nextSelected &&
+          !restoredPanels.includes(nextTab)
+          ? [...restoredPanels, nextTab]
+          : restoredPanels,
+      );
+
+      // Restore the rail open-state for this session. A deep link / reload that
+      // carries a workspace signal — a file to open (?file=) or a comment to
+      // surface (?comment=) — reveals the rail even when this session was last
+      // left closed; otherwise the linked file/comment would render into a
+      // collapsed, invisible panel.
+      setRightPanelOpen(restoredRailOpen(conversationId, canvasMode, searchParams));
     }
-    const persisted = readSessionWorkspaceState(conversationId);
-    const showAgents = searchParams.get("panel") === "agents";
+  }
+  if (previousRootSessionId !== rootSessionId) setPreviousRootSessionId(rootSessionId);
 
-    const storageKey = `omnigent.web.panel-key:${conversationId}`;
-    const stored = sessionStorage.getItem(storageKey);
-    const requestedView = terminalFirst ? searchParams.get("view") : null;
-    const terminalKey =
-      agentTerminal === null ? PANEL_NO_TERMINAL_KEY : terminalTabKey(agentTerminal);
-    const defaultToTerminal = terminalFirst && readTranscriptViewDefault() === "terminal";
-    setPanelInitialKeyState(
-      showAgents || requestedView === "chat"
-        ? null
-        : requestedView === "terminal"
-          ? resolveTerminalViewKey(stored, terminalKey)
-          : stored === CHAT_VIEW_STORAGE_VALUE
-            ? null
-            : (stored ?? (defaultToTerminal ? terminalKey : null)),
-    );
-
-    // A remembered per-session tab wins; otherwise use the Appearance default.
-    // Navigating within the visible Agents tree is one continuous rail action,
-    // so keep that tab while moving between its root and descendants.
-    const keepAgentsAcrossTreeNavigation =
-      rightRailTab === "subagents" &&
-      rootSessionId !== null &&
-      previousRootSessionIdRef.current === rootSessionId;
-    let nextTab: RightRailTab | null =
-      persisted.rightRailTab ??
-      (keepAgentsAcrossTreeNavigation ? "subagents" : readInitialWorkspaceTab());
-    // Browser is a dynamic soft-tab mode, not a permanent nav destination.
-    // A stale pre-soft-tab selection (or a closed last tab) restores to the
-    // configured static default instead of showing an unselected rail.
-    const persistedBrowsers = persisted.openBrowsers ?? [];
-    if (
-      nextTab === "browser" &&
-      (persisted.selectedBrowserId === null ||
-        persisted.selectedBrowserId === undefined ||
-        !persistedBrowsers.includes(persisted.selectedBrowserId))
-    ) {
-      nextTab = readInitialWorkspaceTab();
-    }
-
-    // Restore the open file tabs from the per-session store, then merge the
-    // URL ?file= param: a deep-link selects (and, if absent, opens) that file
-    // without discarding the other remembered tabs.
-    const fileParam = searchParams.get("file");
-    const urlFile = fileParam === null || fileParam === "" ? null : fileParam;
-    const persistedFiles = persisted.openFiles ?? [];
-    const nextOpenFiles =
-      urlFile && !persistedFiles.includes(urlFile) ? [...persistedFiles, urlFile] : persistedFiles;
-    const nextSelected = showAgents ? null : (urlFile ?? persisted.selectedFilePath ?? null);
-    setOpenFiles(nextOpenFiles);
-    setSelectedFilePath(nextSelected);
-    // The tab strip derives from the live terminal list, so there's nothing to
-    // restore for the tabs themselves — only which shell was focused. The prune
-    // effect clears that selection if its terminal no longer exists once this
-    // session's list loads. A restored shell selection must not coexist with a
-    // file selection (one content slot).
-    autoFocusTerminalKeyRef.current = null;
-    setSelectedTerminalKey(nextSelected ? null : (persisted.selectedTerminalKey ?? null));
-    // A maximized rail is transient too — the incoming session starts docked.
-    // If we were maximized, restore the sidebar we collapsed on entry (the
-    // toggle handler won't run on a session switch).
-    setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
-      return false;
-    });
-    // A selected file must be visible in the rail. The Files and Changes tabs
-    // both surface the inline viewer; the Agents/Browser tabs don't, so
-    // pull the rail to Files unless it's already on a files scope.
-    if (nextSelected && nextTab !== "files" && nextTab !== "changes") {
-      nextTab = "files";
-    }
-    if (showAgents) {
-      nextTab = "subagents";
-      setSelectedTerminalKey(null);
-      setSubagentsPanelOpen(isMobileViewport());
-    }
-    setRightRailTab(nextTab);
-    const restoredPanels = persisted.openPanels ?? [];
-    setOpenPanels(
-      isDefaultWorkspaceTab(nextTab) &&
-        !readPinnedWorkspaceTabs().includes(nextTab) &&
-        !nextSelected &&
-        !restoredPanels.includes(nextTab)
-        ? [...restoredPanels, nextTab]
-        : restoredPanels,
-    );
-
-    // Restore the rail open-state for this session. A deep link / reload that
-    // carries a workspace signal — a file to open (?file=) or a comment to
-    // surface (?comment=) — reveals the rail even when this session was last
-    // left closed; otherwise the linked file/comment would render into a
-    // collapsed, invisible panel.
-    setRightPanelOpenImmediately(restoredRailOpen(conversationId, canvasMode, searchParams));
-
-    stateConvRef.current = conversationId;
-  }, [conversationId, canvasMode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Record the incoming root after restoration compares it with the outgoing tree.
+  // The parts of a session switch that can't run during render: ref writes and
+  // the sidebar, which belongs to another hook. A still-armed shell-create ref
+  // would otherwise auto-focus an unrelated shell in the new session.
   useEffect(() => {
-    previousRootSessionIdRef.current = rootSessionId;
-  }, [rootSessionId]);
+    pendingShellCreateRef.current = null;
+    autoFocusTerminalKeyRef.current = null;
+    stateConvRef.current = conversationId ?? null;
+    cancelRightPanelVisibilityMotion();
+    if (restoredWorkspace?.exitedMaximized) restoreSidebarAfterMaximize();
+  }, [restoredWorkspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Session metadata can arrive after the restore effect above. Once the
   // terminal-first label is known, apply URL state first, then the per-tab
@@ -1431,13 +1430,8 @@ function AppShellImpl() {
   // Keyed on the state (not conversationId) and targeted at the conversation
   // the current state belongs to (stateConvRef, set by the restore effect) so
   // a conversation switch can't write the outgoing session's state into the
-  // incoming one. The first run (mount) is skipped so it can't clobber the
-  // store with defaults before the restore effect's values are applied.
+  // incoming one.
   useEffect(() => {
-    if (!workspacePersistHydrated.current) {
-      workspacePersistHydrated.current = true;
-      return;
-    }
     const id = stateConvRef.current;
     if (!id) return;
     writeSessionWorkspaceState(id, {

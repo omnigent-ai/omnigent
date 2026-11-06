@@ -92,6 +92,13 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  // Reload on a conversation switch during render, so the session's first frame
+  // (and the rail's tab fallback) never sees the previous session's tabs.
+  const [stateConversationId, setStateConversationId] = useState(conversationId);
+  if (stateConversationId !== conversationId) {
+    setStateConversationId(conversationId);
+    setState(readBrowserTabsState(conversationId));
+  }
   // The session on screen, so a late async update for another one only persists.
   const shownConversationRef = useRef(conversationId);
   shownConversationRef.current = conversationId;
@@ -100,7 +107,6 @@ export function useBrowserTabs(conversationId: string) {
     state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
   );
   useEffect(() => {
-    setState(readBrowserTabsState(conversationId));
     // Showing the session again (or a remounted rail) counts as a selection, so a reopen
     // started before it doesn't move the tab shown now.
     noteBrowserSelection(conversationId);

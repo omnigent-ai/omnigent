@@ -460,13 +460,23 @@ function PathDisplay() {
  * test can exercise the conversation-switch effect (AppShell stays mounted,
  * only the :conversationId route param changes) without a full remount.
  */
-/** Records the rail's state in the first commit of each session, before paint. */
-function RailFirstFrameProbe({ frames, to }: { frames: string[]; to: string }) {
+const railOpenState = () =>
+  document.querySelector('aside[aria-label="Workspace"]')?.getAttribute("data-state") ?? "none";
+
+/** Records `snapshot` (the rail's open state by default) in each session's first commit. */
+function RailFirstFrameProbe({
+  frames,
+  to,
+  snapshot = railOpenState,
+}: {
+  frames: string[];
+  to: string;
+  snapshot?: () => string;
+}) {
   const { conversationId } = useParams();
   useLayoutEffect(() => {
-    const rail = document.querySelector('aside[aria-label="Workspace"]');
-    frames.push(`${conversationId}:${rail?.getAttribute("data-state") ?? "none"}`);
-  }, [conversationId, frames]);
+    frames.push(`${conversationId}:${snapshot()}`);
+  }, [conversationId, frames]); // eslint-disable-line react-hooks/exhaustive-deps
   return <SessionNavButton to={to} />;
 }
 
@@ -3658,6 +3668,69 @@ describe("Right workspace card visibility", () => {
       expect(frames).toEqual([`conv_from:${from}`, `conv_to:${to}`]);
     },
   );
+
+  it("shows the incoming session's rail tab and file in its first frame", () => {
+    writeSessionWorkspaceState("conv_from", {
+      open: true,
+      rightRailTab: "files",
+      openFiles: ["a.ts"],
+      selectedFilePath: "a.ts",
+    });
+    writeSessionWorkspaceState("conv_to", { open: true, rightRailTab: "changes" });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const frames: string[] = [];
+    const railSelection = () => {
+      const tab = document.querySelector('[role="tab"][aria-selected="true"]')?.textContent;
+      const file = document.querySelector('[aria-current="true"][title]')?.getAttribute("title");
+      return `${tab ?? "none"},${file ?? "none"}`;
+    };
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={railSelection} />,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none,a.ts", "conv_to:Changes,none"]);
+  });
+
+  it("shows the incoming session's Chat/TUI view in its first frame", () => {
+    mockConversations([
+      { id: "conv_from", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+      { id: "conv_to", permission_level: null, labels: { "omnigent.ui": "terminal" } },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_claude_main", name: "claude", session: "main", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    sessionStorage.setItem("omnigent.web.panel-key:conv_from", "terminal:terminal_claude_main");
+    sessionStorage.setItem("omnigent.web.panel-key:conv_to", "__chat__");
+    const frames: string[] = [];
+    const view = () => screen.getByTestId("view-probe").getAttribute("data-view") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <>
+          <TerminalFirstViewProbe />
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={view} />
+        </>,
+      ),
+    );
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:terminal", "conv_to:chat"]);
+  });
 
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");
