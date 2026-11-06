@@ -4,8 +4,8 @@
 // Web Speech mode: the button toggles a SpeechRecognition session; final
 // transcripts are emitted via onTranscript. It renders nothing when the
 // browser has no SpeechRecognition constructor AND the server offers no
-// dictation (Electron's Web Speech has no backend, so the server fallback is
-// the only path there).
+// dictation. Electron's Web Speech has no backend, so Electron uses server
+// dictation or, on macOS, the macOS Dictation fallback (bridge mocked here).
 //
 // Server mode: when there is no SpeechRecognition constructor but the
 // /v1/info capability probe reports dictation_available, the button drives a

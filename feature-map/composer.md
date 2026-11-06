@@ -176,11 +176,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   be removed. State: unsupported file type rejected without losing the message.
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
-  terminal or code editor. While listening, Enter keeps the dictated text and
-  Escape discards it. The button is absent when neither the browser nor the
-  server can transcribe; the desktop app's browser engine cannot, so there the
-  button uses the connected server's dictation. Without it, the button starts
-  macOS Dictation in the message box on a Mac and is absent elsewhere.
+  terminal or code editor. While a browser or server take is listening, Enter
+  keeps the dictated text and Escape discards it. The button is absent when
+  neither the browser nor the server can transcribe; the desktop app's browser
+  engine cannot, so there the button uses the connected server's dictation.
+  Without it, the button starts macOS Dictation in the message box on a Mac,
+  which then uses its own Dictation controls, and is absent elsewhere.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
   Inbox reply box follows the same shortcut.
@@ -289,9 +290,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   A plugin catalog the host could not read is named in the Skills section with
   a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
-  message box; press Enter to keep the text or Escape to discard it. In the
-  desktop app the button uses the connected server's dictation; without it, a
-  Mac opens macOS Dictation in the message box, and other platforms show no
+  message box. For browser or server dictation, press Enter to keep the text or
+  Escape to discard it. In the desktop app the button uses the connected
+  server's dictation; without it, a Mac opens macOS Dictation in the message
+  box (stop it with the macOS Dictation controls), and other platforms show no
   button. A side chat's composer ("Ask a side question...") shows the same
   button under the same rule; the shortcut belongs to the main composer.
 - Send while the agent is working to queue a message, then steer it.
@@ -737,12 +739,14 @@ Other connection providers alone do not enable the managed MCP picker.
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
   node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server without dictation (on macOS, the macOS Dictation mic instead), then
-  the mic dictating through a fake-engine server. Manually, for the in-session, new-session and side-chat composers:
-  connect the desktop app to a default `omnigent server` (`/v1/info` reports
-  `dictation_available: false`) and expect no mic and ⌘/Ctrl+Alt+V to do
-  nothing on Windows or Linux; on a Mac expect the mic, and clicking it or
-  pressing ⌘⌥V to open macOS Dictation with the message box focused, then the
-  spoken text in it. Restart the server with
+  the mic dictating through a fake-engine server. Manually, for the in-session,
+  new-session and side-chat composers: connect the desktop app to a default
+  `omnigent server` (`/v1/info` reports `dictation_available: false`) and
+  expect no mic and ⌘/Ctrl+Alt+V to do nothing on Windows or Linux. On a Mac
+  expect the mic in each composer; clicking it (or, in the in-session and
+  new-session composers, pressing ⌘⌥V; side chat has no shortcut) opens macOS
+  Dictation with that message box focused, and the spoken text stays in it.
+  Restart the server with
   `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
   state on click, and the fake transcript in the message box.
 - **`send-shortcut`:**
