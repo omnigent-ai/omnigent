@@ -127,6 +127,7 @@ describe("resolveIdentity transient failures", () => {
   it.each<[string, () => void]>([
     ["a network error", () => fetchMock.mockRejectedValueOnce(new Error("network"))],
     ["a gateway 503", failWithStatus(503)],
+    ["a gateway 403", failWithStatus(403)],
     ["a 408", failWithStatus(408)],
     ["a 429", failWithStatus(429)],
     [
@@ -153,8 +154,8 @@ describe("resolveIdentity transient failures", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("caches a 4xx answer without probing again", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
+  it("caches a non-transient 4xx answer without probing again", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
     const { resolveIdentity } = await import("./identity");
 
     expect(await resolveIdentity()).toBeNull();
