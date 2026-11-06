@@ -216,6 +216,27 @@ describe("MembersPage actions", () => {
     expect(await screen.findByText("bob")).toBeInTheDocument();
   });
 
+  it("restores the row locally when the delete and its follow-up refresh both fail", async () => {
+    vi.mocked(accountsApi.listUsers)
+      .mockResolvedValueOnce([user({ id: "alice" }), user({ id: "bob" })])
+      .mockResolvedValue(null);
+    vi.mocked(accountsApi.deleteUser).mockResolvedValue({
+      ok: false,
+      error: "Could not reach the server.",
+      status: 0,
+    });
+    renderPage();
+
+    const bobRow = (await screen.findByText("bob")).closest("tr")!;
+    fireEvent.click(within(bobRow).getByRole("button", { name: /Remove/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+
+    expect(await screen.findByText(/Could not load members/)).toBeInTheDocument();
+    expect(screen.getByText("alice")).toBeInTheDocument();
+    expect(screen.getByText("bob")).toBeInTheDocument();
+  });
+
   it("keeps a row hidden while its delete is still running after another one finishes", async () => {
     vi.mocked(accountsApi.listUsers)
       .mockResolvedValueOnce([user({ id: "alice" }), user({ id: "bob" })])

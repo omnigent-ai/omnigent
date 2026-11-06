@@ -204,6 +204,42 @@ describe("useDeleteDefaultPolicy", () => {
     expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[0], seeded[2]]);
   });
 
+  it("keeps a policy hidden from list refetches while its DELETE is in flight", async () => {
+    const a = { id: "p1", name: "block_canada" } as DefaultPolicy;
+    const b = { id: "p2", name: "budget" } as DefaultPolicy;
+    let listed = [a, b]; // the server keeps p1 until its DELETE lands
+    let finishFirst: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method !== "DELETE") {
+        return Promise.resolve(mockResponse({ object: "list", data: listed }));
+      }
+      if (url.endsWith("/p1")) {
+        return new Promise<Response>((resolve) => {
+          finishFirst = resolve;
+        });
+      }
+      listed = [a];
+      return Promise.resolve(mockResponse(undefined));
+    });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderHook(
+      () => ({ list: useDefaultPolicies(), del: useDeleteDefaultPolicy() }),
+      { wrapper: wrapperWith(queryClient) },
+    );
+    await waitFor(() => expect(result.current.list.data).toEqual([a, b]));
+
+    result.current.del.mutate("p1");
+    result.current.del.mutate("p2");
+    // p2's settle refetches the list, which still contains p1.
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, i]) => !i?.method)).toHaveLength(2));
+    await waitFor(() => expect(result.current.list.isFetching).toBe(false));
+    expect(result.current.list.data).toEqual([]);
+
+    listed = [];
+    finishFirst(mockResponse(undefined));
+    await waitFor(() => expect(result.current.del.isSuccess).toBe(true));
+  });
+
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });

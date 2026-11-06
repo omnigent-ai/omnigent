@@ -38,6 +38,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { showToast } from "@/components/ui/toast";
+import { restoreListItem } from "@/lib/restoreListItem";
 import {
   type AccountListEntry,
   type InviteCreated,
@@ -88,7 +89,8 @@ export function MembersPage() {
       setLoadError(
         "Could not load members. You may not have admin permission, or the server is unreachable.",
       );
-      setUsers([]);
+      // Keep rows already shown; only a first load has nothing to keep.
+      setUsers((current) => current ?? []);
       return;
     }
     setLoadError(null);
@@ -178,13 +180,17 @@ export function MembersPage() {
   async function onConfirmDelete() {
     if (deleteCandidate === null) return;
     const userId = deleteCandidate;
-    // Close now and drop the row; the refresh puts it back if the delete failed.
+    const shown = users ?? [];
+    // Close now and drop the row; a failed delete puts it back where it was.
     setDeleteCandidate(null);
     pendingDeletes.current.add(userId);
     setUsers((current) => current?.filter((u) => u.id !== userId) ?? null);
     const result = await deleteUser(userId);
     pendingDeletes.current.delete(userId);
-    if (!result.ok) showToast(`Couldn't remove ${userId}: ${result.error}`);
+    if (!result.ok) {
+      showToast(`Couldn't remove ${userId}: ${result.error}`);
+      setUsers((current) => current && restoreListItem(current, shown, (u) => u.id, userId));
+    }
     await refresh();
   }
 

@@ -4094,6 +4094,82 @@ describe("useDeleteProject", () => {
     }
     expect(toasts).toEqual([`Couldn't delete project "Sprint 42". Its sessions were archived.`]);
   });
+  /** Route the project sweep's requests; each project DELETE waits for the test to settle it. */
+  function routeEmptyProjects(server: { projects: { id: string; name: string }[] }) {
+    const settleDelete = new Map<string, (response: Response) => void>();
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === "/v1/sessions/projects") return Promise.resolve(mockResponse(server.projects));
+      if (url.startsWith("/v1/sessions?")) {
+        return Promise.resolve(
+          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+        );
+      }
+      if (init?.method === "DELETE") {
+        return new Promise<Response>((resolve) => {
+          settleDelete.set(url, resolve);
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    return settleDelete;
+  }
+
+  it("restores each failed folder without undoing another failed delete's restore", async () => {
+    const a = { id: "p_a", name: "Alpha" };
+    const b = { id: "p_b", name: "Beta" };
+    const settleDelete = routeEmptyProjects({ projects: [a, b] });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [a, b]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+    const projects = () => queryClient.getQueryData(["projects"]);
+
+    result.current.mutate(a);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_a")).toBe(true));
+    result.current.mutate(b);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_b")).toBe(true));
+    expect(projects()).toEqual([]);
+
+    settleDelete.get("/v1/projects/p_a")!(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(projects()).toEqual([a]));
+    settleDelete.get("/v1/projects/p_b")!(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(projects()).toEqual([a, b]));
+  });
+
+  it("keeps a folder hidden from list refetches while its delete is in flight", async () => {
+    const a = { id: "p_a", name: "Alpha" };
+    const b = { id: "p_b", name: "Beta" };
+    // The server still lists Alpha until its DELETE lands.
+    const server = { projects: [a, b] };
+    const settleDelete = routeEmptyProjects(server);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => ({ list: useProjects(), del: useDeleteProject() }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.list.data).toEqual([a, b]));
+
+    result.current.del.mutate(a);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_a")).toBe(true));
+    result.current.del.mutate(b);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_b")).toBe(true));
+    server.projects = [a];
+    settleDelete.get("/v1/projects/p_b")!(mockResponse({ deleted: true }));
+
+    // Beta's settle refetches the list; Alpha is still on the server but stays hidden.
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/v1/sessions/projects")).toHaveLength(
+        2,
+      ),
+    );
+    await waitFor(() => expect(result.current.list.isFetching).toBe(false));
+    expect(result.current.list.data).toEqual([]);
+    server.projects = [];
+    settleDelete.get("/v1/projects/p_a")!(mockResponse({ deleted: true }));
+    await waitFor(() => expect(result.current.del.isSuccess).toBe(true));
+  });
 });
 
 describe("undoArchiveConversations optimistic restore", () => {

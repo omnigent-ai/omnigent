@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
+import { restoreListItem } from "@/lib/restoreListItem";
 
 /** A server-wide default policy returned by the admin CRUD API. */
 export interface DefaultPolicy {
@@ -22,11 +23,14 @@ export interface DefaultPolicy {
 
 const QUERY_KEY = ["default-policies"];
 
+/** Policies whose DELETE is still in flight, hidden from refetched lists. */
+const deletingPolicyIds = new Set<string>();
+
 async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
   const res = await authenticatedFetch("/v1/policies");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: DefaultPolicy[] };
-  return body.data;
+  return body.data.filter((policy) => policy.id === null || !deletingPolicyIds.has(policy.id));
 }
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
@@ -97,6 +101,7 @@ export function useDeleteDefaultPolicy() {
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
     onMutate: async (policyId) => {
+      deletingPolicyIds.add(policyId);
       await queryClient.cancelQueries({ queryKey: QUERY_KEY });
       const previous = queryClient.getQueryData<DefaultPolicy[]>(QUERY_KEY);
       queryClient.setQueryData<DefaultPolicy[]>(QUERY_KEY, (old) =>
@@ -105,19 +110,18 @@ export function useDeleteDefaultPolicy() {
       return { previous };
     },
     onError: (err, policyId, context) => {
+      deletingPolicyIds.delete(policyId);
       // Put back only this row: another removal may have landed since the snapshot.
       const previous = context?.previous ?? [];
-      const index = previous.findIndex((policy) => policy.id === policyId);
-      const restored = index >= 0 ? previous[index] : undefined;
-      if (restored !== undefined) {
-        queryClient.setQueryData<DefaultPolicy[]>(QUERY_KEY, (old) => {
-          if (old === undefined || old.some((policy) => policy.id === policyId)) return old;
-          return [...old.slice(0, index), restored, ...old.slice(index)];
-        });
-      }
-      showToast(`Couldn't remove ${restored?.name ?? "policy"}: ${err.message}`);
+      queryClient.setQueryData<DefaultPolicy[]>(
+        QUERY_KEY,
+        (old) => old && restoreListItem(old, previous, (policy) => policy.id, policyId),
+      );
+      const name = previous.find((policy) => policy.id === policyId)?.name ?? "policy";
+      showToast(`Couldn't remove ${name}: ${err.message}`);
     },
-    onSettled: () => {
+    onSettled: (_data, _err, policyId) => {
+      deletingPolicyIds.delete(policyId);
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     },
   });

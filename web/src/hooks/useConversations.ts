@@ -53,6 +53,7 @@ import {
   type SessionListWireItem,
 } from "@/lib/sessionListCache";
 import { showToast } from "@/components/ui/toast";
+import { restoreListItem } from "@/lib/restoreListItem";
 import {
   conversationDisplayLabel,
   readPinnedConversationIds,
@@ -2203,7 +2204,8 @@ export interface ProjectSummary {
 /**
  * Fetch the caller's projects from `GET /v1/sessions/projects`, which
  * dual-reads first-class projects (with id, incl. empty ones) and legacy
- * label-projects (id=null), unioned by name and sorted.
+ * label-projects (id=null), unioned by name and sorted. Projects with a
+ * delete in flight are left out, so a refetch can't bring their folder back.
  */
 export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery<ProjectSummary[]>({
@@ -2211,7 +2213,8 @@ export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
     queryFn: async ({ signal }) => {
       const res = await authenticatedFetch("/v1/sessions/projects", { signal });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      return (await res.json()) as ProjectSummary[];
+      const projects = (await res.json()) as ProjectSummary[];
+      return projects.filter((p) => !deletingProjectNames.has(p.name));
     },
     staleTime: 30_000,
     enabled,
@@ -2716,6 +2719,9 @@ function cachedProjectMemberIds(queryClient: QueryClient, project: ProjectSummar
   return [...ids];
 }
 
+/** Names of projects whose delete is still in flight. */
+const deletingProjectNames = new Set<string>();
+
 /** Every member was archived and unfiled, but the project row's DELETE failed. */
 class ProjectContainerDeleteError extends Error {
   readonly succeeded: string[];
@@ -2753,6 +2759,7 @@ export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
     onMutate: async (project: ProjectSummary) => {
+      deletingProjectNames.add(project.name);
       await queryClient.cancelQueries({ queryKey: ["projects"] });
       const memberIds = cachedProjectMemberIds(queryClient, project);
       // Hide the members before the folder, so they never fall into the flat list.
@@ -2782,7 +2789,12 @@ export function useDeleteProject() {
       }
       restoreArchiveLists(queryClient, context.snapshot);
       reapplyLiveSessionTombstones(queryClient);
-      queryClient.setQueryData(["projects"], context.projects);
+      // Put back only this folder: another delete may have changed the list since.
+      deletingProjectNames.delete(name);
+      queryClient.setQueryData<ProjectSummary[]>(
+        ["projects"],
+        (old) => old && restoreListItem(old, context.projects ?? [], (p) => p.name, name),
+      );
       showToast(
         err instanceof BulkConversationMutationError
           ? `Couldn't delete project "${name}": some sessions couldn't be archived (you may not own them).`
@@ -2831,7 +2843,8 @@ export function useDeleteProject() {
       }
       return { succeeded, failed };
     },
-    onSettled: () => {
+    onSettled: (_data, _err, { name }) => {
+      deletingProjectNames.delete(name);
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
