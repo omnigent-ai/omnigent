@@ -182,6 +182,13 @@ _WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS = 12.0
 _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
+# Bounds on explaining an app-server that exits before ``initialize`` returns:
+# how long to wait for its stderr and exit status, how long the follow-up
+# ``codex debug models`` config check may run, and how much of each stderr line
+# the surfaced error keeps.
+_STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS = 2.0
+_STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS = 10.0
+_STARTUP_EXIT_STDERR_LINE_LIMIT = 500
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
@@ -616,6 +623,67 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout.decode("utf-8", errors="replace"),
     )
     return match.group(1) if match is not None else None
+
+
+async def _codex_config_check_error(
+    codex_path: str,
+    config_overrides: Sequence[str],
+    env: Mapping[str, str],
+    *,
+    timeout: float = _STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS,
+) -> str | None:
+    """
+    Return the error Codex reports when loading the app-server's config.
+
+    When ``config.toml`` fails to load, Codex falls back to its default
+    config, and an app-server with a ``-c model_provider=...`` override then
+    exits with only ``Model provider `X` not found``. ``codex debug models``
+    loads the same config and prints the original error, e.g. an unsupported
+    key or an unreadable ``model_catalog_json``.
+
+    :param codex_path: The codex binary the app-server ran, e.g.
+        ``"/usr/local/bin/codex"``.
+    :param config_overrides: The app-server's ``-c`` overrides, e.g.
+        ``['model_provider="example"']``.
+    :param env: The app-server's environment, including its ``CODEX_HOME``.
+    :param timeout: Seconds to wait before giving up.
+    :returns: The first ``Error:`` line from a failed check, e.g.
+        ``"Error: No such file or directory (os error 2)"``, or ``None`` when
+        the check passes, prints no error line, or cannot run.
+    """
+    argv = [codex_path, "debug", "models"]
+    for override in config_overrides:
+        argv.extend(["-c", override])
+    try:
+        proc = await _create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+    except OSError:
+        return None
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except BaseException as exc:
+        # Also on cancellation: a session closing mid-check must not leave
+        # the check running.
+        with suppress(ProcessLookupError):
+            proc.kill()
+        with suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1)
+        close_subprocess_transport(proc)
+        if isinstance(exc, TimeoutError):
+            return None
+        raise
+    if proc.returncode == 0:
+        return None
+    for line in stderr.decode("utf-8", errors="replace").splitlines():
+        text = line.strip()
+        if text.startswith("Error:"):
+            return text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+    return None
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -2929,6 +2997,12 @@ class _CodexAppServerSession:
         self._default_effort: str | None = None
         self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
+        # Set by a real worker launch, so an exit before ``initialize``
+        # returns is reported with its exit status and stderr. The config
+        # check is the unsandboxed launch's codex path, ``-c`` overrides and
+        # environment, for ``codex debug models``.
+        self._explain_startup_exit = False
+        self._startup_config_check: tuple[str, list[str], dict[str, str]] | None = None
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
         # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
@@ -3211,6 +3285,14 @@ class _CodexAppServerSession:
             finally:
                 if liveness_read_fd is not None:
                     os.close(liveness_read_fd)
+            self._explain_startup_exit = True
+            # A sandboxed or signer-backed worker's config is only safe to load
+            # inside that containment, so it gets no out-of-sandbox check.
+            self._startup_config_check = (
+                None
+                if self._worker_launch.sandboxed or self._signer is not None
+                else (self._codex_path, list(self._codex_config_overrides), dict(proc_env))
+            )
             self._reader_task = asyncio.create_task(self._reader_loop())
             self._stderr_task = asyncio.create_task(self._stderr_loop())
             self._worker_census_task = asyncio.create_task(self._refresh_worker_census())
@@ -4550,7 +4632,10 @@ class _CodexAppServerSession:
                     continue
                 self._note_native_activity(message)
                 await self._events.put(message)
-            self._note_transport_closed("Codex app-server closed stdout", clean_eof=True)
+            detail = "Codex app-server closed stdout"
+            if self._explain_startup_exit and not self._started and not self._closing:
+                detail = await self._startup_exit_detail(detail)
+            self._note_transport_closed(detail, clean_eof=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
@@ -4559,6 +4644,49 @@ class _CodexAppServerSession:
         finally:
             if not self._closing:
                 await self._close_signer()
+
+    async def _startup_exit_detail(self, detail: str) -> str:
+        """
+        Explain an app-server that exited before ``initialize`` returned.
+
+        Such an exit is almost always a config or install problem that every
+        retry repeats, and the bare EOF names no cause.
+
+        :param detail: The transport-loss message, e.g.
+            ``"Codex app-server closed stdout"``.
+        :returns: *detail* followed by the exit status, the stderr tail and
+            the ``codex debug models`` error, where available, e.g.
+            ``"Codex app-server closed stdout; exited with code 1 during
+            startup; stderr: Error: Model provider `example` not found; codex
+            config check: Error: No such file or directory (os error 2)"``.
+        """
+        proc = self._proc
+        stderr_task = self._stderr_task
+        if stderr_task is not None:
+            await asyncio.wait({stderr_task}, timeout=_STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS)
+        if proc is not None and proc.returncode is None:
+            with suppress(TimeoutError):
+                await asyncio.wait_for(proc.wait(), timeout=_STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS)
+        parts = [detail]
+        if proc is not None and proc.returncode is not None:
+            parts.append(f"exited with code {proc.returncode} during startup")
+        # Codex prefixes its fatal message with ``Error:``; keep only those
+        # when present so routine warnings do not bury the cause.
+        error_lines = [line for line in self._recent_stderr if line.startswith("Error:")]
+        stderr_tail = [
+            line[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+            for line in (error_lines or self._recent_stderr)[-5:]
+        ]
+        if stderr_tail:
+            parts.append(f"stderr: {' | '.join(stderr_tail)}")
+        if self._startup_config_check is not None:
+            codex_path, overrides, env = self._startup_config_check
+            config_error = await _codex_config_check_error(codex_path, overrides, env)
+            if config_error is not None and config_error not in stderr_tail:
+                parts.append(f"codex config check: {config_error}")
+        message = "; ".join(parts)
+        logger.warning("%s", message)
+        return message
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
