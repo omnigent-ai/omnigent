@@ -463,6 +463,29 @@ def _no_configured_codex_app_server_command(
     return real
 
 
+@pytest.fixture(autouse=True)
+def _no_configured_claude_launch(monkeypatch: pytest.MonkeyPatch) -> Callable[[], bool]:
+    """
+    Skip the native Claude plugin probe unless a test configures a launch.
+
+    A command or launcher in the user's ``~/.omnigent/config.yaml`` would
+    otherwise make every native Claude skill catalog run it.
+
+    :param monkeypatch: Fixture used to stub the launch check.
+    :returns: The real launch check, for a test that exercises it.
+    """
+    from omnigent.harnesses.claude_native import plugin_discovery
+
+    real = plugin_discovery.claude_launch_is_customized
+    monkeypatch.setattr(plugin_discovery, "claude_launch_is_customized", lambda: False)
+    monkeypatch.setattr(plugin_discovery, "_probes", {})
+    # A runner lifespan's shutdown would otherwise stop probes for later tests.
+    monkeypatch.setattr(plugin_discovery, "_exiting", False)
+    # Tests share one data dir, so an answer stored by one must not serve the next.
+    shutil.rmtree(plugin_discovery.stored_answers_dir(), ignore_errors=True)
+    return real
+
+
 @pytest.fixture()
 def claude_managed_settings() -> None:
     """Opt back in to the host's real Claude Code managed-settings chain.

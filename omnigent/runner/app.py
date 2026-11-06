@@ -217,7 +217,7 @@ from omnigent.server.schemas import (
     BackgroundSessionTitleRequest,
     BackgroundSessionTitleResponse,
 )
-from omnigent.spec.skill_sources import resolve_session_skills
+from omnigent.spec.skill_sources import CLAUDE_LAUNCH_PLUGINS_LOADING, resolve_session_skills
 from omnigent.spec.types import AgentSpec, LocalToolInfo, SkillSpec
 from omnigent.util.dedicated_executor import DedicatedExecutor
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1225,6 +1225,8 @@ def get_session_agent_id(session_id: str) -> str | None:
 # Repeated invocations share a filesystem scan; installed skills become
 # resolvable after at most one minute without restarting the runner.
 _SESSION_SKILLS_CACHE_TTL_SECONDS = 60.0
+# A catalog missing a failed source is rescanned soon, once that source may answer again.
+_INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS = 5.0
 _SESSION_INIT_ENVELOPE_TTL_SECONDS = 60.0
 
 
@@ -1357,7 +1359,7 @@ def create_runner_app(
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
     # effort only from the forwarded turn body, which is built field by field.
     _session_reasoning_effort: dict[str, str] = {}
-    _session_skills_cache: dict[str, tuple[float, list[SkillSpec]]] = {}
+    _session_skills_cache: dict[str, tuple[float, list[SkillSpec], bool, int]] = {}
     _session_workspace_cache: dict[str, str | None] = {}  # session_id → workspace path
     _session_cursor_model_names: dict[str, dict[str, str]] = {}
     _session_claude_launch_configs: dict[str, ClaudeNativeUcodeConfig | None] = {}
@@ -8079,11 +8081,21 @@ def create_runner_app(
         except OmnigentError:
             return None
 
-    async def _resolve_session_skills(session_id: str) -> list[SkillSpec]:
+    async def _resolve_session_skills(
+        session_id: str, *, wait_for_launch_plugins: bool = False
+    ) -> list[SkillSpec]:
+        from omnigent.harnesses.claude_native.plugin_discovery import launch_plugins_generation
+
+        # A launch probe that finished since may list skills a cached catalog lacks.
+        generation = launch_plugins_generation()
         cached = _session_skills_cache.get(session_id)
         if cached is not None:
-            expires_at, cached_skills = cached
-            if time.monotonic() < expires_at:
+            expires_at, cached_skills, answers_waiting, cached_generation = cached
+            if (
+                time.monotonic() < expires_at
+                and cached_generation == generation
+                and (answers_waiting or not wait_for_launch_plugins)
+            ):
                 return cached_skills
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_resolved_spec(entry) if entry is not None else None
@@ -8106,12 +8118,26 @@ def create_runner_app(
         if not roots:
             roots.append(Path.cwd())
 
+        problems: list[str] = []
         skills = await asyncio.to_thread(
-            resolve_session_skills, spec, tuple(roots), _resolved_spec_workdir(entry)
+            resolve_session_skills,
+            spec,
+            tuple(roots),
+            _resolved_spec_workdir(entry),
+            warnings=problems,
+            wait_for_launch_plugins=wait_for_launch_plugins,
+        )
+        ttl = (
+            _INCOMPLETE_SESSION_SKILLS_CACHE_TTL_SECONDS
+            if problems
+            else _SESSION_SKILLS_CACHE_TTL_SECONDS
         )
         _session_skills_cache[session_id] = (
-            time.monotonic() + _SESSION_SKILLS_CACHE_TTL_SECONDS,
+            time.monotonic() + ttl,
             skills,
+            # Waiting changes only a list that a still-loading launch left incomplete.
+            wait_for_launch_plugins or CLAUDE_LAUNCH_PLUGINS_LOADING not in problems,
+            generation,
         )
         return skills
 

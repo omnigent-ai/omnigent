@@ -141,8 +141,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `session_event_types`; claude-sdk sessions only when it reports
   `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
   as text. A claude-sdk `/clear` continues in a new, empty session on the same
-  machine and the view follows it. States: loading, error/retry,
-  unavailable while disconnected, and an incomplete catalog.
+  machine and the view follows it.
+  A Claude native launch customized by a configured command, arguments or
+  launcher also lists the plugins that launch loads, such as `--plugin-dir`, in
+  both the in-session and new-session composers. The host asks the launch from
+  the home directory, so plugins it adds relative to a workspace are not listed.
+  States: loading, error/retry, unavailable while disconnected, and an
+  incomplete catalog, including a launch that has not reported its plugins yet
+  (the host asks it in the background) or cannot report them. A runner reuses
+  the host's answer from the last hour; without one, its first use of a listed
+  launch-loaded skill waits up to 7 s, and a slower launch reports the skill as
+  not found until it answers.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -641,7 +650,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
-  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`;
+  launcher-loaded Claude plugins:
+  `tests/e2e_ui/chat/test_claude_skills_menu_terminal_parity.py::test_claude_menu_lists_plugin_skills_a_launcher_loads`
+  covers a started session. Manually, configure a launcher that adds
+  `--plugin-dir`, choose Claude (native) on that host in the new-session
+  composer and type `/`: expect its skills, or a still-loading note whose Retry
+  lists them once the host has asked the launch.
   claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
   `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
   Manually, in a claude-sdk session with one finished turn, type `/cle` and

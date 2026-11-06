@@ -1,0 +1,55 @@
+"""A configured native Claude command that records each launch, for launch-probe tests."""
+
+from __future__ import annotations
+
+import json
+import sys
+from collections.abc import Sequence
+from pathlib import Path
+
+
+def write_launch_recorder(launcher: Path, launches: Path, script: str) -> None:
+    """
+    Write an executable that appends its argv, cwd and pid to *launches*, then runs *script*.
+
+    :param launcher: Executable path to create, e.g. ``tmp_path / "bin" / "claude"``.
+    :param launches: JSON-lines file each launch appends to.
+    :param script: Python run after recording; ``json``, ``os``, ``sys`` and
+        ``time`` are imported, e.g. ``"time.sleep(30)\\n"``.
+    """
+    launcher.write_text(
+        f"#!{sys.executable}\nimport json, os, sys, time\n"
+        f"with open({str(launches)!r}, 'a') as out:\n"
+        "    record = {'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid()}\n"
+        "    out.write(json.dumps(record) + '\\n')\n" + script
+    )
+    launcher.chmod(0o755)
+
+
+def configure_claude_launch(
+    config_home: Path,
+    launches: Path,
+    script: str,
+    args: Sequence[str] = ("--",),
+    *,
+    interpreted: bool = False,
+) -> None:
+    """
+    Make ``harness.claude-native.command`` a launch recorder in *config_home*'s config.
+
+    :param config_home: The isolated ``OMNIGENT_CONFIG_HOME``, e.g. from
+        ``isolate_provider_resolution``.
+    :param launches: JSON-lines file each launch appends to.
+    :param script: Python the launch runs after recording itself.
+    :param args: Configured ``harness.claude-native.args``, e.g. ``("--token", "secret")``.
+    :param interpreted: Configure this Python as the command and the recorder as its
+        first argument, so the launch also runs on Windows, which ignores shebangs.
+    """
+    launcher = config_home / "claude-launcher"
+    write_launch_recorder(launcher, launches, script)
+    command, launch_args = (
+        (sys.executable, [str(launcher), *args]) if interpreted else (str(launcher), [*args])
+    )
+    (config_home / "config.yaml").write_text(
+        json.dumps({"harness": {"claude-native": {"command": command, "args": launch_args}}})
+    )

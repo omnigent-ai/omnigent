@@ -1027,6 +1027,7 @@ def _claude_model_probe_launch(
     extra_args: Sequence[str] = (),
     *,
     stream_input: bool = False,
+    cfg: Mapping[str, object] | None = None,
 ) -> tuple[str, list[str]]:
     """
     Resolve probe command and arguments without constructing the launch environment.
@@ -1034,6 +1035,7 @@ def _claude_model_probe_launch(
     :param claude_config: The resolved native launch config, or ``None``.
     :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
     :param stream_input: Send control requests and /model over stdin.
+    :param cfg: The Omnigent config to read the launch from; loaded when omitted.
     :returns: ``(command, launch_args)`` shared by discovery and its cache key.
     """
     from omnigent.claude_launcher import resolve_claude_launch
@@ -1055,7 +1057,8 @@ def _claude_model_probe_launch(
     args.extend(["--no-session-persistence", *extra_args])
     if claude_config is not None and claude_config.api_key_helper:
         args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
-    cfg = load_effective_config()
+    if cfg is None:
+        cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
     return resolve_claude_launch(command, launch_args)
@@ -1066,10 +1069,11 @@ def _claude_model_probe_invocation(
     extra_args: Sequence[str] = (),
     *,
     stream_input: bool = False,
+    cfg: Mapping[str, object] | None = None,
 ) -> tuple[str, list[str], dict[str, str]]:
     """Assemble a headless probe with the terminal's launch and auth environment."""
     command, launch_args = _claude_model_probe_launch(
-        claude_config, extra_args, stream_input=stream_input
+        claude_config, extra_args, stream_input=stream_input, cfg=cfg
     )
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))

@@ -10,18 +10,24 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import httpx
 import pytest
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
 
+from omnigent.spec.skill_sources import CLAUDE_LAUNCH_PLUGINS_LOADING
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.native_session import create_native_session
+from tests._helpers.polling import poll_until
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.messages.test_message_render_parity import _select_view_mode
 from tests.e2e_ui.messages.test_native_claude_render_parity import (
@@ -233,6 +239,99 @@ def _wait_pane_contains(base_url: str, session_id: str, needle: str) -> str:
     raise AssertionError(f"terminal never rendered {needle!r}; pane:\n{pane}")
 
 
+@contextmanager
+def _claude_session_page(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    claude_config_dir: Path,
+    config: Mapping[str, object] | None = None,
+) -> Iterator[tuple[httpx.Client, Page, str]]:
+    """Open the native Claude session of a host using *claude_config_dir* and *config*."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with (
+        httpx.Client(base_url=live_server, timeout=20) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            env={
+                "CLAUDE_CONFIG_DIR": str(claude_config_dir),
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            },
+            config=config,
+            command=_host_command(live_server, mock_llm_server_url),
+        ) as host,
+    ):
+        host.wait_online(client, timeout=120, poll_interval=0.5)
+        created = create_native_session(
+            client,
+            live_server,
+            harness="claude",
+            metadata={"host_id": host.host_id, "workspace": str(workspace)},
+        )
+        session_id = str(created["session_id"])
+        try:
+            reviewed_key = json.dumps(f"omnigent:imports-reviewed:{host.host_id}")
+            page = request.getfixturevalue("page")
+            page.add_init_script(f"localStorage.setItem({reviewed_key}, 'true')")
+            page.goto(f"{live_server}/c/{session_id}")
+            expect(page.get_by_label("Message the agent")).to_be_visible(timeout=60_000)
+            yield client, page, session_id
+        finally:
+            client.delete(f"/v1/sessions/{session_id}")
+
+
+def _type_plugin_in_terminal(page: Page, live_server: str, session_id: str, *names: str) -> str:
+    """Type ``/<plugin>`` in the Claude TUI; return its pane once it lists each of *names*."""
+    _open_terminal_view(page)
+    _wait_terminal_connected(page)
+    _focus_tui(page)
+    page.keyboard.type(f"/{_PLUGIN}", delay=30)
+    pane = ""
+    for name in names:
+        pane = _wait_pane_contains(live_server, session_id, f"{_PLUGIN}:{name}")
+    page.wait_for_timeout(1_500)
+    return pane
+
+
+def _fill_chat_composer(page: Page, text: str) -> None:
+    """Clear the TUI's ``/<plugin>`` input, switch to Chat, and type *text* in the composer."""
+    for _ in range(len(_PLUGIN) + 1):
+        page.keyboard.press("Backspace")
+    _select_view_mode(page, "Chat")
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(text)
+
+
+def _expect_menu_lists(page: Page, client: httpx.Client, session_id: str, name: str) -> None:
+    """Wait for ``/<plugin>:<name>`` in the chat menu, naming what ``/v1/skills`` lists if not."""
+    item = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:{name}")
+    loading = page.get_by_role("status").filter(has_text=CLAUDE_LAUNCH_PLUGINS_LOADING)
+
+    def offered() -> bool:
+        if item.is_visible():
+            return True
+        if loading.is_visible():
+            # A catalog fetched before the launch answered says so; Retry fetches it again.
+            # The note can go as a refetch answers, so a missed click waits for the next poll.
+            with suppress(PlaywrightError):
+                loading.get_by_role("button", name="Retry").click(timeout=5_000)
+        return False
+
+    try:
+        poll_until(offered, timeout_s=30, interval_s=1)
+    except AssertionError:
+        listed = client.get("/v1/skills", params={"session_id": session_id}).json()
+        names = [skill["name"] for skill in listed.get("skills", [])]
+        raise AssertionError(
+            f"chat menu lacks /{_PLUGIN}:{name} although the terminal lists it; "
+            f"/v1/skills names={names}"
+        ) from None
+
+
 @pytest.mark.timeout(600)
 def test_claude_menu_lists_plugin_commands_the_terminal_lists(
     request: pytest.FixtureRequest,
@@ -250,70 +349,69 @@ def test_claude_menu_lists_plugin_commands_the_terminal_lists(
         pytest.skip("needs the claude CLI and tmux")
     claude_config_dir = tmp_path / "claude-config"
     _install_claude_plugin(claude_config_dir, tmp_path / "marketplace")
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    host_env = {
-        "CLAUDE_CONFIG_DIR": str(claude_config_dir),
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    }
-    with (
-        httpx.Client(base_url=live_server, timeout=20) as client,
-        isolated_host(
-            tmp_path / "host",
-            live_server,
-            env=host_env,
-            command=_host_command(live_server, mock_llm_server_url),
-        ) as host,
-    ):
-        host.wait_online(client, timeout=120, poll_interval=0.5)
-        created = create_native_session(
-            client,
-            live_server,
-            harness="claude",
-            metadata={"host_id": host.host_id, "workspace": str(workspace)},
+    with _claude_session_page(
+        request, live_server, mock_llm_server_url, tmp_path, claude_config_dir
+    ) as (client, page, session_id):
+        evidence_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+        pane = _type_plugin_in_terminal(page, live_server, session_id, "review", "simplify")
+        if evidence_dir:
+            Path(evidence_dir, "terminal-pane.txt").write_text(pane)
+            page.screenshot(path=f"{evidence_dir}/terminal-menu.png")
+
+        _fill_chat_composer(page, f"/{_PLUGIN}")
+        expect(page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:simplify")).to_be_visible(
+            timeout=30_000
         )
-        session_id = str(created["session_id"])
-        try:
-            reviewed_key = json.dumps(f"omnigent:imports-reviewed:{host.host_id}")
-            page = request.getfixturevalue("page")
-            page.add_init_script(f"localStorage.setItem({reviewed_key}, 'true')")
-            page.goto(f"{live_server}/c/{session_id}")
-            composer = page.get_by_label("Message the agent")
-            expect(composer).to_be_visible(timeout=60_000)
+        page.wait_for_timeout(1_500)
+        if evidence_dir:
+            page.screenshot(path=f"{evidence_dir}/chat-menu.png")
+        _expect_menu_lists(page, client, session_id, "review")
 
-            evidence_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
 
-            _open_terminal_view(page)
-            _wait_terminal_connected(page)
-            _focus_tui(page)
-            page.keyboard.type(f"/{_PLUGIN}", delay=30)
-            _wait_pane_contains(live_server, session_id, f"{_PLUGIN}:review")
-            pane = _wait_pane_contains(live_server, session_id, f"{_PLUGIN}:simplify")
+def _plugin_dir_launcher(root: Path, plugin: Path) -> Path:
+    """Write a Claude launcher that loads *plugin* via ``--plugin-dir``, as wrapper CLIs do."""
+    claude = shutil.which("claude")
+    assert claude is not None
+    launcher = root / "claude-launcher"
+    launcher.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "--" ] && shift\n'
+        f'exec {shlex.quote(claude)} --plugin-dir {shlex.quote(str(plugin))} "$@"\n'
+    )
+    launcher.chmod(0o755)
+    return launcher
+
+
+@pytest.mark.timeout(600)
+def test_claude_menu_lists_plugin_skills_a_launcher_loads(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """Plugin skills a configured Claude launcher loads are offered in the chat menu.
+
+    The host's ``harness.claude-native.command`` points at a launcher passing
+    ``--plugin-dir``, so the plugin is never recorded in ``installed_plugins.json``.
+    """
+    if shutil.which("claude") is None or shutil.which("tmux") is None:
+        pytest.skip("needs the claude CLI and tmux")
+    plugin = tmp_path / "launcher-plugins" / _PLUGIN
+    (plugin / ".claude-plugin").mkdir(parents=True)
+    (plugin / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": _PLUGIN, "version": "1.0.0", "description": "e2e plugin"})
+    )
+    _seed_skill(plugin / "skills", "review", "review skill")
+    launcher = _plugin_dir_launcher(tmp_path, plugin)
+    claude_config_dir = tmp_path / "claude-config"
+    claude_config_dir.mkdir()
+    config = {"harness": {"claude-native": {"command": str(launcher), "args": ["--"]}}}
+    with _claude_session_page(
+        request, live_server, mock_llm_server_url, tmp_path, claude_config_dir, config
+    ) as (client, page, session_id):
+        _type_plugin_in_terminal(page, live_server, session_id, "review")
+        _fill_chat_composer(page, f"/{_PLUGIN}:review")
+        _expect_menu_lists(page, client, session_id, "review")
+        if os.environ.get("OMNIGENT_E2E_RECORD_DIR"):
+            # Hold the menu on screen so a recorded video shows it.
             page.wait_for_timeout(1_500)
-            if evidence_dir:
-                Path(evidence_dir, "terminal-pane.txt").write_text(pane)
-                page.screenshot(path=f"{evidence_dir}/terminal-menu.png")
-            for _ in range(len(_PLUGIN) + 1):
-                page.keyboard.press("Backspace")
-
-            _select_view_mode(page, "Chat")
-            expect(composer).to_be_visible(timeout=30_000)
-            composer.fill(f"/{_PLUGIN}")
-            expect(page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:simplify")).to_be_visible(
-                timeout=30_000
-            )
-            page.wait_for_timeout(1_500)
-            if evidence_dir:
-                page.screenshot(path=f"{evidence_dir}/chat-menu.png")
-            review_row = page.get_by_test_id(f"slash-menu-item-{_PLUGIN}:review")
-            try:
-                expect(review_row).to_be_visible(timeout=30_000)
-            except AssertionError:
-                listed = client.get("/v1/skills", params={"session_id": session_id}).json()
-                names = [skill["name"] for skill in listed.get("skills", [])]
-                raise AssertionError(
-                    f"chat menu lacks /{_PLUGIN}:review although the terminal lists it; "
-                    f"/v1/skills names={names}"
-                ) from None
-        finally:
-            client.delete(f"/v1/sessions/{session_id}")

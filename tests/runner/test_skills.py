@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.runner import create_runner_app
 from omnigent.runner.app import ResolvedSpec
 from omnigent.spec.types import SkillSpec
+from tests._helpers.claude_launch import configure_claude_launch
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture(autouse=True)
@@ -653,6 +657,74 @@ async def test_resolve_finds_a_surfaced_plugin_skill(
 
     assert resp.status_code == 200, resp.text
     assert "<skill>" in resp.json()["meta_text"]
+
+
+@pytest.mark.posix_only
+@pytest.mark.asyncio
+async def test_resolve_waits_for_a_claude_launch_only_for_an_unlisted_skill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _no_configured_claude_launch: Callable[[], bool],
+) -> None:
+    """A listed skill resolves while the configured launch is pending; its plugin skill waits.
+
+    A runner that has not asked the launch reuses the answer stored for it; a changed launch
+    is asked again.
+    """
+    for env_name in ("OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH", "OMNIGENT_CLAUDE_LAUNCHER"):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
+    home = tmp_path / "home"
+    plugin = tmp_path / "launch" / "dev"
+    for root, name in ((home / ".claude", "local"), (plugin, "review")):
+        skill = root / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(_skill_md(name, f"Use {name}."))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    release = tmp_path / "release"
+    plugins = [{"name": "dev", "path": str(plugin), "source": "dev@inline"}]
+    init = {"type": "system", "subtype": "init", "plugins": plugins}
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    launches = tmp_path / "launches.jsonl"
+    script = (
+        f"while not os.path.exists({str(release)!r}):\n    time.sleep(0.05)\n"
+        f"print({json.dumps(init)!r})\n"
+    )
+    configure_claude_launch(config_home, launches, script)
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    app = _make_app(bundle, [], "all", workspace=workspace, harness="claude-native")
+    url = "/v1/sessions/conv_launch/skills/resolve"
+    review = {"name": "dev:review"}
+
+    async for c in _client(app):
+        try:
+            listed = await asyncio.wait_for(c.post(url, json={"name": "local"}), 5)
+            pending = asyncio.ensure_future(c.post(url, json=review))
+            await asyncio.sleep(0.5)
+            waited = not pending.done()
+        finally:
+            release.touch()
+        launched = await asyncio.wait_for(pending, 15)
+
+        monkeypatch.setattr(plugin_discovery, "_probes", {})
+        reused = await c.post("/v1/sessions/conv_reused/skills/resolve", json=review)
+        launches_before_change = len(launches.read_text().splitlines())
+        configure_claude_launch(config_home, launches, script, args=("--", "changed"))
+        changed = await c.post("/v1/sessions/conv_changed/skills/resolve", json=review)
+
+    assert listed.status_code == 200, listed.text
+    assert waited
+    assert launched.status_code == 200, launched.text
+    assert "body for review" in launched.json()["meta_text"]
+    assert reused.status_code == 200, reused.text
+    assert launches_before_change == 1
+    assert changed.status_code == 200, changed.text
+    assert len(launches.read_text().splitlines()) == 2
 
 
 @pytest.mark.asyncio

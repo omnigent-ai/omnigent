@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
@@ -34,6 +34,12 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 _logger = logging.getLogger("omnigent.runner.app")
 
 
+class _ResolveSessionSkillsFn(Protocol):
+    async def __call__(
+        self, session_id: str, *, wait_for_launch_plugins: bool = False
+    ) -> list[SkillSpec]: ...
+
+
 # Claude-native session model listing: how long one request waits inline for
 # the probe before answering 503-pending, and how long the probe may stay
 # pending before the configured rows are served instead. Module-level so
@@ -57,7 +63,7 @@ def register_model_option_routes(
     _resolve_session_claude_launch_config: Callable[
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
     ],
-    _resolve_session_skills: Callable[[str], Coroutine[Any, Any, list[SkillSpec]]],
+    _resolve_session_skills: _ResolveSessionSkillsFn,
     _session_cursor_model_names: dict[str, dict[str, str]],
     _session_harness_name: Callable[[str], str | None],
     _session_spec_cache: dict[str, _SpecEntry | None],
@@ -414,8 +420,12 @@ def register_model_option_routes(
                 status_code=400,
                 content={"error": "invalid_request", "detail": "'arguments' must be a string."},
             )
+        # Only a skill not listed yet waits for a configured Claude launch to report.
         skills = await _resolve_session_skills(session_id)
         skill = find_skill_by_name(skills, name)
+        if skill is None:
+            skills = await _resolve_session_skills(session_id, wait_for_launch_plugins=True)
+            skill = find_skill_by_name(skills, name)
         if skill is None:
             return JSONResponse(
                 status_code=404,

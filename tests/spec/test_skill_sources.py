@@ -1,16 +1,41 @@
 from __future__ import annotations
 
+import itertools
 import json
 import logging
+import threading
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from omnigent.claude_launcher import ClaudeLauncher
+from omnigent.harnesses.claude_native import plugin_discovery
 from omnigent.spec.skill_sources import (
     SkillSourceContext,
     _harness_family,
     resolve_harness_skills,
 )
+from tests._helpers.claude_launch import configure_claude_launch, write_launch_recorder
+from tests._helpers.polling import poll_until
+from tests._helpers.providers import isolate_provider_resolution
+
+
+@pytest.fixture(autouse=True)
+def _default_claude_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _no_configured_claude_launch: Callable[[], bool],
+) -> None:
+    """Check the real launch, ignoring a developer's configured one, which the menu would probe."""
+    monkeypatch.setattr(
+        plugin_discovery, "claude_launch_is_customized", _no_configured_claude_launch
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "default-config"))
+    for name in ("OMNIGENT_CLAUDE_LAUNCHER", "OMNIGENT_CLAUDE_PATH", "HARNESS_CLAUDE_PATH"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _write_skill(skills_dir: Path, name: str, *, user_invocable: bool | None = None) -> None:
@@ -1010,6 +1035,277 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     assert "sp:using-superpowers" not in names
+
+
+def _print_init(plugins: list[dict[str, str]]) -> str:
+    event = {"type": "system", "subtype": "init", "plugins": plugins}
+    return f"print({json.dumps(event)!r})\n"
+
+
+def _launch_ctx(root: Path, home: Path, warnings: list[str] | None = None) -> SkillSourceContext:
+    """A context that waits for a configured launch, as a lookup of an unlisted skill does."""
+    return replace(_ctx(root, home), warnings=warnings, wait_for_launch_plugins=True)
+
+
+@pytest.mark.posix_only
+def test_claude_native_lists_plugins_the_configured_launch_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch's session-only plugin is listed; workspace disables and installed copies win.
+
+    An installed plugin loads only from its trusted install path, even one only the launch
+    enables. A record without ``source`` cannot be matched to settings keys, so it is ignored.
+    """
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    plugins_dir = home / ".claude" / "plugins"
+    lazy = plugins_dir / "cache" / "mkt" / "lazy" / "1.0.0"
+    _write_skill(lazy / "skills", "installed")
+    outside = tmp_path / "outside"
+    _write_skill(outside / "skills", "escaped")
+    manifest = json.loads((plugins_dir / "installed_plugins.json").read_text())
+    manifest["plugins"] |= {
+        "lazy@mkt": [{"installPath": str(lazy)}],
+        "ext@mkt": [{"installPath": str(outside)}],
+    }
+    (plugins_dir / "installed_plugins.json").write_text(json.dumps(manifest))
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"sp@mkt": True, "ext@mkt": True}})
+    )
+    launch_dirs = tmp_path / "launch"
+    for plugin, skill in (
+        ("dev-productivity", "review"),
+        ("sp", "stale"),
+        ("off", "hidden"),
+        ("lazy", "stale"),
+    ):
+        _write_skill(launch_dirs / plugin / "skills", skill)
+    ws = tmp_path / "ws"
+    (ws / ".claude").mkdir(parents=True)
+    (ws / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"off@mkt": False}})
+    )
+    config_home = isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    assert not plugin_discovery.claude_launch_is_customized()
+    launches = tmp_path / "launches.jsonl"
+    configured_settings = json.dumps({"disableAllHooks": False})
+    configure_claude_launch(
+        config_home,
+        launches,
+        _print_init(
+            [
+                {"name": "builtin-tools", "path": "builtin", "source": "builtin-tools@builtin"},
+                {
+                    "name": "dev-productivity",
+                    "path": str(launch_dirs / "dev-productivity"),
+                    "source": "dev-productivity@inline",
+                },
+                {"name": "sp", "path": str(launch_dirs / "sp"), "source": "sp@mkt"},
+                {"name": "off", "path": str(launch_dirs / "off"), "source": "off@mkt"},
+                {"name": "off", "path": str(launch_dirs / "off")},
+                {"name": "lazy", "path": str(launch_dirs / "lazy"), "source": "lazy@mkt"},
+                # The launch reports an installed plugin at its manifest path, outside the root.
+                {"name": "ext", "path": str(outside), "source": "ext@mkt"},
+            ]
+        ),
+        args=("--", "--settings", configured_settings),
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    warnings: list[str] = []
+
+    names = {
+        s.name for s in resolve_harness_skills(_launch_ctx(ws, home, warnings), "claude-native")
+    }
+
+    assert {"dev-productivity:review", "sp:installed", "lazy:installed"} <= names
+    assert not names & {"sp:stale", "off:hidden", "lazy:stale", "ext:escaped"}
+    assert warnings == []
+    [launch] = [json.loads(line) for line in launches.read_text().splitlines()]
+    # The probe's settings follow configured ones, so its hooks stay disabled.
+    settings = [
+        value for flag, value in itertools.pairwise(launch["argv"]) if flag == "--settings"
+    ]
+    assert [json.loads(value) for value in settings] == [
+        {"disableAllHooks": False},
+        {"disableAllHooks": True},
+    ]
+    assert Path(launch["cwd"]).resolve() == home.resolve()
+
+
+def test_unreadable_omnigent_config_warns_and_keeps_installed_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    config = isolate_provider_resolution(monkeypatch, tmp_path / "config") / "config.yaml"
+    # The YAML error would quote this value, such as an unquoted credential read as an alias.
+    config.write_text("harness: *synthetic-config-secret\n")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    warnings: list[str] = []
+
+    skills = resolve_harness_skills(_launch_ctx(tmp_path / "ws", home, warnings), "claude-native")
+
+    assert "sp:installed" in {s.name for s in skills}
+    assert warnings == [
+        "Claude plugins added by a configured launch may be missing: the Omnigent "
+        "config could not be read; see the host log for details."
+    ]
+    assert f"ComposerError in {config}, line 1, column 10" in caplog.text
+    assert "synthetic-config-secret" not in caplog.text
+
+
+@pytest.mark.posix_only
+def test_unchanged_claude_launch_is_probed_once_until_it_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated catalogs reuse one answer until an executable the launch runs changes.
+
+    A launcher plugin picks its executable itself, so that executable is checked too. Past
+    the safety TTL the last answer is served while one background probe refreshes it.
+    """
+    now = [0.0]
+    monkeypatch.setattr(
+        plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0])
+    )
+    probes_may_run = threading.Event()
+    probes_may_run.set()
+
+    class HeldThread(threading.Thread):
+        def run(self) -> None:
+            probes_may_run.wait(10)
+            super().run()
+
+    monkeypatch.setattr(
+        plugin_discovery, "threading", SimpleNamespace(Event=threading.Event, Thread=HeldThread)
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    launches = tmp_path / "launches.jsonl"
+    wrapper = tmp_path / "wrapper"
+
+    class WrapperLauncher(ClaudeLauncher):
+        def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+            return str(wrapper), args
+
+    monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "wrapper")
+    monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: WrapperLauncher())
+    answer = tmp_path / "answer.json"
+
+    def report(plugin_name: str) -> None:
+        plugin = tmp_path / "plugins" / plugin_name
+        _write_skill(plugin / "skills", "review")
+        record = {"name": plugin_name, "path": str(plugin), "source": f"{plugin_name}@inline"}
+        answer.write_text(json.dumps({"type": "system", "subtype": "init", "plugins": [record]}))
+
+    report("one")
+    # The launch reports whichever plugin the answer file names, so a new probe shows it.
+    script = f"print(open({str(answer)!r}).read())\n"
+    write_launch_recorder(wrapper, launches, script)
+
+    def catalog(workspace: str) -> tuple[int, list[str]]:
+        skills = resolve_harness_skills(_launch_ctx(tmp_path / workspace, home), "claude-native")
+        return len(launches.read_text().splitlines()), [skill.name for skill in skills]
+
+    assert [catalog(workspace) for workspace in ("first", "second", "first")] == [
+        (1, ["one:review"])
+    ] * 3
+    report("two")
+    now[0] = plugin_discovery.LAUNCH_PLUGINS_TTL_S - 1
+    assert catalog("second") == (1, ["one:review"])
+    write_launch_recorder(wrapper, launches, script + "# upgraded\n")
+    assert catalog("second") == (2, ["two:review"])
+    report("three")
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    probes_may_run.clear()
+    assert catalog("first")[1] == ["two:review"]
+    probes_may_run.set()
+    poll_until(
+        lambda: plugin_discovery.launch_plugins_generation() > generation,
+        timeout_s=10,
+        interval_s=0.05,
+    )
+    assert catalog("first") == (3, ["three:review"])
+
+
+@pytest.mark.posix_only
+def test_failing_claude_launch_backs_off_until_it_reports_its_plugins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Consecutive failures wait 30s, doubling up to 10 min, to respawn; success resets it.
+
+    Installed plugins stay listed meanwhile, and the launch's arguments stay out of the log.
+    """
+    now = [0.0]
+    monkeypatch.setattr(
+        plugin_discovery, "time", SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0])
+    )
+    home = _claude_home_with_plugin(
+        tmp_path / "home", plugin="sp", marketplace="mkt", skill="installed", enabled=True
+    )
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    failing = tmp_path / "failing"
+    failing.touch()
+    plugin = tmp_path / "dev"
+    plugin.mkdir()
+    launches = tmp_path / "launches.jsonl"
+    configure_claude_launch(
+        isolate_provider_resolution(monkeypatch, tmp_path / "config"),
+        launches,
+        f"if os.path.exists({str(failing)!r}):\n    sys.exit(3)\n"
+        + _print_init([{"name": "dev", "path": str(plugin), "source": "dev@inline"}]),
+        args=("--token", "synthetic-launch-secret"),
+    )
+    missing = [
+        "Claude plugins added by the configured launch are missing: the launch "
+        "exited 3 without an init event; see the host log for details."
+    ]
+
+    def catalog() -> tuple[int, list[str]]:
+        warnings: list[str] = []
+        skills = resolve_harness_skills(
+            _launch_ctx(tmp_path / "ws", home, warnings), "claude-native"
+        )
+        assert "sp:installed" in {s.name for s in skills}
+        return len(launches.read_text().splitlines()), warnings
+
+    def wait_for_background_probe(generation: int) -> None:
+        poll_until(
+            lambda: plugin_discovery.launch_plugins_generation() > generation,
+            timeout_s=10,
+            interval_s=0.05,
+        )
+
+    assert catalog() == (1, missing)
+    for count, backoff_s in enumerate((30, 60, 120, 240, 480, 600, 600), start=2):
+        now[0] += backoff_s - 1
+        assert catalog() == (count - 1, missing)
+        now[0] += 1
+        assert catalog() == (count, missing)
+    assert "exited 3 without an init event" in caplog.text
+    assert "synthetic-launch-secret" not in caplog.text
+    failing.unlink()
+    now[0] += 600
+    assert catalog() == (9, [])
+
+    failing.touch()
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += plugin_discovery.LAUNCH_PLUGINS_TTL_S
+    catalog()
+    wait_for_background_probe(generation)
+    # A failed refresh keeps the last answer and backs off from 30s again.
+    now[0] += 29
+    assert catalog() == (10, [])
+    assert plugin_discovery.claude_launch_plugin_dirs() == {"dev@inline": plugin}
+    generation = plugin_discovery.launch_plugins_generation()
+    now[0] += 1
+    catalog()
+    wait_for_background_probe(generation)
+    assert catalog() == (11, [])
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(
