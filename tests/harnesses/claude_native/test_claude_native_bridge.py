@@ -5730,16 +5730,23 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
     assert tui["enters"] == 2
 
 
+@pytest.mark.parametrize(
+    "replay_captures,recovered_draft",
+    [(8, ""), (25, ""), (8, "unfinished terminal edit")],
+    ids=["composer-returned", "still-replaying", "nonempty-composer"],
+)
 def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    replay_captures: int,
+    recovered_draft: str,
 ) -> None:
     """
     A paste that lands while a resumed TUI is still replaying must not be submitted blind.
 
-    The composer frame is absent when the paste wait ends, so an Enter would submit
-    nothing and report success. Delivery waits for the composer, clears, pastes once
-    more, and presses Enter only after the draft is visible in the input box.
+    The first paste is dropped while replaying; the composer may return before
+    the paste wait ends. Delivery pastes once more and presses Enter only after
+    the draft is visible in the input box.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -5748,6 +5755,7 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -5776,9 +5784,9 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         if "capture-pane" in cmd:
             if tui["replaying"]:
                 tui["replay_captures"] += 1
-                if tui["replay_captures"] > 25:
+                if tui["replay_captures"] > replay_captures:
                     tui["replaying"] = False
-                    tui["pane"] = _composer_pane()
+                    tui["pane"] = _composer_pane(recovered_draft)
                 else:
                     return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
@@ -5797,6 +5805,20 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    if recovered_draft:
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "has_pending_user_prompt",
+            lambda _bridge_dir: tui["pastes"] > 0 and not tui["replaying"],
+        )
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            inject_user_message(
+                bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8
+            )
+        assert tui["pastes"] == 1
+        assert tui["enter_saw_draft"] == []
+        assert tui["pane"] == _composer_pane(recovered_draft)
+        return
     inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
 
     assert tui["enter_saw_draft"] == [True], (

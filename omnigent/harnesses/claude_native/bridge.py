@@ -4625,13 +4625,22 @@ def _paste_and_submit(
     delivery_diagnostics.set_stage("pasting")
     # A terminal-owned draft must be released before this initial paste.
     _prepare_empty_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
     )
-    if not draft_seen and _composer_box(pane) is None:
-        # The composer frame is not mounted (a resumed TUI still replaying its
-        # transcript). An Enter now would submit nothing yet report success, so
-        # wait for the composer, clear what the first paste left, and paste once more.
+    box = _composer_box(pane)
+    # A TUI that submits the paste itself leaves an empty box and a new transcript line.
+    submitted_by_paste = bool(needle) and (
+        pane.count(needle) > transcript_before_paste.count(needle)
+    )
+    if (
+        not draft_seen
+        and not submitted_by_paste
+        and (box is None or (box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH))
+    ):
+        # A resuming TUI can drop the paste, then remount an empty composer
+        # before the draft wait ends. Recover once before sending any Enter.
         delivery_diagnostics.set_stage("waiting_for_composer")
         _wait_for_claude_prompt_ready(
             socket_path,
