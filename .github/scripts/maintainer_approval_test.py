@@ -95,16 +95,19 @@ def test_trusted_automation_author_passes_without_review():
 
 @pytest.mark.parametrize("activation", ["explicit", "removed-label"])
 @pytest.mark.parametrize(
-    "reviews, expected",
+    "author, reviews, expected",
     [
-        pytest.param([], False, id="missing"),
-        pytest.param([review("APPROVED", "old")], False, id="stale"),
-        pytest.param([review("DISMISSED", "old")], False, id="auto-dismissed"),
-        pytest.param([review("APPROVED", "new")], True, id="current"),
+        pytest.param("omni-resolve-agent[bot]", [], False, id="missing"),
+        pytest.param("omni-resolve-agent[bot]", [review("APPROVED", "old")], False, id="stale"),
+        pytest.param(
+            "omni-resolve-agent[bot]", [review("DISMISSED", "old")], False, id="auto-dismissed"
+        ),
+        pytest.param("omni-resolve-agent[bot]", [review("APPROVED", "new")], True, id="current"),
+        pytest.param("maintainer", [], False, id="maintainer-exemption"),
     ],
 )
 def test_address_requires_current_maintainer_approval_even_for_trusted_author(
-    activation, reviews, expected
+    activation, author, reviews, expected
 ):
     timeline = [dismissal_event()]
     if activation == "removed-label":
@@ -117,7 +120,7 @@ def test_address_requires_current_maintainer_approval_even_for_trusted_author(
             },
         ]
     decision = decide(
-        author="omni-resolve-agent[bot]",
+        author=author,
         reviews=reviews,
         commits=[commit("old"), commit("new")],
         timeline=timeline,

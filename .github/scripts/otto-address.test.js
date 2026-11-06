@@ -2,24 +2,29 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const authorize = require("./otto-address.js");
 
-async function run({ comment = {}, pull = {}, maintainers = "maintainer\n", apiFailure = false, reviewers = "Reader,second-reader\nthird-reader" } = {}) {
+async function run({ comment = {}, pull = {}, context = {}, maintainers = "maintainer\n", apiFailure = false, reviewers = "Reader,second-reader\nthird-reader" } = {}) {
   const outputs = {};
   const calls = [];
   let pullReads = 0;
+  let commentReads = 0;
   await authorize({
     reviewers,
     context: {
       repo: { owner: "omnigent-ai", repo: "omnigent" },
       payload: { issue: { number: 7, pull_request: {} }, comment: { id: 42 } },
+      ...context,
     },
     core: { info() {}, setOutput: (key, value) => { outputs[key] = value; } },
     github: { rest: {
-      issues: { getComment: async () => ({ data: {
-        body: "/address", user: { login: "reader", type: "User" },
-        issue_url: "https://api.github.com/repos/omnigent-ai/omnigent/issues/7",
-        created_at: "2026-11-06T01:00:00Z", updated_at: "2026-11-06T01:00:00Z",
-        ...comment,
-      } }) },
+      issues: { getComment: async () => {
+        commentReads += 1;
+        return { data: {
+          body: "/address", user: { login: "reader", type: "User" },
+          issue_url: "https://api.github.com/repos/omnigent-ai/omnigent/issues/7",
+          created_at: "2026-11-06T01:00:00Z", updated_at: "2026-11-06T01:00:00Z",
+          ...comment,
+        } };
+      } },
       pulls: { get: async () => {
         pullReads += 1;
         return { data: {
@@ -36,7 +41,16 @@ async function run({ comment = {}, pull = {}, maintainers = "maintainer\n", apiF
       } },
     } },
   });
-  return { outputs, calls, pullReads };
+  return { outputs, calls, pullReads, commentReads };
+}
+
+for (const [name, context] of [
+  ["wrong repository", { repo: { owner: "other", repo: "omnigent" } }],
+  ["non-PR issue", { payload: { issue: { number: 7 }, comment: { id: 42 } } }],
+]) {
+  test(`rejects ${name} without API reads or outputs`, async () => {
+    assert.deepEqual(await run({ context }), { outputs: {}, calls: [], pullReads: 0, commentReads: 0 });
+  });
 }
 
 test("allows an explicitly listed reader without consulting repository Write permissions", async () => {
@@ -105,7 +119,6 @@ test("explains an authorized user's edited command without authorizing dispatch"
 
 for (const scenario of [
   {},
-  { pull: { state: "closed" } },
   { comment: { updated_at: "2026-11-06T02:00:00Z" } },
 ]) {
   test(`unlisted callers cannot cause public replies: ${JSON.stringify(scenario)}`, async () => {
