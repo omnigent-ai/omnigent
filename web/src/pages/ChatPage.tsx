@@ -29,7 +29,10 @@ import { BotIcon, WandSparklesIcon, FileTextIcon, Loader2Icon, XIcon } from "luc
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   composerSendShortcutKeys,
+  CompactShortcutKeys,
+  ESC_KEY,
   KeyboardShortcutTooltipContent,
+  SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
 import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
@@ -75,8 +78,9 @@ import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/
 import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
-import { useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
+import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
+import { useTypeToComposer } from "@/hooks/useTypeToComposer";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
@@ -98,11 +102,13 @@ import {
   holdsInitialDraft,
   isStaleTempConvId,
   isTempConvId,
+  retryConversationLoad,
   type ChatState,
   type PendingInitialPrompt,
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { isRetryableRequestError } from "@/lib/queryRetry";
 import { useTrueForAtMost } from "@/hooks/useTrueForAtMost";
 import {
   isNativeTerminalSession,
@@ -1648,6 +1654,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     conversationRef.current = el;
     setContainerEl(el);
   }, []);
+  // Typing in the conversation starts a message in the composer.
+  useTypeToComposer(() => composerRef.current?.focus(), conversationRef, !showTerminal);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
   // True only while the chat/terminal surface is the frontmost thing on screen.
   // Drives both native overlays so neither floats over an opened drawer.
@@ -1958,10 +1966,10 @@ function HydratingPlaceholder() {
  * verbatim instead of falling through to the chat surface so the user
  * sees the problem (instead of a blank chat that silently posts to a
  * non-existent conversation on next send). Most common cause: invalid
- * conversation id in the URL — surfaces quickly because the store's
- * items fetch disables retries.
+ * conversation id in the URL — surfaces quickly because the store retries
+ * only failures a retry can fix.
  */
-function ConversationLoadError({
+export function ConversationLoadError({
   conversationId,
   error,
 }: {
@@ -1969,19 +1977,29 @@ function ConversationLoadError({
   error: Error;
 }) {
   const navigate = useNavigate();
+  const missing = error instanceof ApiError && error.status === 404;
   return (
     <div className="flex flex-1 items-center justify-center px-6">
       <div className="flex max-w-md flex-col items-center gap-3 text-center">
-        <h1 className="font-medium text-foreground text-lg">Conversation not found</h1>
+        <h1 className="font-medium text-foreground text-lg">
+          {missing ? "Conversation not found" : "Couldn't load this conversation"}
+        </h1>
         <p className="text-muted-foreground text-ui">
           Couldn't load{" "}
           <code className="rounded bg-muted px-1.5 py-0.5 font-mono text-sm">{conversationId}</code>
           : {error.message}
         </p>
-        {/* Route to the home composer ("/"), which owns session creation. */}
-        <Button type="button" variant="outline" onClick={() => navigate("/")}>
-          Start a new chat
-        </Button>
+        <div className="flex gap-2">
+          {isRetryableRequestError(error) && (
+            <Button type="button" onClick={() => void retryConversationLoad(conversationId)}>
+              Try again
+            </Button>
+          )}
+          {/* Route to the home composer ("/"), which owns session creation. */}
+          <Button type="button" variant="outline" onClick={() => navigate("/")}>
+            Start a new chat
+          </Button>
+        </div>
       </div>
     </div>
   );
@@ -1990,6 +2008,8 @@ function ConversationLoadError({
 interface ComposerHandle {
   appendReplyQuote: (text: string) => void;
   startSideChat: (selectedText: string) => void;
+  /** Take keyboard focus for typing (not on phones, or while a /btw answer holds it). */
+  focus: () => void;
 }
 
 interface ComposerProps {
@@ -2650,10 +2670,9 @@ function ComposerImpl(
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
   // exists and the gear isn't disabled (not read-only, unreachable, or busy).
-  useModelPickerHotkey(
-    () => setPickerOpenNonce((n) => n + 1),
-    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy,
-  );
+  const modelPickerHotkeyEnabled =
+    showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable && !configBusy;
+  useModelPickerHotkey(() => setPickerOpenNonce((n) => n + 1), modelPickerHotkeyEnabled);
   const hydratedComposerContext = useMemo(
     () => composerContextFromLabels(composerSession?.labels),
     [composerSession?.labels],
@@ -2796,6 +2815,8 @@ function ComposerImpl(
   const dirtyRef = useRef(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
+  // While dictation listens, Esc cancels the take instead of interrupting the turn.
+  const [dictating, setDictating] = useState(false);
   // On mobile, programmatic focus immediately summons the software keyboard.
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
@@ -3609,6 +3630,10 @@ function ComposerImpl(
 
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
+    focus() {
+      if (isMobileRef.current || composerLockedByBtw) return;
+      textareaRef.current?.focus({ preventScroll: true });
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
       if (blocked || composerLockedByBtw || !text.trim()) return;
@@ -3867,6 +3892,16 @@ function ComposerImpl(
     });
   };
 
+  // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
+  const composerEmptyForRecall =
+    fullText === "" && files.length === 0 && mentionedItems.length === 0;
+  // The queued row ↑ recalls: the queue tail, only while the composer takes input and
+  // is empty and quote-free.
+  const arrowUpRecallQueueId =
+    !inputDisabled && composerEmptyForRecall && draft.quotes.length === 0
+      ? composerQueuedMessages.at(-1)?.queueId
+      : undefined;
+
   const handleKeyDown = (
     e: KeyboardEvent<HTMLTextAreaElement>,
     {
@@ -3938,7 +3973,7 @@ function ComposerImpl(
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
-        if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
+        if (composerEmptyForRecall) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
           if (target !== undefined) {
             e.preventDefault();
@@ -4023,6 +4058,7 @@ function ComposerImpl(
             elsewhere never leaks in. */}
         <QueuedMessagesStrip
           messages={composerQueuedMessages}
+          arrowUpRecallQueueId={arrowUpRecallQueueId}
           onDelete={dequeueMessage}
           onEdit={(queueId) => {
             // Pull the queued message back into the composer for editing:
@@ -4109,6 +4145,7 @@ function ComposerImpl(
           COMPOSER_COLUMN_WIDTH,
           isDragActive && "ring-2 ring-ring ring-inset",
         )}
+        data-suggestions-open={slashCompletion.open || mentionOpen ? "true" : undefined}
         input={{
           ref: bindTailTextarea,
           value: draft.text,
@@ -4232,7 +4269,10 @@ function ComposerImpl(
               {/* /btw side-chat overlay — transient question+answer panel,
             dismissed with Esc / ✕. Never persisted to the transcript. */}
               {btwSidechat && (
-                <div className="border-b border-border bg-card/50 p-4 backdrop-blur-sm">
+                <div
+                  data-btw-overlay="true"
+                  className="border-b border-border bg-card/50 p-4 backdrop-blur-sm"
+                >
                   <div className="mb-3 flex items-start justify-between">
                     <h3 className="text-sm font-medium">Claude Quick Answer</h3>
                     <button
@@ -4386,6 +4426,10 @@ function ComposerImpl(
                       ? undefined
                       : "Only the session owner can change the permission mode"
                   }
+                  // The message box takes ⇧Tab, so not while it's disabled.
+                  shortcut={
+                    nextFromSelected === null || inputDisabled ? undefined : [SHIFT_KEY, "Tab"]
+                  }
                   onSelect={(mode) => void changePermission(mode)}
                   openNonce={permissionPickerOpenNonce}
                 />
@@ -4428,6 +4472,7 @@ function ComposerImpl(
                     // no message can wake (unreachable) get an inert gear.
                     disabled={isReadOnly || unreachable}
                     openNonce={pickerOpenNonce}
+                    modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
                   />
                 </div>
               </MobileHeaderControlPortal>
@@ -4441,6 +4486,7 @@ function ComposerImpl(
                 onVoiceDiscard={() => {
                   setValue(voiceSnapshotRef.current);
                 }}
+                onListeningChange={setDictating}
                 onTranscript={(text) => {
                   dictation.appendFinal(text);
                   dirtyRef.current = true;
@@ -4469,15 +4515,24 @@ function ComposerImpl(
                             sendDisabledReason !== null ||
                             hasPendingElicitation
                       }
-                      title={showInterruptButton ? "Interrupt" : (sendDisabledReason ?? undefined)}
+                      title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
                     />
                   </TooltipTrigger>
-                  {!showInterruptButton && !preventsKeyboardSubmit && (
+                  {showInterruptButton ? (
+                    // The message box takes Esc to interrupt, so not while it's disabled
+                    // or while dictation listens (Esc then cancels the take).
                     <KeyboardShortcutTooltipContent
-                      label="Send"
-                      keys={composerSendShortcutKeys(submitWithModEnter)}
+                      label="Interrupt"
+                      keys={inputDisabled || dictating ? [] : [ESC_KEY]}
                     />
+                  ) : (
+                    !preventsKeyboardSubmit && (
+                      <KeyboardShortcutTooltipContent
+                        label="Send"
+                        keys={composerSendShortcutKeys(submitWithModEnter)}
+                      />
+                    )
                   )}
                 </Tooltip>
               </TooltipProvider>
@@ -4896,6 +4951,7 @@ function SessionHarnessPicker({
   modelPickWakesSession,
   disabled,
   openNonce = 0,
+  modelPickerShortcutEnabled = false,
 }: {
   appearance?: "composer" | "header";
   busy: boolean;
@@ -4919,6 +4975,8 @@ function SessionHarnessPicker({
   modelPickWakesSession: boolean;
   disabled: boolean;
   openNonce?: number;
+  /** Whether the Ctrl+Shift+M hotkey opens this picker (mirrors its enabled state). */
+  modelPickerShortcutEnabled?: boolean;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -5348,7 +5406,17 @@ function SessionHarnessPicker({
           (sessionModelSeeded || pendingModelChange !== null) &&
           (modelPickerKind === "claude" || modelPickerKind === "codex"),
       }}
-      tooltip={<ComposerConfigTooltipRows rows={summary} />}
+      tooltip={
+        <>
+          <ComposerConfigTooltipRows rows={summary} />
+          {modelPickerShortcutEnabled && (
+            <span className="flex items-center gap-2 pt-1 text-muted-foreground">
+              Open model picker
+              <CompactShortcutKeys keys={MODEL_PICKER_KEYS} />
+            </span>
+          )}
+        </>
+      }
       tooltipTestId="composer-config-gear-tooltip"
       testId="composer-agent-menu"
     >
