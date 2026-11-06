@@ -16,6 +16,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
     startup_permissions as startup_permissions,
@@ -679,13 +680,26 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
         created_id = result["conversation_id"]
         assert {s.id for s in store.list_conversations().data} - before == {created_id}
     else:
-        response = await auth_client.post(
-            "/v1/sessions/orchestrated",
-            headers={ORCHESTRATION_SOURCE_HEADER: manager["id"]},
-            json={"agent_id": source["agent_id"], "host_id": hosts[2], "workspace": "/requested"},
-        )
+        with capture_debug_rows("server") as rows:
+            response = await auth_client.post(
+                "/v1/sessions/orchestrated",
+                headers={ORCHESTRATION_SOURCE_HEADER: manager["id"]},
+                json={
+                    "agent_id": source["agent_id"],
+                    "host_id": hosts[2],
+                    "workspace": "/requested",
+                },
+            )
         assert response.status_code == 201, response.text
         created_id = response.json()["id"]
+        [created_row] = [
+            row
+            for row in rows
+            if row["event_name"] == "session_created" and row["session_id"] == created_id
+        ]
+        assert created_row["attributes"]["created_by_session_id"] == manager["id"]
+        assert "parent_session_id" not in created_row["attributes"]
+        assert created_row["user_id"] == "alice"
     created = store.get_conversation(created_id)
     expected_host = hosts[1] if move_before_recheck else hosts[0]
     expected_workspace = "/moved" if move_before_recheck else "/original"

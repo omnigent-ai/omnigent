@@ -95,6 +95,13 @@ describe("SessionImage (standalone, no host fetcher)", () => {
 
     expect(screen.getByRole("img", { name: "pending" }).tagName).toBe("IMG");
   });
+
+  it("reserves a square for a user attachment before its session path resolves", () => {
+    render(<SessionImage path={undefined} alt="pending" variant="userAttachment" />);
+
+    expect(screen.getByRole("status", { name: "Loading image: pending" })).toHaveClass("size-20");
+    expect(screen.getByTestId("spinner")).toBeInTheDocument();
+  });
 });
 
 describe("SessionImage (embedded, host fetcher present)", () => {
@@ -122,6 +129,36 @@ describe("SessionImage (embedded, host fetcher present)", () => {
     expect(img).toHaveClass("cls");
     expect(createObjectURL).toHaveBeenCalledWith(blob);
     expect(authenticatedFetch).toHaveBeenCalledWith("/p");
+  });
+
+  it("keeps a user attachment square while its bytes load", async () => {
+    let resolveFetch: (response: { ok: boolean; blob: () => Promise<Blob> }) => void = () => {};
+    authenticatedFetch.mockImplementation(
+      () =>
+        new Promise<{ ok: boolean; blob: () => Promise<Blob> }>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    render(<SessionImage path="/thumbnail" alt="shot.png" variant="userAttachment" />);
+
+    const placeholder = screen.getByRole("status", { name: "Loading image: shot.png" });
+    expect(placeholder).toHaveClass("size-20");
+
+    resolveFetch({ ok: true, blob: () => Promise.resolve(new Blob(["x"])) });
+    const image = await screen.findByRole("img", { name: "shot.png" });
+    expect(image.closest("div")).toHaveClass("size-20");
+    expect(image).toHaveClass("max-h-20", "max-w-20", "object-contain");
+    expect(screen.getByRole("button", { name: "Zoom image: shot.png" })).toHaveClass("size-20");
+  });
+
+  it("keeps a failed user attachment in the same square", async () => {
+    authenticatedFetch.mockResolvedValue({ ok: false, status: 404 });
+    render(<SessionImage path="/gone" alt="gone.png" variant="userAttachment" />);
+
+    const fallback = await screen.findByRole("img", { name: "gone.png" });
+    expect(fallback).toHaveClass("size-20");
+    expect(fallback).toHaveTextContent("gone.png");
+    expect(screen.queryByRole("button", { name: "Zoom image: gone.png" })).toBeNull();
   });
 
   it("renders the error fallback when the response is not ok", async () => {
@@ -240,6 +277,16 @@ describe("InlineImage (data: URI carried by the transcript)", () => {
     const chip = screen.getByRole("img", { name: "broken.png" });
     expect(chip).not.toHaveAttribute("src");
     expect(chip).toHaveTextContent("broken.png");
+  });
+
+  it("keeps the square footprint when an inline user attachment cannot decode", () => {
+    render(<InlineImage src={BAD_PNG} alt="broken.png" variant="userAttachment" />);
+    const image = screen.getByRole("img", { name: "broken.png" });
+    expect(image.closest("div")).toHaveClass("size-20");
+    expect(image).toHaveClass("max-h-20", "max-w-20");
+
+    fireEvent.error(image);
+    expect(screen.getByRole("img", { name: "broken.png" })).toHaveClass("size-20");
   });
 
   it("drops the lightbox affordance once the image has failed", () => {
