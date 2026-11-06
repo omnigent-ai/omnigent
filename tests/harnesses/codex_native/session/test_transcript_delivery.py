@@ -968,6 +968,109 @@ def test_forwarder_keeps_resumed_message_ahead_of_steer_a_read_cannot_place(
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
+def test_forwarder_keeps_steer_recovery_ahead_of_concurrent_replay(tmp_path: Path) -> None:
+    """
+    Replay cannot mirror a later message while assistant-start recovery reads for a steer.
+
+    On its own, replay cannot place the steer ahead of the resumed message's
+    positional id, so it drops the steer and mirrors the message.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    first = _native_user_message("item_first", "fix the bug", "client-first")
+    steer = _native_user_message("item_steer", "also update the docs", _STEER_CLIENT_ID)
+    typed = {
+        "type": "userMessage",
+        "id": "item_typed",
+        "content": [{"type": "text", "text": "run the tests", "text_elements": []}],
+    }
+    fake_client = _FakeCodexAppServerClient(
+        response={
+            "result": {
+                "thread": {
+                    "id": "thread_123",
+                    "turns": [{"id": "turn_123", "items": [first, steer, typed]}],
+                }
+            }
+        }
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_123",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    resumed_items = [{**first, "id": "item-1"}, {**typed, "id": "item-2"}]
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        read_paused = asyncio.Event()
+        release_read = asyncio.Event()
+        read_thread = fake_client.request
+
+        async def pause_first_read(method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if not read_paused.is_set():
+                read_paused.set()
+                await release_read.wait()
+            return await read_thread(method, params)
+
+        fake_client.request = pause_first_read  # type: ignore[method-assign]
+        locks_token = codex_native_forwarder._conversation_item_locks.set({})
+        try:
+            async with _recording_forwarder_client(posted) as client:
+
+                async def deliver(event: dict[str, Any]) -> None:
+                    await codex_native_forwarder._handle_event(
+                        client,
+                        **_forwarder_context(client, tmp_path),
+                        event=event,
+                        expected_thread_id="thread_123",
+                        forwarder_state=forwarder_state,
+                    )
+
+                await deliver(_turn_item_event("item/completed", first))
+                await _accept_web_steer(tmp_path, "also update the docs")
+                await deliver(
+                    _turn_item_event("item/started", {"type": "agentMessage", "id": "msg_1"})
+                )
+                await deliver(_agent_message_event("turn_123", "msg_1", "reply 1"))
+                recovery = asyncio.create_task(
+                    deliver(
+                        _turn_item_event("item/started", {"type": "agentMessage", "id": "msg_2"})
+                    )
+                )
+                await asyncio.wait_for(read_paused.wait(), timeout=5.0)
+                replay = asyncio.create_task(
+                    codex_native_forwarder._replay_resume_response(
+                        client,
+                        **_forwarder_context(client, tmp_path),
+                        response={
+                            "result": {
+                                "thread": {
+                                    "id": "thread_123",
+                                    "turns": [{"id": "turn_123", "items": resumed_items}],
+                                }
+                            }
+                        },
+                        forwarder_state=forwarder_state,
+                    )
+                )
+                # Replay outside the delivery scope would finish here, ahead of the steer.
+                await asyncio.wait({replay}, timeout=0.2)
+                release_read.set()
+                await asyncio.wait_for(asyncio.gather(recovery, replay), timeout=5.0)
+        finally:
+            codex_native_forwarder._conversation_item_locks.reset(locks_token)
+
+    asyncio.run(run())
+
+    assert _transcript(posted) == [
+        "user: fix the bug",
+        "assistant: reply 1",
+        _RECOVERED_STEER,
+        "user: run the tests",
+    ]
+    assert [method for method, _ in fake_client.requests] == ["thread/read"]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
 def test_forwarder_backs_off_reads_for_steer_missing_from_transcript(tmp_path: Path) -> None:
     """
     A steer Codex never wrote is read for at backed-off replies, then dropped at turn end.

@@ -7473,6 +7473,8 @@ async def _mirror_missed_steers(
     already mirrored ahead of: a server ignoring ``delivery_attempt_id`` would
     settle its late copy against another input. Steers sent after ``before`` stay
     queued behind it, so they are kept for a later read.
+    The session's delivery scope is held throughout, so a message another task
+    delivers cannot land between the read and the posts.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7486,65 +7488,71 @@ async def _mirror_missed_steers(
     """
     if forwarder_state is None or not thread_id or not turn_id:
         return
-    steers = [
-        steer
-        for steer in read_sent_steers(bridge_dir, thread_id=thread_id)
-        if steer.turn_id == turn_id or steer.turn_ended
-    ]
-    if not steers:
-        forwarder_state.steer_recovery_checks.pop(turn_id, None)
-        return
-    mirrored = forwarder_state.mirrored_user_client_ids
-    unmirrored = [
-        steer for steer in steers if (thread_id, steer.client_message_id) not in mirrored
-    ]
-    turn_message_posted = forwarder_state.has_posted_user_message(turn_id)
-    overtaken = [
-        steer
-        for steer in unmirrored
-        if steer.turn_ended and steer.turn_id != turn_id and turn_message_posted
-    ]
-    missed = [steer for steer in unmirrored if steer not in overtaken]
-    transcript_read = False
-    if missed and (
-        turn_ended or before is not None or forwarder_state.steer_recovery_due(turn_id)
-    ):
-        transcript_read = await _post_missed_steers(
-            client, session_id, forwarder_state, thread_id=thread_id, steers=missed, before=before
-        )
-    if before is not None:
-        newer = _steers_sent_after(
-            steers, before, turn_id=turn_id, opens_turn=not turn_message_posted
-        )
-        overtaken.extend(
+    async with _conversation_item_delivery_scope(session_id):
+        steers = [
             steer
-            for steer in missed
-            if (thread_id, steer.client_message_id) not in mirrored and steer not in newer
-        )
-    if overtaken:
-        _logger.warning(
-            "Codex forwarder dropped steered input not mirrored ahead of a later message: "
-            "thread=%s count=%d",
-            thread_id,
-            len(overtaken),
-        )
-    # A steer absent from its ended turn's transcript was never consumed.
-    settled = [
-        steer
-        for steer in steers
-        if (thread_id, steer.client_message_id) in mirrored
-        or steer in overtaken
-        or (transcript_read and (turn_ended or steer.turn_ended))
-    ]
-    if turn_ended or all(steer in settled for steer in missed):
-        forwarder_state.steer_recovery_checks.pop(turn_id, None)
-    if settled or turn_ended:
-        settle_sent_steers(
-            bridge_dir,
-            thread_id=thread_id,
-            steers=settled,
-            ended_turn_id=turn_id if turn_ended else None,
-        )
+            for steer in read_sent_steers(bridge_dir, thread_id=thread_id)
+            if steer.turn_id == turn_id or steer.turn_ended
+        ]
+        if not steers:
+            forwarder_state.steer_recovery_checks.pop(turn_id, None)
+            return
+        mirrored = forwarder_state.mirrored_user_client_ids
+        unmirrored = [
+            steer for steer in steers if (thread_id, steer.client_message_id) not in mirrored
+        ]
+        turn_message_posted = forwarder_state.has_posted_user_message(turn_id)
+        overtaken = [
+            steer
+            for steer in unmirrored
+            if steer.turn_ended and steer.turn_id != turn_id and turn_message_posted
+        ]
+        missed = [steer for steer in unmirrored if steer not in overtaken]
+        transcript_read = False
+        if missed and (
+            turn_ended or before is not None or forwarder_state.steer_recovery_due(turn_id)
+        ):
+            transcript_read = await _post_missed_steers(
+                client,
+                session_id,
+                forwarder_state,
+                thread_id=thread_id,
+                steers=missed,
+                before=before,
+            )
+        if before is not None:
+            newer = _steers_sent_after(
+                steers, before, turn_id=turn_id, opens_turn=not turn_message_posted
+            )
+            overtaken.extend(
+                steer
+                for steer in missed
+                if (thread_id, steer.client_message_id) not in mirrored and steer not in newer
+            )
+        if overtaken:
+            _logger.warning(
+                "Codex forwarder dropped steered input not mirrored ahead of a later message: "
+                "thread=%s count=%d",
+                thread_id,
+                len(overtaken),
+            )
+        # A steer absent from its ended turn's transcript was never consumed.
+        settled = [
+            steer
+            for steer in steers
+            if (thread_id, steer.client_message_id) in mirrored
+            or steer in overtaken
+            or (transcript_read and (turn_ended or steer.turn_ended))
+        ]
+        if turn_ended or all(steer in settled for steer in missed):
+            forwarder_state.steer_recovery_checks.pop(turn_id, None)
+        if settled or turn_ended:
+            settle_sent_steers(
+                bridge_dir,
+                thread_id=thread_id,
+                steers=settled,
+                ended_turn_id=turn_id if turn_ended else None,
+            )
 
 
 def _steers_sent_after(
