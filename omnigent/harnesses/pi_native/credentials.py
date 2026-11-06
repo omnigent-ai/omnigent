@@ -1970,6 +1970,7 @@ def pi_native_provider_launch(
     selection: str | None = None,
     global_agent_dir: Path | None = None,
     client_surface: str | None = None,
+    pi_env: Mapping[str, str] | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1982,6 +1983,9 @@ def pi_native_provider_launch(
         model. When that provider no longer serves the model, the provider that
         does is used instead.
     :param global_agent_dir: User root resolved against the session workspace.
+    :param pi_env: Environment the Pi terminal will start with, after overrides
+        and exclusions; host MCP placeholders resolve against it. Defaults to
+        ``os.environ``.
     :returns: The launch env, CLI args and any effort warning.
     :raises ValueError: If no generated provider serves the selected model.
     """
@@ -2031,6 +2035,7 @@ def pi_native_provider_launch(
         global_agent_dir=global_agent_dir
         if global_agent_dir is not None
         else global_pi_agent_dir(),
+        pi_env=pi_env,
     )
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     if os.name == "posix" and any(
