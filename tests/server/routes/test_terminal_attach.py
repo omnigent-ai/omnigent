@@ -38,7 +38,10 @@ from omnigent.runtime import (
     set_runner_router,
     set_runner_ws_factory,
 )
-from omnigent.server._runner_ws_tunnel import make_tunnel_ws_factory
+from omnigent.server._runner_ws_tunnel import (
+    RunnerUnavailableWSError,
+    make_tunnel_ws_factory,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -614,6 +617,35 @@ async def test_attach_terminal_tunnel_factory_failure_close_code(
         ws.receive_bytes()
 
     assert exc_info.value.code == expected_code
+
+
+async def test_attach_terminal_await_launch_waits_for_waking_runner(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``await_launch`` attach waits out a runner the shell create is waking.
+
+    Without the flag the same miss closes 1013 at once and the browser re-dials
+    on its backoff; with it, the relay retries until the runner's tunnel is up.
+    """
+    monkeypatch.setattr("omnigent.server.routes.terminal_attach._RUNNER_WS_RETRY_S", 0.01)
+    pty_bytes = b"$ "
+    connected = _FakeRunnerWSFactory(_FakeRunnerWSConn(outgoing=[pty_bytes]))
+    attempts: list[str] = []
+
+    def waking_factory(runner_path: str) -> object:
+        attempts.append(runner_path)
+        if len(attempts) < 3:
+            raise RunnerUnavailableWSError("runner is offline")
+        return connected(runner_path)
+
+    set_runner_ws_factory(waking_factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+    ) as ws:
+        assert ws.receive_bytes() == pty_bytes
+
+    assert len(attempts) == 3
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
