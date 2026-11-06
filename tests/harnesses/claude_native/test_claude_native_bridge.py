@@ -14764,6 +14764,24 @@ _SWITCH_MODEL_CONFIRM_PANE = """\
      2. No, go back
 """
 
+# A search title left in scrollback above the rule-less switch confirmation.
+_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE = (
+    "  Search prompts · everywhere\n" + _SWITCH_MODEL_CONFIRM_PANE
+)
+
+# The 2.1.295 search in a 40-column pane, its footer wrapped onto two rows.
+_NARROW_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s)
+────────────────────────────────────────
+  Search prompts · everywhere
+  ❯ 24s ago  Write a long reply.
+  ╭────────────────────────────────────╮
+  │ ⌕ Filter history…                  │
+  ╰────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to
+  use · Esc to cancel · ctrl+s to scope
+"""
+
 # A 2.1.295 draft quoting dialog titles, wrapped in a 28-column pane mid-turn.
 _DRAFT_QUOTING_DIALOGS_PANE = """\
 ✢ Leavening… (25s)
@@ -14793,12 +14811,14 @@ _REPLY_QUOTING_DIALOGS_PANE = """\
         (_INLINE_REVERSE_SEARCH_PANE, True),
         (_REVERSE_SEARCH_PANE, True),
         (_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_NARROW_OVERLAY_REVERSE_SEARCH_PANE, True),
         (_SLIVER_MULTILINE_DRAFT_PANE, True),
         (_DRAFT_QUOTING_DIALOGS_PANE, True),
         (_REPLY_QUOTING_DIALOGS_PANE, True),
         (_MODEL_PICKER_PANE, False),
         (_EFFORT_DIALOG_PANE, False),
         (_SWITCH_MODEL_CONFIRM_PANE, False),
+        (_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE, False),
         (_PERMISSION_PROMPT_PANE, False),
         (_REWIND_PANE, False),
         (_SETTINGS_PANEL_PANE, False),
@@ -14811,12 +14831,14 @@ _REPLY_QUOTING_DIALOGS_PANE = """\
         "inline-history-search",
         "history-search",
         "history-search-overlay",
+        "narrow-history-search-overlay",
         "sliver-draft",
         "draft-quoting-dialogs",
         "reply-quoting-dialogs",
         "model-picker",
         "effort-dialog",
         "switch-model-confirm",
+        "search-title-above-switch-confirm",
         "permission-prompt",
         "rewind",
         "settings-panel",

@@ -527,6 +527,8 @@ _AUTO_MODE_BILLING_CONSENT = re.compile(
 _HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
 # Title row of the history search once it draws its own surface (2.1.295).
 _HISTORY_SEARCH_OVERLAY_TITLE = "search prompts"
+# Key hint in that surface's closing footer row, which no dialog carries.
+_HISTORY_SEARCH_OVERLAY_FOOTER_HINT = "enter to use"
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -7080,20 +7082,26 @@ def _history_search_overlay_shown(pane: str) -> bool:
     Return whether the ctrl+r history search is drawn in place of the input box.
 
     Claude Code 2.1.295 draws the search as its own surface: a full-width
-    rule, then a ``Search prompts · everywhere`` title row. Only the row
-    under the lowest column-0 rule is read (the input box's closing rule
-    while the box is up), so transcript text cannot match.
+    rule, then a ``Search prompts · everywhere`` title row, closed by a
+    ``… Enter to use · Esc to cancel …`` footer. The region under the lowest
+    column-0 rule (the input box's closing rule while the box is up) must
+    open with the title and end with that footer, so neither transcript text
+    nor a scrollback row above a dialog drawn without such a rule can match.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the row under that rule, or the top row when
-        no such rule is on screen, titles the search.
+    :returns: ``True`` when the region under that rule, or the whole pane
+        when no such rule is on screen, is framed by the search's title and footer.
     """
     lines = [line for line in pane.splitlines() if line.strip()]
     last_rule = max(
         (i for i, line in enumerate(lines) if _box_rule_start(line) == 0), default=None
     )
     region = lines[last_rule + 1 :] if last_rule is not None else lines
-    return bool(region) and region[0].strip().lower().startswith(_HISTORY_SEARCH_OVERLAY_TITLE)
+    if not region or not region[0].strip().lower().startswith(_HISTORY_SEARCH_OVERLAY_TITLE):
+        return False
+    # A narrow pane may wrap the footer, so its last rows are read as one.
+    footer = " ".join(" ".join(region[-3:]).split()).lower()
+    return _HISTORY_SEARCH_OVERLAY_FOOTER_HINT in footer
 
 
 def _is_box_rule(line: str) -> bool:
