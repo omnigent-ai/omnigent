@@ -1,10 +1,11 @@
 # Database Schema Design
 
 This doc covers four core tables: agents, files, conversations,
-conversation_items. They are part of a larger schema — 17 tables in all, also
-including conversation labels, comments, policies, session permissions,
-conversation metadata, projects, hosts, users, and scheduled tasks. No model
-sets an explicit schema, so every table lives in the default one.
+conversation_items. They are part of a larger schema — 20 tables in all, also
+including conversation labels, comments and their reply threads, policies,
+session permissions, conversation metadata, projects, hosts, users, and
+scheduled tasks. No model sets an explicit schema, so every table lives in the
+default one.
 
 Schema is managed by Alembic migrations in `alembic/`. SQLAlchemy models live
 in `omnigent/db/db_models.py`, which is the source of truth for the full table

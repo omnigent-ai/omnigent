@@ -64,6 +64,11 @@ COMMENT_STATUS: dict[str, int] = {
     "addressed": 2,
 }
 
+COMMENT_REPLY_AUTHOR_KIND: dict[str, int] = {
+    "user": 1,
+    "agent": 2,
+}
+
 # Last relay-observed turn status persisted on the conversation's metadata
 # row (``omnigent_conversation_metadata.live_status``) so any server replica
 # can serve the sidebar's activity state, not just the pod holding the
@@ -245,6 +250,16 @@ def encode_comment_status(name: str) -> int:
 def decode_comment_status(code: int) -> str:
     """Decode a ``comments.status`` int code to its name."""
     return _decode(COMMENT_STATUS, code, field="comments.status")
+
+
+def encode_comment_reply_author_kind(name: str) -> int:
+    """Encode a ``comment_replies.author_kind`` name to its int code."""
+    return _encode(COMMENT_REPLY_AUTHOR_KIND, name, field="comment_replies.author_kind")
+
+
+def decode_comment_reply_author_kind(code: int) -> str:
+    """Decode a ``comment_replies.author_kind`` int code to its name."""
+    return _decode(COMMENT_REPLY_AUTHOR_KIND, code, field="comment_replies.author_kind")
 
 
 def encode_session_live_status(name: str) -> int:
