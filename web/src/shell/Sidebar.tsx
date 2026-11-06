@@ -79,6 +79,7 @@ import {
   SquareCheckIcon,
   Trash2Icon,
   UserRoundIcon,
+  UsersIcon,
   WalletIcon,
   XIcon,
   type LucideIcon,
@@ -348,6 +349,26 @@ function isDotMarker(state: SessionState | null): boolean {
   return state === null || state.kind !== "awaiting";
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
+
+// Per trailing slot: the title's right reserve, and with the w-6 shared icon,
+// a wider reserve plus the icon offset that sits it just left of the slot.
+const TRAILING_SLOT_LAYOUT = {
+  awaiting: { reserve: "pr-29", sharedReserve: "pr-36", sharedIcon: "right-29" },
+  marker: { reserve: "pr-8", sharedReserve: "pr-14", sharedIcon: "right-8" },
+  updated: { reserve: "pr-11", sharedReserve: "pr-18", sharedIcon: "right-11" },
+  none: { reserve: "pr-2", sharedReserve: "pr-8", sharedIcon: "right-1" },
+} as const;
+
+function trailingSlotKind(
+  state: SessionState | null,
+  hasSessionIndicator: boolean,
+  showUpdated: boolean,
+): keyof typeof TRAILING_SLOT_LAYOUT {
+  if (state?.kind === "awaiting") return "awaiting";
+  if (hasSessionIndicator) return "marker";
+  if (showUpdated) return "updated";
+  return "none";
+}
 
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
@@ -4743,6 +4764,20 @@ function SessionErrorHint() {
   );
 }
 
+// Explains the row's people icon, which can't hold a tooltip of its own: it
+// sits over the row link and fades out on hover.
+function SessionSharedHint() {
+  return (
+    <p
+      data-testid="session-shared-hint"
+      className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground"
+    >
+      <UsersIcon aria-hidden className="size-3.5 shrink-0" />
+      <span>Shared with others</span>
+    </p>
+  );
+}
+
 /** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */
 function sessionLocationLabel(
   conversation: Conversation,
@@ -4979,10 +5014,12 @@ function LegacySessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  shared,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  shared: boolean;
 }) {
   return (
     <TooltipContent
@@ -5017,6 +5054,7 @@ function LegacySessionTooltipContent({
           <span className="truncate">{conversation.git_branch}</span>
         </p>
       )}
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5026,10 +5064,12 @@ function SessionTooltipContent({
   conversation,
   hostsById,
   hasError,
+  shared,
 }: {
   conversation: Conversation;
   hostsById: ReadonlyMap<string, Host>;
   hasError: boolean;
+  shared: boolean;
 }) {
   const serverInfo = useContext(ServerInfoContext);
   if (!isFeatureEnabled(serverInfo, "sidebar_grouping_ui")) {
@@ -5038,6 +5078,7 @@ function SessionTooltipContent({
         conversation={conversation}
         hostsById={hostsById}
         hasError={hasError}
+        shared={shared}
       />
     );
   }
@@ -5064,6 +5105,7 @@ function SessionTooltipContent({
         </span>
       </p>
       <SessionTooltipDetails conversation={conversation} />
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </TooltipContent>
   );
@@ -5309,12 +5351,15 @@ function ConversationRowImpl({
   // composer already makes its draft visible. Live session state wins while
   // present; otherwise only an inactive row needs the draft marker.
   const showDraftIndicator = hasDraft && !isActive;
+  // The server reports `shared_with_others` only to the owner; absent means not shared.
+  const showSharedIndicator = isOwner && conversation.shared_with_others === true;
   const hasSessionIndicator = sessionState !== null || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
+  const trailingLayout =
+    TRAILING_SLOT_LAYOUT[trailingSlotKind(sessionState, hasSessionIndicator, showUpdated)];
   const showHarness = show.includes("harness");
-  const hasTrailingIndicator = hasSessionIndicator || showUpdated;
   const metaEnvironment = show.includes("environment") ? (
     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
   ) : null;
@@ -5606,13 +5651,7 @@ function ConversationRowImpl({
         // reserves only what the badge needs — the same width desktop uses at
         // rest, before hover reveals the controls.
         !selectionMode &&
-          (sessionState?.kind === "awaiting"
-            ? "pr-29"
-            : showUpdated
-              ? "pr-11"
-              : hasTrailingIndicator
-                ? "pr-8"
-                : "pr-2"),
+          (showSharedIndicator ? trailingLayout.sharedReserve : trailingLayout.reserve),
         // The narrowed reserve must track exactly when the trailing controls
         // appear and the state marker fades — both keyed on `:focus-visible`.
         // `focus-within` also fires for a plain click, which shrank the reserve
@@ -5735,6 +5774,7 @@ function ConversationRowImpl({
               projectIcon={projectFlyoutIcon}
               gitBranch={gitBranch}
               hasError={sessionState?.kind === "error"}
+              shared={showSharedIndicator}
             />
           </HoverCard>
         ) : isMobile ? (
@@ -5746,6 +5786,7 @@ function ConversationRowImpl({
               conversation={conversation}
               hostsById={hostsById}
               hasError={sessionState?.kind === "error"}
+              shared={showSharedIndicator}
             />
           </Tooltip>
         )
@@ -5769,6 +5810,7 @@ function ConversationRowImpl({
             projectIcon={projectFlyoutIcon}
             gitBranch={gitBranch}
             hasError={sessionState?.kind === "error"}
+            shared={showSharedIndicator}
           />
         </HoverCard>
       ) : isMobile ? (
@@ -5802,6 +5844,7 @@ function ConversationRowImpl({
             conversation={conversation}
             hostsById={hostsById}
             hasError={sessionState?.kind === "error"}
+            shared={showSharedIndicator}
           />
         </Tooltip>
       )}
@@ -5855,6 +5898,24 @@ function ConversationRowImpl({
           <SessionUpdatedLabel updatedAt={conversation.updated_at} />
         </span>
       ) : null}
+      {!selectionMode && showSharedIndicator && (
+        <span
+          role="img"
+          // The row's hover surface carries the visible explanation.
+          aria-label="Shared with others"
+          // Shares the state slot's classes so it fades on every trigger the
+          // badge does (hover, focus, open menu, shortcut hint).
+          className={cn(
+            SESSION_STATE_SLOT_CLASS,
+            SESSION_STATE_DOT_SLOT_CLASS,
+            "shrink-0 text-muted-foreground",
+            overlayTop,
+            trailingLayout.sharedIcon,
+          )}
+        >
+          <UsersIcon className="size-3.5" aria-hidden="true" />
+        </span>
+      )}
       {/* Trailing controls (pin + kebab) share one absolutely-positioned flex
           row, so their spacing is defined once (gap-0.5) and stays aligned
           with the project-folder header actions, which use the same pattern.
@@ -6223,6 +6284,7 @@ const RENDERED_CONVERSATION_FIELDS: readonly (keyof Conversation)[] = [
   "background_work_running",
   "blocked_on",
   "provisional",
+  "shared_with_others",
 ];
 
 function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
@@ -6312,12 +6374,14 @@ function PinnedProjectFlyoutContent({
   projectIcon,
   gitBranch,
   hasError,
+  shared,
 }: {
   title: string;
   projectName: string;
   projectIcon: string | null;
   gitBranch: string | null;
   hasError: boolean;
+  shared: boolean;
 }) {
   return (
     <HoverCardContent
@@ -6344,6 +6408,7 @@ function PinnedProjectFlyoutContent({
           <span className="truncate">{gitBranch}</span>
         </p>
       )}
+      {shared && <SessionSharedHint />}
       {hasError && <SessionErrorHint />}
     </HoverCardContent>
   );
