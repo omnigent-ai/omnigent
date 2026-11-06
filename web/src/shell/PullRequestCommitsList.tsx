@@ -44,9 +44,6 @@ export function PullRequestCommitsList({
   const visible = useMemo(() => filterCommits(commits, query), [commits, query]);
 
   const renderBody = () => {
-    if (unavailable) {
-      return <p className="p-3 text-ui text-muted-foreground">Commits are unavailable.</p>;
-    }
     if (commits.length === 0) {
       return <p className="p-3 text-ui text-muted-foreground">No commits on this pull request.</p>;
     }
@@ -84,6 +81,10 @@ export function PullRequestCommitsList({
     );
   };
 
+  // The notice replaces the whole pane: an unreadable history is not a list of zero commits.
+  if (unavailable) {
+    return <p className="p-3 text-ui text-muted-foreground">Commits are unavailable.</p>;
+  }
   // A failed refresh keeps the history already on screen; only an empty pane shows the error alone.
   if (errorMessage && commits.length === 0) {
     return (

@@ -22,6 +22,20 @@ describe("useCommitViewState", () => {
     expect(result.current.collapsedPaths.size).toBe(0);
   });
 
+  it("drops a write captured for a commit that is no longer open", () => {
+    const { result, rerender } = renderHook(({ sha }) => useCommitViewState(sha), {
+      initialProps: { sha: "a" as string | null },
+    });
+    const staleReveal = result.current.reveal;
+    rerender({ sha: "b" });
+    act(() => result.current.setCollapsedPaths((prev) => new Set(prev).add("kept.ts")));
+
+    act(() => staleReveal("x.ts"));
+
+    expect([...result.current.collapsedPaths]).toEqual(["kept.ts"]);
+    expect(result.current.revealedPaths.size).toBe(0);
+  });
+
   it("clears one reveal without touching the collapse set", () => {
     const { result } = renderHook(() => useCommitViewState("c"));
     act(() => {

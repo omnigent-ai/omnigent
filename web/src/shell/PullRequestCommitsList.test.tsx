@@ -1,7 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
-import type { PullRequestCommit } from "@/hooks/usePullRequests";
+import { PULL_REQUEST_COMMITS_LIMIT, type PullRequestCommit } from "@/hooks/usePullRequests";
 import { filterCommits, PullRequestCommitsList } from "./PullRequestCommitsList";
 
 const commit = (sha: string, title: string, author: string | null): PullRequestCommit => ({
@@ -121,7 +121,9 @@ describe("PullRequestCommitsList", () => {
   it("says when GitHub's history is truncated", () => {
     render(<ControlledList hasMore />);
 
-    expect(screen.getByText("History limited to 250 commits")).toBeInTheDocument();
+    expect(
+      screen.getByText(`History limited to ${PULL_REQUEST_COMMITS_LIMIT} commits`),
+    ).toBeInTheDocument();
   });
 
   it("shows loading, error and empty states in place of the list", () => {

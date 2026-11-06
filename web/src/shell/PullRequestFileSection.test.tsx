@@ -214,4 +214,32 @@ describe("PullRequestFileSection overrides", () => {
       screen.getByRole("button", { name: "Copy path" }),
     );
   });
+
+  it("shows no review features while review is off, and keeps the file's own actions", () => {
+    const thread = { id: "t1", path: FILE.path, line: 2, side: "RIGHT", resolved: false } as never;
+    renderSection({
+      reviewable: false,
+      forceMount: true,
+      threads: [thread],
+      headerActions: <button type="button">Copy path</button>,
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByTestId("diff")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy path" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Viewed control" })).toBeNull();
+    expect(screen.queryByTitle("1 conversation")).toBeNull();
+    expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select lines" }));
+    expect(selectedOf()).toBeNull();
+  });
+
+  it("shows the review actions while review is on", () => {
+    renderSection({
+      forceMount: true,
+      reviewActions: <button type="button">Viewed control</button>,
+    });
+
+    expect(screen.getByRole("button", { name: "Viewed control" })).toBeInTheDocument();
+  });
 });

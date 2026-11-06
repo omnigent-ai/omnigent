@@ -595,9 +595,10 @@ export function PullRequestChangesTab({
   );
   const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
   // Viewed marks belong to the PR's changes, so their controls, filter and progress wait for Changes.
-  const viewedControls = mode === "changes";
+  // Review features (threads, drafts, the viewed controls and their marks) belong to Changes only.
+  const reviewing = mode === "changes";
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
-  const hiddenPaths = view.hideViewed && viewedControls ? viewedFiles.viewed : NO_HIDDEN_PATHS;
+  const hiddenPaths = view.hideViewed && reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS;
   const visibleFiles = useMemo(
     () => selectVisibleFiles(files, { pathFilter: view.pathFilter, hiddenPaths }),
     [files, view.pathFilter, hiddenPaths],
@@ -607,8 +608,7 @@ export function PullRequestChangesTab({
   const changedListed = files.some((file) => viewedFiles.changed.has(file.path));
   // Hide viewed has emptied every file the path filter still matches.
   const matchingCount = filterChangedPaths(files, view.pathFilter).length;
-  const allViewed =
-    view.hideViewed && viewedControls && visibleFiles.length === 0 && matchingCount > 0;
+  const allViewed = view.hideViewed && reviewing && visibleFiles.length === 0 && matchingCount > 0;
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
@@ -728,7 +728,7 @@ export function PullRequestChangesTab({
       const collapse = !isCollapsed(path);
       clearPaneReveal(path);
       // Mark ownership belongs to the PR's Changes view; a commit's toggles leave it alone.
-      if (!commitView) releaseMarkCollapse([path]);
+      if (reviewing) releaseMarkCollapse([path]);
       setPaneCollapsed((prev) => {
         if (prev.has(path) === collapse) return prev;
         const next = new Set(prev);
@@ -737,13 +737,13 @@ export function PullRequestChangesTab({
         return next;
       });
     },
-    [isCollapsed, clearPaneReveal, setPaneCollapsed, commitView, releaseMarkCollapse],
+    [isCollapsed, clearPaneReveal, setPaneCollapsed, reviewing, releaseMarkCollapse],
   );
 
   const allCollapsed = visibleFiles.length > 0 && visibleFiles.every((f) => isCollapsed(f.path));
   const toggleAll = useCallback(() => {
     for (const file of visibleFiles) clearPaneReveal(file.path);
-    if (!commitView) releaseMarkCollapse(visibleFiles.map((file) => file.path));
+    if (reviewing) releaseMarkCollapse(visibleFiles.map((file) => file.path));
     setPaneCollapsed((prev) => {
       const next = new Set(prev);
       for (const file of visibleFiles) {
@@ -757,7 +757,7 @@ export function PullRequestChangesTab({
     allCollapsed,
     clearPaneReveal,
     setPaneCollapsed,
-    commitView,
+    reviewing,
     releaseMarkCollapse,
   ]);
 
@@ -878,21 +878,23 @@ export function PullRequestChangesTab({
   // Find searches the visible files; the hidden count searches the rest, and no filter changes.
   // Corpora are built only while the bar is open.
   const { matchCase, regex } = find;
-  const query = find.open ? find.query : "";
+  // The commit list has no find bar, so find stays idle there.
+  const findOpen = find.open && !commitsView;
+  const query = findOpen ? find.query : "";
   // Matches follow the query one render later, so typing stays responsive on large patches.
   const deferredQuery = useDeferredValue(query);
   const searchCorpus = useMemo(
-    () => (find.open ? buildSearchCorpus(filesByPath, visibleFiles) : []),
-    [find.open, filesByPath, visibleFiles],
+    () => (findOpen ? buildSearchCorpus(filesByPath, visibleFiles) : []),
+    [findOpen, filesByPath, visibleFiles],
   );
   const hiddenCorpus = useMemo(() => {
-    if (!find.open) return [];
+    if (!findOpen) return [];
     const shown = new Set(visiblePaths);
     return buildSearchCorpus(
       filesByPath,
       files.filter((file) => !shown.has(file.path)),
     );
-  }, [find.open, filesByPath, files, visiblePaths]);
+  }, [findOpen, filesByPath, files, visiblePaths]);
   const search = useMemo(
     () => findMatches(searchCorpus, deferredQuery, { matchCase, regex, limit: MATCH_LIMIT }),
     [searchCorpus, deferredQuery, matchCase, regex],
@@ -941,16 +943,16 @@ export function PullRequestChangesTab({
   // Seed the match when the bar opens or its query changes: the first at or below the
   // viewport top. A path match also scrolls its header, as stepping to it does.
   useEffect(() => {
-    if (!find.open || findTarget || !matches.length || deferredQuery !== query) return;
+    if (!findOpen || findTarget || !matches.length || deferredQuery !== query) return;
     const seeded = matches[firstMatchAtOrBelow(matches, visiblePaths, activePath)];
     setFindTarget(seeded);
     if (seeded.target.kind === "path") setPendingReveal({ path: seeded.target.path });
-  }, [find.open, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
+  }, [findOpen, findTarget, matches, visiblePaths, activePath, deferredQuery, query]);
 
   // The active match's file opens even if the reader collapsed it earlier.
   useEffect(() => {
-    if (activeFilePath) revealPane(activeFilePath);
-  }, [activeFilePath, findTarget, revealPane]);
+    if (activeFilePath && !commitsView) revealPane(activeFilePath);
+  }, [activeFilePath, findTarget, revealPane, commitsView]);
 
   const stepMatch = (direction: 1 | -1) => {
     // Matches for a query still being searched would navigate the previous results.
@@ -999,11 +1001,16 @@ export function PullRequestChangesTab({
   const withoutText = files.length - patchFileCount;
   // Counts are meaningless until the patch has loaded and parsed.
   const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
-  const emptyChangesMessage = commitView
-    ? "This commit has no file changes."
-    : "No changes vs base.";
+  // A disabled commit query has no data, which is not a commit without changes.
+  const commitUnavailable =
+    commitView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
+  const emptyChangesMessage = commitUnavailable
+    ? "This commit's diff can't be read here."
+    : commitView
+      ? "This commit has no file changes."
+      : "No changes vs base.";
   const coverageNote =
-    find.open && !commitsView && patchReady && (listing.data?.has_more || withoutText > 0)
+    findOpen && !commitsView && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
@@ -1065,7 +1072,6 @@ export function PullRequestChangesTab({
     canReply: !!(canEdit && data.capabilities.review_thread_replies),
     canCreate: !!(
       canEdit &&
-      !commitView &&
       data.capabilities.review_thread_creation &&
       pr.state === "OPEN" &&
       pr.head_sha &&
@@ -1080,7 +1086,7 @@ export function PullRequestChangesTab({
     loadingComments: reviews.loadingComments,
   };
   // Review conversations belong to the PR's head, so a commit's patch shows none.
-  const threads = commitView ? [] : (reviews.page?.data ?? []);
+  const threads = reviewing ? (reviews.page?.data ?? []) : [];
   const matchingRevision =
     !!reviews.page &&
     reviews.page.head_sha === prDiff.data?.head_sha &&
@@ -1201,7 +1207,7 @@ export function PullRequestChangesTab({
           onToggleFilter={
             files.length > 0 && sidebarCollapsed && !commitsView ? toggleInlineFilter : undefined
           }
-          canNavigateThreads={unresolved.length > 0 && !commitsView}
+          canNavigateThreads={unresolved.length > 0}
           onNavigateThread={navigateThread}
           loadingThreads={reviews.isFetching}
           diffStyle={diffStyle}
@@ -1239,7 +1245,7 @@ export function PullRequestChangesTab({
             )
           }
           progress={
-            files.length > 0 && viewedFiles.available && viewedControls ? (
+            files.length > 0 && viewedFiles.available && reviewing ? (
               <PullRequestViewedProgress
                 viewedCount={viewedCount}
                 totalCount={files.length}
@@ -1307,7 +1313,7 @@ export function PullRequestChangesTab({
                   onSelectFile={jumpTo}
                   collapsedDirs={collapsedDirs}
                   onToggleDir={toggleDir}
-                  viewedPaths={viewedControls ? viewedFiles.viewed : NO_HIDDEN_PATHS}
+                  viewedPaths={reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS}
                 />
               ))
             )}
@@ -1386,18 +1392,17 @@ export function PullRequestChangesTab({
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
-                headerActions={
-                  <>
-                    {fileActions(file)}
-                    {viewedControls && viewedFiles.available && (
-                      <PullRequestViewedToggle
-                        path={file.path}
-                        viewed={viewedFiles.viewed.has(file.path)}
-                        changed={viewedFiles.changed.has(file.path)}
-                        onToggle={() => toggleViewed(file.path)}
-                      />
-                    )}
-                  </>
+                headerActions={fileActions(file)}
+                reviewable={reviewing}
+                reviewActions={
+                  viewedFiles.available ? (
+                    <PullRequestViewedToggle
+                      path={file.path}
+                      viewed={viewedFiles.viewed.has(file.path)}
+                      changed={viewedFiles.changed.has(file.path)}
+                      onToggle={() => toggleViewed(file.path)}
+                    />
+                  ) : undefined
                 }
                 threads={threadsByFile.get(file.path) ?? []}
                 threadContext={threadContext}
