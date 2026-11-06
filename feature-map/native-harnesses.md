@@ -77,6 +77,10 @@ implements them separately, so a fix for one harness does not reach the others.
   approval waits from the five-minute execution budget. A pending approval
   stays pending past five minutes; rejection or expiry does not run the tool.
   Cancellation or a disconnected caller releases that call's pending approval.
+- `questions`: Claude's questions show an answer form in chat. An answer
+  submitted during a brief Omnigent outage still reaches Claude. If the web
+  question can't be shown or its wait expires, Claude receives a request to
+  ask in chat text.
 - `devin-questions`: Devin's native question picker appears in Chat and Inbox;
   selected options and custom answers return to the running tool.
 - `resume`: resume a previous conversation from the CLI (`--resume`, or a bare
@@ -272,7 +276,7 @@ Probes run only on expansion.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
-shown for a newly connected or requested host → See more. The modal auto-opens
+shown once for the host desktop onboarding just connected → See more. It opens
 only when the server enables the `import_review` release feature.
 
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
@@ -561,12 +565,13 @@ Cross-harness journeys:
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
   `web/src/shell/settingsNav.test.tsx` and
-  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_once_and_links_to_harnesses`.
+  `tests/e2e_ui/onboarding/test_import_review_modal.py::test_import_modal_opens_after_onboarding`.
   Start the isolated instance without release flags. Check the Harnesses sidebar
   link and direct links to the catalog and a harness detail page. Stop it, then
   use `OMNIGENT_FEATURES=import_review verify-env start`; without that feature the
-  import review modal never opens. Connect a new host, then click See more
-  beside Confirm. Check that the modal closes and Harnesses opens. Open Import
+  import review modal never opens. Finish desktop onboarding (or stub the
+  shell's `takeOnboardingRunner` as the E2E does), then click See more beside
+  Confirm. Check that the modal closes and Harnesses opens. Open Import
   sessions and check that only session imports remain. The Harnesses sidebar
   and direct links remain available without the import-review flag. The server
   response contract is covered by
@@ -740,6 +745,11 @@ Cross-harness journeys:
   (`tests/runner/test_app_sessions_native_events_lifecycle.py::test_codex_native_late_settings_ack_still_reaches_an_older_server`).
 - **`approvals`:**
   `tests/e2e_ui/approvals/test_native_edit_tools_approval_card.py::test_native_file_edit_tools_require_approval_card`
+- **`questions` (`claude-native`):**
+  `tests/e2e_ui/approvals/test_native_claude_question.py::test_native_question_reaches_chat_and_returns_to_claude`
+  sends from both chat and the embedded terminal, answers the web form, and
+  separately injects the server's empty-200 timeout response to check the
+  chat-text fallback.
 - **`approvals`, Claude directory access:**
   `tests/e2e_ui/approvals/test_claude_permission_auto_mode.py::test_permission_card_grants_directories_without_changing_auto_mode`
   checks Chat (including reload), Inbox, and standalone approval links against

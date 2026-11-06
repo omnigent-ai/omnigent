@@ -32,7 +32,9 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
     bypassPermissions: "full-access",
   },
   "codex-native": {
-    default: "automatic",
+    default: "manual",
+    "ask-for-approval": "manual",
+    "approve-for-me": "automatic",
     "full-access": "full-access",
     "read-only": "read-only",
     bypass: "full-access",
@@ -184,31 +186,55 @@ export const DEVIN_NATIVE_PERMISSION_MODES: NativeHarnessMode[] = [
   },
 ];
 
-// Codex approval presets matching the `/permissions` TUI popup.
-// Each preset bundles a sandbox profile + approval policy, mirroring
-// codex-rs/utils/approval-presets/src/lib.rs. "default" is the auto
-// preset (workspace-write + on-request) and sends no flags so the
-// runner uses Codex's built-in default.
-// Keep in sync with `codex --help` and
-// https://developers.openai.com/codex/agent-approvals-security
+// Create-time Codex approval presets. "default" sends no flags, so Codex uses
+// its built-in default or the user's Codex config. The others use the labels of
+// Codex's `/permissions` popup (omnigent/codex_approval_modes.py), so the
+// running-session picker shows the same name the session was created with.
+// Keep in sync with https://developers.openai.com/codex/agent-approvals-security
 export const CODEX_NATIVE_DEFAULT_APPROVAL_MODE = "default";
 export const CODEX_NATIVE_APPROVAL_MODES: NativeHarnessMode[] = [
   {
     value: "default",
     label: "Default",
-    description: "Read/edit/run in workspace; approval for external edits or network",
+    description: "Codex's default permissions, or your Codex config",
     args: [],
   },
   {
+    value: "ask-for-approval",
+    label: "Ask for approval",
+    description: "Read/edit/run in the workspace; approval for the internet or external edits",
+    args: [
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "on-request",
+      "-c",
+      'approvals_reviewer="user"',
+    ],
+  },
+  {
+    value: "approve-for-me",
+    label: "Approve for me",
+    description: "Only asks for actions detected as potentially unsafe",
+    args: [
+      "--sandbox",
+      "workspace-write",
+      "--ask-for-approval",
+      "on-request",
+      "-c",
+      'approvals_reviewer="auto_review"',
+    ],
+  },
+  {
     value: "full-access",
-    label: "Full access",
+    label: "Full Access",
     description: "Edit any file and access the internet without approval",
     args: ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
   },
   {
     value: "read-only",
-    label: "Read only",
-    description: "Read files only; approval required for edits, commands, or network",
+    label: "Read Only",
+    description: "Read files only; approval required to edit files or access the internet",
     args: ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
   },
 ];
@@ -232,6 +258,30 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
   label: "Bypass approvals & sandbox",
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [],
+};
+
+/**
+ * Modes automations cannot use: a scheduled run has nobody to answer a prompt,
+ * so it needs an approval gate. Mirrors UNATTENDED_DISALLOWED_PERMISSION_MODES
+ * in omnigent/native/permission_modes.py.
+ */
+export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new Set([
+  "bypassPermissions",
+  "dontAsk",
+  "full-access",
+  "bypass",
+  "yolo",
+  "skip",
+  "dangerous",
+]);
+
+/**
+ * Mode a new automation starts with. Nobody watches an automation's turns, so a
+ * mode that asks would stall them; the user can still pick another one.
+ */
+export const NEW_AUTOMATION_PERMISSION_MODES: Readonly<Record<string, string>> = {
+  "claude-native": "auto",
+  "codex-native": "approve-for-me",
 };
 
 /** Create-time permission choices shared by New Chat and automations. */
