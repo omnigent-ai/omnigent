@@ -321,6 +321,40 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+InteractiveOrigin = Callable[[Request], bool | None]
+"""Whether a request's credential belongs to a person's interactive client.
+
+``True`` for an interactive client such as the web UI, ``False`` for a
+credential that code can hold (an API or runner token), ``None`` when unknown.
+"""
+
+_NON_INTERACTIVE_AUTOMATION_CHANGE_MSG = (
+    "Automation changes from an API token must come from an agent's approved "
+    "tool call or from the Omnigent UI"
+)
+
+
+def _require_interactive_or_unmarked(
+    request: Request, interactive_origin: InteractiveOrigin | None
+) -> None:
+    """Refuse an unmarked mutation that a runner or non-interactive credential sent.
+
+    Without a source header the request skipped the agent approval path, so it
+    is accepted only from a caller that is not known to be code.
+    """
+    if RUNNER_TUNNEL_TOKEN_HEADER in request.headers:
+        raise OmnigentError(_NON_INTERACTIVE_AUTOMATION_CHANGE_MSG, code=ErrorCode.FORBIDDEN)
+    if interactive_origin is None:
+        return
+    try:
+        interactive = interactive_origin(request)
+    except Exception:
+        _logger.exception("automation origin check failed; refusing the change")
+        interactive = False
+    if interactive is False:
+        raise OmnigentError(_NON_INTERACTIVE_AUTOMATION_CHANGE_MSG, code=ErrorCode.FORBIDDEN)
+
+
 def require_scheduled_task_agent_origin(
     request: Request,
     *,
@@ -328,12 +362,20 @@ def require_scheduled_task_agent_origin(
     auth_provider: AuthProvider | None,
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
+    interactive_origin: InteractiveOrigin | None = None,
+    allow_unmarked: bool = False,
 ) -> None:
-    """Bind a runner-marked mutation to the owner's source session and runner."""
+    """Bind a runner-marked mutation to the owner's source session and runner.
+
+    An unmarked mutation is refused when a runner or a non-interactive
+    credential sent it, unless *allow_unmarked*; see
+    :func:`_require_interactive_or_unmarked`.
+    """
     if auth_provider is None or owner == RESERVED_USER_LOCAL:
         return
     if ORCHESTRATION_SOURCE_HEADER not in request.headers:
-        # UI/API saves and older runners do not opt into source verification.
+        if not allow_unmarked:
+            _require_interactive_or_unmarked(request, interactive_origin)
         return
     source_id = (request.headers.get(ORCHESTRATION_SOURCE_HEADER) or "").strip()
     if not source_id or permission_store is None:
@@ -397,6 +439,7 @@ def create_scheduled_tasks_router(
     project_store: ProjectStore | None = None,
     automations: DeploymentGate = True,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    interactive_origin: InteractiveOrigin | None = None,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -408,6 +451,9 @@ def create_scheduled_tasks_router(
         ``None`` rejects tasks that set a project.
     :param automations: Per-request gate; every route returns 404 while it is off.
     :param liveness_lookup: Shared bulk session liveness; masks stale approval counts.
+    :param interactive_origin: Classifies the credential of a create or update
+        that carries no agent source header. ``False`` refuses it; ``None`` (or no
+        hook) accepts it. Pausing a task is always accepted.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :returns: A configured :class:`APIRouter`.
@@ -605,6 +651,7 @@ def create_scheduled_tasks_router(
             auth_provider=auth_provider,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            interactive_origin=interactive_origin,
         )
         await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
@@ -939,12 +986,16 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Update mutable fields of a task and re-sync the scheduler."""
         owner = _owner(request)
+        # Pausing only reduces what a task does, so any of the owner's clients may.
+        pause_only = body.model_fields_set == {"state"} and body.state == "paused"
         require_scheduled_task_agent_origin(
             request,
             owner=owner,
             auth_provider=auth_provider,
             conversation_store=conversation_store,
             permission_store=permission_store,
+            interactive_origin=interactive_origin,
+            allow_unmarked=pause_only,
         )
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
