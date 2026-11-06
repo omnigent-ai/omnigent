@@ -581,6 +581,7 @@ def create_auth_router(
         if permission_store is not None:
             permission_store.ensure_user(email)
             promote_if_listed(admin_list, permission_store, email)
+            permission_store.mark_logged_in(email, int(time.time()))
 
         # A native sign-in gets a one-time code at its redirect URI;
         # the session is minted when the app exchanges it with its verifier.
