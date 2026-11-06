@@ -311,6 +311,7 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_claude_sdk_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
@@ -423,6 +424,7 @@ def build_native_controls(
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
+    _release_session_harness: Callable[[str], Coroutine[Any, Any, None]],
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
     _resolve_session_claude_launch_config: Callable[
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
@@ -1437,6 +1439,7 @@ def build_native_controls(
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
+            model_switch_acknowledged,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1611,6 +1614,10 @@ def build_native_controls(
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
+        elif model_arg.lower().endswith("[1m]"):
+            # A bound 1M pick is typed with its marker too, and the statusLine
+            # names the model without it; the unmarked name confirms the pick.
+            unmarked_expected = {normalized_model_id(value) for value in expected}
 
         def _switched(current: str | None) -> bool:
             comparable = current if bound_model or not current else canonical_claude_id(current)
@@ -1664,6 +1671,18 @@ def build_native_controls(
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
+                return Response(status_code=204)
+            if await asyncio.to_thread(model_switch_acknowledged, bridge_dir, command=command):
+                # Claude Code acknowledged the command on the pane while the
+                # statusLine snapshot still reads otherwise; the forwarder's
+                # report settles the row on what the pane actually runs.
+                _logger.info(
+                    "claude-native model change for session=%s confirmed by Claude Code's "
+                    "acknowledgement; statusLine still reports %r",
+                    conv_id,
+                    current,
+                    extra={"session_id": conv_id},
+                )
                 return Response(status_code=204)
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a
@@ -2436,6 +2455,71 @@ def build_native_controls(
                 _ingest_now_serving[conv_id] = _seq + 1
                 _cond.notify_all()
 
+    def _retire_ingest_ticket(conv_id: str, seq: int, cond: asyncio.Condition) -> None:
+        """Advance the ingest gate past an abandoned ticket once its turn comes."""
+
+        async def retire() -> None:
+            async with cond:
+                while _ingest_now_serving.get(conv_id, 0) < seq:
+                    if _ingest_cond.get(conv_id) is not cond:
+                        return  # The session's gate was torn down meanwhile.
+                    await cond.wait()
+                if _ingest_now_serving.get(conv_id, 0) == seq:
+                    _ingest_now_serving[conv_id] = seq + 1
+                    cond.notify_all()
+
+        task = asyncio.create_task(retire(), name=f"retire-ingest-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _handle_claude_sdk_clear(conv_id: str) -> Response:
+        """Drop a claude-sdk session's live client and history before ``/clear``.
+
+        Called only for a ``clear`` marked ``continue_in_new_session``: the
+        server then continues the work in a fresh session, so this one ends
+        here; a later message rebuilds its client from the transcript.
+        Refused with 409 while a turn runs or messages wait for one, through
+        the same ingest gate the message path uses.
+        """
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.setdefault(conv_id, asyncio.Condition())
+        try:
+            async with _cond:
+                while _ingest_now_serving.get(conv_id, 0) != _seq:
+                    if _ingest_cond.get(conv_id) is not _cond:
+                        # The session was deleted while this waited: its gate
+                        # is gone, so answer without recreating it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "claude_sdk_clear_session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
+                    await _cond.wait()
+        except asyncio.CancelledError:
+            # Give up the place in line without jumping the input ahead of it,
+            # or later input for the session would wait on it forever.
+            _retire_ingest_ticket(conv_id, _seq, _cond)
+            raise
+        try:
+            if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "claude_sdk_clear_busy",
+                        "detail": "A turn is running; stop it before /clear.",
+                    },
+                )
+            _session_histories.pop(conv_id, None)
+            await _release_session_harness(conv_id)
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -2582,6 +2666,7 @@ def build_native_controls(
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
         handle_claude_native_model_change=_handle_claude_native_model_change,
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
+        handle_claude_sdk_clear=_handle_claude_sdk_clear,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
         handle_codex_native_clear=_handle_codex_native_clear,

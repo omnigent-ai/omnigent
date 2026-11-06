@@ -3,11 +3,21 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
+export interface FindState {
+  open: boolean;
+  query: string;
+  matchCase: boolean;
+  regex: boolean;
+}
+
 interface ChangesView {
   pathFilter: string;
   hideViewed: boolean;
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
+  find: FindState;
+  /** The head whose "viewed marks were reset" notice the reader dismissed. */
+  dismissedResetHead: string | null;
 }
 
 export interface ChangesViewState extends ChangesView {
@@ -15,9 +25,17 @@ export interface ChangesViewState extends ChangesView {
   setHideViewed: (hide: boolean) => void;
   reveal: (path: string) => void;
   clearReveal: (path: string) => void;
+  setFind: (patch: Partial<FindState>) => void;
+  setDismissedResetHead: (head: string | null) => void;
 }
 
-const EMPTY_VIEW: ChangesView = { pathFilter: "", hideViewed: false, revealedPaths: new Set() };
+const EMPTY_VIEW: ChangesView = {
+  pathFilter: "",
+  hideViewed: false,
+  revealedPaths: new Set(),
+  find: { open: false, query: "", matchCase: false, regex: false },
+  dismissedResetHead: null,
+};
 // Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
 const listeners = new Set<() => void>();
@@ -53,6 +71,8 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
       setHideViewed: (hideViewed) => update(key, () => ({ hideViewed })),
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
+      setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
+      setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
     }),
     [key],
   );
