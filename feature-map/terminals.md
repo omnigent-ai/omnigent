@@ -62,10 +62,16 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
-- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
-  is inert while the host is offline, the session is stranded, or a shell is
-  still being created, and it yields to a focused terminal or editor.
+- Press Control+` (on every platform) to open a shell of the remembered default
+  type, also from a focused terminal. The chord is inert while the host is
+  offline, the session is stranded, or a shell is still being created.
+- In the desktop app, Control+` or File → New Terminal does the same, also
+  while an embedded browser tab has focus. The menu item is disabled whenever
+  the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
+  In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
+  workspace tab, using the same terminal confirmation. A read-only viewer's
+  terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -124,9 +130,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `web/src/shell/TerminalSplitControls.test.tsx` and
   `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
-  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
-  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
-  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  twice and expect Terminal view, then Chat view; press Control+` and
+  expect a new shell tab to open and take focus. With `splittable_terminal_view_ui`,
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
@@ -149,6 +154,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py::test_pane_liveness_reads_the_requested_pane`
+  checks both shared WebSocket probes against real split tmux panes, including
+  an exited neighbor. This is a process check without a browser or vendor CLI.
 - **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
   `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
   executable at spawn and cancellation after a real pane starts, including
@@ -171,6 +179,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+
+For the desktop Close shortcut, open a shell tab in an ordinary session,
+focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
+only that tab should close. Cancel the prompt to keep the tab and session.
+Repeat as a read-only viewer: the shortcut should leave the terminal open.
+Cmd/Ctrl+Shift+W should close the window. Native accelerator delivery requires
+an Electron run; component tests cover the selection and confirmation paths.
 
 ## Gotchas
 

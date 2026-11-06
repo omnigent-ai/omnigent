@@ -320,6 +320,11 @@ async def test_local_create_follows_policy(
         revoke = await alice.delete(f"/v1/sessions/{json_session}/permissions/__public__")
         assert revoke.status_code == 204, revoke.text
         assert not _is_public(perms, json_session)
+        # A fork of the now-private session still takes the creation default;
+        # only a /clear continuation keeps its source's sharing instead.
+        refork = await alice.post(f"/v1/sessions/{json_session}/fork", json={})
+        assert refork.status_code == 201, refork.text
+        assert _is_public(perms, refork.json()["id"])
 
 
 @pytest.mark.asyncio
