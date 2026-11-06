@@ -84,9 +84,15 @@ async def test_session_delete_keeps_shared_sandbox_until_last_binding(
     assert await conversations.delete_conversation(other.id, preserve_host_binding=host_id)
     assert conversations.get_conversation(other.id) is None
     assert host_store.delete_host(host_id, keep_if_bound=True) is None
+    with pytest.raises(OmnigentError, match="must reuse its host"):
+        conversations.create_conversation(
+            conversation_id=other.id, workspace="/wrong-host", labels={"rejected": "1"}
+        )
+    assert conversations.get_conversation(other.id) is None
     conversations.create_conversation(
         conversation_id=other.id, host_id=host_id, workspace="/replacement"
     )
+    assert "rejected" not in conversations.get_conversation(other.id).labels
     assert host_store.resolve_launch_token(host_id, "shared-token") is not None
     assert await conversations.delete_conversation(other.id)
     assert host_store.get_host(host_id) is None

@@ -1243,7 +1243,11 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             def insert_metadata(meta_sess: Session) -> SqlConversationMetadata:
                 lock_host_for_binding(meta_sess, host_id)
-                previous = meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
+                previous = (
+                    meta_sess.get(SqlConversationMetadata, (current_workspace_id(), new_id))
+                    if conversation_id is not None
+                    else None
+                )
                 if previous is not None:
                     # ponytail: keep the binding so replacement can resume after a crash.
                     if previous.host_id != host_id:
@@ -1309,8 +1313,6 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def _discard_unbound_conversation(self, conversation_id: str) -> None:
         """Undo an unpublished conversation when metadata admission was rejected."""
-        if self._get_meta(conversation_id) is not None:
-            return
 
         def write(session: Session) -> bool:
             keys = list(
@@ -1967,6 +1969,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
                     )
                 members = self._family_member_ids(session, family_id)
+                if source_meta.family_id is None and members:
+                    raise OmnigentError(
+                        "This session ID is still used by another family",
+                        code=ErrorCode.CONFLICT,
+                    )
                 if len(set(members) | {source_id, session_id}) > MAX_SESSION_FAMILY_MEMBERS:
                     raise OmnigentError(
                         f"A family supports up to {MAX_SESSION_FAMILY_MEMBERS} sessions",
@@ -2089,6 +2096,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             return False
         family_id = source.family_id or source.id
 
+        def family_members(session: Session) -> list[str]:
+            meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
+            if meta is None or meta.family_id is None:
+                return []
+            if meta.family_id != family_id:
+                raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
+            return self._family_member_ids(session, family_id)
+
         def clear_legacy_labels(labels_session: Session, ids: list[str]) -> None:
             labels_session.execute(
                 delete(SqlConversationLabel).where(
@@ -2100,7 +2115,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
-            ids = self._family_member_ids(session, family_id)
+            ids = family_members(session)
             with self._profile_label_session(session) as labels_session:
                 if ids:
                     self._require_family_representative(
@@ -2125,7 +2140,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             # Commit filing before deleting the only legacy copy in another database.
             def clear_labels(session: Session) -> None:
                 self._lock_session_family(session, family_id)
-                ids = self._family_member_ids(session, family_id)
+                ids = family_members(session)
                 if ids:
                     with self._profile_label_session(session) as labels_session:
                         clear_legacy_labels(labels_session, ids)

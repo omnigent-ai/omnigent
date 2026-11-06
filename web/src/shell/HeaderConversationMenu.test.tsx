@@ -141,7 +141,7 @@ function renderMenu(
   overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
   queryClient?: QueryClient,
 ) {
-  return render(menuTree(overrides, queryClient));
+  return render(menuTree(overrides, true, queryClient));
 }
 
 function openMenu() {

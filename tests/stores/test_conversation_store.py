@@ -9916,6 +9916,16 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
         later.id,
     }
 
+    replacement = store.create_conversation(conversation_id=source.id)
+    store.set_conversation_project(replacement.id, None)
+    assert store.get_conversation(replacement.id).project_id is None
+    assert all(member.project_id == project_id for member in store.get_session_family(later.id))
+    candidate = store.create_conversation()
+    with pytest.raises(OmnigentError, match="another family"):
+        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    assert store.get_conversation(replacement.id).family_id is None
+    assert store.get_conversation(candidate.id).family_id is None
+
     another = store.create_conversation()
     another_sibling = store.create_conversation()
     store.add_new_sibling(another.id, another_sibling.id, user_id=user_id)

@@ -25,9 +25,9 @@ import {
   Trash2Icon,
 } from "lucide-react";
 import { toast } from "sonner";
-import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import {
+  ARIA_MOD_KEY,
   ARCHIVE_SESSION_KEYS,
   FORK_SESSION_KEYS,
   CompactShortcutKeys,
