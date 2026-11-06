@@ -1638,8 +1638,9 @@ async def test_background_task_result_wakes_session_whose_turn_ended(
     ``/events`` so it takes a turn and calls ``sys_read_inbox``. A result that
     lands mid-turn defers that decision to turn end: the turn may drain it
     itself, in which case a wake would only start an extra turn, even when a
-    later cancelled task left its own result unread. When a
-    sub-agent result is also waiting, the turn-end notice names the newer one.
+    later cancelled task left its own result unread and a child is still
+    running. When a sub-agent result is also waiting, the turn-end notice names
+    the newer one.
     """
     session_id = "b7e0c4a1d2f34e5a9c8b7a6f5e4d3c2b"
     child_id = "5d4c3b2a1f0e4d9c8b7a6f5e4d3c2b1a"
@@ -1746,6 +1747,13 @@ async def test_background_task_result_wakes_session_whose_turn_ended(
                     )
                     await _call(client, "sys_cancel_async", {"handle_id": cancelled["handle_id"]})
                     await poll_until_async(lambda: inbox.qsize() == 1, timeout_s=5.0)
+                    # A child that is still running has nothing to announce either.
+                    subagent_work.register_subagent_work(
+                        parent_session_id=session_id,
+                        child_session_id=child_id,
+                        agent="researcher",
+                        title="check",
+                    )
                 # The turn is still active, so it could collect the result itself.
                 assert len(server_client.wake_posts) == (0 if subagent_finishes is None else 1)
                 gate.set()

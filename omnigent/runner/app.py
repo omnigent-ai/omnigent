@@ -5021,23 +5021,30 @@ def create_runner_app(
             is_rewake=is_rewake,
         )
 
-    def _unread_async_result(session_id: str) -> tuple[float, str, str, str] | None:
-        latest = _latest_async_results.get(session_id)
+    def _unread_inbox_handle_ids(session_id: str) -> set[str]:
         inbox = _session_inboxes.get(session_id)
-        if latest is None or inbox is None:
-            return None
+        if inbox is None:
+            return set()
         # asyncio.Queue has no peek; cycling it without awaiting keeps its order.
         items = [inbox.get_nowait() for _ in range(inbox.qsize())]
         for item in items:
             inbox.put_nowait(item)
-        if any(item.get("handle_id") == latest[1] for item in items):
-            return latest
-        _latest_async_results.pop(session_id, None)
-        return None
+        return {handle_id for item in items if isinstance(handle_id := item.get("handle_id"), str)}
 
     def _schedule_latest_inbox_wake(session_id: str, *, is_rewake: bool = False) -> None:
-        latest_work = latest_wake_eligible_subagent_work(list_subagent_work(session_id))
-        latest_async = _unread_async_result(session_id)
+        # Only a completion still waiting in the inbox is worth announcing.
+        unread = _unread_inbox_handle_ids(session_id)
+        latest_async = _latest_async_results.get(session_id)
+        if latest_async is not None and latest_async[1] not in unread:
+            _latest_async_results.pop(session_id, None)
+            latest_async = None
+        latest_work = latest_wake_eligible_subagent_work(
+            [
+                entry
+                for entry in list_subagent_work(session_id)
+                if entry.delivered and entry.child_session_id in unread
+            ]
+        )
         if latest_async is not None and (
             latest_work is None or latest_async[0] >= (latest_work.completed_at or 0.0)
         ):
