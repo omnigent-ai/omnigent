@@ -51,12 +51,13 @@ import {
   KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
+  keyboardActiveQuestionId,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
@@ -198,6 +199,10 @@ function TranscriptImpl({
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const keyboardActiveElicitationId = useMemo(
+    () => keyboardActiveQuestionId(pendingElicitations),
+    [pendingElicitations],
+  );
   const streamBubbles = useMemo(
     () =>
       visibleTranscriptBubbles(
@@ -226,6 +231,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blockCount: blocks.length,
       committedUserIds,
       hasCommittedAnchor:
@@ -241,6 +247,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blocks,
       committedUserIds,
       hasTasks,
@@ -372,11 +379,12 @@ function TranscriptImpl({
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
-            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            !isMobileViewport &&
+              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -441,12 +449,18 @@ function TranscriptImpl({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard
+                        item={item}
+                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+                      />
                     </MessageContent>
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
+                <WorkingIndicatorRow
+                  key={display.conversationId ?? "landing"}
+                  show={showWorkingIndicator}
+                />
                 {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
@@ -467,7 +481,13 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          <ConversationScrollButton
+            className={
+              isMobileViewport
+                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                : undefined
+            }
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}

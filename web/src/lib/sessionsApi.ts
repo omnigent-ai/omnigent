@@ -159,6 +159,10 @@ interface SessionResponseWire {
   title?: string | null;
   labels?: Record<string, string>;
   project_id?: string | null;
+  /** The session whose Workspace rail lists this one as a side chat. */
+  side_chat_parent_id?: string | null;
+  /** Whether the viewer may start side chats here; absent from older servers. */
+  side_chat_allowed?: boolean | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -358,6 +362,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,
+    sideChatParentId: wire.side_chat_parent_id ?? null,
+    sideChatAllowed: wire.side_chat_allowed ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
