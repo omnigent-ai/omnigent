@@ -12,6 +12,7 @@ import {
   SANDBOX_WAKE_REQUEST_MS,
   SANDBOX_WAKE_SETTLE_MS,
   endPassiveSandboxWake,
+  RECONNECT_RECOVERY_HELD_LABEL_KEY,
   useSandboxPassivelyWoken,
   useSandboxWake,
   useSandboxWakeOnSessionOpen,
@@ -24,7 +25,14 @@ const state: {
   runnerOnline: boolean | undefined;
   permissionLevel: number | null | undefined;
   eventTypes: string[] | "loading";
-} = { liveness: "host_asleep", runnerOnline: false, permissionLevel: 2, eventTypes: [] };
+  labels: Record<string, string>;
+} = {
+  liveness: "host_asleep",
+  runnerOnline: false,
+  permissionLevel: 2,
+  eventTypes: [],
+  labels: {},
+};
 
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
@@ -39,7 +47,10 @@ let sessionLoaded = true;
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string | undefined) => ({
     // Like production, a loading snapshot is null.
-    session: id && sessionLoaded ? { id, permissionLevel: state.permissionLevel } : null,
+    session:
+      id && sessionLoaded
+        ? { id, permissionLevel: state.permissionLevel, labels: state.labels }
+        : null,
   }),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -78,6 +89,7 @@ beforeEach(() => {
     runnerOnline: false,
     permissionLevel: 2,
     eventTypes: ["retry_session", "wake_session"],
+    labels: {},
   });
   sessionLoaded = true;
   wakeMock.mockReset();
@@ -206,6 +218,19 @@ describe("useSandboxWake", () => {
       expect(result.current.passive).toBe(false);
     },
   );
+
+  it("keeps automatic recovery off on a fresh page while the server holds recovery", () => {
+    state.liveness = "online";
+    state.runnerOnline = true;
+    state.labels = { [RECONNECT_RECOVERY_HELD_LABEL_KEY]: "true" };
+    const { result, rerender } = renderHook(() => useSandboxPassivelyWoken("conv_sleepy"));
+    expect(result.current).toBe(true);
+
+    // A message or Resume releases the hold server-side.
+    state.labels = {};
+    rerender();
+    expect(result.current).toBe(false);
+  });
 
   it("ends the passive wake when the sandbox sleeps again after coming online", () => {
     const { result, rerender } = renderHook(() => ({

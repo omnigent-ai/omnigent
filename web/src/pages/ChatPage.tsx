@@ -4016,6 +4016,7 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
+    wakeSandboxForComposer();
     slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
@@ -4165,10 +4166,7 @@ function ComposerImpl(
         input={{
           ref: bindTailTextarea,
           value: draft.text,
-          onChange: (e) => {
-            wakeSandboxForComposer();
-            handleTextChange(null, e);
-          },
+          onChange: (e) => handleTextChange(null, e),
           onPointerDown: wakeSandboxForComposer,
           onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
@@ -4238,6 +4236,7 @@ function ComposerImpl(
                 }}
                 inputFor={(quote) => ({
                   onChange: (e) => handleTextChange(quote.id, e),
+                  onPointerDown: wakeSandboxForComposer,
                   onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
                   onBlur: dismissMention,
                   onKeyDown: handleKeyDown,

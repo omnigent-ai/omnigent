@@ -98,15 +98,25 @@ async function startSandboxWake(conversationId: string): Promise<void> {
 }
 
 /**
- * Whether this page woke the session's sandbox passively and no explicit
- * work has followed, so automatic recovery must wait for the user.
+ * Server-owned label a passive wake writes before launching the runner; it
+ * stays until a message, a plain retry, or restoring the session's agents.
+ */
+export const RECONNECT_RECOVERY_HELD_LABEL_KEY = "omnigent.reconnect_recovery_held";
+
+/**
+ * Whether the session's sandbox was woken passively and no explicit work has
+ * followed, so automatic recovery must wait for the user. Reads this page's
+ * own wakes (before the snapshot shows the label) and the persisted hold
+ * label, so a reload or another tab still waits.
  */
 export function useSandboxPassivelyWoken(conversationId: string | null | undefined): boolean {
   const get = useCallback(
     () => (conversationId ? passiveWakes.has(conversationId) : false),
     [conversationId],
   );
-  return useSyncExternalStore(subscribe, get);
+  const local = useSyncExternalStore(subscribe, get);
+  const { session } = useSession(conversationId);
+  return local || session?.labels?.[RECONNECT_RECOVERY_HELD_LABEL_KEY] !== undefined;
 }
 
 /** Explicit work started on the session: automatic recovery may run again. */

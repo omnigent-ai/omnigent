@@ -329,6 +329,26 @@ describe("Composer focus handle", () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
+  it("wakes an asleep sandbox from a reply quote's text, not its focus", () => {
+    wakeSandboxMock.mockClear();
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps();
+    render(<Composer {...props} ref={ref} />);
+    // Text typed before quoting becomes the editable block before the quote.
+    fireEvent.change(textarea(), { target: { value: "Intro" } });
+    act(() => ref.current?.appendReplyQuote("Quoted text"));
+    wakeSandboxMock.mockClear();
+    const before = screen.getByLabelText("Reply text before quote 1");
+    act(() => before.focus());
+    expect(wakeSandboxMock).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(before);
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
+    fireEvent.change(before, { target: { value: "My introduction" } });
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
   it("takes focus for typing, unless disabled or read-only", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
