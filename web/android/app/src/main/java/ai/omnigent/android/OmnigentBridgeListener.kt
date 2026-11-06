@@ -33,6 +33,8 @@ class OmnigentBridgeListener(
     private val onSignOut: (() -> Unit)? = null,
     /** Web asked to sign the server out; the shell answers whether it took over. */
     private val onSignOutOfServer: () -> Unit = {},
+    /** Web picked a debug authentication fault the picker payload offered. */
+    private val onAuthDebugAction: (Int) -> Unit = {},
 ) : WebViewCompat.WebMessageListener {
     override fun onPostMessage(
         view: WebView,
@@ -124,6 +126,11 @@ class OmnigentBridgeListener(
 
             "signOutOfServer" -> {
                 onSignOutOfServer()
+            }
+
+            "runAuthDebugAction" -> {
+                val id = json.opt("id") as? Int ?: return
+                onAuthDebugAction(id)
             }
         }
     }
