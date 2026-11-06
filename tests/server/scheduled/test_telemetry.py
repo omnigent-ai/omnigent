@@ -63,7 +63,12 @@ def test_creation_telemetry_tolerates_logging_failure(task, monkeypatch):
     log.assert_called_once()
 
 
-def test_captured_logs_classify_automation_descendants_and_spend(task, monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "missing_evidence", [None, "creator", "parent", "tokens", "cost", "usage"]
+)
+def test_captured_logs_classify_automation_descendants_and_spend(
+    task, monkeypatch, tmp_path, missing_evidence
+):
     """Reconstruct origin and spend solely from rows sent to the debug sink."""
     import json
 
@@ -116,12 +121,23 @@ def test_captured_logs_classify_automation_descendants_and_spend(task, monkeypat
                 ("automation", "alice", 120),
                 ("automation", "alice", 120),
             ]:
+                incomplete_usage = session_id == "nested_worker"
+                if incomplete_usage and missing_evidence == "usage":
+                    continue
                 with debug_logging.current_user_id_scope(f"{owner}@example.com"):
                     event = SessionUsageEvent(
                         type="session.usage",
                         conversation_id=session_id,
-                        total_cost_usd=tokens / 100,
-                        usage_by_model={"model": ModelUsage(total_tokens=tokens)},
+                        total_cost_usd=None
+                        if incomplete_usage and missing_evidence == "cost"
+                        else tokens / 100,
+                        usage_by_model={
+                            "model": ModelUsage(
+                                total_tokens=None
+                                if incomplete_usage and missing_evidence == "tokens"
+                                else tokens
+                            )
+                        },
                     )
                     session_stream.publish(session_id, event.model_dump(exclude_none=True))
     finally:
@@ -131,6 +147,16 @@ def test_captured_logs_classify_automation_descendants_and_spend(task, monkeypat
     captured = tmp_path / "captured_usage_rows.json"
     captured.write_text(json.dumps(rows, indent=2))
     rows = json.loads(captured.read_text())
+    # Simulate an absent creator/parent creation record in the retained log window.
+    missing_creation = {"creator": "automation", "parent": "worker"}.get(missing_evidence)
+    rows = [
+        row
+        for row in rows
+        if not (
+            row["session_id"] == missing_creation
+            and row["event_name"] in {"session_created", "scheduled_run_session_created"}
+        )
+    ]
     automated = {
         row["session_id"] for row in rows if row["event_name"] == "scheduled_run_session_created"
     }
@@ -139,41 +165,83 @@ def test_captured_logs_classify_automation_descendants_and_spend(task, monkeypat
         for row in rows
         if row["event_name"] == "session_created"
     }
+    cohorts = dict.fromkeys(automated, "automation")
+    cohorts.update(
+        {
+            session_id: "interactive"
+            for session_id, attrs in creations.items()
+            if not attrs.get("parent_session_id") and not attrs.get("created_by_session_id")
+        }
+    )
     while True:
         descendants = {
-            session_id
+            session_id: cohorts[origin]
             for session_id, attrs in creations.items()
-            if attrs.get("parent_session_id") in automated
-            or attrs.get("created_by_session_id") in automated
+            if session_id not in cohorts
+            and (origin := attrs.get("parent_session_id") or attrs.get("created_by_session_id"))
+            in cohorts
         }
-        if descendants <= automated:
+        if not descendants:
             break
-        automated.update(descendants)
-    assert automated == {"automation", "worker", "child", "nested_worker"}
+        cohorts.update(descendants)
     latest_usage = {row["session_id"]: row for row in rows if row["event_name"] == "session.usage"}
+    sessions_seen = set(creations) | set(latest_usage) | automated
+    unknown = sessions_seen - cohorts.keys()
+    assert unknown == (
+        {"automation", "worker", "child", "nested_worker"}
+        if missing_evidence == "creator"
+        else {"worker", "child", "nested_worker"}
+        if missing_evidence == "parent"
+        else set()
+    )
+    cohorts.update(dict.fromkeys(unknown, "unknown"))
     report = {}
-    for cohort, sessions in (
-        ("automation", automated),
-        ("interactive", set(creations) - automated),
-    ):
+    for cohort in ("automation", "interactive", "unknown"):
+        sessions = {session_id for session_id, origin in cohorts.items() if origin == cohort}
         # Parent snapshots already include subagent spend; sum each spawn tree once.
         spend_rows = [
-            latest_usage[session_id]
+            latest_usage.get(session_id, {}).get("attributes", {})
             for session_id in sessions
             if creations.get(session_id, {}).get("parent_session_id") not in sessions
         ]
-        assert all(row["attributes"]["usage_kind"] == "cumulative" for row in spend_rows)
-        assert all(row["attributes"]["usage_scope"] == "session_subtree" for row in spend_rows)
+        assert all(attrs["usage_kind"] == "cumulative" for attrs in spend_rows if attrs)
+        assert all(attrs["usage_scope"] == "session_subtree" for attrs in spend_rows if attrs)
         report[cohort] = {
             "sessions": len(sessions),
-            "users": len({latest_usage[session_id]["user_id"] for session_id in sessions}),
-            "tokens": sum(int(row["attributes"]["total_tokens"]) for row in spend_rows),
-            "cost_usd": round(
-                sum(float(row["attributes"]["total_cost_usd"]) for row in spend_rows), 2
+            "users": len(
+                {
+                    row["user_id"]
+                    for row in rows
+                    if row["session_id"] in sessions and row["user_id"]
+                }
             ),
+            "tokens": sum(int(attrs["total_tokens"]) for attrs in spend_rows)
+            if cohort != "unknown" and all("total_tokens" in attrs for attrs in spend_rows)
+            else None,
+            "cost_usd": round(sum(float(attrs["total_cost_usd"]) for attrs in spend_rows), 2)
+            if cohort != "unknown" and all("total_cost_usd" in attrs for attrs in spend_rows)
+            else None,
         }
+    expected_tokens, expected_cost = {
+        None: (670, 6.7),
+        "creator": (0, 0.0),
+        "parent": (120, 1.2),
+        "tokens": (None, 6.7),
+        "cost": (670, None),
+        "usage": (None, None),
+    }[missing_evidence]
     assert report == {
-        "automation": {"sessions": 4, "users": 1, "tokens": 670, "cost_usd": 6.7},
+        "automation": {
+            "sessions": 4 - len(unknown),
+            "users": int(missing_evidence != "creator"),
+            "tokens": expected_tokens,
+            "cost_usd": expected_cost,
+        },
         "interactive": {"sessions": 2, "users": 1, "tokens": 500, "cost_usd": 5.0},
+        "unknown": {
+            "sessions": len(unknown),
+            "users": int(bool(unknown)),
+            "tokens": None,
+            "cost_usd": None,
+        },
     }
-    print(json.dumps({"report": report, "captured_logs": str(captured)}, indent=2))
