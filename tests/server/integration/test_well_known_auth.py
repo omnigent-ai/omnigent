@@ -7,6 +7,7 @@ desktop can rely on ``POST /auth/native-token`` existing without a probe.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -99,6 +100,21 @@ async def test_oidc_manifest_names_mode_and_cookie(
     # The promised endpoint is mounted (a bad request, not a 404).
     assert exchange.status_code == 400
     assert exchange.json() == {"error": "invalid_request"}
+
+
+async def test_oidc_app_shares_its_admission_policy_with_sharing(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """``create_app`` hands session sharing the same admission policy as sign-in."""
+    config = replace(
+        _oidc_config("https://omni.example/auth/callback"),
+        allowed_domains=frozenset({"example.com"}),
+    )
+    app = _app(db_uri, tmp_path, UnifiedAuthProvider(source="oidc", oidc_config=config))
+
+    admitted = app.state.share_target_admitted
+    assert admitted("alice@example.com") is True
+    assert admitted("alice@exmaple.com") is False
 
 
 @pytest.mark.parametrize("mode", ["accounts", "header"])

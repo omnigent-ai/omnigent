@@ -5114,7 +5114,10 @@ def create_app(
                 tags=["auth"],
             )
         elif isinstance(auth_provider, UnifiedAuthProvider):
-            from omnigent.server.routes.auth import create_auth_router
+            from omnigent.server.routes.auth import (
+                build_oidc_admission_policy,
+                create_auth_router,
+            )
 
             # OIDC invites are opt-in (OMNIGENT_OIDC_ALLOW_INVITES) and
             # need the token/invited-email store. Construct one on the
@@ -5132,14 +5135,28 @@ def create_app(
 
                 oidc_account_store = SqlAlchemyAccountStore(permission_store.storage_location)
 
+            _oidc_allowed_domains = frozenset(allowed_domains or ()) or None
+            _oidc_admission = (
+                build_oidc_admission_policy(
+                    _oidc_cfg, admin_list, oidc_account_store, _oidc_allowed_domains
+                )
+                if _oidc_cfg is not None
+                else None
+            )
+            if _oidc_admission is not None:
+                # Session sharing asks the same question as sign-in: a grant
+                # to an email that could never sign in only leaves a ghost
+                # member behind (see routes_permissions.grant_permission).
+                app.state.share_target_admitted = _oidc_admission.is_admitted
             app.include_router(
                 create_auth_router(
                     auth_provider,
                     permission_store,
                     admin_list,
                     oidc_account_store,
-                    allowed_domains=frozenset(allowed_domains or ()) or None,
+                    allowed_domains=_oidc_allowed_domains,
                     device_grant_store=device_grant_store,
+                    admission=_oidc_admission,
                 ),
                 prefix="/auth",
                 tags=["auth"],

@@ -1443,6 +1443,56 @@ async def test_grant_upgrade_via_upsert(
     )
 
 
+async def test_share_refuses_new_user_the_server_would_not_admit(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Under OIDC admission, a share can't create a member who could never sign in.
+
+    A typo'd or out-of-allowlist email used to get a user row and a dead
+    grant, then showed up as a member nobody could remove. New admitted
+    users and users that already exist are unaffected.
+    """
+    auth_app.state.share_target_admitted = lambda email: email.endswith("@example.com")
+    agent = await create_test_agent(auth_client, user="owner@example.com")
+    session = await _create_session_as(auth_client, agent["id"], "owner@example.com")
+    session_id = session["id"]
+    # An out-of-domain user that already exists (e.g. admitted earlier as
+    # an admin or by invite) keeps being shareable.
+    await create_test_agent(auth_client, user="partner@other.org")
+
+    typo = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="bob@exmaple.com",
+        level=LEVEL_READ,
+    )
+    new_admitted = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="Carol@Example.com",
+        level=LEVEL_READ,
+    )
+    existing = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="partner@other.org",
+        level=LEVEL_READ,
+    )
+
+    assert typo.status_code == 400, typo.text
+    assert "cannot sign in" in typo.text
+    assert new_admitted.status_code == 200, new_admitted.text
+    assert existing.status_code == 200, existing.text
+    listed = await _list_permissions(auth_client, session_id, user="owner@example.com")
+    grantees = {g["user_id"] for g in listed.json()["permissions"]}
+    assert "bob@exmaple.com" not in grantees
+    assert {"Carol@Example.com", "partner@other.org"} <= grantees
+
+
 # ── Unauthenticated request: no header ────────────────────
 
 

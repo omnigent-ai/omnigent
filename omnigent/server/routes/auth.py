@@ -183,6 +183,37 @@ class _NativeCode:
     created_at: float = field(default_factory=time.time)
 
 
+def build_oidc_admission_policy(
+    config: OIDCConfig,
+    admin_list: AdminList,
+    account_store: SqlAlchemyAccountStore | None = None,
+    allowed_domains: frozenset[str] | None = None,
+) -> OidcAdmissionPolicy:
+    """Build the policy that decides which emails may sign in via OIDC.
+
+    Domain allowlist (env ∪ runtime-editable file ∪ server config) with
+    the admin-list and, when invites are on, invite bypasses. The app
+    builds it once and hands it both to :func:`create_auth_router` and
+    to session sharing, so a share can't name someone who could never
+    sign in.
+
+    :param config: The server's OIDC configuration.
+    :param admin_list: File-backed admin roster (admins always pass).
+    :param account_store: Invite store; consulted only when
+        ``config.allow_invites`` is on.
+    :param allowed_domains: Domains from the server config's
+        ``allowed_domains:`` key.
+    :returns: The admission policy.
+    """
+    return OidcAdmissionPolicy(
+        env_allowed_domains=config.allowed_domains,
+        domains_file_path=resolve_allowed_domains_path(),
+        admin_list=admin_list,
+        invited_lookup=account_store if config.allow_invites else None,
+        config_allowed_domains=allowed_domains,
+    )
+
+
 def create_auth_router(
     auth_provider: UnifiedAuthProvider,
     permission_store: PermissionStore | None,
@@ -190,6 +221,7 @@ def create_auth_router(
     account_store: SqlAlchemyAccountStore | None = None,
     allowed_domains: frozenset[str] | None = None,
     device_grant_store: DeviceGrantStore | None = None,
+    admission: OidcAdmissionPolicy | None = None,
 ) -> APIRouter:
     """Create an :class:`APIRouter` with OIDC login/callback/logout routes.
 
@@ -216,6 +248,9 @@ def create_auth_router(
         so hosts and CLIs can renew without a human re-running
         ``omnigent login``. ``None`` keeps the legacy
         session-JWT-only response.
+    :param admission: A prebuilt admission policy, so the app can share
+        one instance with session sharing. ``None`` builds one from the
+        other arguments (see :func:`build_oidc_admission_policy`).
     :returns: A FastAPI router with ``/login``, ``/callback``,
         ``/logout``, ``/cli-login``, ``/cli-poll``, ``/native-token``,
         ``/users`` (and ``/invite`` when invites are enabled).
@@ -232,13 +267,8 @@ def create_auth_router(
     # Admission policy: domain allowlist (env ∪ runtime-editable file)
     # with admin-list and (when enabled) invite bypasses. One place
     # decides who may sign in — see omnigent/server/oidc_access.py.
-    admission = OidcAdmissionPolicy(
-        env_allowed_domains=config.allowed_domains,
-        domains_file_path=resolve_allowed_domains_path(),
-        admin_list=admin_list,
-        invited_lookup=invite_store,
-        config_allowed_domains=allowed_domains,
-    )
+    if admission is None:
+        admission = build_oidc_admission_policy(config, admin_list, account_store, allowed_domains)
 
     # Cookie names and secure flag depend on HTTP vs HTTPS (derived
     # from redirect_uri). The __Host- prefix requires HTTPS — using

@@ -176,6 +176,23 @@ def register_permissions_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         target = await asyncio.to_thread(permission_store.get_user, body.user_id)
+        # Sharing with someone who has never signed in creates their user
+        # row. Under OIDC, refuse when that email could never sign in (a
+        # typo, a domain outside the allowlist): the grant would be dead
+        # and the row would show up as a member nobody can remove. Set
+        # only by the OIDC wiring in create_app; other modes skip it.
+        _admitted = getattr(request.app.state, "share_target_admitted", None)
+        if (
+            target is None
+            and body.user_id != RESERVED_USER_PUBLIC
+            and _admitted is not None
+            and not _admitted(body.user_id.lower())
+        ):
+            raise OmnigentError(
+                f"{body.user_id} cannot sign in to this Omnigent server, "
+                "so the session cannot be shared with them.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         with target_account_scope(body.user_id, target.account_generation if target else None):
             existing = await asyncio.to_thread(permission_store.get, body.user_id, session_id)
             if existing is not None and existing.level == LEVEL_OWNER:
