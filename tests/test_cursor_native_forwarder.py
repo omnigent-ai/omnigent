@@ -28,6 +28,7 @@ import pytest
 from omnigent.harnesses.cursor_native import forwarder as fwd
 from omnigent.harnesses.cursor_native import status
 from omnigent.harnesses.cursor_native.forwarder import _persist_native_compaction_item
+from tests._helpers.polling import poll_until_async
 
 # Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
 # persist side (forwarder) and the resume side (runner's strict
@@ -483,6 +484,50 @@ class TestChatContestedByUnboundSibling:
             fwd._chat_contested_by_unbound_sibling(root / "me", chat_dir / "store.db", "/ws")
             is contested
         )
+
+
+class TestHookNamedStore:
+    """``_hook_named_store`` resolves the chat store a stop-hook marker names."""
+
+    @pytest.mark.parametrize(
+        ("hook_chat_id", "store_workspaces", "expected_workspace"),
+        [
+            (_CHAT_ID, ["/ws", "/other"], "/ws"),
+            (_CHAT_ID, ["/other"], "/other"),
+            (_CHAT_ID, ["/other", "/third"], None),
+            (_CHAT_ID_ABSENT, ["/ws"], None),
+            ("*", ["/other"], None),
+            (None, ["/ws"], None),
+        ],
+        ids=["own-workspace", "unique-elsewhere", "ambiguous", "absent", "invalid-id", "legacy"],
+    )
+    def test_resolves_only_an_unambiguous_named_store(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        hook_chat_id: str | None,
+        store_workspaces: list[str],
+        expected_workspace: str | None,
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        stores: dict[str, Path] = {}
+        for workspace in store_workspaces:
+            store = (
+                chats_root / hashlib.md5(workspace.encode()).hexdigest() / _CHAT_ID / "store.db"
+            )
+            store.parent.mkdir(parents=True)
+            store.write_bytes(b"")
+            stores[workspace] = store
+        bridge_dir = tmp_path / "bridge"
+        payload = {"status": "completed"}
+        if hook_chat_id is not None:
+            payload["conversation_id"] = hook_chat_id
+        status.record_turn_end(bridge_dir, payload)
+
+        resolved = fwd._hook_named_store(bridge_dir, "/ws", 1)
+
+        assert resolved == (stores[expected_workspace] if expected_workspace else None)
 
 
 class _RecordingClient:
@@ -1129,10 +1174,11 @@ class TestForwardLoopPreseedResume:
     """Forwarder uses pre-seeded bridge state on cold resume, skipping discovery."""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("confirmed", [True, False], ids=["confirmed", "legacy-state"])
     async def test_uses_preseed_store_without_discover(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, confirmed: bool
     ) -> None:
-        """When bridge state is pre-seeded, forwarder skips _discover_store."""
+        """Pre-seeded state skips _discover_store; only a confirmed chat is PATCHed."""
         chat_id = _CHAT_ID
         store = tmp_path / chat_id / "store.db"
         store.parent.mkdir(parents=True)
@@ -1148,10 +1194,14 @@ class TestForwardLoopPreseedResume:
         bridge_dir = tmp_path / "cursor-native" / "sess"
         bridge_dir.mkdir(parents=True)
         # Pre-seed: rowid 1 already mirrored (old history), start from there.
-        fwd._write_state(
-            bridge_dir,
-            fwd._ForwardState(store_path=str(store), last_rowid=1, launch_epoch_ms=999_000),
-        )
+        state: dict[str, object] = {
+            "store_path": str(store),
+            "last_rowid": 1,
+            "launch_epoch_ms": 999_000,
+        }
+        if confirmed:
+            state |= {"workspace": "/ws", "confirmed": True}
+        (bridge_dir / fwd._STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
 
         discover_calls: list = []
 
@@ -1167,8 +1217,13 @@ class TestForwardLoopPreseedResume:
         async def _collect(client: object, *, session_id: str, item: fwd._MirrorItem) -> None:
             delivered.append(item)
 
+        patches: list[tuple[str, str]] = []
+
+        async def _record_patch(client: object, *, session_id: str, chat_id: str) -> None:
+            patches.append((session_id, chat_id))
+
         monkeypatch.setattr(fwd, "_post_conversation_item", _collect)
-        monkeypatch.setattr(fwd, "_patch_external_session_id", lambda *a, **k: None)
+        monkeypatch.setattr(fwd, "_patch_external_session_id", _record_patch)
 
         task = asyncio.create_task(
             fwd.forward_cursor_store_to_session(
@@ -1183,12 +1238,7 @@ class TestForwardLoopPreseedResume:
             )
         )
         try:
-            for _ in range(2000):
-                if delivered:
-                    break
-                await asyncio.sleep(0.001)
-            else:
-                raise AssertionError("forwarder never mirrored the new message")
+            await poll_until_async(lambda: delivered, timeout_s=5.0, interval_s=0.001)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -1198,6 +1248,8 @@ class TestForwardLoopPreseedResume:
         assert delivered[0].item_data["content"][0]["text"] == "new message"
         # _discover_store was never called (pre-seed took the fast path).
         assert not discover_calls
+        assert patches == ([("conv_1", chat_id)] if confirmed else [])
+        assert fwd._read_state(bridge_dir).confirmed is confirmed
 
 
 class TestForwardLoopExternalSessionId:
@@ -1223,17 +1275,6 @@ class TestForwardLoopExternalSessionId:
                 poll_interval_s=0.001,
             )
         )
-
-    @staticmethod
-    async def _wait_for(condition, *, extra_polls: int = 0) -> None:
-        for _ in range(2000):
-            if condition():
-                break
-            await asyncio.sleep(0.001)
-        else:
-            raise AssertionError("forwarder never reached the expected state")
-        for _ in range(extra_polls):
-            await asyncio.sleep(0.001)
 
     @pytest.mark.asyncio
     async def test_patches_the_hook_confirmed_chat_not_the_discovery_guess(
@@ -1264,12 +1305,19 @@ class TestForwardLoopExternalSessionId:
         task = self._start(bridge_dir)
         try:
             with caplog.at_level(logging.WARNING, logger=fwd._logger.name):
-                await self._wait_for(lambda: mirrored() == ["guess"], extra_polls=20)
+                await poll_until_async(
+                    lambda: mirrored() == ["guess"], timeout_s=5.0, interval_s=0.001
+                )
+                await asyncio.sleep(0.02)
                 assert patches == []
                 status.record_turn_end(
                     bridge_dir, {"conversation_id": _CHAT_ID_2, "status": "completed"}
                 )
-                await self._wait_for(lambda: status.read_posted_count(bridge_dir) == 1)
+                await poll_until_async(
+                    lambda: status.read_posted_count(bridge_dir) == 1,
+                    timeout_s=5.0,
+                    interval_s=0.001,
+                )
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -1304,7 +1352,10 @@ class TestForwardLoopExternalSessionId:
 
         task = self._start(bridge_dir)
         try:
-            await self._wait_for(lambda: status.read_posted_count(bridge_dir) == 2, extra_polls=50)
+            await poll_until_async(
+                lambda: status.read_posted_count(bridge_dir) == 2, timeout_s=5.0, interval_s=0.001
+            )
+            await asyncio.sleep(0.05)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -1521,10 +1572,11 @@ class TestSiblingSessionsInOneWorkspace:
             )
         ]
         try:
-            for _ in range(2000):
-                if all(fwd._read_state(d).workspace == "/ws" for d in (signed_out, reviewer)):
-                    break
-                await asyncio.sleep(0.001)
+            await poll_until_async(
+                lambda: all(fwd._read_state(d).workspace == "/ws" for d in (signed_out, reviewer)),
+                timeout_s=5.0,
+                interval_s=0.001,
+            )
             staged = tmp_path / "staged"
             staged.mkdir()
             (staged / "meta.json").write_text(json.dumps({"createdAtMs": now_ms + 1_000}))
@@ -1540,10 +1592,9 @@ class TestSiblingSessionsInOneWorkspace:
             os.rename(staged, chat_dir)
             await asyncio.sleep(0.05)
             status.record_turn_end(reviewer, {"conversation_id": _CHAT_ID, "status": "completed"})
-            for _ in range(2000):
-                if status.read_posted_count(reviewer) == 1:
-                    break
-                await asyncio.sleep(0.001)
+            await poll_until_async(
+                lambda: status.read_posted_count(reviewer) == 1, timeout_s=5.0, interval_s=0.001
+            )
             await asyncio.sleep(0.05)
         finally:
             for task in tasks:
@@ -1613,10 +1664,9 @@ class TestSiblingSessionsInOneWorkspace:
             )
         )
         try:
-            for _ in range(2000):
-                if status.read_posted_count(bridge_dir) == 1:
-                    break
-                await asyncio.sleep(0.001)
+            await poll_until_async(
+                lambda: status.read_posted_count(bridge_dir) == 1, timeout_s=5.0, interval_s=0.001
+            )
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
