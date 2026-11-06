@@ -1204,6 +1204,27 @@ def _format_subagent_wake_notice(*, agent: str, title: str, status: str, pending
     )
 
 
+def _format_async_result_wake_notice(
+    *, handle_id: str, tool_name: str, status: str, pending: int
+) -> str:
+    """
+    Build the framework notice that wakes a session after a background task finishes.
+
+    :param handle_id: The ``sys_call_async`` handle, e.g. ``"handle_0123456789ab"``.
+    :param tool_name: The dispatched tool, e.g. ``"sys_os_shell"``.
+    :param status: Terminal task status, e.g. ``"completed"`` or ``"failed"``.
+    :param pending: Number of undrained items in the session inbox, e.g. ``1``.
+    :returns: A ``[System: ...]`` notice string, e.g. ``"[System: background task
+        handle_0123456789ab (sys_os_shell) finished (completed) — 1 result waiting
+        in inbox. Call sys_read_inbox to collect.]"``.
+    """
+    noun = "result" if pending == 1 else "results"
+    return (
+        f"[System: background task {handle_id} ({tool_name}) finished ({status}) — "
+        f"{pending} {noun} waiting in inbox. Call sys_read_inbox to collect.]"
+    )
+
+
 # Max length of a child message preview mirrored to the parent stream.
 # Matches the server-side ``_latest_message_preview`` truncation so the
 # live runner-pushed preview and the snapshot preview look the same.

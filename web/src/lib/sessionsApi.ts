@@ -83,6 +83,8 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /** The session a claude-sdk `clear` continued in; absent for other events. */
+  sessionId?: string;
 }
 
 /**
@@ -157,6 +159,10 @@ interface SessionResponseWire {
   title?: string | null;
   labels?: Record<string, string>;
   project_id?: string | null;
+  /** The session whose Workspace rail lists this one as a side chat. */
+  side_chat_parent_id?: string | null;
+  /** Whether the viewer may start side chats here; absent from older servers. */
+  side_chat_allowed?: boolean | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -356,6 +362,8 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,
+    sideChatParentId: wire.side_chat_parent_id ?? null,
+    sideChatAllowed: wire.side_chat_allowed ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
@@ -503,6 +511,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  session_id?: string;
 }): PostEventResponse {
   return {
     queued: wire.queued,
@@ -511,6 +520,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    sessionId: wire.session_id,
   };
 }
 
@@ -1518,6 +1528,7 @@ export async function postEvent(
       pending_id?: string;
       recovered?: boolean;
       recovery?: PostEventResponse["recovery"];
+      session_id?: string;
     },
   );
 }

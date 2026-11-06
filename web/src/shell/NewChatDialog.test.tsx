@@ -3283,7 +3283,11 @@ describe("Run on this machine (desktop host enrollment)", () => {
     await clickRunOnThisMachine();
 
     const chip = screen.getByTestId("new-chat-landing-host-chip");
-    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…, Offline"));
+    await waitFor(() => expect(chip).toHaveAccessibleName("Host: Connecting…"));
+    expect(within(chip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(chip.className).toContain("after:animate-pulse");
     expect(chip.className).toContain("after:content-['Connecting…']");
 
@@ -4311,14 +4315,14 @@ describe("NewChatLandingScreen", () => {
       "min-h-0",
       "max-w-[800px]",
       "px-4",
-      "pb-[max(20px,env(safe-area-inset-bottom))]",
+      "pb-[max(16px,env(safe-area-inset-bottom))]",
       "md:pb-16",
     );
     expect(landingContent?.firstElementChild).toHaveClass("flex-1", "md:flex-none");
     expect(composerSurface.firstElementChild).toBe(workspaceControls);
     expect(workspaceControls).toContainElement(workspace);
     expect(workspaceControls.nextElementSibling).toBe(composer.closest("form"));
-    expect(composerSurface).toHaveClass("gap-0", "max-md:w-[calc(100%-1rem)]");
+    expect(composerSurface).toHaveClass("gap-0", "w-full");
     expect(workspaceControls).toHaveClass(
       "mx-3",
       "-mb-px",
@@ -4403,7 +4407,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-lg",
       "px-2",
       "py-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "md:min-h-7",
     );
@@ -4899,7 +4903,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveClass(
       "min-w-0",
       "truncate",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-medium",
       "text-foreground",
@@ -4941,7 +4945,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("High");
     expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveClass(
       "shrink-0",
-      "text-[13px]",
+      "text-ui",
       "leading-5",
       "font-normal",
       "text-muted-foreground",
@@ -5559,6 +5563,49 @@ describe("NewChatLandingScreen", () => {
     expect(notices).toHaveClass("mt-1");
     expect(importActions).toHaveClass("mt-5");
     expect(notices.nextElementSibling).toBe(importActions);
+  });
+
+  it("opens import settings from the empty landing", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    renderLanding();
+
+    fireEvent.click(screen.getByRole("button", { name: "Import your recent sessions" }));
+
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/settings/import");
+  });
+
+  it("dismisses the import suggestion beside its button and keeps it dismissed after remount", () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    const landing = renderLanding();
+    const importButton = screen.getByRole("button", { name: "Import your recent sessions" });
+    const dismissButton = screen.getByRole("button", { name: "Dismiss import suggestion" });
+    expect(importButton.nextElementSibling).toBe(dismissButton);
+    expect(dismissButton).toHaveAttribute("data-variant", "ghost");
+
+    fireEvent.click(dismissButton);
+
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Dismiss import suggestion" })).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-input")).toBeVisible();
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(/^\/$/);
+
+    landing.unmount();
+    renderLanding();
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
+  });
+
+  it("dismisses the import suggestion when storage writes fail", async () => {
+    useConversationsMock.mockReturnValue({ data: { pages: [{ data: [] }], pageParams: [] } });
+    renderLanding();
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Storage unavailable", "QuotaExceededError");
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss import suggestion" }));
+    });
+
+    expect(screen.queryByTestId("landing-import-sessions")).not.toBeInTheDocument();
   });
 
   it("keeps the footer anchored to the composer when a harness notice appears", () => {
@@ -6710,6 +6757,12 @@ describe("NewChatLandingScreen", () => {
     // The chip reads the empty state…
     const hostChip = screen.getByTestId("new-chat-landing-host-chip");
     expect(hostChip).toHaveAccessibleName(expect.stringContaining("No host selected"));
+    expect(hostChip).not.toHaveAccessibleName(expect.stringContaining("Offline"));
+    expect(hostChip).toBeEnabled();
+    expect(within(hostChip).getByTestId("new-chat-landing-host-status")).toHaveAttribute(
+      "data-status",
+      "offline",
+    );
     expect(hostChip.querySelector(".bg-success")).toBeNull();
     expect(hostChip.querySelector(".lucide-laptop")).not.toBeNull();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
@@ -6784,7 +6837,14 @@ describe("NewChatLandingScreen", () => {
       within(menu)
         .getAllByRole("menuitemradio")
         .map((item) => item.textContent),
-    ).toEqual(["Default", "Full access", "Read only", "Bypass approvals & sandbox"]);
+    ).toEqual([
+      "Default",
+      "Ask for approval",
+      "Approve for me",
+      "Full Access",
+      "Read Only",
+      "Bypass approvals & sandbox",
+    ]);
   });
 
   it("offers the Codex effort ladder in the gear modal and sends the pick as reasoning_effort", async () => {
@@ -7034,8 +7094,10 @@ describe("NewChatLandingScreen", () => {
 
   it.each([
     ["default", "Default"],
-    ["full-access", "Full access"],
-    ["read-only", "Read only"],
+    ["ask-for-approval", "Ask for approval"],
+    ["approve-for-me", "Approve for me"],
+    ["full-access", "Full Access"],
+    ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],
   ])("remembers Codex %s across harness switches and fresh visits", (mode, label) => {
     renderLanding();
@@ -7128,11 +7190,35 @@ describe("NewChatLandingScreen", () => {
   it.each([
     ["default", "Default", undefined],
     [
+      "ask-for-approval",
+      "Ask for approval",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="user"',
+      ],
+    ],
+    [
+      "approve-for-me",
+      "Approve for me",
+      [
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+        "-c",
+        'approvals_reviewer="auto_review"',
+      ],
+    ],
+    [
       "full-access",
-      "Full access",
+      "Full Access",
       ["--sandbox", "danger-full-access", "--ask-for-approval", "never"],
     ],
-    ["read-only", "Read only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
+    ["read-only", "Read Only", ["--sandbox", "read-only", "--ask-for-approval", "on-request"]],
   ] as const)("clears bypass when the hand dropdown selects %s", async (mode, label, args) => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
@@ -7542,6 +7628,14 @@ describe("NewChatLandingScreen", () => {
 
     expect(row).not.toHaveAttribute("aria-disabled");
     expect(screen.queryByRole("tooltip")).toBeNull();
+  });
+
+  it("names the model-picker shortcut in the picker's tooltip", async () => {
+    renderLanding();
+    fireEvent.focus(screen.getByTestId("new-chat-landing-agent-select"));
+    expect(await screen.findByTestId("new-chat-landing-agent-tooltip")).toHaveTextContent(
+      "Open model picker",
+    );
   });
 
   it("replaces a selected broken harness model label with a warning tooltip", async () => {
@@ -8475,7 +8569,7 @@ describe("NewChatLandingScreen", () => {
 
     await screen.findByTestId("new-chat-landing-input");
     expect(screen.getByRole("heading", { name: "What should we build?" })).toHaveClass(
-      "text-[24px]",
+      "text-[28px]",
     );
     expect(screen.queryByTestId("new-chat-landing-project-chip")).toBeNull();
   });
@@ -11614,7 +11708,9 @@ describe("NewChatLandingScreen Smart Routing harness row", () => {
   function expectSmartRoutingHidden(): void {
     expect(screen.queryByTestId(SMART_ROUTING_ROW)).toBeNull();
     const heading = screen.getByText("Harnesses");
-    expect(heading.closest('[role="menu"]')?.firstElementChild).toBe(heading);
+    expect(
+      heading.closest('[role="menu"]')?.querySelector("[data-harness-menu-section-label]"),
+    ).toBe(heading);
     expect(screen.getByTestId("new-chat-landing-agent-a1")).toBeVisible();
   }
 

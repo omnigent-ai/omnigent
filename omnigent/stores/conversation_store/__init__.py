@@ -150,6 +150,11 @@ SIDE_CHAT_LABEL_KEY = "omnigent.side_chat"
 # Server-owned routing ancestry; it does not require a workspace or own a runner.
 SIDE_CHAT_SOURCE_LABEL_KEY = "omnigent.side_chat.source_id"
 
+# Items a generic side chat copies from its parent get ids starting with the side
+# chat's own first 12 id characters, so any device can hide exactly that history.
+# A side chat's own items get random ids, which match by chance once in 16**12.
+SIDE_CHAT_COPY_ID_PREFIX_LEN = 12
+
 # Single-user / no-auth sentinel for the per-user pin key suffix, mirroring the
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
@@ -569,6 +574,7 @@ class ConversationStore(ABC):
         cost_control_mode_override: str | None = None,
         subagent_routing_override: str | None = None,
         harness_override: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """
         Create a new conversation. Generates a unique
@@ -631,6 +637,9 @@ class ConversationStore(ABC):
         :param cost_control_mode_override: Optional per-session cost-control mode.
         :param subagent_routing_override: Optional per-session sub-agent routing mode.
         :param harness_override: Optional per-session harness override.
+        :param side_chat_parent_id: The session whose Workspace rail lists this
+            conversation as a side chat, e.g. ``"conv_abc123"``; ``None`` for
+            anything else.
         :returns: The newly created :class:`Conversation`.
         :raises NameAlreadyExistsError: If
             ``parent_conversation_id`` is not ``None`` and a
@@ -790,6 +799,27 @@ class ConversationStore(ABC):
 
         Pass the last row's (creation time, ID) as *after* to continue via
         the workspace/parent/creation-time/ID index.
+        """
+        ...
+
+    @abstractmethod
+    def list_side_chat_ids(
+        self,
+        parent_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 100,
+    ) -> list[str]:
+        """Return the ids of *parent_id*'s side chats in id order.
+
+        Reads at most *limit* index entries. There is no per-row access check:
+        only the owner of the parent's root can start side chats there, and
+        the routes list them to that owner alone.
+
+        :param parent_id: Session whose rail lists the side chats, e.g. ``"conv_abc123"``.
+        :param after: Cursor: the previous page's last id.
+        :param limit: Maximum ids to return.
+        :returns: Side-chat ids, e.g. ``["conv_side1"]``.
         """
         ...
 
@@ -2198,9 +2228,14 @@ class ConversationStore(ABC):
         resume_source_native_session: bool = True,
         presentation_labels: dict[str, str] | None = None,
         up_to_response_id: str | None = None,
+        before_item_id: str | None = None,
+        copy_items: bool = True,
+        continue_source: bool = False,
         project_id: str | None = None,
         file_id_map: Mapping[str, str] | None = None,
         created_by: str | None = None,
+        conversation_id: str | None = None,
+        side_chat_parent_id: str | None = None,
     ) -> Conversation:
         """
         Deep-copy a conversation and its items into a new conversation.
@@ -2301,6 +2336,19 @@ class ConversationStore(ABC):
             transcript; when the response is the source's last one, the
             copy is equivalent to a full fork and the directive is kept.
             ``None`` (default) copies the full history.
+        :param before_item_id: When set, copy only the items positioned
+            before this item, e.g. ``"msg_abc123"`` — the item and
+            everything after it are dropped (the first item keeps nothing,
+            as ``/clear`` does). Always a truncation, so the external-session fork
+            directive is dropped. Mutually exclusive with
+            ``up_to_response_id``.
+        :param copy_items: ``False`` copies no items at all, whatever the
+            source holds when the fork commits, e.g. for ``/clear``. A
+            truncation; exclusive with both cutoffs.
+        :param continue_source: Also copy the source's host, workspace and
+            branch (in the same write that creates the fork), its routing
+            switches and its workspace-file sharing, for a same-owner
+            continuation of the source's work.
         :param project_id: First-class project to file the fork into
             (``metadata.project_id``), or ``None`` (default) to leave it
             unfiled. The caller resolves whether the fork keeps the
@@ -2315,11 +2363,21 @@ class ConversationStore(ABC):
         :param created_by: Identity of the forking user, recorded on the
             cloned session-scoped agent so its code can only be mutated by
             the owner. ``None`` in single-user mode or when no clone is made.
+        :param conversation_id: Id for the fork, chosen by a caller that must
+            be able to remove it even if this call is interrupted; ``None``
+            generates one.
+        :param side_chat_parent_id: The session whose Workspace rail lists the
+            fork as a side chat, e.g. ``"conv_abc123"``; written with the fork's
+            metadata. Its copied items get ids starting with the fork's first
+            ``SIDE_CHAT_COPY_ID_PREFIX_LEN`` id characters, so the side chat can
+            hide them.
         :returns: The newly created :class:`Conversation`.
         :raises LookupError: If no conversation with
             *source_conversation_id* exists.
         :raises ValueError: If *up_to_response_id* is set but no item in
-            the source conversation has that ``response_id``.
+            the source conversation has that ``response_id``, if
+            *before_item_id* names no item in the source conversation, or
+            if both are set.
         """
         ...
 

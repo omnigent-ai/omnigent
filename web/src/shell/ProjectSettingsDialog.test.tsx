@@ -487,6 +487,18 @@ describe("ProjectSettingsDialog", () => {
     expect(updateMock).not.toHaveBeenCalled();
   });
 
+  it("shows no tooltip on a healthy picker that no shortcut opens", async () => {
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
+    renderDialog();
+    fireEvent.focus(await screen.findByTestId("new-chat-landing-agent-select"));
+    // Give a tooltip time to open, then check none did.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    expect(screen.queryByTestId("new-chat-landing-agent-tooltip")).toBeNull();
+    expect(screen.queryByText("Open model picker")).toBeNull();
+  });
+
   it("offers the same agent set as the composer picker (hidden agents excluded)", async () => {
     // Filter parity with the new-session composer (selectableSessionAgents):
     // if this picker offered an agent the composer hides, a project could pin
