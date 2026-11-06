@@ -12,8 +12,10 @@ import pytest
 import omnigent.inner.codex_native_executor as native_executor
 from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
+    SentSteer,
     read_bridge_state,
     read_sent_steers,
+    record_sent_steer,
 )
 from omnigent.native.input_diagnostics import input_delivery_scope
 from tests.harnesses.codex_native.session._support import (
@@ -538,6 +540,9 @@ def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> No
 
 
 _STEER_CLIENT_ID = "c" * 32
+_FOLLOW_UP_CLIENT_ID = "d" * 32
+_RECOVERED_STEER = f"user: also update the docs [delivery {_STEER_CLIENT_ID}]"
+_TRANSCRIPT_READ = "codex: thread/read"
 
 
 def _turn_item_event(
@@ -561,20 +566,28 @@ def _native_user_message(item_id: str, text: str, client_id: str) -> dict[str, A
 
 
 def _transcript(posted: list[dict[str, Any]]) -> list[str]:
-    """Summarize posted messages and status edges, e.g. ``"user: hi"``."""
+    """Summarize posted messages, status edges and app-server reads, e.g. ``"user: hi"``."""
     summary = []
     for payload in posted:
         data = payload["data"]
         if payload["type"] == "external_conversation_item":
             item_data = data["item_data"]
-            summary.append(f"{item_data['role']}: {item_data['content'][0]['text']}")
+            line = f"{item_data['role']}: {item_data['content'][0]['text']}"
+            if "delivery_attempt_id" in data:
+                line += f" [delivery {data['delivery_attempt_id']}]"
+            summary.append(line)
         elif payload["type"] == "external_session_status":
             summary.append(f"status: {data['status']}")
+        elif payload["type"] == "codex_request":
+            summary.append(f"codex: {data['method']}")
     return summary
 
 
 async def _accept_web_steer(
-    bridge_dir: Path, text: str, before_reply: Callable[[], Awaitable[None]] | None = None
+    bridge_dir: Path,
+    text: str,
+    before_reply: Callable[[], Awaitable[None]] | None = None,
+    client_id: str = _STEER_CLIENT_ID,
 ) -> None:
     """Steer the active turn through the executor, as a web send does."""
     state = read_bridge_state(bridge_dir)
@@ -589,16 +602,14 @@ async def _accept_web_steer(
             return reply
 
         steer_client.request = request  # type: ignore[method-assign]
-    with input_delivery_scope({"delivery_attempt_id": _STEER_CLIENT_ID}):
+    with input_delivery_scope({"delivery_attempt_id": client_id}):
         await native_executor._steer_codex_turn(
             steer_client,  # type: ignore[arg-type]
             bridge_dir=bridge_dir,
             state=state,
             input_items=[{"type": "text", "text": text}],
         )
-    assert [params["clientUserMessageId"] for _, params in steer_client.requests] == [
-        _STEER_CLIENT_ID
-    ]
+    assert [params["clientUserMessageId"] for _, params in steer_client.requests] == [client_id]
 
 
 def _run_steered_turn(
@@ -610,9 +621,11 @@ def _run_steered_turn(
     next_turn_replies: int = 0,
     steer_in_transcript: bool = True,
     late_steer_reply: bool = False,
-) -> tuple[list[str], list[str]]:
+    live_follow_up_steer: bool = False,
+    during_read: Callable[[], None] | None = None,
+) -> list[str]:
     """
-    Run one turn that a web send steers, returning posts and forwarder RPCs.
+    Run one turn that a web send steers, returning posts and forwarder reads in order.
 
     :param bridge_dir: Native Codex bridge directory.
     :param live_steer_copy: Whether Codex's live ``userMessage`` for the steer arrives.
@@ -621,14 +634,20 @@ def _run_steered_turn(
     :param next_turn_replies: Assistant messages in a following turn, if one runs.
     :param steer_in_transcript: Whether Codex's transcript holds the steer.
     :param late_steer_reply: Whether the turn ends before the steer's reply arrives.
-    :returns: Transcript summary and the forwarder's app-server methods.
+    :param live_follow_up_steer: Whether a second web steer, seen live, follows the first.
+    :param during_read: Called while each transcript read is in flight.
+    :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
     first = _native_user_message("item_first", "fix the bug", "client-first")
     steer = _native_user_message("item_steer", "also update the docs", _STEER_CLIENT_ID)
+    follow_up = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
     next_prompt = _native_user_message("item_next", "run the tests", "client-next")
+    steered_items = [first, steer] if steer_in_transcript else [first]
+    if live_follow_up_steer:
+        steered_items.append(follow_up)
     turns = [
-        {"id": "turn_123", "items": [first, steer] if steer_in_transcript else [first]},
+        {"id": "turn_123", "items": steered_items},
         {"id": "turn_456", "items": [next_prompt]},
     ]
     fake_client = _FakeCodexAppServerClient(
@@ -639,6 +658,15 @@ def _run_steered_turn(
         codex_client=fake_client,  # type: ignore[arg-type]
     )
     posted: list[dict[str, Any]] = []
+    read_thread = fake_client.request
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        posted.append({"type": "codex_request", "data": {"method": method}})
+        if during_read is not None:
+            during_read()
+        return await read_thread(method, params)
+
+    fake_client.request = request  # type: ignore[method-assign]
 
     async def run() -> None:
         async with _recording_forwarder_client(posted) as client:
@@ -662,6 +690,11 @@ def _run_steered_turn(
             await _accept_web_steer(bridge_dir, "also update the docs")
             if live_steer_copy:
                 await deliver(_turn_item_event("item/completed", steer))
+            if live_follow_up_steer:
+                await _accept_web_steer(
+                    bridge_dir, "and the changelog", client_id=_FOLLOW_UP_CLIENT_ID
+                )
+                await deliver(_turn_item_event("item/completed", follow_up))
             for index in range(1, replies_after_steer + 1):
                 agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
                 await deliver(_turn_item_event("item/started", agent_item))
@@ -680,7 +713,7 @@ def _run_steered_turn(
             await deliver(_completed_event("turn_456", thread_id="thread_123"))
 
     asyncio.run(run())
-    return _transcript(posted), [method for method, _ in fake_client.requests]
+    return _transcript(posted)
 
 
 @pytest.mark.parametrize(
@@ -691,13 +724,23 @@ def _run_steered_turn(
             [
                 "user: fix the bug",
                 "assistant: reply 1",
-                "user: also update the docs",
+                _TRANSCRIPT_READ,
+                _RECOVERED_STEER,
                 "assistant: reply 2",
                 "assistant: reply 3",
                 "status: idle",
             ],
         ),
-        (0, ["user: fix the bug", "user: also update the docs", "status: idle"]),
+        (
+            1,
+            [
+                "user: fix the bug",
+                "assistant: reply 1",
+                _TRANSCRIPT_READ,
+                _RECOVERED_STEER,
+                "status: idle",
+            ],
+        ),
     ],
     ids=["later_model_step", "turn_end"],
 )
@@ -710,24 +753,43 @@ def test_forwarder_mirrors_accepted_steer_whose_live_message_was_missed(
     The server settles a steered web input only once its native message is
     mirrored. Codex records a steer at its next model step, so the forwarder
     reads the transcript at the second reply after the steer, or at turn end.
+    The mirror names the delivery it carried, so the server settles only that input.
     """
-    transcript, requests = _run_steered_turn(
+    transcript = _run_steered_turn(
         tmp_path, live_steer_copy=False, replies_after_steer=replies_after_steer
     )
 
     assert transcript == expected_transcript
-    assert requests == ["thread/read"]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
 def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Path) -> None:
     """A steer Codex consumed is mirrored at turn end even before its RPC reply arrives."""
-    transcript, requests = _run_steered_turn(
+    transcript = _run_steered_turn(
         tmp_path, live_steer_copy=False, replies_after_steer=0, late_steer_reply=True
     )
 
-    assert transcript == ["user: fix the bug", "user: also update the docs", "status: idle"]
-    assert requests == ["thread/read"]
+    assert transcript == ["user: fix the bug", _TRANSCRIPT_READ, _RECOVERED_STEER, "status: idle"]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_mirrors_missed_steer_ahead_of_later_steer(tmp_path: Path) -> None:
+    """
+    A missed steer is mirrored before a later steer seen live, in transcript order.
+
+    The server reports inputs queued ahead of a mirrored message as undelivered.
+    """
+    transcript = _run_steered_turn(
+        tmp_path, live_steer_copy=False, replies_after_steer=0, live_follow_up_steer=True
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        _TRANSCRIPT_READ,
+        _RECOVERED_STEER,
+        "user: and the changelog",
+        "status: idle",
+    ]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
@@ -737,34 +799,66 @@ def test_forwarder_backs_off_reads_for_steer_missing_from_transcript(tmp_path: P
 
     Reads run at the second, fourth and eighth replies after the steer and at turn end.
     """
-    transcript, requests = _run_steered_turn(
+    transcript = _run_steered_turn(
         tmp_path, live_steer_copy=False, replies_after_steer=8, steer_in_transcript=False
     )
 
+    replies = [f"assistant: reply {index}" for index in range(1, 9)]
     assert transcript == [
         "user: fix the bug",
-        *(f"assistant: reply {index}" for index in range(1, 9)),
+        replies[0],
+        _TRANSCRIPT_READ,
+        *replies[1:3],
+        _TRANSCRIPT_READ,
+        *replies[3:7],
+        _TRANSCRIPT_READ,
+        replies[7],
+        _TRANSCRIPT_READ,
         "status: idle",
     ]
-    assert requests == ["thread/read"] * 4
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_keeps_steer_recorded_under_new_turn_during_read(tmp_path: Path) -> None:
+    """A steer the executor re-records under a later turn while its ended turn is read stays."""
+
+    def record_under_next_turn() -> None:
+        record_sent_steer(
+            tmp_path,
+            thread_id="thread_123",
+            turn_id="turn_456",
+            client_message_id=_STEER_CLIENT_ID,
+        )
+
+    transcript = _run_steered_turn(
+        tmp_path,
+        live_steer_copy=False,
+        replies_after_steer=0,
+        steer_in_transcript=False,
+        during_read=record_under_next_turn,
+    )
+
+    assert transcript == ["user: fix the bug", _TRANSCRIPT_READ, "status: idle"]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == [
+        SentSteer("turn_456", _STEER_CLIENT_ID)
+    ]
 
 
 @pytest.mark.parametrize(
     ("steer_in_transcript", "expected_steer"),
-    [(True, ["user: also update the docs"]), (False, [])],
+    [(True, [_RECOVERED_STEER]), (False, [])],
     ids=["recorded", "never_recorded"],
 )
 def test_forwarder_retries_steer_whose_turn_end_read_failed(
     tmp_path: Path, steer_in_transcript: bool, expected_steer: list[str]
 ) -> None:
     """
-    A steer whose ended turn could not be read is retried on the next turn's read.
+    A steer whose ended turn could not be read is retried before the next user message.
 
-    The retry settles it, so later replies read nothing: a steer found is mirrored,
-    and one absent from its ended turn was never consumed.
+    The retry settles it, so later replies read nothing: a steer found is mirrored
+    ahead of that message, and one absent from its ended turn was never consumed.
     """
-    transcript, requests = _run_steered_turn(
+    transcript = _run_steered_turn(
         tmp_path,
         live_steer_copy=False,
         replies_after_steer=0,
@@ -775,23 +869,24 @@ def test_forwarder_retries_steer_whose_turn_end_read_failed(
 
     assert transcript == [
         "user: fix the bug",
+        _TRANSCRIPT_READ,
         "status: idle",
         "status: running",
+        _TRANSCRIPT_READ,
+        *expected_steer,
         "user: run the tests",
         "assistant: next 1",
-        *expected_steer,
         "assistant: next 2",
         "assistant: next 3",
         "assistant: next 4",
         "status: idle",
     ]
-    assert requests == ["thread/read", "thread/read"]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
 def test_forwarder_does_not_read_transcript_for_steer_seen_live(tmp_path: Path) -> None:
     """A steer whose live ``userMessage`` arrived is posted once, without a transcript read."""
-    transcript, requests = _run_steered_turn(tmp_path, live_steer_copy=True, replies_after_steer=3)
+    transcript = _run_steered_turn(tmp_path, live_steer_copy=True, replies_after_steer=3)
 
     assert transcript == [
         "user: fix the bug",
@@ -801,7 +896,6 @@ def test_forwarder_does_not_read_transcript_for_steer_seen_live(tmp_path: Path) 
         "assistant: reply 3",
         "status: idle",
     ]
-    assert requests == []
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 

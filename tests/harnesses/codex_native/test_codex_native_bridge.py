@@ -1169,7 +1169,10 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
         bridge_dir, thread_id="thread_new", turn_id="turn_2", client_message_id="steer_3"
     )
     settle_sent_steers(
-        bridge_dir, thread_id="thread_new", client_message_ids=["steer_1"], ended_turn_id="turn_1"
+        bridge_dir,
+        thread_id="thread_new",
+        steers=[SentSteer("turn_1", "steer_1")],
+        ended_turn_id="turn_1",
     )
 
     assert read_sent_steers(bridge_dir, thread_id="thread_old") == []
@@ -1179,8 +1182,15 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
     ]
 
     settle_sent_steers(
-        bridge_dir, thread_id="thread_new", client_message_ids=["steer_2", "steer_3"]
+        bridge_dir,
+        thread_id="thread_new",
+        steers=[SentSteer("turn_2", "steer_2"), SentSteer("turn_2", "steer_3")],
     )
+    assert read_sent_steers(bridge_dir, thread_id="thread_new") == [
+        SentSteer("turn_1", "steer_2", turn_ended=True),
+    ]
+
+    settle_sent_steers(bridge_dir, thread_id="thread_new", steers=[SentSteer("turn_1", "steer_2")])
     assert read_sent_steers(bridge_dir, thread_id="thread_new") == []
     assert not (bridge_dir / "sent_steers.json").exists()
 

@@ -1411,29 +1411,32 @@ def settle_sent_steers(
     bridge_dir: Path,
     *,
     thread_id: str,
-    client_message_ids: Collection[str],
+    steers: Collection[SentSteer],
     ended_turn_id: str | None = None,
 ) -> None:
     """
     Drop settled steers and mark an ended turn's other steers for retry (best-effort).
 
+    A steer re-recorded under another turn since ``steers`` was read is kept.
+
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
-    :param client_message_ids: Steers mirrored, rejected, or absent from their ended turn.
+    :param steers: Steers mirrored, rejected, or absent from their ended turn.
     :param ended_turn_id: Turn that just ended, e.g. ``"turn_abc"``.
     :returns: None.
     """
+    settled = {(steer.turn_id, steer.client_message_id) for steer in steers}
     try:
         with _bridge_state_lock(bridge_dir, _SENT_STEERS_LOCK_FILE):
-            recorded_thread_id, steers = _load_sent_steers(bridge_dir)
+            recorded_thread_id, recorded = _load_sent_steers(bridge_dir)
             if recorded_thread_id != thread_id:
                 return
             remaining = [
                 replace(steer, turn_ended=True) if steer.turn_id == ended_turn_id else steer
-                for steer in steers
-                if steer.client_message_id not in client_message_ids
+                for steer in recorded
+                if (steer.turn_id, steer.client_message_id) not in settled
             ]
-            if remaining != steers:
+            if remaining != recorded:
                 _write_sent_steers(bridge_dir, thread_id, remaining)
     except OSError:
         _logger.warning("Could not settle sent Codex steers in %s", bridge_dir, exc_info=True)

@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
     CodexNativeBridgeState,
     CodexStartupFailure,
+    SentSteer,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     clear_pending_shell_command,
@@ -413,13 +414,18 @@ async def _native_delivery_request_once(
     else:
         client_message_id = None
     steer_client_id = client_message_id if method == "turn/steer" else None
-    if steer_client_id is not None and requested_turn_id is not None:
+    sent_steer = (
+        SentSteer(requested_turn_id, steer_client_id)
+        if steer_client_id is not None and requested_turn_id is not None
+        else None
+    )
+    if sent_steer is not None:
         # Recorded before sending so a late reply cannot miss the forwarder's turn-end recovery.
         record_sent_steer(
             bridge_dir,
             thread_id=state.thread_id,
-            turn_id=requested_turn_id,
-            client_message_id=steer_client_id,
+            turn_id=sent_steer.turn_id,
+            client_message_id=sent_steer.client_message_id,
         )
     log_input_event(
         _logger,
@@ -459,10 +465,8 @@ async def _native_delivery_request_once(
             exception_type=type(exc).__name__,
             rpc_error_code=exc.code if isinstance(exc, CodexAppServerResponseError) else None,
         )
-        if steer_client_id is not None and isinstance(exc, CodexAppServerResponseError):
-            settle_sent_steers(
-                bridge_dir, thread_id=state.thread_id, client_message_ids=[steer_client_id]
-            )
+        if sent_steer is not None and isinstance(exc, CodexAppServerResponseError):
+            settle_sent_steers(bridge_dir, thread_id=state.thread_id, steers=[sent_steer])
         if isinstance(exc, (OSError, WebSocketException)):
             if isinstance(client_message_id, str):
                 confirmed_turn = await _read_native_delivery_receipt(

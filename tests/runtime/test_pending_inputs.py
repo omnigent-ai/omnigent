@@ -354,6 +354,34 @@ def test_resolve_matching_text_leaves_entries_when_no_text_matches() -> None:
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [first]
 
 
+def test_resolve_delivery_attempt_drains_only_its_own_entry() -> None:
+    """A mirror naming its delivery drains that entry alone; a miss drains nothing."""
+    older = pending_inputs.record("conv_a", [_text_block("first")])
+    steered = pending_inputs.record("conv_a", [_text_block("second")])
+    delivery_attempt_id = pending_inputs.delivery_attributes_for("conv_a", steered)[
+        "delivery_attempt_id"
+    ]
+    assert isinstance(delivery_attempt_id, str)
+
+    assert pending_inputs.resolve_delivery_attempt("conv_a", "f" * 32).matched is None
+    held = pending_inputs.resolve_delivery_attempt("conv_a", delivery_attempt_id, hold=True)
+
+    assert held.matched is not None and held.matched.pending_id == steered
+    assert held.skipped == [] and held.uncertain == []
+    assert held.match_method == "delivery_attempt_id"
+    assert pending_inputs.resolve_delivery_attempt("conv_a", delivery_attempt_id).matched is None
+    pending_inputs.release("conv_a", held.matched)
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [older]
+
+    older_attempt_id = pending_inputs.delivery_attributes_for("conv_a", older)[
+        "delivery_attempt_id"
+    ]
+    assert isinstance(older_attempt_id, str)
+    drained = pending_inputs.resolve_delivery_attempt("conv_a", older_attempt_id)
+    assert drained.matched is not None and drained.matched.pending_id == older
+    assert not pending_inputs.has_pending("conv_a")
+
+
 def test_resolve_matching_text_does_not_match_on_unanchored_suffix() -> None:
     """A short pending entry must not be matched by an unrelated prompt that
     merely ends with its text (e.g. queued "ok" vs. an accepted "...still ok"),

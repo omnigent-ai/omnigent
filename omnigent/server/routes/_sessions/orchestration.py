@@ -3148,16 +3148,26 @@ async def _persist_external_conversation_item_unlocked(
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
         # Skipped older entries are persisted as undelivered. A miss falls back
-        # to the oldest entry, except for Kiro, whose prompt text is exact.
+        # to the oldest entry, except for Kiro, whose prompt text is exact, and
+        # a message naming its delivery, which settles only that entry.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)
-        matched = pending_inputs.resolve_matching_text(
-            session_id,
-            text,
-            hold=True,
-            claude_commands=native_agent is not None and native_agent.harness == "claude-native",
-        )
+        delivery_attempt_id = body.data.get("delivery_attempt_id")
+        if not isinstance(delivery_attempt_id, str) or not delivery_attempt_id:
+            delivery_attempt_id = None
+        if delivery_attempt_id is not None:
+            matched = pending_inputs.resolve_delivery_attempt(
+                session_id, delivery_attempt_id, hold=True
+            )
+        else:
+            matched = pending_inputs.resolve_matching_text(
+                session_id,
+                text,
+                hold=True,
+                claude_commands=native_agent is not None
+                and native_agent.harness == "claude-native",
+            )
         drained = matched.matched
         match_method = matched.match_method
         if agent_message_candidate:
@@ -3177,7 +3187,12 @@ async def _persist_external_conversation_item_unlocked(
             # message would brand everything queued in between undelivered.
             # Leave the older entries queued for a later mirror instead.
             held_older = [*matched.skipped, *matched.uncertain]
-        if drained is None and not agent_message_candidate and not _is_kiro_native_session(conv):
+        if (
+            drained is None
+            and delivery_attempt_id is None
+            and not agent_message_candidate
+            and not _is_kiro_native_session(conv)
+        ):
             drained = pending_inputs.resolve_oldest(session_id, hold=True)
             if drained is not None:
                 match_method = "fifo_fallback"

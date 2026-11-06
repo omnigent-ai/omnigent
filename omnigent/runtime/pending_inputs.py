@@ -941,6 +941,42 @@ def resolve_matching_text(
         )
 
 
+def resolve_delivery_attempt(
+    conversation_id: str, delivery_attempt_id: str, *, hold: bool = False
+) -> MatchedDrain:
+    """
+    Drain only the entry whose native delivery carried ``delivery_attempt_id``.
+
+    A harness that echoes the delivery id back names its own entry, so no other
+    entry is a candidate: older entries stay queued and a miss drains nothing.
+
+    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param delivery_attempt_id: Delivery id the harness echoed, e.g.
+        ``"0f1e2d3c4b5a69788796a5b4c3d2e1f0"``.
+    :param hold: Keep the entry in place, marked held, as in
+        :func:`resolve_matching_text`.
+    :returns: The matched entry with nothing skipped, or no match.
+    """
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id, {})
+        for pending_id, entry in entries.items():
+            if entry.held or entry.delivery_attempt_id != delivery_attempt_id:
+                continue
+            if hold:
+                entry.held = True
+            else:
+                del entries[pending_id]
+                if not entries:
+                    _pending.pop(conversation_id, None)
+            return MatchedDrain(
+                matched=_drained_input(entry),
+                skipped=[],
+                match_method="delivery_attempt_id",
+            )
+    return MatchedDrain(matched=None, skipped=[])
+
+
 def has_pending(conversation_id: str) -> bool:
     """
     Report whether a session still holds an un-consumed message.

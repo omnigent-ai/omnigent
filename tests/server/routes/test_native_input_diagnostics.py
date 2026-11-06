@@ -342,3 +342,116 @@ async def test_uncertain_or_interrupted_input_does_not_report_missing_message(
     assert all(item.type != "error" for item in saved.values())
     assert "item_id" not in attrs and "error_item_id" not in attrs
     assert pending_inputs.snapshot_for(conv.id) == []
+
+
+def _mirrored_user_message(text: str, source_id: str, **data: object) -> SessionEventInput:
+    """Build a forwarder-mirrored native user message, e.g. with ``delivery_attempt_id``."""
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "response_id": "resp_native",
+            "source_id": source_id,
+            **data,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_message_naming_its_delivery_settles_only_that_input(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
+    older = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "fix the bug"}],
+        stable_id="a" * 32,
+        background_titles_enabled=False,
+    )
+    steered = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "also update the docs"}],
+        stable_id="b" * 32,
+        background_titles_enabled=False,
+    )
+    delivery_attempt_id = pending_inputs.delivery_attributes_for(conv.id, steered)[
+        "delivery_attempt_id"
+    ]
+    caplog.set_level(logging.INFO)
+
+    item_id = await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        _mirrored_user_message(
+            "also update the docs", "codex:steer:0", delivery_attempt_id=delivery_attempt_id
+        ),
+        store,
+    )
+
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"
+    ]
+    assert record.attributes["pending_id"] == steered
+    assert record.attributes["match_method"] == "delivery_attempt_id"
+    assert record.attributes["item_id"] == item_id
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [older]
+    pending_inputs.resolve(conv.id, older)
+
+
+@pytest.mark.asyncio
+async def test_message_naming_a_settled_delivery_leaves_newer_input_queued(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
+    missed = pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "also update the docs"}],
+        stable_id="a" * 32,
+        background_titles_enabled=False,
+    )
+    delivery_attempt_id = pending_inputs.delivery_attributes_for(conv.id, missed)[
+        "delivery_attempt_id"
+    ]
+    pending_inputs.record(
+        conv.id,
+        [{"type": "input_text", "text": "and the changelog"}],
+        stable_id="b" * 32,
+        background_titles_enabled=False,
+    )
+    # The follow-up's mirror reports the earlier, missed input undelivered.
+    await _persist_external_conversation_item(
+        conv.id, conv, _mirrored_user_message("and the changelog", "codex:follow-up:0"), store
+    )
+    queued = pending_inputs.record(
+        conv.id,
+        [
+            {"type": "input_file", "file_id": "file_log", "filename": "build.log"},
+            {"type": "input_text", "text": "see this log"},
+        ],
+        stable_id="c" * 32,
+        background_titles_enabled=False,
+    )
+    caplog.set_level(logging.INFO)
+
+    recovered_id = await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        _mirrored_user_message(
+            "also update the docs", "codex:recovered:0", delivery_attempt_id=delivery_attempt_id
+        ),
+        store,
+    )
+
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [queued]
+    assert not [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "native_input_settled"
+        and r.attributes.get("pending_id") == queued
+    ]
+    recovered = {item.id: item for item in store.list_items(conv.id).data}[recovered_id]
+    assert recovered.data.content == [{"type": "input_text", "text": "also update the docs"}]
+    pending_inputs.resolve(conv.id, queued)

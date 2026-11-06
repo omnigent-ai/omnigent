@@ -6445,6 +6445,17 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
+        if bridge_dir is not None:
+            await _mirror_missed_steers(
+                client,
+                session_id,
+                forwarder_state,
+                bridge_dir=bridge_dir,
+                thread_id=_thread_id_from_params(params),
+                turn_id=_turn_id_from_payload(params),
+                turn_ended=False,
+                before=item,
+            )
         posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
@@ -7406,33 +7417,33 @@ def _find_turn_user_message(response: CodexMessage, turn_id: str) -> _JsonObject
     :returns: The ``userMessage`` item dict, or ``None`` when the turn or
         its user message is absent.
     """
-    return next(iter(_turn_user_messages(response, turn_id)), None)
+    messages = _thread_user_messages(response)
+    return next((item for item_turn_id, item in messages if item_turn_id == turn_id), None)
 
 
-def _turn_user_messages(response: CodexMessage, turn_id: str) -> list[_JsonObject]:
+def _thread_user_messages(response: CodexMessage) -> list[tuple[str, _JsonObject]]:
     """
-    List a turn's ``userMessage`` items in a ``thread/resume`` or ``thread/read`` response.
+    List the ``userMessage`` items in a ``thread/resume`` or ``thread/read`` response.
 
     :param response: Codex response envelope whose result holds the thread.
-    :param turn_id: Codex turn id, e.g. ``"turn_123"``.
-    :returns: The turn's ``userMessage`` items in transcript order.
+    :returns: ``(turn_id, item)`` pairs in transcript order.
     """
     result = response.get("result")
     thread = result.get("thread") if isinstance(result, dict) else None
     turns = thread.get("turns") if isinstance(thread, dict) else None
     if not isinstance(turns, list):
         return []
-    messages: list[_JsonObject] = []
+    messages: list[tuple[str, _JsonObject]] = []
     for turn in turns:
-        if not isinstance(turn, dict) or _turn_id_from_payload(turn) != turn_id:
+        turn_id = _turn_id_from_payload(turn) if isinstance(turn, dict) else None
+        items = turn.get("items") if isinstance(turn, dict) else None
+        if not turn_id or not isinstance(items, list):
             continue
-        items = turn.get("items")
-        if isinstance(items, list):
-            messages.extend(
-                item
-                for item in items
-                if isinstance(item, dict) and item.get("type") == "userMessage"
-            )
+        messages.extend(
+            (turn_id, item)
+            for item in items
+            if isinstance(item, dict) and item.get("type") == "userMessage"
+        )
     return messages
 
 
@@ -7445,13 +7456,16 @@ async def _mirror_missed_steers(
     thread_id: str | None,
     turn_id: str | None,
     turn_ended: bool,
+    before: _JsonObject | None = None,
 ) -> None:
     """
     Mirror sent steers whose live ``userMessage`` notification never arrived.
 
     The server settles a steered input only when its native message is mirrored,
     so this finds the executor's recorded client ids in the native transcript.
-    A steer whose ended turn could not be read is retried on a later read.
+    A steer whose ended turn could not be read is retried on a later read. The
+    server reports inputs queued ahead of a mirrored user message as undelivered,
+    so steers Codex recorded before ``before`` are mirrored ahead of it.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7460,6 +7474,7 @@ async def _mirror_missed_steers(
     :param thread_id: Parent Codex thread id, e.g. ``"thread_abc"``.
     :param turn_id: Codex turn id, e.g. ``"turn_abc"``.
     :param turn_ended: Whether the turn finished, forcing a last read.
+    :param before: User message about to be mirrored, forcing a read.
     :returns: None.
     """
     if forwarder_state is None or not thread_id or not turn_id:
@@ -7476,13 +7491,15 @@ async def _mirror_missed_steers(
     mirrored = forwarder_state.mirrored_user_client_ids
     missed = [steer for steer in steers if (thread_id, steer.client_message_id) not in mirrored]
     transcript_read = False
-    if missed and (turn_ended or forwarder_state.steer_recovery_due(turn_id)):
+    if missed and (
+        turn_ended or before is not None or forwarder_state.steer_recovery_due(turn_id)
+    ):
         transcript_read = await _post_missed_steers(
-            client, session_id, forwarder_state, thread_id=thread_id, steers=missed
+            client, session_id, forwarder_state, thread_id=thread_id, steers=missed, before=before
         )
     # A steer absent from its ended turn's transcript was never consumed.
     settled = [
-        steer.client_message_id
+        steer
         for steer in steers
         if (thread_id, steer.client_message_id) in mirrored
         or (transcript_read and (turn_ended or steer.turn_ended))
@@ -7491,7 +7508,7 @@ async def _mirror_missed_steers(
         settle_sent_steers(
             bridge_dir,
             thread_id=thread_id,
-            client_message_ids=settled,
+            steers=settled,
             ended_turn_id=turn_id if turn_ended else None,
         )
 
@@ -7503,15 +7520,19 @@ async def _post_missed_steers(
     *,
     thread_id: str,
     steers: list[SentSteer],
+    before: _JsonObject | None = None,
 ) -> bool:
     """
     Post the native user messages of steers not yet mirrored.
+
+    Each post names the delivery it carried, so the server settles only that input.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param forwarder_state: Forwarder state holding the app-server client.
     :param thread_id: Parent Codex thread id, e.g. ``"thread_abc"``.
     :param steers: Recorded steers not yet mirrored.
+    :param before: User message whose transcript position ends the search.
     :returns: Whether the native transcript was read.
     """
     codex_client = forwarder_state.codex_client
@@ -7529,23 +7550,38 @@ async def _post_missed_steers(
             "Codex forwarder could not read steered input: thread=%s", thread_id, exc_info=True
         )
         return False
-    for turn_id in dict.fromkeys(steer.turn_id for steer in steers):
-        client_ids = {steer.client_message_id for steer in steers if steer.turn_id == turn_id}
-        for item in _turn_user_messages(response, turn_id):
-            client_id = item.get("clientId")
-            if not isinstance(client_id, str) or client_id not in client_ids:
-                continue
-            item_params: _JsonObject = {"threadId": thread_id, "turnId": turn_id, "item": item}
-            source_id = _claim_completed_item(item_params, item, forwarder_state)
-            if source_id is not None and await _post_user_message(
-                client, session_id, item_params, item, source_id=source_id
-            ):
-                _logger.info(
-                    "Codex forwarder recovered steered user message: thread=%s turn=%s",
-                    thread_id,
-                    turn_id,
-                )
+    client_ids = {steer.client_message_id for steer in steers}
+    for turn_id, item in _thread_user_messages(response):
+        if before is not None and _is_same_user_message(item, before):
+            break
+        client_id = item.get("clientId")
+        if not isinstance(client_id, str) or client_id not in client_ids:
+            continue
+        item_params: _JsonObject = {"threadId": thread_id, "turnId": turn_id, "item": item}
+        source_id = _claim_completed_item(item_params, item, forwarder_state)
+        if source_id is not None and await _post_user_message(
+            client,
+            session_id,
+            item_params,
+            item,
+            source_id=source_id,
+            delivery_attempt_id=client_id,
+        ):
+            _logger.info(
+                "Codex forwarder recovered steered user message: thread=%s turn=%s",
+                thread_id,
+                turn_id,
+            )
     return True
+
+
+def _is_same_user_message(item: _JsonObject, other: _JsonObject) -> bool:
+    """Whether two ``userMessage`` items share a native client or item id."""
+    for key in ("clientId", "id"):
+        value = other.get(key)
+        if isinstance(value, str) and value and item.get(key) == value:
+            return True
+    return False
 
 
 async def _post_user_message(
@@ -7555,6 +7591,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    delivery_attempt_id: str | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -7564,6 +7601,8 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
+    :param delivery_attempt_id: Server delivery id the message carried, so the
+        server settles only that queued input.
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
@@ -7598,6 +7637,7 @@ async def _post_user_message(
         item_data=item_data,
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
+        delivery_attempt_id=delivery_attempt_id,
     )
 
 
@@ -8229,6 +8269,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    delivery_attempt_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8244,6 +8285,7 @@ async def _post_external_item(
     :param response_id: Response id for the mirrored Codex turn.
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
+    :param delivery_attempt_id: Server delivery id a user message carried.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -8255,6 +8297,8 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if delivery_attempt_id is not None:
+        data["delivery_attempt_id"] = delivery_attempt_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

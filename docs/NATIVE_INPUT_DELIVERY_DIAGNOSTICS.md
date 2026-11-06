@@ -74,7 +74,8 @@ emit these input-delivery events.
 
 `native_input_settled.outcome` distinguishes:
 
-- `native_transcript_matched`: the pending input matched the mirrored text.
+- `native_transcript_matched`: the pending input matched the mirrored text, or
+  the delivery the mirror named.
 - `native_transcript_fifo_attributed`: no text match was found; the existing
   FIFO fallback attributed the mirror to the oldest input. This is uncertain.
 - `skipped_without_native_record`: an older unmatched input was saved with a
@@ -100,9 +101,12 @@ Skipped inputs also carry a bounded `cause_class`:
 `completed_without_native_record`; it never contains prompt or terminal text.
 
 `match_method` is `normalized_text`, `attachment_normalized_text`,
-`fifo_fallback`, or `input_stable_id`. `last_delivery_stage` records the last
-identity-linked stage the server observed: enqueue/forward stages, native turn
-start/terminal stages, or `rejected_before_handoff`. A transcript can arrive
+`fifo_fallback`, `input_stable_id`, or `delivery_attempt_id`. A mirror naming
+its `delivery_attempt_id`, such as a recovered Codex steer, settles only that
+input: older inputs stay queued and a miss uses no FIFO fallback.
+`last_delivery_stage` records the last identity-linked stage the server
+observed: enqueue/forward stages, native turn start/terminal stages, or
+`rejected_before_handoff`. A transcript can arrive
 before the forwarding HTTP response, so a settled input can still say
 `forward_requested`. Lifecycle events also carry the server's `pending_id` and
 `delivery_attempt_id`, so an input without a client `stable_id` can retain its
