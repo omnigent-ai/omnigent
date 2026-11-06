@@ -59,6 +59,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
+        base_branch="HEAD",
         host_id=_uid("host_abc123"),
         project_id=_uid("proj_abc"),
         delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
@@ -77,7 +78,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch is None
+    assert task.base_branch == "HEAD"
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.project_id == _uid("proj_abc")
@@ -210,15 +211,18 @@ def test_update_workspace_explicit_null_clears_it(
         agent_id=_uid("ag"),
         timezone="UTC",
         workspace="/repo",
+        base_branch="HEAD",
         host_id=_uid("h"),
     )
     # Omitting workspace leaves it unchanged.
     unchanged = store.update(_uid("st_ws"), name="renamed")
     assert unchanged is not None and unchanged.workspace == "/repo"
+    assert unchanged.base_branch == "HEAD"
     # Explicit None clears both host and workspace (the managed-switch shape).
-    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None, base_branch=None)
     assert cleared is not None
     assert cleared.workspace is None
+    assert cleared.base_branch is None
     assert cleared.host_id is None
 
 
@@ -2243,6 +2247,34 @@ def test_update_sets_and_clears_the_continued_session(
     assert back_to_new is not None and back_to_new.session_mode == "new"
 
 
+def test_release_session_clears_only_the_session_it_was_given(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_release", session_mode="continue")
+    assert store.adopt_session(task.id, _uid("c1"), snapshot=task) == "adopted"
+    before = store.get(task.id)
+
+    # Another run replaced it, or the caller was looking at a stale id: no change.
+    assert store.release_session(task.id, _uid("other")) is False
+    assert store.get(task.id).session_id == _uid("c1")
+
+    assert store.release_session(task.id, _uid("c1")) is True
+    after = store.get(task.id)
+    assert after.session_id is None
+    # Housekeeping, not an edit: a firing compares updated_at with its own read.
+    assert after.updated_at == before.updated_at
+    assert store.release_session(task.id, _uid("c1")) is False
+    assert store.release_session(_uid("missing"), _uid("c1")) is False
+
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
+
+    # A deleted task releases nothing.
+    store.delete(task.id)
+    assert store.release_session(task.id, _uid("c2")) is False
+
+
 def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2268,6 +2300,7 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000)
     for name, value in (
         ("workspace", "/elsewhere"),
+        ("base_branch", "HEAD"),
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
@@ -2301,3 +2334,201 @@ def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
     assert (delivered.status, delivered.conversation_id) == ("succeeded", _uid("c1"))
     assert delivered.finished_at == now + 30
     assert delivered.lease_expires_at is None
+
+
+@pytest.mark.parametrize("state", ["active", "paused"])
+@pytest.mark.parametrize(
+    "latest_status, conversation_id",
+    [("failed", _uid("session")), ("starting", None), ("running", None), ("succeeded", None)],
+    ids=["linked-failure", "starting", "running", "succeeded"],
+)
+def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status, conversation_id):
+    task = _session_task(store, "inbox", state=state)
+    run_id = _uid("inbox-failure")
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private error must not be returned",
+    )
+    failures, cursor = store.list_inbox_failures(owner_user_id=task.user_id)
+    assert cursor is None
+    assert [item.run_id for item in failures] == [run_id]
+    assert failures[0].error_code == "host_offline"
+    assert not hasattr(failures[0], "error")
+    assert not hasattr(failures[0], "prompt")
+
+    # Each newer state independently replaces the visible sessionless failure.
+    store.create_run(
+        run_id=_uid("latest"),
+        scheduled_task_id=task.id,
+        status=latest_status,
+        scheduled_at=200,
+        conversation_id=conversation_id,
+    )
+    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+
+
+def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.db.db_models import SqlScheduledTask
+
+    tasks = [_session_task(store, f"inbox-page-{i}") for i in range(4)]
+    for task in tasks:
+        store.create_run(
+            run_id=_uid(task.id),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            error_code="no_online_host",
+        )
+    ordered = sorted(tasks, key=lambda task: (task.created_at, task.id), reverse=True)
+    with store._session("test_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[0].id)).state = 3  # deleted, retained history
+        session.get(SqlScheduledTask, (0, ordered[1].id)).account_generation = "old"
+    # Post-page filtering must still advance through empty pages.
+    first, cursor = store.list_inbox_failures(owner_user_id=tasks[0].user_id, limit=1)
+    assert first == [] and cursor is not None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        second, next_cursor = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id,
+            generation="current",
+            check_generation=True,
+            after=cursor,
+            limit=1,
+        )
+    assert second == [] and next_cursor is not None and next_cursor != cursor
+    remaining, final = store.list_inbox_failures(
+        owner_user_id=tasks[0].user_id,
+        after=next_cursor,
+        limit=2,
+    )
+    assert [item.task_id for item in remaining] == [task.id for task in ordered[2:]]
+    assert final is None
+    assert store.list_inbox_failures(owner_user_id="someone-else") == ([], None)
+    assert store.list_inbox_failures(owner_user_id=None) == ([], None)
+    with store._session("test_matching_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[2].id)).account_generation = "current"
+        session.get(SqlScheduledTask, (0, ordered[3].id)).user_id = None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        matching, _ = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id, generation="current", check_generation=True
+        )
+    assert [item.task_id for item in matching] == [ordered[2].id]
+    local, _ = store.list_inbox_failures(owner_user_id=None)
+    assert [item.task_id for item in local] == [ordered[3].id]
+    with workspace_scope(99):
+        assert store.list_inbox_failures(owner_user_id=tasks[0].user_id) == ([], None)
+
+
+def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
+    from sqlalchemy import event
+
+    task = _session_task(store, "inbox-plan")
+    store.create_run(
+        run_id=_uid("plan-run"), scheduled_task_id=task.id, scheduled_at=100, status="failed"
+    )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list_inbox_failures(owner_user_id=task.user_id, limit=1)
+        store.list_inbox_failures(
+            owner_user_id=task.user_id, after=(task.created_at + 1, task.id), limit=1
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 4
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            index = (
+                "ix_scheduled_task_runs_scheduled_task_id"
+                if "FROM scheduled_task_runs" in statement
+                else "ix_scheduled_tasks_user_scope"
+            )
+            assert index in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
+            assert "LIMIT" in statement
+
+
+@pytest.mark.parametrize("returned_owner", ["OWNER", "owner ", "ownér"])
+def test_inbox_rechecks_exact_owner_before_reading_runs(store, monkeypatch, returned_owner):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # Simulate rows already matched by a case/accent-insensitive SQL collation.
+    candidate = SimpleNamespace(id=_uid("candidate"), created_at=100, user_id=returned_owner)
+    session = MagicMock()
+    session.execute.return_value.all.return_value = [candidate, candidate]
+    session_context = MagicMock()
+    session_context.return_value.__enter__.return_value = session
+    monkeypatch.setattr(store, "_session", session_context)
+    assert store.list_inbox_failures(owner_user_id="owner", limit=1) == (
+        [],
+        (candidate.created_at, candidate.id),
+    )
+    assert session.execute.call_count == 1  # Rejected owners never trigger run reads.
+
+
+def test_inbox_mysql_deep_page_seeks_to_cursor(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTask),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "workspace_id": 0,
+                    "user_id": "plan-owner",
+                    "name": "Report",
+                    "prompt": "Report",
+                    "rrule": "FREQ=DAILY",
+                    "agent_id": _uid("agent"),
+                    "created_at": index // 10,
+                }
+                for index in range(10_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_tasks").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_tasks."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        failures, cursor = store.list_inbox_failures(
+            owner_user_id="plan-owner", after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert failures == [] and cursor == (95, f"{955:032x}")
+    assert len(plans) == 1
+    assert "Index range scan" in plans[0] and "ix_scheduled_tasks_user_scope" in plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]

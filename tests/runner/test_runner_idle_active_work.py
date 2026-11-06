@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -494,8 +495,24 @@ async def test_terminal_only_native_work_idle_accounting(
             )
 
 
+_API_ERROR_CAUSE = "The request exceeded the model's context window."
+# Longer than the published message's 1,024-character clip, so the raw envelope cannot
+# stand in for the cause it carries.
+_LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
+    {"error": {"type": "api_error", "message": _API_ERROR_CAUSE}, "details": "x" * 1200}
+)
+_PANE_FAILURE_DETAILS = {
+    "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
+    "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+    # Claude's own refusal of a turn whose context is full; no StopFailure hook follows.
+    "pane_overflow": "Prompt is too long",
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+@pytest.mark.parametrize(
+    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+)
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -507,22 +524,52 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        if status_source == "pane":
+        if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            publish = app.state.session_resource_registry._session_status_publisher
-            assert publish is not None
-            publish(conv_id, "failed", None)
+            if status_source in _PANE_FAILURE_DETAILS:
+                publish_failure = app.state.session_resource_registry._session_failure_publisher
+                assert publish_failure is not None
+                publish_failure(conv_id, _PANE_FAILURE_DETAILS[status_source])
+            else:
+                publish = app.state.session_resource_registry._session_status_publisher
+                assert publish is not None
+                publish(conv_id, "failed", None)
             events = []
             while not queue.empty():
                 events.append(queue.get_nowait())
             failures = [event for event in events if event and event.get("status") == "failed"]
             assert len(failures) == 1
-            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
-            assert "Open the terminal" in failures[0]["error"]["message"]
+            if status_source == "pane_detail":
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"].startswith("API Error: 499")
+                assert "synthetic-secret-token" not in str(failures)
+                context = failures[0]["failure_context"]
+                assert context["http_status"] == 499
+                assert context["failure_source"] == "claude_program_status"
+                assert context["detail_source"] == "program_status_error"
+                assert "native_hook_event" not in context
+            elif status_source == "pane_envelope":
+                assert len(_LONG_API_ERROR_ENVELOPE) > 1024
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"] == _API_ERROR_CAUSE
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == _API_ERROR_CAUSE
+                assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
+            elif status_source == "pane_overflow":
+                assert failures[0]["error"]["code"] == "context_length_exceeded"
+                assert failures[0]["error"]["message"].startswith("Context limit reached")
+                assert "/compact" in failures[0]["error"]["message"]
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == "Prompt is too long"
+                assert context["failure_source"] == "claude_program_status"
+            else:
+                assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+                assert "Open the terminal" in failures[0]["error"]["message"]
         else:
             await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
