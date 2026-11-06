@@ -50,6 +50,7 @@ import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   closeDesktopWindow,
+  confirmDesktopQuit,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -165,6 +166,7 @@ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
+import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -2136,6 +2138,12 @@ function AppShellImpl() {
     // An open file with unsaved edits asks before the session (and its viewer) goes away.
     else guardFileNavigation(null, undefined, () => navigateTo("/"));
   });
+  // Desktop Quit (⌘Q / Ctrl+Q) asks here first, over any page; a second ⌘Q
+  // leaves the open prompt to answer.
+  const [quitPrompt, setQuitPrompt] = useState<{ detail: string | null } | null>(null);
+  useDesktopCommand("quit", (event) =>
+    setQuitPrompt((current) => current ?? { detail: event.quitDetail }),
+  );
   // Desktop Reload (⌘R) reloads the app unless a browser tab's toolbar took it.
   useDesktopCommand("reload", () => window.location.reload());
 
@@ -3038,6 +3046,14 @@ function AppShellImpl() {
               void closeDesktopWindow();
             }}
             onCancel={() => setCloseWindowPrompt(null)}
+          />
+          <QuitDialog
+            prompt={quitPrompt}
+            onConfirm={(dontAskAgain) => {
+              setQuitPrompt(null);
+              void confirmDesktopQuit(dontAskAgain);
+            }}
+            onCancel={() => setQuitPrompt(null)}
           />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}

@@ -37,8 +37,9 @@ let lastReported: string | null = null;
 let availableCommands: ReadonlySet<DesktopCommand> = new Set();
 const availabilityListeners = new Set<() => void>();
 
-// Reload still works behind a dialog or menu, as the native menu's Reload did.
-const COMMANDS_THROUGH_DIALOGS: ReadonlySet<DesktopCommand> = new Set(["reload"]);
+// Reload still works behind a dialog or menu, as the native menu's Reload did, and Quit
+// still asks, so ⌘Q never goes dead.
+const COMMANDS_THROUGH_DIALOGS: ReadonlySet<DesktopCommand> = new Set(["reload", "quit"]);
 
 function dispatch(event: DesktopCommandEvent): void {
   // A modal dialog or open menu owns the keyboard, like a sheet in a native app.
