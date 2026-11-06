@@ -21,7 +21,10 @@ from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import (
+    REQUEST_SIZE_OVERFLOW_GUIDANCE,
+    is_request_size_rejection,
+)
 
 __all__ = [
     "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
@@ -397,7 +400,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
-    if detect_request_size_overflow(message) is not None:
+    if is_request_size_rejection(message):
         return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None
@@ -414,6 +417,21 @@ def classify_native_turn_error(code: str, message: str) -> str:
     ):
         return "transient_upstream_error"
     return code
+
+
+def turn_error_display_message(code: str, message: str) -> str:
+    """Return the text to show for a classified turn error.
+
+    A request-size rejection is replaced with the context-overflow guidance so the
+    user sees the remedy instead of the gateway's raw response body.
+
+    :param code: Classified error code, e.g. ``"context_length_exceeded"``.
+    :param message: Raw harness error text.
+    :returns: The guidance for a request-size rejection, else ``message`` unchanged.
+    """
+    if code == "context_length_exceeded" and is_request_size_rejection(message):
+        return REQUEST_SIZE_OVERFLOW_GUIDANCE
+    return message
 
 
 def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
