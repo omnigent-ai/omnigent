@@ -12785,13 +12785,15 @@ assert workflow.default_provider_for_harness is original
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("unowned_cache", [False, True])
 def test_resolve_native_claude_config_connect_broker_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unowned_cache: bool
 ) -> None:
     """A managed connect host (host-only [omnigent] profile + broker sidecar) routes
     native Claude Code through the workspace gateway with a broker-minted apiKeyHelper."""
     _isolate_to_connect_fallback(monkeypatch)
     from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding.ucode_state import UcodeWorkspaceState
 
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
@@ -12799,6 +12801,13 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     workspace_url = "https://ws.cloud.databricks.com"
     dc._write_profile(cfg, workspace_url)
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
+
+    state = (
+        UcodeWorkspaceState(workspace_url=workspace_url, claude_models={"opus": "unowned-opus"})
+        if unowned_cache
+        else None
+    )
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
 
     config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
 
@@ -12815,15 +12824,86 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
     # Model comes from the catalog default (stubbed by _stub_catalog_default).
     assert config.model == "catalog-databricks-claude-default"
+    assert not any(key in config.env for key in claude_native.ALIAS_MODEL_ENV_VARS.values())
 
 
+@pytest.mark.parametrize(
+    ("cached_models", "agent_model_env", "fable_enabled", "expected_alias_env"),
+    [
+        pytest.param({}, {}, False, {}, id="no-cache"),
+        pytest.param(
+            {"opus": "opaque-opus", "sonnet": "opaque-sonnet", "haiku": "opaque-haiku"},
+            {},
+            False,
+            {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "opaque-opus",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "opaque-sonnet",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "opaque-haiku",
+            },
+            id="cached-families",
+        ),
+        pytest.param(
+            {"haiku": "opaque-haiku"},
+            {},
+            False,
+            {"ANTHROPIC_DEFAULT_HAIKU_MODEL": "opaque-haiku"},
+            id="partial-cache",
+        ),
+        pytest.param(
+            {"opus": "cached-opus", "sonnet": "cached-sonnet", "haiku": "cached-haiku"},
+            {"ANTHROPIC_DEFAULT_OPUS_MODEL": "explicit-opus", "ANTHROPIC_DEFAULT_HAIKU_MODEL": ""},
+            False,
+            {
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "explicit-opus",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "cached-sonnet",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "",
+            },
+            id="explicit-pins-win",
+        ),
+        pytest.param({"fable": "opaque-fable"}, {}, False, {}, id="fable-disabled"),
+        pytest.param(
+            {"fable": "opaque-fable"},
+            {},
+            True,
+            {"ANTHROPIC_DEFAULT_FABLE_MODEL": "opaque-fable"},
+            id="fable-enabled",
+        ),
+        pytest.param(
+            {
+                "opus": "opus",
+                "sonnet": "  ",
+                "future": "opaque-future",
+                "sonnet_5": "opaque-custom",
+            },
+            {},
+            False,
+            {},
+            id="no-invented-pins",
+        ),
+        pytest.param(
+            {"haiku": "cached-haiku"},
+            {"ANTHROPIC_DEFAULT_HAIKU_MODEL": ""},
+            False,
+            {"ANTHROPIC_DEFAULT_HAIKU_MODEL": ""},
+            id="explicit-empty-pin",
+        ),
+    ],
+)
 @pytest.mark.parametrize("gateway", [False, True])
 def test_connect_fallback_prefers_ucode_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, gateway: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: bool,
+    cached_models: dict[str, str],
+    agent_model_env: dict[str, str],
+    fable_enabled: bool,
+    expected_alias_env: dict[str, str],
 ) -> None:
     """When ucode has populated ~/.ucode/state.json for the connected workspace,
     the managed-connect config uses ucode's base URL and discovered served model,
     while still minting the bearer through our own broker apiKeyHelper."""
+    from unittest.mock import Mock
+
     _isolate_to_connect_fallback(monkeypatch)
     from omnigent.host import databricks_credential as dc
     from omnigent.onboarding.ucode_state import UcodeAgentState, UcodeWorkspaceState
@@ -12839,6 +12919,8 @@ def test_connect_fallback_prefers_ucode_state(
 
     state = UcodeWorkspaceState(
         workspace_url=workspace_url,
+        claude_models=cached_models,
+        fable_enabled=fable_enabled,
         agents={
             "claude": UcodeAgentState(
                 model="system.ai.claude-sonnet-4-6",
@@ -12846,11 +12928,17 @@ def test_connect_fallback_prefers_ucode_state(
                     "ANTHROPIC_BASE_URL": base_url,
                     "ANTHROPIC_CUSTOM_HEADERS": "User-Agent: ucode/0.1.0 claude/2.1.0",
                     "CLAUDE_CODE_DISABLE_ADVISOR_TOOL": "0",
+                    **agent_model_env,
                 },
             )
         },
     )
-    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", lambda url: state)
+    read_state = Mock(return_value=state)
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", read_state)
+    discovery = Mock(side_effect=AssertionError("cached broker config must not discover models"))
+    monkeypatch.setattr(
+        "omnigent.models.databricks_model_discovery.discover_databricks_claude_catalog", discovery
+    )
 
     config = claude_native.resolve_native_claude_config(spec=None, refresh_models=False)
 
@@ -12874,10 +12962,21 @@ def test_connect_fallback_prefers_ucode_state(
     # But the bearer is still our own broker command, not ucode's.
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
+    read_state.assert_called_once_with(workspace_url)
+    terminal_env = claude_native.build_native_claude_terminal_env(config)
+    for env_var in claude_native.ALIAS_MODEL_ENV_VARS.values():
+        assert config.env.get(env_var) == expected_alias_env.get(env_var)
+        assert terminal_env.get(env_var) == expected_alias_env.get(env_var)
+    assert "ANTHROPIC_CUSTOM_MODEL_OPTION" not in config.env
+    discovery.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    "ucode_base_url",
+    ["https://evil.example/anthropic", "http://ws.example/anthropic", None],
+)
 def test_connect_fallback_rejects_ucode_base_url_off_workspace_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ucode_base_url: str | None
 ) -> None:
     """Security: state.json is writable and the broker bearer is presented to
     whatever ANTHROPIC_BASE_URL resolves to. A ucode base URL that is not HTTPS on
@@ -12898,10 +12997,14 @@ def test_connect_fallback_rejects_ucode_base_url_off_workspace_host(
     # would otherwise adopt). Must be refused.
     state = UcodeWorkspaceState(
         workspace_url="https://ws.example",
+        claude_models={"sonnet": "untrusted-cached-sonnet"},
         agents={
             "claude": UcodeAgentState(
                 model="system.ai.claude-sonnet-4-6",
-                env={"ANTHROPIC_BASE_URL": "https://evil.example/anthropic"},
+                env={
+                    **({"ANTHROPIC_BASE_URL": ucode_base_url} if ucode_base_url else {}),
+                    "ANTHROPIC_DEFAULT_SONNET_MODEL": "untrusted-explicit-sonnet",
+                },
             )
         },
     )
@@ -12915,6 +13018,7 @@ def test_connect_fallback_rejects_ucode_base_url_off_workspace_host(
     # And its paired model is not adopted either (falls back to the catalog default).
     assert config.model != "system.ai.claude-sonnet-4-6"
     assert config.api_key_helper is not None
+    assert not any(key in config.env for key in claude_native.ALIAS_MODEL_ENV_VARS.values())
 
 
 def test_connect_fallback_pins_deployment_gateway_model(
