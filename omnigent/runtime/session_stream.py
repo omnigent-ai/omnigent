@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import threading
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
@@ -199,6 +200,46 @@ _SSE_SAFE_KEYS = (
 )
 
 
+def _sse_usage_attributes(event: dict[str, Any]) -> dict[str, object]:
+    """Log numeric spend only, distinguishing response deltas from subtree totals."""
+    if event.get("type") == "session.usage":
+        by_model = event.get("usage_by_model")
+        buckets = list(by_model.values()) if isinstance(by_model, dict) else []
+        kind, scope = "cumulative", "session_subtree"
+    elif event.get("type") == "response.completed":
+        response = event.get("response")
+        buckets = [response.get("usage")] if isinstance(response, dict) else []
+        kind, scope = "delta", "response"
+    else:
+        return {}
+    attrs: dict[str, Any] = {}
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+    ):
+        values = [bucket.get(key) if isinstance(bucket, dict) else None for bucket in buckets]
+        counts = [value for value in values if type(value) is int and value >= 0]
+        # A model that reports only cost must not silently count as zero tokens.
+        if counts and len(counts) == len(values):
+            attrs[key] = sum(counts)
+    # Session cost already has a top-level field; response cost is nested.
+    if kind == "delta" and buckets and isinstance(buckets[0], dict):
+        cost = buckets[0].get("cost_usd")
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+        ):
+            attrs["cost_usd"] = cost
+    if attrs or (kind == "cumulative" and event.get("total_cost_usd") is not None):
+        attrs.update(usage_kind=kind, usage_scope=scope)
+    return attrs
+
+
 def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
     """Extract only safe identifiers/dimensions from an SSE event.
 
@@ -207,7 +248,7 @@ def _sse_safe_attributes(event: dict[str, Any]) -> dict[str, object]:
     human/LLM-authored ``reason`` / ``blocked_on``, and ``tool_name``) are never
     read, so no model response or user content reaches the debug table.
     """
-    attrs: dict[str, object] = {}
+    attrs: dict[str, object] = _sse_usage_attributes(event)
     for key in _SSE_SAFE_KEYS:
         value = event.get(key)
         if value is not None and not isinstance(value, (dict, list)):
