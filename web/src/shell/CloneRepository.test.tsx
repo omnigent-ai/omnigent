@@ -176,6 +176,13 @@ describe("CloneRepositoryDialog", () => {
     );
     expect(onCloned).not.toHaveBeenCalled();
     expect(onOpenChange).not.toHaveBeenCalledWith(false);
+
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "git@github.com:acme/public.git" },
+    });
+    await waitFor(() =>
+      expect(screen.queryByTestId("clone-repository-error")).not.toBeInTheDocument(),
+    );
   });
 
   it.each([

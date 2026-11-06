@@ -33,9 +33,10 @@ _REAP_TIMEOUT_S: float = 5.0
 
 # Mirrors the server's accepted repository URL forms. Checked again here so a
 # frame can never smuggle a git transport such as ``ext::`` or a local path.
-# A leading ``-`` in the host would reach ssh as an option.
+# A leading ``-`` in the host would reach ssh as an option, and git reads a
+# ``/`` before the ``:`` as a local path rather than an ssh host.
 _ACCEPTED_URL = re.compile(
-    r"^(?:https://[^\s@/#-][^\s@/#]*/[^\s@#]+|git@[^\s@:#-][^\s@:#]*:[^\s@#]+)$"
+    r"^(?:https://[^\s@/#-][^\s@/#]*/[^\s@#]+|git@[^\s@:#/-][^\s@:#/]*:[^\s@#]+)$"
 )
 _DIRECTORY_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -82,13 +83,20 @@ class ClonedRepository:
 def _git_env() -> dict[str, str]:
     """Return the environment for every git command this module runs.
 
+    Credential helpers, ssh-agent and the host's git config still apply; only
+    the interactive fallbacks are switched off.
+
     :returns: The host environment with prompts disabled and messages in C locale.
     """
+    env = {key: value for key, value in os.environ.items() if key != "SSH_ASKPASS"}
     return {
-        **os.environ,
+        **env,
         "LC_ALL": "C",
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
+        # An empty GIT_ASKPASS also overrides core.askPass and SSH_ASKPASS in git.
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS_REQUIRE": "never",
     }
 
 
@@ -283,6 +291,9 @@ def clone_repository(
             shutil.rmtree(destination, ignore_errors=True)
             raise CloneError(f"git clone timed out after {timeout_s:.0f}s") from exc
         if completed.returncode != 0:
+            # A failed checkout leaves a folder whose HEAD resolves, which a
+            # retry would otherwise reuse as finished.
+            shutil.rmtree(destination, ignore_errors=True)
             raise CloneError(_summarize_git_error(completed.stderr))
 
     _logger.info("Cloned %s into %s", url, destination)

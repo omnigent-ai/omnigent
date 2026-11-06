@@ -290,7 +290,11 @@ vi.mock("@/hooks/useCloneHostRepository", async (importOriginal) => ({
     mutate: (
       variables: { hostId: string; url: string; parentDirectory: string },
       options?: { onSuccess?: (clone: unknown) => void },
-    ) => options?.onSuccess?.(cloneHostRepositoryMock(variables)),
+    ) => {
+      const clone = cloneHostRepositoryMock(variables);
+      if (clone instanceof Promise) void clone.then((done) => options?.onSuccess?.(done));
+      else options?.onSuccess?.(clone);
+    },
     reset: () => {},
     isPending: false,
     isError: false,
@@ -1395,6 +1399,9 @@ function LandingNavigationProbe() {
       </button>
       <button type="button" onClick={() => navigate("?prompt=Another+request")}>
         Open another prompt link
+      </button>
+      <button type="button" onClick={() => navigate("?project=Beta")}>
+        Open project Beta
       </button>
     </>
   );
@@ -5576,6 +5583,40 @@ describe("NewChatLandingScreen", () => {
     });
     expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/code/widgets");
     expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1).toContain(
+      "/Users/corey/code/widgets",
+    );
+  });
+
+  it("drops a clone that finishes after the composer switched project", async () => {
+    let finishClone: (clone: unknown) => void = () => {};
+    cloneHostRepositoryMock.mockReturnValue(
+      new Promise((resolve) => {
+        finishClone = resolve;
+      }),
+    );
+    renderLanding({ host_repository_clone: true });
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-clone-repository"));
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "https://github.com/acme/widgets" },
+    });
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "/Users/corey/code" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+    fireEvent.click(screen.getByText("Open project Beta"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("clone-repository-dialog")).not.toBeInTheDocument(),
+    );
+    await act(async () => {
+      finishClone({ path: "/Users/corey/code/widgets", name: "widgets", reusedExisting: false });
+    });
+
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).not.toHaveAccessibleName(
+      "Working directory: /Users/corey/code/widgets",
+    );
+    expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1 ?? []).not.toContain(
       "/Users/corey/code/widgets",
     );
   });

@@ -177,8 +177,9 @@ describe("NewProjectButton clone section", () => {
   });
 
   it("retries on the default host after a failed clone, even once it leaves", async () => {
-    fetchMock.mockResolvedValue(
-      new Response(JSON.stringify({ detail: "Couldn't clone the repository." }), { status: 422 }),
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ detail: "Couldn't clone the repository." }), { status: 422 }),
     );
     hostsMock.data = [LAPTOP, DESKTOP];
     const { rerenderWithHosts } = renderButton();
@@ -203,6 +204,12 @@ describe("NewProjectButton clone section", () => {
     expect(screen.getByTestId("new-project-confirm")).toBeDisabled();
     fireEvent.click(screen.getByTestId("new-project-confirm"));
     expect(requestsTo(fetchMock, "/repositories")).toHaveLength(1);
+
+    hostsMock.data = [DESKTOP, LAPTOP];
+    rerenderWithHosts();
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    await waitFor(() => expect(requestsTo(fetchMock, "/repositories")).toHaveLength(2));
+    expect(requestsTo(fetchMock, "/v1/hosts/host_laptop/repositories")).toHaveLength(2);
     expect(requestsTo(fetchMock, "/v1/hosts/host_desktop/repositories")).toEqual([]);
   });
 

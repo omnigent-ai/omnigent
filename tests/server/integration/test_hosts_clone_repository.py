@@ -34,6 +34,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import websocket_scope as _websocket_scope
 
 # Same liveness-race flake guard as test_hosts_create_directory.py.
@@ -89,8 +90,7 @@ async def _connect_fake_host(
         capabilities=capabilities,
     )
     await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(hello)})
-    while registry.get(_HOST_ID) is None:
-        await asyncio.sleep(0.01)
+    await poll_until_async(lambda: registry.get(_HOST_ID) is not None, timeout_s=5.0)
 
     fake = _FakeHost()
 
@@ -233,6 +233,7 @@ async def test_clone_fails_fast_when_host_disconnects(
             "must not embed credentials",
         ),
         ({"url": "https://github.com/acme/widgets#main", "parent_directory": "/work"}, "'#'"),
+        ({"url": "git@foo/bar:baz", "parent_directory": "/work"}, "local path"),
         ({"url": "https://github.com/acme/widgets", "parent_directory": "code"}, "absolute"),
         ({"url": "https://github.com/acme/widgets", "parent_directory": "  "}, "empty"),
     ],

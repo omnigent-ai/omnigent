@@ -351,8 +351,9 @@ bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
 choice only when the server supports cleanup.
 
-**New project with a clone:** click **+** on the Projects header, expand **Clone a
-repository**, pick a connected host, and enter a URL. Create clones first, then
+**New project with a clone:** click **+** on the Projects header (or **New
+project** on the Canvas page), expand **Clone a repository**, pick a connected
+host, and enter a URL. Create clones first, then
 saves the checkout as the project's host and working directory; **New session in
 <project>** starts there. A failed clone keeps the dialog open and creates no project.
 
@@ -722,8 +723,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`project-clone`:**
   `tests/e2e_ui/start_session/test_clone_repository.py::test_new_project_clones_repository_as_its_default_workspace`
   starts its own host with a git `insteadOf` rewrite to local bare repositories.
-  By hand, create a project from a repository the host can reach, then open **New
-  session in <project>** and expect the clone in the working-directory chip. Host
+  By hand, create a project from a repository the host can reach (from the
+  sidebar or Canvas **New project**), then open **New session in <project>** and
+  expect the clone in the working-directory chip. Host
   selection, retries and failures: `web/src/shell/NewProjectButton.test.tsx`.
 - **`project`, sidebar row and header folder tag:**
   `tests/e2e_ui/sessions/test_move_to_project.py::test_move_session_into_project_regroups_sidebar_row`

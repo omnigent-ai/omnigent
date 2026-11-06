@@ -417,8 +417,8 @@ async def _proxy_clone_repository(
     """
     Send a ``host.clone_repository`` frame and await the result.
 
-    Mirrors :func:`_proxy_create_dir`. The pending future is also failed when
-    the tunnel drops, so a long clone does not wait out its whole bound.
+    The pending future is also failed when the tunnel drops, so a long clone
+    does not wait out its whole bound.
 
     :param host_registry: Server-side registry; used to enqueue the frame.
     :param host_conn: Live host connection.
@@ -430,38 +430,21 @@ async def _proxy_clone_repository(
     :raises HTTPException: 504 on timeout, 502 on connection drop.
     """
     request_id = secrets.token_hex(8)
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future[dict[str, Any]] = loop.create_future()
-    host_conn.pending_repository_clones[request_id] = future
-
-    frame = encode_host_frame(
-        HostCloneRepositoryFrame(
+    return await _proxy_rpc(
+        host_registry=host_registry,
+        host_conn=host_conn,
+        request_id=request_id,
+        pending=host_conn.pending_repository_clones,
+        frame=HostCloneRepositoryFrame(
             request_id=request_id,
             url=url,
             parent_directory=parent_directory,
             directory_name=directory_name,
             timeout_s=CLONE_REPOSITORY_BUDGET_S,
-        )
+        ),
+        timeout_s=_CLONE_REPOSITORY_TIMEOUT_S,
+        action="finish the clone",
     )
-    try:
-        try:
-            host_registry.send_text(host_conn, frame)
-            return await asyncio.wait_for(future, timeout=_CLONE_REPOSITORY_TIMEOUT_S)
-        except ConnectionError as exc:
-            raise HTTPException(
-                status_code=502,
-                detail=f"host '{host_conn.host_id}' connection lost during the clone",
-            ) from exc
-        except TimeoutError as exc:
-            raise HTTPException(
-                status_code=504,
-                detail=(
-                    f"host '{host_conn.host_id}' did not finish the clone "
-                    f"within {_CLONE_REPOSITORY_TIMEOUT_S:.0f}s"
-                ),
-            ) from exc
-    finally:
-        host_conn.pending_repository_clones.pop(request_id, None)
 
 
 async def _proxy_install_harness(
@@ -1894,6 +1877,13 @@ def create_hosts_router(
             repository = parse_repo_workspace(url)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if url.startswith("git@") and "/" in url[len("git@") :].partition(":")[0]:
+            # Git reads a slash before the colon as a local path, not an ssh host.
+            raise HTTPException(
+                status_code=400,
+                detail="the ssh host in a git@ URL must not contain '/', which git reads "
+                "as a local path",
+            )
         parent_directory = body.parent_directory.strip()
         _require_host_resolvable_path(parent_directory, field="parent_directory")
 

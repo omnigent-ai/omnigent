@@ -180,6 +180,37 @@ def test_git_failure_reports_summarized_stderr(remote: Path, tmp_path: Path) -> 
     assert not (tmp_path / "missing").exists()
 
 
+def test_failed_checkout_is_removed_so_a_retry_clones_again(
+    remote: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone whose checkout fails leaves nothing a retry could reuse."""
+    source = tmp_path / "filtered-source"
+    source.mkdir()
+    _git(source, "init", "-q", "-b", "main")
+    (source / ".gitattributes").write_text("*.txt filter=broken\n")
+    (source / "data.txt").write_text("payload\n")
+    _git(source, "add", ".")
+    _git(source, "commit", "-q", "-m", "init")
+    _git(tmp_path, "clone", "-q", "--bare", str(source), str(remote / "acme" / "filtered.git"))
+    url = f"{_REMOTE_BASE}acme/filtered.git"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "3")
+    monkeypatch.setenv("GIT_CONFIG_KEY_1", "filter.broken.smudge")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_1", "false")
+    monkeypatch.setenv("GIT_CONFIG_KEY_2", "filter.broken.required")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_2", "true")
+
+    with pytest.raises(CloneError, match="checkout failed") as raised:
+        clone_repository(url=url, parent_directory=str(tmp_path), directory_name="filtered")
+    assert raised.value.conflict is False
+    assert not (tmp_path / "filtered").exists()
+
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    retried = clone_repository(url=url, parent_directory=str(tmp_path), directory_name="filtered")
+
+    assert retried.reused_existing is False
+    assert (tmp_path / "filtered" / "data.txt").read_text() == "payload\n"
+
+
 def test_timeout_removes_partial_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A clone killed at its budget does not leave a half-written folder."""
 
@@ -245,6 +276,7 @@ def test_concurrent_clone_into_same_destination_is_a_conflict(tmp_path: Path) ->
         ("ext::sh -c touch% /tmp/pwned", "/work", "repo", "https:// or git@"),
         ("/srv/git/repo.git", "/work", "repo", "https:// or git@"),
         ("git@-oProxyCommand=evil:acme/repo", "/work", "repo", "https:// or git@"),
+        ("git@foo/bar:baz", "/work", "baz", "https:// or git@"),
         ("https://-x/acme/repo", "/work", "repo", "https:// or git@"),
         (_URL, "/work", "../escape", "not a usable folder name"),
         (_URL, "/work", "..", "not a usable folder name"),
@@ -265,9 +297,34 @@ def test_rejects_unsafe_input_without_running_git(
         clone_repository(url=url, parent_directory=parent, directory_name=name)
 
 
-def test_git_runs_without_prompts() -> None:
-    """Credential prompts are disabled so a missing login fails fast."""
-    env = git_clone._git_env()
+def test_git_never_asks_for_credentials(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Inherited askpass programs are not run, so a missing login fails at once."""
+    asked = tmp_path / "asked"
+    askpass = tmp_path / "askpass.sh"
+    askpass.write_text(f"#!/bin/sh\ntouch {asked}\necho secret\n")
+    askpass.chmod(0o755)
+    monkeypatch.setenv("GIT_ASKPASS", str(askpass))
+    monkeypatch.setenv("SSH_ASKPASS", str(askpass))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.askPass")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(askpass))
 
-    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    asked_git = subprocess.run(
+        ["git", "credential", "fill"],
+        input="protocol=https\nhost=git.example.test\n\n",
+        env=git_clone._git_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        start_new_session=True,
+    )
+
+    assert asked_git.returncode != 0
+    assert "terminal prompts disabled" in asked_git.stderr
+    assert not asked.exists()
+    env = git_clone._git_env()
+    assert "SSH_ASKPASS" not in env
+    assert env["SSH_ASKPASS_REQUIRE"] == "never"
     assert env["GCM_INTERACTIVE"] == "never"

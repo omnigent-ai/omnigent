@@ -2723,6 +2723,10 @@ export function NewChatLandingScreen() {
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   const [cloneRepositoryOpen, setCloneRepositoryOpen] = useState(false);
+  // Bumped when the composer switches project, so a clone started for the old
+  // project can't replace the new one's workspace when it finishes.
+  const [cloneTarget, setCloneTarget] = useState(0);
+  const cloneTargetRef = useRef(0);
   const [workspacePickerInitialPath, setWorkspacePickerInitialPath] = useState<string | undefined>(
     undefined,
   );
@@ -2933,6 +2937,9 @@ export function NewChatLandingScreen() {
     // would clone the previous project's repo into this project's sandbox.
     setSandboxRepoSelections([]);
     setPendingRepoUrl("");
+    cloneTargetRef.current += 1;
+    setCloneTarget(cloneTargetRef.current);
+    setCloneRepositoryOpen(false);
     agentFromConfigRef.current = false;
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
@@ -6651,7 +6658,7 @@ export function NewChatLandingScreen() {
                   <button
                     type="button"
                     className="w-full text-left"
-                    disabled={selectedHostId === null}
+                    disabled={selectedHostId === null || selectedHost?.status !== "online"}
                     onClick={() => {
                       setWorkspacePopoverOpen(false);
                       setCloneRepositoryOpen(true);
@@ -7585,10 +7592,12 @@ export function NewChatLandingScreen() {
             }
           />
           <CloneRepositoryDialog
+            key={cloneTarget}
             open={cloneRepositoryOpen}
             onOpenChange={setCloneRepositoryOpen}
             hostId={selectedHostId}
             onCloned={({ path }) => {
+              if (cloneTargetRef.current !== cloneTarget) return;
               workspaceFromConfigRef.current = false;
               setWorkspace(path);
               addRecent(path);

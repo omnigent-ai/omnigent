@@ -129,8 +129,7 @@ function NewProjectForm({
   const { data: hosts } = useHosts({ enabled: cloneSupported });
   // An explicitly chosen host stays listed while offline, so it is never swapped silently.
   const cloneHosts = (hosts ?? []).filter(
-    (host) =>
-      host.sandbox_provider == null && (host.status === "online" || host.host_id === cloneHostId),
+    (host) => !host.sandbox_provider && (host.status === "online" || host.host_id === cloneHostId),
   );
   const selectedCloneHostId =
     cloneHostId ?? cloneHosts.find((host) => host.status === "online")?.host_id ?? null;
@@ -275,7 +274,12 @@ function NewProjectForm({
           {cloneOpen && (
             <div className="flex flex-col gap-3" data-testid="new-project-clone-section">
               <div className="flex flex-col gap-1.5">
-                <label className="text-sm font-medium text-muted-foreground">Host</label>
+                <label
+                  htmlFor="new-project-clone-host"
+                  className="text-sm font-medium text-muted-foreground"
+                >
+                  Host
+                </label>
                 {cloneHosts.length === 0 ? (
                   <p className="text-sm text-muted-foreground" data-testid="new-project-no-host">
                     Connect a host to clone a repository onto it.
@@ -291,7 +295,7 @@ function NewProjectForm({
                     disabled={pending}
                   >
                     <SelectTrigger
-                      aria-label="Host"
+                      id="new-project-clone-host"
                       data-testid="new-project-clone-host"
                       className="w-full"
                     >

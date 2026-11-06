@@ -1,4 +1,4 @@
-import { type KeyboardEvent, useEffect, useState } from "react";
+import { type KeyboardEvent, useState } from "react";
 import { FolderOpenIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -169,18 +169,22 @@ export function CloneRepositoryDialog({
   onCloned,
 }: CloneRepositoryDialogProps) {
   const cloneRepository = useCloneHostRepository();
-  const { reset } = cloneRepository;
-  useEffect(() => {
-    if (open) reset();
-  }, [open, reset]);
+  const close = () => {
+    // Clear the last failure on close so a reopened dialog never shows it.
+    cloneRepository.reset();
+    onOpenChange(false);
+  };
 
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
+        if (next) {
+          onOpenChange(true);
+          return;
+        }
         // Closing mid-clone would hide the result of a clone that keeps running.
-        if (!next && cloneRepository.isPending) return;
-        onOpenChange(next);
+        if (!cloneRepository.isPending) close();
       }}
     >
       <DialogContent data-testid="clone-repository-dialog">
@@ -194,10 +198,10 @@ export function CloneRepositoryDialog({
         <CloneRepositoryForm
           hostId={hostId}
           cloneRepository={cloneRepository}
-          onCancel={() => onOpenChange(false)}
+          onCancel={close}
           onCloned={(clone) => {
             onCloned(clone);
-            onOpenChange(false);
+            close();
           }}
         />
       </DialogContent>
@@ -232,9 +236,15 @@ function CloneRepositoryForm({
       <CloneRepositoryFields
         hostId={hostId}
         url={url}
-        onUrlChange={setUrl}
+        onUrlChange={(next) => {
+          setUrl(next);
+          cloneRepository.reset();
+        }}
         parentDirectory={parentDirectory}
-        onParentDirectoryChange={setParentDirectory}
+        onParentDirectoryChange={(next) => {
+          setParentDirectory(next);
+          cloneRepository.reset();
+        }}
         onSubmit={submit}
         disabled={cloneRepository.isPending}
         autoFocus
