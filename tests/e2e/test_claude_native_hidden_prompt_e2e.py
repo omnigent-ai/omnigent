@@ -2,10 +2,13 @@
 
 Claude reports its ``/model`` picker as waiting only while no reply streams. The
 local Messages API streams one slow reply; Claude, tmux and the runner watcher run live.
+Shell mode, the history search and a narrow pane keep the input box in use, so they
+must not raise the alert.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -22,6 +25,7 @@ import pytest
 
 from omnigent.harnesses.claude_native import bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import resource_registry
 from omnigent.runner.resource_registry import (
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -42,7 +46,8 @@ pytestmark = [
 ]
 
 _MODEL = "claude-opus-4-8"
-_STREAMED_WORDS = 40
+_STREAMED_WORDS = 75
+_ALERT_SECONDS = 3.0
 
 
 def _sse(event: str, data: dict[str, object]) -> bytes:
@@ -134,6 +139,28 @@ def _slow_messages_api() -> Iterator[str]:
         thread.join(timeout=5)
 
 
+def _resize(terminal: TerminalInstance, *, columns: int) -> None:
+    subprocess.run(
+        [
+            *("tmux", "-S", str(terminal.socket_path), "resize-window"),
+            *("-t", terminal.tmux_target, "-x", str(columns), "-y", "40"),
+        ],
+        check=True,
+        timeout=5,
+    )
+
+
+async def _hold_input_mode(terminal: TerminalInstance, marker: str) -> None:
+    """Keep an input mode open past the alert delay; *marker* is its lowercased chrome."""
+    await wait_for_terminal_screen(
+        terminal,
+        lambda pane: marker in pane.lower() and not bridge.claude_pane_text_ready(pane),
+        description=marker,
+    )
+    await asyncio.sleep(2 * _ALERT_SECONDS)
+    assert marker in (terminal.last_pane_text() or "").lower()
+
+
 async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -156,7 +183,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
     # Keep the slow reply short; the production delay only matters for unknown surfaces.
-    monkeypatch.setattr(resource_registry, "_HIDDEN_INPUT_BOX_ALERT_SECONDS", 3.0)
+    monkeypatch.setattr(resource_registry, "_HIDDEN_INPUT_BOX_ALERT_SECONDS", _ALERT_SECONDS)
     session_id = uuid.uuid4().hex
     bridge_dir = bridge.prepare_bridge_dir(session_id, workspace=workspace, launch_model=_MODEL)
     terminals = TerminalRegistry()
@@ -207,14 +234,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
                     ),
                 ),
             )
-            subprocess.run(
-                [
-                    *("tmux", "-S", str(terminal.socket_path), "resize-window"),
-                    *("-t", terminal.tmux_target, "-x", "120", "-y", "40"),
-                ],
-                check=True,
-                timeout=5,
-            )
+            _resize(terminal, columns=120)
             bridge.write_tmux_target(
                 bridge_dir, socket_path=terminal.socket_path, tmux_target=terminal.tmux_target
             )
@@ -235,6 +255,26 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
                 terminal, lambda pane: "word2" in pane, description="the reply streaming"
             )
             await poll_until_async(lambda: statuses[-1:] == [("running", None)], timeout_s=10)
+
+            assert await terminal.send("!", keys="") == {"status": "sent"}
+            await _hold_input_mode(terminal, "! for shell mode")
+            assert alert not in statuses
+            assert await terminal.send(keys="BSpace") == {"status": "sent"}
+            await wait_for_terminal_screen(
+                terminal, bridge.claude_pane_text_ready, description="the input box after `!`"
+            )
+            assert await terminal.send(keys="C-r") == {"status": "sent"}
+            await _hold_input_mode(terminal, "search prompts")
+            assert alert not in statuses
+            assert await terminal.send(keys="Escape") == {"status": "sent"}
+            await wait_for_terminal_screen(
+                terminal, bridge.claude_pane_text_ready, description="the input box after ctrl+r"
+            )
+            _resize(terminal, columns=28)
+            await asyncio.sleep(2 * _ALERT_SECONDS)
+            assert bridge.claude_pane_text_ready(terminal.last_pane_text() or "")
+            _resize(terminal, columns=120)
+            assert alert not in statuses
 
             assert await terminal.send("/model", keys="") == {"status": "sent"}
             await wait_for_terminal_screen(

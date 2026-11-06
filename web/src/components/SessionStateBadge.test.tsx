@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SessionStateBadge } from "./SessionStateBadge";
 import type { SessionState } from "@/hooks/useSessionState";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 
 function renderBadge(state: SessionState) {
   return render(
@@ -33,6 +34,13 @@ describe("SessionStateBadge — per-state rendering", () => {
       "aria-label",
       "Waiting for you in the agent's terminal (permission prompt)",
     );
+  });
+
+  it("hedges a terminal prompt the runner inferred from the screen", () => {
+    renderBadge({ kind: "awaiting", count: 0, terminalReason: TERMINAL_PROMPT_BLOCKED_ON });
+    const badge = screen.getByTestId("session-state-badge");
+    expect(badge).toHaveTextContent("Needs response");
+    expect(badge).toHaveAttribute("aria-label", "May need your input in the agent's terminal");
   });
 
   it("uses singular wording when only one prompt is pending", () => {

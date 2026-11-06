@@ -33,7 +33,6 @@ from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
     TerminalExitEvent,
     TerminalLifecycle,
-    _native_input_ready_probe,
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
@@ -1589,6 +1588,43 @@ _CLAUDE_NOTICE_PANE = """\
    What's new in Claude Code
    Press Enter to continue
 """
+# Input modes Claude Code 2.1.295 drew mid-reply, with the input box still in use.
+_CLAUDE_SHELL_MODE_PANE = """\
+● word0 word1 word2
+* Jitterbugging… (23s · ↓ 40 tokens)
+──────────────────────────────────────────
+!\u00a0
+──────────────────────────────────────────
+  ! for shell mode
+"""
+_CLAUDE_HISTORY_SEARCH_PANE = """\
+● word0 word1 word2
+✢ Jitterbugging… (29s · ↓ 50 tokens)
+──────────────────────────────────────────
+  Search prompts · everywhere
+                      ╭──────────────────╮
+                      │ Write a reply.   │
+  ❯ 24s ago  Write …  ╰──────────────────╯
+  ╭──────────────────────────────────────╮
+  │ ⌕ Filter history…                    │
+  ╰──────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+# A 28-column pane, where the footer tip and a draft both wrap.
+_CLAUDE_NARROW_DRAFT_PANE = """\
+  word42 word43 word44
+· Jitterbugging… (45s)
+  ⎿ \u00a0Tip: Use /btw to ask a
+     quick side question
+     without interrupting
+     Claude's current work
+────────────────────────────
+❯\u00a0please also summarize
+  the follow-up items
+  afterwards
+────────────────────────────
+  ⏵⏵ auto mode on
+"""
 
 
 class _HiddenInputBoxSession:
@@ -1636,17 +1672,16 @@ async def _hidden_input_box_session(
     clock = {"now": 100.0}
     monkeypatch.setattr("omnigent.runner.resource_registry._monotonic", lambda: clock["now"])
     if during_probe is not None:
-        real_probe = _native_input_ready_probe(CLAUDE_NATIVE_TERMINAL_ROLE)
-        assert real_probe is not None
+        import omnigent.harnesses.claude_native.bridge as claude_bridge
 
-        def probe(probed_session_id: str, probed_instance: TerminalInstance) -> bool:
-            ready = real_probe(probed_session_id, probed_instance)
+        real_probe = claude_bridge.claude_pane_input_box_shown
+
+        def probe(pane: str) -> bool:
+            shown = real_probe(pane)
             during_probe()
-            return ready
+            return shown
 
-        monkeypatch.setattr(
-            "omnigent.runner.resource_registry._native_input_ready_probe", lambda _role: probe
-        )
+        monkeypatch.setattr(claude_bridge, "claude_pane_input_box_shown", probe)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     published: list[tuple[str, str | None]] = []
     on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
@@ -1697,6 +1732,32 @@ async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
     await session.tick_at(161.0, _CLAUDE_WORKING_PANE)
     assert published[-1] == ("running", waiting_for)
     assert session.registry.session_turn_is_active("conv_hidden_input_box")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pane",
+    [_CLAUDE_SHELL_MODE_PANE, _CLAUDE_HISTORY_SEARCH_PANE, _CLAUDE_NARROW_DRAFT_PANE],
+    ids=["shell-mode", "history-search", "narrow-wrapped"],
+)
+async def test_input_box_in_another_mode_raises_no_terminal_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str
+) -> None:
+    """A person typing in shell mode, the history search or a narrow pane is not blocked."""
+    session_id = "conv_hidden_input_mode"
+    session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, pane)
+    assert session.published == [("running", None)]
+
+    # A real hidden prompt still alerts, and switching to this mode clears it.
+    await session.tick_at(141.0, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(156.0, _CLAUDE_NOTICE_PANE)
+    assert session.published[-1] == ("running", "terminal prompt")
+    await session.tick_at(157.0, pane)
+    assert session.published[1:] == [("running", "terminal prompt"), ("running", None)]
+    assert session.registry.session_turn_is_active(session_id)
 
 
 @pytest.mark.asyncio
@@ -1789,8 +1850,6 @@ async def test_turn_end_during_input_box_probe_is_not_overwritten(
         tmp_path, monkeypatch, session_id, during_probe=end_turn_mid_probe
     )
     session.write_claude_status("busy")
-    # Once the box has been seen, only the hidden-box check probes the pane.
-    await session.tick_at(99.0, _CLAUDE_WORKING_PANE)
     await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
     if alerting:
         await session.tick_at(116.0, _CLAUDE_NOTICE_PANE)

@@ -1858,10 +1858,9 @@ class SessionResourceRegistry:
 
             loop.call_soon_threadsafe(deliver)
 
-        def _check_hidden_input_box(
-            probe: Callable[[str, TerminalInstance], bool],
-            watch: _HiddenInputBoxWatch,
-        ) -> None:
+        def _check_hidden_input_box(watch: _HiddenInputBoxWatch) -> None:
+            from omnigent.harnesses.claude_native.bridge import claude_pane_input_box_shown
+
             edge = self._published_status_edge(session_id)
             alerting = edge == ("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
             turn = self._active_turn_generation(session_id)
@@ -1870,7 +1869,8 @@ class SessionResourceRegistry:
                 if (edge == ("running", None) or alerting) and _structured_status_active()
                 else None
             )
-            input_box_visible = probe(session_id, instance)
+            # Shell mode and the history search count: the person is typing there.
+            input_box_visible = claude_pane_input_box_shown(instance.last_pane_text() or "")
             hidden_too_long = watch.observe(
                 input_box_visible=input_box_visible, running_turn=running_turn
             )
@@ -1936,10 +1936,10 @@ class SessionResourceRegistry:
                                 stage="native_input",
                             ),
                         )
-            if hidden_input_box_watch is not None and input_ready_probe is not None:
+            if hidden_input_box_watch is not None:
                 # The alert is advisory; a probe failure must not stop the watcher.
                 try:
-                    _check_hidden_input_box(input_ready_probe, hidden_input_box_watch)
+                    _check_hidden_input_box(hidden_input_box_watch)
                 except Exception:
                     _logger.debug(
                         "Hidden input box check failed",

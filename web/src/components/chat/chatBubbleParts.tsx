@@ -72,6 +72,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
@@ -506,12 +507,6 @@ function useAgentTurnActive(): boolean {
 function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
   return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
 }
-
-/**
- * Runner's `blockedOn` reason when the agent still reads as working but its
- * terminal shows something it did not report, e.g. a dialog opened mid-reply.
- */
-export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
 
 /**
  * The label shown next to the working shimmer. When the agent is parked on a

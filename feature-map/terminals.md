@@ -32,7 +32,9 @@ reattach when the session moves to another host.
   says so and routes the user to the terminal. When Claude Code still reports a
   running turn but its input box has been hidden for 15 seconds (for example a
   dialog opened while a reply streams), chat says something in the terminal may
-  need input until the input box returns.
+  need input, and the sidebar shows "Needs response" with a tooltip saying it may
+  need input, until the input box returns. `!` shell mode and the ctrl+r history
+  search keep the input box in use, so they do not count as hidden.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -181,8 +183,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e/test_claude_native_hidden_prompt_e2e.py::test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal`
   (real Claude Code and tmux against a slow local Messages API; needs `claude`
   on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
-  (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery'`) and the
-  label in `web/src/pages/ChatPage.test.ts`.
+  (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery or
+  input_box_in_another_mode'`), the pane matrix in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py`
+  (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
+  `web/src/components/SessionStateBadge.test.tsx`.
   For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).

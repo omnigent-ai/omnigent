@@ -12005,6 +12005,21 @@ _REVERSE_SEARCH_PANE = """\
   ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
 """
 
+# The same search as Claude Code 2.1.295 draws it mid-reply, under the
+# full-width rule that replaces the input box. Widths shortened.
+_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s · ↓ 50 tokens)
+──────────────────────────────────────────────────────────────────────
+  Search prompts · everywhere
+                                  ╭──────────────────────────────╮
+                                  │ Write a long reply.          │
+  ❯ 24s ago  Write a long reply.  ╰──────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────╮
+  │ ⌕ Filter history…                                            │
+  ╰──────────────────────────────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+
 # The same ctrl+r search as Claude Code 2.1.212 renders it: the search rides
 # the framed composer as its filter field, so the frame and ❯ glyph read
 # exactly like a free input box — only the lowercase footer under the
@@ -14735,6 +14750,46 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
     assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_IDLE_PANE, True),
+        (_SHELL_MODE_PANE, True),
+        (_INLINE_REVERSE_SEARCH_PANE, True),
+        (_REVERSE_SEARCH_PANE, True),
+        (_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_SLIVER_MULTILINE_DRAFT_PANE, True),
+        (_MODEL_PICKER_PANE, False),
+        (_EFFORT_DIALOG_PANE, False),
+        (_PERMISSION_PROMPT_PANE, False),
+        (_REWIND_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+        ("", False),
+    ],
+    ids=[
+        "idle",
+        "shell-mode",
+        "inline-history-search",
+        "history-search",
+        "history-search-overlay",
+        "sliver-draft",
+        "model-picker",
+        "effort-dialog",
+        "permission-prompt",
+        "rewind",
+        "settings-panel",
+        "empty",
+    ],
+)
+def test_claude_pane_input_box_shown_counts_every_input_mode(pane: str, expected: bool) -> None:
+    """
+    Shell mode and the history search keep the person at the input box.
+
+    Only a dialog or panel drawn in its place means the terminal may need them.
+    """
+    assert claude_native_bridge.claude_pane_input_box_shown(pane) is expected
 
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:

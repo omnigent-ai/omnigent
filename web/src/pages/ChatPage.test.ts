@@ -47,7 +47,7 @@ import {
   WORKING_MESSAGES,
   workingIndicatorLabel,
 } from "./ChatPage";
-import { TERMINAL_PROMPT_BLOCKED_ON } from "@/components/chat/chatBubbleParts";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { modelPickerKindForConv } from "@/lib/composerCapabilities";
 import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
