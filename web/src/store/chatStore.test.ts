@@ -1635,6 +1635,35 @@ describe("chatStore — switchTo", () => {
     ]);
   });
 
+  it("does not restore a snapshot pending_input that a Stop settled before the items page arrived", async () => {
+    // The session metadata lists two queued inputs. Stop settles the first while
+    // the items page is still loading; hydration must not bring that bubble back.
+    seedSession("conv_settled_cold", []);
+    seedPendingInputs("conv_settled_cold", [
+      { pending_id: "pending_settled", content: [{ type: "input_text", text: "before stop" }] },
+      { pending_id: "pending_live", content: [{ type: "input_text", text: "after stop" }] },
+    ]);
+    let releaseItems: () => void = () => {};
+    const itemsReleased = new Promise<void>((resolve) => {
+      releaseItems = resolve;
+    });
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("/v1/sessions/conv_settled_cold/items")) await itemsReleased;
+      return defaultFetchHandler(input, init);
+    });
+
+    const switching = useChatStore.getState().switchTo("conv_settled_cold");
+    await tick();
+    useChatStore.getState().dropPendingUserMessages("conv_settled_cold", ["pending_settled"]);
+    releaseItems();
+    await switching;
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      { tempId: "pending_live", content: [{ type: "input_text", text: "after stop" }] },
+    ]);
+  });
+
   it("keeps a pending_input matching a committed message that the transcript reformatted", async () => {
     // The native transcript can prepend markers/blockquotes, so the
     // committed text is a superset of the POSTed text. Containment (not

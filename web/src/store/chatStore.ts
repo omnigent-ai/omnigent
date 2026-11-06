@@ -5310,7 +5310,11 @@ async function bindStream(
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
+        // A Stop that landed while this fetch was in flight already settled
+        // these entries; the metadata captured before it still lists them.
+        const serverPending = (session.pendingInputs ?? [])
+          .filter((p) => !state.stoppedPendingIds.includes(p.pendingId))
+          .map(toPending);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
