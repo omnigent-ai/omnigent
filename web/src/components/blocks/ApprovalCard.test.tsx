@@ -1,8 +1,19 @@
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  within,
+} from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import type { ClaudeQuestion, ClaudeQuestionOption } from "@/lib/askUserQuestion";
 import {
@@ -10,6 +21,7 @@ import {
   clearAskUserQuestionDraft,
   getAskUserQuestionDraft,
 } from "@/lib/askUserQuestionDrafts";
+import type { AnyBlock } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { buildBubbles, type RenderItem } from "@/lib/renderItems";
 import { parseEventLines } from "@/lib/sse";
@@ -41,6 +53,104 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /approve/i })).toBeDefined();
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
     expect(screen.queryByTestId("approval-card-options")).toBeNull();
+  });
+
+  describe("the approve chord in the Approve button tooltip", () => {
+    const pending = (elicitationId: string, requestedSchema: object = {}) => ({
+      type: "elicitation",
+      elicitationId,
+      status: "pending",
+      requestedSchema,
+    });
+    const FIELD_SCHEMA = {
+      type: "object",
+      properties: { branch: { type: "string" } },
+      required: ["branch"],
+    };
+
+    afterEach(() => {
+      useChatStore.setState({ blocks: [] });
+    });
+
+    it.each([
+      {
+        name: "shows on the prompt the chord approves",
+        bound: true,
+        blocks: [pending("elic_chord")],
+        keys: [MOD_KEY, ENTER_KEY],
+      },
+      {
+        name: "hides on an older prompt, since the chord approves the newer one",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        keys: [],
+      },
+      {
+        name: "hides on an older approval behind a newer form",
+        bound: true,
+        blocks: [pending("elic_chord"), pending("elic_form", FIELD_SCHEMA)],
+        keys: [],
+      },
+      {
+        name: "hides where nothing binds the chord, as on the standalone approval page",
+        bound: false,
+        blocks: [pending("elic_chord")],
+        keys: [],
+      },
+    ])("$name", async ({ bound, blocks, keys }) => {
+      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      if (bound) renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Approve" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Approve");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+    });
+
+    it.each([
+      { name: "the prompt Esc declines", blocks: [pending("elic_chord")], keys: [ESC_KEY] },
+      {
+        name: "an older prompt",
+        blocks: [pending("elic_chord"), pending("elic_newer")],
+        keys: [],
+      },
+    ])("names Esc on the Reject button of $name only", async ({ blocks, keys }) => {
+      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      renderHook(() => useApproveHotkey());
+      render(
+        <ApprovalCard
+          elicitationId="elic_chord"
+          message="Approve running ls?"
+          phase="tool_call"
+          policyName="approve_shell_commands"
+          contentPreview="ls"
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+        />,
+      );
+      fireEvent.pointerMove(screen.getByRole("button", { name: "Reject" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByRole("tooltip");
+      expect(tooltip).toHaveTextContent("Reject");
+      const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+      expect(shown.map((key) => key.textContent)).toEqual(keys);
+    });
   });
 
   it("shows the harness name instead of the synthetic policy stamp on native prompts", () => {
@@ -1963,6 +2073,159 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
   });
 });
 
+describe("ApprovalCard — file edit diff", () => {
+  const editInput = {
+    file_path: "/repo/config.py",
+    old_string: "TIMEOUT = 30\nRETRIES = 3\n",
+    new_string: "TIMEOUT = 60\nRETRIES = 3\n",
+    replace_all: false,
+  };
+  const props = {
+    elicitationId: "elic_edit",
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: `Edit(${JSON.stringify(editInput)})`,
+    requestedSchema: {},
+    status: "pending" as const,
+    response: null,
+  };
+
+  it("shows a gated edit from the event stream as a diff in place of its JSON", () => {
+    const events = parseEventLines([
+      JSON.stringify({
+        event: "response.elicitation_request",
+        data: {
+          type: "response.elicitation_request",
+          elicitation_id: props.elicitationId,
+          params: {
+            mode: "form",
+            message: props.message,
+            phase: props.phase,
+            policy_name: props.policyName,
+            content_preview: props.contentPreview,
+            requestedSchema: {},
+            file_edit: { tool_name: "Edit", tool_input: editInput },
+          },
+        },
+      }),
+    ]);
+    const bubble = buildBubbles(new BlockStream().reduceSync([...events]), null)[0];
+    if (bubble.kind !== "assistant") throw new Error("Expected an assistant bubble");
+    const item = bubble.items[0];
+    if (item.kind !== "elicitation") throw new Error("Expected an elicitation card");
+
+    const { container } = render(
+      <TooltipProvider>
+        <ElicitationCard item={item} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/config.py+1-1");
+    expect(container.textContent).toContain("-TIMEOUT = 30");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(container.textContent).not.toContain('"old_string"');
+    expect(screen.getByRole("button", { name: /^approve$/i })).toBeInTheDocument();
+  });
+
+  it("shows a write over a file as its full content", () => {
+    const content = "# Notes\n";
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          message="Claude wants to call **Write**"
+          contentPreview="Write({...})"
+          fileEdit={{ toolName: "Write", toolInput: { file_path: "/repo/notes.md", content } }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    expect(container.textContent).toContain("# Notes");
+  });
+
+  it("says when an edit in a batch replaces every occurrence", () => {
+    // WHY: the diff renders a replace-all edit the same as a single replacement.
+    const edits = [
+      { old_string: "a", new_string: "b" },
+      { old_string: "c", new_string: "d" },
+    ];
+    const note = /replaces every occurrence/i;
+    const renderBatch = (batch: Record<string, unknown>[]) =>
+      render(
+        <TooltipProvider>
+          <ApprovalCard
+            {...props}
+            message="Claude wants to call **MultiEdit**"
+            contentPreview="MultiEdit({...})"
+            fileEdit={{
+              toolName: "MultiEdit",
+              toolInput: { file_path: "/repo/a.py", edits: batch },
+            }}
+          />
+        </TooltipProvider>,
+      );
+
+    renderBatch(edits);
+    expect(screen.queryByText(note)).toBeNull();
+    cleanup();
+    renderBatch([edits[0]!, { ...edits[1]!, replace_all: true }]);
+    expect(screen.getByText(note)).toBeVisible();
+  });
+
+  it("shows the full request on demand", () => {
+    render(
+      <TooltipProvider>
+        <ApprovalCard {...props} fileEdit={{ toolName: "Edit", toolInput: editInput }} />
+      </TooltipProvider>,
+    );
+
+    expect(screen.queryByTestId("tool-value-view")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show request" }));
+    expect(screen.getByTestId("tool-value-view")).toHaveTextContent("Replace allNo");
+  });
+
+  it("previews a long diff and expands it in full", () => {
+    const oldLines = Array.from({ length: 120 }, (_, i) => `old ${i}`);
+    const newLines = Array.from({ length: 120 }, (_, i) => `new ${i}`);
+    const { container } = render(
+      <TooltipProvider>
+        <ApprovalCard
+          {...props}
+          fileEdit={{
+            toolName: "Edit",
+            toolInput: {
+              file_path: "/repo/big.py",
+              old_string: oldLines.join("\n"),
+              new_string: newLines.join("\n"),
+            },
+          }}
+        />
+      </TooltipProvider>,
+    );
+
+    expect(container.textContent).not.toContain("+new 119");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+new 119");
+  });
+
+  it.each([
+    { label: "no file edit", fileEdit: null },
+    { label: "an unsupported tool", fileEdit: { toolName: "NotebookEdit", toolInput: editInput } },
+    {
+      label: "an edit with no change",
+      fileEdit: { toolName: "Edit", toolInput: { ...editInput, new_string: editInput.old_string } },
+    },
+  ])("keeps the JSON preview for $label", ({ fileEdit }) => {
+    const { container } = render(<ApprovalCard {...props} fileEdit={fileEdit} />);
+
+    expect(container.textContent).toContain('"old_string"');
+    expect(screen.queryByRole("button", { name: "Copy diff" })).toBeNull();
+  });
+});
+
 describe("ApprovalCard — resolved-elsewhere pill", () => {
   const props = {
     elicitationId: "elic_auto",
@@ -2345,4 +2608,72 @@ describe("Kiro approval delivery", () => {
       native_delivery_attempt: "reject-attempt",
     });
   });
+});
+
+describe("question custom selection and editing", () => {
+  it.each([false, true])(
+    "retains edited text and selections across navigation (multi=%s)",
+    async (multiSelect) => {
+      const user = userEvent.setup();
+      const submit = vi.fn().mockResolvedValue(undefined);
+      useChatStore.setState({ conversationId: "conv_custom", submitApproval: submit });
+      render(
+        <ApprovalCard
+          elicitationId="custom-focus"
+          message="Choose"
+          phase="pre_tool_use"
+          policyName="claude_native_permission"
+          contentPreview=""
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          askUserQuestion={{
+            questions: [
+              { question: "First", options: [{ label: "Preset" }], multiSelect },
+              { question: "Second", options: [{ label: "Done" }], multiSelect: false },
+            ],
+          }}
+        />,
+      );
+      expect(screen.getByRole("button", { name: "Prev" })).toBeDisabled();
+      await user.click(screen.getByLabelText("Preset"));
+      const toggle = screen.getByRole(multiSelect ? "checkbox" : "radio", {
+        name: "Select custom answer",
+      });
+      const editor = screen.getByRole("textbox", { name: "Custom answer" });
+      const selectionLabel = toggle.closest("label")!;
+      expect(selectionLabel).not.toContainElement(editor);
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).not.toBeChecked();
+      await user.click(selectionLabel);
+      expect(toggle).toBeChecked();
+      expect(editor).not.toHaveFocus();
+      if (multiSelect) {
+        await user.click(selectionLabel);
+        expect(toggle).not.toBeChecked();
+        await user.click(selectionLabel);
+        expect(toggle).toBeChecked();
+      }
+      await user.click(editor);
+      expect(editor).toHaveFocus();
+      expect(toggle).toBeChecked();
+      await user.type(editor, "Custom text");
+      expect(submit).not.toHaveBeenCalled();
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByLabelText("Done")).toBeChecked();
+      expect(screen.getByRole("button", { name: "Submit" })).toBeEnabled();
+      await user.click(screen.getByLabelText("Done"));
+      await user.click(screen.getByRole("button", { name: "Prev" }));
+      expect(screen.getByRole("textbox", { name: "Custom answer" })).toHaveValue("Custom text");
+      expect(screen.getByTestId("ask-user-question-custom-toggle")).toBeChecked();
+      expect(screen.getByLabelText("Preset").matches(":checked")).toBe(multiSelect);
+      await user.click(screen.getByRole("button", { name: "Next" }));
+      await user.click(screen.getByRole("button", { name: "Submit" }));
+      expect(submit).toHaveBeenCalledExactlyOnceWith("custom-focus", "accept", {
+        First: multiSelect ? ["Preset", "Custom text"] : "Custom text",
+        Second: "Done",
+      });
+    },
+  );
 });

@@ -11,6 +11,7 @@ import {
   derivePermissionLevel,
   getSessionOwner,
   grantPermission,
+  isOwnerLevel,
   listPermissions,
   revokePermission,
 } from "@/lib/permissionsApi";
@@ -95,6 +96,19 @@ export function useCanEdit(conversationId: string): boolean {
     );
     return permissionLevel == null || permissionLevel >= 2;
   }, [conversationsData, conversationId, activeSession, sessionLoading]);
+}
+
+/**
+ * Whether the viewer can start side chats in a session: only the owner of its
+ * root can. Uses the server's answer, falling back to the viewer's permission
+ * level for servers that don't send one.
+ */
+export function useCanStartSideChat(
+  sessionId: string | null | undefined,
+  permissionLevel: number | null,
+): boolean {
+  const { session, isLoading } = useSession(sessionId);
+  return session?.sideChatAllowed ?? (!isLoading && isOwnerLevel(permissionLevel));
 }
 
 export type { Permission };

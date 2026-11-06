@@ -6,7 +6,10 @@
 // native CLI; a mode whose `args` are empty sends no flags (the CLI keeps its
 // own configured default). Keep in sync with each CLI's `--help`.
 
-import { CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE } from "@/lib/claudePermissionMode";
+import {
+  CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE,
+  CLAUDE_NATIVE_PERMISSION_MODES,
+} from "@/lib/claudePermissionMode";
 
 /** One selectable mode: value + label + blurb + the CLI flags it maps to. */
 export interface NativeHarnessMode {
@@ -88,13 +91,13 @@ export const AGY_NATIVE_DEFAULT_SKIP_MODE = "default";
 export const AGY_NATIVE_SKIP_VALUE = "skip";
 export const AGY_NATIVE_SKIP_MODES: NativeHarnessMode[] = [
   {
-    value: AGY_NATIVE_DEFAULT_SKIP_MODE,
+    value: "default",
     label: "Ask every time",
     description: "Prompts before each tool runs",
     args: [],
   },
   {
-    value: AGY_NATIVE_SKIP_VALUE,
+    value: "skip",
     label: "Skip permissions",
     description: "Runs everything; no prompts or safety checks",
     args: ["--dangerously-skip-permissions"],
@@ -225,8 +228,41 @@ export const CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY = "omnigent.codex_native.bypa
 // terminal_launch_args, so its `args` are empty and it's handled specially.
 export const CODEX_NATIVE_BYPASS_APPROVAL_VALUE = "bypass";
 export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
-  value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  value: "bypass",
   label: "Bypass approvals & sandbox",
   description: "Runs Codex with no approval prompts and no command sandbox",
   args: [],
 };
+
+/**
+ * Modes automations cannot use: a scheduled run has nobody to answer a prompt,
+ * so it needs an approval gate. Mirrors UNATTENDED_DISALLOWED_PERMISSION_MODES
+ * in omnigent/native/permission_modes.py.
+ */
+export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new Set([
+  "bypassPermissions",
+  "dontAsk",
+  "full-access",
+  "bypass",
+  "yolo",
+  "skip",
+  "dangerous",
+]);
+
+/** Create-time permission choices shared by New Chat and automations. */
+export function nativePermissionOptions(harness: string | null | undefined) {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_PERMISSION_MODES;
+    case "codex-native":
+      return [...CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_BYPASS_APPROVAL_OPTION];
+    case "cursor-native":
+      return CURSOR_NATIVE_EXEC_MODES;
+    case "antigravity-native":
+      return AGY_NATIVE_SKIP_MODES;
+    case "devin-native":
+      return DEVIN_NATIVE_PERMISSION_MODES;
+    default:
+      return [];
+  }
+}

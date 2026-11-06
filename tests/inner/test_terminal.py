@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -2376,7 +2377,7 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 ) -> None:
     """Managed-terminal preflight accepts tmux 3.3 and newer."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     terminal_mod._require_supported_tmux()
 
@@ -2393,6 +2394,8 @@ def test_require_supported_tmux_rejects_missing_binary(
     assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
     assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
     assert "brew install tmux" in str(caught.value)
+    # Desktop hosts keep the app's startup PATH, so restarting the host alone can't help.
+    assert "quit and reopen the Omnigent app" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2409,9 +2412,25 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
 ) -> None:
     """Managed terminals fail early unless tmux 3.3 support is confirmed."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_treats_undecodable_version_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``tmux -V`` that prints invalid UTF-8 still fails as a clear host setup error."""
+    tmux = tmp_path / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(
+        terminal_mod.TmuxUnavailableError, match="Could not determine the installed tmux version"
+    ):
         terminal_mod._require_supported_tmux()
 
 
