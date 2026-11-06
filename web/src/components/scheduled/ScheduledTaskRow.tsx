@@ -42,6 +42,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
+import { ProjectRowIcon } from "@/shell/ProjectPicker";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
 import { isTriggerPrompt } from "./triggerTemplates";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -49,6 +50,7 @@ import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
 export function ScheduledTaskRow({
   task,
+  project,
   now,
   onEdit,
   onPauseToggle,
@@ -57,6 +59,8 @@ export function ScheduledTaskRow({
   busy,
 }: {
   task: ScheduledTask;
+  /** The task's resolved project; omitted when unfiled, unresolved, or redundant. */
+  project?: { name: string; icon?: string | null };
   // The current wall-clock time, supplied by the parent's shared `useNow` ticker
   // so the relative next-run label ("in 3 hours") re-renders and stays fresh as
   // time passes. Passed in (not read here) to keep the row a pure function of
@@ -114,6 +118,15 @@ export function ScheduledTaskRow({
             className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
           >
             Paused
+          </span>
+        )}
+        {project && (
+          <span
+            data-testid="task-project-chip"
+            className="flex min-w-0 shrink items-center gap-1 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+          >
+            <ProjectRowIcon icon={project.icon} className="size-3 text-[11px]" />
+            <span className="truncate">{project.name}</span>
           </span>
         )}
       </span>
