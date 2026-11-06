@@ -308,6 +308,23 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
   );
 }
 
+describe("Composer focus handle", () => {
+  it("takes focus for typing, unless disabled or read-only", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).toHaveFocus();
+
+    textarea().blur();
+    rerender(<Composer {...composerProps({ disabled: true })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+    rerender(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
+    act(() => ref.current?.focus());
+    expect(textarea()).not.toHaveFocus();
+  });
+});
+
 describe("Composer Escape interrupt", () => {
   beforeEach(() => {
     clearSessionDrafts();
@@ -767,8 +784,6 @@ describe("Composer send shortcut", () => {
     [false, "{Shift>}{Enter}{/Shift}"],
     [true, "{Enter}"],
     [true, "{Shift>}{Enter}{/Shift}"],
-    [false, "{Alt>}{Enter}{/Alt}"],
-    [true, "{Alt>}{Enter}{/Alt}"],
   ] as const)("preserves newline input (alternate send: %s, keys: %s)", async (alternate, keys) => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, String(alternate));
     const onSend = vi.fn();
@@ -840,6 +855,16 @@ describe("Composer send shortcut", () => {
     } finally {
       restorePointer();
     }
+  });
+
+  it("leaves an open slash menu's highlighted command alone on Alt+Enter", () => {
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    fireEvent.change(textarea(), { target: { value: "/des" } });
+
+    fireEvent.keyDown(textarea(), { key: "Enter", altKey: true });
+    expect(textarea().value).toBe("/des");
+    expect(onSend).not.toHaveBeenCalled();
   });
 
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {

@@ -177,7 +177,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
-  Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
+  Shift+Enter inserts a newline in both composers. The
   Inbox reply box follows the same shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
@@ -190,8 +190,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
-  opens and focuses the new-session composer in browsers. Native shells retain
-  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+  opens and focuses the new-session composer in browsers. Native shells use
+  ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
@@ -722,8 +722,7 @@ Other connection providers alone do not enable the managed MCP picker.
   Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
   to restore the previous draft.
 - **`send-shortcut`:**
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`
 - **`list-formatting`, both composers:** no browser-level coverage; the list
   cases in `web/src/components/composer/ChatComposer.test.tsx`
   (`pnpm --dir web test`). Manually: type `1.` then Space and expect ` 1.`;
