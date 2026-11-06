@@ -78,7 +78,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
                 return httpx.Response(503)
             if capability == "invalid_json":
                 return httpx.Response(200, text="Unavailable")
-            info = {"request_managed_sandbox_host_id": True}
+            info = {"request_managed_sandbox_host_id": True, "sibling_sessions": True}
             if capability != "missing":
                 info["features"] = {
                     "enabled": {"sandbox_profiles": True},
@@ -91,7 +91,9 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
             return httpx.Response(202, json={"queued": True})
         if request.method == "GET":
             return httpx.Response(200, json={"id": session_id, "parent_session_id": "manager"})
-        return httpx.Response(201, json={"id": session_id, "agent_id": "worker"})
+        return httpx.Response(
+            201, json={"id": session_id, "agent_id": "worker", "family": {"id": "manager"}}
+        )
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), base_url="http://server"
@@ -150,6 +152,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert requests[0].url.path == "/v1/sessions/orchestrated"
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert result["kind"] == "default"
+        assert result["family"] == {"id": "manager"}
         assert result["agent_id"] == "worker"
         assert len(requests) == (2 if placement == "same_host" else 1)
         assert result["title"] == "Worker task"
@@ -181,7 +185,7 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
     def unsupported(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={})
+            return httpx.Response(200, json={"sibling_sessions": True})
         requests.append(request)
         return httpx.Response(status, json={"detail": "Unsupported route"})
 
@@ -244,6 +248,8 @@ async def test_same_host_first_task_failure_returns_created_session(status):
     requests = []
 
     def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"sibling_sessions": True})
         requests.append(request)
         if request.url.path.endswith("/events"):
             if status == "policy_denied":
@@ -292,7 +298,10 @@ async def test_independent_creation_uncertain_result_is_not_retried(
 
     def respond(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"request_managed_sandbox_host_id": reserves_host})
+            return httpx.Response(
+                200,
+                json={"request_managed_sandbox_host_id": reserves_host, "sibling_sessions": True},
+            )
         requests.append(request)
         assert request.url.path == "/v1/sessions/orchestrated"
         if isinstance(failure, int):
@@ -603,7 +612,9 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
 
     def respond(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"request_managed_sandbox_host_id": supported})
+            return httpx.Response(
+                200, json={"request_managed_sandbox_host_id": supported, "sibling_sessions": True}
+            )
         requests.append((dict(request.headers), json.loads(request.content)))
         if len(requests) == 1:
             return httpx.Response(401)
@@ -629,3 +640,43 @@ async def test_managed_create_routes_to_reserved_host_through_auth_retry(monkeyp
     headers, body = requests[-1]
     assert headers.get(OMNIGENT_SLICE_KEY_HEADER.lower()) == body.get("host_id")
     assert ("host_id" in body) is supported
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize("capability", [None, False, True])
+async def test_independent_creation_supports_disabled_or_missing_sibling_capability(
+    placement, capability
+):
+    paths = []
+    session_id = uuid4().hex
+    family = {"id": "manager"} if capability is True else None
+
+    def handle(request):
+        paths.append(request.url.path)
+        if request.url.path == "/v1/info":
+            return httpx.Response(
+                200, json={} if capability is None else {"sibling_sessions": capability}
+            )
+        assert request.url.path == "/v1/sessions/orchestrated"
+        assert request.headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
+        assert "parent_session_id" not in json.loads(request.content)
+        return httpx.Response(201, json={"id": session_id, "family": family})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": placement}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "error" not in result, result
+    assert result["conversation_id"] == session_id
+    assert result["kind"] == "default"
+    assert result["family"] == family
+    assert paths.count("/v1/sessions/orchestrated") == 1
+    assert "/v1/sessions" not in paths

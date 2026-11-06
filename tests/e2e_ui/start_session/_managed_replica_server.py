@@ -58,7 +58,7 @@ class LocalManagedHost(SandboxHostLauncher):
         self.provisioning = threading.Event()
         # Set to make the next provision fail like a cloud allocation error.
         self.fail_provision = False
-        self.process: subprocess.Popen[bytes] | None = None
+        self.processes: dict[str, subprocess.Popen[bytes]] = {}
 
     def prepare(self) -> None:
         pass
@@ -88,12 +88,14 @@ class LocalManagedHost(SandboxHostLauncher):
         # Stands in for the ingress routing the host's tunnel by its key: a host
         # keyed by its id reaches B, an unkeyed one the default replica.
         url = self.keyed_url if keyed else self.unkeyed_url
-        workspace = self.root / "workspace"
+        host_root = self.root / "sandboxes" / sandbox_id
+        host_root.mkdir(parents=True, exist_ok=True)
+        workspace = host_root / "workspace"
         workspace.mkdir(exist_ok=True)
         if on_stage:
             on_stage("starting")
-        with (self.root / "host.log").open("w") as log:
-            self.process = subprocess.Popen(
+        with (host_root / "host.log").open("w") as log:
+            self.processes[sandbox_id] = subprocess.Popen(
                 [
                     sys.executable,
                     "-m",
@@ -105,6 +107,8 @@ class LocalManagedHost(SandboxHostLauncher):
                 ],
                 env={
                     **os.environ,
+                    "OMNIGENT_CONFIG_HOME": str(host_root / "config"),
+                    "OMNIGENT_DATA_DIR": str(host_root / "data"),
                     "OMNIGENT_HOST_ID": host_id,
                     "OMNIGENT_HOST_NAME": host_name,
                     "OMNIGENT_HOST_TOKEN": token,
@@ -116,9 +120,11 @@ class LocalManagedHost(SandboxHostLauncher):
         return str(workspace)
 
     def terminate(self, sandbox_id: str) -> None:
-        if self.process is not None:
-            terminate(self.process)
-            self.process = None
+        ids = [sandbox_id] if sandbox_id else list(self.processes)
+        for identifier in ids:
+            process = self.processes.pop(identifier, None)
+            if process is not None:
+                terminate(process)
 
 
 def replica_app(
@@ -128,12 +134,15 @@ def replica_app(
     from omnigent.runtime import init
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app
+    from omnigent.server.auth import create_auth_provider
     from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
     from omnigent.stores.host_store import HostStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -185,7 +194,10 @@ def replica_app(
         artifact_store=artifacts,
         agent_cache=cache,
         host_store=HostStore(uri),
+        auth_provider=create_auth_provider(),
+        permission_store=SqlAlchemyPermissionStore(uri),
         scheduled_task_store=SqlAlchemyScheduledTaskStore(uri),
+        project_store=SqlAlchemyProjectStore(uri),
         extra_routers=[(control, "/__test", ["test-control"])],
         sandbox_config=ManagedSandboxDeployment.single(
             ManagedSandboxConfig(
