@@ -15,6 +15,7 @@ from omnigent.server.feature_flags import (
     FeatureFlags,
     resolve_feature_flags,
 )
+from omnigent.server.sharing_settings import write_peer_session_messaging_override
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
@@ -38,7 +39,8 @@ pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture(autouse=True)
-def orchestration_environment(monkeypatch, request):
+def orchestration_environment(monkeypatch, request, tmp_path):
+    monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     features = getattr(request, "param", None)
     monkeypatch.setenv("OMNIGENT_FEATURES", f"sibling_sessions,{features or ''}")
     return features
@@ -112,7 +114,6 @@ async def test_private_sender_can_message_shared_receiver(
         ("-peer_session_messaging", None, "Messaging other sessions is disabled"),
         ("peer_session_messaging", None, None),
         (None, None, None),
-        (None, "-peer_session_messaging", "disabled on this runner"),
         (
             "-peer_session_messaging",
             "peer_session_messaging",
@@ -135,6 +136,27 @@ async def test_peer_messaging_needs_server_and_runner_flags(
         return
     assert refusal in result.get("detail", result.get("error", "")), result
     assert not captured.get("posts")
+
+
+async def test_admin_can_disable_and_restore_peer_messaging(auth_client, peers, db_uri):
+    source, target, captured = peers
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("admin", is_admin=True)
+    admin_headers = {"X-Forwarded-Email": "admin"}
+    for enabled in (False, True):
+        response = await auth_client.put(
+            "/v1/sharing",
+            headers=admin_headers,
+            json={"peer_session_messaging": enabled},
+        )
+        assert response.status_code == 200, response.text
+        captured.clear()
+        result = await _send(auth_client, source, target)
+        if enabled:
+            assert result.get("queued") is True, result
+        else:
+            assert "Messaging other sessions is disabled" in result["detail"]
+            assert not captured.get("posts")
 
 
 async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, peers, db_uri):
@@ -283,8 +305,9 @@ async def test_editor_beyond_first_grant_page_blocks_controls(auth_client, peers
     assert (await auth_client.post("/v1/sessions", json=metadata)).status_code == 403
 
 
+@pytest.mark.parametrize("restriction", ["sharing", "admin_messaging"])
 async def test_sharing_during_receiver_startup_blocks_delivery(
-    auth_client, peers, db_uri, monkeypatch
+    auth_client, peers, db_uri, monkeypatch, restriction
 ):
     from omnigent.server.routes import sessions
 
@@ -293,7 +316,10 @@ async def test_sharing_during_receiver_startup_blocks_delivery(
     permissions.ensure_user("bob")
 
     async def share_while_starting(*args, **kwargs):
-        permissions.grant("bob", source["id"], LEVEL_EDIT)
+        if restriction == "sharing":
+            permissions.grant("bob", source["id"], LEVEL_EDIT)
+        else:
+            write_peer_session_messaging_override(False)
 
     monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", share_while_starting)
     result = await _send(auth_client, source, target)

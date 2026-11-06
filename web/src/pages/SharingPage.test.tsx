@@ -51,6 +51,8 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
     default_public_sessions: "off",
     default_public_sessions_editable: true,
     default_public_sessions_options: ["off", "sandbox", "all"],
+    peer_session_messaging_enabled: true,
+    peer_session_messaging_editable: true,
     ...overrides,
   };
 }
@@ -439,6 +441,76 @@ describe("SharingPage", () => {
       expect(radios.every((r) => !r.disabled)).toBe(true);
       expect(radios.find((r) => r.value === "all")!.checked).toBe(true);
       expect(screen.queryByText(/to change the default visibility/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe("peer session messaging", () => {
+    const TOGGLE = "Message other sessions";
+
+    it.each([true, false])(
+      "changes messaging independently of sharing mode (enabled=%s)",
+      async (enabled) => {
+        setSharingState(state({ sharing_mode: "off", peer_session_messaging_enabled: enabled }));
+        renderPage();
+        const toggle = await screen.findByRole("switch", { name: TOGGLE });
+        expect(toggle).toBeEnabled();
+        expect(toggle).toHaveAttribute("aria-checked", String(enabled));
+        expect(toggle).toHaveAccessibleDescription(/child-session messaging is unchanged/);
+        fireEvent.click(toggle);
+        expect(setModeMutate).toHaveBeenCalledWith(
+          { peer_session_messaging: !enabled },
+          expect.anything(),
+        );
+      },
+    );
+
+    it.each(["deployment", "pending"])(
+      "disables messaging changes when %s blocks them",
+      async (blocker) => {
+        setSharingState(
+          state({
+            peer_session_messaging_enabled: false,
+            peer_session_messaging_editable: blocker !== "deployment",
+          }),
+        );
+        if (blocker === "pending") {
+          vi.mocked(sharingHook.useSetSharing).mockReturnValue({
+            mutate: setModeMutate,
+            isPending: true,
+          } as unknown as ReturnType<typeof sharingHook.useSetSharing>);
+        }
+        renderPage();
+        const toggle = await screen.findByRole("switch", { name: TOGGLE });
+        expect(toggle).toBeDisabled();
+        expect(toggle).not.toBeChecked();
+        if (blocker === "deployment") {
+          expect(toggle).toHaveAccessibleDescription(/Disabled by this deployment/);
+        }
+        fireEvent.click(toggle);
+        expect(setModeMutate).not.toHaveBeenCalled();
+      },
+    );
+
+    it("hides the control when the server does not support it", async () => {
+      setSharingState(
+        state({
+          peer_session_messaging_enabled: undefined,
+          peer_session_messaging_editable: undefined,
+        }),
+      );
+      renderPage();
+      await screen.findByRole("combobox", { name: "Session sharing mode" });
+      expect(screen.queryByRole("switch", { name: TOGGLE })).not.toBeInTheDocument();
+    });
+
+    it("keeps the saved setting and reports a failed update", async () => {
+      setSharingState(state());
+      setModeMutate.mockImplementation((_update, { onError }) => onError(new Error("Save failed")));
+      renderPage();
+      const toggle = await screen.findByRole("switch", { name: TOGGLE });
+      fireEvent.click(toggle);
+      expect(screen.getByText("Save failed")).toBeInTheDocument();
+      expect(toggle).toBeChecked();
     });
   });
 

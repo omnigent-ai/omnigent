@@ -14,6 +14,8 @@ redeploy:
   ``<data_dir>/public_sharing_max_level`` (``read`` / ``edit``, default read);
 - which *new* sessions start public: ``OMNIGENT_DEFAULT_PUBLIC_SESSIONS`` →
   ``<data_dir>/default_public_sessions`` (``off`` / ``sandbox`` / ``all``).
+- peer messaging: ``<data_dir>/peer_session_messaging`` (``on`` / ``off``,
+  default on), limited by the deployment's orchestration and messaging flags.
 
 A missing, empty, or unreadable file means "no override recorded", so the caller
 falls back to the env-var default; an unrecognized value is likewise ignored
@@ -38,6 +40,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from omnigent.server.admin_list import resolve_data_dir
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, SharingMode, workspace_sharing_blocked
+from omnigent.server.feature_flags import Feature, FeatureFlags
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,7 @@ _SHARING_MODE_FILE = "sharing_mode"
 _PUBLIC_SHARING_FILE = "public_sharing"
 _PUBLIC_SHARING_MAX_LEVEL_FILE = "public_sharing_max_level"
 _DEFAULT_PUBLIC_SESSIONS_FILE = "default_public_sessions"
+_PEER_SESSION_MESSAGING_FILE = "peer_session_messaging"
 # Public sharing is enabled unless a value explicitly says otherwise, so a typo
 # or a stray value fails OPEN (never silently disables a working feature).
 _PUBLIC_FALSY = ("0", "false", "no", "off")
@@ -245,6 +249,29 @@ def read_public_sharing_override() -> bool | None:
 def write_public_sharing_override(enabled: bool) -> None:
     """Persist the admin public-sharing override atomically."""
     _write_override_text(resolve_public_sharing_path(), "on" if enabled else "off")
+
+
+def peer_session_messaging_available(flags: FeatureFlags) -> bool:
+    """Whether the deployment permits admins to enable peer messaging."""
+    return flags.enabled(Feature.SESSION_ORCHESTRATION) and flags.enabled(
+        Feature.PEER_SESSION_MESSAGING
+    )
+
+
+def peer_session_messaging_enabled(flags: FeatureFlags) -> bool:
+    """Apply the live admin setting within the deployment's limits."""
+    if not peer_session_messaging_available(flags):
+        return False
+    raw = _read_override_text(resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE)
+    # Invalid stored values must not restore messaging after an admin disabled it.
+    return raw is None or raw.lower() == "on"
+
+
+def write_peer_session_messaging_override(enabled: bool) -> None:
+    """Persist the admin messaging setting atomically."""
+    _write_override_text(
+        resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE, "on" if enabled else "off"
+    )
 
 
 def public_sharing_max_level_env_default() -> PublicSharingMaxLevel:
