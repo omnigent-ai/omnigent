@@ -6223,11 +6223,6 @@
             "title": "Request Managed Sandbox Host Id",
             "type": "boolean"
           },
-          "retry_session_wake_only": {
-            "default": true,
-            "title": "Retry Session Wake Only",
-            "type": "boolean"
-          },
           "sandbox_provider": {
             "anyOf": [
               {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
-import { retrySession } from "@/lib/sessionsApi";
+import { ApiError, wakeSession } from "@/lib/sessionsApi";
 
 /**
  * How long to keep showing "Starting sandbox…" after the server reports the
@@ -11,7 +11,8 @@ export const SANDBOX_WAKE_SETTLE_MS = 30_000;
 /** How long the server may take to answer a wake before it counts as failed. */
 export const SANDBOX_WAKE_REQUEST_MS = 5 * 60_000;
 
-export type SandboxWakePhase = "idle" | "waking" | "failed";
+/** `unsupported`: the server can't wake without resuming work, so the view never does. */
+export type SandboxWakePhase = "idle" | "waking" | "failed" | "unsupported";
 
 export interface SandboxAutoWake {
   phase: SandboxWakePhase;
@@ -23,7 +24,7 @@ export interface SandboxAutoWake {
 
 interface WakeAttempt {
   /** `requesting`: the server is resuming it; `settling`: waiting for liveness to agree. */
-  step: "requesting" | "settling" | "failed";
+  step: "requesting" | "settling" | "failed" | "unsupported";
   error: string | null;
   /** Fails an attempt that never answers or that liveness never confirms. */
   timer?: number;
@@ -33,6 +34,7 @@ const PHASE_BY_STEP: Record<WakeAttempt["step"], SandboxWakePhase> = {
   requesting: "waking",
   settling: "waking",
   failed: "failed",
+  unsupported: "unsupported",
 };
 
 // Per session, so an attempt outlives the view that started it: a remounted
@@ -70,7 +72,7 @@ async function startSandboxWake(conversationId: string): Promise<void> {
   setAttemptWithDeadline(conversationId, attempt, SANDBOX_WAKE_REQUEST_MS);
   try {
     // "already_connected" also settles: liveness can lag a runner that is up.
-    await retrySession(conversationId, { wakeOnly: true });
+    await wakeSession(conversationId);
     if (attempts.get(conversationId) !== attempt) return;
     setAttemptWithDeadline(
       conversationId,
@@ -79,6 +81,11 @@ async function startSandboxWake(conversationId: string): Promise<void> {
     );
   } catch (error) {
     if (attempts.get(conversationId) !== attempt) return;
+    // A server without `wake_session` rejects it as an unknown event type.
+    if (error instanceof ApiError && error.status === 400 && error.code === "invalid_input") {
+      setAttempt(conversationId, { step: "unsupported", error: null });
+      return;
+    }
     setAttempt(conversationId, {
       step: "failed",
       error:
@@ -100,8 +107,8 @@ export function resetSandboxWakesForTesting(): void {
 
 /**
  * Wake a session's asleep (`host_asleep`) sandbox once per visible opening, sharing
- * attempts across remounts. A view with cached content needs no wake; the wake-only
- * `retry_session` it sends never resumes agent work.
+ * attempts across remounts. A view with cached content needs no wake; the
+ * `wake_session` it sends never resumes agent work.
  */
 export function useSandboxAutoWake({
   conversationId,

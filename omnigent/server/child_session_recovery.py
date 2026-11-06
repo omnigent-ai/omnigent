@@ -77,29 +77,35 @@ async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> 
         await asyncio.to_thread(store.delete_label, session_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
 
 
-async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
-    """When *session_id* is given work, end its hold and those of ancestors that recover it."""
+async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> bool:
+    """When *session_id* is given work, end its hold and those of ancestors that recover it.
+
+    Returns whether *session_id* itself was held.
+    """
+    held_session = False
     seen: set[str] = set()
     child: Conversation | None = None
     next_id: str | None = session_id
     for _ in range(_RELEASE_MAX_READS):
         if next_id is None or next_id in seen:
-            return
+            break
         conv = await asyncio.to_thread(store.get_conversation, next_id)
         if conv is None or (child is not None and conv.runner_id != child.runner_id):
-            return
+            break
         wake_running = conv.id in _wake_only_retries
         if wake_running:
             _released_during_wake.add(conv.id)
         # A running wake can land its hold after the read above.
         if wake_running or RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels:
             await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
+            held_session = held_session or conv.id == session_id
         # As on runner connect, a hosted child recovers as its own tree.
         if conv.host_id is not None and not is_parent_owned_subagent(conv):
-            return
+            break
         seen.add(conv.id)
         child = conv
         next_id = conv.parent_conversation_id
+    return held_session
 
 
 def reconnect_recovery_deferred(conv: Conversation) -> bool:
@@ -185,25 +191,18 @@ def _restorable(conv: Conversation) -> bool:
     )
 
 
-def failed_by_runner_loss(conv: Conversation) -> bool:
-    """Whether *conv* still shows the failure of a turn its runner's departure interrupted."""
+def _interrupted(conv: Conversation) -> bool:
     from omnigent.server.routes._sessions.common import _session_status_cache
     from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
 
+    status = _session_status_cache.get(conv.id, conv.live_status)
     error = _last_task_error_from_labels(conv.labels)
-    return (
-        _session_status_cache.get(conv.id, conv.live_status) == "failed"
+    return status in {"running", "waiting"} or (
+        status == "failed"
         and error is not None
         and error.get("code")
         in {"runner_disconnected", "runner_failed_to_start", RUNNER_PROCESS_CRASH}
     )
-
-
-def _interrupted(conv: Conversation) -> bool:
-    from omnigent.server.routes._sessions.common import _session_status_cache
-
-    status = _session_status_cache.get(conv.id, conv.live_status)
-    return status in {"running", "waiting"} or failed_by_runner_loss(conv)
 
 
 async def restore_active_children(

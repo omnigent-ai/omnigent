@@ -20,8 +20,8 @@ export interface SandboxWakeHintState {
  *
  * `sandboxOffline`: the session's managed sandbox itself is down (stopped
  * while idle, for example), not just its runner. "The agent is asleep"
- * misreads that, so name the sandbox; a message starts it again. With
- * `wake`, the panel starts the sandbox itself and shows that progress.
+ * misreads that, so name the sandbox; a message starts it again.
+ * Optional `wake` supplies progress, failure, and retry controls.
  */
 export function RunnerAsleepHint({
   sandboxOffline = false,

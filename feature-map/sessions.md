@@ -447,8 +447,9 @@ On a phone only the Files drawer counts as open, not the hidden desktop rail.
 The panel shows **Starting sandbox…**, then the file list; a failed wake shows
 the reason and **Try again**. If the sandbox sleeps again while the panel stays
 open, it shows **Start sandbox** rather than waking again. Read-only viewers,
-sessions whose access level isn't known, and servers that don't advertise
-`retry_session_wake_only` in `/v1/info` keep the send-a-message hint.
+sessions whose access level isn't known, and servers that don't list
+`wake_session` in `/v1/info` `session_event_types` keep the send-a-message
+hint, as does a panel whose wake a server rejects as an unknown event.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -981,7 +982,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`reconnect`, Files view on an asleep sandbox:**
   `tests/e2e_ui/files/test_asleep_sandbox_auto_wake.py` uses the same patch,
   with workspace reads failing until the wake succeeds. It checks that opening
-  Files in the desktop rail sends only a wake-only `retry_session` and then
+  Files in the desktop rail sends only a `wake_session` event and then
   lists the files. A failed wake's Try again, the mobile drawer, and the
   older-server fallback are covered by `web/src/shell/FilesPanel.test.tsx`.
 - **`message-recovery`, native binding races (own environment):**

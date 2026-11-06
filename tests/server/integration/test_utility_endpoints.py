@@ -117,8 +117,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
     assert data["scheduled_task_subhour"] is True
-    # Gates the Files panel's sandbox wake; older servers ignore the flag.
-    assert data["retry_session_wake_only"] is True
     assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
     assert data["agent_detail"] is True
@@ -126,6 +124,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the web's /clear for native sessions; older servers reject it.
     assert data["session_event_types"] == sorted(CLIENT_SESSION_EVENT_TYPES)
     assert "clear" in data["session_event_types"]
+    # Gates the Files panel's sandbox wake; older servers reject it.
+    assert "wake_session" in data["session_event_types"]
     # Browser-posted despite its prefix; runner-only events stay unadvertised.
     assert "external_btw_dismiss" in data["session_event_types"]
     assert "external_output_text_delta" not in data["session_event_types"]

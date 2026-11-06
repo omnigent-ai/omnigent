@@ -258,7 +258,6 @@ describe.each([
   "scheduled_task_subhour",
   "scheduled_task_sandbox_workspaces",
   "scheduled_task_inbox",
-  "retry_session_wake_only",
 ] as const)("resolveServerInfo %s", (capability) => {
   it.each([
     [true, true],

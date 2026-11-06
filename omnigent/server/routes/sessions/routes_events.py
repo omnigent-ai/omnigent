@@ -180,6 +180,7 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_STATUS_TYPE,
+    _WAKE_SESSION_TYPE,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
@@ -386,6 +387,7 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         "message",
         _SLASH_COMMAND_TYPE,
         _RETRY_SESSION_TYPE,
+        _WAKE_SESSION_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _SUBAGENT_STATUS_TYPE,
     }
@@ -777,15 +779,13 @@ async def _recover_retry_session_once(
     """Run one recovery attempt for :func:`_recover_retry_session`."""
     from omnigent.server.child_session_recovery import (
         clear_skipped_resume,
-        failed_by_runner_loss,
         hold_reconnect_recovery,
         note_skipped_resume,
         release_reconnect_recovery,
         skipped_resume_runner,
     )
 
-    if not wake_only:
-        await release_reconnect_recovery(session_id, conversation_store)
+    was_held = not wake_only and await release_reconnect_recovery(session_id, conversation_store)
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
@@ -835,8 +835,8 @@ async def _recover_retry_session_once(
         and conv.runner_id is not None
         and (
             skipped_resume_runner(session_id) == conv.runner_id
-            # A wake leaves the failure in place, so the debt outlives an evicted marker.
-            or (was_connected and failed_by_runner_loss(conv))
+            # The wake's persisted hold outlives an evicted marker.
+            or (was_connected and was_held)
         )
     )
     resumes_wake = (
@@ -1398,6 +1398,9 @@ def register_events_routes(
           the normal message-dispatch relaunch path.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
+        - ``"wake_session"`` reconnects or relaunches it like
+          ``"retry_session"`` but resumes no interrupted turn and retries
+          no startup input.
         - ``"message"`` on an ``omnigent claude`` terminal session
           is forwarded to the bound runner for tmux injection only;
           the accepted prompt is persisted later when Claude records
@@ -1607,6 +1610,7 @@ def register_events_routes(
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
+            _WAKE_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
@@ -1719,7 +1723,7 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if (
-            body.type == _RETRY_SESSION_TYPE
+            body.type in (_RETRY_SESSION_TYPE, _WAKE_SESSION_TYPE)
             or (body.type == "message" and body.data.get("role") == "user")
         ) and await _codex_side_chat_fork_lost(
             conv,
@@ -1735,10 +1739,10 @@ def register_events_routes(
                 "This side chat ended when its runner restarted and can't be continued.",
                 code=ErrorCode.CONFLICT,
             )
-        if body.type == _RETRY_SESSION_TYPE:
+        if body.type in (_RETRY_SESSION_TYPE, _WAKE_SESSION_TYPE):
             startup = getattr(request.app.state, "startup_inputs", None)
             # A passive wake (e.g. opening Files) must not start agent work.
-            wake_only = body.data.get("wake_only") is True
+            wake_only = body.type == _WAKE_SESSION_TYPE
             result = await _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,

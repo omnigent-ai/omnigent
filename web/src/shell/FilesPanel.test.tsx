@@ -18,7 +18,7 @@ import {
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
-import { retrySession } from "@/lib/sessionsApi";
+import { ApiError, retrySession, wakeSession } from "@/lib/sessionsApi";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
@@ -29,6 +29,7 @@ vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
   retrySession: vi.fn(),
+  wakeSession: vi.fn(),
 }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
@@ -91,6 +92,7 @@ vi.mock("@/hooks/useSession", () => ({
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
 const retrySessionMock = vi.mocked(retrySession);
+const wakeSessionMock = vi.mocked(wakeSession);
 const useAsleepMock = vi.mocked(useWorkspaceAsleep);
 const useRunnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
@@ -101,7 +103,10 @@ const useSearchMock = vi.mocked(useWorkspaceFileSearch);
 const allFilesRefetchMock = vi.fn(() => Promise.resolve());
 const changedFilesRefetchMock = vi.fn(() => Promise.resolve());
 const searchRefetchMock = vi.fn(() => Promise.resolve());
-const WAKE_CAPABLE_INFO: ServerInfo = { ...FALLBACK_SERVER_INFO, retry_session_wake_only: true };
+const WAKE_CAPABLE_INFO: ServerInfo = {
+  ...FALLBACK_SERVER_INFO,
+  session_event_types: ["message", "wake_session"],
+};
 let serverInfo: ServerInfo | "loading" = WAKE_CAPABLE_INFO;
 
 function file(path: string, bytes = 10): WorkspaceFile {
@@ -300,7 +305,8 @@ beforeEach(() => {
   useAsleepMock.mockReturnValue(false);
   useRunnerOnlineMock.mockReturnValue(undefined);
   retrySessionMock.mockReset();
-  retrySessionMock.mockResolvedValue({ queued: false, recovered: true });
+  wakeSessionMock.mockReset();
+  wakeSessionMock.mockResolvedValue({ queued: false, recovered: true });
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
   useDirectoriesMock.mockClear();
@@ -523,8 +529,8 @@ describe("FilesPanel on an asleep sandbox", () => {
       useAsleepMock.mockReturnValue(true);
       renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
 
-      expect(retrySessionMock).toHaveBeenCalledTimes(1);
-      expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+      expect(wakeSessionMock).toHaveBeenCalledTimes(1);
+      expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
       expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
       expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
       expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
@@ -548,16 +554,10 @@ describe("FilesPanel on an asleep sandbox", () => {
 
     rerender(panelAt("conv_asleep"));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
   });
 
-  it("starts the sandbox once when the mobile Files drawer opens and reopens", async () => {
-    let answerWake: (response: { queued: boolean; recovered: boolean }) => void = () => {};
-    retrySessionMock.mockReturnValueOnce(
-      new Promise((resolve) => {
-        answerWake = resolve;
-      }),
-    );
+  it("starts the sandbox when the mobile Files drawer opens", async () => {
     useAsleepMock.mockReturnValue(true);
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
     useChangedFilesMock.mockReturnValue(
@@ -590,21 +590,12 @@ describe("FilesPanel on an asleep sandbox", () => {
       </CapabilitiesProvider>
     );
     const { rerender } = render(drawer(false));
-    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(wakeSessionMock).not.toHaveBeenCalled();
 
     await act(async () => rerender(drawer(true)));
-    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
+    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    // Reopening while the request is in flight, then while it settles, joins it.
-    await act(async () => rerender(drawer(false)));
-    await act(async () => rerender(drawer(true)));
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    await act(async () => answerWake({ queued: false, recovered: true }));
-    await act(async () => rerender(drawer(false)));
-    await act(async () => rerender(drawer(true)));
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -629,7 +620,7 @@ describe("FilesPanel on an asleep sandbox", () => {
       files: [],
       listsLoaded: false,
     });
-    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(wakeSessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
@@ -640,20 +631,20 @@ describe("FilesPanel on an asleep sandbox", () => {
     serverInfo = WAKE_CAPABLE_INFO;
     await act(async () => rerender(panelAt("conv_asleep")));
     await act(async () => rerender(panelAt("conv_asleep")));
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
-    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
+    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
   });
 
   it("does not wake the sandbox from a hidden panel, but offers to start it", async () => {
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false, active: false });
 
-    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(wakeSessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
     });
-    expect(retrySessionMock).toHaveBeenCalledWith("conv_asleep", { wakeOnly: true });
+    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
   });
 
   it("loads the files once the sandbox is back, and only offers to start it once it sleeps again", async () => {
@@ -665,7 +656,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     });
     await act(async () => {});
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
 
     useAsleepMock.mockReturnValue(false);
     useRunnerOnlineMock.mockReturnValue(true);
@@ -679,20 +670,32 @@ describe("FilesPanel on an asleep sandbox", () => {
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
     await act(async () => rerender(panelAt("conv_asleep")));
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(retrySessionMock).toHaveBeenCalledTimes(1);
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
     });
-    expect(retrySessionMock).toHaveBeenCalledTimes(2);
-    expect(retrySessionMock).toHaveBeenLastCalledWith("conv_asleep", { wakeOnly: true });
+    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
+    expect(wakeSessionMock).toHaveBeenLastCalledWith("conv_asleep");
   });
 
-  it("keeps the send-a-message hint on an older server", () => {
-    serverInfo = { ...FALLBACK_SERVER_INFO, retry_session_wake_only: undefined };
+  it.each<[string, ServerInfo, number]>([
+    [
+      "that doesn't list the wake",
+      { ...FALLBACK_SERVER_INFO, session_event_types: ["message"] },
+      0,
+    ],
+    ["that rejects the wake as an unknown event", WAKE_CAPABLE_INFO, 1],
+  ])("keeps the send-a-message hint on an older server %s", async (_label, info, wakes) => {
+    serverInfo = info;
+    wakeSessionMock.mockRejectedValueOnce(
+      new ApiError("Unknown event type: 'wake_session'", 400, "invalid_input"),
+    );
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+    await act(async () => {});
 
+    expect(wakeSessionMock).toHaveBeenCalledTimes(wakes);
     expect(retrySessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
@@ -709,14 +712,14 @@ describe("FilesPanel on an asleep sandbox", () => {
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
 
-    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(wakeSessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
   });
 
   it("shows why the wake failed and tries again on request", async () => {
-    retrySessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
+    wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
     await act(async () => {});
@@ -728,7 +731,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     });
-    expect(retrySessionMock).toHaveBeenCalledTimes(2);
+    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
   });
 
@@ -738,7 +741,7 @@ describe("FilesPanel on an asleep sandbox", () => {
 
     expect(screen.getByText("README.md")).toBeInTheDocument();
     expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
-    expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(wakeSessionMock).not.toHaveBeenCalled();
   });
 });
 

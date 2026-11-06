@@ -18,7 +18,7 @@ need a dormant resumable sandbox host patch what the SPA sees instead:
   session to the sidebar or revert its liveness to the real values.
 
 The seeded session's runner stays really connected, so filesystem reads and
-``retry_session`` reach the real server.
+wake events reach the real server.
 """
 
 from __future__ import annotations
@@ -152,22 +152,21 @@ def force_host_asleep(
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
 
-def hold_wake_requests(page: Page, session_id: str, *, wake_only: bool) -> list[Route]:
-    """Hold each ``retry_session`` POST of one kind until the test releases it.
+def hold_wake_requests(page: Page, session_id: str, *, event_type: str) -> list[Route]:
+    """Hold each wake POST of *event_type* until the test releases it.
 
     :param page: Playwright page, before the wake is requested.
     :param session_id: Session whose events endpoint to intercept.
-    :param wake_only: Hold the Files view's wake-only requests if true, else
-        plain ones such as Reconnect host; the other kind passes through.
+    :param event_type: ``wake_session`` for the Files view's wake, or
+        ``retry_session`` for Reconnect host.
     :returns: Held routes, in arrival order; other events pass through.
     """
     held: list[Route] = []
 
     def _hold(route: Route) -> None:
         request = route.request
-        if request.method == "POST" and "retry_session" in (request.post_data or ""):
-            data = request.post_data_json.get("data") or {}
-            if bool(data.get("wake_only")) == wake_only:
+        if request.method == "POST" and event_type in (request.post_data or ""):
+            if request.post_data_json.get("type") == event_type:
                 held.append(route)
                 return
         route.continue_()

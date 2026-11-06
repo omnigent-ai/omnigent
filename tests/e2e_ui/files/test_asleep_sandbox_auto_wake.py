@@ -2,12 +2,12 @@
 
 A session whose managed sandbox idle-stopped reads ``host_asleep``, and the
 Files panel has no workspace to list. Opening the panel must ask the server to
-resume the sandbox with a wake-only ``retry_session`` event, show that it is starting,
+resume the sandbox with a ``wake_session`` event, show that it is starting,
 and list the files once the sandbox reads online, without the user sending a
 chat message. ``force_host_asleep`` patches the browser's view into
 ``host_asleep`` and workspace reads answer the runner-offline 503 until a wake
 request succeeds; the seeded runner stays really connected, so the file list
-and ``retry_session`` then come from the real server.
+and ``wake_session`` then come from the real server.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ from tests.e2e_ui.sessions._host_asleep import (
 )
 
 _FILE_PATH = "sandbox_notes.txt"
-_RETRY_SESSION = {"type": "retry_session", "data": {"wake_only": True}}
+_WAKE_SESSION = {"type": "wake_session", "data": {}}
 # Long enough for a viewer to read each state in a recorded demo.
 _HOLD_MS = 2_500
 
@@ -92,7 +92,7 @@ class _SandboxWakeRecorder:
     def on_response(self, response: Response) -> None:
         request = response.request
         if response.ok and self._is_event_post(request):
-            if request.post_data_json == _RETRY_SESSION:
+            if request.post_data_json == _WAKE_SESSION:
                 self.host_online["online"] = True
 
 
@@ -121,7 +121,7 @@ def _open_asleep_session(
     force_host_asleep(page, session_id, host_online=recorder.host_online)
     _fail_workspace_reads_while_asleep(page, recorder)
     # The rail defaults open, so the panel can request the wake as the page loads.
-    held = hold_wake_requests(page, session_id, wake_only=True)
+    held = hold_wake_requests(page, session_id, event_type="wake_session")
     page.on("request", recorder.on_request)
     page.on("response", recorder.on_response)
     page.goto(f"{base_url}/c/{session_id}")
@@ -150,5 +150,5 @@ def test_opening_files_wakes_asleep_sandbox(
     )
     expect(rail.get_by_text("Starting sandbox…")).to_have_count(0)
     # The wake is the only session event: no chat message was sent.
-    assert recorder.events == [_RETRY_SESSION]
+    assert recorder.events == [_WAKE_SESSION]
     _hold_for_viewer(request, page)

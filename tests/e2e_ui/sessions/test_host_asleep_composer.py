@@ -116,7 +116,7 @@ def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
     page: Page = request.getfixturevalue("page")
     host_online = {"online": False}
     force_host_asleep(page, session_id, host_online=host_online)
-    held = hold_wake_requests(page, session_id, wake_only=False)
+    held = hold_wake_requests(page, session_id, event_type="retry_session")
     toasts = page.locator("[data-sonner-toast]")
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -155,7 +155,7 @@ def test_failed_wake_restores_dot_and_reports_error(
     base_url, session_id = seeded_session
     page: Page = request.getfixturevalue("page")
     force_host_asleep(page, session_id)
-    held = hold_wake_requests(page, session_id, wake_only=False)
+    held = hold_wake_requests(page, session_id, event_type="retry_session")
 
     page.goto(f"{base_url}/c/{session_id}")
 
@@ -242,7 +242,7 @@ def test_wake_stuck_on_stage_brings_reconnect_host_back(
         session_id,
         sandbox_status={"stage": "provisioning", "provider": "arclet", "error": None},
     )
-    held = hold_wake_requests(page, session_id, wake_only=False)
+    held = hold_wake_requests(page, session_id, event_type="retry_session")
     toasts = page.locator("[data-sonner-toast]")
     page.clock.install()
 

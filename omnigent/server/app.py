@@ -284,9 +284,6 @@ class ServerInfoResponse(BaseModel):
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
-    # ``retry_session`` honours ``wake_only``; older servers ignore it and may
-    # resume an interrupted turn, so clients must not send it there.
-    retry_session_wake_only: bool = True
     # A multipart create's metadata accepts ``model_override``; older servers
     # reject it.
     session_bundle_model_override: bool = True
@@ -3653,7 +3650,6 @@ def create_app(
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
-                "retry_session_wake_only": True,
                 "session_bundle_model_override": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,

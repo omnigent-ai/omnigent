@@ -1,7 +1,8 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { retrySession } from "@/lib/sessionsApi";
+import { ApiError, wakeSession } from "@/lib/sessionsApi";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type { PostEventResponse } from "@/lib/sessionsApi";
 import {
   resetSandboxWakesForTesting,
@@ -10,9 +11,12 @@ import {
   useSandboxAutoWake,
 } from "./useSandboxAutoWake";
 
-vi.mock("@/lib/sessionsApi", () => ({ retrySession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  wakeSession: vi.fn(),
+}));
 
-const retryMock = vi.mocked(retrySession);
+const wakeMock = vi.mocked(wakeSession);
 const recovered: PostEventResponse = { queued: false, recovered: true };
 
 type Props = Parameters<typeof useSandboxAutoWake>[0];
@@ -41,8 +45,8 @@ function deferred<T>() {
 }
 
 beforeEach(() => {
-  retryMock.mockReset();
-  retryMock.mockResolvedValue(recovered);
+  wakeMock.mockReset();
+  wakeMock.mockResolvedValue(recovered);
 });
 
 afterEach(() => {
@@ -62,18 +66,18 @@ describe("useSandboxAutoWake", () => {
     "wakes an asleep sandbox once when the server %s, and waits for it to come back",
     async (_label, response) => {
       const request = deferred<PostEventResponse>();
-      retryMock.mockReturnValue(request.promise);
+      wakeMock.mockReturnValue(request.promise);
       const { result, rerender } = renderWake(asleepAndOpen);
 
-      expect(retryMock).toHaveBeenCalledTimes(1);
-      expect(retryMock).toHaveBeenCalledWith("conv_sleepy", { wakeOnly: true });
+      expect(wakeMock).toHaveBeenCalledTimes(1);
+      expect(wakeMock).toHaveBeenCalledWith("conv_sleepy");
       expect(result.current.phase).toBe("waking");
 
       await act(async () => request.resolve(response));
       // Liveness hasn't caught up yet: still starting, and no second request.
       expect(result.current.phase).toBe("waking");
       rerender({ ...asleepAndOpen });
-      expect(retryMock).toHaveBeenCalledTimes(1);
+      expect(wakeMock).toHaveBeenCalledTimes(1);
 
       rerender({ ...asleepAndOpen, ...online });
       expect(result.current.phase).toBe("idle");
@@ -85,7 +89,7 @@ describe("useSandboxAutoWake", () => {
     async (oldWake) => {
       const first = deferred<PostEventResponse>();
       const second = deferred<PostEventResponse>();
-      retryMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+      wakeMock.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
       const { result, rerender } = renderWake(asleepAndOpen);
       if (oldWake === "failed") {
         await act(async () => first.reject(new Error("old session failed")));
@@ -93,7 +97,7 @@ describe("useSandboxAutoWake", () => {
       }
 
       await act(async () => rerender({ ...asleepAndOpen, conversationId: "conv_other" }));
-      expect(retryMock).toHaveBeenLastCalledWith("conv_other", { wakeOnly: true });
+      expect(wakeMock).toHaveBeenLastCalledWith("conv_other");
       expect(result.current.phase).toBe("waking");
       if (oldWake === "pending") {
         await act(async () => first.reject(new Error("old session failed")));
@@ -104,7 +108,7 @@ describe("useSandboxAutoWake", () => {
       await act(async () => second.resolve(recovered));
       rerender({ ...asleepAndOpen, conversationId: "conv_other", ...online });
       expect(result.current.phase).toBe("idle");
-      expect(retryMock).toHaveBeenCalledTimes(2);
+      expect(wakeMock).toHaveBeenCalledTimes(2);
     },
   );
 
@@ -116,7 +120,7 @@ describe("useSandboxAutoWake", () => {
     async (_label, answerWhileHidden) => {
       vi.useFakeTimers();
       const request = deferred<PostEventResponse>();
-      retryMock.mockReturnValueOnce(request.promise);
+      wakeMock.mockReturnValueOnce(request.promise);
       const { result, rerender } = renderWake(asleepAndOpen);
 
       if (!answerWhileHidden) await act(async () => request.resolve(recovered));
@@ -125,24 +129,24 @@ describe("useSandboxAutoWake", () => {
 
       // Still asleep on reopen: liveness hasn't caught up with that wake yet.
       await act(async () => rerender(asleepAndOpen));
-      expect(retryMock).toHaveBeenCalledTimes(1);
+      expect(wakeMock).toHaveBeenCalledTimes(1);
       expect(result.current.phase).toBe("waking");
 
       // The reopening joined that wake, so its timeout doesn't trigger another.
       act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS));
       expect(result.current.phase).toBe("failed");
-      expect(retryMock).toHaveBeenCalledTimes(1);
+      expect(wakeMock).toHaveBeenCalledTimes(1);
     },
   );
 
   it("shows the failure of a wake that fails after switching away and back", async () => {
     const request = deferred<PostEventResponse>();
-    retryMock.mockReturnValueOnce(request.promise);
+    wakeMock.mockReturnValueOnce(request.promise);
     const { result, rerender } = renderWake(asleepAndOpen);
 
     rerender({ ...asleepAndOpen, conversationId: "conv_awake", ...online });
     await act(async () => rerender(asleepAndOpen));
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
     expect(result.current.phase).toBe("waking");
 
     await act(async () => request.reject(new Error("Sandbox resume timed out")));
@@ -159,12 +163,12 @@ describe("useSandboxAutoWake", () => {
 
     const { result } = renderWake(asleepAndOpen);
     await act(async () => {});
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
     expect(result.current.phase).toBe("waking");
 
     act(() => vi.advanceTimersByTime(SANDBOX_WAKE_SETTLE_MS / 2));
     expect(result.current.phase).toBe("failed");
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
   });
 
   it.each<[string, Partial<Props>]>([
@@ -173,16 +177,16 @@ describe("useSandboxAutoWake", () => {
   ])("does not wake when the view is %s", (_label, override) => {
     const { result } = renderWake({ ...asleepAndOpen, ...override });
 
-    expect(retryMock).not.toHaveBeenCalled();
+    expect(wakeMock).not.toHaveBeenCalled();
     expect(result.current.phase).toBe("idle");
   });
 
   it("wakes when a hidden pre-mounted view becomes visible", async () => {
     const { rerender } = renderWake({ ...asleepAndOpen, active: false });
-    expect(retryMock).not.toHaveBeenCalled();
+    expect(wakeMock).not.toHaveBeenCalled();
 
     await act(async () => rerender(asleepAndOpen));
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not wake a sandbox that idles back to sleep while the view stays open", async () => {
@@ -192,18 +196,18 @@ describe("useSandboxAutoWake", () => {
     expect(result.current.phase).toBe("idle");
 
     rerender(asleepAndOpen);
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
     expect(result.current.phase).toBe("idle");
 
     // Reopening the view is a new opening and wakes it again.
     rerender({ ...asleepAndOpen, active: false });
     await act(async () => rerender(asleepAndOpen));
-    expect(retryMock).toHaveBeenCalledTimes(2);
+    expect(wakeMock).toHaveBeenCalledTimes(2);
   });
 
   it("forgets a wake still in flight once the runner comes online", async () => {
     const request = deferred<PostEventResponse>();
-    retryMock.mockReturnValueOnce(request.promise);
+    wakeMock.mockReturnValueOnce(request.promise);
     const { result, rerender } = renderWake(asleepAndOpen);
     rerender({ ...asleepAndOpen, ...online });
     expect(result.current.phase).toBe("idle");
@@ -214,7 +218,7 @@ describe("useSandboxAutoWake", () => {
     await act(async () => {
       await result.current.wake();
     });
-    expect(retryMock).toHaveBeenCalledTimes(2);
+    expect(wakeMock).toHaveBeenCalledTimes(2);
     await act(async () => request.reject(new Error("stale")));
     expect(result.current.phase).toBe("waking");
     expect(result.current.error).toBeNull();
@@ -224,24 +228,24 @@ describe("useSandboxAutoWake", () => {
     const { result, rerender } = renderWake({ ...asleepAndOpen, ...online });
     await act(async () => rerender(asleepAndOpen));
 
-    expect(retryMock).not.toHaveBeenCalled();
+    expect(wakeMock).not.toHaveBeenCalled();
     expect(result.current.phase).toBe("idle");
   });
 
   it("reports a failed wake without retrying, and wakes again on request", async () => {
-    retryMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
+    wakeMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
     const { result, rerender } = renderWake(asleepAndOpen);
     await act(async () => {});
 
     expect(result.current.phase).toBe("failed");
     expect(result.current.error).toBe("Couldn't start the sandbox: Sandbox resume timed out");
     rerender({ ...asleepAndOpen });
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       await result.current.wake();
     });
-    expect(retryMock).toHaveBeenCalledTimes(2);
+    expect(wakeMock).toHaveBeenCalledTimes(2);
     expect(result.current.phase).toBe("waking");
     expect(result.current.error).toBeNull();
   });
@@ -268,13 +272,31 @@ describe("useSandboxAutoWake", () => {
         expect(view.current.phase).toBe("failed");
         expect(view.current.error).toBe("The sandbox didn't come back online.");
       }
-      expect(retryMock).toHaveBeenCalledTimes(1);
+      expect(wakeMock).toHaveBeenCalledTimes(1);
     },
   );
 
+  it("stops waking for good when the server rejects the wake event", async () => {
+    wakeMock.mockRejectedValueOnce(
+      new ApiError("Unknown event type: 'wake_session'", 400, "invalid_input"),
+    );
+    const { result, rerender } = renderWake(asleepAndOpen);
+    await act(async () => {});
+    expect(result.current.phase).toBe("unsupported");
+    expect(result.current.error).toBeNull();
+
+    await act(async () => {
+      await result.current.wake();
+    });
+    rerender({ ...asleepAndOpen, active: false });
+    await act(async () => rerender(asleepAndOpen));
+    expect(wakeMock).toHaveBeenCalledTimes(1);
+    expect(result.current.phase).toBe("unsupported");
+  });
+
   it("fails a wake whose request never answers, and wakes again on request", async () => {
     vi.useFakeTimers();
-    retryMock.mockReturnValueOnce(new Promise<PostEventResponse>(() => {}));
+    wakeMock.mockReturnValueOnce(new Promise<PostEventResponse>(() => {}));
     const { result } = renderWake(asleepAndOpen);
     expect(result.current.phase).toBe("waking");
 
@@ -285,7 +307,7 @@ describe("useSandboxAutoWake", () => {
     await act(async () => {
       await result.current.wake();
     });
-    expect(retryMock).toHaveBeenCalledTimes(2);
+    expect(wakeMock).toHaveBeenCalledTimes(2);
     expect(result.current.phase).toBe("waking");
   });
 
@@ -303,6 +325,6 @@ describe("useSandboxAutoWake", () => {
     rerender(asleepAndOpen);
     expect(result.current.phase).toBe("failed");
     expect(result.current.error).toBe("The sandbox didn't come back online.");
-    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(wakeMock).toHaveBeenCalledTimes(1);
   });
 });

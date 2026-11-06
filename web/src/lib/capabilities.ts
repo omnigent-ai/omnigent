@@ -254,11 +254,6 @@ export interface ServerInfo {
   /** True when sandbox forks accept an explicit `workspaces` list; absent on older servers. */
   session_fork_workspaces?: boolean;
   /**
-   * True when `retry_session` honours `wake_only`. Older servers ignore it and
-   * may resume an interrupted turn, so the Files panel doesn't wake there.
-   */
-  retry_session_wake_only?: boolean;
-  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -431,7 +426,6 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
-  retry_session_wake_only: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -600,7 +594,6 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
-          retry_session_wake_only: data.retry_session_wake_only === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,

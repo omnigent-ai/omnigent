@@ -708,9 +708,7 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     interrupted = _create_session(app, agent.id)
     child = _create_session(app, agent.id, kind="sub_agent", parent_conversation_id=interrupted.id)
     retry_url = f"/v1/sessions/{interrupted.id}/events"
-    wake = await client.post(
-        retry_url, json={"type": "retry_session", "data": {"wake_only": True}}
-    )
+    wake = await client.post(retry_url, json={"type": "wake_session", "data": {}})
     assert wake.status_code == 503, wake.text
     if process_state_lost:
         # A server restart or cache eviction leaves only what the store persisted.
@@ -786,7 +784,7 @@ async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wa
     wake = asyncio.create_task(
         client.post(
             f"/v1/sessions/{parent.id}/events",
-            json={"type": "retry_session", "data": {"wake_only": True}},
+            json={"type": "wake_session", "data": {}},
         )
     )
     if during_wake:

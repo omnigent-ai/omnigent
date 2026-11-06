@@ -522,7 +522,7 @@ export function FilesPanel({
     session?.permissionLevel != null &&
     isEditorLevel(session.permissionLevel) &&
     serverInfo !== "loading" &&
-    serverInfo.retry_session_wake_only === true;
+    serverInfo.session_event_types?.includes("wake_session") === true;
   const sandboxWake = useSandboxAutoWake({
     conversationId,
     asleep: sandboxAsleep,
@@ -725,7 +725,7 @@ export function FilesPanel({
           <RunnerAsleepHint
             sandboxOffline
             wake={
-              canWake
+              canWake && sandboxWake.phase !== "unsupported"
                 ? {
                     phase: sandboxWake.phase,
                     error: sandboxWake.error,

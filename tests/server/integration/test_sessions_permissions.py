@@ -578,9 +578,9 @@ async def test_user_without_grants_sees_no_sessions(
             "data": {"role": "user", "content": [{"type": "input_text", "text": "blocked"}]},
         },
         # The Files panel's sandbox wake.
-        {"type": "retry_session", "data": {"wake_only": True}},
+        {"type": "wake_session", "data": {}},
     ],
-    ids=["message", "wake-only-retry"],
+    ids=["message", "wake"],
 )
 async def test_read_grant_allows_get_but_blocks_post_events(
     auth_client: httpx.AsyncClient,
