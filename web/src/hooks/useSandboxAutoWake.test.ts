@@ -32,9 +32,11 @@ vi.mock("@/hooks/useSessionLiveness", async (importOriginal) => ({
   ...(await importOriginal<typeof LivenessModule>()),
   useSessionLiveness: () => ({ kind: state.liveness }),
 }));
+// False: the session snapshot hasn't loaded.
+let sessionLoaded = true;
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string | undefined) => ({
-    session: id ? { id, permissionLevel: state.permissionLevel } : undefined,
+    session: id && sessionLoaded ? { id, permissionLevel: state.permissionLevel } : undefined,
   }),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -74,6 +76,7 @@ beforeEach(() => {
     permissionLevel: 2,
     eventTypes: ["retry_session", "wake_session"],
   });
+  sessionLoaded = true;
   wakeMock.mockReset();
   wakeMock.mockResolvedValue(recovered);
   setVisibility("visible");
@@ -251,6 +254,24 @@ describe("useSandboxWakeOnSessionOpen", () => {
     act(() => vi.advanceTimersByTime(SANDBOX_WAKE_OPEN_DWELL_MS));
     expect(wakeMock).not.toHaveBeenCalled();
     state.liveness = "host_asleep";
+    rerender({ id: "conv_sleepy" });
+    expect(wakeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<[string, Partial<typeof state>]>([
+    ["server capabilities", { eventTypes: "loading" }],
+    ["the session", { permissionLevel: undefined }],
+  ])("waits for %s that load after the dwell", (_label, loading) => {
+    vi.useFakeTimers();
+    const loaded = { eventTypes: state.eventTypes, permissionLevel: state.permissionLevel };
+    Object.assign(state, loading);
+    if ("permissionLevel" in loading) sessionLoaded = false;
+    const { rerender } = renderOpen("conv_sleepy");
+    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_OPEN_DWELL_MS));
+    expect(wakeMock).not.toHaveBeenCalled();
+
+    Object.assign(state, loaded);
+    sessionLoaded = true;
     rerender({ id: "conv_sleepy" });
     expect(wakeMock).toHaveBeenCalledTimes(1);
   });

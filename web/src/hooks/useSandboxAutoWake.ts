@@ -100,6 +100,11 @@ export interface SandboxWake {
   /** A wake of this session's sandbox is in flight. */
   waking: boolean;
   /**
+   * Whether the session and the server's capabilities have loaded, so
+   * {@link SandboxWake.wakeIfAsleep} can decide rather than skip for lack of data.
+   */
+  ready: boolean;
+  /**
    * Wake the sandbox if it is asleep and this user may restart it. Call it
    * from a user action that needs the host. A no-op otherwise, and joins a
    * wake already in flight.
@@ -147,6 +152,7 @@ export function useSandboxWake(conversationId: string | undefined): SandboxWake 
 
   return {
     waking: step === "requesting" || step === "settling",
+    ready: session !== undefined && serverInfo !== "loading",
     wakeIfAsleep,
   };
 }
@@ -181,7 +187,7 @@ export function useSandboxWakeWhenOpened(
  */
 export function useSandboxWakeOnSessionOpen(conversationId: string | undefined): SandboxWake {
   const wake = useSandboxWake(conversationId);
-  const { wakeIfAsleep } = wake;
+  const { ready, wakeIfAsleep } = wake;
   // Until liveness resolves, "not asleep" may only mean not polled yet.
   const { session } = useSession(conversationId);
   const turnActive = useSessionActive(conversationId);
@@ -196,7 +202,8 @@ export function useSandboxWakeOnSessionOpen(conversationId: string | undefined):
   const checkRef = useRef(() => {});
   checkRef.current = () => {
     const current = opening.current;
-    if (!current.dwelled || current.done || !current.conversationId || !livenessKnown) return;
+    if (!current.dwelled || current.done || !current.conversationId) return;
+    if (!livenessKnown || !ready) return;
     current.done = true;
     wakeIfAsleep();
   };
@@ -229,10 +236,10 @@ export function useSandboxWakeOnSessionOpen(conversationId: string | undefined):
     };
   }, [conversationId]);
 
-  // Liveness that resolves after the dwell finishes the check.
+  // Liveness, the session or capabilities resolving after the dwell finish the check.
   useEffect(() => {
     checkRef.current();
-  }, [livenessKnown]);
+  }, [livenessKnown, ready]);
 
   return wake;
 }
