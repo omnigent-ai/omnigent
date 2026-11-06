@@ -3022,6 +3022,23 @@ function ComposerImpl(
     files.length === 0 &&
     hasCommandPrefix &&
     splitSlashCommand(value, slashCommandNames) !== null;
+  // Pin the overlay to the textarea's own box: the input area also holds the inline
+  // textarea's line-box descent, which would cut the overlay's scroll range short.
+  useLayoutEffect(() => {
+    const overlay = backdropRef.current;
+    const textarea = tailTextareaRef.current;
+    if (!overlay || !textarea) return;
+    const align = () => {
+      overlay.style.top = `${textarea.offsetTop}px`;
+      overlay.style.height = `${textarea.offsetHeight}px`;
+      overlay.scrollTop = textarea.scrollTop;
+    };
+    align();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(align);
+    observer.observe(textarea);
+    return () => observer.disconnect();
+  }, [composerIsCommand]);
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -4305,8 +4322,8 @@ function ComposerImpl(
               {/* Highlight overlay: a textarea can only paint its text one color, so
             to tint just the command or skill token we hide the textarea's own glyphs
             (text-transparent, caret kept visible) and render an aligned mirror
-            behind it. Same box/typography so wrapping matches the textarea
-            exactly. Only mounted while the draft is a command. */}
+            behind it, pinned to the textarea's box. Same typography so wrapping
+            matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
           inputBackdrop: composerIsCommand && (
@@ -4314,7 +4331,7 @@ function ComposerImpl(
               ref={backdropRef}
               aria-hidden
               data-testid="composer-highlight-overlay"
-              className="composer-input-text pointer-events-none absolute inset-0 overflow-hidden whitespace-pre-wrap break-words px-3 pt-3 pb-1 text-ui text-foreground max-md:px-4 max-md:pt-4 max-md:pb-2"
+              className="composer-input-text pointer-events-none absolute inset-x-0 overflow-hidden whitespace-pre-wrap break-words px-3 text-ui text-foreground max-md:px-4"
             >
               {(() => {
                 const split = splitSlashCommand(value, slashCommandNames);

@@ -140,7 +140,12 @@ import {
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
 import { useTerminalActivityStore } from "./terminalActivity";
-import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import {
+  isClosedDuringLaunch,
+  terminalInfoFromResource,
+  terminalsQueryKey,
+  type TerminalInfo,
+} from "@/lib/terminals";
 import type {
   BackgroundTaskInfo,
   ContentBlock,
@@ -9495,6 +9500,8 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
   if (info === null) return;
   if (queryClient === null) return;
   const key = terminalsQueryKey(sessionId);
+  // The user closed this shell before its create returned; its launch deletes it.
+  if (isClosedDuringLaunch(info.id)) return;
   const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
   if (current.some((t) => t.id === info.id)) return;
   queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
