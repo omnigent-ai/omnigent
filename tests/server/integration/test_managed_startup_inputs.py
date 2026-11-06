@@ -316,6 +316,8 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         else:
             assert woken.status_code == 400, woken.text
             assert woken.json()["error"]["code"] == "invalid_input"
+            # The web client recognizes an older server by this message prefix.
+            assert woken.json()["error"]["message"].startswith("Unknown event type")
         assert recover.await_count == int(wake_supported)
         assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
         assert not [event for event in forwarded if event.get("type") == "message"]
