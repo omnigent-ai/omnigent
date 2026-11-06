@@ -1019,6 +1019,29 @@ function bearerTokenFor(serverUrl) {
   return null;
 }
 
+const OMNIGENT_SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
+const WORKSPACE_API_PATH = "/api/2.0/omnigent";
+
+/**
+ * Whether requests to `serverUrl` should carry a host's routing key, by the same
+ * rule as `databricks_request_headers()` (omnigent/cli_auth.py): on by default
+ * for the host-sharded workspace mount, opt-in on other servers with
+ * `OMNIGENT_HOST_SLICE_KEY_ENABLED=1`, and off for either when it is "0".
+ *
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function hostRoutingEnabled(serverUrl) {
+  const setting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+  if (setting === "0") return false;
+  if (setting === "1") return true;
+  try {
+    return new URL(serverUrl).pathname.replace(/\/+$/, "") === WORKSPACE_API_PATH;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The "basic request" that detects whether a host's tunnel is up: a single
  * `GET {serverUrl}/v1/hosts/{host_id}`, reading `body.status` — the same probe
@@ -1048,6 +1071,8 @@ async function probeHostTunnel(serverUrl, hostId, { timeoutMs = 2000 } = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
   else if (!isLoopbackServer(serverUrl))
     return { status: null, reachable: false, authMissing: true };
+  // Route to the replica holding this host's tunnel, the one whose status we want.
+  if (hostRoutingEnabled(serverUrl)) headers[OMNIGENT_SLICE_KEY_HEADER] = hostId;
   const base = serverUrl.replace(/\/+$/, "");
   const target = `${base}/v1/hosts/${encodeURIComponent(hostId)}`;
   try {
@@ -1245,6 +1270,7 @@ module.exports = {
   readDaemonRecords,
   daemonServerUrl,
   bearerTokenFor,
+  hostRoutingEnabled,
   probeHostTunnel,
   getHostConnectionFast,
 };

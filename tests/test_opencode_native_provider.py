@@ -141,8 +141,9 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     assert parsed["providers"]["databricks-gateway"]["settings"]["apiKey"] == "tok"
 
 
+@pytest.mark.parametrize("client_surface", [None, "desktop"])
 def test_write_provider_config_attributes_unity_gateway_models(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_surface: str | None
 ) -> None:
     """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
@@ -162,13 +163,15 @@ def test_write_provider_config_attributes_unity_gateway_models(
         }
     }
 
-    path = write_opencode_provider_config(tmp_path, config)
+    path = write_opencode_provider_config(tmp_path, config, client_surface=client_surface)
 
     providers = json.loads(path.read_text())["providers"]
     assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
         "User-Agent": "ucode/0.1.0 opencode/1.2.0",
         "Databricks-Custom-Coding-Agent": "opencode",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+        "Databricks-Custom-Client-Surfaces": (
+            "omnigent-desktop, ug" if client_surface else "omnigent, ug"
+        ),
     }
     assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
     # The caller's config is left as it was.

@@ -130,7 +130,8 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.CUSTOM_AGENTS_SETTINGS_UI,
         description="Manage reusable custom agents from Settings",
         owner="web",
-        review_by_release="0.18.0",
+        review_by_release="0.24.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_GROUPING_UI,
