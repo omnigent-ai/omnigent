@@ -21,6 +21,7 @@ from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.oidc import OIDCConfig, derive_code_challenge
 from omnigent.server.routes import auth as auth_routes
 from omnigent.server.routes.auth import create_auth_router
+from omnigent.server.routes.device_auth import LoginGrant
 
 pytestmark = pytest.mark.asyncio
 
@@ -152,7 +153,8 @@ def _client(transport: httpx.ASGITransport) -> httpx.AsyncClient:
 async def test_native_sign_in_delivers_code_and_exchanges_for_session() -> None:
     """The full loopback flow ends with a session token, and the browser gets none."""
     grant_store = MagicMock()
-    with patch.object(auth_routes, "issue_login_grant", return_value="refresh-abc") as issue:
+    grant = LoginGrant(refresh_token="refresh-abc", refresh_expires_at=1_900_000_000)
+    with patch.object(auth_routes, "issue_login_grant", return_value=grant) as issue:
         async with _client(_transport(device_grant_store=grant_store)) as client:
             idp_state, state_cookie = await _start(client)
             callback = await _callback(client, idp_state, state_cookie)
