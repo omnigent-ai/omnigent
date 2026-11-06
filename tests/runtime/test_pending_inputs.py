@@ -895,6 +895,41 @@ def test_resolve_matching_text_prefers_a_live_resend_over_an_interrupted_twin() 
     assert pending_inputs.pending_ids("conv_a") == []
 
 
+@pytest.mark.parametrize("stage", ["native_turn_failed", "rejected_before_handoff"])
+def test_resolve_matching_text_prefers_a_live_resend_over_a_twin_whose_turn_failed(
+    stage: str,
+) -> None:
+    """The original's turn failed, then the same text was resent: the resend takes the mirror.
+
+    The agent recorded the resend. Matching the failed original first would leave
+    the resend queued, to be called lost at the next match.
+    """
+    failed = pending_inputs.record("conv_a", [_text_block("continue")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage=stage)
+    resend = pending_inputs.record("conv_a", [_text_block("continue")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "continue")
+
+    assert drained.matched is not None and drained.matched.pending_id == resend
+    assert [entry.pending_id for entry in drained.skipped] == [failed]
+    assert drained.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == []
+
+
+def test_failed_twin_keeps_queue_order_when_a_live_input_intervenes() -> None:
+    """A live input between the failed original and the resend keeps queue order."""
+    failed = pending_inputs.record("conv_a", [_text_block("continue")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle("conv_a", "a" * 32, stage="native_turn_failed")
+    other = pending_inputs.record("conv_a", [_text_block("something else")])
+    resend = pending_inputs.record("conv_a", [_text_block("continue")])
+
+    drained = pending_inputs.resolve_matching_text("conv_a", "continue")
+
+    assert drained.matched is not None and drained.matched.pending_id == failed
+    assert drained.skipped == [] and drained.uncertain == []
+    assert pending_inputs.pending_ids("conv_a") == [other, resend]
+
+
 @pytest.mark.parametrize("with_attachment", [False, True])
 def test_delayed_interrupted_echo_does_not_skip_a_live_message_before_a_resend(
     with_attachment: bool,

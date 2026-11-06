@@ -61,7 +61,8 @@ match that jumps over one drains it quietly like an uncertain entry, and it
 no longer counts as pending or replays in the snapshot. A mirror carrying its
 own text still drains it normally, since the agent did record it after all,
 unless a live entry has the same text (a resend after Stop): that one takes
-the mirror. The positional drain (:func:`resolve_oldest`) never picks one.
+the mirror. An entry whose own native turn failed yields to a resend the same
+way. The positional drain (:func:`resolve_oldest`) never picks one.
 
 The one imperfect case is interleaving a web-composer message with a
 message typed directly in the TUI: the TUI message (which has no pending
@@ -189,6 +190,8 @@ _DELIVERY_STAGES = frozenset(
         "unknown",
     }
 )
+# Stages whose native turn already ended without running the input.
+_FAILED_TURN_DELIVERY_STAGES = frozenset({"native_turn_failed", "rejected_before_handoff"})
 _DISPOSITION_CODE_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 _DISPOSITION_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,256}")
 
@@ -843,8 +846,8 @@ def resolve_matching_text(
     undelivered web messages.
 
     Identical texts match in queue order, except that an entry the person
-    cancelled by interrupting yields to a later live one with the same text
-    when no other live input intervenes. Otherwise, a delayed pre-Stop echo
+    cancelled by interrupting, or whose own turn failed, yields to a later live
+    one with the same text when no other live input intervenes. Otherwise, a delayed pre-Stop echo
     could incorrectly declare the intervening message lost.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
@@ -887,8 +890,8 @@ def resolve_matching_text(
         # the executor pastes one generated marker line per file block ahead
         # of the text, so drop exactly that many from the mirror and compare
         # with the entry's own text — typed marker-like text still counts.
-        interrupted = [entry.interrupted for _pid, entry in ordered]
-        match_index = _first_match(texts, exact_needle, interrupted)
+        superseded = [_superseded_by_resend(entry) for _pid, entry in ordered]
+        match_index = _first_match(texts, exact_needle, superseded)
         match_method = "normalized_text"
         if match_index is None:
             match_method = "attachment_normalized_text"
@@ -902,7 +905,7 @@ def resolve_matching_text(
                     == texts[index]
                 ):
                     marker_matches.append(index)
-            match_index = _prefer_live(marker_matches, interrupted)
+            match_index = _prefer_live(marker_matches, superseded)
         if match_index is None:
             return MatchedDrain(matched=None, skipped=[])
         # Bound one drain's work: report at most a cap's worth of skipped
@@ -1036,7 +1039,7 @@ def _content_text(content: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int | None:
+def _first_match(texts: list[str], needle: str, superseded: list[bool]) -> int | None:
     """
     Index of the first non-empty text equal to ``needle``, preferring a live one.
 
@@ -1047,36 +1050,53 @@ def _first_match(texts: list[str], needle: str, interrupted: list[bool]) -> int 
 
     :param texts: Whitespace-collapsed queued entry texts in queue order.
     :param needle: The whitespace-collapsed mirrored text.
-    :param interrupted: Per entry, whether the person cancelled it by interrupting.
+    :param superseded: Per entry, whether a later identical resend should take
+        its mirror (see :func:`_superseded_by_resend`).
     :returns: The matching index (see :func:`_prefer_live`), or ``None``.
     """
     if not needle:
         return None
     return _prefer_live(
-        [index for index, text in enumerate(texts) if text and text == needle], interrupted
+        [index for index, text in enumerate(texts) if text and text == needle], superseded
     )
 
 
-def _prefer_live(candidates: list[int], interrupted: list[bool]) -> int | None:
+def _prefer_live(candidates: list[int], superseded: list[bool]) -> int | None:
     """
     Prefer a live resend only when it cannot skip another live input.
 
-    A resend of the same text after Stop leaves a cancelled entry and a live
-    one that match the same mirror. Prefer the resend unless another live
-    input intervenes: text alone cannot rule out a delayed original echo,
-    and choosing the resend would incorrectly mark that intervening input lost.
+    A resend of the same text after Stop, or after the original's turn failed,
+    leaves a superseded entry and a live one that match the same mirror. Prefer
+    the resend unless another live input intervenes: text alone cannot rule out
+    a delayed original echo, and choosing the resend would incorrectly mark that
+    intervening input lost.
 
     :param candidates: Queue indices of the entries that match, oldest first.
-    :param interrupted: Per entry, whether the person cancelled it by interrupting.
+    :param superseded: Per entry, whether a later identical resend should take
+        its mirror (see :func:`_superseded_by_resend`).
     :returns: The chosen index, or ``None`` when there are no candidates.
     """
     if not candidates:
         return None
     first = candidates[0]
     for index in candidates:
-        if not interrupted[index]:
-            return first if any(not flag for flag in interrupted[first:index]) else index
+        if not superseded[index]:
+            return first if any(not flag for flag in superseded[first:index]) else index
     return first
+
+
+def _superseded_by_resend(entry: _Entry) -> bool:
+    """
+    Whether a later live entry with the same text should take this entry's mirror.
+
+    True when the person cancelled it with Stop, or when its own native turn
+    already failed or was rejected: a resend of the same text is then the
+    likelier owner of the mirror.
+
+    :param entry: Queued web entry.
+    :returns: Whether the entry yields to a later identical live entry.
+    """
+    return entry.interrupted or entry.last_delivery_stage in _FAILED_TURN_DELIVERY_STAGES
 
 
 def _collapse_whitespace(text: str) -> str:
