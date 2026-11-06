@@ -2776,10 +2776,12 @@ async def test_connect_watchdog_silent_when_runner_connects(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("connects", [True, False])
 async def test_connect_watchdog_allows_the_runner_sign_in_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    connects: bool,
 ) -> None:
     """A runner connecting after its allowed sign-in wait is not reported as hung."""
     from omnigent.host import connect as connect_module
@@ -2799,7 +2801,8 @@ async def test_connect_watchdog_allows_the_runner_sign_in_budget(
 
     async def _connect_after_sign_in(tasks: set[asyncio.Task[None]], *, timeout: float) -> None:
         # Advance the host wait to a connect just after the runner's permitted wait.
-        if timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
+        assert 0 < timeout < float("inf")
+        if connects and timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
             marker.touch()
 
     monkeypatch.setattr(
@@ -2815,11 +2818,12 @@ async def test_connect_watchdog_allows_the_runner_sign_in_budget(
         exit_watcher.cancel()
         await asyncio.gather(exit_watcher, return_exceptions=True)
 
-    assert not [
+    errors = [
         record
         for record in caplog.records
         if getattr(record, "event_name", None) == "runner_never_connected"
     ]
+    assert bool(errors) is not connects
 
 
 async def test_connect_watchdog_silent_on_intentional_stop(

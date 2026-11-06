@@ -209,6 +209,7 @@ from omnigent.runner.identity import (
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SIGN_IN_PENDING_WAIT_S,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -379,9 +380,8 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
-# The server's 30s send wait handles user feedback; this host check also covers
-# create-time launches and outlasts the runner's 150s pending-sign-in wait.
-_RUNNER_CONNECT_DEADLINE_S = 180.0
+# This check also covers create-time launches and outlasts the full sign-in wait.
+_RUNNER_CONNECT_DEADLINE_S = max(180.0, RUNNER_SIGN_IN_PENDING_WAIT_S + 30.0)
 
 
 def _connect_marker_path(log_path: Path) -> Path:

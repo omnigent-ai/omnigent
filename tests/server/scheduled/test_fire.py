@@ -1430,7 +1430,9 @@ async def test_connected_host_dispatch_uses_resolved_local_owner(
     assert captured["user_id"] == RESERVED_USER_LOCAL
     assert waits[0] == 30.0
     if pending_sign_in:
-        assert len(waits) == 2 and 30.0 < waits[1] <= 150.0
+        from omnigent.runner.identity import RUNNER_SIGN_IN_PENDING_WAIT_S
+
+        assert len(waits) == 2 and 30.0 < waits[1] <= RUNNER_SIGN_IN_PENDING_WAIT_S
     else:
         assert len(waits) == 1
     # The kickoff names the bundle it runs, so the runner sees a later reinstall.
