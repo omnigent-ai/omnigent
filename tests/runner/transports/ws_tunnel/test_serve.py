@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict, Unpack
 
@@ -3926,13 +3927,31 @@ async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monke
         await asyncio.gather(task, return_exceptions=True)
 
 
-def test_process_age_ms_measures_from_process_creation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The age is wall time since the process was created, in milliseconds."""
+def test_linux_process_age_ms_uses_the_boot_relative_clock(tmp_path: Path) -> None:
+    """Age is uptime minus the process start time, both boot-relative."""
+    (tmp_path / "self").mkdir()
+    (tmp_path / "uptime").write_text("1000.50 4000.00\n")
+    ticks_per_s = os.sysconf("SC_CLK_TCK")
+    start_ticks = int(998.25 * ticks_per_s)
+    # A command name with spaces and ")" must not shift the fields.
+    fields = ["S", *["0"] * 18, str(start_ticks), "0"]
+    (tmp_path / "self" / "stat").write_text(f"123 (python (x) y) {' '.join(fields)}\n")
+
+    assert serve_module._linux_process_age_ms(str(tmp_path)) == 2250
+
+
+def test_linux_process_age_ms_is_none_without_procfs(tmp_path: Path) -> None:
+    assert serve_module._linux_process_age_ms(str(tmp_path / "missing")) is None
+
+
+def test_process_age_ms_falls_back_to_psutil_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without procfs, the age is wall time since psutil's creation time."""
 
     class _Process:
         def create_time(self) -> float:
             return 1_000.0
 
+    monkeypatch.setattr(serve_module, "_linux_process_age_ms", lambda: None)
     monkeypatch.setattr("psutil.Process", _Process)
     monkeypatch.setattr(serve_module.time, "time", lambda: 1_002.5)
 
@@ -3949,6 +3968,7 @@ def test_process_age_ms_is_none_when_the_process_is_unreadable(
         def create_time(self) -> float:
             raise psutil.AccessDenied()
 
+    monkeypatch.setattr(serve_module, "_linux_process_age_ms", lambda: None)
     monkeypatch.setattr("psutil.Process", _Process)
 
     assert serve_module._process_age_ms() is None
