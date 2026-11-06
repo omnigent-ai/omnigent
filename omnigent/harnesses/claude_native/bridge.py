@@ -209,18 +209,19 @@ BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
 DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 
 
-def _runner_temp_parent() -> Path:
-    """The temp root the runner used, even when this process may only read it.
+def _pinned_temp_parent() -> Path | None:
+    """A pinned ``TMPDIR`` this process may only read, to validate bridges under it.
 
     Helpers launched for the runner get its ``TMPDIR`` pinned (see
-    :func:`build_mcp_config`), but Python skips a ``TMPDIR`` it can't write, and a
-    sandboxed relay may only read it. Honour the pinned value as given then, so the
-    runner's bridge tree stays under this process's trusted root.
+    :func:`build_mcp_config`), but Python skips a ``TMPDIR`` it can't write, as in a
+    sandboxed relay. New bridges are still allocated under ``tempfile``'s choice; this
+    root only lets the helper recognise the bridge the runner prepared under it.
     """
     pinned = os.environ.get("TMPDIR")
-    if pinned and os.path.isabs(pinned) and os.path.isdir(pinned):
-        return Path(os.path.abspath(pinned))
-    return Path(tempfile.gettempdir())
+    if not (pinned and os.path.isabs(pinned) and os.path.isdir(pinned)):
+        return None
+    root = _absolute_syntactic_path(Path(pinned))
+    return None if root == _absolute_syntactic_path(_TRUSTED_PARENT) else root
 
 
 # Root for the per-process Claude bridge tree. Namespaced by uid so
@@ -229,7 +230,7 @@ def _runner_temp_parent() -> Path:
 # trusted parent (`/tmp`) is shared; everything under
 # `_BRIDGE_ROOT_PARENT` must be owned by the current uid and not be a
 # symlink — see :func:`_ensure_secure_dir`.
-_TRUSTED_PARENT = _runner_temp_parent()
+_TRUSTED_PARENT = Path(tempfile.gettempdir())
 _BRIDGE_ROOT_PARENT = _TRUSTED_PARENT / f"omnigent-{stable_user_id()}"
 _BRIDGE_ROOT = _BRIDGE_ROOT_PARENT / "claude-native"
 # Markers for permission hooks parked on a verdict, keyed by SESSION id: the
@@ -942,6 +943,12 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     router_root = _absolute_syntactic_path(subagent_router_bridge_root())
     if target.is_relative_to(router_root):
         return _absolute_syntactic_path(router_root.parent.parent)
+
+    # A sandboxed helper may only read the TMPDIR the runner pinned for it, and the
+    # bridge the runner prepared sits in that root's uid-scoped tree.
+    pinned = _pinned_temp_parent()
+    if pinned is not None and target.is_relative_to(pinned / f"omnigent-{stable_user_id()}"):
+        return pinned
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "

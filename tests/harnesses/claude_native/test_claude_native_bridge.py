@@ -17203,21 +17203,59 @@ async def test_relay_keeps_high_descriptor_connections_alive(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
-def test_bridge_temp_parent_follows_a_pinned_tmpdir_it_cannot_write(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Relay helpers run with ``TMPDIR`` pinned to the runner's, but a sandbox may let
-    them only read it. Python's tempdir then falls back elsewhere, and the bridge tree
-    the runner made would no longer sit under the helper's trusted root."""
-    from omnigent.harnesses.claude_native.bridge import _runner_temp_parent
-
-    pinned = tmp_path / "runner-tmp"
+def test_a_read_only_pinned_tmpdir_still_allocates_bridges_elsewhere(tmp_path: Path) -> None:
+    """A runner whose ``TMPDIR`` exists but can't be written keeps tempfile's fallback."""
+    pinned = tmp_path / "read-only-tmp"
     pinned.mkdir()
     pinned.chmod(0o500)
+    probe = (
+        "from omnigent.harnesses.claude_native import bridge\n"
+        "print(bridge._TRUSTED_PARENT)\n"
+        "print(bridge.prepare_acp_mcp_bridge_dir())\n"
+    )
     try:
-        monkeypatch.setenv("TMPDIR", f"{pinned}/")
-        assert _runner_temp_parent() == pinned
-        monkeypatch.setenv("TMPDIR", "relative/tmp")
-        assert _runner_temp_parent() == Path(tempfile.gettempdir())
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env={**os.environ, "TMPDIR": str(pinned)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+    finally:
+        pinned.chmod(0o700)
+    trusted_parent, bridge_dir = map(Path, completed.stdout.split())
+    assert trusted_parent != pinned
+    assert bridge_dir.is_relative_to(trusted_parent) and bridge_dir.is_dir()
+    shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandboxed relay may only read the ``TMPDIR`` its entry pins, so tempfile falls
+    back elsewhere; the runner's bridge under that pinned root must still validate."""
+    from omnigent._platform import stable_user_id
+    from omnigent.harnesses.claude_native import bridge
+
+    pinned = tmp_path / "runner-tmp"
+    bridge_dir = pinned / f"omnigent-{stable_user_id()}" / "acp-mcp" / "abc123"
+    bridge_dir.mkdir(parents=True, mode=0o700)
+    for directory in (bridge_dir.parent, bridge_dir.parent.parent):
+        directory.chmod(0o700)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path / "sandbox-scratch")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "sandbox-scratch" / "claude-native")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+        bridge._trusted_parent_for_bridge_dir(bridge_dir)
+
+    monkeypatch.setenv("TMPDIR", f"{pinned}/")
+    pinned.chmod(0o500)
+    try:
+        assert bridge._trusted_parent_for_bridge_dir(bridge_dir) == pinned
+        bridge._ensure_secure_dir(bridge_dir)
+        # Only the uid-scoped tree under it counts, not the whole pinned root.
+        with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+            bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
     finally:
         pinned.chmod(0o700)
