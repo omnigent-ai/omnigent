@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import subprocess
 import threading
 from collections import Counter
@@ -17,12 +18,16 @@ from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_CLI_UNRESPONSIVE,
+    HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
 )
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
     _binary_availability_reason,
     _databricks_credential_source,
+    _with_tmux_requirement,
     configured_harness_map,
     harness_is_configured,
 )
@@ -106,6 +111,28 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
     monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
+    # Native readiness also requires tmux; pin a supported one ahead of the
+    # host's so these verdicts don't depend on whether the machine has tmux.
+    tmux_dir = tmp_path / "tmux-bin"
+    _write_fake_executable(tmux_dir, "tmux", "tmux 3.6a")
+    monkeypatch.setenv("PATH", f"{tmux_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def _write_fake_executable(directory: Path, name: str, output: str | None) -> Path:
+    """Write an executable shell script that prints *output* and exits 0.
+
+    :param directory: Directory to create the script in, e.g. a test PATH entry.
+    :param name: Executable name, e.g. ``"tmux"`` or ``"devin"``.
+    :param output: Line printed on every invocation, e.g. ``"tmux 3.2"``;
+        ``None`` prints nothing.
+    :returns: Path of the written script.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    body = f"printf '%s\\n' {shlex.quote(output)}\n" if output is not None else ""
+    script.write_text(f"#!/bin/sh\n{body}exit 0\n")
+    script.chmod(0o755)
+    return script
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -121,6 +148,9 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # satisfying version so tests that simply need "binary present" are not
     # tripped up by an unexpected subprocess probe.
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if argv == ["/usr/bin/tmux", "-V"]:
+            # Native harnesses also need a supported tmux on the same PATH.
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="tmux 3.6a\n")
         if len(argv) >= 2 and argv[1] == "--version":
             # OpenCode's declared range is [2.0.0, 3.0.0); Cursor uses calendar
             # versions and needs a build after 2026-06-01; everything else is
@@ -1649,3 +1679,116 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
         )
     )
     assert configured_harness_map()["antigravity"] is True
+
+
+def _isolated_cli_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point PATH at one empty directory holding a fake ``devin`` CLI.
+
+    Devin has no version floor or login probe, so its native harness is ready
+    from binary presence alone and only tmux can change its verdict.
+
+    :returns: The PATH directory, for adding or replacing a fake ``tmux``.
+    """
+    bin_dir = tmp_path / "isolated-bin"
+    _write_fake_executable(bin_dir, "devin", "devin 1.0.0")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    return bin_dir
+
+
+@pytest.mark.parametrize(
+    ("tmux_output", "expected"),
+    [
+        pytest.param(None, HARNESS_TMUX_UNAVAILABLE, id="missing"),
+        pytest.param("tmux 3.2", HARNESS_TMUX_UNAVAILABLE, id="too-old"),
+        pytest.param("tmux next", HARNESS_TMUX_UNAVAILABLE, id="unparseable"),
+        pytest.param("tmux 3.3", True, id="minimum"),
+        pytest.param("tmux 3.6a", True, id="suffixed"),
+    ],
+)
+def test_native_readiness_requires_supported_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tmux_output: str | None,
+    expected: bool | str,
+) -> None:
+    """A native harness with a usable CLI reports tmux-unavailable until tmux works."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    if tmux_output is not None:
+        _write_fake_executable(bin_dir, "tmux", tmux_output)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == expected
+    assert result["native-devin"] == expected
+    # Non-native harnesses never launch tmux, so their verdicts are unaffected.
+    assert result["claude-sdk"] is True
+    assert result["claude"] is True
+    # A missing vendor CLI keeps precedence so its installer is still offered.
+    assert result["codex-native"] == HARNESS_BINARY_MISSING
+    assert result["codex"] == HARNESS_BINARY_MISSING
+    # The launch gate stays binary-only; the runner's tmux preflight owns that error.
+    assert harness_is_configured("devin-native") is True
+
+
+@pytest.mark.parametrize(
+    "availability",
+    [HARNESS_NEEDS_AUTH, HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW, False],
+)
+def test_tmux_requirement_keeps_every_state_but_ready(availability: HarnessAvailability) -> None:
+    """Sign-in and CLI problems keep their own state, so the UI still shows what to fix first."""
+    assert _with_tmux_requirement("devin-native", availability, tmux_usable=False) == availability
+    assert (
+        _with_tmux_requirement("devin-native", True, tmux_usable=False) == HARNESS_TMUX_UNAVAILABLE
+    )
+
+
+@pytest.mark.parametrize("broken_tmux", [None, "tmux 3.2"], ids=["missing", "too-old"])
+def test_native_readiness_recovers_when_tmux_is_repaired(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    broken_tmux: str | None,
+) -> None:
+    """A tmux placed in an existing PATH directory is picked up on the next probe."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    if broken_tmux is not None:
+        _write_fake_executable(bin_dir, "tmux", broken_tmux)
+    assert configured_harness_map()["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+
+    _write_fake_executable(bin_dir, "tmux", "tmux 3.4")
+
+    assert configured_harness_map()["devin-native"] is True
+
+
+def test_configured_harness_map_probes_tmux_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every native spelling shares one ``tmux -V`` run per readiness map."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    calls = tmp_path / "tmux-calls"
+    tmux = bin_dir / "tmux"
+    tmux.write_text(f"#!/bin/sh\necho call >> {shlex.quote(str(calls))}\necho 'tmux 3.2'\n")
+    tmux.chmod(0o755)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+    assert calls.read_text().splitlines() == ["call"]
+
+
+def test_undecodable_tmux_version_reads_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Invalid UTF-8 from ``tmux -V`` is an unknown version, not an aborted readiness map."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    tmux = bin_dir / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+    assert result["claude-sdk"] is True
+    assert result["codex"] == HARNESS_BINARY_MISSING

@@ -39,6 +39,9 @@ export interface ResolvedSetupStep {
 
 export type HarnessReadinessState = "available" | "unavailable" | "broken" | "setup-required";
 
+/** Oldest tmux native terminals accept (mirrors `MIN_TMUX_VERSION` in `omnigent/util/tmux_compat.py`). */
+export const MIN_TMUX_VERSION = "3.3";
+
 export type HarnessReadinessReason =
   | "ready"
   | "readiness-unknown"
@@ -49,6 +52,7 @@ export type HarnessReadinessReason =
   | "needs-auth"
   | "unconfigured"
   | "version-too-low"
+  | "tmux-unavailable"
   | "readiness-error";
 
 export interface HarnessReadinessExplanation {
@@ -141,6 +145,12 @@ export function harnessReadinessOnHost(
     return harnessReadinessResult("broken", "version-too-low", true, {
       label: "Harness is outdated",
       description: "Update this harness before starting a session with it.",
+    });
+  }
+  if (availability === "tmux-unavailable") {
+    return harnessReadinessResult("setup-required", "tmux-unavailable", true, {
+      label: "tmux is required",
+      description: `Install tmux ${MIN_TMUX_VERSION} or newer on the selected host, then check again.`,
     });
   }
   if (availability === "binary-missing") {
@@ -249,12 +259,14 @@ export function harnessUnavailableReasonOnHost(
     return "unconfigured";
   }
   // Installed-but-not-ready CLI harnesses report a structured string;
-  // "version-too-low" and "cli-unresponsive" can surface for any CLI harness.
+  // "version-too-low" and "cli-unresponsive" can surface for any CLI harness,
+  // and "tmux-unavailable" for a native harness on a host without a usable tmux.
   if (
     availability === "binary-missing" ||
     availability === "cli-unresponsive" ||
     availability === "needs-auth" ||
-    availability === "version-too-low"
+    availability === "version-too-low" ||
+    availability === "tmux-unavailable"
   ) {
     return availability;
   }
@@ -308,6 +320,7 @@ export function harnessWarningBadgeText(reason: string | null, collapsed = false
   if (reason === "needs-auth") return "needs auth";
   if (reason === "version-too-low") return "outdated";
   if (reason === "cli-unresponsive") return "not responding";
+  if (reason === "tmux-unavailable") return "needs tmux";
   return "needs setup";
 }
 
@@ -397,8 +410,10 @@ export function harnessAuthableOnHost(
  * ``"needs-auth"`` (installed, not signed in), ``"binary-missing"`` / ``false``
  * (not installed). Each step's ``status_key`` says which sub-state it tracks:
  * ``"installed"`` is done once the binary is present (anything but not-installed);
- * ``"authed"`` is done only when fully ready. A ``null`` key isn't locally
- * determinable → ``"unknown"`` (informational).
+ * ``"authed"`` is done only when fully ready, or when the only thing missing is
+ * tmux (the host reports ``"tmux-unavailable"`` only for an otherwise ready
+ * harness). A ``null`` key isn't locally determinable → ``"unknown"``
+ * (informational).
  */
 function stepStatus(
   statusKey: string | null,
@@ -410,7 +425,9 @@ function stepStatus(
     availability === "binary-missing" ||
     availability === "version-too-low";
   if (statusKey === "installed") return notInstalled ? "todo" : "done";
-  if (statusKey === "authed") return availability === true ? "done" : "todo";
+  if (statusKey === "authed") {
+    return availability === true || availability === "tmux-unavailable" ? "done" : "todo";
+  }
   return "unknown";
 }
 
@@ -428,9 +445,9 @@ export function resolveSetupSteps(
   harness: string | null | undefined,
   host: Host | undefined | null,
 ): ResolvedSetupStep[] {
-  if (!serverSteps || !harness) return [];
+  if (!harness) return [];
   const availability = host?.configured_harnesses?.[harness];
-  const resolved = serverSteps.map((step) => ({
+  const resolved: ResolvedSetupStep[] = (serverSteps ?? []).map((step) => ({
     kind: step.kind,
     title: step.title,
     detail: step.detail,
@@ -439,6 +456,20 @@ export function resolveSetupSteps(
     status: stepStatus(step.status_key, availability),
     harness,
   }));
+  // tmux is a host prerequisite with no server step, so add it while it's the blocker.
+  if (availability === "tmux-unavailable") {
+    resolved.push({
+      kind: "tmux",
+      title: `Install tmux ${MIN_TMUX_VERSION} or newer`,
+      detail:
+        "Native terminals run in tmux on the host. On Linux, use your package manager. " +
+        "If Omnigent still can't find tmux after you install it, quit and reopen the Omnigent app.",
+      action: "command",
+      command: "brew install tmux",
+      status: "todo",
+      harness,
+    });
+  }
   // Drop steps whose status the host can't determine (status_key: null, e.g.
   // Pi/Qwen's credential step) WHEN there's a trackable step to anchor on.
   // Showing an untrackable step pre-install and then having it vanish once the

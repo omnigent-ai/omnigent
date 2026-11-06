@@ -42,6 +42,7 @@ from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
     HARNESS_CLI_UNRESPONSIVE,
     HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
 )
@@ -77,6 +78,7 @@ from omnigent.onboarding.provider_config import (
     default_provider_for_harness,
     load_config,
 )
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 # In-process SDK harnesses: no CLI binary to gate on. The launch gate never
 # blocks them (spec-level auth is invisible here), but the picker map reports
@@ -1049,6 +1051,21 @@ def _is_codex_family_harness(canonical: str) -> bool:
     )
 
 
+def _with_tmux_requirement(
+    canonical: str, availability: HarnessAvailability, tmux_usable: bool
+) -> HarnessAvailability:
+    """Report a ready native harness as blocked on an unusable tmux.
+
+    Every other state keeps precedence and is fixed first. ``needs-auth``
+    stays so sign-in status stays visible. Because only ``True`` is replaced,
+    ``"tmux-unavailable"`` also means the CLI is installed and signed in, and
+    an older server can be sent ``True`` in its place.
+    """
+    if tmux_usable or canonical not in NATIVE_HARNESSES or availability is not True:
+        return availability
+    return HARNESS_TMUX_UNAVAILABLE
+
+
 def configured_harness_map() -> dict[str, HarnessAvailability]:
     """Return per-harness readiness for every accepted harness spelling.
 
@@ -1058,7 +1075,9 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     harnesses map to ``True``; CLI wrappers report local binary/auth readiness; SDK
     harnesses report ``"needs-auth"`` when no local credential source is
     visible. Codex entries distinguish ``"binary-missing"`` from
-    ``"needs-auth"``.
+    ``"needs-auth"``. Ready native (tmux-backed) harnesses report
+    ``"tmux-unavailable"`` when this host's tmux is missing or too old; tmux is
+    probed once per call.
 
     :returns: Mapping of harness spelling to readiness, e.g.
         ``{"claude-native": False, "codex-native": "needs-auth",
@@ -1108,13 +1127,18 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
         max_workers=min(_READINESS_PROBE_MAX_WORKERS, len(canonical_by_cache_key)),
         thread_name_prefix="harness-readiness",
     ) as executor:
+        # Windows natives already report False, so there is no tmux to probe.
+        tmux_future = None if IS_WINDOWS else executor.submit(tmux_unavailable_reason)
         futures = {
             cache_key: executor.submit(_harness_availability, canonical)
             for cache_key, canonical in canonical_by_cache_key.items()
         }
         availability_cache = {cache_key: future.result() for cache_key, future in futures.items()}
+        tmux_usable = tmux_future is None or tmux_future.result() is None
 
     return {
-        spelling: availability_cache[cache_key]
+        spelling: _with_tmux_requirement(
+            _canonical_harness(spelling), availability_cache[cache_key], tmux_usable
+        )
         for spelling, cache_key in cache_key_by_spelling.items()
     }

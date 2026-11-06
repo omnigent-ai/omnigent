@@ -10,9 +10,17 @@ HARNESS_BINARY_MISSING: Final[Literal["binary-missing"]] = "binary-missing"
 HARNESS_CLI_UNRESPONSIVE: Final[Literal["cli-unresponsive"]] = "cli-unresponsive"
 HARNESS_NEEDS_AUTH: Final[Literal["needs-auth"]] = "needs-auth"
 HARNESS_VERSION_TOO_LOW: Final[Literal["version-too-low"]] = "version-too-low"
+# A native (tmux-backed) harness whose CLI is usable but the host's tmux is
+# missing, too old, or of unknown version. Older servers drop it from a hello and
+# reject a live readiness refresh that contains it.
+HARNESS_TMUX_UNAVAILABLE: Final[Literal["tmux-unavailable"]] = "tmux-unavailable"
 
 HarnessUnavailableReason = Literal[
-    "binary-missing", "cli-unresponsive", "needs-auth", "version-too-low"
+    "binary-missing",
+    "cli-unresponsive",
+    "needs-auth",
+    "version-too-low",
+    "tmux-unavailable",
 ]
 HarnessAvailability = Literal[
     True,
@@ -21,6 +29,7 @@ HarnessAvailability = Literal[
     "cli-unresponsive",
     "needs-auth",
     "version-too-low",
+    "tmux-unavailable",
 ]
 
 # Readiness and model-family checks must agree on every Codex spelling.
@@ -36,6 +45,7 @@ def is_harness_availability(value: object) -> TypeGuard[HarnessAvailability]:
         HARNESS_CLI_UNRESPONSIVE,
         HARNESS_NEEDS_AUTH,
         HARNESS_VERSION_TOO_LOW,
+        HARNESS_TMUX_UNAVAILABLE,
     )
 
 

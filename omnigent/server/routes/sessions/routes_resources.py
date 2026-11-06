@@ -31,7 +31,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -717,7 +717,7 @@ def register_resources_routes(
         :returns: ``(roots, unconfined, workspace)``, or ``None`` when the
             session has no workspace or spec to resolve.
         """
-        from omnigent.inner.sandbox import is_unconfined, reachable_roots, resolve_sandbox
+        from omnigent.inner.sandbox import declared_filesystem_reach
 
         if not conversation.workspace:
             return None
@@ -730,10 +730,10 @@ def register_resources_routes(
         if spec_os_env is None:
             return None
         root = Path(conversation.workspace)
-        policy = resolve_sandbox(spec_os_env, root)
+        roots, unconfined = declared_filesystem_reach(root, spec_os_env)
         return (
-            reachable_roots(root, policy),
-            is_unconfined(policy),
+            roots,
+            unconfined,
             conversation.workspace,
         )
 
@@ -1564,6 +1564,7 @@ def register_resources_routes(
             declared by the agent spec (or the agent has no
             ``terminals:`` block at all).
         """
+        timings = StageTimings()
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         is_native_bootstrap = (
@@ -1596,6 +1597,7 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        timings.mark("authorize")
         # A session whose runner merely went to sleep (host still up, or a
         # resumable managed sandbox) is transparently reconnected here, so
         # opening a shell from the web wakes it instead of dead-ending on a
@@ -1612,6 +1614,7 @@ def register_resources_routes(
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
+        timings.mark("ensure_runner")
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
@@ -1621,6 +1624,18 @@ def register_resources_routes(
             path,
             body,
             conv,
+        )
+        timings.mark("runner_launch")
+        _logger.info(
+            "Terminal create finished",
+            extra=debug_event(
+                "terminal_create_finished",
+                session_id=session_id,
+                terminal=body.get("terminal"),
+                native_bootstrap=is_native_bootstrap,
+                status_code=status,
+                **timings.attributes(),
+            ),
         )
         if status >= 400:
             error = payload.get("error", {})
@@ -3608,16 +3623,24 @@ def register_resources_routes(
         request: Request,
         session_id: str,
         pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> dict[str, Any]:
         """
         List the PR's changed files (empty when the branch has no PR).
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param head_sha: With ``base_sha``, the revision of the displayed patch;
+            the list is rejected when the PR moved off it.
         :returns: Flat list of changed files with ``status`` and line counts.
         """
         conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        if base_sha:
+            params["base_sha"] = base_sha
         return await _fs_get_with_host_fallback(
             session_id,
             conv,

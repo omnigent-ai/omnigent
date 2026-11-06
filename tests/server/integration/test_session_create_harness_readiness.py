@@ -110,6 +110,50 @@ async def test_child_create_preserves_ready_and_unknown_hosts(
     assert response.json()["harness"] == "jcode"
 
 
+@pytest.mark.parametrize(
+    ("harness", "expected_status"),
+    [("devin-native", 412), ("jcode", 201)],
+)
+async def test_child_create_gates_only_the_tmux_backed_harness(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    harness: str,
+    expected_status: int,
+) -> None:
+    """A host without usable tmux blocks its native harness with tmux repair steps."""
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.host_store import HostStore
+
+    agent = await create_test_agent(client)
+    parent = (await client.post("/v1/sessions", json={"agent_id": agent["id"]})).json()
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(parent["id"], "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", workspace="/tmp/workspace")
+    store.set_runner_id(parent["id"], "runner_test")
+    hosts = HostStore(db_uri)
+    hosts.upsert_on_connect(
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "test-host",
+        "local",
+        configured_harnesses={"devin-native": "tmux-unavailable", "jcode": True},
+    )
+    app.state.host_store = hosts
+    response = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "parent_session_id": parent["id"],
+            "harness_override": harness,
+        },
+    )
+    assert response.status_code == expected_status, response.text
+    if expected_status == 412:
+        error = response.json()["error"]
+        assert error["code"] == "harness_not_configured"
+        assert "tmux 3.3 or newer" in error["message"]
+        assert "quit and reopen the Omnigent app" in error["message"]
+
+
 @pytest.mark.parametrize("bundle", [False, True])
 async def test_top_level_create_rejects_unavailable_harness(
     client: httpx.AsyncClient,

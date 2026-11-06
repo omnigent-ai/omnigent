@@ -938,7 +938,8 @@ class SysSessionCreateTool(Tool):
             "using the server's configured default provider. Managed creation requires a "
             "configured sandbox provider; use same_host for an existing connected host. "
             "These placements require orchestration enabled "
-            "and a private sending session, including its side-chat source chain. "
+            "and a sending session that is private or shared read-only, including its "
+            "side-chat source chain. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -1055,10 +1056,9 @@ class SysSessionCreateTool(Tool):
                             ],
                             "description": (
                                 "Optional reasoning level for the child "
-                                "session, e.g. 'high'. Only valid with "
-                                "'agent_id', and only for harnesses with "
-                                "effort plumbing; omit to use the agent's "
-                                "default."
+                                "session, e.g. 'high'. Only for harnesses "
+                                "with effort plumbing; omit to use the "
+                                "agent's default."
                             ),
                         },
                     },

@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
@@ -30,9 +30,11 @@ from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
+from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.harness_accounts import HarnessAccounts, normalize_harness_accounts
 from omnigent.harness_availability import (
     HARNESS_CLI_UNRESPONSIVE,
+    HARNESS_TMUX_UNAVAILABLE,
     HARNESS_VERSION_TOO_LOW,
     HarnessAvailability,
     is_harness_availability,
@@ -42,6 +44,7 @@ from omnigent.inner.native_attachments import (
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_FILESYSTEM_ATTACHMENTS,
 )
+from omnigent.scheduled_context import parse_scheduled_run
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -106,6 +109,63 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
 ]
+
+# Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
+# server sends no frame before the host's hello). Older servers send no header.
+SERVER_CAPABILITIES_HEADER = "X-Omnigent-Server-Capabilities"
+# The server accepts ``"tmux-unavailable"`` readiness. An older server's live
+# readiness decoder rejects the whole frame for it, so hosts down-map it to True.
+SERVER_CAP_TMUX_READINESS = "tmux_readiness"
+SERVER_CAPABILITIES: list[str] = [SERVER_CAP_TMUX_READINESS]
+
+
+def parse_server_capabilities(header_value: str | None) -> frozenset[str]:
+    """Parse the comma-separated :data:`SERVER_CAPABILITIES_HEADER` value.
+
+    :param header_value: Raw header value, e.g. ``"tmux_readiness"``, or ``None``.
+    :returns: The advertised capability tokens; empty for an older server.
+    """
+    if not header_value:
+        return frozenset()
+    return frozenset(token.strip() for token in header_value.split(",") if token.strip())
+
+
+def frame_for_server(frame: HostFrame, server_capabilities: frozenset[str]) -> HostFrame:
+    """Down-map readiness states the connected server can't decode.
+
+    ``"tmux-unavailable"`` only replaces ``True``, so the older server gets the
+    readiness it saw before tmux was checked. ``False`` would make it offer the
+    CLI installer for a CLI that is already installed; with ``True`` the launch
+    fails with the terminal's own "install tmux" error instead.
+
+    :param frame: Any host frame; only frames with a readiness map change.
+    :param server_capabilities: Tokens from :func:`parse_server_capabilities`.
+    :returns: *frame*, or a copy whose ``"tmux-unavailable"`` entries read
+        ``True`` for a server without :data:`SERVER_CAP_TMUX_READINESS`.
+    """
+    if not isinstance(
+        frame,
+        HostHelloFrame
+        | HostHarnessReadinessFrame
+        | HostInstallHarnessResultFrame
+        | HostRefreshHarnessesResultFrame
+        | HostHarnessLoginCompletedFrame
+        | HostHarnessLogoutResultFrame
+        | HostStoreSecretResultFrame,
+    ):
+        return frame
+    configured = frame.configured_harnesses
+    if (
+        not configured
+        or SERVER_CAP_TMUX_READINESS in server_capabilities
+        or HARNESS_TMUX_UNAVAILABLE not in configured.values()
+    ):
+        return frame
+    downgraded: dict[str, HarnessAvailability] = {
+        harness: True if availability == HARNESS_TMUX_UNAVAILABLE else availability
+        for harness, availability in configured.items()
+    }
+    return replace(frame, configured_harnesses=downgraded)
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -340,6 +400,7 @@ class HostLaunchRunnerFrame:
     harness: str | None = None
     inference_config: dict[str, Any] | None = None
     superseded_runner_ids: tuple[str, ...] | None = None
+    scheduled_run: ScheduledRunLogContext | None = None
 
 
 @dataclass
@@ -1634,6 +1695,8 @@ def encode_host_frame(frame: HostFrame) -> str:
             "harness": frame.harness,
             "inference_config": frame.inference_config,
         }
+        if frame.scheduled_run is not None:
+            payload["scheduled_run"] = frame.scheduled_run.model_dump()
         if frame.superseded_runner_ids is not None:
             payload["superseded_runner_ids"] = list(frame.superseded_runner_ids)
         return _encode_payload(payload)
@@ -2682,11 +2745,11 @@ def _decode_harness_readiness(msg: _JsonObject) -> HostHarnessReadinessFrame:
     raw = msg.get("configured_harnesses")
     if not isinstance(raw, dict):
         raise ValueError("harness readiness frame requires a configured_harnesses object")
+    # Unknown states from a newer host drop per entry (that harness reads as not
+    # ready) so the frame's other readiness, account and gateway updates still apply.
     configured_harnesses = _decode_configured_harnesses(msg)
     if configured_harnesses is None:
         raise ValueError("harness readiness frame requires a configured_harnesses object")
-    if len(configured_harnesses) != len(raw):
-        raise ValueError("harness readiness frame contains an unsupported availability state")
     if not configured_harnesses:
         raise ValueError("harness readiness frame requires a non-empty configured_harnesses map")
     return HostHarnessReadinessFrame(
@@ -2712,6 +2775,7 @@ def _decode_launch_runner(msg: _JsonObject) -> HostLaunchRunnerFrame:
         session_id=_optional_nullable_str(msg, "session_id"),
         harness=_optional_nullable_str(msg, "harness"),
         inference_config=inference_config,
+        scheduled_run=parse_scheduled_run(msg.get("scheduled_run")),
         # Absent (an older server) is distinct from an empty list.
         superseded_runner_ids=(
             tuple(_optional_str_list(msg, "superseded_runner_ids"))
