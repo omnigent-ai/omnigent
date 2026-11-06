@@ -240,6 +240,27 @@ describe("control-mode terminal", () => {
     expect(terminalSessionMock.instances[1].url).not.toContain("await_launch");
   });
 
+  it("re-dials an early attach that failed while the runner was being rebound", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-rebind1", "attach");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-rebind1" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    // No runner pinned yet: the relay closes with an internal error (4500).
+    act(() =>
+      terminalSessionMock.instances[0].onState({
+        kind: "closed",
+        code: 4500,
+        reason: "runner attach factory failed",
+      }),
+    );
+    expect(screen.getByText("Starting shell…")).toBeTruthy();
+    act(() => setTerminalLaunching("terminal_zsh_u-rebind1", null));
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(terminalSessionMock.instances[1].url).not.toContain("await_launch");
+  });
+
   it("re-dials when the refusal arrives after the create already succeeded", async () => {
     vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
     setTerminalLaunching("terminal_zsh_u-retry2", "attach");
