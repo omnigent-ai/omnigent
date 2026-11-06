@@ -2239,8 +2239,10 @@ export function ConversationScrollRefBridge({
     state: ConversationScroller["state"];
     stopScroll: () => void;
   };
-  useEffect(() => {
-    // Runs after commit, when StickToBottom has populated scrollRef.current.
+  // Before paint: the virtualized transcript renders no rows until it has the
+  // scroll element, so handing it over later paints a newly opened session blank.
+  // Render this after StickToBottom.Content so its scrollRef is attached by now.
+  useLayoutEffect(() => {
     const el = ctx.scrollRef?.current ?? null;
     onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
     return () => onScroller(null);

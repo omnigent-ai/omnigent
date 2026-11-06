@@ -1514,7 +1514,7 @@ describe("PullRequestPanel", () => {
     renderChanges();
 
     fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
-    const key = viewedStorageKey(window.location.origin, "alice", selected, "head");
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
     expect(localStorage.getItem(key)).toContain("hello.py");
   });
 
