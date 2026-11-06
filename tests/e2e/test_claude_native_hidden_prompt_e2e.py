@@ -2,8 +2,8 @@
 
 Claude reports its ``/model`` picker as waiting only while no reply streams. The
 local Messages API streams one slow reply; Claude, tmux and the runner watcher run live.
-Shell mode, the history search and a narrow pane keep the input box in use, so they
-must not raise the alert.
+Shell mode, the history search and a wrapped draft quoting dialog titles keep the
+input box in use, so they must not raise the alert.
 """
 
 from __future__ import annotations
@@ -190,7 +190,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
     resources = SessionResourceRegistry(terminals)
     statuses: list[tuple[str, str | None]] = []
     resources.set_session_status_publisher(
-        lambda _session, status, blocked_on: statuses.append((status, blocked_on))
+        lambda _session, status, blocked_on, inferred=False: statuses.append((status, blocked_on))
     )
     alert = ("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
     with _slow_messages_api() as base_url:
@@ -271,10 +271,24 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
                 terminal, bridge.claude_pane_text_ready, description="the input box after ctrl+r"
             )
             _resize(terminal, columns=28)
+            draft = "Explain Switch model? and Change effort level? and use this session only"
+            assert await terminal.send(draft, keys="") == {"status": "sent"}
+            await wait_for_terminal_screen(
+                terminal,
+                lambda pane: "  and Change effort level?" in pane,
+                description="the draft wrapped in a narrow pane",
+            )
             await asyncio.sleep(2 * _ALERT_SECONDS)
-            assert bridge.claude_pane_text_ready(terminal.last_pane_text() or "")
-            _resize(terminal, columns=120)
             assert alert not in statuses
+            assert "  and Change effort level?" in (terminal.last_pane_text() or "")
+            _resize(terminal, columns=120)
+            # ctrl+u clears only the cursor's wrapped row, so clear at full width.
+            assert await terminal.send(keys="C-u") == {"status": "sent"}
+            await wait_for_terminal_screen(
+                terminal,
+                lambda pane: "Switch model?" not in pane and bridge.claude_pane_text_ready(pane),
+                description="the input box after clearing the draft",
+            )
 
             assert await terminal.send("/model", keys="") == {"status": "sent"}
             await wait_for_terminal_screen(
@@ -286,7 +300,7 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
                 lambda pane: "Select model" in pane and not bridge.claude_pane_text_ready(pane),
                 description="the model picker covering the input box",
             )
-            (tmp_path / "native-hidden-prompt.txt").write_text(picker)
+            assert not bridge.claude_pane_input_box_shown(picker)
             # Claude itself still reports a plain busy turn while the reply streams.
             records = [
                 json.loads(path.read_text()) for path in (config_dir / "sessions").glob("*.json")

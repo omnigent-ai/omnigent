@@ -6270,15 +6270,12 @@ def claude_pane_input_box_shown(pane: str) -> bool:
 
     Broader than :func:`claude_pane_text_ready`: ``!`` shell mode and the
     ctrl+r prompt-history search also count, since the person is typing
-    there rather than being held up by a dialog.
+    there rather than being held up by a dialog. Dialogs are told apart by the
+    missing input box frame, not their titles, which a draft or reply may quote.
 
     :param pane: Captured pane text, e.g. the watcher's last capture.
     :returns: ``False`` when a dialog or picker replaces the input box.
     """
-    if _MODEL_PICKER_OPEN_HINT in pane:
-        return False
-    if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
-        return False
     return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
 
 

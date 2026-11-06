@@ -14752,6 +14752,39 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
 
 
+# Claude Code 2.1.295 draws the switch confirmation under a ▔ border, with no input box.
+_SWITCH_MODEL_CONFIRM_PANE = """\
+  ⎿  Kept model as Opus 4.8
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ Kept effort level as auto ▔
+   Switch model?
+   Your next response will be slower and use more tokens
+   This conversation is cached for the current model. Switching to Opus 5.5 (default)
+   means the full history gets re-read on your next message.
+   ❯ 1. Yes, switch to Opus 5.5 (default)
+     2. No, go back
+"""
+
+# A 2.1.295 draft quoting dialog titles, wrapped in a 28-column pane mid-turn.
+_DRAFT_QUOTING_DIALOGS_PANE = """\
+✢ Leavening… (25s)
+────────────────────────────
+❯ Explain Switch model?
+  and Change effort level?
+  and use this session
+  only
+────────────────────────────
+  ⏵⏵ auto mode on
+"""
+
+_REPLY_QUOTING_DIALOGS_PANE = """\
+⏺ Switch model? and Change effort level? confirm a switch; s to use this session only.
+──────────────────────────────
+❯
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
 @pytest.mark.parametrize(
     ("pane", "expected"),
     [
@@ -14761,8 +14794,11 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
         (_REVERSE_SEARCH_PANE, True),
         (_OVERLAY_REVERSE_SEARCH_PANE, True),
         (_SLIVER_MULTILINE_DRAFT_PANE, True),
+        (_DRAFT_QUOTING_DIALOGS_PANE, True),
+        (_REPLY_QUOTING_DIALOGS_PANE, True),
         (_MODEL_PICKER_PANE, False),
         (_EFFORT_DIALOG_PANE, False),
+        (_SWITCH_MODEL_CONFIRM_PANE, False),
         (_PERMISSION_PROMPT_PANE, False),
         (_REWIND_PANE, False),
         (_SETTINGS_PANEL_PANE, False),
@@ -14775,8 +14811,11 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
         "history-search",
         "history-search-overlay",
         "sliver-draft",
+        "draft-quoting-dialogs",
+        "reply-quoting-dialogs",
         "model-picker",
         "effort-dialog",
+        "switch-model-confirm",
         "permission-prompt",
         "rewind",
         "settings-panel",
@@ -14787,7 +14826,8 @@ def test_claude_pane_input_box_shown_counts_every_input_mode(pane: str, expected
     """
     Shell mode and the history search keep the person at the input box.
 
-    Only a dialog or panel drawn in its place means the terminal may need them.
+    Only a dialog or panel drawn in its place means the terminal may need them;
+    a draft or reply quoting a dialog's title does not.
     """
     assert claude_native_bridge.claude_pane_input_box_shown(pane) is expected
 
