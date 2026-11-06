@@ -2330,7 +2330,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # noqa: BLE001 - best-effort model fallback
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -4391,7 +4391,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # noqa: BLE001 - best-effort interrupt forwarding
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -5319,7 +5319,7 @@ def create_runner_app(
                                     registry.seed_snapshot(
                                         change.path, original, session_id=_captured_session_id
                                     )
-                        except Exception:  # noqa: BLE001 - best-effort native original recovery
+                        except Exception:
                             _logger.warning(
                                 "native original recovery failed for session=%s path=%r",
                                 _captured_session_id,
@@ -5333,7 +5333,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # noqa: BLE001 - best-effort file-change recording
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -8407,7 +8407,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # noqa: BLE001 - best-effort status resync
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,
