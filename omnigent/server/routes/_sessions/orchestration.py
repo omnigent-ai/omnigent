@@ -3174,8 +3174,16 @@ async def _persist_external_conversation_item_unlocked(
             # pending match is evidence of a web submission; preserve others.
             held_older = [*matched.skipped, *matched.uncertain]
         elif item.stable_id is not None or _is_kiro_native_session(conv):
+            lost_candidates = matched.skipped
+            if native_agent is not None and native_agent.harness == "codex-native":
+                # Codex can record an accepted input after a later one, so being
+                # overtaken is not loss; keep it queued for its own mirror.
+                held_older = [entry for entry in matched.skipped if _handed_to_native(entry)]
+                lost_candidates = [
+                    entry for entry in matched.skipped if not _handed_to_native(entry)
+                ]
             skipped_pending = [
-                pending_inputs.classify_missing_native_record(entry) for entry in matched.skipped
+                pending_inputs.classify_missing_native_record(entry) for entry in lost_candidates
             ]
             # Jumped-over entries that a positional drain may already have
             # settled: drained without an undelivered record.
@@ -3620,6 +3628,16 @@ async def _settle_undelivered_native_input(
             match_method="input_stable_id",
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
+
+
+def _handed_to_native(entry: pending_inputs.DrainedInput) -> bool:
+    """Whether the runner accepted this input and no failure of its own was reported."""
+    return entry.last_delivery_stage in {
+        "forward_accepted",
+        "native_turn_started",
+        "native_turn_accepted",
+        "native_turn_completed",
+    }
 
 
 def _restore_drained_inputs(

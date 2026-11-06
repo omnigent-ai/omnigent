@@ -6332,6 +6332,84 @@ async def test_claude_native_mirror_matches_pending_text_and_reports_lost_input(
         pending_inputs.reset_for_tests()
 
 
+def _codex_user_mirror(text: str, source_id: str) -> SessionEventInput:
+    """Build a Codex forwarder user-message mirror carrying a source id."""
+    return SessionEventInput(
+        type="external_conversation_item",
+        data={
+            "item_type": "message",
+            "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            "response_id": "codex_thread",
+            "source_id": source_id,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_native_mirror_keeps_an_overtaken_input_queued_for_its_own_mirror() -> None:
+    """Codex can record an accepted input after a later one; that is not loss.
+
+    The overtaken entry stays queued, so its own late mirror matches it by text
+    instead of being branded undelivered and then draining a newer entry.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    older = pending_inputs.record(sid, [{"type": "input_text", "text": "first steer"}])
+    pending_inputs.mark_delivery_stage(sid, older, "forward_accepted")
+    pending_inputs.record(sid, [{"type": "input_text", "text": "second steer"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid, conv, _codex_user_mirror("second steer", "thread:turn:item-2"), store
+        )
+        assert [item.type for item in store.appended_items] == ["message"]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [older]
+
+        await _persist_external_conversation_item(
+            sid, conv, _codex_user_mirror("first steer", "thread:turn:item-3"), store
+        )
+        assert [item.type for item in store.appended_items] == ["message", "message"]
+        assert store.appended_items[1].data.content == [
+            {"type": "input_text", "text": "first steer"}
+        ]
+        assert pending_inputs.snapshot_for(sid) == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_codex_native_mirror_does_not_keep_an_input_whose_delivery_failed() -> None:
+    """An overtaken Codex input whose own turn failed is not held for a mirror."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    pending_inputs.record(sid, [{"type": "input_text", "text": "failed"}], stable_id="b" * 32)
+    pending_inputs.mark_lifecycle(sid, "b" * 32, stage="native_turn_failed")
+    pending_inputs.record(sid, [{"type": "input_text", "text": "next"}])
+
+    try:
+        await _persist_external_conversation_item(
+            sid, conv, _codex_user_mirror("next", "thread:turn:item-2"), store
+        )
+        assert pending_inputs.snapshot_for(sid) == []
+        assert store.appended_items[-1].data.content == [{"type": "input_text", "text": "next"}]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
 @pytest.mark.asyncio
 async def test_claude_native_mirror_without_text_match_drains_the_oldest_entry() -> None:
     """A mirror whose text the transcript reformatted still drains by position.
