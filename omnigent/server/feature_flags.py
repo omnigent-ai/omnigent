@@ -137,7 +137,9 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.SIDEBAR_GROUPING_UI,
         description="Sidebar grouping, ordering and row metadata options, Shared section",
         owner="web",
-        review_by_release="0.19.0",
+        # On by default; remove the flag and its off path in 0.23.0.
+        review_by_release="0.23.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.CLAUDE_OSC_STATUS,

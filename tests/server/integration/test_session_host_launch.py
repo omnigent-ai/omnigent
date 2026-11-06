@@ -73,6 +73,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from tests.budgets import Deadline, budget
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import create_test_agent
 from tests.server.helpers import websocket_scope as _websocket_scope
 
@@ -442,13 +443,16 @@ async def test_inline_launch_binds_runner_and_returns_host(
     agent = await create_test_agent(client)
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    resp = await client.post(
-        "/v1/sessions",
-        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
-    )
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(
+            "/v1/sessions",
+            json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+        )
     await responder
 
     assert resp.status_code == 201, f"expected 201, got {resp.status_code}: {resp.text}"
+    accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
+    assert float(accepted["attributes"]["create_host_launch_ms"]) >= 0
     body = resp.json()
     # The response must carry the binding so the UI can route to the
     # runner; a None here means the launch branch didn't run.

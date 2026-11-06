@@ -9,6 +9,7 @@ without creating an API-layer import cycle.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
@@ -24,6 +25,11 @@ DEFAULT_ENVIRONMENT_ID = "default"
 ResourceType = Literal["environment", "terminal", "file"]
 
 _SAFE_RESOURCE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+#: How long an ``await_launch`` attach waits for its terminal to register.
+#: Covers a tmux spawn plus a runner that is slow to answer the create.
+TERMINAL_LAUNCH_ATTACH_WAIT_S = 15.0
+_TERMINAL_LAUNCH_ATTACH_POLL_S = 0.05
 
 
 def safe_resource_component(value: str) -> str:
@@ -319,3 +325,34 @@ def resolve_terminal_entry_by_resource_id(
         if terminal_resource_id(entry.terminal_name, entry.session_key) == terminal_id:
             return entry
     return None
+
+
+async def wait_for_terminal_entry_by_resource_id(
+    session_id: str,
+    terminal_id: str,
+    terminal_registry: TerminalRegistry | None,
+    *,
+    timeout_s: float | None = None,
+) -> TerminalListEntry | None:
+    """Wait for a terminal whose launch is still in flight to register.
+
+    The web opens a new shell's attach WebSocket while its create request is
+    still running, so the attach can arrive before the launch registers the
+    terminal. Callers opt in with ``await_launch``; a plain attach keeps the
+    immediate not-found answer.
+
+    :param session_id: Owning session/conversation id.
+    :param terminal_id: Opaque terminal resource id,
+        e.g. ``"terminal_zsh_u-ab12cd"``.
+    :param terminal_registry: The runner's terminal registry.
+    :param timeout_s: Seconds to wait before giving up, e.g. ``15.0``;
+        defaults to :data:`TERMINAL_LAUNCH_ATTACH_WAIT_S`.
+    :returns: The matching entry, or ``None`` when none registered in time.
+    """
+    wait_s = TERMINAL_LAUNCH_ATTACH_WAIT_S if timeout_s is None else timeout_s
+    deadline = asyncio.get_running_loop().time() + wait_s
+    while True:
+        entry = resolve_terminal_entry_by_resource_id(session_id, terminal_id, terminal_registry)
+        if entry is not None or asyncio.get_running_loop().time() >= deadline:
+            return entry
+        await asyncio.sleep(_TERMINAL_LAUNCH_ATTACH_POLL_S)
