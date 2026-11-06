@@ -3142,6 +3142,48 @@ def _merge_append_system_prompt(args: list[str], extra: str | None) -> list[str]
 # Claude Code's print mode answers once and exits instead of opening the TUI.
 _CLAUDE_PRINT_MODE_FLAGS = frozenset({"-p", "--print"})
 
+# Claude Code options that take a required value (``claude --help``, 2.1.295).
+# Claude reads the next token as that value even when it looks like a flag.
+_CLAUDE_VALUE_OPTIONS = frozenset(
+    {
+        "--add-dir",
+        "--agent",
+        "--agents",
+        "--allowedTools",
+        "--allowed-tools",
+        "--append-system-prompt",
+        "--append-system-prompt-file",
+        "--autocompact",
+        "--betas",
+        "--debug-file",
+        "--disallowedTools",
+        "--disallowed-tools",
+        "--effort",
+        "--environment",
+        "--fallback-model",
+        "--file",
+        "--input-format",
+        "--json-schema",
+        "--max-budget-usd",
+        "--model",
+        "-n",
+        "--name",
+        "--output-format",
+        "--permission-mode",
+        "--permission-prompts",
+        "--plugin-dir",
+        "--plugin-url",
+        "--remote-control-session-name-prefix",
+        "--session-id",
+        "--setting-sources",
+        "--settings",
+        "--system-prompt",
+        "--system-prompt-file",
+        "--system-prompt-snapshot",
+        "--tools",
+    }
+)
+
 
 def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> list[str]:
     """
@@ -3151,9 +3193,11 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
     leaves it unable to start. ``--print`` runs Claude headless, which a
     terminal session can't use, and Claude refuses to start when an
     ``--mcp-config`` file has since been deleted. Tokens after an option
-    terminator ``--`` are positional text and are kept as they are. Options
-    that exist only in print mode (``--no-session-persistence`` and the like)
-    are left alone: a session stored with them never started.
+    terminator ``--`` are positional text, and the value of another option
+    (``--system-prompt --print``) is that option's value; both are kept as
+    they are. Options that exist only in print mode
+    (``--no-session-persistence`` and the like) are left alone: a session
+    stored with them never started.
 
     :param args: The session's Claude Code launch args, e.g. ``["--print"]``.
     :param workspace: Directory Claude runs in, which relative config paths
@@ -3168,6 +3212,10 @@ def drop_startup_fatal_claude_args(args: Sequence[str], *, workspace: Path) -> l
         if arg == "--":
             kept.extend(args[index - 1 :])
             break
+        if arg in _CLAUDE_VALUE_OPTIONS:
+            kept.extend(args[index - 1 : index + 1])
+            index += 1
+            continue
         if arg in _CLAUDE_PRINT_MODE_FLAGS:
             _logger.warning(
                 "Dropped %s from the Claude launch args; the session needs its TUI", arg

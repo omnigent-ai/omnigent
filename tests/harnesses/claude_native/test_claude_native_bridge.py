@@ -3985,6 +3985,28 @@ def test_drop_startup_fatal_claude_args_drops_print_mode(tmp_path: Path) -> None
     assert args == ["fix the bug", "--model", "opus"]
 
 
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (["--system-prompt", "--print"], ["--system-prompt", "--print"]),
+        (
+            ["--append-system-prompt", "-p", "--model", "opus"],
+            ["--append-system-prompt", "-p", "--model", "opus"],
+        ),
+        (
+            ["--system-prompt", "--mcp-config=deleted.json"],
+            ["--system-prompt", "--mcp-config=deleted.json"],
+        ),
+        (["--system-prompt", "be brief", "--print"], ["--system-prompt", "be brief"]),
+    ],
+)
+def test_drop_startup_fatal_claude_args_keeps_values_of_other_options(
+    stored: list[str], expected: list[str], tmp_path: Path
+) -> None:
+    """Claude reads the token after a value-taking option as its value, even a flag-like one."""
+    assert drop_startup_fatal_claude_args(stored, workspace=tmp_path) == expected
+
+
 def test_drop_startup_fatal_claude_args_keeps_text_after_option_terminator(
     tmp_path: Path,
 ) -> None:
