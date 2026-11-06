@@ -20,9 +20,17 @@ Usage in config.yaml::
         - name: hindsight_reflect
           api_key: ${HINDSIGHT_API_KEY}
 
-Config keys (all optional except ``api_key``):
+A credential is required, supplied one of three ways (first non-empty wins):
+``api_key`` → ``api_key_ref`` → the ``HINDSIGHT_API_KEY_FILE`` environment
+variable. The last reads the key from a host-owned file so only its *path* —
+never the secret — travels in the runner environment or a generated service
+file, and a rotated file is picked up without restarting.
+
+Config keys (all optional; a credential is required):
 
 - ``api_key``: Hindsight API key (or set it via ``${HINDSIGHT_API_KEY}``).
+- ``api_key_ref``: a secret reference resolved at call time —
+  ``env:<VAR>`` / ``keychain:<name>`` / ``file:<path>``.
 - ``api_url``: API base URL. Defaults to Hindsight Cloud.
 - ``bank_id``: Memory bank to read/write. Defaults to ``ctx.agent_id``.
 - ``budget``: recall/reflect budget level — ``low`` / ``mid`` / ``high``.
@@ -35,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import TYPE_CHECKING, Any
 
 from omnigent.tools.base import Tool, ToolContext
@@ -73,23 +82,45 @@ class _HindsightToolBase(Tool):
     def __init__(self, config: dict[str, str] | None = None) -> None:
         self._config = config or {}
         self._cached_client: Hindsight | None = None
+        self._cached_key: str | None = None
+
+    def _resolve_api_key(self) -> str:
+        """Resolve the Hindsight credential, failing loud when absent.
+
+        Order (first non-empty wins): inline ``api_key`` → ``api_key_ref``
+        (``env:`` / ``keychain:`` / ``file:``) → the ``HINDSIGHT_API_KEY_FILE``
+        environment variable (read as a ``file:`` reference). The last lets a
+        host deliver the key in a file whose *path* — never the secret —
+        travels in the runner environment.
+        """
+        inline = self._config.get("api_key")
+        if inline:
+            return inline
+        ref = self._config.get("api_key_ref")
+        key_file = os.environ.get("HINDSIGHT_API_KEY_FILE")
+        if ref or key_file:
+            from omnigent.onboarding.provider_config import resolve_secret
+
+            return resolve_secret(ref or f"file:{key_file}")
+        raise ValueError(
+            "Hindsight memory tools require a credential: set 'api_key' "
+            "(e.g. api_key: ${HINDSIGHT_API_KEY}), 'api_key_ref' "
+            "(env:/keychain:/file:), or the HINDSIGHT_API_KEY_FILE "
+            "environment variable."
+        )
 
     def _client(self) -> Hindsight:
         """Build (and cache) a Hindsight client from the spec config.
 
         Imports ``hindsight_client`` lazily so merely importing this module
         (e.g. for ``description()`` during tool discovery) never requires the
-        optional dependency.
+        optional dependency. The credential is re-resolved on each call so a
+        rotated file/keychain value rebuilds the client rather than serving a
+        stale key from cache.
         """
-        if self._cached_client is not None:
+        api_key = self._resolve_api_key()
+        if self._cached_client is not None and self._cached_key == api_key:
             return self._cached_client
-
-        api_key = self._config.get("api_key")
-        if not api_key:
-            raise ValueError(
-                "Hindsight memory tools require an 'api_key' in the tool config "
-                "(e.g. api_key: ${HINDSIGHT_API_KEY})."
-            )
 
         import hindsight_client
 
@@ -98,6 +129,7 @@ class _HindsightToolBase(Tool):
             api_key=api_key,
             timeout=30.0,
         )
+        self._cached_key = api_key
         return self._cached_client
 
     def _bank(self, ctx: ToolContext) -> str:
