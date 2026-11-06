@@ -21,7 +21,10 @@ import {
   XIcon,
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
-import { ARIA_MOD_KEY, RIGHT_SIDEBAR_TOGGLE_KEYS } from "@/components/KeyboardShortcut";
+import {
+  rightSidebarToggleAriaShortcut,
+  rightSidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -828,7 +831,7 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
-                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+]`}
+                aria-keyshortcuts={rightSidebarToggleAriaShortcut()}
                 onClick={onToggleRightPanel}
                 componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
@@ -840,7 +843,7 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent shortcut={RIGHT_SIDEBAR_TOGGLE_KEYS}>
+            <TooltipContent shortcut={rightSidebarToggleShortcutKeys()}>
               <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>

@@ -144,18 +144,35 @@ describe("desktop command bridge", () => {
       closingQuits: true,
     });
     h.emit("omnigent:desktop-command", { command: "new-terminal", browserViewId: 7 });
+    h.emit("omnigent:desktop-command", {
+      command: "quit",
+      quitDetail: "The local server will stop.",
+    });
+    h.emit("omnigent:desktop-command", { command: "quit", quitDetail: 1 });
     h.emit("omnigent:desktop-command", { command: 5 });
     h.emit("omnigent:desktop-command", null);
     assert.deepEqual(JSON.parse(JSON.stringify(received)), [
-      { command: "close", browserViewId: "browser-tab:s:t", closingQuits: true },
-      { command: "new-terminal", browserViewId: null, closingQuits: false },
+      {
+        command: "close",
+        browserViewId: "browser-tab:s:t",
+        closingQuits: true,
+        quitDetail: null,
+      },
+      { command: "new-terminal", browserViewId: null, closingQuits: false, quitDetail: null },
+      {
+        command: "quit",
+        browserViewId: null,
+        closingQuits: false,
+        quitDetail: "The local server will stop.",
+      },
+      { command: "quit", browserViewId: null, closingQuits: false, quitDetail: null },
     ]);
 
     unsubscribe();
     assert.equal(h.hasListener("omnigent:desktop-command"), false);
   });
 
-  it("reports command state as plain values and asks main to close the window", async () => {
+  it("reports command state as plain values and asks main to close the window or quit", async () => {
     const h = loadPreload();
     h.desktop.setDesktopCommandState({
       commands: ["close", 3],
@@ -176,5 +193,66 @@ describe("desktop command bridge", () => {
 
     await h.desktop.closeWindow();
     assert.deepEqual(h.invokes.at(-1), { channel: "omnigent:close-window", args: undefined });
+
+    await h.desktop.confirmQuit({ dontAskAgain: "yes" });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
+      channel: "omnigent:confirm-quit",
+      args: { dontAskAgain: false },
+    });
+  });
+});
+
+describe("browser view bridge", () => {
+  it("asks main to focus a re-attached page only when told to", async () => {
+    const h = loadPreload();
+    await h.desktop.browserSetActive("browser-tab:s:t");
+    await h.desktop.browserSetActive("browser-tab:s:t", { focus: true });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.slice(-2))), [
+      {
+        channel: "omnigent:browser-set-active",
+        args: { conversationId: "browser-tab:s:t", focus: false },
+      },
+      {
+        channel: "omnigent:browser-set-active",
+        args: { conversationId: "browser-tab:s:t", focus: true },
+      },
+    ]);
+  });
+
+  it("asks main which page has keyboard focus", async () => {
+    const h = loadPreload();
+    await h.desktop.browserFocusedView();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:browser-focused-view");
+  });
+});
+
+describe("global show shortcut bridge", () => {
+  it("reads the saved shortcut and forwards only plain setting values", async () => {
+    const h = loadPreload();
+
+    await h.desktop.getGlobalShortcut();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:get-global-shortcut");
+
+    await h.desktop.setGlobalShortcut({ enabled: true, accelerator: "Control+Shift+K", extra: 1 });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
+      channel: "omnigent:set-global-shortcut",
+      args: { enabled: true, accelerator: "Control+Shift+K" },
+    });
+    // Turning off sends no chord, so the shell keeps its saved one.
+    await h.desktop.setGlobalShortcut({ enabled: false, extra: 1 });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))), {
+      channel: "omnigent:set-global-shortcut",
+      args: { enabled: false },
+    });
+    await h.desktop.setGlobalShortcut({ enabled: false, accelerator: "Alt+J" });
+    assert.deepEqual(JSON.parse(JSON.stringify(h.invokes.at(-1))).args, {
+      enabled: false,
+      accelerator: "Alt+J",
+    });
+
+    await h.desktop.recordGlobalShortcut();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
+    await h.desktop.cancelGlobalShortcutRecording();
+    assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
   });
 });

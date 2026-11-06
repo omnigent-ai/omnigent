@@ -21,6 +21,7 @@ const {
   Notification,
   clipboard,
   dialog,
+  globalShortcut,
   ipcMain,
   nativeImage,
   nativeTheme,
@@ -43,7 +44,8 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
+const { registerLocalhostCors } = require("./localhost_cors");
+const { isLoopbackPreviewUrl } = require("./browserUrlPolicy");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -122,6 +124,8 @@ const {
   macApplicationMenu,
   settingsMenuItem,
 } = require("./settingsNavigation");
+const { createQuitConfirmation } = require("./quitConfirmation");
+const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
@@ -1674,6 +1678,76 @@ const updater = createDesktopUpdater({
   // never be redirected to a repository-local update configuration.
   forceDevUpdateConfig: !app.isPackaged,
   updatesEnabled: !app.isPackaged || !isDevBuild,
+});
+
+/**
+ * Native consent before a system-wide shortcut registers. The IPC gate only proves the
+ * request came from the pinned server's page, not that the user asked for it.
+ */
+async function confirmGlobalShortcut(win, accelerator) {
+  const origin = win ? pinnedOrigin(win) : null;
+  if (!origin) return false;
+  let host = origin;
+  try {
+    host = new URL(origin).host;
+  } catch {
+    // Keep the full origin string if it doesn't parse.
+  }
+  const label = acceleratorLabel(accelerator, process.platform === "darwin");
+  const icon = nativeImage.createFromPath(ICON_PNG);
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    icon: icon.isEmpty() ? undefined : icon,
+    title: "Omnigent",
+    message: `Use ${label} to show Omnigent from any app?`,
+    detail:
+      `${host} wants to set a system-wide shortcut. While Omnigent is running, pressing ` +
+      `${label} in any app brings Omnigent to the front.\n\nOnly allow servers you trust.`,
+    buttons: ["Don't Allow", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+  return response === 1;
+}
+
+// The Quit menu item asks first, in a window's page; every other quit path
+// calls app.quit().
+const quitConfirmation = createQuitConfirmation({
+  isMac: process.platform === "darwin",
+  appName: () => app.name,
+  loadSettings,
+  saveSettings,
+  runningWork: () => serverManager.runningWork(),
+  ask: (detail) => {
+    const win = quitPromptWindow();
+    if (!win) return false;
+    if (win.isMinimized()) win.restore();
+    win.show();
+    win.focus();
+    sendDesktopCommand(win, "quit", { quitDetail: detail });
+    return true;
+  },
+  quit: () => app.quit(),
+});
+
+// "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
+// come forward from another app.
+const globalShowShortcut = createGlobalShowShortcut({
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  isMac: process.platform === "darwin",
+  show: () => {
+    const win = activeWindow();
+    if (!win) {
+      createWindow();
+      return;
+    }
+    if (win.isMinimized()) win.restore();
+    win.focus();
+    if (process.platform === "darwin") app.focus({ steal: true });
+  },
 });
 
 // Shell-owned About window: available from the native application menu even
@@ -3638,9 +3712,7 @@ function buildMenu() {
       },
     },
   ];
-  const quitItems = [
-    { id: "quit", label: `Quit ${app.name}`, accelerator: "CmdOrCtrl+Q", click: () => app.quit() },
-  ];
+  const quitItems = quitConfirmation.menuItems();
   // Commands the focused window's SPA performs. Their items stay disabled
   // until that SPA reports it can run them (see desktopCommands.js).
   const commandWindow = focusedConnectedWindow(BrowserWindow.getFocusedWindow(), windows);
@@ -3700,7 +3772,21 @@ function buildMenu() {
         label: "New Browser Tab",
         accelerator: "CmdOrCtrl+T",
         enabled: canRun("new-browser-tab"),
-        click: () => runCommand("new-browser-tab"),
+        click: () => focusAppAndSend("new-browser-tab"),
+      },
+      {
+        id: "focus_address_bar",
+        label: "Focus Address Bar",
+        accelerator: "CmdOrCtrl+L",
+        enabled: canRun("focus-address-bar"),
+        click: () => focusAppAndSend("focus-address-bar"),
+      },
+      {
+        id: "reopen_closed_tab",
+        label: "Reopen Closed Tab",
+        accelerator: "CmdOrCtrl+Shift+T",
+        enabled: canRun("reopen-closed-tab"),
+        click: () => focusAppAndSend("reopen-closed-tab"),
       },
       { type: "separator" },
       // Windows and Linux have no app menu, so Settings and Quit live here.
@@ -3758,7 +3844,12 @@ function buildMenu() {
   template.push({
     label: "View",
     submenu: [
-      { role: "reload" },
+      {
+        id: "reload",
+        label: "Reload",
+        accelerator: "CmdOrCtrl+R",
+        click: () => reloadFocused(),
+      },
       { role: "forceReload" },
       { type: "separator" },
       { role: "resetZoom" },
@@ -3784,6 +3875,21 @@ function buildMenu() {
         accelerator: "CmdOrCtrl+]",
         enabled: canRun("go-forward"),
         click: () => goInHistory(desktopCommandTarget("go-forward"), "go-forward"),
+      },
+      { type: "separator" },
+      {
+        id: "previous_tab",
+        label: "Previous Tab",
+        accelerator: "CmdOrCtrl+Shift+[",
+        enabled: canRun("previous-tab"),
+        click: () => focusAppAndSend("previous-tab"),
+      },
+      {
+        id: "next_tab",
+        label: "Next Tab",
+        accelerator: "CmdOrCtrl+Shift+]",
+        enabled: canRun("next-tab"),
+        click: () => focusAppAndSend("next-tab"),
       },
     ],
   });
@@ -4074,7 +4180,7 @@ function guardAgentPartitionRequests(partition, registry) {
 function arcaPreviewRecoveryTargetForEvent(event, url) {
   const win = BrowserWindow.fromWebContents(event.sender);
   if (
-    !isLocalhostUrl(url) ||
+    !isLoopbackPreviewUrl(url) ||
     !isPinnedOriginSender(event) ||
     !win ||
     win.isDestroyed() ||
@@ -4774,6 +4880,42 @@ function registerIpc() {
   ipcMain.handle("omnigent:close-window", (event) => {
     if (!isPinnedOriginSender(event)) return false;
     BrowserWindow.fromWebContents(event.sender)?.close();
+    return true;
+  });
+
+  // Quit (⌘Q), once the page's own dialog confirmed it.
+  ipcMain.handle("omnigent:confirm-quit", (event, options) => {
+    if (!isPinnedOriginSender(event)) return false;
+    quitConfirmation.confirmQuit({ dontAskAgain: options?.dontAskAgain === true });
+    return true;
+  });
+
+  // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
+  ipcMain.handle("omnigent:get-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("get-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.current();
+  });
+  ipcMain.handle("omnigent:set-global-shortcut", (event, setting) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("set-global-shortcut is only available to a connected server page");
+    }
+    const win = BrowserWindow.fromWebContents(event.sender);
+    return globalShowShortcut.set(setting, (accelerator) =>
+      confirmGlobalShortcut(win, accelerator),
+    );
+  });
+  // The Settings recorder takes the next chord here, ahead of the page's shortcuts and the menu.
+  ipcMain.handle("omnigent:record-global-shortcut", (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("record-global-shortcut is only available to a connected server page");
+    }
+    return globalShowShortcut.record(event.sender);
+  });
+  ipcMain.handle("omnigent:cancel-global-shortcut-recording", (event) => {
+    if (!isPinnedOriginSender(event)) return false;
+    globalShowShortcut.cancelRecording();
     return true;
   });
 
@@ -5556,11 +5698,29 @@ function desktopCommandTarget(command) {
 }
 
 /**
+ * The window to ask in before quitting: the focused one, else any other whose
+ * SPA can ask.
+ *
+ * @returns {BrowserWindow | null}
+ */
+function quitPromptWindow() {
+  // A hung page can't show the dialog or answer it, so it doesn't count.
+  return (
+    [BrowserWindow.getFocusedWindow(), ...windows.keys()].find(
+      (win) =>
+        focusedConnectedWindow(win, windows) &&
+        !windows.get(win).unresponsive &&
+        windows.get(win).desktopCommands?.commands.has("quit"),
+    ) ?? null
+  );
+}
+
+/**
  * Hand a native menu command to a window's SPA (see desktopCommands.js).
  *
  * @param {BrowserWindow | null} win
  * @param {string} command
- * @param {{ browserViewId?: string | null }} [extra]
+ * @param {{ browserViewId?: string | null, closingQuits?: boolean, quitDetail?: string | null }} [extra]
  */
 function sendDesktopCommand(win, command, extra = {}) {
   if (!win || win.isDestroyed()) return;
@@ -5625,6 +5785,34 @@ function goInHistory(win, command) {
     return;
   }
   sendDesktopCommand(win, command);
+}
+
+/**
+ * Reload (⌘R). A focused embedded web page reloads itself instead of the app
+ * around it; otherwise the page decides (its browser toolbar, else the app).
+ */
+function reloadFocused() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return;
+  const target = desktopCommandTarget("reload");
+  const viewId = target ? focusedBrowserViewId(target) : null;
+  const view = viewId ? windows.get(target).browserRegistry.get(viewId)?.view : null;
+  if (view) view.webContents.reload();
+  // A hung page can't run its own reload, so its window reloads directly.
+  else if (target && !windows.get(target).unresponsive) sendDesktopCommand(target, "reload");
+  else (target ?? focused).webContents.reload();
+}
+
+/**
+ * Take keyboard focus back from an embedded page, then hand `command` to the
+ * app, naming the page that had focus so the app can return to it.
+ */
+function focusAppAndSend(command) {
+  const target = desktopCommandTarget(command);
+  if (!target) return;
+  const browserViewId = focusedBrowserViewId(target);
+  target.webContents.focus();
+  sendDesktopCommand(target, command, { browserViewId });
 }
 
 /**
@@ -5908,6 +6096,7 @@ if (!gotLock) {
     registerSessionExpiryAccess();
     registerIpc();
     buildMenu();
+    globalShowShortcut.apply();
     // Patch PATH for GUI-launched Electron on macOS/Linux:
     // A desktop launcher inherits a minimal system PATH that omits directories like
     // /opt/homebrew/bin and ~/.nvm/... where CLI tools (claude, codex, tmux) live.
@@ -5953,6 +6142,7 @@ if (!gotLock) {
     });
   });
 
+  app.on("will-quit", () => globalShortcut.unregisterAll());
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -5986,6 +6176,7 @@ if (!gotLock) {
   };
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
+    quitConfirmation.quitStarted();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first
