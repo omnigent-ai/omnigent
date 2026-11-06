@@ -109,6 +109,15 @@ afterEach(() => {
 });
 
 describe("TerminalsPanel navigation", () => {
+  it("marks itself as closing on Escape only while open", () => {
+    // Page-wide Escape shortcuts (declining an approval) leave keys inside it alone.
+    renderPanel({ open: true });
+    expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-escape-owner");
+    cleanup();
+    renderPanel({ open: false });
+    expect(screen.getByTestId("terminals-panel")).not.toHaveAttribute("data-escape-owner");
+  });
+
   it("only casts a shadow while visible", () => {
     const { rerender } = renderPanel({ open: false });
     const panel = screen.getByTestId("terminals-panel");
