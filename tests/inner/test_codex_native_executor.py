@@ -21,6 +21,7 @@ import omnigent.inner.codex_native_executor as codex_native_executor
 from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
+    AcceptedSteer,
     CodexNativeBridgeState,
     clear_active_turn_id_if_matches,
     read_accepted_steers,
@@ -1036,8 +1037,8 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
         assert state.active_turn_id == active_turn_id
     assert "private prompt" not in json.dumps(attrs)
     steered = active_turn_id is not None and rpc_reply is None
-    assert read_accepted_steers(tmp_path, thread_id="thread_123", turn_id="turn_steered") == (
-        ["c" * 32] if steered else []
+    assert read_accepted_steers(tmp_path, thread_id="thread_123") == (
+        [AcceptedSteer("turn_steered", "c" * 32)] if steered else []
     )
 
 

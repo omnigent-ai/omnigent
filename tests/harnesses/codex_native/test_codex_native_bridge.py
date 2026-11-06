@@ -16,6 +16,7 @@ from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
+    AcceptedSteer,
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
@@ -23,7 +24,6 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     codex_mcp_config_overrides,
     codex_terminal_interactive,
-    forget_accepted_steers,
     mcp_startup_waiting_detail,
     pending_mcp_servers,
     prepare_bridge_dir,
@@ -44,6 +44,7 @@ from omnigent.harnesses.codex_native.bridge import (
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
+    settle_accepted_steers,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -1147,29 +1148,41 @@ def test_child_usage_baseline_storage_failure_keeps_recorded_baselines(
     )
 
 
-def test_accepted_steers_are_listed_per_turn_until_forgotten(bridge_dir: Path) -> None:
-    """Recent steers stay listed for their turn; a new thread drops the previous thread's."""
+def test_accepted_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None:
+    """Recent steers stay recorded until settled; a new thread drops the previous thread's."""
     for index in range(34):
         record_accepted_steer(
             bridge_dir, thread_id="thread_old", turn_id="turn_a", client_message_id=f"old_{index}"
         )
-    assert read_accepted_steers(bridge_dir, thread_id="thread_old", turn_id="turn_a") == [
-        f"old_{index}" for index in range(2, 34)
+    assert read_accepted_steers(bridge_dir, thread_id="thread_old") == [
+        AcceptedSteer("turn_a", f"old_{index}") for index in range(2, 34)
     ]
 
+    for turn_id, client_message_id in [("turn_1", "steer_1"), ("turn_1", "steer_2")]:
+        record_accepted_steer(
+            bridge_dir,
+            thread_id="thread_new",
+            turn_id=turn_id,
+            client_message_id=client_message_id,
+        )
     record_accepted_steer(
-        bridge_dir, thread_id="thread_new", turn_id="turn_1", client_message_id="steer_1"
+        bridge_dir, thread_id="thread_new", turn_id="turn_2", client_message_id="steer_3"
     )
-    record_accepted_steer(
-        bridge_dir, thread_id="thread_new", turn_id="turn_2", client_message_id="steer_2"
+    settle_accepted_steers(
+        bridge_dir, thread_id="thread_new", client_message_ids=["steer_1"], ended_turn_id="turn_1"
     )
-    forget_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_1")
 
-    assert read_accepted_steers(bridge_dir, thread_id="thread_old", turn_id="turn_a") == []
-    assert read_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_1") == []
-    assert read_accepted_steers(bridge_dir, thread_id="thread_new", turn_id="turn_2") == [
-        "steer_2"
+    assert read_accepted_steers(bridge_dir, thread_id="thread_old") == []
+    assert read_accepted_steers(bridge_dir, thread_id="thread_new") == [
+        AcceptedSteer("turn_1", "steer_2", turn_ended=True),
+        AcceptedSteer("turn_2", "steer_3"),
     ]
+
+    settle_accepted_steers(
+        bridge_dir, thread_id="thread_new", client_message_ids=["steer_2", "steer_3"]
+    )
+    assert read_accepted_steers(bridge_dir, thread_id="thread_new") == []
+    assert not (bridge_dir / "accepted_steers.json").exists()
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
