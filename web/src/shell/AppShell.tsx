@@ -3078,6 +3078,7 @@ function AppShellImpl() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            rightSidebarShortcutEnabled={!gridRoute}
           />
           <RecentSessionsSwitcher
             conversations={allConversations}
