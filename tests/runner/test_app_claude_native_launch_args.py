@@ -1751,9 +1751,12 @@ def test_claude_terminal_env_keeps_a_user_api_timeout(
         assert "API_TIMEOUT_MS" not in terminal_env
 
 
-def test_claude_terminal_env_lifts_the_default_output_token_cap() -> None:
-    """The launch env raises Claude Code's 32000-token reply cap to its 64000 maximum."""
-    assert build_native_claude_terminal_env(None)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "64000"
+def test_claude_terminal_env_lifts_the_default_output_token_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The launch env sets the largest per-model output cap, so no model's default is lowered."""
+    monkeypatch.delenv("CLAUDE_CODE_MAX_OUTPUT_TOKENS", raising=False)
+    assert build_native_claude_terminal_env(None)["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "128000"
 
 
 @pytest.mark.parametrize("source", ["ambient", "provider"])

@@ -2644,7 +2644,7 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
         "API_TIMEOUT_MS": "120000",
-        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+        "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
         "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     assert spec.command == "claude"

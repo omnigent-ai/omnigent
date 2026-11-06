@@ -272,10 +272,11 @@ _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
 # Claude Code waits 10 minutes by default for response headers, so a request
 # whose connection died silently (e.g. across host sleep) stalls the turn.
 _CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
-# Claude Code caps replies at 32000 output tokens by default, which cuts long answers off.
-# 64000 is the highest value its CLI accepts for this variable.
+# Claude Code's default reply cap is 32000 tokens for many models. The CLI clamps this
+# variable to each model's own limit, so 128000 (the largest) lifts every model to its
+# limit; a lower value would also lower models whose default is already higher.
 _CLAUDE_CODE_MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
-_CLAUDE_CODE_MAX_OUTPUT_TOKENS_VALUE = "64000"
+_CLAUDE_CODE_MAX_OUTPUT_TOKENS_VALUE = "128000"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
