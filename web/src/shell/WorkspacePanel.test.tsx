@@ -1,10 +1,22 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import userEvent from "@testing-library/user-event";
 import type { ReactNode, RefObject } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import * as sessionsApi from "@/lib/sessionsApi";
+import * as identity from "@/lib/identity";
 import { useChatStore } from "@/store/chatStore";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -17,6 +29,7 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import { browserViewId } from "@/lib/browserTabs";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
+import { type FileNavigationGuard, FileViewerContext } from "./FileViewerContext";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -24,6 +37,7 @@ import {
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
@@ -106,7 +120,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
   }) => (
     <div
       data-testid="side-chat-pane-stub"
-      data-read-only={String(readOnly ?? false)}
+      data-read-only={readOnly === undefined ? undefined : String(readOnly)}
       data-full-session={String(fullSession ?? false)}
     >
       {childId}
@@ -153,6 +167,19 @@ afterEach(() => {
   >);
 });
 
+/** File-viewer context whose guard stands in for the mounted viewer's unsaved-edits check. */
+function fileViewerContextWithGuard(guardFileNavigation: FileNavigationGuard) {
+  return {
+    openFile: vi.fn(),
+    guardFileNavigation,
+    openGithubTab: vi.fn(),
+    isChangedPath: () => false,
+    conversationId: "conv_ws",
+    workspaceRoot: null,
+    workspaceHome: null,
+  };
+}
+
 /**
  * Render WorkspacePanel with a complete prop set, overridable per test. Returns
  * the spied callbacks the tests assert against (openFileViewer / onCloseFile /
@@ -162,6 +189,7 @@ function renderWorkspace(
   initialOverrides: {
     conversationId?: string;
     contained?: boolean;
+    width?: number;
     rightRailTab?: RightRailTab | null;
     openPanels?: DefaultWorkspaceTab[];
     selectedFilePath?: string | null;
@@ -183,6 +211,10 @@ function renderWorkspace(
     mobileSideChatsOpen?: boolean;
     queryClient?: QueryClient;
     initialPath?: string;
+    withHide?: boolean;
+    permissionLevel?: number | null;
+    /** Stands in for the mounted viewer's unsaved-edits check. */
+    fileGuard?: FileNavigationGuard;
   } = {},
 ) {
   let overrides = initialOverrides;
@@ -198,12 +230,13 @@ function renderWorkspace(
   const queryClient =
     initialOverrides.queryClient ??
     new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const onHide = vi.fn();
   const tree = () => (
     <TooltipProvider delayDuration={0}>
       <WorkspacePanel
         conversationId={overrides.conversationId ?? "conv_ws"}
         contained={overrides.contained}
-        width={360}
+        width={overrides.width ?? 360}
         open={overrides.open}
         animateVisibility={overrides.animateVisibility}
         resizing={overrides.resizing}
@@ -224,6 +257,7 @@ function renderWorkspace(
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
         onReveal={onReveal}
+        onHide={overrides.withHide === false ? undefined : onHide}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -240,7 +274,7 @@ function renderWorkspace(
         onCloseTerminal={onCloseTerminal}
         maximized={overrides.maximized ?? false}
         onToggleMaximized={onToggleMaximized}
-        permissionLevel={null}
+        permissionLevel={overrides.permissionLevel ?? null}
         filesPanelSort={"recent" as ChangedSort}
         onSortChange={vi.fn()}
         filesPanelShowHidden={false}
@@ -252,10 +286,20 @@ function renderWorkspace(
       />
     </TooltipProvider>
   );
+  const fileViewerContext =
+    initialOverrides.fileGuard && fileViewerContextWithGuard(initialOverrides.fileGuard);
   // The panel reads session snapshots and renders router links.
   const Providers = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={queryClient}>
-      <MemoryRouter initialEntries={[initialOverrides.initialPath ?? "/"]}>{children}</MemoryRouter>
+      <MemoryRouter initialEntries={[initialOverrides.initialPath ?? "/"]}>
+        {fileViewerContext ? (
+          <FileViewerContext.Provider value={fileViewerContext}>
+            {children}
+          </FileViewerContext.Provider>
+        ) : (
+          children
+        )}
+      </MemoryRouter>
     </QueryClientProvider>
   );
   const view = render(tree(), { wrapper: Providers });
@@ -274,6 +318,7 @@ function renderWorkspace(
     onCloseTerminal,
     onToggleMaximized,
     onMobileSideChatsOpenChange,
+    onHide,
     view,
   };
 }
@@ -481,6 +526,33 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
   });
 
+  it("keeps numbered tab picks in a focused strip while a question waits", () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "changes" });
+    render(
+      <AskUserQuestionForm
+        elicitationId="elic_strip"
+        questions={[
+          {
+            id: "pick",
+            question: "Pick one",
+            multiSelect: false,
+            options: [{ label: "First" }, { label: "Second" }],
+          },
+        ]}
+        onSubmit={vi.fn()}
+        onReject={vi.fn()}
+        keyboardActive
+      />,
+    );
+    const changes = screen.getByRole("tab", { name: "Changes" });
+    changes.focus();
+    fireEvent.keyDown(changes, { key: "2" });
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+    expect(screen.getByLabelText("Second")).not.toBeChecked();
+  });
+
   it("selects permanent tabs by their visible number while the tab strip is focused", () => {
     writeDefaultWorkspaceTab("changes");
     const { onRightRailTabChange } = renderWorkspace({
@@ -668,6 +740,32 @@ describe("WorkspacePanel open-file tabs", () => {
     // (stopPropagation), or closing would race with a selection.
     expect(onCloseFile).toHaveBeenCalledWith("src/App.tsx");
     expect(openFileViewer).not.toHaveBeenCalled();
+  });
+
+  it("asks the open file's viewer before its x or middle click closes it", () => {
+    const allowClose: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allowClose.push(commit);
+    });
+    const { onCloseFile } = renderWorkspace({
+      openFiles: ["src/App.tsx", "docs/README.md"],
+      selectedFilePath: "src/App.tsx",
+      fileGuard,
+    });
+
+    // A tab in the background has no editor mounted, so nothing can be lost.
+    fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
+    expect(fileGuard).not.toHaveBeenCalled();
+    expect(onCloseFile).toHaveBeenCalledWith("docs/README.md");
+
+    fireEvent.click(screen.getByRole("button", { name: "Close App.tsx" }));
+    const appTab = screen.getByRole("button", { name: "Close App.tsx" }).closest("[role='button']");
+    fireEvent(appTab!, new MouseEvent("auxclick", { bubbles: true, button: 1 }));
+    expect(fileGuard).toHaveBeenCalledTimes(2);
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    expect(onCloseFile).not.toHaveBeenCalledWith("src/App.tsx");
+    act(() => allowClose[0]!());
+    expect(onCloseFile).toHaveBeenCalledWith("src/App.tsx");
   });
 });
 
@@ -868,7 +966,27 @@ describe('WorkspacePanel "+" new-tab menu', () => {
       Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
 
     expect(keycaps(browser)).toEqual(["Ctrl", "Alt", "B"]);
-    expect(keycaps(shell)).toEqual(["Ctrl", "Alt", "T"]);
+    expect(keycaps(shell)).toEqual(["Ctrl", "`"]);
+  });
+
+  it("shows the desktop menu's New Browser Tab chord when the shell owns it", async () => {
+    declaresShell();
+    Object.assign(window, {
+      omnigentDesktop: {
+        kind: "electron",
+        onDesktopCommand: () => () => {},
+        setDesktopCommandState: () => {},
+      },
+    });
+    renderWorkspace({ showBrowserTab: true });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
+    const browser = await screen.findByRole("menuitem", { name: "Browser" });
+    expect(Array.from(browser.querySelectorAll("kbd"), (key) => key.textContent)).toEqual([
+      "Ctrl",
+      "T",
+    ]);
+    resetDesktopCommandsForTests();
   });
 
   it("ignores number shortcuts from the portalled menu", async () => {
@@ -987,6 +1105,26 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     // Focus is not restored to the "+" trigger on close — that focus return is
     // what re-opened its tooltip for a frame (the visible flash after launch).
     expect(screen.getByRole("button", { name: "Open new" })).not.toHaveFocus();
+  });
+
+  it("opens a Side chat tab from the menu with its composer asked to take focus", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({ sessionHarness: "openai-agents", sideChatComposers: {} });
+    try {
+      const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.pointerDown(await screen.findByRole("button", { name: "Open new" }), { button: 0 });
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Side chat" }));
+
+      const pendingId = screen.getByTestId("side-chat-pane-stub").firstChild?.textContent ?? "";
+      expect(pendingId).toMatch(/^pending:/);
+      expect(onRightRailTabChange).toHaveBeenCalledWith("sidechat");
+      expect(useChatStore.getState().sideChatComposers).toEqual({
+        [pendingId]: { text: "", files: [], autoFocus: true },
+      });
+    } finally {
+      useChatStore.setState({ sessionHarness: previousHarness, sideChatComposers: {} });
+    }
   });
 
   it("does not launch on the multi-shell row when the session is offline", async () => {
@@ -1216,7 +1354,7 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
-  it("uses page labels in tabs, close controls, and the panel picker", async () => {
+  it("closes the selected browser with its close button", async () => {
     const title = "Documentation: a complete guide to configuring your workspace and browser";
     const firstView = browserViewId("conv_ws", "docs");
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
@@ -1342,6 +1480,91 @@ describe("WorkspacePanel browser tab", () => {
   });
 });
 
+describe("WorkspacePanel restored side chats", () => {
+  it.each([false, true])("automatically adds saved side-chat tabs (mobile: %s)", async (mobile) => {
+    isMobileMock.mockReturnValue(mobile);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      sideChatAllowed: true,
+    });
+    const fetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockResolvedValue(
+        new Response(
+          JSON.stringify({ data: [{ id: "remote-side" }], has_more: true, last_id: "remote-side" }),
+        ),
+      );
+    try {
+      const view = renderWorkspace({ queryClient, mobileSideChatsOpen: mobile });
+      const container = mobile
+        ? screen.getByTestId("side-chats-panel-drawer")
+        : screen.getByRole("complementary", { name: "Workspace" });
+      const tab = await within(container).findByRole("tab", { name: "Side chat 1" });
+      expect(screen.queryByRole("button", { name: "Browse side chats" })).not.toBeInTheDocument();
+      expect(fetch).toHaveBeenCalledWith(
+        "/v1/sessions/conv_ws/side_chats?limit=20",
+        expect.anything(),
+      );
+      expect(view.onRightRailTabChange).not.toHaveBeenCalled();
+      expect(view.onReveal).not.toHaveBeenCalled();
+      fireEvent.click(tab);
+      if (!mobile) view.rerender({ rightRailTab: "sidechat" });
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("remote-side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
+      expect(fetch.mock.calls.filter(([url]) => String(url).includes("/side_chats"))).toHaveLength(
+        1,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
+  it.each([404, 500])("keeps local tabs when discovery returns %s", async (status) => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    writeSessionWorkspaceState("conv_ws", {
+      openSideChats: ["local-side"],
+      selectedSideChatId: "local-side",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], { id: "conv_ws", sideChatAllowed: true });
+    vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(new Response("{}", { status }));
+    try {
+      renderWorkspace({ queryClient, rightRailTab: "sidechat" });
+      await waitFor(() =>
+        expect(
+          queryClient.isFetching({ queryKey: ["conversation", "conv_ws", "side_chats"] }),
+        ).toBe(0),
+      );
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("local-side");
+      expect(readSessionWorkspaceState("conv_ws").openSideChats).toEqual(["local-side"]);
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+
+  it("restores the selected Codex child without overriding the pane's permissions", () => {
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    try {
+      // Restored from storage, e.g. on another device or after a reload.
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["conv_codex_side"],
+        selectedSideChatId: "conv_codex_side",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_codex_side");
+      expect(screen.getByTestId("side-chat-pane-stub")).not.toHaveAttribute("data-read-only");
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
@@ -1349,9 +1572,10 @@ describe("WorkspacePanel mobile side chats", () => {
       selectedSideChatId: "conv_side_b",
     });
 
-  it.each([false, true])(
-    "keeps a side chat, draft, and queue when close fails (mobile=%s)",
-    async (mobile) => {
+  it.each(["desktop button", "mobile button"])(
+    "keeps a side chat, draft, and queue when close fails (%s)",
+    async (entry) => {
+      const mobile = entry === "mobile button";
       isMobileMock.mockReturnValue(mobile);
       openTabs();
       const followUp = {
@@ -1375,7 +1599,10 @@ describe("WorkspacePanel mobile side chats", () => {
       const surface = mobile
         ? screen.getByTestId("side-chats-panel-drawer")
         : screen.getByRole("complementary", { name: "Workspace" });
-      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      const close = () => {
+        fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      };
+      close();
 
       await waitFor(() =>
         expect(toast.error).toHaveBeenCalledWith("Couldn't close side chat. Try again."),
@@ -1390,7 +1617,7 @@ describe("WorkspacePanel mobile side chats", () => {
         useChatStore.setState((s) => ({ queuedMessages: [...s.queuedMessages, queuedDuringStop] }));
         return { queued: false };
       });
-      fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));
+      close();
       await waitFor(() =>
         expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_a"),
       );
@@ -1402,6 +1629,41 @@ describe("WorkspacePanel mobile side chats", () => {
       stop.mockRestore();
     },
   );
+
+  // Owner level either way: an admin has it without owning the session.
+  it.each([
+    [true, true],
+    [false, false],
+  ])("offers a new side chat when the server allows it (%s)", (sideChatAllowed, offered) => {
+    isMobileMock.mockReturnValue(true);
+    const before = useChatStore.getState();
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(["session", "conv_ws"], {
+      id: "conv_ws",
+      agentId: "agent",
+      status: "idle",
+      createdAt: 0,
+      labels: {},
+      permissionLevel: 4,
+      sideChatAllowed,
+    });
+    try {
+      renderWorkspace({
+        rightRailTab: "sidechat",
+        mobileSideChatsOpen: true,
+        permissionLevel: 4,
+        queryClient,
+      });
+
+      const drawer = screen.getByTestId("side-chats-panel-drawer");
+      expect(within(drawer).queryByRole("button", { name: "New side chat" }) !== null).toBe(
+        offered,
+      );
+    } finally {
+      useChatStore.setState({ sessionHarness: before.sessionHarness });
+    }
+  });
 
   it("shows the selected side chat in the drawer, not the hidden rail", () => {
     isMobileMock.mockReturnValue(true);
@@ -1787,4 +2049,220 @@ it("keeps a contained workspace inline on narrow viewports and scopes its file b
     "flex",
   );
   expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-session", "conv_ws");
+});
+
+describe("WorkspacePanel desktop menu commands", () => {
+  type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
+  let sendCommand: CommandListener = () => {};
+  const browserClose = vi.fn();
+
+  beforeEach(() => {
+    browserClose.mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        kind: "electron",
+        onDesktopCommand: (callback: CommandListener) => {
+          sendCommand = callback;
+          return () => {};
+        },
+        setDesktopCommandState: () => {},
+        browserClose,
+      },
+    });
+  });
+
+  afterEach(() => {
+    resetDesktopCommandsForTests();
+  });
+
+  /** Put keyboard focus on the rail's tab strip, as a click inside the rail would. */
+  function focusRail() {
+    const strip = screen.getByRole("toolbar", { name: "Workspace tabs" });
+    strip.focus();
+    expect(document.activeElement).toBe(strip);
+  }
+
+  const close = (focusedViewId: string | null = null) =>
+    sendCommand({ command: "close", browserViewId: focusedViewId });
+
+  it("closes the shell on screen when the rail has focus", () => {
+    const { onCloseTerminal } = renderWorkspace({
+      openTerminals: ["terminal:zsh"],
+      selectedTerminalKey: "terminal:zsh",
+    });
+    focusRail();
+    close();
+    expect(onCloseTerminal).toHaveBeenCalledWith("terminal:zsh");
+  });
+
+  it("leaves a shell open for a viewer, who has no close button either", () => {
+    const { onCloseTerminal, onHide } = renderWorkspace({
+      openTerminals: ["terminal:zsh"],
+      selectedTerminalKey: "terminal:zsh",
+      permissionLevel: 1,
+    });
+    focusRail();
+    close();
+    expect(onCloseTerminal).not.toHaveBeenCalled();
+    expect(onHide).not.toHaveBeenCalled();
+  });
+
+  it("closes the open file tab", () => {
+    const { onCloseFile } = renderWorkspace({
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+    });
+    focusRail();
+    close();
+    expect(onCloseFile).toHaveBeenCalledWith("src/a.ts");
+  });
+
+  it("closes the open file only once its viewer allows dropping unsaved edits", () => {
+    const allowClose: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allowClose.push(commit);
+    });
+    const { onCloseFile } = renderWorkspace({
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+      fileGuard,
+    });
+    focusRail();
+    close();
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    expect(onCloseFile).not.toHaveBeenCalled();
+    act(() => allowClose[0]!());
+    expect(onCloseFile).toHaveBeenCalledWith("src/a.ts");
+  });
+
+  it("closes the browser tab whose embedded view has focus, with focus outside the rail", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+
+    close(browserViewId("conv_ws", "browser-1"));
+    await waitFor(() =>
+      expect(browserClose).toHaveBeenCalledWith(browserViewId("conv_ws", "browser-1")),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Browser 1" })).not.toBeInTheDocument(),
+    );
+  });
+
+  it("closes a tab clicked where nothing takes focus, such as a new tab's empty page", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1"],
+      selectedBrowserId: "browser-1",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+
+    await userEvent.setup().click(screen.getByTestId("browser-pane-stub"));
+    close();
+    await waitFor(() =>
+      expect(browserClose).toHaveBeenCalledWith(browserViewId("conv_ws", "browser-1")),
+    );
+  });
+
+  it("keeps focus in the rail after closing a tab, so the next Close closes the next tab", async () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["browser-1", "browser-2"],
+      selectedBrowserId: "browser-2",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+
+    // Browser 2's page has focus; closing it removes the focused view.
+    close(browserViewId("conv_ws", "browser-2"));
+    await waitFor(() =>
+      expect(screen.queryByRole("tab", { name: "Browser 2" })).not.toBeInTheDocument(),
+    );
+    close();
+    await waitFor(() =>
+      expect(browserClose).toHaveBeenCalledWith(browserViewId("conv_ws", "browser-1")),
+    );
+  });
+
+  it("closes an unpinned page tab, and hides the rail on a fixed page", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onClosePanel, onHide, rerender } = renderWorkspace({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+    });
+    focusRail();
+    close();
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+    expect(onHide).not.toHaveBeenCalled();
+
+    rerender({ rightRailTab: "files", openPanels: [] });
+    focusRail();
+    close();
+    expect(onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes Close on when focus is outside the rail and its browser view", () => {
+    const onClose = vi.fn();
+    const { onCloseFile, onHide } = renderWorkspace({
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+    });
+    // A lower-priority handler, as AppShell registers, receives what the rail declines.
+    renderHook(() => useDesktopCommand("close", onClose));
+
+    close("browser-tab:another-session:tab");
+    expect(onCloseFile).not.toHaveBeenCalled();
+    expect(onHide).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Close while the workspace is still starting", () => {
+    const { onCloseFile, onHide } = renderWorkspace({
+      pending: true,
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+    });
+    focusRail();
+    close();
+    expect(onCloseFile).not.toHaveBeenCalled();
+    expect(onHide).not.toHaveBeenCalled();
+  });
+
+  it("opens New Browser Tab over an open file only once its viewer allows it", () => {
+    const allowLeaving: (() => void)[] = [];
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      allowLeaving.push(commit);
+    });
+    const { onRightRailTabChange } = renderWorkspace({
+      showBrowserTab: true,
+      openFiles: ["src/a.ts"],
+      selectedFilePath: "src/a.ts",
+      fileGuard,
+    });
+    sendCommand({ command: "new-browser-tab", browserViewId: null });
+    expect(fileGuard).toHaveBeenCalledWith(null, undefined, expect.any(Function));
+    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
+    act(() => allowLeaving[0]!());
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+  });
+
+  it("does not close a page that a stale shell selection leaves unselected", () => {
+    // Unpinned, Changes is an open page tab that Close could remove.
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onClosePanel } = renderWorkspace({
+      rightRailTab: "changes",
+      openPanels: ["changes"],
+      selectedTerminalKey: "terminal:gone",
+      openTerminals: [],
+    });
+    focusRail();
+    close();
+    expect(onClosePanel).not.toHaveBeenCalled();
+  });
+
+  it("opens a browser tab for New Browser Tab when the workspace offers browsers", () => {
+    const { onRightRailTabChange, onReveal } = renderWorkspace({ showBrowserTab: true });
+    sendCommand({ command: "new-browser-tab", browserViewId: null });
+    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
+    expect(onReveal).toHaveBeenCalled();
+  });
 });

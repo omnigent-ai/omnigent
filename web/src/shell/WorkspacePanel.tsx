@@ -1,4 +1,4 @@
-import type { FilePosition, OpenFileOptions } from "./FileViewerContext";
+import { type FilePosition, FileViewerContext, type OpenFileOptions } from "./FileViewerContext";
 import {
   BotIcon,
   CheckIcon,
@@ -27,6 +27,7 @@ import {
   memo,
   Suspense,
   useCallback,
+  useContext,
   useEffect,
   useRef,
   useState,
@@ -38,9 +39,13 @@ import {
   ARIA_MOD_KEY,
   CompactShortcutKeys,
   MOD_KEY,
+  NEW_BROWSER_TAB_KEYS,
+  NEW_TERMINAL_KEYS,
   SHIFT_KEY,
 } from "@/components/KeyboardShortcut";
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import {
   type DefaultWorkspaceTab,
   defaultWorkspaceTabs,
@@ -68,11 +73,14 @@ import { useInertRef } from "@/hooks/useInertRef";
 import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useQuery } from "@tanstack/react-query";
+import { authenticatedFetch } from "@/lib/identity";
 import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { SUBAGENT_TAB_FALLBACK_LABEL, SubagentTabPane, useSubagentTabLabels } from "./SubagentTab";
 import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
@@ -103,7 +111,6 @@ const TerminalView = lazy(() =>
 );
 const WORKSPACE_OPEN_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
-const NEW_SHELL_KEYS = [MOD_KEY, ALT_KEY, "T"] as const;
 const workspacePanels = {
   "content-search": { label: "Content search", icon: SearchIcon },
   files: { label: "Files", icon: FolderTreeIcon },
@@ -121,13 +128,6 @@ function WorkspaceMenuShortcut({
 }) {
   return <CompactShortcutKeys keys={keys} className={className} />;
 }
-
-// Side-chat child ids opened in THIS app session. Module scope, so it resets on
-// reload/restart. A Codex side chat is an ephemeral thread-fork of the parent's
-// runner: one restored from localStorage after a restart points at a dead
-// process, so it must be read-only. This set distinguishes a live, this-session
-// child from a restored (dead) one.
-const sideChatsStartedThisSession = new Set<string>();
 
 function WorkspaceTabTooltip({
   label,
@@ -296,7 +296,7 @@ function NewTabMenu({
         {connectState === "offline" && (
           <span className="text-sm text-muted-foreground">Offline</span>
         )}
-        <WorkspaceMenuShortcut keys={NEW_SHELL_KEYS} />
+        <WorkspaceMenuShortcut keys={NEW_TERMINAL_KEYS} />
       </span>
     </>
   );
@@ -351,7 +351,10 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
-            <WorkspaceMenuShortcut keys={NEW_BROWSER_KEYS} className="ml-auto pl-4" />
+            <WorkspaceMenuShortcut
+              keys={supportsDesktopCommands() ? NEW_BROWSER_TAB_KEYS : NEW_BROWSER_KEYS}
+              className="ml-auto pl-4"
+            />
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -718,6 +721,8 @@ interface WorkspacePanelProps {
   showBrowserTab: boolean;
   /** Reveal the workspace when a global shortcut opens a tab. */
   onReveal?: () => void;
+  /** Hide the rail; desktop Close uses it when no tab on screen can close. */
+  onHide?: () => void;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -796,8 +801,8 @@ interface WorkspacePanelProps {
   mobileSideChatsOpen?: boolean;
   /** Open or close the mobile side-chats drawer. */
   onMobileSideChatsOpenChange?: (open: boolean) => void;
-  /** Reports whether a sub-agent tab is open, so a phone can reach the drawer. */
-  onHasSubagentTabsChange?: (hasSubagentTabs: boolean) => void;
+  /** Reports whether a side-chat or sub-agent tab is open, so a phone can reach the drawer. */
+  onHasSideChatTabsChange?: (hasSideChatTabs: boolean) => void;
   /** Opens a sub-agent from the Agents tab as a rail tab; absent where unsupported (Grid panes). */
   subagentPanelOpener?: SubagentPanelOpener;
 }
@@ -839,6 +844,7 @@ function WorkspacePanelImpl({
   showGithubTab,
   showBrowserTab,
   onReveal,
+  onHide,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -870,12 +876,14 @@ function WorkspacePanelImpl({
   onShellCreateFailed,
   mobileSideChatsOpen = false,
   onMobileSideChatsOpenChange,
-  onHasSubagentTabsChange,
+  onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
   const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
+  const railRef = useRef<HTMLElement | null>(null);
+  const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
   const closeBrowserTab = async (tabId: string) => {
     const closed = await browsers.close(tabId);
@@ -890,20 +898,34 @@ function WorkspacePanelImpl({
     browsers.selected !== null &&
     selectedFilePath === null &&
     selectedTerminalKey === null;
+  const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
+  // A new browser tab replaces the file on screen, so its viewer confirms unsaved edits first.
   const addBrowser = () => {
-    browsers.add();
-    onRightRailTabChange("browser");
-    onReveal?.();
+    const openBrowser = () => {
+      browsers.add();
+      onRightRailTabChange("browser");
+      onReveal?.();
+    };
+    if (selectedFilePath !== null && guardFileNavigation) {
+      guardFileNavigation(null, undefined, openBrowser);
+    } else {
+      openBrowser();
+    }
   };
   useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
+  useDesktopCommand(
+    "new-browser-tab",
+    showBrowserTab && !pending && !contained ? addBrowser : null,
+  );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
   const sideChats = useSideChats(conversationId);
-  const hasSubagentTabs = sideChats.tabs.some((id) => subagentSessionIdFromTab(id) !== null);
+  // Open tabs stay reachable even where this viewer can't start a side chat.
+  const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
-    onHasSubagentTabsChange?.(hasSubagentTabs);
-    return () => onHasSubagentTabsChange?.(false);
-  }, [hasSubagentTabs, onHasSubagentTabsChange]);
+    onHasSideChatTabsChange?.(hasSideChatTabs);
+    return () => onHasSideChatTabsChange?.(false);
+  }, [hasSideChatTabs, onHasSideChatTabsChange]);
   const activeHarness = useChatStore((s) => s.sessionHarness);
   const sideChatHarness = sessionHarness === undefined ? activeHarness : sessionHarness;
   const sideChatToOpen = useChatStore((s) => s.sideChatToOpen);
@@ -938,8 +960,6 @@ function WorkspacePanelImpl({
       // existing session) must not take a slot in the Codex awaiting queue.
       sideChats.open(childId);
     } else {
-      // Started this session → live (not a dead restored Codex fork).
-      sideChatsStartedThisSession.add(childId);
       const awaiting = awaitingPendingIdsRef.current.shift();
       if (awaiting !== undefined) {
         sideChats.rekey(awaiting, childId);
@@ -962,9 +982,30 @@ function WorkspacePanelImpl({
   // that supports side chat.
   const activeAgentId = useChatStore((s) => s.boundAgentId);
   const parentAgentId = agentId === undefined ? activeAgentId : agentId;
-  const onNewSideChat = supportsSideChat(sideChatHarness)
+  const canStartSideChat = useCanStartSideChat(conversationId, permissionLevel);
+  const discoverSideChats = !pending && supportsSideChat(sideChatHarness, canStartSideChat);
+  const { data: savedSideChats } = useQuery({
+    queryKey: ["conversation", conversationId, "side_chats"],
+    queryFn: async ({ signal }): Promise<{ id: string }[]> => {
+      const response = await authenticatedFetch(
+        `/v1/sessions/${encodeURIComponent(conversationId)}/side_chats?limit=20`,
+        { signal },
+      );
+      if (response.status === 404) return [];
+      if (!response.ok) throw new Error("Could not load side chats");
+      return (await response.json()).data;
+    },
+    enabled: discoverSideChats,
+  });
+  const restoreSideChats = sideChats.restore;
+  useEffect(() => {
+    if (savedSideChats && discoverSideChats) {
+      restoreSideChats(savedSideChats.map((chat) => chat.id));
+    }
+  }, [savedSideChats, discoverSideChats, restoreSideChats]);
+  const onNewSideChat = supportsSideChat(sideChatHarness, canStartSideChat)
     ? () => {
-        sideChats.openPending();
+        useChatStore.getState().requestSideChatFocus(sideChats.openPending());
         onRightRailTabChange("sidechat");
       }
     : undefined;
@@ -1090,7 +1131,7 @@ function WorkspacePanelImpl({
   for (const tabId of sideChats.tabs) {
     chatTabLabels[tabId] = subagentTabLabels[tabId] ?? `Side chat ${++sideChatNumber}`;
   }
-  const railInertRef = useInertRef<HTMLElement>(inert ?? false);
+  const railInertRef = useInertRef<HTMLElement>(inert ?? false, railRef);
   const selectedSideChat = sideChats.selected;
   const selectedSubagentId =
     selectedSideChat === null ? null : subagentSessionIdFromTab(selectedSideChat);
@@ -1113,14 +1154,6 @@ function WorkspacePanelImpl({
           (isMobile ? mobileSideChatsOpen : open && sideChatSelected) ? conversationId : undefined
         }
         onStart={(text) => startPendingSideChat(selectedSideChat, text)}
-        // A Codex side chat restored after a restart is a dead ephemeral
-        // fork: show it read-only rather than let the user
-        // send into a thread that no longer exists.
-        readOnly={
-          usesNativeSideChatFork(sideChatHarness) &&
-          !selectedSideChat.startsWith("pending:") &&
-          !sideChatsStartedThisSession.has(selectedSideChat)
-        }
       />
     );
   };
@@ -1150,12 +1183,24 @@ function WorkspacePanelImpl({
     sideChats.close(childId);
   };
 
+  // Closing the file on screen asks its viewer first, which confirms before
+  // dropping edits it hasn't saved. Other file tabs have no mounted editor.
+  const closeFile = useCallback(
+    (path: string) => {
+      if (path === selectedFilePath && guardFileNavigation) {
+        guardFileNavigation(null, undefined, () => onCloseFile(path));
+      } else {
+        onCloseFile(path);
+      }
+    },
+    [guardFileNavigation, onCloseFile, selectedFilePath],
+  );
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
   const handleCloseTab = useCallback(() => {
-    if (selectedFilePath !== null) onCloseFile(selectedFilePath);
-  }, [onCloseFile, selectedFilePath]);
+    if (selectedFilePath !== null) closeFile(selectedFilePath);
+  }, [closeFile, selectedFilePath]);
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
@@ -1430,6 +1475,46 @@ function WorkspacePanelImpl({
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
+  // Desktop Close (⌘W / Ctrl+W) while the rail, or its embedded browser view,
+  // has focus: close the tab on screen, or hide the rail on a fixed page.
+  // Otherwise AppShell's handler leaves the session.
+  useDesktopCommand(
+    "close",
+    (event) => {
+      const browserFocused =
+        event.browserViewId !== null && event.browserViewId === browsers.viewId;
+      if (!browserFocused && !railRef.current?.contains(document.activeElement)) return false;
+      if (pending) return true;
+      // Like the tab strip, a page counts as selected only with no shell selected.
+      const openPanel =
+        selectedTerminalKey === null
+          ? visibleOpenPanels.find((tab) => tab === rightRailTab)
+          : undefined;
+      if (terminalShown && selectedTerminalKey !== null) {
+        // Viewers can't close shells; the tab shows no close button for them either.
+        if (!isEditorLevel(permissionLevel)) return true;
+        // A terminal already closing gets no second request.
+        if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
+      } else if (selectedFilePath !== null) {
+        handleCloseTab();
+      } else if (scopeView === "sidechat" && sideChats.selected !== null) {
+        void closeSideChat(sideChats.selected);
+      } else if (scopeView === "browser" && browsers.selected !== null) {
+        void closeBrowserTab(browsers.selected);
+      } else if (openPanel !== undefined) {
+        onClosePanel(openPanel);
+      } else if (onHide) {
+        onHide();
+        return true;
+      } else {
+        return false;
+      }
+      // Keep focus in the rail, so the next Close closes the tab shown next.
+      railContentRef.current?.focus({ preventScroll: true });
+      return true;
+    },
+    { priority: 10 },
+  );
   const rail = (
     <aside
       aria-label="Workspace"
@@ -1587,7 +1672,7 @@ function WorkspacePanelImpl({
                   openFiles={openFiles}
                   activeFilePath={selectedFilePath}
                   onFileSelect={openFileViewer}
-                  onCloseFile={onCloseFile}
+                  onCloseFile={closeFile}
                 />
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
@@ -1769,10 +1854,14 @@ function WorkspacePanelImpl({
         </div>
         {/* Single content slot: an open shell or file tab, else the selected tab's view. */}
         <div
+          ref={railContentRef}
           data-workspace-panel-content
-          className="relative flex min-h-0 flex-1 flex-col overflow-hidden"
+          // A click on any part of a tab focuses the rail, so Close (⌘W) closes that tab.
+          tabIndex={-1}
+          className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
-          {showContentSearch && showFilesPanel && !pending && (
+          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+          {showContentSearch && showFilesPanel && !pending && !isMobile && (
             <div
               className={cn(
                 "min-h-0 flex-1 flex-col",

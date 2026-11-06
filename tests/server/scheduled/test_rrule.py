@@ -239,7 +239,7 @@ def test_position_selection_consumes_work() -> None:
         next(iter_bounded(parsed, max_steps=4, max_seconds=1))
 
 
-def test_search_stops_at_elapsed_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_search_stops_at_cpu_time_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from itertools import count
 
     for evaluate in (
@@ -248,9 +248,27 @@ def test_search_stops_at_elapsed_time_limit(monkeypatch: pytest.MonkeyPatch) -> 
     ):
         # Advance only the recurrence clock; no real delay or costly input is needed.
         ticks = count()
-        monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", ticks.__next__)
+        monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", ticks.__next__)
         with pytest.raises(RRuleValidationError, match="time limit"):
             evaluate("FREQ=DAILY")
+
+
+def test_search_time_limit_ignores_time_spent_off_cpu() -> None:
+    import time
+
+    from dateutil.rrule import rrulestr
+
+    from omnigent.server.scheduled._bounded_rrule import iter_bounded
+
+    # A stalled thread (loaded host, GIL wait, GC elsewhere) must not reject a valid rule.
+    parsed = rrulestr("FREQ=HOURLY", dtstart=_dt(2026, 1, 1))
+    occurrences = []
+    for occurrence in iter_bounded(parsed, max_steps=100, max_seconds=0.05):
+        occurrences.append(occurrence)
+        if len(occurrences) == 3:
+            break
+        time.sleep(0.1)
+    assert occurrences == [_dt(2026, 1, 1, hour) for hour in range(3)]
 
 
 def test_yearly_leap_day_rule_is_supported() -> None:
@@ -407,3 +425,37 @@ def test_legacy_search_horizon_remains_midnight_based() -> None:
     after = _dt(2026, 1, 1, 2)
     assert get_next_fire_time(rule, after, UTC) is None
     assert get_next_fire_time(rule, after, UTC, anchor=after) == _dt(2034, 1, 1, 1)
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox", None])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+@pytest.mark.parametrize("minutes", [1, 5, 9, 10, 11, 15, 30, 59, 60])
+def test_minimum_interval_depends_on_execution(execution_target, session_mode, minutes):
+    minimum = 10 if execution_target == "connected_host" or session_mode == "continue" else 60
+    options = {
+        "execution_target": execution_target,
+        "session_mode": session_mode,
+    }
+    rule = f"FREQ=MINUTELY;INTERVAL={minutes}"
+    if minutes < minimum:
+        with pytest.raises(RRuleValidationError, match=f"Minimum interval is {minimum} minutes"):
+            validate_rrule(rule, **options)
+    else:
+        assert validate_rrule(rule, **options).rule == rule
+
+
+@pytest.mark.parametrize(
+    "rule,allowed",
+    [
+        ("FREQ=HOURLY;BYMINUTE=5,15,25,35,45,55", True),
+        ("FREQ=HOURLY;BYMINUTE=0,10,19,30", False),
+        ("FREQ=SECONDLY;INTERVAL=600", True),
+        ("FREQ=SECONDLY;INTERVAL=599", False),
+    ],
+)
+def test_continued_session_checks_actual_gaps(rule, allowed):
+    if allowed:
+        assert validate_rrule(rule, session_mode="continue").rule == rule
+    else:
+        with pytest.raises(RRuleValidationError, match="Minimum interval is 10 minutes"):
+            validate_rrule(rule, session_mode="continue")
