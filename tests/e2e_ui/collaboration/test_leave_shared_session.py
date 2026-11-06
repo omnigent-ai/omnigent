@@ -123,7 +123,7 @@ def test_shared_viewer_leaves_session_and_row_disappears(
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is hidden under the default "My sessions" filter
-        # (it isn't the viewer's own); it shows under the "Shared sessions"
+        # (it isn't the viewer's own); it shows under the "Shared with me"
         # filter, where the viewer leaves it from.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         page.locator(_FILTER).click()

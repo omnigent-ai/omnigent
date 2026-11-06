@@ -39,19 +39,29 @@ describe("Settings native menu item", () => {
       opened += 1;
     });
     const settings = settingsMenuItem(() => {});
-    const menu = macApplicationMenu("Electron", about, settings);
+    const checkForUpdates = { id: "check_for_updates", label: "Check for Updates…" };
+    const restartToUpdate = { id: "restart_to_update", label: "Restart to Update" };
+    const quit = { id: "quit", label: "Quit Electron" };
+    const menu = macApplicationMenu("Electron", {
+      about,
+      updates: [checkForUpdates, restartToUpdate],
+      settings,
+      quit: [quit],
+    });
 
     assert.equal(menu.label, "Electron");
-    assert.equal(menu.submenu[0], about);
+    assert.deepEqual(menu.submenu.slice(0, 3), [about, checkForUpdates, restartToUpdate]);
     assert.equal(about.id, "open_about");
     assert.equal(about.label, "About Omnigent");
     about.click();
     assert.equal(opened, 1);
-    assert.equal(menu.submenu[2], settings);
+    assert.equal(menu.submenu[4], settings);
+    // Quit is the shell's own item, not Electron's quit role.
     assert.deepEqual(
       menu.submenu.filter((entry) => entry.role).map((entry) => entry.role),
-      ["services", "hide", "hideOthers", "unhide", "quit"],
+      ["services", "hide", "hideOthers", "unhide"],
     );
+    assert.equal(menu.submenu.at(-1), quit);
   });
 });
 
