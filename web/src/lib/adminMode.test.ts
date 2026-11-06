@@ -44,6 +44,9 @@ async function eligibleAdmin(enabled = false) {
   const mode = await import("./adminMode");
   mode.initializeAdminMode();
   stopWatching = mode.subscribeAdminModeChanges();
+  if (!document.cookie.includes("omnigent_admin_mode_server_a=")) {
+    document.cookie = "omnigent_admin_mode_server_a=off; Path=/";
+  }
   mode.resolveAdminMode({
     user_id: "admin@example.test",
     can_enable_admin_mode: true,
@@ -54,23 +57,25 @@ async function eligibleAdmin(enabled = false) {
 }
 
 describe("browser admin mode", () => {
-  it("starts ordinary access without overwriting a mode already accepted by the server", async () => {
+  it("opts into bootstrap without writing a generic cookie or overwriting scoped state", async () => {
+    document.cookie = "omnigent_admin_mode_server_a=accepted-user-hash; Path=/";
+    const cookie = vi.spyOn(document, "cookie", "set");
     const mode = await import("./adminMode");
     mode.initializeAdminMode();
-    expect(document.cookie).toContain("omnigent_admin_mode=off");
-
-    document.cookie = "omnigent_admin_mode_server_a=accepted-user-hash; Path=/";
     mode.initializeAdminMode();
-    expect(document.cookie).toContain("omnigent_admin_mode=off");
+    expect(mode.usesBrowserAdminMode()).toBe(true);
+    expect(cookie).not.toHaveBeenCalled();
+    expect(document.cookie).not.toContain("omnigent_admin_mode=");
     expect(document.cookie).toContain("omnigent_admin_mode_server_a=accepted-user-hash");
   });
 
-  it("uses the standalone base path for its cookie", async () => {
+  it("opts standalone subpath deployments into the server handshake", async () => {
     window.__OMNIGENT_BASE_PATH__ = "/proxy/6767";
     const cookie = vi.spyOn(document, "cookie", "set");
-    const { initializeAdminMode } = await import("./adminMode");
-    initializeAdminMode();
-    expect(cookie).toHaveBeenCalledWith("omnigent_admin_mode=off; Path=/proxy/6767; SameSite=Lax");
+    const mode = await import("./adminMode");
+    mode.initializeAdminMode();
+    expect(mode.usesBrowserAdminMode()).toBe(true);
+    expect(cookie).not.toHaveBeenCalled();
   });
 
   it("requires embedded hosts to opt into the shared cookie path", async () => {
@@ -78,6 +83,7 @@ describe("browser admin mode", () => {
     const mode = await eligibleAdmin();
     expect(document.cookie).not.toContain("omnigent_admin_mode=");
     expect(mode.getAdminMode()).toBeNull();
+    expect(mode.usesBrowserAdminMode()).toBe(false);
 
     mocks.cookiePath = "/";
     mode.initializeAdminMode();
@@ -88,6 +94,7 @@ describe("browser admin mode", () => {
       admin_mode_cookie_name: "omnigent_admin_mode_server_a",
     });
     expect(mode.getAdminMode()).toBe(false);
+    expect(mode.usesBrowserAdminMode()).toBe(true);
   });
 
   it("reacts to server identity and hides the switch for old servers and ordinary users", async () => {

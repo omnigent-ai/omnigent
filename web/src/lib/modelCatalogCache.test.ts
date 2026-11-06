@@ -51,10 +51,11 @@ it("does not restore Fusion configurations as selectable model IDs", () => {
 it.each(["server", "user", "target", "kind", "harness", "agent", "admin mode"])(
   "isolates catalogs by %s",
   (dimension) => {
+    if (dimension === "admin mode") vi.mocked(getAdminMode).mockReturnValue(true);
     writeModelCatalogCache(key(), models, true);
     if (dimension === "server") vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
     if (dimension === "user") vi.mocked(getCurrentUserId).mockReturnValue("bob");
-    if (dimension === "admin mode") vi.mocked(getAdminMode).mockReturnValue(true);
+    if (dimension === "admin mode") vi.mocked(getAdminMode).mockReturnValue(false);
     const other = modelCatalogCacheKey(
       dimension === "kind" ? "host" : "sandbox",
       dimension === "target" ? "other-provider" : "company",

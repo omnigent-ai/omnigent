@@ -455,19 +455,34 @@ async def test_non_admin_cannot_list_users(
 async def test_logout_clears_session_cookie(
     client: httpx.AsyncClient,
 ) -> None:
-    """POST /auth/logout returns 204 and clears the session cookie."""
-    cookies = await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD)
-    headers = _cookie_header(cookies)
+    """Logout clears authentication and resets admin mode across the next login."""
+    await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD)
+    identity = (await client.get("/v1/me", headers={"X-Omnigent-Admin-Mode": "browser"})).json()
+    cookie_name = identity["admin_mode_cookie_name"]
+    assert identity["can_enable_admin_mode"] is True
+    assert identity["admin_mode_enabled"] is False
+    assert client.cookies.get(cookie_name) == "off"
+    enabled = await client.post("/v1/me/admin-mode", json={"enabled": True})
+    assert enabled.status_code == 200
+    assert enabled.json()["admin_mode_enabled"] is True
+    assert (await client.get("/auth/users")).status_code == 200
 
-    resp = await client.post("/auth/logout", headers=headers)
+    resp = await client.post("/auth/logout")
     assert resp.status_code == 204
 
     # The Set-Cookie header should expire/delete the session cookie.
     set_cookie_headers = resp.headers.get_list("set-cookie")
     assert any("session" in h.lower() for h in set_cookie_headers)
-    # Note: the JWT is stateless, so resending the raw cookie header
-    # would still authenticate. The test verifies the Set-Cookie
-    # deletion header was sent (which clears the browser cookie).
+    assert client.cookies.get(cookie_name) == "off"
+    assert (await client.get("/v1/me")).status_code == 401
+
+    await _login(client, _ADMIN_USERNAME, _ADMIN_PASSWORD)
+    identity = (await client.get("/v1/me")).json()
+    assert identity["user_id"] == _ADMIN_USERNAME
+    assert identity["can_enable_admin_mode"] is True
+    assert identity["admin_mode_enabled"] is False
+    assert identity["is_admin"] is False
+    assert (await client.get("/auth/users")).status_code == 403
 
 
 # ── 9. Magic link ────────────────────────────────────────

@@ -44,12 +44,47 @@ vi.mock("./App", () => ({
 // Keep the backend discovery pending: the root must be marked before it resolves.
 const fetcher = () => new Promise<Response>(() => {});
 
+it("gates embedded data providers until the admin mode bootstrap cookie arrives", async () => {
+  let finishIdentity!: (response: Response) => void;
+  const identity = new Promise<Response>((resolve) => {
+    finishIdentity = resolve;
+  });
+  const request = vi.fn((path: string) =>
+    path === "/v1/me" ? identity : new Promise<Response>(() => {}),
+  );
+  const view = render(
+    <MemoryRouter>
+      <OmnigentApp fetcher={request} serverIdentity="embed-test" adminModeCookiePath="/" />
+    </MemoryRouter>,
+  );
+  await act(async () => {});
+  expect(view.queryByRole("button", { name: "Header action" })).not.toBeInTheDocument();
+  expect(request.mock.calls.map(([path]) => path).sort()).toEqual(["/v1/info", "/v1/me"]);
+
+  await act(async () => {
+    document.cookie = "omnigent_admin_mode_embed_test=off; Path=/";
+    finishIdentity(
+      new Response(
+        JSON.stringify({
+          user_id: "admin@example.test",
+          is_admin: false,
+          can_enable_admin_mode: true,
+          admin_mode_enabled: false,
+          admin_mode_cookie_name: "omnigent_admin_mode_embed_test",
+        }),
+      ),
+    );
+  });
+  expect(view.getByRole("button", { name: "Header action" })).toBeInTheDocument();
+  expect(request.mock.calls.some(([path]) => path === "/v1/extensions")).toBe(true);
+});
+
 it("cleans up admin mode guards and reattaches them on remount", () => {
   const stopWatching = vi.fn();
   const watch = vi.spyOn(adminMode, "subscribeAdminModeChanges").mockReturnValue(stopWatching);
   const app = (
     <MemoryRouter>
-      <OmnigentApp fetcher={fetcher} />
+      <OmnigentApp fetcher={fetcher} adminModeCookiePath="/" />
     </MemoryRouter>
   );
   const first = render(app);
@@ -87,6 +122,7 @@ function selectorFor(fragment: string): string {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  document.cookie = "omnigent_admin_mode_embed_test=; Path=/; Max-Age=0";
   document.documentElement.className = "";
   document.documentElement.style.colorScheme = "";
   vi.unstubAllGlobals();

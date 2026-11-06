@@ -16,7 +16,7 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
-import { resolveAdminMode } from "./adminMode";
+import { resolveAdminMode, usesBrowserAdminMode } from "./adminMode";
 import { getCachedServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
@@ -396,7 +396,12 @@ function isTransientIdentityStatus(status: number): boolean {
  */
 async function probeIdentity(): Promise<boolean> {
   try {
-    const res = await hostFetch("/v1/me");
+    const res = await hostFetch(
+      "/v1/me",
+      usesBrowserAdminMode()
+        ? { headers: { "X-Omnigent-Admin-Mode": "browser" }, cache: "no-store" }
+        : undefined,
+    );
     if (res.status === 401) {
       // OIDC / accounts mode: server requires authentication.
       // Redirect to the login URL provided in the response body —
@@ -416,6 +421,7 @@ async function probeIdentity(): Promise<boolean> {
       } catch {
         // Response body was not JSON — still a signed-out answer.
       }
+      resolveAdminMode({ user_id: null });
       return true;
     }
     if (res.ok) {
@@ -426,12 +432,14 @@ async function probeIdentity(): Promise<boolean> {
         admin_mode_enabled?: boolean;
         admin_mode_cookie_name?: string;
       };
+      if (!resolveAdminMode(data)) return false;
       currentUserId = data.user_id;
       currentIsAdmin = data.is_admin ?? false;
-      resolveAdminMode(data);
       return true;
     }
-    return !isTransientIdentityStatus(res.status);
+    if (isTransientIdentityStatus(res.status)) return false;
+    resolveAdminMode({ user_id: null });
+    return true;
   } catch {
     // Server unreachable, connection dropped, or the body was cut off.
     return false;
@@ -501,6 +509,11 @@ export function subscribeIdentity(listener: () => void): () => void {
     identityListeners.delete(listener);
     if (identityListeners.size === 0) cancelIdentityRetry();
   };
+}
+
+/** Boot remains gated while the identity request or scoped-cookie handshake can retry. */
+export function getIdentityResolutionState(): "loading" | "retrying" | "ready" {
+  return identityResolved ? "ready" : identityRetryPending ? "retrying" : "loading";
 }
 
 /** Return the cached user ID (null before resolveIdentity completes). */

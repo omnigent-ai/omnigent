@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, StrictBool
+from starlette._utils import get_route_path
 from starlette.requests import HTTPConnection
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -70,7 +71,13 @@ class AdminModeMiddleware:
         connection = HTTPConnection(scope)
         state_cookie_name = admin_mode_cookie_name(connection, self._base_path)
         value = connection.cookies.get(state_cookie_name)
-        browser = ADMIN_MODE_COOKIE in connection.cookies or value is not None
+        initialize = (
+            scope["type"] == "http"
+            and scope.get("method") == "GET"
+            and get_route_path(scope) == "/v1/me"
+            and connection.headers.get("x-omnigent-admin-mode") == "browser"
+        )
+        browser = initialize or value is not None
         # Clients without the browser cookie retain their existing API behavior.
         enabled = not browser
         if value is not None and value.startswith("on:"):
@@ -82,14 +89,19 @@ class AdminModeMiddleware:
             if (
                 browser
                 and message["type"] == "http.response.start"
-                and cookie_name
-                and any(
-                    name.lower() == b"set-cookie"
-                    and header_value.startswith(cookie_name.encode() + b"=")
-                    for name, header_value in message.get("headers", [])
+                and (
+                    (initialize and value is None)
+                    or (
+                        cookie_name
+                        and any(
+                            name.lower() == b"set-cookie"
+                            and header_value.startswith(cookie_name.encode() + b"=")
+                            for name, header_value in message.get("headers", [])
+                        )
+                    )
                 )
             ):
-                # A fresh login or logout ends the previous login's admin mode.
+                # First browser use and each login/logout start with ordinary access.
                 reset = Response()
                 reset.set_cookie(
                     state_cookie_name,

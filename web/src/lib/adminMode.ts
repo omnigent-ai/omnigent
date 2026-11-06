@@ -8,14 +8,14 @@ import {
 } from "./host";
 import { randomUUID } from "./randomUUID";
 
-const COOKIE_NAME = "omnigent_admin_mode";
 const CHANGE_KEY_PREFIX = "omnigent:admin-mode-change:";
 const listeners = new Set<() => void>();
 let adminMode: boolean | null = null;
 let userId: string | null = null;
-let cookieReady = false;
+let browserModeRequested = false;
 let modeCookieName: string | null = null;
 let initialCookie: string | undefined;
+let resolvedScope: string | null = null;
 
 function cookiePath(): string | null {
   const path = isDatabricksWorkspace()
@@ -24,7 +24,7 @@ function cookiePath(): string | null {
   return path?.startsWith("/") && !/[;\r\n]/.test(path) ? path : null;
 }
 
-function readCookie(name: string = COOKIE_NAME): string | undefined {
+function readCookie(name: string): string | undefined {
   try {
     return document.cookie
       .split(";")
@@ -39,18 +39,28 @@ function changeKey(): string {
   return `${CHANGE_KEY_PREFIX}${JSON.stringify([getOmnigentServerIdentity(), cookiePath(), modeCookieName, userId])}`;
 }
 
-/** Initialize before app requests so a fresh browser starts with ordinary access. */
+function bootstrapScope(): string {
+  return JSON.stringify([getOmnigentServerIdentity(), cookiePath(), browserModeRequested]);
+}
+
+/** Opt into the identity bootstrap before any app requests start. */
 export function initializeAdminMode(): void {
-  const path = cookiePath();
-  if (path === null || typeof document === "undefined") return;
-  if (readCookie() !== `${COOKIE_NAME}=off`) {
-    try {
-      document.cookie = `${COOKIE_NAME}=off; Path=${path}; SameSite=Lax${location.protocol === "https:" ? "; Secure" : ""}`;
-    } catch {
-      return;
-    }
-  }
-  cookieReady = readCookie() !== undefined;
+  browserModeRequested = cookiePath() !== null && typeof document !== "undefined";
+}
+
+export function usesBrowserAdminMode(): boolean {
+  return browserModeRequested;
+}
+
+/** Cached identity cannot authorize a remount after its deployment or cookie changes. */
+export function hasAdminModeContextChanged(): boolean {
+  return (
+    browserModeRequested &&
+    ((resolvedScope !== null && resolvedScope !== bootstrapScope()) ||
+      (modeCookieName !== null &&
+        initialCookie !== undefined &&
+        readCookie(modeCookieName) !== initialCookie))
+  );
 }
 
 /** Watch mode changes only while the app is mounted, preserving identity on remount. */
@@ -62,9 +72,7 @@ export function subscribeAdminModeChanges(): () => void {
     if (event.persisted && adminMode !== null) location.reload();
   };
   const onFocus = () => {
-    if (adminMode !== null && modeCookieName && readCookie(modeCookieName) !== initialCookie) {
-      location.reload();
-    }
+    if (hasAdminModeContextChanged()) location.reload();
   };
   window.addEventListener("storage", onStorage);
   window.addEventListener("pageshow", onPageShow);
@@ -77,33 +85,40 @@ export function subscribeAdminModeChanges(): () => void {
   };
 }
 
-/** Only a supporting backend and eligible account can offer the switch. */
+/** Supporting servers must establish the scoped cookie before app requests can start. */
 export function resolveAdminMode(data: {
   user_id: string | null;
   can_enable_admin_mode?: boolean;
   admin_mode_enabled?: boolean;
   admin_mode_cookie_name?: string;
-}): void {
+}): boolean {
+  resolvedScope = bootstrapScope();
   userId = data.user_id;
   modeCookieName =
     typeof data.admin_mode_cookie_name === "string" &&
     /^omnigent_admin_mode_[a-zA-Z0-9_]+$/.test(data.admin_mode_cookie_name)
       ? data.admin_mode_cookie_name
       : null;
+  initialCookie = modeCookieName ? readCookie(modeCookieName) : undefined;
+  const supportsAdminMode =
+    data.admin_mode_cookie_name !== undefined ||
+    data.can_enable_admin_mode !== undefined ||
+    data.admin_mode_enabled !== undefined;
+  const ready = !browserModeRequested || !supportsAdminMode || initialCookie !== undefined;
   adminMode =
-    cookieReady &&
-    cookiePath() !== null &&
+    browserModeRequested &&
+    ready &&
     modeCookieName !== null &&
     data.can_enable_admin_mode === true &&
     typeof data.admin_mode_enabled === "boolean"
       ? data.admin_mode_enabled
       : null;
-  initialCookie = modeCookieName ? readCookie(modeCookieName) : undefined;
   for (const listener of listeners) listener();
+  return ready;
 }
 
 export function getAdminMode(): boolean | null {
-  return adminMode;
+  return browserModeRequested ? adminMode : null;
 }
 
 function subscribe(listener: () => void): () => void {
@@ -118,7 +133,7 @@ export function useAdminMode(): boolean | null {
 
 /** Reload every view after the cookie takes effect, dropping cached permissions and streams. */
 export async function setAdminMode(enabled: boolean): Promise<void> {
-  if (adminMode === null) throw new Error("Admin mode is unavailable for this account.");
+  if (getAdminMode() === null) throw new Error("Admin mode is unavailable for this account.");
   const changeFailed = "Could not change admin mode. Try again.";
   try {
     const response = await hostFetch("/v1/me/admin-mode", {
