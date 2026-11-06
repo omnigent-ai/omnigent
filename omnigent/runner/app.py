@@ -770,6 +770,16 @@ class InstructionComposition:
 _GATED_COMPOSED_INSTRUCTION_HARNESSES = frozenset({"opencode-native", "hermes"})
 
 
+def _history_message_from_body(body: _JsonObject) -> _JsonObject:
+    """Preserve the persisted initiating item when recording an incoming message."""
+    return {
+        "type": "message",
+        "role": body.get("role", "user"),
+        "content": body.get("content", []),
+        "id": body.get("persisted_item_id"),
+    }
+
+
 def _wrap_as_message_event(body: _JsonObject) -> _JsonObject:
     """
     Adapt a ``CreateResponseRequest``-shaped body into a
@@ -4860,12 +4870,7 @@ def create_runner_app(
                 if not buf:
                     _session_message_buffers.pop(session_id, None)
                 _session_histories.setdefault(session_id, []).append(
-                    {
-                        "type": "message",
-                        "role": next_body.get("role", "user"),
-                        "content": next_body.get("content", []),
-                        "id": next_body.get("persisted_item_id"),
-                    }
+                    _history_message_from_body(next_body)
                 )
             else:
                 all_bodies = list(buf)
@@ -4874,12 +4879,7 @@ def create_runner_app(
 
                 for body in all_bodies:
                     _session_histories.setdefault(session_id, []).append(
-                        {
-                            "type": "message",
-                            "role": body.get("role", "user"),
-                            "content": body.get("content", []),
-                            "id": body.get("persisted_item_id"),
-                        }
+                        _history_message_from_body(body)
                     )
                 next_body = all_bodies[-1]
 
@@ -7312,12 +7312,7 @@ def create_runner_app(
                             },
                         )
 
-                new_item = {
-                    "type": "message",
-                    "role": message_body.get("role", "user"),
-                    "content": message_body.get("content", []),
-                    "id": message_body.get("persisted_item_id"),
-                }
+                new_item = _history_message_from_body(message_body)
                 if conversation_id in _session_histories:
                     _session_histories[conversation_id].append(new_item)
                 else:

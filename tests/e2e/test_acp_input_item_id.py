@@ -25,10 +25,14 @@ def test_acp_prompt_names_readable_input_item(tmp_path: Path) -> None:
     probe = tmp_path / "probe"
     probe.mkdir()
     agent_script = probe / "agent.py"
+    prompt_anchor = '        sid = msg["params"]["sessionId"]'
+    session_anchor = '    elif method == "session/new":'
+    assert prompt_anchor in FAKE_ACP_AGENT_SCRIPT
+    assert session_anchor in FAKE_ACP_AGENT_SCRIPT
     agent_script.write_text(
         f"#!{sys.executable}\n"
         + FAKE_ACP_AGENT_SCRIPT.replace(
-            '        sid = msg["params"]["sessionId"]',
+            prompt_anchor,
             """        import time, urllib.request
         from pathlib import Path
         root = Path(__file__).parent
@@ -47,7 +51,7 @@ def test_acp_prompt_names_readable_input_item(tmp_path: Path) -> None:
             time.sleep(0.01)
         sid = msg["params"]["sessionId"]""",
         ).replace(
-            '    elif method == "session/new":',
+            session_anchor,
             """    elif method == "session/new":
         import time
         from pathlib import Path

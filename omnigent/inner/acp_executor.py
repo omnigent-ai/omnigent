@@ -61,6 +61,7 @@ from typing import Any, Protocol, TypeAlias
 
 from omnigent.debug_logging import debug_event
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
 from omnigent.inner.acp_subagents import SubAgentActivity, SubAgentStart, read_subagent_events
@@ -1889,16 +1890,13 @@ class AcpExecutor(Executor):
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
         latest_user_idx: int | None = None
-        input_item_id: str | None = None
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
             role = msg.get("role", "") if isinstance(msg, dict) else ""
             if role == "user":
                 latest_user_idx = idx
-                if idx == len(messages) - 1:
-                    candidate_id = msg.get("input_item_id")
-                    if isinstance(candidate_id, str):
-                        input_item_id = candidate_id
                 content = msg.get("content", "") if isinstance(msg, dict) else ""
                 if isinstance(content, str):
                     user_text = content
@@ -1951,7 +1949,7 @@ class AcpExecutor(Executor):
                 "params": {
                     "sessionId": session_id,
                     "prompt": prompt_blocks,
-                    "_meta": {"ai.omnigent/inputItemId": input_item_id},
+                    "_meta": {_META_INPUT_ITEM_ID: input_item_id},
                 },
             }
         )

@@ -413,7 +413,7 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     recovery = next(
         message for message in messages if "Continue the existing task" in str(message["content"])
     )
-    assert recovery.get("input_item_id") is None
+    assert "input_item_id" not in recovery
     # The first init started the continuation; the retry saw the consumed
     # recovery id and started nothing.
     rows = _init_rows(caplog)

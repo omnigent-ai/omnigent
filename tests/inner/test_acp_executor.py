@@ -26,6 +26,7 @@ import pytest
 
 from omnigent.inner import _proc
 from omnigent.inner import acp_executor as acp_executor_module
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp, _to_acp_mcp_servers
 from omnigent.inner.acp_executor import (
     AcpAgentConfig,
@@ -2948,6 +2949,6 @@ async def test_prompt_input_item_id_is_current_or_null(fresh_session, tail, expe
     events = [event async for event in executor.run_turn(messages, [], "system")]
     assert any(isinstance(event, TurnComplete) for event in events)
     assert len(prompts) == 1
-    assert prompts[0]["params"]["_meta"] == {"ai.omnigent/inputItemId": expected_id}
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: expected_id}
     if fresh_session and tail.get("role") == "user":
         assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]

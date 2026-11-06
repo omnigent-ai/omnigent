@@ -414,6 +414,12 @@ missing executor values.
 Register commands in `~/.omnigent/config.yaml` under `acp.agents`; the slug is
 derived from the agent name.
 
+Every ACP `session/prompt`, including Goose and Qwen prompts, carries
+`params._meta["ai.omnigent/inputItemId"]`. Its value is the persisted user item
+ID, already readable via `GET /v1/sessions/{id}/items` when the prompt arrives.
+A `null` value means a synthetic or tool-recovery prompt without an initiating
+persisted user item. A missing key indicates an older Omnigent version.
+
 OpenClaw's Gateway ACP bridge is one such server. It rejects per-session
 `mcpServers`, so disable Omnigent's MCP relay for that entry and let OpenClaw
 use its own tools, routing, memory, and channels:
