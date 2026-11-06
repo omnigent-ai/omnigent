@@ -613,7 +613,9 @@ async def _prepare_antigravity_terminal(
                 client,
                 session_bundle,
                 bridge_id=bridge_id,
+                terminal_launch_args=list(antigravity_args) or None,
             )
+            await _persist_launch_config(client, session_id, antigravity_args=(), model=model)
         else:
             _update_progress(startup_progress, "Loading Antigravity session...")
             payload = await _fetch_antigravity_session(client, session_id)
@@ -643,6 +645,9 @@ async def _prepare_antigravity_terminal(
                     tmux_target=existing.tmux_target,
                     reattached=True,
                 )
+            await _persist_launch_config(
+                client, session_id, antigravity_args=antigravity_args, model=model
+            )
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
@@ -668,12 +673,6 @@ async def _prepare_antigravity_terminal(
                 client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
             )
             if autocreated is not None:
-                if antigravity_args or model is not None:
-                    click.echo(
-                        "Ignoring Antigravity launch args/model for the runner-owned "
-                        "terminal; restart the session terminal to apply them.",
-                        err=True,
-                    )
                 _update_progress(startup_progress, "Antigravity terminal ready.")
                 return PreparedAntigravityTerminal(
                     session_id=session_id,
@@ -807,9 +806,11 @@ async def _prepare_antigravity_terminal_via_daemon(
                     client,
                     session_bundle,
                     bridge_id=bridge_id,
+                    terminal_launch_args=list(antigravity_args) or None,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
             )
+            await _persist_launch_config(client, session_id, antigravity_args=(), model=model)
         else:
             _update_progress(startup_progress, "Loading Antigravity session...")
             payload = await _fetch_antigravity_session(client, session_id)
@@ -848,6 +849,9 @@ async def _prepare_antigravity_terminal_via_daemon(
                     tmux_target=existing.tmux_target,
                     reattached=True,
                 )
+            await _persist_launch_config(
+                client, session_id, antigravity_args=antigravity_args, model=model
+            )
             external = payload.get("external_session_id") if isinstance(payload, dict) else None
             conversation_id = external if isinstance(external, str) and external else bridge_id
             resume = isinstance(external, str) and bool(external)
@@ -882,12 +886,6 @@ async def _prepare_antigravity_terminal_via_daemon(
             client, session_id, _RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S
         )
         if autocreated is not None:
-            if antigravity_args or model is not None:
-                click.echo(
-                    "Ignoring Antigravity launch args/model for the runner-owned "
-                    "terminal; restart the session terminal to apply them.",
-                    err=True,
-                )
             _update_progress(startup_progress, "Antigravity terminal ready.")
             return PreparedAntigravityTerminal(
                 session_id=session_id,
@@ -1415,6 +1413,7 @@ async def _create_antigravity_session(
     bundle: bytes,
     *,
     bridge_id: str,
+    terminal_launch_args: list[str] | None = None,
 ) -> str:
     """
     Create a bundled terminal-first Antigravity session.
@@ -1430,12 +1429,18 @@ async def _create_antigravity_session(
     :param client: HTTP client pointed at the Omnigent server.
     :param bundle: Gzipped Antigravity wrapper agent bundle.
     :param bridge_id: Opaque bridge id to write on the session labels.
+    :param terminal_launch_args: Pass-through agy args to persist on the session,
+        e.g. ``["--dangerously-skip-permissions"]``. The runner that owns the agy
+        terminal reads them back when it builds the agy argv. ``None`` or empty
+        persists nothing.
     :returns: New Omnigent session id, e.g. ``"conv_abc123"``.
     :raises click.ClickException: If creation fails.
     """
     labels = dict(_SESSION_LABELS)
     labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = bridge_id
     metadata: dict[str, object] = {"labels": labels}
+    if terminal_launch_args:
+        metadata["terminal_launch_args"] = terminal_launch_args
     resp = await client.post(
         "/v1/sessions",
         data={"metadata": json.dumps(metadata)},
@@ -1453,6 +1458,42 @@ async def _create_antigravity_session(
             "Antigravity session creation response did not include session_id."
         )
     return new_session_id
+
+
+async def _persist_launch_config(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    antigravity_args: tuple[str, ...],
+    model: str | None,
+) -> None:
+    """
+    Persist this launch's pass-through args and model on an existing session.
+
+    The runner that owns the agy terminal builds the agy argv from the session's
+    ``terminal_launch_args`` and ``model_override``, so a resume that starts a new
+    terminal must store the current launch's values first. Nothing is sent when
+    the launch carries neither.
+
+    :param client: HTTP client pointed at the Omnigent server.
+    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
+    :param antigravity_args: Raw pass-through agy args.
+    :param model: Optional agy model id.
+    :raises click.ClickException: If the update fails.
+    """
+    patch: dict[str, object] = {}
+    if antigravity_args:
+        patch["terminal_launch_args"] = list(antigravity_args)
+    if model is not None:
+        patch["model_override"] = model
+    if not patch:
+        return
+    resp = await client.patch(f"/v1/sessions/{url_component(session_id)}", json=patch)
+    if resp.status_code >= 400:
+        raise click.ClickException(
+            f"Antigravity session launch config update failed "
+            f"({resp.status_code}): {error_text(resp)}"
+        )
 
 
 async def _fetch_antigravity_session(

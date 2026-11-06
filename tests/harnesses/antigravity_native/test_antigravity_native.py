@@ -1314,3 +1314,272 @@ async def test_cli_cold_start_falls_back_when_port_unattributable(
 
     assert len(started) == 1
     assert started[0][0] == 52548  # safe candidate fallback (agy is up in the pane)
+
+
+# ---------------------------------------------------------------------------
+# Pass-through args reach the runner-owned terminal
+# ---------------------------------------------------------------------------
+
+_SKIP_FLAG = "--dangerously-skip-permissions"
+
+
+async def test_create_session_persists_terminal_launch_args() -> None:
+    """The session create request carries the pass-through args the runner reads back."""
+    seen: dict[str, object] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/v1/sessions"
+        body = request.read().decode("utf-8", errors="replace")
+        start = body.index("{")
+        seen["metadata"] = json.loads(body[start : body.index("}\r\n--", start) + 1])
+        return httpx.Response(200, json={"session_id": "conv_new"})
+
+    async with _mock_client(_handler) as client:
+        session_id = await _mod._create_antigravity_session(
+            client, b"bundle", bridge_id="bridge_1", terminal_launch_args=[_SKIP_FLAG]
+        )
+
+    assert session_id == "conv_new"
+    metadata = seen["metadata"]
+    assert isinstance(metadata, dict)
+    assert metadata["terminal_launch_args"] == [_SKIP_FLAG]
+
+
+async def test_create_session_omits_launch_args_when_none() -> None:
+    """With no pass-through args the create request has no terminal_launch_args key."""
+    seen: dict[str, object] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = request.read().decode("utf-8", errors="replace")
+        start = body.index("{")
+        seen["metadata"] = json.loads(body[start : body.index("}\r\n--", start) + 1])
+        return httpx.Response(200, json={"session_id": "conv_new"})
+
+    async with _mock_client(_handler) as client:
+        await _mod._create_antigravity_session(client, b"bundle", bridge_id="bridge_1")
+
+    metadata = seen["metadata"]
+    assert isinstance(metadata, dict)
+    assert "terminal_launch_args" not in metadata
+
+
+async def test_daemon_fresh_session_is_created_with_the_pass_through_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``omni agy --dangerously-skip-permissions`` on the daemon path persists the flag.
+
+    The runner builds the agy argv from the session's persisted
+    ``terminal_launch_args``; before the fix the CLI dropped them, so agy started
+    without the flag.
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+    created: dict[str, object] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith(
+            f"/resources/terminals/{terminal_id}"
+        ):
+            return httpx.Response(
+                200,
+                json={"id": terminal_id, "metadata": {"running": True, "tmux_target": "main"}},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    async def _create(*args: object, **kwargs: object) -> str:
+        created.update(kwargs)
+        return "conv_fresh123"
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(_mod, "_create_antigravity_session", _create)
+    monkeypatch.setattr(_mod, "wait_for_host_online", _noop)
+    monkeypatch.setattr(_mod, "wait_for_runner_online", _noop)
+    monkeypatch.setattr(_mod, "launch_or_reuse_daemon_runner", _noop)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _noop)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        await _mod._prepare_antigravity_terminal_via_daemon(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id=None,
+            session_bundle=b"bundle",
+            antigravity_args=(_SKIP_FLAG,),
+            command="agy",
+            model=None,
+            host_id="host_1",
+            workspace="/tmp/ws",
+            startup_progress=None,
+        )
+
+    assert created["terminal_launch_args"] == [_SKIP_FLAG]
+
+
+async def test_local_fresh_session_is_created_with_the_pass_through_args(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The local-server prepare path persists the pass-through args as well."""
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+    created: dict[str, object] = {}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith(
+            f"/resources/terminals/{terminal_id}"
+        ):
+            return httpx.Response(
+                200,
+                json={"id": terminal_id, "metadata": {"running": True, "tmux_target": "main"}},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    async def _create(*args: object, **kwargs: object) -> str:
+        created.update(kwargs)
+        return "conv_local_fresh"
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    monkeypatch.setattr(_mod, "_create_antigravity_session", _create)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _noop)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        await _mod._prepare_antigravity_terminal(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id=None,
+            runner_id="runner_local_1",
+            session_bundle=b"bundle",
+            antigravity_args=(_SKIP_FLAG,),
+            command="agy",
+            model=None,
+            startup_progress=None,
+        )
+
+    assert created["terminal_launch_args"] == [_SKIP_FLAG]
+
+
+async def test_daemon_cold_resume_updates_launch_args_and_model_before_bind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Resuming a session whose terminal exited re-persists the args and model.
+
+    The runner re-reads ``terminal_launch_args`` / ``model_override`` from the
+    session when it relaunches agy, so they must be patched before the bind.
+    """
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+    patches: list[dict[str, object]] = []
+    order: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.endswith(f"/resources/terminals/{terminal_id}"):
+            return httpx.Response(404, json={"error": {"code": "not_found"}})
+        if request.method == "GET":
+            return httpx.Response(200, json=_antigravity_session_payload())
+        if request.method == "PATCH":
+            order.append("patch")
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {path}")
+
+    async def _record_launch(client: object, **kwargs: object) -> _mod.LaunchedAntigravityTerminal:
+        return _mod.LaunchedAntigravityTerminal(
+            terminal_id=terminal_id, tmux_socket=None, tmux_target=None
+        )
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    async def _bind(*args: object, **kwargs: object) -> None:
+        order.append("bind")
+
+    monkeypatch.setattr(_mod, "_launch_and_record", _record_launch)
+    monkeypatch.setattr(_mod, "wait_for_host_online", _noop)
+    monkeypatch.setattr(_mod, "wait_for_runner_online", _noop)
+    monkeypatch.setattr(_mod, "launch_or_reuse_daemon_runner", _noop)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _bind)
+    monkeypatch.setattr(_mod, "_RUNNER_TERMINAL_AUTOCREATE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_mod, "_RUNNER_TERMINAL_POLL_INTERVAL_S", 0.01)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        await _mod._prepare_antigravity_terminal_via_daemon(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id="conv_abc123",
+            session_bundle=None,
+            antigravity_args=(_SKIP_FLAG,),
+            command="agy",
+            model="gemini-3.8-flash",
+            host_id="host_1",
+            workspace="/tmp/ws",
+            startup_progress=None,
+        )
+
+    assert patches == [
+        {"terminal_launch_args": [_SKIP_FLAG], "model_override": "gemini-3.8-flash"}
+    ]
+    assert order.index("patch") < order.index("bind")
+
+
+async def test_daemon_fresh_session_persists_the_model_before_bind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``--model`` on a fresh daemon launch is stored as the session's model_override."""
+    monkeypatch.setattr(bridge_mod, "_BRIDGE_ROOT", tmp_path / "antigravity-native")
+    terminal_id = antigravity_terminal_resource_id()
+    patches: list[dict[str, object]] = []
+    order: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith(
+            f"/resources/terminals/{terminal_id}"
+        ):
+            return httpx.Response(
+                200,
+                json={"id": terminal_id, "metadata": {"running": True, "tmux_target": "main"}},
+            )
+        if request.method == "PATCH":
+            order.append("patch")
+            patches.append(json.loads(request.content))
+            return httpx.Response(200, json={})
+        raise AssertionError(f"unexpected request: {request.method} {request.url.path}")
+
+    async def _create(*args: object, **kwargs: object) -> str:
+        return "conv_fresh123"
+
+    async def _noop(*args: object, **kwargs: object) -> object:
+        return None
+
+    async def _bind(*args: object, **kwargs: object) -> None:
+        order.append("bind")
+
+    monkeypatch.setattr(_mod, "_create_antigravity_session", _create)
+    monkeypatch.setattr(_mod, "wait_for_host_online", _noop)
+    monkeypatch.setattr(_mod, "wait_for_runner_online", _noop)
+    monkeypatch.setattr(_mod, "launch_or_reuse_daemon_runner", _noop)
+    monkeypatch.setattr(_mod, "_bind_session_runner", _bind)
+
+    async with _mock_client(_handler) as client:
+        _patch_prepare_client(monkeypatch, client)
+        await _mod._prepare_antigravity_terminal_via_daemon(
+            base_url="http://127.0.0.1:0",
+            headers={},
+            session_id=None,
+            session_bundle=b"bundle",
+            antigravity_args=(),
+            command="agy",
+            model="gemini-3.8-flash",
+            host_id="host_1",
+            workspace="/tmp/ws",
+            startup_progress=None,
+        )
+
+    assert patches == [{"model_override": "gemini-3.8-flash"}]
+    assert order.index("patch") < order.index("bind")
