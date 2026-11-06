@@ -1282,6 +1282,8 @@ async def _serve_tunnel_once(
                 reconnect=reconnect,
                 attempt=attempt,
                 downtime_s=_round_seconds(downtime_s),
+                # Spawn-to-connected time of a fresh runner (fork or exec included).
+                process_age_ms=None if reconnect else _process_age_ms(),
                 pid=os.getpid(),
                 **diagnostics.snapshot(),
             ),
@@ -1990,3 +1992,39 @@ class _CloseDetails:
 def _round_seconds(value: float | None) -> float | None:
     """Round a duration for a debug-log attribute; ``None`` passes through."""
     return None if value is None else round(value, 3)
+
+
+def _process_age_ms() -> int | None:
+    """Milliseconds since this process was created, or ``None`` if unknown.
+
+    On Linux both readings come from the kernel's boot-relative clock, so the
+    age is exact to a clock tick. psutil's creation time there is built on a
+    whole-second boot timestamp, which can be off by up to a second.
+    """
+    linux_age = _linux_process_age_ms()
+    if linux_age is not None:
+        return linux_age
+    import psutil
+
+    try:
+        created_at = psutil.Process().create_time()
+    except psutil.Error:
+        return None
+    return round((time.time() - created_at) * 1000)
+
+
+def _linux_process_age_ms(proc_root: str = "/proc") -> int | None:
+    """Process age from ``/proc/uptime`` and ``/proc/self/stat``; ``None`` off Linux.
+
+    :param proc_root: The procfs mount, e.g. ``"/proc"``; tests point it elsewhere.
+    """
+    try:
+        with open(f"{proc_root}/uptime", encoding="ascii") as uptime_file:
+            uptime_s = float(uptime_file.read().split()[0])
+        with open(f"{proc_root}/self/stat", encoding="ascii") as stat_file:
+            # Field 22 (starttime), counted after the parenthesized command name.
+            start_ticks = int(stat_file.read().rsplit(")", 1)[1].split()[19])
+        ticks_per_s = os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+    return round((uptime_s - start_ticks / ticks_per_s) * 1000)
