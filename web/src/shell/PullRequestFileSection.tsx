@@ -188,6 +188,8 @@ function clearFindMatch() {
   if (highlightsSupported()) CSS.highlights.delete(FIND_HIGHLIGHT);
 }
 
+const NO_THREADS: ReviewThread[] = [];
+
 /**
  * One file's section in the stacked diff: a sticky grey header (chevron + status
  * + path + diffstat) and the file's rendered diff. Clicking the header toggles
@@ -209,6 +211,8 @@ export function PullRequestFileSection({
   forceMount = false,
   bypassLargeDiffGate = false,
   highlight = null,
+  reviewable = true,
+  reviewActions,
 }: {
   file: PullRequestChangedFile;
   /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
@@ -231,6 +235,13 @@ export function PullRequestFileSection({
   bypassLargeDiffGate?: boolean;
   /** The active find match; painted and centred, apart from the reader's selection. */
   highlight?: FindHighlight | null;
+  /**
+   * Whether this file offers review features: conversations, drafts, line selection and the
+   * viewed controls. Off, the section shows the diff alone. Saved drafts are left as they are.
+   */
+  reviewable?: boolean;
+  /** Review controls beside the header, such as the viewed toggle. Shown only while reviewable. */
+  reviewActions?: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   // The force flags latch, so a section stays mounted and ungated after the reader moves on.
@@ -261,20 +272,24 @@ export function PullRequestFileSection({
   const selectedLines = selection?.revision === revision ? selection.range : null;
   const readerLines =
     selectionPreview?.revision === revision ? selectionPreview.range : selectedLines;
+  // A line selection starts a review conversation, so it exists only where reviews do.
   const previewSelection = useCallback(
-    (range: SelectedLineRange | null) => setSelectionPreview({ revision, range }),
-    [revision],
+    (range: SelectedLineRange | null) => {
+      if (reviewable) setSelectionPreview({ revision, range });
+    },
+    [revision, reviewable],
   );
   const commitSelection = useCallback(
     (range: SelectedLineRange | null) => {
+      if (!reviewable) return;
       setSelection({ revision, range });
       setSelectionPreview(undefined);
     },
-    [revision],
+    [revision, reviewable],
   );
   const [selectionError, setSelectionError] = useState<string>();
   const startConversation = (range: SelectedLineRange) => {
-    if (!threadContext.canCreate || !fileDiff || composer.draft.pending) return;
+    if (!reviewable || !threadContext.canCreate || !fileDiff || composer.draft.pending) return;
     const lines = reviewSelection(range, fileDiff);
     if (!lines) {
       setSelectionError("Select lines within one diff hunk, on the same side.");
@@ -316,12 +331,14 @@ export function PullRequestFileSection({
     !pureRename &&
     seen &&
     (fileDiff.unifiedLineCount <= LARGE_DIFF_THRESHOLD || showLargeDiff);
-  const anchor = composer.draft.anchor;
-  const showGutterUtility = !!threadContext.canCreate && (!anchor || composer.stale);
+  // With review off, a saved draft and the conversations stay in their stores, unshown here.
+  const anchor = reviewable ? composer.draft.anchor : null;
+  const shownThreads = reviewable ? threads : NO_THREADS;
+  const showGutterUtility = reviewable && !!threadContext.canCreate && (!anchor || composer.stale);
   const showDraftInline = !!anchor && !composer.stale && renderingDiff;
   const { annotations, unplaced } = useMemo(() => {
     const { annotations: threadAnnotations, unplaced: unplacedThreads } = reviewThreadAnnotations(
-      threads,
+      shownThreads,
       renderingDiff ? fileDiff : undefined,
       matchingRevision,
     );
@@ -342,7 +359,7 @@ export function PullRequestFileSection({
         });
     }
     return { annotations: inlineAnnotations, unplaced: unplacedThreads };
-  }, [threads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
+  }, [shownThreads, renderingDiff, fileDiff, matchingRevision, anchor, showDraftInline]);
 
   // Centre the active find match once its row renders. A large diff can take longer than the
   // frame budget, so the next onPostRender centres it instead.
@@ -451,18 +468,21 @@ export function PullRequestFileSection({
             )}
           </span>
           <DiffStat file={file} />
-          {threads.length > 0 && (
+          {shownThreads.length > 0 && (
             <span
               className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground"
-              title={`${threads.length} conversation${threads.length === 1 ? "" : "s"}`}
+              title={`${shownThreads.length} conversation${shownThreads.length === 1 ? "" : "s"}`}
             >
               <MessageSquareIcon className="size-3" />
-              {threads.length}
+              {shownThreads.length}
             </span>
           )}
         </button>
-        {headerActions && (
-          <div className="flex shrink-0 items-center gap-1 pr-2">{headerActions}</div>
+        {(headerActions || (reviewable && reviewActions)) && (
+          <div className="flex shrink-0 items-center gap-1 pr-2">
+            {headerActions}
+            {reviewable && reviewActions}
+          </div>
         )}
       </div>
       {!collapsed && (
@@ -518,7 +538,7 @@ export function PullRequestFileSection({
               fileDiff={fileDiff}
               options={{
                 ...options,
-                enableLineSelection: !!threadContext.canCreate,
+                enableLineSelection: reviewable && !!threadContext.canCreate,
                 enableGutterUtility: showGutterUtility,
                 onLineSelectionStart: previewSelection,
                 onLineSelectionChange: previewSelection,

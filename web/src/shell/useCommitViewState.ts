@@ -34,9 +34,10 @@ export function useCommitViewState(commitSha: string | null): CommitViewState {
   // replaced during render, before anything reads it.
   if (stored.commitSha !== commitSha) setStored(emptySlice(commitSha));
   const current = stored.commitSha === commitSha ? stored : emptySlice(commitSha);
+  // A write from a callback captured for another commit, fired after this one opened, is dropped.
   const write = useCallback(
     (change: (slice: Slice) => Slice) =>
-      setStored((prev) => change(prev.commitSha === commitSha ? prev : emptySlice(commitSha))),
+      setStored((prev) => (prev.commitSha === commitSha ? change(prev) : prev)),
     [commitSha],
   );
   const setCollapsedPaths = useCallback(

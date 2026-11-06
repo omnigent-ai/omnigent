@@ -38,6 +38,15 @@ const mocks = vi.hoisted(() => ({
   commitDiffError: null as Error | null,
   /** The commit list's query cannot run here, so it has no data. */
   commitsUnavailable: false,
+  /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
+  draftAnchor: null as null | {
+    path: string;
+    side: "LEFT" | "RIGHT";
+    line: number;
+    start_line: null;
+    head_sha: string;
+    base_sha: string;
+  },
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -51,11 +60,19 @@ vi.mock("@/lib/clipboard", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
-  usePullRequestReviewThreadComposer: () => ({
-    draft: { pending: false, anchor: null },
+  // The saved draft belongs to one file, so the anchor is returned for that path only.
+  usePullRequestReviewThreadComposer: (_conversationId: string, _prUrl: string, path: string) => ({
+    draft: {
+      body: "",
+      pending: false,
+      error: null,
+      anchor: mocks.draftAnchor?.path === path ? mocks.draftAnchor : undefined,
+    },
     stale: false,
     selectLines: vi.fn(),
     cancel: vi.fn(),
+    setBody: vi.fn(),
+    post: vi.fn(),
   }),
   // A disabled query has no data, as when the workspace cannot be served.
   usePullRequestCommits: () => ({
@@ -1437,6 +1454,7 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.set(SHA_A, A);
     mocks.commitPatches.set(SHA_B, B);
     mocks.commitDiffError = null;
+    mocks.draftAnchor = null;
   });
 
   it("lists commits, opens one with its own files, and steps between commits", () => {
@@ -1488,12 +1506,11 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(screen.getByRole("button", { name: "Commits" }));
     fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
     expect(isCollapsed("a.ts")).toBe(false);
-    // The commit's own collapse toggles, and a sidebar jump reveals the file, in the commit only.
+    // The commit's own collapse toggles, then a sidebar jump reveals the collapsed file, in the commit only.
     fireEvent.click(fileSection("a.ts").querySelector("button")!);
     expect(isCollapsed("a.ts")).toBe(true);
-    fireEvent.click(fileSection("a.ts").querySelector("button")!);
-    expect(isCollapsed("a.ts")).toBe(false);
     fireEvent.click(document.querySelector<HTMLButtonElement>('button[title="a.ts"]')!);
+    expect(isCollapsed("a.ts")).toBe(false);
 
     fireEvent.click(screen.getByRole("button", { name: "Changes" }));
     expect(viewedBox("a.ts")).toBeChecked();
@@ -1502,6 +1519,31 @@ describe("PullRequestChangesTab commits", () => {
     rerender(viewedTab({ conversationId: "commits-isolated", commitHistory: true, head: "head2" }));
     expect(viewedBox("a.ts")).not.toBeChecked();
     expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps a saved PR draft in Changes, leaves it out of a commit view, and returns it unchanged", () => {
+    mocks.draftAnchor = {
+      path: "a.ts",
+      side: "RIGHT",
+      line: 2,
+      start_line: null,
+      head_sha: "head",
+      base_sha: "base",
+    };
+    renderTab({
+      conversationId: "commits-draft",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    expect(isListed("a.ts")).toBe(true);
+    expect(screen.queryByRole("region", { name: "New review conversation" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
   });
 
   it("keeps the commit search while the reader moves between the list and a commit", () => {
