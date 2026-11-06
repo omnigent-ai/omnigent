@@ -772,10 +772,11 @@ def _run_steered_turn(
 
 
 @pytest.mark.parametrize(
-    ("replies_after_steer", "expected_transcript"),
+    ("replies_after_steer", "late_live_steer_id", "expected_transcript"),
     [
         (
             3,
+            None,
             [
                 "user: fix the bug",
                 "assistant: reply 1",
@@ -788,6 +789,7 @@ def _run_steered_turn(
         ),
         (
             1,
+            None,
             [
                 "user: fix the bug",
                 "assistant: reply 1",
@@ -796,42 +798,45 @@ def _run_steered_turn(
                 "status: idle",
             ],
         ),
+        (
+            2,
+            "item_late",
+            [
+                "user: fix the bug",
+                "assistant: reply 1",
+                _TRANSCRIPT_READ,
+                _RECOVERED_STEER,
+                "assistant: reply 2",
+                "status: idle",
+            ],
+        ),
     ],
-    ids=["later_model_step", "turn_end"],
+    ids=["later_model_step", "turn_end", "late_live_copy"],
 )
 def test_forwarder_mirrors_accepted_steer_whose_live_message_was_missed(
-    tmp_path: Path, replies_after_steer: int, expected_transcript: list[str]
+    tmp_path: Path,
+    replies_after_steer: int,
+    late_live_steer_id: str | None,
+    expected_transcript: list[str],
 ) -> None:
     """
-    An accepted steer is mirrored even when its live ``userMessage`` never arrives.
+    An accepted steer is mirrored once even when its live ``userMessage`` never arrives.
 
     The server settles a steered web input only once its native message is
     mirrored. Codex records a steer at its next model step, so the forwarder
     reads the transcript at the second reply after the steer, or at turn end.
     The mirror names the delivery it carried, so the server settles only that input.
+    A live copy arriving later under another item id is not reposted.
     """
     transcript = _run_steered_turn(
-        tmp_path, live_steer_copy=False, replies_after_steer=replies_after_steer
+        tmp_path,
+        live_steer_copy=False,
+        replies_after_steer=replies_after_steer,
+        late_live_steer_id=late_live_steer_id,
     )
 
     assert transcript == expected_transcript
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
-
-
-def test_forwarder_skips_late_live_copy_of_recovered_steer(tmp_path: Path) -> None:
-    """A live copy of a recovered steer arriving later under another item id is not reposted."""
-    transcript = _run_steered_turn(
-        tmp_path, live_steer_copy=False, replies_after_steer=2, late_live_steer_id="item_late"
-    )
-
-    assert transcript == [
-        "user: fix the bug",
-        "assistant: reply 1",
-        _TRANSCRIPT_READ,
-        _RECOVERED_STEER,
-        "assistant: reply 2",
-        "status: idle",
-    ]
 
 
 def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Path) -> None:
