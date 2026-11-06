@@ -618,6 +618,43 @@ async def _accept_web_steer(
     assert [params["clientUserMessageId"] for _, params in steer_client.requests] == [client_id]
 
 
+def _drive_forwarder(
+    bridge_dir: Path,
+    fake_client: _FakeCodexAppServerClient,
+    posted: list[dict[str, Any]],
+    events: Callable[[Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[None]],
+) -> None:
+    """
+    Run ``events`` through a forwarder whose app-server client is ``fake_client``.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param fake_client: App-server client answering the forwarder's requests.
+    :param posted: Receives each Omnigent event post, in order.
+    :param events: Delivers Codex events through its ``deliver`` argument.
+    :returns: None.
+    """
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_123",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+
+            async def deliver(event: dict[str, Any]) -> None:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, bridge_dir),
+                    event=event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+
+            await events(deliver)
+
+    asyncio.run(run())
+
+
 def _run_steered_turn(
     bridge_dir: Path,
     *,
@@ -673,10 +710,6 @@ def _run_steered_turn(
     fake_client = _FakeCodexAppServerClient(
         response={"result": {"thread": {"id": "thread_123", "turns": turns}}}
     )
-    forwarder_state = codex_native_forwarder._CodexForwarderState(
-        parent_session_id="conv_123",
-        codex_client=fake_client,  # type: ignore[arg-type]
-    )
     posted: list[dict[str, Any]] = []
     read_thread = fake_client.request
     lagging_turns = [{"id": "turn_123", "items": steered_items[:first_read_items]}]
@@ -694,58 +727,47 @@ def _run_steered_turn(
 
     fake_client.request = request  # type: ignore[method-assign]
 
-    async def run() -> None:
-        async with _recording_forwarder_client(posted) as client:
+    async def events(deliver: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        await deliver(_turn_item_event("item/completed", first))
+        turn_end = _completed_event("turn_123", thread_id="thread_123")
+        if late_steer_reply:
+            await _accept_web_steer(
+                bridge_dir, "also update the docs", before_reply=lambda: deliver(turn_end)
+            )
+            return
+        await _accept_web_steer(bridge_dir, "also update the docs")
+        if live_steer_copy:
+            await deliver(_turn_item_event("item/completed", steer))
+        if live_follow_up_steer:
+            await _accept_web_steer(
+                bridge_dir,
+                "and the changelog",
+                client_id=_FOLLOW_UP_CLIENT_ID,
+                stable_id="e" * 32,
+            )
+            await deliver(_turn_item_event("item/completed", follow_up))
+        for index in range(1, replies_after_steer + 1):
+            agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
+            await deliver(_turn_item_event("item/started", agent_item))
+            await deliver(_agent_message_event("turn_123", f"msg_{index}", f"reply {index}"))
+        if late_live_steer_id is not None:
+            late_copy = {**steer, "id": late_live_steer_id}
+            await deliver(_turn_item_event("item/completed", late_copy))
+        fake_client.error = turn_end_read_error
+        await deliver(turn_end)
+        fake_client.error = None
+        if not next_turn_replies:
+            return
+        await deliver(_started_event("turn_456"))
+        if live_next_prompt:
+            await deliver(_turn_item_event("item/completed", next_prompt, "turn_456"))
+        for index in range(1, next_turn_replies + 1):
+            agent_item = {"type": "agentMessage", "id": f"next_{index}"}
+            await deliver(_turn_item_event("item/started", agent_item, "turn_456"))
+            await deliver(_agent_message_event("turn_456", f"next_{index}", f"next {index}"))
+        await deliver(_completed_event("turn_456", thread_id="thread_123"))
 
-            async def deliver(event: dict[str, Any]) -> None:
-                await codex_native_forwarder._handle_event(
-                    client,
-                    **_forwarder_context(client, bridge_dir),
-                    event=event,
-                    expected_thread_id="thread_123",
-                    forwarder_state=forwarder_state,
-                )
-
-            await deliver(_turn_item_event("item/completed", first))
-            turn_end = _completed_event("turn_123", thread_id="thread_123")
-            if late_steer_reply:
-                await _accept_web_steer(
-                    bridge_dir, "also update the docs", before_reply=lambda: deliver(turn_end)
-                )
-                return
-            await _accept_web_steer(bridge_dir, "also update the docs")
-            if live_steer_copy:
-                await deliver(_turn_item_event("item/completed", steer))
-            if live_follow_up_steer:
-                await _accept_web_steer(
-                    bridge_dir,
-                    "and the changelog",
-                    client_id=_FOLLOW_UP_CLIENT_ID,
-                    stable_id="e" * 32,
-                )
-                await deliver(_turn_item_event("item/completed", follow_up))
-            for index in range(1, replies_after_steer + 1):
-                agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
-                await deliver(_turn_item_event("item/started", agent_item))
-                await deliver(_agent_message_event("turn_123", f"msg_{index}", f"reply {index}"))
-            if late_live_steer_id is not None:
-                late_copy = {**steer, "id": late_live_steer_id}
-                await deliver(_turn_item_event("item/completed", late_copy))
-            fake_client.error = turn_end_read_error
-            await deliver(turn_end)
-            fake_client.error = None
-            if not next_turn_replies:
-                return
-            await deliver(_started_event("turn_456"))
-            if live_next_prompt:
-                await deliver(_turn_item_event("item/completed", next_prompt, "turn_456"))
-            for index in range(1, next_turn_replies + 1):
-                agent_item = {"type": "agentMessage", "id": f"next_{index}"}
-                await deliver(_turn_item_event("item/started", agent_item, "turn_456"))
-                await deliver(_agent_message_event("turn_456", f"next_{index}", f"next {index}"))
-            await deliver(_completed_event("turn_456", thread_id="thread_123"))
-
-    asyncio.run(run())
+    _drive_forwarder(bridge_dir, fake_client, posted, events)
     return _transcript(posted)
 
 
@@ -985,27 +1007,8 @@ def _run_forwarder_turn(
     fake_client = _FakeCodexAppServerClient(
         response={"result": {"thread": {"id": "thread_123", "turns": turns}}}
     )
-    forwarder_state = codex_native_forwarder._CodexForwarderState(
-        parent_session_id="conv_123",
-        codex_client=fake_client,  # type: ignore[arg-type]
-    )
     posted: list[dict[str, Any]] = []
-
-    async def run() -> None:
-        async with _recording_forwarder_client(posted) as client:
-
-            async def deliver(event: dict[str, Any]) -> None:
-                await codex_native_forwarder._handle_event(
-                    client,
-                    **_forwarder_context(client, bridge_dir),
-                    event=event,
-                    expected_thread_id="thread_123",
-                    forwarder_state=forwarder_state,
-                )
-
-            await events(deliver)
-
-    asyncio.run(run())
+    _drive_forwarder(bridge_dir, fake_client, posted, events)
     return _transcript(posted), [method for method, _ in fake_client.requests]
 
 
@@ -1084,27 +1087,39 @@ def test_forwarder_mirrors_steers_one_read_recovers_in_transcript_order(tmp_path
 @pytest.mark.parametrize(
     "read_holds_newer_steer", [False, True], ids=["newer_steer_unwritten", "newer_steer_after"]
 )
-def test_forwarder_keeps_newer_steer_sent_before_live_steer_arrives(
-    tmp_path: Path, read_holds_newer_steer: bool
+@pytest.mark.parametrize(
+    ("earlier", "newer_kept"),
+    [("recorded_steer", True), ("turn_prompt", True), ("unrecorded_steer", False)],
+    ids=["recorded_steer", "turn_prompt", "unrecorded_steer"],
+)
+def test_forwarder_keeps_steer_recorded_after_earlier_live_message(
+    tmp_path: Path, earlier: str, newer_kept: bool, read_holds_newer_steer: bool
 ) -> None:
     """
-    A steer sent before an earlier steer's live message arrives is still recovered after it.
+    A steer recorded before an earlier web message's live copy arrives is kept if sent after it.
 
     The server keeps inputs sent after a mirrored message queued, so the newer steer's
     record survives the read before that message, whether Codex wrote it yet or not.
+    Every steer of a turn follows the web prompt that started it, but a mid-turn
+    message the ledger does not hold has an unknown order, so the steer is dropped.
     """
     first = _native_user_message("item_first", "fix the bug", "client-first")
     steer = _native_user_message("item_steer", "also update the docs", _STEER_CLIENT_ID)
     newer = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
-    turn_items = [first, steer, newer] if read_holds_newer_steer else [first, steer]
+    turn_items = [first] if earlier == "turn_prompt" else [first, steer]
+    if read_holds_newer_steer:
+        turn_items.append(newer)
 
     async def events(deliver: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
-        await deliver(_turn_item_event("item/completed", first))
-        await _accept_web_steer(tmp_path, "also update the docs")
+        if earlier != "turn_prompt":
+            await deliver(_turn_item_event("item/completed", first))
+        if earlier == "recorded_steer":
+            await _accept_web_steer(tmp_path, "also update the docs")
         await _accept_web_steer(
             tmp_path, "and the changelog", client_id=_FOLLOW_UP_CLIENT_ID, stable_id="e" * 32
         )
-        await deliver(_turn_item_event("item/completed", steer))
+        live_message = first if earlier == "turn_prompt" else steer
+        await deliver(_turn_item_event("item/completed", live_message))
         if newer not in turn_items:
             turn_items.append(newer)
         for index in (1, 2):
@@ -1115,12 +1130,13 @@ def test_forwarder_keeps_newer_steer_sent_before_live_steer_arrives(
 
     transcript, requests = _run_forwarder_turn(tmp_path, turn_items, events)
 
-    assert requests == ["thread/read"] * 2
+    recovered = f"user: and the changelog [delivery {_FOLLOW_UP_CLIENT_ID}] [input {'e' * 32}]"
+    assert requests == ["thread/read"] * (2 if newer_kept else 1)
     assert transcript == [
         "user: fix the bug",
-        "user: also update the docs",
+        *([] if earlier == "turn_prompt" else ["user: also update the docs"]),
         "assistant: reply 1",
-        f"user: and the changelog [delivery {_FOLLOW_UP_CLIENT_ID}] [input {'e' * 32}]",
+        *([recovered] if newer_kept else []),
         "assistant: reply 2",
         "status: idle",
     ]

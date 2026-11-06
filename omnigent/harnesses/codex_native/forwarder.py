@@ -7471,8 +7471,8 @@ async def _mirror_missed_steers(
     so steers Codex recorded before ``before`` are mirrored ahead of it. Any other
     steer sent before ``before`` is dropped, as is one a later user message was
     already mirrored ahead of: a server ignoring ``delivery_attempt_id`` would
-    settle its late copy against another input. Steers sent after a ``before``
-    steer stay queued behind it, so they are kept for a later read.
+    settle its late copy against another input. Steers sent after ``before`` stay
+    queued behind it, so they are kept for a later read.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7513,7 +7513,9 @@ async def _mirror_missed_steers(
             client, session_id, forwarder_state, thread_id=thread_id, steers=missed, before=before
         )
     if before is not None:
-        newer = _steers_sent_after(steers, before)
+        newer = _steers_sent_after(
+            steers, before, turn_id=turn_id, opens_turn=not turn_message_posted
+        )
         overtaken.extend(
             steer
             for steer in missed
@@ -7545,24 +7547,31 @@ async def _mirror_missed_steers(
         )
 
 
-def _steers_sent_after(steers: list[SentSteer], message: _JsonObject) -> list[SentSteer]:
+def _steers_sent_after(
+    steers: list[SentSteer], message: _JsonObject, *, turn_id: str, opens_turn: bool
+) -> list[SentSteer]:
     """
-    Return the steers recorded after the one ``message`` carried, if it is a sent steer.
+    Return the recorded steers sent after ``message``.
+
+    A web prompt that opens a turn is sent by ``turn/start`` and never recorded,
+    so every steer recorded for its turn followed it.
 
     :param steers: Recorded steers, oldest first.
     :param message: Native ``userMessage`` item, matched by its ``clientId``.
-    :returns: Later steers; empty when ``message`` carries no recorded steer.
+    :param turn_id: Codex turn id of ``message``, e.g. ``"turn_abc"``.
+    :param opens_turn: Whether no user message of the turn was posted before ``message``.
+    :returns: Later steers; empty when their order relative to ``message`` is unknown.
     """
     client_id = message.get("clientId")
+    if not isinstance(client_id, str) or not client_id:
+        return []
     index = next(
-        (
-            index
-            for index, steer in enumerate(steers)
-            if isinstance(client_id, str) and steer.client_message_id == client_id
-        ),
+        (index for index, steer in enumerate(steers) if steer.client_message_id == client_id),
         None,
     )
-    return [] if index is None else steers[index + 1 :]
+    if index is not None:
+        return steers[index + 1 :]
+    return [steer for steer in steers if steer.turn_id == turn_id] if opens_turn else []
 
 
 async def _post_missed_steers(
