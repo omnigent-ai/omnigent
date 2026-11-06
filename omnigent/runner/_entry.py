@@ -1975,16 +1975,27 @@ async def _run_tunnel_from_env() -> None:
         callback = getattr(app.state, "has_active_work", None)
         return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
-    def _last_native_activity() -> float | None:
-        """Return native forwarding progress independently of tunnel polling.
+    def _last_work_progress() -> float | None:
+        """Return the newest work progress, independently of tunnel polling.
 
-        :returns: Monotonic time of the last forwarded native event, or ``None``.
+        Covers session events the app published (any turn, however short) and
+        native forwarding (a mirrored sub-agent still streaming while its parent
+        is idle). Request frames are left out: browsing a session is not work.
+
+        :returns: Monotonic time of the newest progress, or ``None`` if none yet.
         """
-        dispatch_at = event_dispatcher.last_dispatch_at
-        post_at = native_forwarder_last_post_at()
-        if dispatch_at is None:
-            return post_at
-        return dispatch_at if post_at is None else max(dispatch_at, post_at)
+        published = getattr(app.state, "last_event_published_at", None)
+        published_at = published() if callable(published) else None
+        stamps: list[float] = [
+            stamp
+            for stamp in (
+                event_dispatcher.last_dispatch_at,
+                native_forwarder_last_post_at(),
+                published_at if isinstance(published_at, float) else None,
+            )
+            if stamp is not None
+        ]
+        return max(stamps, default=None)
 
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
@@ -2054,7 +2065,7 @@ async def _run_tunnel_from_env() -> None:
             )
             direct_attach_listener = None
     # The server extends a managed sandbox only while pongs report busy.
-    pong_busy = RunnerBusyCheck(_has_active_work, _last_native_activity)
+    pong_busy = RunnerBusyCheck(_has_active_work, _last_work_progress)
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy

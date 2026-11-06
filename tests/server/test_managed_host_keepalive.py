@@ -417,6 +417,39 @@ def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPa
     assert len(gate.submitted) == 4, "busy pongs inside an interval must not refresh on their own"
 
 
+def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A 5s refresh interval with 30s pongs: a runner still busy at its last pong
+    # must be refreshed on every tick until a pong says otherwise, or a short
+    # platform window expires between pongs.
+    gate = _BusyGate(monkeypatch)
+    monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 5.0)
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", True)
+    for _ in range(5):
+        gate.now += 5.0
+        managed_host_keepalive.touch("r1")
+    assert gate.submitted == ["r1"] * 6
+
+    managed_host_keepalive.record_pong("r1", False)
+    gate.now += 5.0
+    managed_host_keepalive.touch("r1")
+    gate.now += 5.0
+    managed_host_keepalive.touch("r1")
+    assert len(gate.submitted) == 6, "an idle pong stops refreshes after its pending one"
+
+
+def test_pongs_record_nothing_without_managed_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _BusyGate(monkeypatch)
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", None)
+    managed_host_keepalive.record_pong("r1", True)
+    managed_host_keepalive.record_pong("r1", False)
+    assert managed_host_keepalive._last_pong_busy == {}
+    assert managed_host_keepalive._busy_since_kept == {}
+    assert gate.submitted == []
+
+
 def test_work_that_ended_inside_an_interval_is_refreshed_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

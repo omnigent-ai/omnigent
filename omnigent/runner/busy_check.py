@@ -1,8 +1,10 @@
 """Whether a runner counts as busy for keeping its sandbox awake.
 
 A runner is busy while it has active work (a turn running or an event dispatch
-pending) or while mirrored native events keep advancing after its parent went
-idle. A runner that is merely alive does not count: runners are retained for
+pending) or while its work progress advanced since the previous check: a session
+event was published (so a turn that started and ended between two checks still
+counts) or mirrored native events kept flowing after the parent went idle. A
+runner that is merely alive does not count: runners are retained for
 ``runner.idle_timeout_s`` after their last activity, and keeping a sandbox awake
 for that whole window defeats the platform's idle stop.
 
@@ -26,7 +28,7 @@ class RunnerBusyCheck:
     :param has_active_work: Side-effect-free callback, ``True`` while a turn runs
         or an event dispatch is pending.
     :param get_last_activity: Optional callback returning the monotonic time of
-        the last native-forwarding progress, or ``None`` if there has been none.
+        the newest work progress, or ``None`` if there has been none.
     """
 
     def __init__(
@@ -41,10 +43,11 @@ class RunnerBusyCheck:
     def check(self) -> bool:
         """Return whether the runner is busy now or made progress since the last call.
 
-        :returns: ``True`` while work is active or native forwarding advanced.
+        :returns: ``True`` while work is active or work progress advanced.
         """
         activity_at = self._get_last_activity() if self._get_last_activity is not None else None
-        # Mirrored children can make progress while their parent reports idle.
+        # Catches work that finished between checks, and mirrored children that
+        # make progress while their parent reports idle.
         advanced = activity_at is not None and (
             self._last_activity_at is None or activity_at > self._last_activity_at
         )

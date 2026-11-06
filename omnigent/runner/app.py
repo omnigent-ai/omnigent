@@ -1642,8 +1642,15 @@ def create_runner_app(
 
     app.state.drain_session_streams = _drain_session_streams
 
+    # Monotonic time of the newest published session event. Every turn publishes
+    # through _publish_event, so this records work even when it starts and ends
+    # between two reads of has_active_work.
+    _last_event_published_at: list[float | None] = [None]
+    app.state.last_event_published_at = lambda: _last_event_published_at[0]
+
     def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
         event_body = cast(_JsonObject, event)
+        _last_event_published_at[0] = time.monotonic()
         queue = _session_event_queues.get(session_id)
         if queue is None:
             queue = asyncio.Queue()

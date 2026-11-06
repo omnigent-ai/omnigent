@@ -141,7 +141,7 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
     :param runner_id: Runner that sent the pong.
     :param busy: The pong's busy report; ``None`` when the runner does not report.
     """
-    if busy is None:
+    if busy is None or _sandbox_config is None or _host_store is None:
         return
     was_busy = _last_pong_busy.get(runner_id)
     _last_pong_busy[runner_id] = busy
@@ -182,8 +182,10 @@ def touch(runner_id: str, *, force: bool = False) -> None:
     if not force and last is not None and now - last < _interval_for(runner_id):
         return
     # A reporting runner idle for the whole interval is left alone, so the
-    # platform's idle stop can reclaim its sandbox.
-    if _busy_since_kept.get(runner_id) is False:
+    # platform's idle stop can reclaim its sandbox. The latest report still
+    # counts: with an interval shorter than the ping cadence, several ticks fall
+    # between two pongs from a runner that is still working.
+    if _busy_since_kept.get(runner_id) is False and not _last_pong_busy.get(runner_id):
         return
     with _inflight_lock:
         if runner_id in _inflight:
