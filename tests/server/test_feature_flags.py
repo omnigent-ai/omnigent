@@ -144,6 +144,7 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
         "session_orchestration",
+        "sidebar_grouping_ui",
         "webfonts",
     )
 
