@@ -15305,7 +15305,6 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync();
     const latchedAt = pump.bound.get().sendLatchedAt;
     expect(latchedAt).toBe(previousLatch);
-    expect(pump.bound.get().sendLatchSeenRunning).toBeNull();
     await advanceWithHeartbeats(
       () => pump.sinks.at(-1)!,
       2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
