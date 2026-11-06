@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 from omnigent.entities.scheduled_task import ScheduledRunLogContext
 from omnigent.inner.native_attachments import (
@@ -301,6 +301,8 @@ class StartupInputOptions(BaseModel):
 
 # Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
 _MAX_MESSAGE_PHASE_LENGTH = 64
+# Validation-context key marking item data as the server's own stored record.
+_TRUSTED_ITEM_DATA = "trusted_item_data"
 
 
 class MessageData(BaseModel):
@@ -331,6 +333,13 @@ class MessageData(BaseModel):
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
         Stored as given so clients can act on values added later; ``None``
         when unset, not a string, or longer than 64 characters.
+    :param web_stable_id: On a native terminal's mirrored user message, the
+        ``stable_id`` of the web send whose pending-input entry it drained by a
+        text match, e.g. ``"3f2a..."`` (32 hex). The mirror keeps its own item
+        id, so this is how a client learns that its send was delivered. Set
+        only by the server: validation drops it from any input but the
+        server's own stored record. ``None`` when nothing was drained, the
+        drain was positional, or the match was ambiguous.
     """
 
     role: Literal["user", "assistant"]
@@ -343,9 +352,29 @@ class MessageData(BaseModel):
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
     phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    web_stable_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def drop_unrecorded_web_stable_id(cls, data: Any, info: ValidationInfo) -> Any:
+        """
+        Keep ``web_stable_id`` only when reading the server's own stored record.
+
+        A client, forwarder, runner or import that could set it would make a
+        sender drop a retry it still needs. The server writes it with
+        ``model_copy``, which skips validation.
+
+        :param data: The raw input.
+        :param info: Validation info; see :func:`parse_item_data` ``trusted``.
+        :returns: ``data``, without ``web_stable_id`` unless trusted.
+        """
+        trusted = isinstance(info.context, dict) and info.context.get(_TRUSTED_ITEM_DATA) is True
+        if trusted or not isinstance(data, dict) or "web_stable_id" not in data:
+            return data
+        return {key: value for key, value in data.items() if key != "web_stable_id"}
 
     @field_validator("content")
     @classmethod
@@ -841,7 +870,7 @@ NON_CONTENT_ITEM_TYPES: frozenset[str] = frozenset(
 )
 
 
-def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:
+def parse_item_data(item_type: str, raw: dict[str, Any], *, trusted: bool = False) -> ItemData:
     """
     Parse a raw dict into the appropriate ItemData model.
 
@@ -850,12 +879,17 @@ def parse_item_data(item_type: str, raw: dict[str, Any]) -> ItemData:
     :param item_type: The item type string, e.g. ``"message"``,
         ``"function_call"``.
     :param raw: The raw dict from the DB ``data`` column.
+    :param trusted: ``raw`` is the server's own stored record, so it keeps
+        server-only fields such as ``MessageData.web_stable_id``. Only the
+        store's read path passes it; any other input loses them.
     :returns: A validated ItemData instance.
     :raises ValueError: If ``item_type`` is unknown.
     """
     cls = ITEM_TYPE_TO_DATA_CLS.get(item_type)
     if cls is None:
         raise ValueError(f"unknown item type: {item_type!r}")
+    if trusted:
+        return cls.model_validate(raw, context={_TRUSTED_ITEM_DATA: True})  # type: ignore[return-value]
     return cls(**raw)  # type: ignore[return-value]
 
 

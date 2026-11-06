@@ -856,6 +856,149 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+async def test_native_mirror_names_the_web_send_it_delivered(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A native mirror keeps its forwarder-derived id, and the server tells clients
+    which web send it delivered through ``web_stable_id``. Neither the web POST
+    nor the forwarder can set that field themselves.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
+    pending_inputs.reset_for_tests()
+    web_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    monkeypatch.setattr(
+        sessions_module,
+        "_ensure_native_terminal_ready",
+        AsyncMock(return_value=_NativeTerminalEnsureOutcome(error=None)),
+    )
+    monkeypatch.setattr(
+        sessions_module, "_ensure_runner_session_initialized", AsyncMock(return_value=True)
+    )
+    published: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "omnigent.runtime.session_stream.publish",
+        lambda sid, event: published.append((sid, event)),
+    )
+    content = [{"type": "input_text", "text": "ship it"}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+        monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=runner))
+        monkeypatch.setattr(
+            "omnigent.server.routes._sessions.orchestration._get_runner_client",
+            AsyncMock(return_value=runner),
+        )
+        agent = await create_test_agent(
+            client,
+            name="codex-native-ui",
+            executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+        )
+        created = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent["id"],
+                "labels": {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"},
+            },
+        )
+        assert created.status_code == 201, created.text
+        session_id = created.json()["id"]
+        try:
+            sent = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": content,
+                        "stable_id": web_id,
+                        "web_stable_id": "c" * 32,
+                    },
+                },
+            )
+            assert sent.status_code == 202, sent.text
+            mirrored = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "external_conversation_item",
+                    "data": {
+                        "source_id": "codex-record-1",
+                        "item_type": "message",
+                        "item_data": {
+                            "role": "user",
+                            "content": content,
+                            "web_stable_id": "d" * 32,
+                        },
+                    },
+                },
+            )
+            assert mirrored.status_code == 202, mirrored.text
+        finally:
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    [message] = [item for item in items if item.get("role") == "user"]
+    assert message["id"] != web_id
+    assert message["web_stable_id"] == web_id
+    snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+    # The snapshot nests item data; clients flatten it.
+    snapshot_users = [
+        {**item, **item.get("data", {})}
+        for item in snapshot["items"]
+        if {**item, **item.get("data", {})}.get("role") == "user"
+    ]
+    assert [message["web_stable_id"] for message in snapshot_users] == [web_id]
+    [receipt] = [
+        event["data"]
+        for sid, event in published
+        if sid == session_id and event.get("type") == "session.input.consumed"
+    ]
+    assert receipt["item_id"] == message["id"]
+    assert receipt["data"]["web_stable_id"] == web_id
+
+
+async def test_web_message_cannot_set_web_stable_id(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client's ``web_stable_id`` is dropped: only the server may set it."""
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={"queued": True})),
+        base_url="http://runner",
+    )
+
+    async def get_runner_client(_session_id: str, _runner_router: object) -> httpx.AsyncClient:
+        return fake_runner
+
+    monkeypatch.setattr("omnigent.server.routes.sessions._get_runner_client", get_runner_client)
+    try:
+        posted = await client.post(
+            f"/v1/sessions/{session['id']}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "ship it"}],
+                    "web_stable_id": "c" * 32,
+                },
+            },
+        )
+    finally:
+        await fake_runner.aclose()
+
+    assert posted.status_code == 202, posted.text
+    items = (await client.get(f"/v1/sessions/{session['id']}/items")).json()["data"]
+    message = next(item for item in items if item.get("role") == "user")
+    assert "web_stable_id" not in message
+
+
 async def test_native_user_item_respects_background_title_header_opt_out(
     client: httpx.AsyncClient,
     app: Any,

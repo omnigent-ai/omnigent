@@ -1765,6 +1765,12 @@ const sendChains = new Map<string | symbol, SendChain>();
  */
 const inFlightSends = new Map<string, boolean>();
 
+/**
+ * The session each in-flight send posted to, by stable id: only a native mirror
+ * on that session's own stream may vouch for the send (see `webStableId`).
+ */
+const inFlightSendSessions = new Map<string, string>();
+
 // Sends with no conversation id yet (brand-new chat) serialize together: the
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
@@ -2866,6 +2872,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // otherwise resolve that id, find an empty chain, and overtake this POST.
       const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
       postedSessionId = sessionId;
+      inFlightSendSessions.set(stableId, sessionId);
       // Until this send settles, the server may hold the message without persisting
       // it, so keep its text where a reload can find it (see `unsentSendToRestore`).
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
@@ -3048,8 +3055,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftState =
         draftSessionId === null ? get() : (setterForState(draftSessionId) ?? get());
       // A live `session_input_consumed` for this very attempt proves the runner
-      // took it, whatever became of the POST's answer.
-      let deliveredDespiteFailure = inFlightSends.get(stableId) === true;
+      // took it, whatever became of the POST's answer. So does a native mirror
+      // in this session naming the send: the server links it only on delivery.
+      const ownBlocks =
+        draftSessionId === null ? [] : (setterForState(draftSessionId)?.blocks ?? []);
+      let deliveredDespiteFailure =
+        inFlightSends.get(stableId) === true || mirrorNamesSend(ownBlocks, stableId);
       let unsettled = false;
       if (
         !deliveredDespiteFailure &&
@@ -3147,6 +3158,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
+      inFlightSendSessions.delete(stableId);
       if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
@@ -6089,9 +6101,10 @@ async function rehydrateWindowOnReconnect(
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const freshItemIds = new Set(fresh.items.map((it) => it.id));
+  const freshItemIds = committedSendIdsOf(fresh.items);
+  // A mirror naming its web send proves only that send, never another by text.
   const gapUserTexts = committedUserTextsOf(
-    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId) && !b.ctx.webStableId),
   );
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
@@ -6280,7 +6293,7 @@ async function reconcileOnReconnect(
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
-  const snapshotItemIds = new Set(items.map((it) => it.id));
+  const snapshotItemIds = committedSendIdsOf(items);
   set((s) => {
     const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
@@ -6332,7 +6345,7 @@ async function reconcileOnReconnect(
     nextBlocks = withoutDeliveredSendFailureCards(
       nextBlocks,
       snapshotItemIds,
-      committedUserTextsOf(unseen),
+      committedUserTextsOf(unseen.filter((b) => !b.ctx.webStableId)),
       session,
     );
     // Recover elicitation state the dead socket swallowed: gap-fired
@@ -7777,7 +7790,38 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
 }
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
-  return itemId !== "" && blocks.some((block) => block.ctx.itemId === itemId);
+  return (
+    itemId !== "" &&
+    (blocks.some((block) => block.ctx.itemId === itemId) || mirrorNamesSend(blocks, itemId))
+  );
+}
+
+/**
+ * Whether a native mirror in `blocks` names `stableId` as the web send it
+ * delivered. The mirror commits under its own id; the server links it to the
+ * send only when the link is exact, so this is conclusive.
+ *
+ * @param blocks - One conversation's blocks.
+ * @param stableId - A send's stable id.
+ */
+function mirrorNamesSend(blocks: AnyBlock[], stableId: string): boolean {
+  return stableId !== "" && blocks.some((block) => block.ctx.webStableId === stableId);
+}
+
+/**
+ * The ids a snapshot commits sends under: each item's own id and, for a native
+ * mirror, the web send the server says it delivered (`web_stable_id`).
+ *
+ * @param items - Snapshot items.
+ */
+function committedSendIdsOf(
+  items: readonly { id: string; web_stable_id?: unknown }[],
+): Set<string> {
+  return new Set(
+    items.flatMap((item) =>
+      typeof item.web_stable_id === "string" ? [item.id, item.web_stable_id] : [item.id],
+    ),
+  );
 }
 
 /**
@@ -7984,7 +8028,7 @@ async function sendVerdictFromServer(
  */
 function unsentSendToRestore(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly { id: string; web_stable_id?: unknown }[],
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
@@ -8009,7 +8053,7 @@ function unsentSendToRestore(
   }
   const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
     // Another account may have signed in to this tab since.
-    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+    (send) => send.authorId === viewerId && !committedSendIdsOf(items).has(send.stableId),
   );
   const [first] = sends;
   if (first === undefined) return null;
@@ -8040,7 +8084,7 @@ function unsentSendToRestore(
  */
 function restoreUnsentSendOnceIdentified(
   conversationId: string,
-  items: readonly { id: string }[],
+  items: readonly { id: string; web_stable_id?: unknown }[],
 ): void {
   const unsubscribe = subscribeIdentity(() => {
     if (getCurrentUserId() === null) return;
@@ -8182,6 +8226,7 @@ function committedUserBlock(
   stableKey?: string,
   createdBy?: string,
   createdAtS?: number,
+  webStableId?: string,
 ): UserMessageBlock {
   return {
     type: "user_message",
@@ -8192,6 +8237,8 @@ function committedUserBlock(
       timestamp: 0,
       responseId: "",
       itemId,
+      // Lets a failed send's catch find the mirror that delivered it.
+      ...(webStableId !== undefined ? { webStableId } : {}),
       // Live human-author attribution (multi-user); omit when absent so
       // null carries no author. Mirrors itemsToBlocks on cold load.
       ...(createdBy !== undefined ? { createdBy } : {}),
@@ -9028,12 +9075,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // before it (re)populates the composer with an already-sent prompt,
       // and drop the send's failure card.
       if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
+      // A native mirror keeps its own id and names the web send it delivered,
+      // which only that send's own session can vouch for.
+      const alias = event.webStableId;
+      if (alias && inFlightSendSessions.get(alias) === sourceConversationId) {
+        inFlightSends.set(alias, true);
+      }
       applyToConversation((s) => {
-        const committedIds = new Set([event.itemId]);
-        // A late copy of an item already shown is not a new message.
-        const content = hasCommittedItem(s.blocks, event.itemId)
-          ? null
-          : userContentFromEvent(event);
+        const committedIds = new Set([event.itemId, ...(alias ? [alias] : [])]);
+        // A late copy of an item already shown is not a new message, and a
+        // mirror naming its send proves no other send by its text.
+        const content =
+          hasCommittedItem(s.blocks, event.itemId) || event.webStableId
+            ? null
+            : userContentFromEvent(event);
         const blocks = withoutDeliveredSendFailureCards(
           s.blocks,
           committedIds,
@@ -9151,6 +9206,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   matched.tempId,
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
+                  event.webStableId,
                 ),
               ],
             };
@@ -9187,6 +9243,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 head.tempId,
                 event.createdBy ?? head.author,
                 head.createdAtS,
+                event.webStableId,
               ),
             ],
           };
@@ -9198,7 +9255,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         return {
           blocks: [
             ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
+            committedUserBlock(
+              event.itemId,
+              eventContent,
+              undefined,
+              event.createdBy,
+              undefined,
+              event.webStableId,
+            ),
           ],
         };
       });
