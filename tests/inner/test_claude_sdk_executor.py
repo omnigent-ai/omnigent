@@ -4192,6 +4192,7 @@ _RELAY_ENV_NAMES = (
     "OMNIGENT_MCP_RELAY_PYTHON",
     "OMNIGENT_MCP_RELAY_BRIDGE_DIR",
     "OMNIGENT_MCP_RELAY_TMPDIR",
+    "OMNIGENT_MCP_RELAY_SOCKET_DIR",
 )  # Spelled out, so a renamed variable fails here.
 
 
