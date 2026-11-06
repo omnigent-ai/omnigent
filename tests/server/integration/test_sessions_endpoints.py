@@ -5500,6 +5500,25 @@ async def test_post_external_session_status_carries_response_id(
     assert event["status"] == "running"
     assert event["response_id"] == "codex_turn_123"
 
+    from omnigent.server.routes import sessions as sessions_module
+
+    assert sessions_module._session_last_response_cache.get(session["id"]) == "codex_turn_123"
+    idle = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "idle",
+                "response_id": "codex_turn_123",
+                "turn_completed": True,
+            },
+        },
+    )
+    assert idle.status_code == 202, idle.text
+    assert sessions_module._session_active_response_cache.get(session["id"]) is None
+    assert sessions_module._session_last_response_cache.get(session["id"]) == "codex_turn_123"
+    sessions_module._session_last_response_cache.pop(session["id"], None)
+
 
 async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     monkeypatch: pytest.MonkeyPatch,
@@ -10192,11 +10211,14 @@ async def test_delete_session_evicts_mcp_startup_cache(
         assert resp.status_code == 202, resp.text
         assert session["id"] in sessions_module._session_mcp_startup_cache
 
+        sessions_module._session_last_response_cache[session["id"]] = "resp_deleted"
         resp = await client.delete(f"/v1/sessions/{session['id']}")
         assert resp.status_code == 200, resp.text
         assert session["id"] not in sessions_module._session_mcp_startup_cache
+        assert session["id"] not in sessions_module._session_last_response_cache
     finally:
         sessions_module._session_mcp_startup_cache.pop(session["id"], None)
+        sessions_module._session_last_response_cache.pop(session["id"], None)
 
 
 async def test_post_external_mcp_startup_rejects_malformed_servers(
@@ -10872,7 +10894,9 @@ async def _claude_turn_failure(
     return None
 
 
-def _failed_turn_frames(stable_id: str, error: dict[str, Any]) -> list[str]:
+def _failed_turn_frames(
+    stable_id: str, error: dict[str, Any], identity: dict[str, Any]
+) -> list[str]:
     """The runner's relay frames for a turn that failed with *error*, then [DONE]."""
     from tests.server.routes.test_session_resources import _sse_frame
 
@@ -10882,6 +10906,7 @@ def _failed_turn_frames(stable_id: str, error: dict[str, Any]) -> list[str]:
             {
                 "type": "response.failed",
                 "input_stable_id": stable_id,
+                **identity,
                 "response": {"id": "resp_pane_died", "error": error},
             }
         ),
@@ -10898,7 +10923,9 @@ def _failed_turn_frames(stable_id: str, error: dict[str, Any]) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("pane_died", ["waiting_for_prompt", "after_submit", "stop_during_resend"])
+@pytest.mark.parametrize(
+    "pane_died", ["waiting_for_prompt", "after_submit", "stop_during_resend", "stop_then_new_turn"]
+)
 async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -10918,7 +10945,10 @@ async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes._sessions import orchestration as orchestration_module
     from omnigent.server.routes.sessions import _relay_runner_stream, routes_events
-    from tests.server.routes.test_session_resources import _ScriptedStreamingRunnerClient
+    from tests.server.routes.test_session_resources import (
+        _ScriptedStreamingRunnerClient,
+        _sse_frame,
+    )
 
     agent = await create_test_agent(client, name="claude-native-ui")
     session = await _create_session(
@@ -10945,7 +10975,7 @@ async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
             )
         if request.url.path == terminals_path:
             ensures.append(request.url.path)
-            if pane_died == "stop_during_resend" and gate_ensure:
+            if pane_died in {"stop_during_resend", "stop_then_new_turn"} and gate_ensure:
                 ensure_started.set()
                 await ensure_release.wait()
             return httpx.Response(200, json={})
@@ -10989,7 +11019,7 @@ async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
             ensures.clear()
             gate_ensure = True
 
-            if pane_died in {"waiting_for_prompt", "stop_during_resend"}:
+            if pane_died in {"waiting_for_prompt", "stop_during_resend", "stop_then_new_turn"}:
                 # Delivery was still waiting for the prompt when tmux lost the pane.
                 error = await _claude_turn_failure(
                     monkeypatch,
@@ -11003,26 +11033,79 @@ async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
             assert error is not None
             await _relay_runner_stream(
                 session_id,
-                _ScriptedStreamingRunnerClient(_failed_turn_frames(stable_id, error)),  # type: ignore[arg-type]
+                _ScriptedStreamingRunnerClient(
+                    _failed_turn_frames(
+                        stable_id,
+                        error,
+                        pending_inputs.delivery_attributes_for(session_id, pending_id),
+                    )
+                ),  # type: ignore[arg-type]
                 store,
             )
-            if pane_died == "stop_during_resend":
+            if pane_died in {"stop_during_resend", "stop_then_new_turn"}:
                 await asyncio.wait_for(ensure_started.wait(), timeout=5)
                 stopped = await client.post(
                     f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
                 )
                 assert stopped.status_code == 202, stopped.text
+                if pane_died == "stop_then_new_turn":
+                    gate_ensure = False
+                    later = await client.post(
+                        events_path,
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "stable_id": "7e" * 16,
+                                "content": [{"type": "input_text", "text": "fresh work"}],
+                            },
+                        },
+                    )
+                    assert later.status_code == 202, later.text
+                    await _relay_runner_stream(
+                        session_id,
+                        _ScriptedStreamingRunnerClient(
+                            [
+                                _sse_frame(
+                                    {
+                                        "type": "response.in_progress",
+                                        "response": {"id": "resp_later"},
+                                    }
+                                ),
+                                _sse_frame(
+                                    {
+                                        "type": "response.completed",
+                                        "response": {"id": "resp_later"},
+                                    }
+                                ),
+                                "data: [DONE]\n\n",
+                            ]
+                        ),  # type: ignore[arg-type]
+                        store,
+                    )
+                    assert session_id not in orchestration_module._interrupt_fenced_sessions
                 ensure_release.set()
             await asyncio.gather(*orchestration_module._resend_tasks)
 
             snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
             errors = [item for item in snapshot["items"] if item["type"] == "error"]
-            if pane_died == "stop_during_resend":
-                assert len(forwarded) == 1
-                assert ensures == [terminals_path]
+            if pane_died in {"stop_during_resend", "stop_then_new_turn"}:
+                assert len(forwarded) == (2 if pane_died == "stop_then_new_turn" else 1)
+                assert ensures == [terminals_path] * (
+                    2 if pane_died == "stop_then_new_turn" else 1
+                )
                 assert snapshot["status"] != "failed"
                 assert errors == []
-                assert pending_inputs.snapshot_for(session_id) == []
+                pending = pending_inputs.snapshot_for(session_id)
+                if pane_died == "stop_then_new_turn":
+                    assert len(pending) == 1 and pending[0][
+                        "pending_id"
+                    ] == pending_inputs.pending_id_for_stable_id(session_id, "7e" * 16)
+                    assert forwarded[1]["content"] == [
+                        {"type": "input_text", "text": "fresh work"}
+                    ]
+                else:
+                    assert pending == []
                 assert orchestration_module._active_native_input_resends.get(session_id) is None
                 return
             if pane_died == "after_submit":
@@ -11045,7 +11128,13 @@ async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
             # The re-sent message dies the same way: no third send, the failure stands.
             await _relay_runner_stream(
                 session_id,
-                _ScriptedStreamingRunnerClient(_failed_turn_frames(stable_id, error)),  # type: ignore[arg-type]
+                _ScriptedStreamingRunnerClient(
+                    _failed_turn_frames(
+                        stable_id,
+                        error,
+                        pending_inputs.delivery_attributes_for(session_id, pending_id),
+                    )
+                ),  # type: ignore[arg-type]
                 store,
             )
             await asyncio.gather(*orchestration_module._resend_tasks)

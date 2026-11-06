@@ -2016,13 +2016,21 @@ def create_runner_app(
         if process_manager is None:
             return
 
+        turn_epoch = _turn_bind_epoch.get(session_id)
+
         async def _release() -> None:
             # Let a live turn stream converge first (bounded): the harness's own
             # failure event may already be on the wire, and releasing now would
             # sever the stream carrying it.
             deadline = time.monotonic() + grace_s
-            while session_id in _live_response_id and time.monotonic() < deadline:
+            while (
+                session_id in _live_response_id
+                and _turn_bind_epoch.get(session_id) == turn_epoch
+                and time.monotonic() < deadline
+            ):
                 await asyncio.sleep(0.05)
+            if _turn_bind_epoch.get(session_id) != turn_epoch:
+                return
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -2138,7 +2146,9 @@ def create_runner_app(
             # Claude's live turn may still report that its message was never
             # typed; the server then sends it again, so wait for that turn.
             task = asyncio.create_task(
-                _fail_after_turn_settles(event, error, diagnosis),
+                _fail_after_turn_settles(
+                    event, error, diagnosis, _turn_bind_epoch.get(event.session_id)
+                ),
                 name=f"required-terminal-exit:{event.session_id}",
             )
             task.add_done_callback(_background_tasks.discard)
@@ -2147,12 +2157,21 @@ def create_runner_app(
         _fail_turn_for_terminal_exit(event, error, diagnosis)
 
     async def _fail_after_turn_settles(
-        event: TerminalExitEvent, error: dict[str, str], diagnosis: FailureDiagnosis | None
+        event: TerminalExitEvent,
+        error: dict[str, str],
+        diagnosis: FailureDiagnosis | None,
+        turn_epoch: int | None,
     ) -> None:
-        """Fail the session for a Claude terminal exit unless its turn ended undelivered."""
+        """Fail the owning turn unless it ended undelivered or another turn replaced it."""
         deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
-        while event.session_id in _live_response_id and time.monotonic() < deadline:
+        while (
+            event.session_id in _live_response_id
+            and _turn_bind_epoch.get(event.session_id) == turn_epoch
+            and time.monotonic() < deadline
+        ):
             await asyncio.sleep(0.05)
+        if _turn_bind_epoch.get(event.session_id) != turn_epoch:
+            return
         if event.session_id not in _turns_ended_before_delivery:
             _fail_turn_for_terminal_exit(event, error, diagnosis)
             return
@@ -5741,6 +5760,8 @@ def create_runner_app(
         _authorized_shell = msg_body.get("authorized_native_shell_command")
         if isinstance(_authorized_shell, str):
             harness_body["authorized_native_shell_command"] = _authorized_shell
+        if isinstance(msg_body.get("native_input_receipt"), dict):
+            harness_body["native_input_receipt"] = msg_body["native_input_receipt"]
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and

@@ -336,6 +336,7 @@ from omnigent.server.routes._sessions.common import (
     _server_host_registry as _server_host_registry,
     _server_runner_router as _server_runner_router,
     _session_active_response_cache as _session_active_response_cache,
+    _session_last_response_cache as _session_last_response_cache,
     _session_background_task_count_cache as _session_background_task_count_cache,
     _session_background_tasks_cache as _session_background_tasks_cache,
     _session_blocked_on_cache as _session_blocked_on_cache,
@@ -1010,8 +1011,8 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
-        register_native_input_resend=register_native_input_resend,
         clear_session_into_fresh_session=clear_session_into_fresh_session,
+        register_native_input_resend=register_native_input_resend,
     )
 
     register_permissions_routes(

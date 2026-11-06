@@ -122,17 +122,31 @@ describe("ApprovalCard — binary approve/reject", () => {
     });
 
     it.each([
-      { name: "the prompt Esc declines", blocks: [pending("elic_chord")], keys: [ESC_KEY] },
+      {
+        name: "the prompt Esc declines",
+        blocks: [pending("elic_chord")],
+        inChat: true,
+        keys: [ESC_KEY],
+      },
       {
         name: "an older prompt",
         blocks: [pending("elic_chord"), pending("elic_newer")],
+        inChat: true,
         keys: [],
       },
-    ])("names Esc on the Reject button of $name only", async ({ blocks, keys }) => {
-      useChatStore.setState({ blocks: blocks as AnyBlock[] });
+      {
+        name: "the prompt's copy in Inbox, where Esc leaves it pending",
+        blocks: [pending("elic_chord")],
+        inChat: false,
+        keys: [],
+      },
+    ])("names Esc on the Reject button of $name only", async ({ blocks, inChat, keys }) => {
+      const submitApproval = vi.fn();
+      useChatStore.setState({ blocks: blocks as AnyBlock[], submitApproval });
       renderHook(() => useApproveHotkey());
       render(
         <ApprovalCard
+          inChat={inChat}
           elicitationId="elic_chord"
           message="Approve running ls?"
           phase="tool_call"
@@ -150,6 +164,10 @@ describe("ApprovalCard — binary approve/reject", () => {
       expect(tooltip).toHaveTextContent("Reject");
       const shown = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
       expect(shown.map((key) => key.textContent)).toEqual(keys);
+      // Esc declines exactly when the button names it.
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      if (keys.length > 0) expect(submitApproval).toHaveBeenCalledWith("elic_chord", "decline");
+      else expect(submitApproval).not.toHaveBeenCalled();
     });
   });
 

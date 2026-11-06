@@ -30,7 +30,7 @@ from pydantic import ValidationError
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.db.utils import generate_agent_id, generate_task_id
-from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
+from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
     Agent,
@@ -83,6 +83,12 @@ from omnigent.native.input_diagnostics import (
     input_attributes,
     log_input_event,
     with_input_attributes,
+)
+from omnigent.native.input_receipt import (
+    NATIVE_INPUT_RECEIPT_EVENT,
+    NATIVE_INPUT_RECEIPT_VERSION,
+    build_native_input_receipt,
+    native_input_identity,
 )
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -242,6 +248,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_last_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -417,6 +424,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
+    PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -3121,7 +3129,16 @@ async def _persist_external_conversation_item_unlocked(
         # as undelivered. Items that never touch the queue skip the lookup; their
         # retries are absorbed by the idempotent append below.
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
-        if existing is not None:
+        if existing is not None and existing.response_id != PENDING_INPUT_RESPONSE_ID:
+            if body.type == NATIVE_INPUT_RECEIPT_EVENT and (
+                not isinstance(existing.data, MessageData)
+                or not isinstance(item.data, MessageData)
+                or existing.data.content != item.data.content
+            ):
+                raise OmnigentError(
+                    "Native input receipt differs from its persisted input",
+                    code=ErrorCode.CONFLICT,
+                )
             return existing.id
     if drains_pending_inputs and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
@@ -3145,7 +3162,38 @@ async def _persist_external_conversation_item_unlocked(
     skipped_pending: list[pending_inputs.DrainedInput] = []
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
-    if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
+    receipt = _external_native_input_receipt(body)
+    if receipt is not None:
+        identity = receipt["identity"]
+        try:
+            drained = pending_inputs.resolve_delivery_attempt(
+                session_id,
+                identity["pending_id"],
+                identity["delivery_attempt_id"],
+                stable_id=identity.get("input_stable_id"),
+                hold=True,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        if drained is not None:
+            assert isinstance(item.data, MessageData)
+            if drained.content != item.data.content:
+                pending_inputs.restore(session_id, drained)
+                raise OmnigentError(
+                    "Native input receipt content differs from its pending input",
+                    code=ErrorCode.CONFLICT,
+                )
+            cleared_pending_id = drained.pending_id
+            match_method = "delivery_attempt"
+            item = item.model_copy(
+                update={
+                    "data": item.data.model_copy(
+                        update={"content": drained.content, "user_authored": True}
+                    ),
+                    "created_by": drained.created_by,
+                }
+            )
+    elif drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
         # Match the mirror to its entry by text: a pasted message the TUI never
         # recorded leaves a stale head entry, and draining by position would
         # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
@@ -3349,11 +3397,59 @@ async def _persist_external_conversation_item_unlocked(
     return persisted.id
 
 
+def _external_native_input_receipt(body: SessionEventInput) -> dict[str, Any] | None:
+    """Validate the versioned receipt before any pending-input queue operation."""
+    value = body.data.get("native_input_receipt")
+    if body.type != NATIVE_INPUT_RECEIPT_EVENT:
+        if value is not None:
+            raise OmnigentError(
+                "Native input receipt requires its versioned event", code=ErrorCode.INVALID_INPUT
+            )
+        return None
+    if not isinstance(value, dict) or set(value) != {"version", "identity", "receipt_id"}:
+        raise OmnigentError("Invalid native input receipt metadata", code=ErrorCode.INVALID_INPUT)
+    identity = value.get("identity")
+    receipt_id = value.get("receipt_id")
+    if (
+        type(value.get("version")) is not int
+        or value["version"] != NATIVE_INPUT_RECEIPT_VERSION
+        or not isinstance(identity, dict)
+        or native_input_identity(identity) != identity
+        or not isinstance(receipt_id, str)
+        or re.fullmatch(r"omnigent-paste-[0-9a-f]{32}-[0-9a-f]{64}", receipt_id) is None
+    ):
+        raise OmnigentError("Invalid native input receipt identity", code=ErrorCode.INVALID_INPUT)
+    return value
+
+
 def _new_external_conversation_item(
     session_id: str, body: SessionEventInput
 ) -> NewConversationItem:
-    """Parse an external item event, keyed by its ``source_id`` when it has one."""
+    """Parse a native mirror with its logical input or source identity."""
+    receipt = _external_native_input_receipt(body)
     item = _parse_external_conversation_item(body)
+    if receipt is not None:
+        if (
+            item.type != "message"
+            or not isinstance(item.data, MessageData)
+            or item.data.role != "user"
+            or item.data.is_meta
+            or build_native_input_receipt(item.data.content, receipt["identity"]) is None
+        ):
+            raise OmnigentError(
+                "Native input receipt requires original user content", code=ErrorCode.INVALID_INPUT
+            )
+        logical_input_id = receipt["identity"]["pending_id"]
+        return item.model_copy(
+            update={
+                "stable_id": receipt["identity"].get("input_stable_id")
+                or uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"omnigent-native-input-receipt:{session_id}:{logical_input_id}",
+                ).hex,
+                "data": item.data.model_copy(update={"user_authored": True}),
+            }
+        )
     return_id = body.data.get("subagent_return_id")
     if (
         isinstance(return_id, str)
@@ -3535,7 +3631,7 @@ async def _settle_undelivered_native_input(
     conversation_store: ConversationStore | None,
     session_id: str,
     response_id: str | None,
-    input_stable_id: str | None,
+    input_identity: Mapping[str, Any],
     reason_code: str | None = None,
 ) -> None:
     """
@@ -3543,10 +3639,10 @@ async def _settle_undelivered_native_input(
 
     Only native-terminal sessions queue web messages: the transcript forwarder
     normally mirrors each one back and drains its entry. When the runner
-    reports the turn failed and names the message it carried
-    (``input_stable_id``), an entry still queued under that id is a message the
-    harness never received. Left in the queue it lingers for the TTL and the
-    next mirrored message drains it instead of its own, so the transcript shows
+    reports the turn failed and names the message it carried by client id or
+    exact server delivery attempt, an entry still queued under that id is a
+    message the harness never received. Left in the queue it lingers for the
+    TTL and the next mirrored message drains it instead of its own, so the transcript shows
     the reply above a still-queued bubble and the failed message vanishes on
     reload. Settlement is by identity, never by queue order: a turn that fails
     after its message was mirrored (entry already drained) settles nothing, so
@@ -3556,39 +3652,68 @@ async def _settle_undelivered_native_input(
     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
     :param response_id: The failed turn's response id, so the message groups
         with the error item persisted right after it; ``None`` mints one.
-    :param input_stable_id: The web stable id the runner stamped on the failed
-        turn, passed only when the harness reported the failure as undelivered;
-        ``None`` settles nothing.
+    :param input_identity: Identity from a failure the harness explicitly marked
+        undelivered. Without a client id, both pending and attempt ids are required.
     """
-    if input_stable_id is None:
+    identity = input_attributes(input_identity)
+    if any(
+        key in input_identity and key not in identity
+        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+    ):
+        return
+    input_stable_id = identity.get("input_stable_id")
+    pending_id = identity.get("pending_id")
+    attempt = identity.get("delivery_attempt_id")
+    if (pending_id is None) != (attempt is None):
+        return
+    if conversation_store is None:
+        return
+    if pending_id is None:
+        if not isinstance(input_stable_id, str):
+            return
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if not isinstance(pending_id, str) or pending_inputs.peek(session_id, pending_id) is None:
+        if not isinstance(input_stable_id, str):
+            return
+        saved = await asyncio.to_thread(conversation_store.get_item, session_id, input_stable_id)
+        if saved is None or saved.response_id != PENDING_INPUT_RESPONSE_ID:
+            return
+        await restore_pending_inputs(conversation_store, session_id)
+        if pending_id is None:
+            pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
+    if not isinstance(pending_id, str):
+        return
+    try:
+        drained = pending_inputs.resolve_delivery_attempt(
+            session_id,
+            pending_id,
+            attempt if isinstance(attempt, str) else None,
+            stable_id=input_stable_id if isinstance(input_stable_id, str) else None,
+            hold=True,
+        )
+    except ValueError:
+        return
+    if drained is None:
         return
     pending_inputs.mark_lifecycle(
         session_id,
-        input_stable_id,
+        pending_id=pending_id,
+        stable_id=drained.stable_id,
         stage="rejected_before_handoff",
         cause_class="rejected_before_handoff",
         reason_code=reason_code or "reported_undelivered",
         lifecycle_response_id=response_id,
     )
-    if conversation_store is None:
-        return
-    pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
-        # A saved startup input submitted before a server restart is matched
-        # only once restored.
-        await restore_pending_inputs(conversation_store, session_id)
-        pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_stable_id)
-    if pending_id is None:
-        return
-    drained = pending_inputs.resolve(session_id, pending_id)
-    if drained is None:
-        return
     item = NewConversationItem(
         type="message",
         response_id=response_id or generate_task_id(),
         data=MessageData(role="user", content=drained.content, user_authored=True),
         created_by=drained.created_by,
-        stable_id=drained.stable_id,
+        stable_id=drained.stable_id
+        or uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"omnigent-undelivered-native-user:{session_id}:{drained.pending_id}",
+        ).hex,
         replaces_pending_id=drained.stable_id,
     )
     try:
@@ -3601,6 +3726,7 @@ async def _settle_undelivered_native_input(
         )
         pending_inputs.restore(session_id, drained)
         return
+    pending_inputs.release(session_id, drained)
     if not persisted[0].deduplicated:
         log_input_event(
             _logger,
@@ -3610,7 +3736,7 @@ async def _settle_undelivered_native_input(
             outcome="reported_undelivered",
             item_id=persisted[0].id,
             response_id=persisted[0].response_id,
-            match_method="input_stable_id",
+            match_method="input_stable_id" if input_stable_id is not None else "delivery_attempt",
         )
     _publish_input_consumed(session_id, persisted[0], cleared_pending_id=drained.pending_id)
 
@@ -3620,11 +3746,14 @@ async def _settle_undelivered_native_input(
 _resent_native_inputs: WorkspaceScopedCache[str, bool] = WorkspaceScopedCache(
     lambda: cachetools.TTLCache(maxsize=4096, ttl=3600.0, timer=time.monotonic)
 )
-# Sessions whose failed turn is being re-sent: the runner's failed edge for that
-# turn is dropped so the session does not report a failure the re-send recovers.
-_resending_native_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
+# Suppress only the failed response whose terminal status the recovery replaces.
+_resending_native_sessions: WorkspaceScopedCache[tuple[str, str], bool] = WorkspaceScopedCache(
+    lambda: cachetools.TTLCache(maxsize=4096, ttl=3600.0, timer=time.monotonic)
+)
 # Stable ids currently being re-sent. Stop cancels only these, not later work.
-_active_native_input_resends: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
+_active_native_input_resends: WorkspaceScopedCache[str, dict[str, pending_inputs.DrainedInput]] = (
+    WorkspaceScopedCache()
+)
 # custom-lint: disable-next=workspace-scoped-cache -- task objects
 _resend_tasks: set[asyncio.Task[None]] = set()
 
@@ -3634,12 +3763,16 @@ _native_input_resender: NativeInputResender | None = None
 
 
 def _native_input_resend_was_stopped(session_id: str, stable_id: str | None) -> bool:
-    """Whether Stop landed while this exact input was being recovered."""
-    return (
-        stable_id is not None
-        and stable_id in _active_native_input_resends.get(session_id, set())
-        and session_id in _interrupt_fenced_sessions
-    )
+    """Whether a successful Stop cancelled this exact active recovery."""
+    active = _active_native_input_resends.get(session_id, {})
+    entry = active.get(stable_id) if stable_id is not None else None
+    return entry is not None and entry.interrupted
+
+
+def _interrupt_native_input_resends(session_id: str) -> None:
+    """Keep successful cancellation after a later turn clears the stream fence."""
+    for entry in _active_native_input_resends.get(session_id, {}).values():
+        entry.interrupted = True
 
 
 def set_native_input_resender(resender: NativeInputResender | None) -> None:
@@ -3665,21 +3798,23 @@ async def _claim_native_input_resend(
     Take a failed turn's queued message back to send it once more.
 
     Only a turn whose terminal died before any of the message was typed
-    qualifies (see :data:`pending_inputs.TERMINAL_EXITED_BEFORE_DELIVERY_CODE`),
+    qualifies (see :data:`TERMINAL_EXITED_BEFORE_DELIVERY_CODE`),
     and only once per input. A Stop, an already failed session or a sub-agent
     turn keeps today's failure.
 
     :returns: The drained entry to re-send, or ``None`` to fail the turn.
     """
-    raw_stable_id = event.get("input_stable_id")
+    identity = native_input_identity(event)
+    raw_stable_id = identity.get("input_stable_id") if identity is not None else None
     if (
-        not isinstance(raw_stable_id, str)
+        identity is None
+        or not isinstance(raw_stable_id, str)
         or not _failed_event_undelivered(event)
         or _native_input_reason_code(event) != TERMINAL_EXITED_BEFORE_DELIVERY_CODE
     ):
         return None
     resend_key = f"{session_id}:{raw_stable_id}"
-    pending_id = pending_inputs.pending_id_for_stable_id(session_id, raw_stable_id)
+    pending_id = identity["pending_id"]
     refusal: str | None = None
     if _native_input_resender is None:
         refusal = "no_resender"
@@ -3691,17 +3826,26 @@ async def _claim_native_input_resend(
         refusal = "stopped"
     elif _session_status_cache.get(session_id) == "failed":
         refusal = "session_failed"
-    elif pending_id is None:
+    elif pending_inputs.peek(session_id, pending_id) is None:
         refusal = "not_queued"
     else:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         if conv is None or conv.parent_conversation_id is not None:
             refusal = "sub_agent"
-    drained = (
-        pending_inputs.resolve(session_id, pending_id)
-        if refusal is None and pending_id is not None
-        else None
-    )
+        elif runner_id is not None and conv.runner_id != runner_id:
+            refusal = "runner_replaced"
+    drained = None
+    if refusal is None:
+        try:
+            drained = pending_inputs.resolve_delivery_attempt(
+                session_id,
+                pending_id,
+                identity["delivery_attempt_id"],
+                stable_id=raw_stable_id,
+                allow_restored=False,
+            )
+        except ValueError:
+            refusal = "delivery_attempt_changed"
     if drained is not None and drained.interrupted:
         pending_inputs.restore(session_id, drained)
         drained, refusal = None, "stopped"
@@ -3714,7 +3858,7 @@ async def _claim_native_input_resend(
         )
         return None
     _resent_native_inputs[resend_key] = True
-    _active_native_input_resends.setdefault(session_id, set()).add(raw_stable_id)
+    _active_native_input_resends.setdefault(session_id, {})[raw_stable_id] = drained
     return drained
 
 
@@ -3732,7 +3876,8 @@ async def _resend_native_input(
     queues the message under its original stable id, so the web bubble stays.
     If the send cannot start, the original failure is recorded as it would have
     been without the re-send. If the route accepts the send but its terminal
-    cannot start, that route's own failure stands.
+    cannot start, that route's own failure stands. Delayed recovery keeps error
+    detail on the input's item and leaves session labels to current activity.
     """
     resender = _native_input_resender
     log_input_event(
@@ -3753,13 +3898,21 @@ async def _resend_native_input(
             drained.created_by,
             drained.background_titles_enabled,
         )
-        if not getattr(result, "accepted", True):
+        accepted = (
+            result.get("accepted", True)
+            if isinstance(result, Mapping)
+            else getattr(result, "accepted", True)
+        )
+        if not accepted:
             if _native_input_resend_was_stopped(session_id, drained.stable_id):
                 drained.interrupted = True
                 pending_inputs.restore(session_id, drained)
                 return
             raise RuntimeError("native input resend was not accepted")
     except Exception:  # noqa: BLE001 — fall back to the failure the re-send replaced
+        if drained.interrupted:
+            pending_inputs.restore(session_id, drained)
+            return
         _logger.exception(
             "Relay: could not re-send the undelivered native message for session=%s",
             session_id,
@@ -3773,12 +3926,14 @@ async def _resend_native_input(
             conversation_store,
             session_id,
             response_id,
-            drained.stable_id,
+            pending_inputs.delivery_attributes(drained),
             reason_code=TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
         )
         error_item = _error_item_from_sse(dict(failed_event), response_id=response_id)
         if error_item is not None:
-            await _relay_persist_error_once(conversation_store, session_id, error_item)
+            await _relay_persist_error_once(
+                conversation_store, session_id, error_item, publish_item=True
+            )
         raw_response = failed_event.get("response")
         raw_error = (
             raw_response.get("error") if isinstance(raw_response, dict) else None
@@ -3786,11 +3941,8 @@ async def _resend_native_input(
         status_error = (
             ErrorDetail.model_validate(raw_error) if isinstance(raw_error, dict) else None
         )
-        await _persist_session_status_error_labels(
-            session_id,
-            status_error,
-            conversation_store,
-        )
+        if response_id is None or _session_last_response_cache.get(session_id) != response_id:
+            return
         _publish_status(
             session_id,
             "failed",
@@ -3802,7 +3954,7 @@ async def _resend_native_input(
         if drained.stable_id is not None:
             active = _active_native_input_resends.get(session_id)
             if active is not None:
-                active.discard(drained.stable_id)
+                active.pop(drained.stable_id, None)
                 if not active:
                     _active_native_input_resends.pop(session_id, None)
 
@@ -6771,6 +6923,10 @@ def _build_native_terminal_message_event(
     if isinstance(raw_stable_id, str) and re.fullmatch(r"[0-9a-f]{32}", raw_stable_id):
         event["stable_id"] = raw_stable_id
     event.update(input_attributes(input_delivery))
+    if harness == "codex-native":
+        receipt = build_native_input_receipt(data.content, input_delivery)
+        if receipt is not None:
+            event["native_input_receipt"] = receipt
     # Carry the persisted override in-band like the non-native forwards: a
     # runner whose session cache is cold (fresh process, missed init) must
     # not resolve this turn from the spec and evict the override harness.
@@ -8340,6 +8496,77 @@ def _codex_side_chat_runner_error(resp: httpx.Response) -> OmnigentError:
     )
 
 
+async def _record_codex_native_input(
+    session_id: str,
+    body: SessionEventInput,
+    conversation_store: ConversationStore,
+    created_by: str | None,
+    stable_id: str,
+    background_titles_enabled: bool,
+) -> tuple[str | None, str | None, str, bool]:
+    """Register a browser send once, preserving edited drafts under a fresh identity."""
+    item = _build_new_item(body, generate_task_id(), created_by=created_by, adopt_stable_id=True)
+    try:
+        payload = json.dumps(
+            item.data.model_dump(mode="json", by_alias=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, UnicodeEncodeError) as exc:
+        raise OmnigentError("Invalid native input content", code=ErrorCode.INVALID_INPUT) from exc
+    variant_id = uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"omnigent-native-edited-input:{session_id}:{stable_id}:{hashlib.sha256(payload).hexdigest()}",
+    ).hex
+    async with _native_mirror_lock(session_id):
+        for input_id in (stable_id, variant_id):
+            candidate = item.model_copy(update={"stable_id": input_id})
+            persisted = await asyncio.to_thread(conversation_store.get_item, session_id, input_id)
+            if persisted is not None:
+                comparison = persisted
+                if persisted.response_id == PENDING_INPUT_RESPONSE_ID and isinstance(
+                    persisted.data, MessageData
+                ):
+                    comparison = persisted.model_copy(
+                        update={
+                            "data": persisted.data.model_copy(update={"startup_options": None}),
+                        }
+                    )
+                if not _stable_id_reuse_is_exact_retry(comparison, candidate):
+                    continue
+                if persisted.response_id != PENDING_INPUT_RESPONSE_ID:
+                    return None, persisted.id, input_id, False
+            pending_id = pending_inputs.pending_id_for_stable_id(session_id, input_id)
+            pending = pending_inputs.peek(session_id, pending_id) if pending_id else None
+            if pending is not None:
+                queued = ConversationItem(
+                    id=pending.pending_id,
+                    type="message",
+                    response_id=PENDING_INPUT_RESPONSE_ID,
+                    created_at=0,
+                    status="incomplete",
+                    created_by=pending.created_by,
+                    data=MessageData(role="user", content=pending.content, user_authored=True),
+                )
+                if _stable_id_reuse_is_exact_retry(queued, candidate):
+                    return pending.pending_id, None, input_id, False
+                continue
+            assert isinstance(candidate.data, MessageData)
+            pending_id = pending_inputs.record(
+                session_id,
+                candidate.data.content,
+                created_by=created_by,
+                stable_id=input_id,
+                background_titles_enabled=background_titles_enabled,
+            )
+            return pending_id, None, input_id, True
+    raise OmnigentError(
+        "Native input identity already names different content", code=ErrorCode.CONFLICT
+    )
+
+
 async def _dispatch_session_event_to_runner_impl(
     session_id: str,
     conv: Conversation,
@@ -8360,6 +8587,7 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
+    native_input_resend: bool = False,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8531,7 +8759,12 @@ async def _dispatch_session_event_to_runner_impl(
         queues_message = (
             isinstance(content, list) and bool(content) and not opens_side_chat and not is_btw
         )
-        if queues_message and web_stable_id is not None:
+        codex_stable_input = (
+            queues_message
+            and web_stable_id is not None
+            and _native_pane_harness(conv) == "codex-native"
+        )
+        if queues_message and web_stable_id is not None and not codex_stable_input:
             repeated_pending_id = pending_inputs.pending_id_for_stable_id(
                 session_id, web_stable_id
             )
@@ -8558,19 +8791,40 @@ async def _dispatch_session_event_to_runner_impl(
             conversation_store, session_id
         ):
             return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
-        if _native_input_resend_was_stopped(session_id, web_stable_id):
+        if native_input_resend and _native_input_resend_was_stopped(session_id, web_stable_id):
             return _SessionEventDispatchResult(item_id=None, pending_id=None, accepted=False)
-        pending_id: str | None = (
-            pending_inputs.record(
+        if codex_stable_input:
+            assert web_stable_id is not None
+            (
+                pending_id,
+                persisted_id,
+                delivery_stable_id,
+                should_forward,
+            ) = await _record_codex_native_input(
                 session_id,
-                content,
-                created_by=created_by,
-                stable_id=web_stable_id,
-                background_titles_enabled=background_titles_enabled,
+                body,
+                conversation_store,
+                created_by,
+                web_stable_id,
+                background_titles_enabled,
             )
-            if queues_message
-            else None
-        )
+            if not should_forward:
+                return _SessionEventDispatchResult(item_id=persisted_id, pending_id=pending_id)
+            if delivery_stable_id != web_stable_id:
+                body = body.model_copy(
+                    update={"data": {**body.data, "stable_id": delivery_stable_id}}
+                )
+        else:
+            pending_id = None
+            if queues_message:
+                assert isinstance(content, list)
+                pending_id = pending_inputs.record(
+                    session_id,
+                    content,
+                    created_by=created_by,
+                    stable_id=web_stable_id,
+                    background_titles_enabled=background_titles_enabled,
+                )
         input_delivery = (
             pending_inputs.delivery_attributes_for(session_id, pending_id)
             if pending_id is not None
@@ -8699,7 +8953,7 @@ async def _dispatch_session_event_to_runner_impl(
         # dropping the first message). model_override alone is applied only
         # at spawn, so the in-band switch is what makes routing take on an
         # already-running pane.
-        if _native_input_resend_was_stopped(session_id, web_stable_id):
+        if native_input_resend and _native_input_resend_was_stopped(session_id, web_stable_id):
             if pending_id is not None:
                 pending_inputs.mark_interrupted(session_id, [pending_id])
             return _SessionEventDispatchResult(item_id=None, pending_id=pending_id, accepted=False)
@@ -8745,7 +8999,12 @@ async def _dispatch_session_event_to_runner_impl(
             raise
         finally:
             if not forwarded and pending_id is not None:
-                pending_inputs.resolve(session_id, pending_id)
+                attempt = input_delivery.get("delivery_attempt_id")
+                pending_inputs.resolve(
+                    session_id,
+                    pending_id,
+                    delivery_attempt_id=attempt if isinstance(attempt, str) else None,
+                )
         # Emit the routing chip AFTER forwarding the message to the
         # terminal so the live SSE stream delivers the user bubble
         # (echoed back by the CLI) before the chip.
@@ -8880,6 +9139,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
     """Drop local live state for a session now owned by another replica."""
     _session_status_cache.pop(session_id, None)
     _session_active_response_cache.pop(session_id, None)
+    _session_last_response_cache.pop(session_id, None)
     _session_blocked_on_cache.pop(session_id, None)
     session_live_state.forget_live_status(session_id)
 
@@ -9622,7 +9882,14 @@ async def _relay_runner_stream_once(
                         if resend_input is not None:
                             # Nothing reached the terminal: send the message again
                             # instead of recording this turn's failure.
-                            _resending_native_sessions.add(session_id)
+                            raw_failed_response = event.get("response")
+                            failed_response_id = (
+                                raw_failed_response.get("id")
+                                if isinstance(raw_failed_response, dict)
+                                else None
+                            )
+                            if isinstance(failed_response_id, str) and failed_response_id:
+                                _resending_native_sessions[(session_id, failed_response_id)] = True
                             _spawn_native_input_resend(
                                 conversation_store,
                                 session_id,
@@ -9632,18 +9899,19 @@ async def _relay_runner_stream_once(
                             )
                             current_response_id = None
                             continue
-                    elif evt_type == "session.status" and session_id in _resending_native_sessions:
+                    elif evt_type == "session.status":
                         raw_status_error = event.get("error")
-                        if event.get("status") == "running":
-                            _resending_native_sessions.discard(session_id)
-                        elif (
+                        failed_response_id = event.get("response_id")
+                        if (
                             event.get("status") == "failed"
                             and isinstance(raw_status_error, dict)
                             and raw_status_error.get("code")
                             == TERMINAL_EXITED_BEFORE_DELIVERY_CODE
+                            and isinstance(failed_response_id, str)
+                            and _resending_native_sessions.pop(
+                                (session_id, failed_response_id), False
+                            )
                         ):
-                            # The failed turn's own status edge; the re-send replaces it.
-                            _resending_native_sessions.discard(session_id)
                             continue
 
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
@@ -9839,6 +10107,7 @@ async def _relay_runner_stream_once(
                             current_response_id = _rid
                             # Keep the turn identity across transport retries until final status.
                             _session_active_response_cache[session_id] = _rid
+                            _session_last_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
                         failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
@@ -9990,21 +10259,15 @@ async def _relay_runner_stream_once(
                             "response.cancelled": "cancelled",
                         }.get(evt_type, "completed")
 
-                    if evt_type == "response.failed":
+                    if evt_type == "response.failed" and _failed_event_undelivered(event):
                         # The runner could not hand this turn to a native
                         # harness, so the web message it carried was never
                         # mirrored back: commit it ahead of the error item.
-                        raw_input_stable_id = event.get("input_stable_id")
                         await _settle_undelivered_native_input(
                             conversation_store,
                             session_id,
                             current_response_id,
-                            (
-                                raw_input_stable_id
-                                if isinstance(raw_input_stable_id, str)
-                                and _failed_event_undelivered(event)
-                                else None
-                            ),
+                            event,
                             reason_code=_native_input_reason_code(event),
                         )
                     error_item = _error_item_from_sse(

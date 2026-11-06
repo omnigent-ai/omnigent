@@ -60,6 +60,7 @@ from omnigent.host.frames import (
 from omnigent.inner.native_attachments import parse_data_uri
 from omnigent.mcp_selection import mcp_selection_revision, selected_mcp_spec
 from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
@@ -186,6 +187,7 @@ from omnigent.server.routes._sessions.common import (
     _logger,
     _pushed_model_options_cache,
     _session_active_response_cache,
+    _session_last_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -274,6 +276,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _interrupt_native_input_resends,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -887,6 +890,7 @@ class _NativeInputResendContext:
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
+        NATIVE_INPUT_RECEIPT_EVENT,
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
@@ -975,11 +979,11 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
-    register_native_input_resend: Callable[[Callable[..., Awaitable[object]]], None] | None = None,
     clear_session_into_fresh_session: Callable[
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
     | None = None,
+    register_native_input_resend: Callable[[Callable[..., Awaitable[object]]], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router.
 
@@ -1154,7 +1158,7 @@ def register_events_routes(
             event_type = payload.get("type")
             if event_type not in _RUNNER_EVENT_TYPES:
                 return EventAckFrame(batch.id, index, "event type is not allowed on runner tunnel")
-            if event_type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+            if event_type in {_EXTERNAL_CONVERSATION_ITEM_TYPE, NATIVE_INPUT_RECEIPT_EVENT}:
                 data = payload.get("data")
                 if not isinstance(data, dict) or not isinstance(data.get("source_id"), str):
                     return EventAckFrame(batch.id, index, "source_id required for tunnel replay")
@@ -1336,6 +1340,7 @@ def register_events_routes(
             external_transcript=body.type
             in (
                 _EXTERNAL_CONVERSATION_ITEM_TYPE,
+                NATIVE_INPUT_RECEIPT_EVENT,
                 _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             ),
         )
@@ -1514,6 +1519,7 @@ def register_events_routes(
             _RETRY_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
+            NATIVE_INPUT_RECEIPT_EVENT,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
             _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
             _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
@@ -2082,6 +2088,7 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+                _interrupt_native_input_resends(session_id)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -2110,6 +2117,8 @@ def register_events_routes(
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
+            else:
+                _interrupt_native_input_resends(session_id)
             if (
                 stop_delivered
                 and not conv.host_id
@@ -2456,7 +2465,7 @@ def register_events_routes(
                 conversation_store,
             )
             return {"queued": False, "item_id": item_id}
-        if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+        if body.type in {_EXTERNAL_CONVERSATION_ITEM_TYPE, NATIVE_INPUT_RECEIPT_EVENT}:
             item_id = await _persist_external_conversation_item(
                 session_id,
                 conv,
@@ -3867,10 +3876,17 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
+            **(
+                {"native_input_resend": True}
+                if isinstance(request, _NativeInputResendContext)
+                else {}
+            ),
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}
+        if isinstance(request, _NativeInputResendContext):
+            response["accepted"] = dispatch.accepted
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
         # Native-terminal web message: hand back the pending-input id. It
@@ -4261,6 +4277,7 @@ def register_events_routes(
                     failed_blob_count,
                     len(orphaned_blob_keys),
                 )
+        _interrupt_native_input_resends(session_id)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)
@@ -4279,6 +4296,7 @@ def register_events_routes(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        _session_last_response_cache.pop(session_id, None)
         # Same for the extension-pushed model catalog: kept across reloads
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.

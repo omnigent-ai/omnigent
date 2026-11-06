@@ -749,7 +749,10 @@ async def test_create_rejects_invalid_reasoning_effort(
 @pytest.mark.parametrize(
     ("agent_name", "mode"),
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
-    + [(CODEX_NATIVE_AGENT_NAME, mode) for mode in ("default", "read-only")],
+    + [
+        (CODEX_NATIVE_AGENT_NAME, mode)
+        for mode in ("default", "ask-for-approval", "approve-for-me", "read-only")
+    ],
 )
 async def test_create_persists_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str

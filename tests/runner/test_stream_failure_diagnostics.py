@@ -474,7 +474,10 @@ class _ExitBeforeFailureHarnessClient(_ScriptedHarnessClient):
 
 
 @pytest.mark.asyncio
-async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> None:
+@pytest.mark.parametrize("replacement_turn", [False, True])
+async def test_pane_death_before_the_message_is_typed_fails_only_the_turn(
+    replacement_turn: bool,
+) -> None:
     """A Claude pane that dies while the message waits for its prompt reports one failure.
 
     The exit arrives while the turn is live; the turn then ends saying nothing
@@ -488,6 +491,12 @@ async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> N
 
     _session_event_queues_ref.pop(_CONV_ID, None)
     publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
+
+    def terminal_died() -> None:
+        publish["exit"](_required_terminal_exit(session_was_idle=False))
+        if replacement_turn:
+            app.state.turn_bind_epoch[_CONV_ID] += 1
+
     harness_client = _ExitBeforeFailureHarnessClient(
         [
             _sse({"type": "response.created", "response": {"id": "resp_waiting"}}),
@@ -503,7 +512,7 @@ async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> N
                 }
             ),
         ],
-        on_exit=lambda: publish["exit"](_required_terminal_exit(session_was_idle=False)),
+        on_exit=terminal_died,
     )
     spec = AgentSpec(spec_version=1, name="plain-agent")
 
@@ -511,8 +520,9 @@ async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> N
         del agent_id, session_id
         return spec
 
+    manager = _FakeProcessManager(harness_client)
     app = create_runner_app(
-        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        process_manager=manager,  # type: ignore[arg-type]
         spec_resolver=_resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
@@ -527,11 +537,26 @@ async def test_pane_death_before_the_message_is_typed_fails_only_the_turn() -> N
             return statuses
 
         await poll_until_async(read_statuses, timeout_s=2)
+        await poll_until_async(
+            lambda: (
+                not any(
+                    task.get_name()
+                    in {
+                        f"required-terminal-exit:{_CONV_ID}",
+                        f"required-terminal-release:{_CONV_ID}",
+                    }
+                    for task in asyncio.all_tasks()
+                )
+            ),
+            timeout_s=2,
+        )
     finally:
         _session_event_queues_ref.pop(_CONV_ID, None)
 
     assert failed["error"]["code"] == TERMINAL_EXITED_BEFORE_DELIVERY_CODE
     assert [s["error"]["code"] for s in statuses] == [TERMINAL_EXITED_BEFORE_DELIVERY_CODE]
+
+    assert manager.released == ([] if replacement_turn else [_CONV_ID])
 
 
 @pytest.mark.asyncio

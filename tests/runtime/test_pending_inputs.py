@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -389,6 +390,44 @@ def test_resolve_removes_entry_idempotently() -> None:
     # Idempotent — resolving an already-removed id does nothing and returns None.
     assert pending_inputs.resolve("conv_a", drop) is None
     assert [e["pending_id"] for e in pending_inputs.snapshot_for("conv_a")] == [keep]
+
+
+@pytest.mark.parametrize("with_client_id", [False, True])
+def test_resolve_does_not_consume_a_newer_delivery_attempt(
+    with_client_id: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        pending_inputs, "time", SimpleNamespace(time=lambda: 100.0, monotonic=lambda: 100.0)
+    )
+    stable_id = "a" * 32 if with_client_id else None
+    pending_id = pending_inputs.record("conv_a", [_text_block("retry")], stable_id=stable_id)
+    first = pending_inputs.delivery_attributes_for("conv_a", pending_id)
+    drained = pending_inputs.resolve("conv_a", pending_id)
+    assert drained is not None
+    if with_client_id:
+        assert (
+            pending_inputs.record("conv_a", [_text_block("retry")], stable_id=stable_id)
+            == pending_id
+        )
+    else:
+        pending_inputs.restore("conv_a", replace(drained, delivery_attempt_id="b" * 32))
+    retry = pending_inputs.delivery_attributes_for("conv_a", pending_id)
+    assert retry["delivery_attempt_id"] != first["delivery_attempt_id"]
+
+    assert (
+        pending_inputs.resolve(
+            "conv_a", pending_id, delivery_attempt_id=str(first["delivery_attempt_id"])
+        )
+        is None
+    )
+    assert pending_inputs.delivery_attributes_for("conv_a", pending_id) == retry
+    assert (
+        pending_inputs.resolve(
+            "conv_a", pending_id, delivery_attempt_id=str(retry["delivery_attempt_id"])
+        )
+        is not None
+    )
+    assert pending_inputs.snapshot_for("conv_a") == []
 
 
 def test_entries_are_scoped_per_conversation() -> None:
@@ -1156,3 +1195,101 @@ def test_queued_plain_prompt_recorded_after_a_later_one_is_still_lost(
     [skipped] = match.skipped
     assert skipped.content == [_text_block(older)]
     assert match.uncertain == []
+
+
+@pytest.mark.parametrize("restored", [False, True])
+@pytest.mark.parametrize("attempt_present", [False, True])
+@pytest.mark.parametrize("allow_restored", [False, True])
+def test_stable_receipt_fallback_requires_restored_input_without_current_attempt(
+    restored: bool, attempt_present: bool, allow_restored: bool
+) -> None:
+    older = pending_inputs.record("conv", [_text_block("older")])
+    stable_id = "c" * 32
+    own = pending_inputs.record(
+        "conv", [_text_block("own")], stable_id=stable_id, restored=restored
+    )
+    identity = pending_inputs.delivery_attributes_for("conv", own)
+    attempt = "b" * 32 if attempt_present else None
+    if restored:
+        if not allow_restored:
+            with pytest.raises(ValueError):
+                pending_inputs.resolve_delivery_attempt(
+                    "conv", own, attempt, stable_id=stable_id, allow_restored=False
+                )
+            assert pending_inputs.pending_ids("conv") == [older, own]
+        held = pending_inputs.resolve_delivery_attempt(
+            "conv", own, attempt, stable_id=stable_id, hold=True
+        )
+        assert held is not None and held.restored
+        assert held.delivery_attempt_id is None
+        assert pending_inputs.pending_ids("conv") == [older]
+        with pytest.raises(ValueError):
+            pending_inputs.resolve_delivery_attempt("conv", own, attempt, stable_id=stable_id)
+        pending_inputs.restore("conv", held)
+        pending_inputs.record("conv", [_text_block("own")], stable_id=stable_id)
+        promoted = pending_inputs.delivery_attributes_for("conv", own)
+        assert isinstance(promoted["delivery_attempt_id"], str)
+        assert promoted["delivery_attempt_id"] != attempt
+    with pytest.raises(ValueError):
+        pending_inputs.resolve_delivery_attempt(
+            "conv", own, attempt, stable_id=stable_id, allow_restored=allow_restored
+        )
+    assert pending_inputs.pending_ids("conv") == [older, own]
+    if not restored:
+        current = pending_inputs.delivery_attributes_for("conv", own)
+        assert {key: value for key, value in current.items() if key != "pending_age_ms"} == {
+            key: value for key, value in identity.items() if key != "pending_age_ms"
+        }
+
+
+@pytest.mark.parametrize("operation", ["release", "restore"])
+@pytest.mark.parametrize("replacement_held", [False, True])
+def test_old_append_cannot_release_or_unhold_a_replacement_attempt(
+    operation: str, replacement_held: bool
+) -> None:
+    stable_id = "c" * 32
+    own = pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
+    attempt = pending_inputs.delivery_attributes_for("conv", own)["delivery_attempt_id"]
+    old = pending_inputs.resolve_delivery_attempt(
+        "conv", own, attempt, stable_id=stable_id, hold=True
+    )
+    assert old is not None
+    pending_inputs.resolve("conv", own, delivery_attempt_id=attempt)
+    replacement = pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
+    current = pending_inputs.peek("conv", replacement)
+    assert current is not None and current.delivery_attempt_id != attempt
+    held = None
+    if replacement_held:
+        held = pending_inputs.resolve_delivery_attempt(
+            "conv", replacement, current.delivery_attempt_id, stable_id=stable_id, hold=True
+        )
+    getattr(pending_inputs, operation)("conv", old)
+    after = pending_inputs.peek("conv", replacement)
+    assert after is not None
+    assert after.delivery_attempt_id == current.delivery_attempt_id
+    assert after.content == current.content
+    assert pending_inputs.pending_ids("conv") == ([] if replacement_held else [replacement])
+    if held is not None:
+        pending_inputs.restore("conv", held)
+
+
+@pytest.mark.parametrize(
+    "replacement_completed", [False, True], ids=["cancelled", "replacement-completed"]
+)
+def test_held_restore_does_not_resurrect_a_retired_attempt(replacement_completed: bool) -> None:
+    stable_id = "c" * 32
+    own = pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
+    attempt = pending_inputs.delivery_attributes_for("conv", own)["delivery_attempt_id"]
+    held = pending_inputs.resolve_delivery_attempt(
+        "conv", own, attempt, stable_id=stable_id, hold=True
+    )
+    assert held is not None and held.strict_restore
+    pending_inputs.resolve("conv", own, delivery_attempt_id=attempt)
+    if replacement_completed:
+        pending_inputs.record("conv", [_text_block("original")], stable_id=stable_id)
+        replacement = pending_inputs.delivery_attributes_for("conv", own)["delivery_attempt_id"]
+        assert replacement != attempt
+        pending_inputs.resolve("conv", own, delivery_attempt_id=replacement)
+    pending_inputs.restore("conv", held)
+    assert pending_inputs.peek("conv", own) is None
+    assert pending_inputs.pending_ids("conv") == []

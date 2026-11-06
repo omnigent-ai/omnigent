@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
 import re
+import shutil
 import threading
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator
@@ -6010,6 +6012,225 @@ async def test_kiro_native_dispatch_clears_pending_when_injection_fails(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("earlier_pending", "paste_size"),
+    [
+        ("none", "small"),
+        ("source_id", "small"),
+        ("source_less", "small"),
+        # The size boundary doesn't depend on queue order, so one near-limit case is enough.
+        ("none", "near_event_limit"),
+    ],
+)
+async def test_codex_spilled_paste_is_mirrored_as_sent_and_settles_its_own_input(
+    earlier_pending: str, paste_size: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spilled paste keeps its original blocks after its cache is gone."""
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.native_attachments import pasted_text_cache_dir
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 350)
+    # The large paste's submission and its full mirror both fit one event.
+    paste = "r\u00e9sum\u00e9 line\n" * 120 if paste_size == "small" else "x" * 10_450_000
+    original = [
+        {"type": "input_text", "text": paste},
+        {"type": "input_text", "text": "keep this tail inline"},
+    ]
+    first = None
+    if earlier_pending != "none":
+        first = pending_inputs.record(
+            sid,
+            [{"type": "input_text", "text": "summarize the readme"}],
+            created_by="earlier@example.test",
+            stable_id="a" * 32,
+        )
+        pending_inputs.mark_delivery_stage(sid, first, "forward_accepted")
+    second = pending_inputs.record(
+        sid, original, created_by="paste@example.test", stable_id="b" * 32
+    )
+    with native_input_receipt_scope(
+        build_native_input_receipt(original, pending_inputs.delivery_attributes_for(sid, second))
+    ):
+        items = codex_native_executor._content_to_input_items(original, bridge)
+    assert "pasted_text_" in str(items[0]["text"])
+    echoed = {
+        "type": "userMessage",
+        "clientId": items.client_message_id,
+        "content": [dict(item) for item in items],
+    }
+    client = _RecordingClient()
+    source_id = "codex:spilled-paste:0" if earlier_pending != "source_less" else None
+    await forwarder._post_user_message(
+        client, sid, {"turnId": "t1"}, echoed, source_id=source_id, bridge_dir=bridge
+    )
+    [(_url, posted)] = client.posts
+    if source_id is None:
+        posted["data"].pop("source_id", None)
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
+        )
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == original
+        assert second not in pending_inputs.pending_ids(sid)
+        assert pending_inputs.pending_ids(sid) == ([first] if first else [])
+        assert [item.type for item in store.appended_items] == ["message"]
+
+        if paste_size == "small":
+            remaining = pending_inputs.pending_ids(sid)
+            literal = str(items[0]["text"])
+            later = pending_inputs.record(
+                sid,
+                [{"type": "input_text", "text": literal}],
+                created_by="literal@example.test",
+            )
+            literal_client = _RecordingClient()
+            await forwarder._post_user_message(
+                literal_client,
+                sid,
+                {"turnId": "t2"},
+                {
+                    "id": "literal_item",
+                    "type": "userMessage",
+                    "content": [{"type": "text", "text": literal}],
+                },
+                bridge_dir=bridge,
+            )
+            [(_url, literal_posted)] = literal_client.posts
+            literal_posted["data"].pop("source_id", None)
+            literal_id = await _persist_external_conversation_item(
+                sid,
+                conv,
+                SessionEventInput.model_validate(literal_posted),
+                store,  # type: ignore[arg-type]
+            )
+            stored_literal = store.get_item(sid, literal_id)
+            assert stored_literal.created_by == "literal@example.test"
+            assert stored_literal.data.content == [{"type": "input_text", "text": literal}]
+            assert later not in pending_inputs.pending_ids(sid)
+            assert pending_inputs.pending_ids(sid) == remaining
+
+        # The committed message, not the runner's cache, is the durable copy.
+        shutil.rmtree(pasted_text_cache_dir(bridge))
+        durable = ConversationItem.model_validate_json(committed.model_dump_json())
+        assert paste in durable.data.content[0]["text"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upload_name", ["ordinary", "pasted_text"])
+async def test_codex_text_upload_beside_a_spilled_paste_settles_with_the_whole_message(
+    upload_name: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A text upload beside a large paste must not consume an earlier pending input."""
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor
+    from omnigent.inner.native_attachments import attachment_cache_dir, attachment_content_digest
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    pending_inputs.reset_for_tests()
+    store = _ConversationStore()
+    sid = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(sid)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    bridge = tmp_path / "bridge"
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 1_000)
+    csv = "id,value\n" + "1,2\n" * 100
+    paste = "pasted log line\n" * 60
+    filename = (
+        "data.csv"
+        if upload_name == "ordinary"
+        else f"pasted_text_{attachment_content_digest(csv.encode())}.txt"
+    )
+    upload = {"type": "input_file", "file_id": "file_csv", "filename": filename}
+    earlier = pending_inputs.record(
+        sid,
+        [{"type": "input_text", "text": "an earlier ambiguous send"}],
+        created_by="earlier@example.test",
+    )
+    queued = pending_inputs.record(
+        sid, [upload, {"type": "input_text", "text": paste}], created_by="paste@example.test"
+    )
+    resolved_upload = {
+        **upload,
+        "file_data": "data:text/csv;base64," + base64.b64encode(csv.encode()).decode(),
+    }
+    with native_input_receipt_scope(
+        build_native_input_receipt(
+            [upload, {"type": "input_text", "text": paste}],
+            pending_inputs.delivery_attributes_for(sid, queued),
+        )
+    ):
+        items = codex_native_executor._content_to_input_items(
+            [{"type": "input_text", "text": paste}, resolved_upload], bridge
+        )
+    csv_path = attachment_cache_dir(bridge) / filename
+    assert items[0] == {"type": "text", "text": f"[Attached file: {csv_path}]"}
+    assert csv_path.read_text(encoding="utf-8") == csv
+    assert "pasted_text_" in str(items[1]["text"])
+    client = _RecordingClient()
+    await forwarder._post_user_message(
+        client,
+        sid,
+        {"turnId": "t1"},
+        {
+            "type": "userMessage",
+            "clientId": items.client_message_id,
+            "content": [dict(item) for item in items],
+        },
+        bridge_dir=bridge,
+    )
+    [(_url, posted)] = client.posts
+
+    try:
+        item_id = await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput.model_validate(posted),
+            store,  # type: ignore[arg-type]
+        )
+        committed = store.get_item(sid, item_id)
+        assert committed.created_by == "paste@example.test"
+        assert committed.data.content == [
+            upload,
+            {"type": "input_text", "text": paste},
+        ]
+        assert queued not in pending_inputs.pending_ids(sid)
+        assert pending_inputs.pending_ids(sid) == [earlier]
+        assert [item.type for item in store.appended_items] == ["message"]
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_kiro_external_prompt_matches_pending_and_reports_skipped_input() -> None:
     """A failed Kiro prompt must not make the next prompt clear the wrong pending input."""
     from omnigent.runtime import pending_inputs
@@ -8560,10 +8781,12 @@ async def test_relay_fences_cancelled_turn_and_resumes_on_next_turn(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_append", [False, True])
+@pytest.mark.parametrize("with_client_id", [False, True])
 async def test_relay_settles_queued_native_message_on_failed_turn(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fail_first_append: bool,
+    with_client_id: bool,
 ) -> None:
     """A failed native turn commits the queued web message ahead of its error item.
 
@@ -8584,13 +8807,19 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
     sid = "64a784c3aa907d1774f44313546947c6"
     store = _FailOnceStore() if fail_first_append else _ConversationStore()
     content = [{"type": "input_text", "text": "set up the worktree"}]
+    stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d" if with_client_id else None
     pending_id = pending_inputs.record(
         sid,
         content,
         created_by="alice@example.com",
-        stable_id="7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+        stable_id=stable_id,
     )
     original = pending_inputs.delivery_attributes_for(sid, pending_id)
+    identity = {
+        key: value
+        for key, value in original.items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
     caplog.set_level(logging.INFO)
     # A second message the runner is still holding for the next turn.
     queued_next = pending_inputs.record(
@@ -8616,7 +8845,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 {
                     "type": "response.failed",
                     # The runner names the message this turn carried.
-                    "input_stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                    **identity,
                     "response": {
                         "id": "resp_fail",
                         "model": "codex",
@@ -8650,7 +8879,7 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
                 store,  # type: ignore[arg-type]
                 sid,
                 "resp_fail",
-                "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
+                identity,
             )
             assert store.appended_items == []
             assert [e["pending_id"] for e in pending_inputs.snapshot_for(sid)] == [
@@ -8700,12 +8929,14 @@ async def test_relay_settles_queued_native_message_on_failed_turn(
         attrs = record.attributes
         assert attrs["outcome"] == "reported_undelivered"
         assert attrs["pending_id"] == pending_id
-        assert attrs["input_stable_id"] == "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        assert attrs.get("input_stable_id") == stable_id
         assert attrs["delivery_attempt_id"] == original["delivery_attempt_id"]
         assert attrs["input_enqueued_at_ms"] == original["input_enqueued_at_ms"]
         assert attrs["item_id"] == consumed[0]["data"]["item_id"]
         assert attrs["response_id"] == message.response_id == "resp_fail"
-        assert attrs["match_method"] == "input_stable_id"
+        assert attrs["match_method"] == (
+            "input_stable_id" if with_client_id else "delivery_attempt"
+        )
         assert attrs["cause_class"] == "rejected_before_handoff"
         assert attrs["reason_code"] == "databricks_sign_in_pending"
         assert attrs["lifecycle_response_id"] == "resp_fail"
@@ -8728,6 +8959,7 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
         [{"type": "input_text", "text": "set up the worktree"}],
         created_by="alice@example.com",
         stable_id=stable_id,
+        restored=True,
     )
     next_pending = pending_inputs.record(
         session_id,
@@ -8795,8 +9027,9 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refusal", ["exception", "not_accepted"])
+@pytest.mark.parametrize("later_state", [None, "stopped", "running", "completed"])
 async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
-    monkeypatch: pytest.MonkeyPatch, refusal: str
+    monkeypatch: pytest.MonkeyPatch, refusal: str, later_state: str | None
 ) -> None:
     """A re-send that cannot start records the failure the re-send replaced."""
     from types import SimpleNamespace
@@ -8814,11 +9047,32 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
     orchestration_module._session_status_cache.pop(session_id, None)
     stable_id = "9c" * 16
     content = [{"type": "input_text", "text": "run the tests"}]
-    pending_inputs.record(session_id, content, stable_id=stable_id)
+    pending_id = pending_inputs.record(session_id, content, stable_id=stable_id)
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
     attempts: list[str] = []
 
     async def refuse(*args: Any) -> object:
         attempts.append(args[0])
+        if later_state == "stopped":
+            orchestration_module._interrupt_native_input_resends(session_id)
+        elif later_state is not None:
+            frames = [
+                _sse_frame({"type": "response.in_progress", "response": {"id": "resp_later"}}),
+                _sse_frame(
+                    {"type": "session.status", "status": "running", "response_id": "resp_later"}
+                ),
+            ]
+            if later_state == "completed":
+                frames.append(
+                    _sse_frame({"type": "response.completed", "response": {"id": "resp_later"}})
+                )
+                frames.append(
+                    _sse_frame(
+                        {"type": "session.status", "status": "idle", "response_id": "resp_later"}
+                    )
+                )
+            frames.append("data: [DONE]\n\n")
+            await _relay_runner_stream(session_id, _ScriptedStreamingRunnerClient(frames), store)  # type: ignore[arg-type]
         if refusal == "exception":
             raise RuntimeError("runner unavailable")
         return SimpleNamespace(accepted=False)
@@ -8834,13 +9088,21 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
         "undelivered": True,
     }
     store = _ConversationStore()
+    label_writes: list[dict[str, str]] = []
+    original_set_labels = store.set_labels
+
+    def record_labels(target: str, updates: dict[str, str]) -> None:
+        label_writes.append(dict(updates))
+        original_set_labels(target, updates)
+
+    monkeypatch.setattr(store, "set_labels", record_labels)
     client = _ScriptedStreamingRunnerClient(
         [
             _sse_frame({"type": "response.in_progress", "response": {"id": "resp_untyped"}}),
             _sse_frame(
                 {
                     "type": "response.failed",
-                    "input_stable_id": stable_id,
+                    **identity,
                     "response": {"id": "resp_untyped", "error": error},
                 }
             ),
@@ -8849,6 +9111,7 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
                     "type": "session.status",
                     "status": "failed",
                     "error": {"code": error["code"], "message": error["message"]},
+                    "response_id": "resp_untyped",
                 }
             ),
             "data: [DONE]\n\n",
@@ -8859,15 +9122,56 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
         await asyncio.gather(*orchestration_module._resend_tasks)
 
         assert attempts == [session_id]
+        if later_state == "stopped":
+            assert store.appended_items == []
+            assert not [
+                event
+                for event in published
+                if event.get("type") == "session.status" and event.get("status") == "failed"
+            ]
+            assert pending_inputs.snapshot_for(session_id) == []
+            return
         assert [item.type for item in store.appended_items] == ["message", "error"]
         assert store.appended_items[0].data.content == content
         assert store.appended_items[1].data.code == error["code"]
+        assert store.appended_items[1].data.message == error["message"]
+        assert store.appended_items[1].response_id == "resp_untyped"
+        assert not any(error["code"] in updates.values() for updates in label_writes)
+        error_events = [
+            event
+            for event in published
+            if event.get("type") == "response.output_item.done"
+            and event.get("item", {}).get("type") == "error"
+        ]
+        assert len(error_events) == 1
+        assert error_events[0]["item"]["response_id"] == "resp_untyped"
+        attrs = session_stream._sse_safe_attributes(error_events[0])
+        assert attrs["item_type"] == "error"
+        assert attrs.get("item_level", "error") == "error"
+        assert attrs["item_code"] == error["code"]
+        if later_state in {"running", "completed"}:
+            assert (
+                orchestration_module._last_task_error_from_labels(
+                    store._conversations[session_id].labels
+                )
+                is None
+            )
+            assert orchestration_module._session_status_cache.get(session_id) == (
+                "running" if later_state == "running" else "idle"
+            )
+            assert not [
+                event
+                for event in published
+                if event.get("type") == "session.status" and event.get("status") == "failed"
+            ]
+            if later_state == "completed":
+                assert orchestration_module._session_active_response_cache.get(session_id) is None
+            return
         persisted = orchestration_module._last_task_error_from_labels(
             store._conversations[session_id].labels
         )
-        assert persisted is not None
-        assert persisted["code"] == error["code"]
-        assert persisted["message"] == error["message"]
+        # Delayed recovery leaves labels to current activity; its item retains the failure.
+        assert persisted is None
         failed = [
             event
             for event in published
@@ -8883,9 +9187,211 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("undelivered", [True, False])
+@pytest.mark.parametrize("status_response_id", ["resp_recovered", "resp_unrelated"])
+@pytest.mark.parametrize("two_recoveries", [False, True])
+async def test_native_input_resend_suppresses_only_its_own_failed_status(
+    monkeypatch: pytest.MonkeyPatch, status_response_id: str, two_recoveries: bool
+) -> None:
+    """Recovering one input must not hide a different turn's failure."""
+    from types import SimpleNamespace
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    pending_inputs.reset_for_tests()
+    orchestration_module._resent_native_inputs.clear()
+    orchestration_module._session_status_cache.pop(session_id, None)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "run the tests"}], stable_id="a7" * 16
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    error = {
+        "code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+        "message": "terminal died",
+        "undelivered": True,
+    }
+
+    async def resend(*_args: Any) -> object:
+        return SimpleNamespace(accepted=True)
+
+    monkeypatch.setattr(orchestration_module, "_native_input_resender", resend)
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(session_stream, "publish", lambda _session, event: published.append(event))
+    frames = [
+        _sse_frame({"type": "response.in_progress", "response": {"id": "resp_recovered"}}),
+        _sse_frame(
+            {
+                "type": "response.failed",
+                **identity,
+                "response": {"id": "resp_recovered", "error": error},
+            }
+        ),
+    ]
+    if two_recoveries:
+        second_pending = pending_inputs.record(
+            session_id, [{"type": "input_text", "text": "next input"}], stable_id="b7" * 16
+        )
+        second_identity = pending_inputs.delivery_attributes_for(session_id, second_pending)
+        frames.extend(
+            [
+                _sse_frame({"type": "response.in_progress", "response": {"id": "resp_second"}}),
+                _sse_frame(
+                    {
+                        "type": "response.failed",
+                        **second_identity,
+                        "response": {"id": "resp_second", "error": error},
+                    }
+                ),
+            ]
+        )
+    frames.append(
+        _sse_frame(
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": error,
+                "response_id": status_response_id,
+            }
+        )
+    )
+    if two_recoveries:
+        frames.append(
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": error,
+                    "response_id": "resp_second",
+                }
+            )
+        )
+    frames.append("data: [DONE]\n\n")
+    try:
+        await _relay_runner_stream(
+            session_id, _ScriptedStreamingRunnerClient(frames), _ConversationStore()
+        )  # type: ignore[arg-type]
+        await asyncio.gather(*orchestration_module._resend_tasks)
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert len(failed) == (0 if status_response_id == "resp_recovered" else 1)
+    finally:
+        orchestration_module._resent_native_inputs.clear()
+        orchestration_module._active_native_input_resends.clear()
+        orchestration_module._resending_native_sessions.clear()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_case",
+    [
+        "current",
+        "current_runner",
+        "stable_only",
+        "missing_attempt",
+        "wrong_attempt",
+        "wrong_pending",
+        "replaced",
+        "restored",
+        "runner_replaced",
+    ],
+)
+async def test_native_input_resend_claim_requires_the_current_delivery_attempt(
+    monkeypatch: pytest.MonkeyPatch, identity_case: str
+) -> None:
+    """A stale failure cannot reclaim a newer retry of the same web input."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    stable_id = "b3" * 16
+    pending_inputs.reset_for_tests()
+    orchestration_module._resent_native_inputs.clear()
+    orchestration_module._session_status_cache.pop(session_id, None)
+    orchestration_module._interrupt_fenced_sessions.discard(session_id)
+    orchestration_module._intentional_stop_sessions.pop(session_id, None)
+
+    async def resend(*_args: Any) -> object:
+        return object()
+
+    monkeypatch.setattr(orchestration_module, "_native_input_resender", resend)
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "run the tests"}], stable_id=stable_id
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    if identity_case == "stable_only":
+        identity = {"input_stable_id": stable_id}
+    elif identity_case == "missing_attempt":
+        identity.pop("delivery_attempt_id")
+    elif identity_case == "wrong_attempt":
+        identity["delivery_attempt_id"] = "00" * 16
+    elif identity_case == "wrong_pending":
+        identity["pending_id"] = "pending_" + "00" * 16
+    elif identity_case in {"replaced", "restored"}:
+        pending_inputs.resolve(session_id, pending_id)
+        pending_inputs.record(
+            session_id,
+            [{"type": "input_text", "text": "run the tests"}],
+            stable_id=stable_id,
+            restored=identity_case == "restored",
+        )
+    before = pending_inputs.snapshot_for(session_id)
+    event = {
+        "type": "response.failed",
+        **identity,
+        "error": {"code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE, "undelivered": True},
+    }
+    try:
+        store = _ConversationStore()
+        runner_id = None
+        if identity_case in {"current_runner", "runner_replaced"}:
+            store._conversations[session_id].runner_id = "replacement-runner"
+            runner_id = "replacement-runner" if identity_case == "current_runner" else "old-runner"
+        drained = await orchestration_module._claim_native_input_resend(
+            store, session_id, event, runner_id
+        )
+        if identity_case in {"current", "current_runner"}:
+            assert drained is not None and drained.stable_id == stable_id
+            assert pending_inputs.snapshot_for(session_id) == []
+        else:
+            assert drained is None
+            assert pending_inputs.snapshot_for(session_id) == before
+    finally:
+        orchestration_module._resent_native_inputs.clear()
+        orchestration_module._active_native_input_resends.clear()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("undelivered", "identity_case"),
+    [(False, "server_attempt")]
+    + [
+        (True, identity)
+        for identity in (
+            "legacy_stable_id",
+            "live_stable_id",
+            "server_attempt",
+            "pending_only",
+            "attempt_only",
+            "mismatched_attempt",
+            "malformed_attempt",
+            "mismatched_pending",
+            "attempt_only",
+            "mismatched_pending",
+            "mismatched_attempt",
+            "malformed_attempt",
+        )
+    ],
+)
 async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     undelivered: bool,
+    identity_case: str,
 ) -> None:
     """Preserve one real error without a second missing-transcript error on the next turn."""
     from omnigent.inner.executor import ExecutorError, MockExecutor
@@ -8903,13 +9409,38 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
     store = _ConversationStore()
     conv = store.get_conversation(sid)
     assert conv is not None
-    first_stable_id = "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+    first_stable_id = (
+        "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d"
+        if identity_case in {"legacy_stable_id", "live_stable_id"}
+        else None
+    )
     first_content = [{"type": "input_text", "text": "set up the worktree"}]
     next_content = [{"type": "input_text", "text": "then run the tests"}]
     first_pending = pending_inputs.record(
-        sid, first_content, created_by="alice@example.com", stable_id=first_stable_id
+        sid,
+        first_content,
+        created_by="alice@example.com",
+        stable_id=first_stable_id,
+        restored=identity_case == "legacy_stable_id",
     )
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(sid, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    if identity_case in {"legacy_stable_id", "live_stable_id"}:
+        identity = {"input_stable_id": first_stable_id}
+    elif identity_case == "pending_only":
+        identity.pop("delivery_attempt_id")
+    elif identity_case == "attempt_only":
+        identity.pop("pending_id")
+    elif identity_case == "mismatched_attempt":
+        identity["delivery_attempt_id"] = "f" * 32
+    elif identity_case == "malformed_attempt":
+        identity["delivery_attempt_id"] = "not-an-attempt-id"
     next_pending = pending_inputs.record(sid, next_content, created_by="alice@example.com")
+    if identity_case == "mismatched_pending":
+        identity["pending_id"] = next_pending
     # Script only the executor boundary; the real adapter must transport its evidence.
     executor = MockExecutor()
     executor.enqueue_events(
@@ -8936,7 +9467,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
                             "id": "resp_not_ready",
                             "model": "claude",
@@ -8948,7 +9479,7 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
             ]
         )
         await _relay_runner_stream(sid, client, store)  # type: ignore[arg-type]
-        if not undelivered:
+        if not undelivered or identity_case not in {"legacy_stable_id", "server_attempt"}:
             assert [item.type for item in store.appended_items] == ["error"]
             assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == [
                 first_pending,
@@ -8990,17 +9521,21 @@ async def test_uncoded_executor_failure_settles_only_a_proven_undelivered_input(
 
 
 @pytest.mark.asyncio
-async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirror(
+@pytest.mark.parametrize("with_client_id", [False, True])
+@pytest.mark.parametrize(
+    "refusal_case",
+    ["claude_auth", "claude_inactive", "claude_empty", "codex_goal_too_long", "codex_empty"],
+)
+async def test_native_pre_delivery_refusal_is_not_reclassified_as_missing_by_later_mirror(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal_case: str,
+    with_client_id: bool,
 ) -> None:
-    """A pre-delivery refusal must not be reported again as a missing message.
-
-    Claude refuses web ``/login`` before touching the terminal. If that failure
-    is not marked undelivered, the input stays pending. The next successful
-    message's transcript mirror skips it and persists a second error with code
-    ``native_prompt_not_recorded``.
-    """
+    """A refused input must not become a second error when the next echo arrives."""
+    from omnigent.harnesses.claude_native.bridge import REQUEST_SESSION_ID_ENV_VAR
     from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
+    from omnigent.inner.codex_native_executor import CodexNativeExecutor
     from omnigent.runtime import pending_inputs
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
@@ -9015,26 +9550,50 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
     store = _ConversationStore()
     conversation = store.get_conversation(session_id)
     assert conversation is not None
-    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+    first_stable_id = "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a" if with_client_id else None
     later_stable_id = "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"
-    auth_content = [{"type": "input_text", "text": "/login"}]
+    harness = "codex" if refusal_case.startswith("codex") else "claude"
+    if harness == "codex":
+        conversation.labels["omnigent.wrapper"] = "codex-native-ui"
+    if refusal_case == "claude_inactive":
+        (tmp_path / "bridge.json").write_text('{"active_session_id": "conv_new"}')
+        monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_old")
+    text = {
+        "claude_auth": "/login",
+        "claude_inactive": "message from an old tab",
+        "claude_empty": "",
+        "codex_goal_too_long": "/goal " + "x" * 4001,
+        "codex_empty": "",
+    }[refusal_case]
+    refused_content = [{"type": "input_text", "text": text}]
     later_content = [{"type": "input_text", "text": "continue after login"}]
     first_pending = pending_inputs.record(
         session_id,
-        auth_content,
+        refused_content,
         created_by="alice@example.com",
         stable_id=first_stable_id,
     )
-    adapter = ExecutorAdapter(executor_factory=lambda: ClaudeNativeExecutor(tmp_path))
+    identity = {
+        key: value
+        for key, value in pending_inputs.delivery_attributes_for(session_id, first_pending).items()
+        if key in {"input_stable_id", "pending_id", "delivery_attempt_id"}
+    }
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: (
+            CodexNativeExecutor(bridge_dir=tmp_path)
+            if harness == "codex"
+            else ClaudeNativeExecutor(tmp_path)
+        )
+    )
     context = TurnContext(
-        response_id="resp_login_refused",
+        response_id="resp_input_refused",
         event_queue=asyncio.Queue(),
         cancelled=asyncio.Event(),
     )
     try:
         with pytest.raises(RuntimeError) as raised:
             await adapter.run_turn(
-                CreateResponseRequest(model="claude", input=auth_content),
+                CreateResponseRequest(model="claude", input=refused_content),
                 context,
             )
         refusal = adapter._build_error_detail(raised.value).model_dump(exclude_none=True)
@@ -9043,16 +9602,16 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                 _sse_frame(
                     {
                         "type": "response.in_progress",
-                        "response": {"id": "resp_login_refused", "model": "claude"},
+                        "response": {"id": "resp_input_refused", "model": harness},
                     }
                 ),
                 _sse_frame(
                     {
                         "type": "response.failed",
-                        "input_stable_id": first_stable_id,
+                        **identity,
                         "response": {
-                            "id": "resp_login_refused",
-                            "model": "claude",
+                            "id": "resp_input_refused",
+                            "model": harness,
                             "error": refusal,
                         },
                     }
@@ -9077,7 +9636,7 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
                     "item_type": "message",
                     "item_data": {"role": "user", "content": later_content},
                     "response_id": "native_later_turn",
-                    "source_id": "claude:later:0",
+                    "source_id": f"{harness}:later:0",
                 },
             ),
             store,  # type: ignore[arg-type]
@@ -9094,6 +9653,9 @@ async def test_claude_auth_refusal_is_not_reclassified_as_missing_by_later_mirro
             f"settled {later_pending}; persisted={missing_errors}"
         )
         assert refusal.get("undelivered") is True
+        assert [item.type for item in store.appended_items] == ["message", "error", "message"]
+        assert store.appended_items[0].data.content == refused_content
+        assert store.appended_items[-1].data.content == later_content
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
         assert later_pending not in pending_inputs.pending_ids(session_id)
     finally:
@@ -11411,3 +11973,496 @@ async def test_host_write_timeout_preserves_comment_uncertainty(
         )
     else:
         assert response.json()["error"]["code"] == "runner_unavailable"
+
+
+def _encoded_spilled_content(content: object) -> bytes:
+    return json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "owned_multiblock",
+        "owned_upload",
+        "wrong_attempt",
+        "same_source_replay",
+        "distinct_source_replay",
+        "delayed_older_echo",
+        "stable_attempt_replaced",
+        "restored",
+        "restored_resent",
+        "queue_absent",
+        "append_failure",
+        "metadata_missing",
+        "metadata_unknown",
+        "wrong_content",
+        "reprepared_replay",
+        "settled_stable_attempt_replaced",
+        "append_failure_after_cancel",
+        "append_failure_after_replacement_completed",
+    ],
+)
+async def test_spilled_receipt_preserves_exact_queue_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scenario: str
+) -> None:
+    import copy
+
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.inner import codex_native_executor, native_attachments
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    monkeypatch.setattr(pending_inputs, "_pending", {})
+    store = _ConversationStore()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    monkeypatch.setattr(native_attachments, "data_dir", lambda: tmp_path / "data")
+    monkeypatch.setattr(codex_native_executor, "_MAX_INLINE_TEXT_CHARS", 500)
+
+    older_content = [{"type": "input_text", "text": "earlier input still awaiting its echo"}]
+    older_id = pending_inputs.record(session_id, older_content, created_by="older@example.test")
+    pending_inputs.mark_delivery_stage(session_id, older_id, "forward_accepted")
+    older_identity = dict(pending_inputs.delivery_attributes_for(session_id, older_id))
+    original = [
+        {"type": "input_text", "text": "  synthetic résumé line\r\n" * 100},
+        {"type": "input_text", "text": "\tkeep the original tail\n"},
+    ]
+    if scenario == "owned_upload":
+        original.insert(
+            0,
+            {"type": "input_file", "file_id": "file_report", "filename": "report.txt"},
+        )
+    stable_id = (
+        "c" * 32
+        if scenario
+        in {
+            "stable_attempt_replaced",
+            "restored",
+            "restored_resent",
+            "settled_stable_attempt_replaced",
+            "append_failure_after_cancel",
+            "append_failure_after_replacement_completed",
+        }
+        else None
+    )
+    owned_id = pending_inputs.record(
+        session_id, original, created_by="owner@example.test", stable_id=stable_id
+    )
+    owned_identity = dict(pending_inputs.delivery_attributes_for(session_id, owned_id))
+    pending_inputs.mark_delivery_stage(session_id, owned_id, "forward_accepted")
+
+    async def mirror_body(
+        content: list[dict[str, Any]], identity: dict[str, Any], native_item_id: str
+    ) -> SessionEventInput:
+        resolved = copy.deepcopy(content)
+        for block in resolved:
+            if block.get("type") == "input_file":
+                block["file_data"] = (
+                    "data:text/plain;base64,"
+                    + base64.b64encode(b"synthetic upload bytes\n").decode()
+                )
+        with native_input_receipt_scope(build_native_input_receipt(content, identity)):
+            items = codex_native_executor._content_to_input_items(resolved, tmp_path / "bridge")
+        client_id = getattr(items, "client_message_id", identity["delivery_attempt_id"])
+        item = {
+            "type": "userMessage",
+            "id": native_item_id,
+            "clientId": client_id,
+            "content": [dict(entry) for entry in items],
+        }
+        recorder = _RecordingClient()
+        await forwarder._post_user_message(
+            recorder,
+            session_id,
+            {"threadId": "thread_owned", "turnId": "turn_owned"},
+            item,
+            bridge_dir=tmp_path / "bridge",
+        )
+        assert len(recorder.posts) == 1
+        return SessionEventInput.model_validate(recorder.posts[0][1])
+
+    wire_identity = dict(owned_identity)
+    if scenario == "wrong_attempt":
+        wire_identity["delivery_attempt_id"] = "f" * 32
+        assert wire_identity["delivery_attempt_id"] != owned_identity["delivery_attempt_id"]
+    body = await mirror_body(original, wire_identity, "native_owned")
+    if scenario == "metadata_missing":
+        body.data.pop("native_input_receipt")
+    elif scenario == "metadata_unknown":
+        body.data["native_input_receipt"]["version"] = 2
+    elif scenario == "wrong_content":
+        body.data["item_data"]["content"][0]["text"] += " changed"
+    if scenario in {"restored", "restored_resent"}:
+        pending_inputs.resolve(session_id, owned_id)
+        assert (
+            pending_inputs.record(
+                session_id,
+                original,
+                created_by="owner@example.test",
+                stable_id=stable_id,
+                restored=True,
+            )
+            == owned_id
+        )
+        if scenario == "restored_resent":
+            pending_inputs.record(session_id, original, stable_id=stable_id)
+    if scenario == "queue_absent":
+        pending_inputs.resolve(session_id, owned_id)
+    if scenario == "stable_attempt_replaced":
+        pending_inputs.resolve(session_id, owned_id)
+        replacement_id = pending_inputs.record(
+            session_id, original, created_by="owner@example.test", stable_id=stable_id
+        )
+        assert replacement_id == owned_id
+        replacement_identity = pending_inputs.delivery_attributes_for(session_id, replacement_id)
+        assert replacement_identity["delivery_attempt_id"] != owned_identity["delivery_attempt_id"]
+
+    async def persist(event: SessionEventInput) -> tuple[str | None, str | None]:
+        try:
+            item_id = await _persist_external_conversation_item(
+                session_id, conv, event, store, created_by="owner@example.test"
+            )
+            return item_id, None
+        except OmnigentError as error:
+            return None, error.code
+
+    if scenario == "settled_stable_attempt_replaced":
+        pending_inputs.resolve(session_id, owned_id)
+        replacement = pending_inputs.record(
+            session_id, original, created_by="owner@example.test", stable_id=stable_id
+        )
+        replacement_body = await mirror_body(
+            original,
+            dict(pending_inputs.delivery_attributes_for(session_id, replacement)),
+            "newer_native",
+        )
+        replacement_item_id, replacement_error = await persist(replacement_body)
+        assert replacement_error is None
+        before_count = len(store.appended_items)
+        replay_id, replay_error = await persist(body)
+        assert replay_error is None and replay_id == replacement_item_id
+        assert len(store.appended_items) == before_count == 1
+        assert pending_inputs.pending_ids(session_id) == [older_id]
+        assert _encoded_spilled_content(
+            store.appended_items[0].data.content
+        ) == _encoded_spilled_content(original)
+        return
+    if scenario in {"append_failure_after_cancel", "append_failure_after_replacement_completed"}:
+        from omnigent.server.routes._sessions.orchestration import _settle_undelivered_native_input
+
+        original_append = store.append
+        calls = 0
+
+        def retire_before_failure(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                return original_append(*args, **kwargs)
+            pending_inputs.resolve(
+                session_id, owned_id, delivery_attempt_id=owned_identity["delivery_attempt_id"]
+            )
+            if scenario == "append_failure_after_replacement_completed":
+                pending_inputs.record(
+                    session_id, original, stable_id=stable_id, created_by="owner@example.test"
+                )
+                replacement_identity = pending_inputs.delivery_attributes_for(session_id, owned_id)
+                assert (
+                    replacement_identity["delivery_attempt_id"]
+                    != owned_identity["delivery_attempt_id"]
+                )
+                asyncio.run(
+                    _settle_undelivered_native_input(
+                        store,
+                        session_id,
+                        "replacement_response",
+                        replacement_identity,
+                    )
+                )
+                assert pending_inputs.pending_id_for_stable_id(session_id, stable_id) is None
+            raise RuntimeError("retired append failure")
+
+        monkeypatch.setattr(store, "append", retire_before_failure)
+        with pytest.raises(RuntimeError, match="retired append failure"):
+            await persist(body)
+        assert pending_inputs.pending_ids(session_id) == [older_id]
+        assert pending_inputs.pending_id_for_stable_id(session_id, stable_id) is None
+        if scenario == "append_failure_after_replacement_completed":
+            assert len(store.appended_items) == 1
+            assert store.appended_items[0].response_id == "replacement_response"
+        else:
+            assert store.appended_items == []
+        return
+    if scenario == "append_failure":
+        original_append = store.append
+
+        def fail_append(*_args, **_kwargs):
+            raise RuntimeError("injected store failure")
+
+        monkeypatch.setattr(store, "append", fail_append)
+        with pytest.raises(RuntimeError, match="injected store failure"):
+            await persist(body)
+        assert pending_inputs.pending_ids(session_id) == [older_id, owned_id]
+        assert (
+            pending_inputs.delivery_attributes_for(session_id, owned_id)["delivery_attempt_id"]
+            == owned_identity["delivery_attempt_id"]
+        )
+        assert store.appended_items == []
+        monkeypatch.setattr(store, "append", original_append)
+    item_id, error_code = await persist(body)
+    committed = store.get_item(session_id, item_id) if item_id else None
+    observation = {
+        "scenario": scenario,
+        "accepted": item_id is not None,
+        "error_code": error_code,
+        "receipt_carries_server_identity": "native_input_receipt" in body.data,
+        "older_preserved": older_id in pending_inputs.pending_ids(session_id),
+        "original_blocks_exact": (
+            committed is not None
+            and _encoded_spilled_content(committed.data.content)
+            == _encoded_spilled_content(original)
+        ),
+        "owner_attribution_correct": (
+            committed is not None
+            and committed.created_by
+            == (None if scenario == "queue_absent" else "owner@example.test")
+        ),
+        "appended_items": len(store.appended_items),
+        "false_lost_errors": sum(item.type == "error" for item in store.appended_items),
+    }
+
+    if scenario in {
+        "wrong_attempt",
+        "stable_attempt_replaced",
+        "restored_resent",
+        "metadata_missing",
+        "metadata_unknown",
+        "wrong_content",
+    }:
+        expected = {
+            "rejected": True,
+            "queue_unchanged": True,
+            "no_append": True,
+        }
+        actual = {
+            "rejected": item_id is None,
+            "queue_unchanged": pending_inputs.pending_ids(session_id) == [older_id, owned_id],
+            "no_append": store.appended_items == [],
+        }
+    elif scenario in {"same_source_replay", "distinct_source_replay", "reprepared_replay"}:
+        assert committed is not None
+        newer_id = pending_inputs.record(session_id, original, created_by="newer@example.test")
+        before_queue = pending_inputs.pending_ids(session_id)
+        before_count = len(store.appended_items)
+        replay = copy.deepcopy(body)
+        if scenario == "distinct_source_replay":
+            replay.data["source_id"] = str(body.data["source_id"]) + ":resume-alias"
+        if scenario == "reprepared_replay":
+            replay = await mirror_body(original, owned_identity, "new_native_alias")
+            assert (
+                replay.data["native_input_receipt"]["receipt_id"]
+                != body.data["native_input_receipt"]["receipt_id"]
+            )
+        replay_id, replay_error = await persist(replay)
+        observation["replay_accepted"] = replay_id is not None
+        observation["replay_error"] = replay_error
+        expected = {
+            "newer_preserved": True,
+            "queue_unchanged": True,
+            "no_extra_append": True,
+        }
+        actual = {
+            "newer_preserved": newer_id in pending_inputs.pending_ids(session_id),
+            "queue_unchanged": pending_inputs.pending_ids(session_id) == before_queue,
+            "no_extra_append": len(store.appended_items) == before_count,
+        }
+    elif scenario == "delayed_older_echo":
+        delayed_body = await mirror_body(older_content, older_identity, "native_older")
+        delayed_id, delayed_error = await persist(delayed_body)
+        older_items = [
+            item
+            for item in store.appended_items
+            if item.type == "message"
+            and _encoded_spilled_content(item.data.content)
+            == _encoded_spilled_content(older_content)
+        ]
+        observation["delayed_older_accepted"] = delayed_id is not None
+        observation["delayed_older_error"] = delayed_error
+        expected = {
+            "older_was_not_prematurely_settled": True,
+            "older_recorded_once": True,
+            "no_false_lost_error": True,
+        }
+        actual = {
+            "older_was_not_prematurely_settled": observation["older_preserved"],
+            "older_recorded_once": len(older_items) == 1,
+            "no_false_lost_error": not any(item.type == "error" for item in store.appended_items),
+        }
+    else:
+        expected = {
+            "older_preserved": True,
+            "original_blocks_exact": True,
+            "owner_attribution_correct": True,
+            "only_owned_input_settled": True,
+            "no_false_lost_error": True,
+        }
+        actual = {
+            "older_preserved": observation["older_preserved"],
+            "original_blocks_exact": observation["original_blocks_exact"],
+            "owner_attribution_correct": observation["owner_attribution_correct"],
+            "only_owned_input_settled": pending_inputs.pending_ids(session_id) == [older_id],
+            "no_false_lost_error": observation["false_lost_errors"] == 0,
+        }
+    observation["assertions"] = actual
+    assert actual == expected, observation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("startup_placeholder", [False, True])
+@pytest.mark.parametrize("stage", ["queued", "settled"])
+@pytest.mark.parametrize("reuse", ["retry", "edited", "other_author"])
+async def test_codex_browser_stable_id_survives_exact_receipt_settlement(
+    monkeypatch: pytest.MonkeyPatch, stage: str, reuse: str, startup_placeholder: bool
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import (
+        _dispatch_session_event_to_runner,
+        _persist_external_conversation_item,
+    )
+
+    monkeypatch.setattr(pending_inputs, "_pending", {})
+    store = _ConversationStore()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    conv.labels["omnigent.wrapper"] = "codex-native-ui"
+    runner = _FakeRunnerClient()
+    stable_id = "c" * 32
+    original = [
+        {"type": "input_text", "text": "résumé\r\n" * 100},
+        {"type": "input_text", "text": "tail"},
+    ]
+    older = pending_inputs.record(session_id, [{"type": "input_text", "text": "older"}])
+
+    async def send(content, author="owner@example.test"):
+        return await _dispatch_session_event_to_runner(
+            session_id,
+            conv,
+            SessionEventInput(
+                type="message",
+                data={
+                    "role": "user",
+                    "content": content,
+                    "stable_id": stable_id,
+                },
+            ),
+            store,
+            runner,
+            agent_name="codex-native-ui",
+            created_by=author,
+            file_store=None,
+            artifact_store=None,
+        )
+
+    async def settle(result, content, letter):
+        identity = {
+            key: value
+            for key, value in pending_inputs.delivery_attributes_for(
+                session_id, result.pending_id
+            ).items()
+            if key in {"pending_id", "delivery_attempt_id", "input_stable_id"}
+        }
+        return await _persist_external_conversation_item(
+            session_id,
+            conv,
+            SessionEventInput(
+                type="external_native_input_receipt",
+                data={
+                    "item_type": "message",
+                    "item_data": {"role": "user", "content": content},
+                    "native_input_receipt": {
+                        "version": 1,
+                        "identity": identity,
+                        "receipt_id": "omnigent-paste-" + letter * 32 + "-" + letter * 64,
+                    },
+                },
+            ),
+            store,
+        )
+
+    def deliveries():
+        return [body for path, body in runner.post_json_calls if path.endswith("/events")]
+
+    if startup_placeholder:
+        from omnigent.entities import MessageData
+        from omnigent.entities.conversation import StartupInputOptions
+        from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
+
+        store.persisted_by_stable_id[stable_id] = ConversationItem(
+            id=stable_id,
+            type="message",
+            response_id=PENDING_INPUT_RESPONSE_ID,
+            created_at=0,
+            created_by="owner@example.test",
+            status="incomplete",
+            data=MessageData(
+                role="user",
+                content=original,
+                user_authored=True,
+                startup_options=StartupInputOptions(background_titles_enabled=True),
+            ),
+        )
+        with pytest.raises(OmnigentError) as caught:
+            await send(original, "other@example.test")
+        assert caught.value.code == ErrorCode.CONFLICT
+        assert deliveries() == []
+    initial = await send(original)
+    original_identity = pending_inputs.delivery_attributes_for(session_id, initial.pending_id)
+    if stage == "settled":
+        await settle(initial, original, "a")
+        assert store.get_item(session_id, stable_id) is not None
+        assert store.get_item(session_id, stable_id).data.content == original
+    if reuse == "other_author":
+        with pytest.raises(OmnigentError) as caught:
+            await send(original, "other@example.test")
+        assert caught.value.code == ErrorCode.CONFLICT
+        assert len(deliveries()) == 1
+        return
+    content = (
+        [*original[:-1], {"type": "input_text", "text": "edited tail"}]
+        if reuse == "edited"
+        else original
+    )
+    repeated = await send(content)
+    if reuse == "retry":
+        assert len(deliveries()) == 1
+        assert repeated.pending_id == (initial.pending_id if stage == "queued" else None)
+        assert repeated.item_id == (
+            None if stage == "queued" else store.get_item(session_id, stable_id).id
+        )
+        if stage == "queued":
+            await settle(initial, original, "a")
+        assert pending_inputs.pending_ids(session_id) == [older]
+        return
+    assert len(deliveries()) == 2
+    assert repeated.pending_id != initial.pending_id
+    edited_identity = pending_inputs.delivery_attributes_for(session_id, repeated.pending_id)
+    assert edited_identity["delivery_attempt_id"] != original_identity["delivery_attempt_id"]
+    assert edited_identity["input_stable_id"] != stable_id
+    if stage == "queued":
+        await settle(initial, original, "a")
+    edited_id = await settle(repeated, content, "b")
+    assert store.get_item(session_id, stable_id).data.content == original
+    assert store.get_item(session_id, edited_id).data.content == content
+    assert len(store.appended_items) == 2
+    again = await send(content)
+    assert again.item_id == edited_id and again.pending_id is None
+    assert len(deliveries()) == 2
+    assert pending_inputs.pending_ids(session_id) == [older]

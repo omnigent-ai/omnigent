@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -68,6 +69,11 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.native_attachments import (
+    SpilledTextUnavailable,
+    restore_spilled_text,
+    spilled_input_receipt,
+)
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -85,6 +91,7 @@ from omnigent.native._native_supersession import (
     post_clear_supersession,
     unfiled_clear_replacement_body,
 )
+from omnigent.native.input_receipt import NATIVE_INPUT_RECEIPT_EVENT
 from omnigent.process_logging import log_info_once
 from omnigent.runner.launch_failure import is_codex_provider_auth_failure
 from omnigent.runtime.tool_output import cap_tool_output
@@ -513,6 +520,9 @@ class _CodexForwarderState:
     :param codex_client: Connected Codex app-server client. Set by
         ``supervise_forwarder`` so child backfill can issue
         ``thread/resume`` requests.
+    :param bridge_dir: The session's bridge directory. Set by
+        ``supervise_forwarder`` so a recovered user message can restore a
+        spilled paste from the session's attachment cache.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
     :param pending_child_threads: Codex child thread ids announced by
@@ -637,6 +647,7 @@ class _CodexForwarderState:
     posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    bridge_dir: Path | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
@@ -2519,6 +2530,7 @@ async def supervise_forwarder(
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            bridge_dir=bridge_dir,
             child_usage_baseline_dir=bridge_dir,
         )
         # Released when the live event stream shows the thread became
@@ -6387,7 +6399,9 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client, session_id, params, item, source_id=source_id, bridge_dir=bridge_dir
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -7334,6 +7348,7 @@ async def _ensure_user_message_posted(
         recovered_params,
         user_item,
         source_id=source_id,
+        bridge_dir=forwarder_state.bridge_dir,
     ):
         forwarder_state.note_user_message_posted(turn_id)
 
@@ -7376,6 +7391,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -7385,9 +7401,31 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
+    :param bridge_dir: The session's bridge directory, whose attachment cache
+        holds any paste the executor moved out of the message.
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
+    receipt_context: dict[str, Any] | None = None
+    client_message_id = item.get("clientId")
+    if isinstance(client_message_id, str) and re.fullmatch(
+        r"omnigent-paste-[0-9a-f]{32}-[0-9a-f]{64}", client_message_id
+    ):
+        if bridge_dir is None:
+            raise SpilledTextUnavailable("Generated input receipt has no owning bridge")
+        receipt_context = await asyncio.to_thread(
+            spilled_input_receipt, text, bridge_dir, client_message_id
+        )
+        if receipt_context is None:
+            raise SpilledTextUnavailable("Generated input receipt is unavailable or changed")
+    elif bridge_dir is not None:
+        client_message_id = item.get("clientId")
+        text = await asyncio.to_thread(
+            _with_spilled_pastes_restored,
+            text,
+            bridge_dir,
+            client_message_id if isinstance(client_message_id, str) else None,
+        )
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -7400,25 +7438,45 @@ async def _post_user_message(
         return False
     # Text-only / text+image post the text; image-only posts empty content and
     # relies on the server-side pending fold to supply the image block.
-    content: list[_JsonObject] = [{"type": "input_text", "text": text}] if text else []
+    content: list[_JsonObject] = (
+        receipt_context["content"]
+        if receipt_context is not None
+        else [{"type": "input_text", "text": text}]
+        if text
+        else []
+    )
     item_data: _JsonObject = {
         "role": "user",
         "content": content,
     }
-    if _is_codex_skill_wrapper(text):
+    if receipt_context is None and _is_codex_skill_wrapper(text):
         item_data["is_meta"] = True
         _logger.debug(
             "Marked Codex skill wrapper as meta for session=%s source_id=%s",
             session_id,
             _source_id(params, item),
         )
+    receipt = (
+        {
+            "version": receipt_context["version"],
+            "identity": receipt_context["identity"],
+            "receipt_id": client_message_id,
+        }
+        if receipt_context is not None
+        else None
+    )
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=(
+            f"codex-spill:{client_message_id}"
+            if receipt is not None
+            else source_id or _source_id(params, item)
+        ),
+        native_input_receipt=receipt,
     )
 
 
@@ -7770,12 +7828,12 @@ def _codex_tool_call_from_item(item: _JsonObject) -> _CodexToolCall | None:
 # guidance so a top-level session degrades with direction instead of an opaque
 # failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
-# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+# Access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
 _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
-    'shell commands here, start a new Codex session with the "Full access" '
+    'shell commands here, start a new Codex session with the "Full Access" '
     "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )
@@ -8050,6 +8108,7 @@ async def _post_external_item(
     response_id: str,
     message_id: str | None = None,
     source_id: str | None = None,
+    native_input_receipt: _JsonObject | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8076,12 +8135,19 @@ async def _post_external_item(
         data["message_id"] = message_id
     if source_id is not None:
         data["source_id"] = _bounded_source_id(source_id)
+    if native_input_receipt is not None:
+        data["native_input_receipt"] = native_input_receipt
+    event_type = (
+        NATIVE_INPUT_RECEIPT_EVENT
+        if native_input_receipt is not None
+        else "external_conversation_item"
+    )
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(
             client,
             session_id,
-            event_type="external_conversation_item",
+            event_type=event_type,
             data=data,
             max_attempts=None if source_id is not None else _POST_MAX_ATTEMPTS,
             timeout=_DURABLE_ITEM_POST_TIMEOUT_SECONDS if source_id is not None else None,
@@ -8095,7 +8161,7 @@ async def _post_external_item(
             append_dead_letter(
                 dl_dir,
                 session_id=session_id,
-                event_type="external_conversation_item",
+                event_type=event_type,
                 payload=data,
                 reason="delivery interrupted before acknowledgement",
                 delivered_ambiguous=True,
@@ -8912,7 +8978,9 @@ async def _conversation_item_delivery_scope(session_id: str) -> AsyncIterator[No
 
 
 # Durable event types worth dead-lettering (not ephemeral deltas).
-_DEAD_LETTER_EVENT_TYPES = frozenset({"external_conversation_item", "external_session_usage"})
+_DEAD_LETTER_EVENT_TYPES = frozenset(
+    {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT, "external_session_usage"}
+)
 
 
 def _reset_forward_health() -> None:
@@ -9209,7 +9277,7 @@ async def _post_session_event_inner(
             # retried. Completed Codex items carry a stable source id and are
             # safe to retry until the relay recovers.
             if (
-                event_type == "external_conversation_item"
+                event_type in {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT}
                 and not idempotent
                 and post_may_have_been_delivered(exc)
             ):
@@ -9303,7 +9371,7 @@ def _session_event_is_idempotent(event_type: str, data: _JsonObject) -> bool:
     """Return whether retrying this event cannot append a duplicate item."""
     source_id = data.get("source_id")
     return (
-        event_type == "external_conversation_item"
+        event_type in {"external_conversation_item", NATIVE_INPUT_RECEIPT_EVENT}
         and isinstance(source_id, str)
         and bool(source_id.strip())
     )
@@ -9756,6 +9824,28 @@ def _delta_recovery_status_edge(
         turn_id=turn_id,
         source="delta:recovered",
     )
+
+
+def _with_spilled_pastes_restored(
+    text: str, bridge_dir: Path, client_message_id: str | None = None
+) -> str:
+    """
+    Mirror the paste the person sent in place of the file reference Codex saw.
+
+    The server then records and matches the message as sent, whatever its
+    version. The executor refuses a paste whose restored message could not fit
+    one event, so the reference survives only if that check was bypassed.
+
+    :param text: User message text as Codex echoed it.
+    :param bridge_dir: The session's bridge directory.
+    :param client_message_id: Codex's echoed ``clientId``; only a recorded receipt restores pastes.
+    :returns: The text to mirror.
+    """
+    restored = restore_spilled_text(text, bridge_dir, client_message_id)
+    if restored is None:
+        _logger.warning("Codex user message too large to mirror with its paste restored")
+        return text
+    return restored
 
 
 def _user_message_text(item: _JsonObject) -> str:

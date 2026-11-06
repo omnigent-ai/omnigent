@@ -1380,7 +1380,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:
+    except Exception:  # a malformed acp: block must never break startup
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -4226,7 +4226,7 @@ def create_app(
             return own
         try:
             return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
-        except Exception:
+        except Exception:  # an unreadable ancestor leaves the host unknown
             _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
             return None
 
@@ -4272,7 +4272,7 @@ def create_app(
                 ):
                     continue
                 await _launch_runner_on_host(conv, conversation_store, host_registry, host_conn)
-            except Exception:
+            except Exception:  # a failed relaunch keeps the interruption visible
                 _logger.warning(
                     "Relaunch after host return failed for session=%s", conv.id, exc_info=True
                 )

@@ -4,6 +4,7 @@ import {
   applyMacElectronShellAttribute,
   checkDbcert,
   closeDesktopWindow,
+  confirmDesktopQuit,
   onDesktopCommand,
   setDesktopCommandState,
   supportsDesktopCommands,
@@ -18,6 +19,7 @@ import {
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
+  resetOnboardingRunnerForTests,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
@@ -27,6 +29,7 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   switchServer,
+  takeOnboardingRunner,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -214,6 +217,59 @@ describe("supportsArcaConnect", () => {
       window as unknown as { omnigentDesktop: Record<string, unknown> }
     ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
     expect(supportsArcaConnect()).toBe(true);
+  });
+});
+
+describe("takeOnboardingRunner", () => {
+  const shellTake = vi.fn<() => Promise<"local" | "remote" | null>>();
+
+  beforeEach(() => {
+    resetOnboardingRunnerForTests();
+    // Like the shell, answer once and then report nothing.
+    shellTake.mockReset().mockResolvedValueOnce("remote").mockResolvedValue(null);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      takeOnboardingRunner: () => shellTake(),
+    };
+  });
+
+  it("shares one shell read between consumers", async () => {
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("shares a read still in flight", async () => {
+    let answer: (runner: "local" | "remote" | null) => void = () => {};
+    shellTake.mockReset().mockReturnValueOnce(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const picker = takeOnboardingRunner("hostPicker");
+    const review = takeOnboardingRunner("importReview");
+    answer("local");
+    expect(await Promise.all([picker, review])).toEqual(["local", "local"]);
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("hands each consumer the runner only once per page load", async () => {
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBeNull();
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
+
+  it("resolves null when the shell read fails or there's no shell", async () => {
+    shellTake.mockReset().mockRejectedValue(new Error("ipc down"));
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    // An older shell without the handoff.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    setElectron(false);
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
   });
 });
 
@@ -706,6 +762,7 @@ describe("desktop command bridge", () => {
     command: string;
     browserViewId: string | null;
     closingQuits?: boolean;
+    quitDetail?: string | null;
   }) => void;
 
   function installDesktop(api: Record<string, unknown>): void {
@@ -744,9 +801,25 @@ describe("desktop command bridge", () => {
     listener({ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true });
     listener({ command: "open-everything", browserViewId: null });
     listener({ command: "new-terminal", browserViewId: null });
+    listener({ command: "quit", browserViewId: null, quitDetail: "The local server will stop." });
     expect(received.mock.calls).toEqual([
-      [{ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true }],
-      [{ command: "new-terminal", browserViewId: null, closingQuits: false }],
+      [
+        {
+          command: "close",
+          browserViewId: "browser-tab:s:t",
+          closingQuits: true,
+          quitDetail: null,
+        },
+      ],
+      [{ command: "new-terminal", browserViewId: null, closingQuits: false, quitDetail: null }],
+      [
+        {
+          command: "quit",
+          browserViewId: null,
+          closingQuits: false,
+          quitDetail: "The local server will stop.",
+        },
+      ],
     ]);
     stop();
     expect(unsubscribe).toHaveBeenCalled();
@@ -758,6 +831,17 @@ describe("desktop command bridge", () => {
       setDesktopCommandState({ commands: [], sessionPinned: false, sessionArchived: false }),
     ).not.toThrow();
     await expect(closeDesktopWindow()).resolves.toBe(false);
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
+  });
+
+  it("confirms a quit with the Don't ask again choice", async () => {
+    const confirmQuit = vi.fn().mockResolvedValue(true);
+    installDesktop({ confirmQuit });
+    await expect(confirmDesktopQuit(true)).resolves.toBe(true);
+    expect(confirmQuit).toHaveBeenCalledWith({ dontAskAgain: true });
+
+    confirmQuit.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
   });
 
   it("reports state and asks the shell to close the window", async () => {

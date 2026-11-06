@@ -2247,6 +2247,34 @@ def test_update_sets_and_clears_the_continued_session(
     assert back_to_new is not None and back_to_new.session_mode == "new"
 
 
+def test_release_session_clears_only_the_session_it_was_given(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_release", session_mode="continue")
+    assert store.adopt_session(task.id, _uid("c1"), snapshot=task) == "adopted"
+    before = store.get(task.id)
+
+    # Another run replaced it, or the caller was looking at a stale id: no change.
+    assert store.release_session(task.id, _uid("other")) is False
+    assert store.get(task.id).session_id == _uid("c1")
+
+    assert store.release_session(task.id, _uid("c1")) is True
+    after = store.get(task.id)
+    assert after.session_id is None
+    # Housekeeping, not an edit: a firing compares updated_at with its own read.
+    assert after.updated_at == before.updated_at
+    assert store.release_session(task.id, _uid("c1")) is False
+    assert store.release_session(_uid("missing"), _uid("c1")) is False
+
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
+
+    # A deleted task releases nothing.
+    store.delete(task.id)
+    assert store.release_session(task.id, _uid("c2")) is False
+
+
 def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:

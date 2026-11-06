@@ -332,6 +332,54 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         await runner.aclose()
 
 
+@pytest.mark.parametrize("restored_before_failure", [False, True])
+async def test_undelivered_native_failure_settles_saved_input_after_restart(
+    startup_env: _Env,
+    monkeypatch: pytest.MonkeyPatch,
+    restored_before_failure: bool,
+) -> None:
+    """A saved input keeps its failure identity after receipt matching is rebuilt."""
+    from omnigent.server.routes._sessions.orchestration import (
+        _settle_undelivered_native_input,
+    )
+    from omnigent.server.startup_inputs import restore_pending_inputs
+
+    env = startup_env
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+        entry = _bind(env, session_id)
+        await env.app.state.startup_inputs._deliver(env.app, session_id, entry)
+        assert env.conv_store.list_pending_inputs(session_id)[0].status == "incomplete"
+        pending_id = pending_inputs.pending_id_for_stable_id(session_id, entry.id)
+        assert pending_id is not None
+        original_identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+        assert original_identity["delivery_attempt_id"]
+
+        pending_inputs.reset_for_tests()
+        if restored_before_failure:
+            await restore_pending_inputs(env.conv_store, session_id)
+        await _settle_undelivered_native_input(
+            env.conv_store,
+            session_id,
+            "resp_startup_refused",
+            original_identity,
+            reason_code="databricks_sign_in_pending",
+        )
+
+        assert env.conv_store.list_pending_inputs(session_id) == []
+        assert pending_inputs.snapshot_for(session_id) == []
+        settled = env.conv_store.get_item(session_id, entry.id)
+        assert settled is not None
+        assert settled.response_id == "resp_startup_refused"
+        assert settled.data.model_dump()["content"] == _INPUT["data"]["content"]
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+    finally:
+        pending_inputs.reset_for_tests()
+        await runner.aclose()
+
+
 @pytest.mark.parametrize("bundled", [False, True])
 async def test_multipart_input_keeps_attachment_in_session_namespace(
     startup_env: _Env, db_uri: str, monkeypatch: pytest.MonkeyPatch, bundled: bool
@@ -625,8 +673,9 @@ async def test_accepts_followups_before_provisioning_and_delivers_in_order(
     assert env.conv_store.list_pending_inputs(session_id) == []
 
 
+@pytest.mark.parametrize("exact_receipt", [False, True])
 async def test_native_mirror_retry_does_not_consume_next_identical_input(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, exact_receipt: bool
 ) -> None:
     env = startup_env
     session_id = await _create(env, name=CODEX_NATIVE_CODING_AGENT.agent_name)
@@ -637,16 +686,36 @@ async def test_native_mirror_retry_does_not_consume_next_identical_input(
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
 
+    receipt_contexts = {}
+
     async def echo(source: str):
+        receipt_metadata = {}
+        if exact_receipt:
+            if source not in receipt_contexts:
+                message = [event for event in forwarded if event.get("type") == "message"][-1]
+                receipt_contexts[source] = message["native_input_receipt"]
+            receipt_metadata = {
+                "native_input_receipt": {
+                    "version": 1,
+                    "identity": receipt_contexts[source]["identity"],
+                    "receipt_id": "omnigent-paste-"
+                    + ("a" if source == "native-first" else "b") * 32
+                    + "-"
+                    + "c" * 64,
+                }
+            }
         result = await env.client.post(
             f"/v1/sessions/{session_id}/events",
             json={
-                "type": "external_conversation_item",
+                "type": "external_native_input_receipt"
+                if exact_receipt
+                else "external_conversation_item",
                 "data": {
                     "item_type": "message",
                     "item_data": _INPUT["data"],
                     "response_id": source,
                     "source_id": source,
+                    **receipt_metadata,
                 },
             },
         )

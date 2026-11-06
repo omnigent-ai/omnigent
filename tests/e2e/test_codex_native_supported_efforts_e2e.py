@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -29,7 +30,10 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.harnesses.codex_native.app_server import client_for_transport
+from omnigent.harnesses.codex_native.app_server import (
+    CodexAppServerResponseError,
+    client_for_transport,
+)
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
 from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
@@ -140,6 +144,200 @@ def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -
                 pass
 
 
+@pytest.mark.parametrize("input_kind", ["paste", "text-upload", "aggregate"])
+def test_oversized_input_survives_real_codex_transport(
+    codex_effort_rig: _Rig, input_kind: str
+) -> None:
+    """Real Codex either echoes a spill receipt or refuses before creating a native turn."""
+    rig = codex_effort_rig
+    version_match = re.search(r"\b(\d+)\.(\d+)\.(\d+)", rig.codex_version)
+    assert version_match is not None, rig.codex_version
+    supports_spill_receipts = tuple(int(part) for part in version_match.groups()) >= (0, 154, 0)
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        end_marker = f"END_OF_LARGE_INPUT_{uuid.uuid4().hex}"
+        text = (
+            "synthetic input line\n" * (230_000 if input_kind == "paste" else 70_000) + end_marker
+        )
+        stable_id = uuid.uuid4().hex
+        if input_kind == "text-upload":
+            uploaded = _json(
+                rig.api.post(
+                    f"/v1/sessions/{session.id}/resources/files",
+                    files={"file": ("large-input.txt", text.encode(), "text/plain")},
+                )
+            )
+            original_content = [
+                {"type": "input_file", "filename": "large-input.txt", "file_id": uploaded["id"]}
+            ]
+        elif input_kind == "aggregate":
+            original_content = [
+                {"type": "input_text", "text": chunk} for chunk in (text[:600_000], text[600_000:])
+            ]
+        else:
+            original_content = [{"type": "input_text", "text": text}]
+        _json(rig.model.post("/mock/reset"))
+
+        response = rig.api.post(
+            f"/v1/sessions/{session.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "stable_id": stable_id,
+                    "content": original_content,
+                },
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            user_matches = [
+                item
+                for item in items
+                if item.get("role") == "user" and item.get("content") == original_content
+            ]
+            refusals = [
+                item
+                for item in items
+                if item.get("type") == "error" and item.get("code") == "input_too_large"
+            ]
+            state = read_bridge_state(session.bridge)
+            if (
+                user_matches
+                and state is not None
+                and not snapshot.get("pending_inputs")
+                and (supports_spill_receipts or refusals)
+            ):
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                f"Oversized input did not complete.\n{session.tmux('capture-pane', '-p')}\n"
+                f"{rig.stack.log_tail()}"
+            )
+
+        async def read_thread() -> dict[str, Any]:
+            assert state is not None
+            client = client_for_transport(state.socket_path, client_name="spill-e2e-observer")
+            await client.connect()
+            try:
+                assert client.supports_user_message_ids is supports_spill_receipts
+                result = await client.request(
+                    "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                )
+                payload = result.get("result")
+                assert isinstance(payload, dict)
+                thread = payload.get("thread")
+                assert isinstance(thread, dict)
+                return thread
+            finally:
+                await client.close()
+
+        assert len(user_matches) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot["pending_inputs"] == []
+        assert user_matches[0]["id"] == stable_id
+        retried = _json(
+            rig.api.post(
+                f"/v1/sessions/{session.id}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "stable_id": stable_id,
+                        "content": original_content,
+                    },
+                },
+            )
+        )
+        assert retried["item_id"] == stable_id
+        assert _json(rig.api.get(f"/v1/sessions/{session.id}"))["pending_inputs"] == []
+        if not supports_spill_receipts:
+            assert len(refusals) == 1
+            assert user_matches[0]["id"] == stable_id
+            assert refusals[0]["message"] == (
+                "This Codex version cannot preserve a large paste in history; "
+                "this message was not sent."
+            )
+            assert (
+                refusals[0]["remediation"]
+                == "Upgrade Codex to 0.154.0 or later and restart this native session after "
+                "current work finishes."
+            )
+            assert state.active_turn_id is None
+            with pytest.raises(
+                CodexAppServerResponseError, match="is not materialized yet"
+            ) as unmaterialized:
+                asyncio.run(read_thread())
+            assert unmaterialized.value.code == -32600
+            return
+
+        assert refusals == []
+        deadline = time.monotonic() + 30
+        last_read_error: CodexAppServerResponseError | None = None
+        while time.monotonic() < deadline:
+            try:
+                thread = asyncio.run(read_thread())
+                break
+            except CodexAppServerResponseError as exc:
+                if "is not materialized yet" not in str(exc):
+                    raise
+                last_read_error = exc
+                time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Codex thread did not materialize after the oversized input: "
+                f"{last_read_error}\n{rig.stack.log_tail()}"
+            )
+        native_user_items = [
+            item
+            for turn in thread["turns"]
+            for item in turn.get("items", [])
+            if item.get("type") == "userMessage"
+            and str(item.get("clientId", "")).startswith("omnigent-paste-")
+        ]
+        wire = json.dumps(native_user_items)
+        assert len(native_user_items) == 1
+        assert "[Attached file:" in wire
+        native_texts = [
+            entry["text"]
+            for entry in native_user_items[0]["content"]
+            if entry.get("type") == "text"
+        ]
+        cached = {}
+        for entry in native_texts:
+            if entry.startswith("[Attached file: "):
+                path = Path(entry.removeprefix("[Attached file: ").removesuffix("]"))
+                cached[entry] = path.read_text(encoding="utf-8")
+        assert cached, "the real CLI must receive the complete prepared file"
+        restored = [cached.get(entry, entry) for entry in native_texts]
+        expected = (
+            [text]
+            if input_kind == "text-upload"
+            else [entry["text"] for entry in original_content]
+        )
+        assert restored == expected
+        (rig.stack.root / f"oversized-{input_kind}-receipt.json").write_text(
+            json.dumps(
+                {
+                    "native_client_id": native_user_items[0]["clientId"],
+                    "user_items": len(user_matches),
+                    "original_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                    "cached_sha256": [
+                        hashlib.sha256(value.encode()).hexdigest() for value in cached.values()
+                    ],
+                },
+                indent=2,
+            )
+        )
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),
@@ -163,6 +361,7 @@ class _Rig:
     source_home: Path
     catalog: dict[str, Any]
     runner_env: dict[str, str]
+    codex_version: str
 
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
@@ -243,7 +442,7 @@ def codex_effort_rig(
         httpx.Client(base_url=mock_llm_server_url, timeout=10, trust_env=False) as model,
     ):
         stack.start_runner(cwd=_REPO_ROOT, env=env)
-        yield _Rig(stack, api, model, source, catalog, env)
+        yield _Rig(stack, api, model, source, catalog, env, version)
 
 
 @dataclass
@@ -349,7 +548,13 @@ async def _native_settings(session: _Session, model: str) -> dict[str, Any]:
                     thread = await client.request(
                         "thread/read", {"threadId": state.thread_id, "includeTurns": False}
                     )
-                    return {"model": row, "thread": thread["result"]["thread"]}
+                    return {
+                        "model": row,
+                        "thread": thread["result"]["thread"],
+                        "supports_user_message_ids": getattr(
+                            client, "supports_user_message_ids", False
+                        ),
+                    }
             cursor = result.get("nextCursor")
             assert cursor, f"Real Codex model/list did not advertise {model}"
     finally:
