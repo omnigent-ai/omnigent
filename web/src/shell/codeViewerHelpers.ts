@@ -53,10 +53,7 @@ export const SPLIT_DIFF_MIN_WIDTH = 920;
 
 export const MAX_RICH_MARKDOWN_BYTES = 256 * 1024;
 
-/**
- * Use source for large Markdown: the rich editor renders the whole document on
- * load and lays all of it out again on every resize.
- */
+/** Use source for large Markdown: the rich editor lays out the whole document on every resize. */
 export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
   return (
     lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
