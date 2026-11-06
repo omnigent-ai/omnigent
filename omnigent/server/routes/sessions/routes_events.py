@@ -289,6 +289,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
+    _settle_empty_native_turn_input,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -2703,6 +2704,11 @@ def register_events_routes(
                 )
             elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
+            undelivered_input_stable_id = data.get("undelivered_input_stable_id")
+            if status == "idle" and isinstance(undelivered_input_stable_id, str):
+                await _settle_empty_native_turn_input(
+                    conversation_store, conv, session_id, undelivered_input_stable_id
+                )
             _publish_status(
                 session_id,
                 status,
