@@ -8718,10 +8718,6 @@ def create_runner_app(
     _require_os_env = _resource_routes.require_os_env
     _resolve_conversation_id = _resource_routes.resolve_conversation_id
 
-    async def _release_session_harness(session_id: str) -> None:
-        if process_manager is not None:
-            await process_manager.release(session_id)
-
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.workspace_upload import register_upload_routes, upload_state_path
 
@@ -8735,6 +8731,10 @@ def create_runner_app(
         resolve_registry=_resolve_session_fs_registry,
         state_path=upload_state_path(runner_workspace),
     )
+
+    async def _release_session_harness(session_id: str) -> None:
+        if process_manager is not None:
+            await process_manager.release(session_id)
 
     _native_controls = build_native_controls(
         _active_turns=_active_turns,
