@@ -15,9 +15,9 @@ import { FitAddon } from "@xterm/addon-fit";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
-import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
+import { openSameOriginSessionLink } from "@/lib/sessionNavigation";
 import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
@@ -133,33 +133,9 @@ export function openTerminalLink(
 ): void {
   event.preventDefault();
   if (onFileLink?.(uri)) return;
-  const sameOriginSessionPath = sameOriginSessionLink(uri);
-  if (sameOriginSessionPath) {
-    // A terminal-printed session link may be unprefixed (`/c/<id>`); rebase it
-    // so client-side navigation stays under the router basename. withBasePath
-    // is idempotent, so an already-prefixed link is left unchanged.
-    const target = withBasePath(sameOriginSessionPath);
-    const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-    if (target !== currentPath) {
-      window.history.pushState(null, "", target);
-      window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
-    }
-    return;
-  }
+  if (openSameOriginSessionLink(uri)) return;
   if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
-}
-
-function sameOriginSessionLink(uri: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(uri, window.location.href);
-  } catch {
-    return null;
-  }
-  if (url.origin !== window.location.origin) return null;
-  if (!/(^|\/)c\/[^/]+\/?$/.test(url.pathname)) return null;
-  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 /**

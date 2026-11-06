@@ -1,4 +1,5 @@
-// Desktop chat links open independent in-app tabs when opted in.
+// Desktop chat links: a plain click on a same-origin session link opens it in
+// place; other links open independent in-app tabs when opted in.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -18,6 +19,7 @@ vi.mock("@/lib/fetchSessionHostId", () => ({
 }));
 
 const LINK = "https://example.com/page";
+const SESSION_LINK = `${window.location.origin}/c/conv-2`;
 let openOrNavigate: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
@@ -30,6 +32,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  window.history.replaceState(null, "", "/");
   delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
   window.localStorage.clear();
 });
@@ -84,11 +87,47 @@ it.each([
   expect(openOrNavigate).not.toHaveBeenCalled();
 });
 
-it.each([{}, { metaKey: true }, { ctrlKey: true }])(
-  "keeps the external default when the preference is off (%j)",
-  (init) => {
-    writeOpenLinksInApp(false);
-    expect(clickLink(LINK, init).defaultPrevented).toBe(false);
+it.each([
+  [LINK, {}],
+  [LINK, { metaKey: true }],
+  [LINK, { ctrlKey: true }],
+  ["https://other.example.com/c/conv-2", {}],
+  [SESSION_LINK, { metaKey: true }],
+  [SESSION_LINK, { ctrlKey: true }],
+])("keeps %s (%j) on the external path when the preference is off", (href, init) => {
+  writeOpenLinksInApp(false);
+  window.history.replaceState(null, "", "/c/conv-1");
+  expect(clickLink(href, init).defaultPrevented).toBe(false);
+  expect(window.location.pathname).toBe("/c/conv-1");
+  expect(openOrNavigate).not.toHaveBeenCalled();
+});
+
+it.each([true, false])(
+  "opens a same-origin session link in place (in-app browser preference %s)",
+  async (preference) => {
+    writeOpenLinksInApp(preference);
+    window.history.replaceState(null, "", "/c/conv-1");
+    expect(clickLink(SESSION_LINK).defaultPrevented).toBe(true);
+    expect(window.location.pathname).toBe("/c/conv-2");
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
     expect(openOrNavigate).not.toHaveBeenCalled();
+  },
+);
+
+it.each([true, false])(
+  "keeps a same-origin non-session link off the session path (in-app browser preference %s)",
+  async (preference) => {
+    writeOpenLinksInApp(preference);
+    window.history.replaceState(null, "", "/c/conv-1");
+    const settingsLink = `${window.location.origin}/settings/c/session`;
+    expect(clickLink(settingsLink).defaultPrevented).toBe(preference);
+    expect(window.location.pathname).toBe("/c/conv-1");
+    await vi.waitFor(() =>
+      expect(openOrNavigate.mock.calls.map(([, url]) => url)).toEqual(
+        preference ? [settingsLink] : [],
+      ),
+    );
   },
 );

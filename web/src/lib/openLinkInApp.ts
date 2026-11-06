@@ -15,6 +15,7 @@ import {
 } from "./nativeBridge";
 import { fetchSessionHostId } from "./fetchSessionHostId";
 import { randomUUID } from "./randomUUID";
+import { openSameOriginSessionLink } from "./sessionNavigation";
 import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
 type OpenOrNavigate = (
@@ -141,10 +142,11 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * Modified clicks keep their native semantics outside the in-app browser.
  * In a native shell the default path is the
  * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser: plain and Cmd/Ctrl clicks open
- * matching or new in-app tabs, while Shift-click opens externally. The web
- * popup fallback never runs natively: the shell's policy reports `null` from
- * window.open regardless, so it would navigate twice.
+ * that a plain click on a same-origin session link navigates the app in place,
+ * and, when the user opted in to the in-app browser, other plain and Cmd/Ctrl
+ * clicks open matching or new in-app tabs, while Shift-click opens externally.
+ * The web popup fallback never runs natively: the shell's policy reports
+ * `null` from window.open regardless, so it would navigate twice.
  */
 export function followLinkWithPopupFallback(
   event: MouseEvent,
@@ -154,7 +156,13 @@ export function followLinkWithPopupFallback(
   if (event.defaultPrevented || event.button !== 0) return;
   if (event.shiftKey || event.altKey) return;
   if (isNativeShell()) {
-    if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
+    const plainClick = !event.metaKey && !event.ctrlKey;
+    if (
+      (plainClick && openSameOriginSessionLink(href)) ||
+      maybeOpenLinkInApp(conversationId, href)
+    ) {
+      event.preventDefault();
+    }
     return;
   }
   if (event.metaKey || event.ctrlKey) return;

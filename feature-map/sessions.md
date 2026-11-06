@@ -579,7 +579,10 @@ composer is read-only (for example a Read grant) gets neither **Reply** nor
 
 **Desktop browser:** choose **+ → Browser** in the Workspace panel or press
 ⌘/Ctrl+Alt+B. Agent browser requests and chat links with in-app opening enabled
-create or select a closable Browser soft tab automatically.
+create or select a closable Browser soft tab automatically. A plain click on a
+chat link to a session on the connected server instead opens that session in
+the current window, whether or not in-app opening is enabled. The iOS app does
+the same for a plain tap.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control
@@ -1043,6 +1046,12 @@ plain `uv run pytest`, which starts a private server for the test.
   Chrome profile, so it is manual: sign into a site in Chrome, open that site in
   the pane, click the cookie button, confirm the native prompt, and check the
   page is signed in while an unrelated site in the same session is not.
+- **Desktop session links (real Electron, own environment):**
+  `web/electron/e2e/desktop_session_link.e2e.js` plain-clicks a chat link to
+  another session on the connected server and checks it opens in the same
+  window with no system browser. With in-app opening off, Cmd-click still opens
+  it externally; `web/src/components/blocks/ChatMarkdown.inAppLinkRouting.test.tsx`
+  covers that. Check it and an iOS tap of the same link manually.
 - **`canvas-workspace` (sidebar entry, project cards, chat, focus, and history):**
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions`.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide
