@@ -3146,60 +3146,117 @@ describe("chatStore — send (first-send ordering)", () => {
       vi.unstubAllEnvs();
     });
 
-    /** Answer the session's next snapshot GETs with `statuses`; returns every GET made. */
-    function failSnapshots(id: string, statuses: number[]): string[] {
-      const gets: string[] = [];
+    /**
+     * Answer the session's next `request` GETs with `statuses`, and open its
+     * streams on sinks the test writes to. Returns both requests' GETs.
+     */
+    function failSnapshots(
+      id: string,
+      statuses: number[],
+      request: "metadata" | "items" = "metadata",
+    ): { gets: Record<"metadata" | "items", string[]>; streams: StreamSink[] } {
+      const gets = { metadata: [] as string[], items: [] as string[] };
+      const streams: StreamSink[] = [];
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        if (url.split("?")[0] === `/v1/sessions/${id}` && (init?.method ?? "GET") === "GET") {
-          gets.push(url);
-          const status = statuses.shift();
+        const path = url.split("?")[0];
+        if (path === `/v1/sessions/${id}/stream`) {
+          const sink = pushableStream();
+          streams.push(sink);
+          init?.signal?.addEventListener("abort", () =>
+            sink.error(new DOMException("aborted", "AbortError")),
+          );
+          return mockResponse(null, { bodyStream: sink.stream });
+        }
+        const requested =
+          path === `/v1/sessions/${id}`
+            ? "metadata"
+            : path === `/v1/sessions/${id}/items`
+              ? "items"
+              : null;
+        if (requested !== null && (init?.method ?? "GET") === "GET") {
+          gets[requested].push(url);
+          const status = requested === request ? statuses.shift() : undefined;
           if (status !== undefined) return mockResponse({}, { ok: false, status });
         }
         return defaultFetchHandler(input, init);
       });
-      return gets;
+      return { gets, streams };
     }
 
-    it("retries a failure a retry can fix", async () => {
-      vi.useFakeTimers();
-      seedSession("conv_flaky", []);
-      const gets = failSnapshots("conv_flaky", [503]);
+    /** One chunk of a native reply's live preview. */
+    function previewDelta(delta: string, index: number): string {
+      return sse("response.output_text.delta", { delta, message_id: "m1", index });
+    }
 
-      const switched = useChatStore.getState().switchTo("conv_flaky");
-      await vi.advanceTimersByTimeAsync(2_000);
-      await switched;
+    it.each(["metadata", "items"] as const)(
+      "retries a failed %s request on its own",
+      async (request) => {
+        vi.useFakeTimers();
+        seedSession("conv_flaky", []);
+        const { gets } = failSnapshots("conv_flaky", [503], request);
 
-      expect(conversationRegistry.peek("conv_flaky")!.getState().conversationLoadError).toBeNull();
-      expect(gets).toHaveLength(2);
-    });
+        const switched = useChatStore.getState().switchTo("conv_flaky");
+        await vi.advanceTimersByTimeAsync(100);
+        const entry = conversationRegistry.peek("conv_flaky")!;
+        expect(entry.getState()).toMatchObject({
+          loadingConversation: true,
+          conversationLoadError: null,
+        });
+        await vi.advanceTimersByTimeAsync(2_000);
+        await switched;
+
+        expect(entry.getState()).toMatchObject({
+          loadingConversation: false,
+          conversationLoadError: null,
+        });
+        expect(gets[request]).toHaveLength(2);
+        expect(gets[request === "metadata" ? "items" : "metadata"]).toHaveLength(1);
+      },
+    );
 
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
-      const gets = failSnapshots("conv_missing", [404, 404, 404]);
+      const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
 
       await useChatStore.getState().switchTo("conv_missing");
 
       const error = conversationRegistry.peek("conv_missing")!.getState().conversationLoadError;
       expect(error).toMatchObject({ status: 404 });
-      expect(gets).toHaveLength(1);
+      expect(gets.metadata).toHaveLength(1);
     });
 
     it("loads again in place once the retries run out", async () => {
       vi.useFakeTimers();
       seedSession("conv_down", []);
-      const gets = failSnapshots("conv_down", [503, 503, 503]);
+      const { gets, streams } = failSnapshots("conv_down", [503, 503, 503]);
 
       const switched = useChatStore.getState().switchTo("conv_down");
       await vi.advanceTimersByTimeAsync(10_000);
       await switched;
       const entry = conversationRegistry.peek("conv_down")!;
       expect(entry.getState().conversationLoadError).not.toBeNull();
-      expect(gets).toHaveLength(3);
+      expect(gets.metadata).toHaveLength(3);
+      // The stream stays up meanwhile, partway through a reply.
+      streams[0]!.push(previewDelta("Hello ", 0));
+      streams[0]!.push(previewDelta("wor", 1));
+      await vi.advanceTimersByTimeAsync(10);
+      const preview = () =>
+        entry
+          .getState()
+          .blocks.filter((block) => block.ctx.itemId === "live:m1")
+          .map((block) => (block.type === "text_done" ? block.fullText : block.type));
+      expect(preview()).toEqual(["Hello wor"]);
 
       await retryConversationLoad("conv_down");
+      expect(streams).toHaveLength(2);
+      // A new stream replays the reply so far as one cumulative chunk.
+      streams[1]!.push(previewDelta("Hello world!", 2));
+      await vi.advanceTimersByTimeAsync(10);
+
       expect(entry.getState().conversationLoadError).toBeNull();
-      expect(gets).toHaveLength(4);
+      expect(gets.metadata).toHaveLength(4);
+      expect(preview()).toEqual(["Hello world!"]);
     });
 
     it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
@@ -3254,28 +3311,10 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(slots.heldByTab()).toBe(1);
     });
 
-    it("keeps the session loading while it waits to retry", async () => {
-      vi.useFakeTimers();
-      seedSession("conv_wait", []);
-      failSnapshots("conv_wait", [503]);
-
-      const switched = useChatStore.getState().switchTo("conv_wait");
-      await vi.advanceTimersByTimeAsync(100);
-      const entry = conversationRegistry.peek("conv_wait")!;
-      expect(entry.getState()).toMatchObject({
-        loadingConversation: true,
-        conversationLoadError: null,
-      });
-
-      await vi.advanceTimersByTimeAsync(2_000);
-      await switched;
-      expect(entry.getState().loadingConversation).toBe(false);
-    });
-
     it("stops retrying once the session is closed", async () => {
       vi.useFakeTimers();
       seedSession("conv_closed", []);
-      const gets = failSnapshots("conv_closed", [503, 503, 503]);
+      const { gets } = failSnapshots("conv_closed", [503, 503, 503]);
 
       const switched = useChatStore.getState().switchTo("conv_closed");
       await vi.advanceTimersByTimeAsync(100);
@@ -3283,7 +3322,7 @@ describe("chatStore — send (first-send ordering)", () => {
       await vi.advanceTimersByTimeAsync(10_000);
       await switched;
 
-      expect(gets).toHaveLength(1);
+      expect(gets.metadata).toHaveLength(1);
     });
   });
 

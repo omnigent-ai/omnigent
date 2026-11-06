@@ -4992,20 +4992,6 @@ async function refreshFailedInputs(id: string): Promise<void> {
   });
 }
 
-/**
- * Start the session SSE stream, kick off the pump in the background
- * once the stream connects, then fetch metadata plus the most recent
- * page of item history and merge it into state.blocks.
- *
- * Order matters per the migration plan §R1 ("stream-then-snapshot
- * race") — start the stream request FIRST so events emitted during
- * the history fetch window have a live-tail request to land on.
- * Do not await the stream response before loading the snapshot:
- * proxies can delay SSE headers until data arrives, and pending
- * elicitations must still replay on refresh while the stream is
- * connecting. Dedupe by item id on merge so stream-delivered
- * persisted items don't double-render alongside hydrated ones.
- */
 /** Retries of a snapshot load that failed in a way a retry can fix. */
 const SNAPSHOT_LOAD_RETRIES = 2;
 
@@ -5045,12 +5031,28 @@ export async function retryConversationLoad(id: string): Promise<void> {
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.getState().conversationLoadError === null) return;
   // A failed snapshot leaves the pump open; close it so the new bind is the
-  // entry's only subscriber.
+  // entry's only subscriber, and drop its live previews, which the new stream
+  // replays in full.
   abortConversationStream(entry);
+  dropEphemeralInFlightBlocks(id, entrySetter(entry));
   entry.setState({ loadingConversation: true, conversationLoadError: null });
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
+/**
+ * Start the session SSE stream, kick off the pump in the background
+ * once the stream connects, then fetch metadata plus the most recent
+ * page of item history and merge it into state.blocks.
+ *
+ * Order matters per the migration plan §R1 ("stream-then-snapshot
+ * race") — start the stream request FIRST so events emitted during
+ * the history fetch window have a live-tail request to land on.
+ * Do not await the stream response before loading the snapshot:
+ * proxies can delay SSE headers until data arrives, and pending
+ * elicitations must still replay on refresh while the stream is
+ * connecting. Dedupe by item id on merge so stream-delivered
+ * persisted items don't double-render alongside hydrated ones.
+ */
 async function bindStream(
   id: string,
   set: Setter,
