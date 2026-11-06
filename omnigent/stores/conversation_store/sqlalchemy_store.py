@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 
 from sqlalchemy import (
     ColumnElement,
+    Exists,
     LargeBinary,
     Select,
     and_,
@@ -63,6 +64,7 @@ from omnigent.db.enum_codecs import (
     encode_session_live_status,
 )
 from omnigent.db.query_context import query_name_scope
+from omnigent.db.sqlite_trigram import load_trigram_candidates, trigram_candidates
 from omnigent.db.utils import (
     _supports_fts5,
     build_search_snippet,
@@ -699,10 +701,48 @@ def _fetch_labels_bulk(
     return out
 
 
+def _trigram_candidate_matches(
+    conversation_id: QueryableAttribute[str], item_matches: ColumnElement[bool]
+) -> Exists:
+    """
+    Whether a trigram candidate of a conversation satisfies *item_matches*.
+
+    Walks the conversation's loaded candidates and reads each candidate item by
+    primary key, so a probe never reads the conversation's other items.
+
+    :param conversation_id: The conversation to probe, e.g. ``SqlConversation.id``
+        in a correlated subquery.
+    :param item_matches: The search predicate on ``conversation_items``.
+    :returns: A correlated ``EXISTS``.
+    """
+    candidate = trigram_candidates.c
+    matching_item = (
+        select(SqlConversationItem.id)
+        .where(
+            SqlConversationItem.workspace_id == candidate.workspace_id,
+            SqlConversationItem.conversation_id == candidate.conversation_id,
+            SqlConversationItem.id == candidate.item_id,
+            item_matches,
+        )
+        .exists()
+    )
+    return (
+        select(candidate.item_id)
+        .where(
+            candidate.workspace_id == current_workspace_id(),
+            candidate.conversation_id == conversation_id,
+            matching_item,
+        )
+        .exists()
+    )
+
+
 def _fetch_search_snippets(
     session: Session,
     conversation_ids: list[str],
     query: str,
+    *,
+    candidates_only: bool = False,
 ) -> dict[str, str]:
     """
     Build a per-conversation preview excerpt of matching chat content.
@@ -723,6 +763,8 @@ def _fetch_search_snippets(
     :param conversation_ids: Conversation IDs to build snippets for,
         e.g. ``["conv_a", "conv_b"]``.
     :param query: The user's search string.
+    :param candidates_only: Whether to read only the trigram candidates loaded
+        for this search instead of every item of the conversations.
     :returns: Mapping ``{conversation_id: snippet}``. Conversations whose
         only match was the title (no item body match) are absent — the
         caller leaves their ``search_snippet`` as ``None``.
@@ -738,11 +780,24 @@ def _fetch_search_snippets(
     # same reason as the content match in ``list_conversations``: the lower()
     # form matches the pg_trgm index expression, and the planner then scans the
     # whole workspace even though this is already scoped to one page of ids.
+    item_matches = SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE)
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
+        item_matches,
     )
+    if candidates_only:
+        # Probe items by candidate key instead of walking each conversation.
+        candidate = trigram_candidates.c
+        match_pred = and_(
+            match_pred,
+            tuple_(SqlConversationItem.conversation_id, SqlConversationItem.id).in_(
+                select(candidate.conversation_id, candidate.item_id).where(
+                    candidate.workspace_id == workspace_id,
+                    candidate.conversation_id.in_(conversation_ids),
+                )
+            ),
+        )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
     earliest = (
@@ -764,6 +819,9 @@ def _fetch_search_snippets(
             earliest,
             and_(
                 SqlConversationItem.workspace_id == workspace_id,
+                # Redundant with the join, but keeps SQLite from walking the
+                # whole workspace's position index to find the page's rows.
+                SqlConversationItem.conversation_id.in_(conversation_ids),
                 SqlConversationItem.conversation_id == earliest.c.cid,
                 SqlConversationItem.position == earliest.c.pos,
             ),
@@ -3105,9 +3163,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             otherwise matches conversations where
             ``LOWER(title) LIKE %query%`` or any
             ``conversation_items.search_text`` contains the
-            query. Implemented with the SQL ``LIKE`` operator
-            (no FTS) so it works against both SQLite and
-            Postgres without extra extensions.
+            query. Implemented with the SQL ``LIKE`` operator.
+            On SQLite with the trigram index, ``LIKE`` checks only
+            the index's candidate items when they are few enough.
         :param search_scope: Which matches ``search_query`` returns:
             ``"all"`` (title or content), ``"title"`` (title matches
             only), or ``"content"`` (content matches whose title does
@@ -3253,6 +3311,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = select(SqlConversation).where(
                 SqlConversation.workspace_id == current_workspace_id()
             )
+            use_trigram_candidates = False
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
@@ -3361,15 +3420,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                 # match but cannot use that index, so the probe stays on the
                 # (workspace_id, conversation_id) btree above. Do not "simplify"
                 # this back to lower(...) LIKE; see the covering test.
-                content_match = (
-                    select(SqlConversationItem.conversation_id)
-                    .where(
-                        SqlConversationItem.workspace_id == current_workspace_id(),
-                        SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
-                    )
-                    .exists()
+                item_matches = SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE)
+                # On SQLite, probe only the trigram index's candidate items. The
+                # same ILIKE still decides, since the index folds case differently.
+                use_trigram_candidates = search_scope != "title" and load_trigram_candidates(
+                    session, search_query
                 )
+                if use_trigram_candidates:
+                    content_match = _trigram_candidate_matches(SqlConversation.id, item_matches)
+                else:
+                    content_match = (
+                        select(SqlConversationItem.conversation_id)
+                        .where(
+                            SqlConversationItem.workspace_id == current_workspace_id(),
+                            SqlConversationItem.conversation_id == SqlConversation.id,
+                            item_matches,
+                        )
+                        .exists()
+                    )
                 if search_scope == "title":
                     stmt = stmt.where(title_match)
                 elif search_scope == "content":
@@ -3507,7 +3575,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query)
+                _fetch_search_snippets(
+                    session, row_ids, search_query, candidates_only=use_trigram_candidates
+                )
                 if search_query and search_scope != "title"
                 else {}
             )
