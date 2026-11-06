@@ -176,6 +176,7 @@ def test_webfonts_is_a_frontend_visible_feature() -> None:
         "claude_osc_status",
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
+        "peer_session_messaging",
         "session_orchestration",
         "sidebar_grouping_ui",
         "webfonts",
