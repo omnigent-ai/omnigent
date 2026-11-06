@@ -115,6 +115,7 @@ from omnigent.server.routes._errors import (
     agent_removed,
 )
 from omnigent.server.routes._errors import session_not_found as _session_not_found
+from omnigent.server.routes._host_launch import _deployment_is_sharded
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.server.routes._sessions.common import (
     _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY,
@@ -253,6 +254,7 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.file_store import FileStore
+from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry.surface import CLIENT_SURFACE_LABEL_KEY, resolve_client_surface
@@ -384,9 +386,6 @@ async def _require_archive_teardown_replica(
     :raises OmnigentError: ``WRONG_REPLICA`` when the session's host is live
         on another replica of a sharded deployment.
     """
-    from omnigent.server.routes._host_launch import _deployment_is_sharded
-    from omnigent.stores.host_store import host_is_live
-
     if not _deployment_is_sharded():
         return
     host_registry = getattr(request.app.state, "host_registry", None)
