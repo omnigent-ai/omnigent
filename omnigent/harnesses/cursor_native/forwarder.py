@@ -156,7 +156,8 @@ class _ForwardState:
     """Durable forwarder cursor, persisted to ``bridge_dir/cursor_forwarder.json``.
 
     :param store_path: Absolute path of the cursor chat store being tailed, or
-        ``None`` before one is discovered.
+        ``None`` while unbound. An unbound live session still persists its
+        heartbeat so siblings defer guessing a chat it may own.
     :param last_rowid: Highest ``blobs.rowid`` already processed for
         ``store_path`` (forwarded or deliberately skipped). The store is
         append-only and content-addressed, so rowids only grow — tracking the
@@ -167,12 +168,17 @@ class _ForwardState:
     :param heartbeat_ms: Wall-clock ms of the last persist. A sibling reads this
         to tell a live owner from a dead session's leftover claim (see
         :func:`_chat_claimed_by_other`). Stamped by :func:`_write_state`.
+    :param workspace: This session's working directory (cursor's chat-dir key).
+    :param confirmed: Whether this session's own ``stop`` hook (or a resume of a
+        known chat) named ``store_path``, rather than timestamp discovery.
     """
 
     store_path: str | None = None
     last_rowid: int = 0
     launch_epoch_ms: int = 0
     heartbeat_ms: int = 0
+    workspace: str | None = None
+    confirmed: bool = False
 
 
 @dataclass
@@ -203,11 +209,14 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     last_rowid = data.get("last_rowid")
     launch_epoch_ms = data.get("launch_epoch_ms")
     heartbeat_ms = data.get("heartbeat_ms")
+    workspace = data.get("workspace")
     return _ForwardState(
         store_path=store_path if isinstance(store_path, str) else None,
         last_rowid=last_rowid if isinstance(last_rowid, int) else 0,
         launch_epoch_ms=launch_epoch_ms if isinstance(launch_epoch_ms, int) else 0,
         heartbeat_ms=heartbeat_ms if isinstance(heartbeat_ms, int) else 0,
+        workspace=workspace if isinstance(workspace, str) else None,
+        confirmed=data.get("confirmed") is True,
     )
 
 
@@ -232,6 +241,8 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> bool:
                     # the chat claim; a peer treats a claim older than
                     # ``_CLAIM_FRESH_MS`` as a dead session it may take over.
                     "heartbeat_ms": int(time.time() * 1000),
+                    "workspace": state.workspace,
+                    "confirmed": state.confirmed,
                 }
             ),
             encoding="utf-8",
@@ -257,21 +268,25 @@ def clear_cursor_bridge_state(bridge_dir: Path) -> None:
         (bridge_dir / _STATE_FILE).unlink()
 
 
-def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int) -> bool:
+def _chat_claimed_by_other(
+    bridge_dir: Path, store_path: Path, my_launch_ms: int, my_confirmed: bool = False
+) -> bool:
     """Whether another LIVE session is already mirroring *store_path*.
 
-    cursor keeps one chat per working directory, so two cursor-native sessions
-    launched in the same cwd discover the SAME store — without this guard both
-    would mirror it into two separate conversations (the duplicate-session bug).
-    A sibling bridge dir under the same root claims the chat when its persisted
+    Discovery picks a chat by timestamp, so two cursor-native sessions launched
+    in the same cwd can both pick the SAME store — without this guard both would
+    mirror it into two separate conversations (the duplicate-session bug). A
+    sibling bridge dir under the same root claims the chat when its persisted
     state names the same store with a heartbeat fresher than ``_CLAIM_FRESH_MS``.
-    Ties resolve toward the EARLIER-launched session (then the lexicographically
-    smaller bridge-dir name, for a deterministic, symmetric verdict), so the
-    established session keeps the chat and a duplicate later launch yields.
+    A claim confirmed by the owner's ``stop`` hook outranks a timestamp guess.
+    Otherwise ties resolve toward the EARLIER-launched session (then the
+    lexicographically smaller bridge-dir name, for a deterministic, symmetric
+    verdict), so the established session keeps the chat.
 
     :param bridge_dir: This session's bridge dir (its parent is the shared root).
     :param store_path: The cursor chat store this session would mirror.
     :param my_launch_ms: This session's ``launch_epoch_ms``.
+    :param my_confirmed: Whether this session's own hook named *store_path*.
     :returns: ``True`` if a different live session owns the chat (so this session
         should not mirror it); ``False`` otherwise.
     """
@@ -289,11 +304,63 @@ def _chat_claimed_by_other(bridge_dir: Path, store_path: Path, my_launch_ms: int
             continue
         if now_ms - other.heartbeat_ms > _CLAIM_FRESH_MS:
             continue  # stale claim — the owning session is gone; ignore it
+        if other.confirmed != my_confirmed:
+            if other.confirmed:
+                return True
+            continue
         if other.launch_epoch_ms < my_launch_ms:
             return True
         if other.launch_epoch_ms == my_launch_ms and sibling.name < me:
             return True
     return False
+
+
+def _chat_contested_by_unbound_sibling(bridge_dir: Path, store_path: Path, workspace: str) -> bool:
+    """Whether a live, still-unbound sibling in this workspace may own *store_path*.
+
+    Each cursor-agent process creates its own chat, but discovery can only match
+    by creation time. When another live session in the same workspace launched
+    early enough to have created this chat, neither session can tell whose it is
+    until a ``stop`` hook names it, so discovery must not guess.
+    """
+    root = bridge_dir.parent
+    if not root.is_dir():
+        return False
+    created_ms = _chat_created_ms(store_path.parent)
+    store_hash = store_path.parent.parent.name
+    now_ms = int(time.time() * 1000)
+    for sibling in root.iterdir():
+        if sibling.name == bridge_dir.name or not sibling.is_dir():
+            continue
+        other = _read_state(sibling)
+        if other.store_path is not None or other.workspace is None:
+            continue
+        if now_ms - other.heartbeat_ms > _CLAIM_FRESH_MS:
+            continue
+        if other.workspace != workspace and _workspace_hash(other.workspace) != store_hash:
+            continue
+        if created_ms >= other.launch_epoch_ms - _DISCOVERY_SKEW_MS:
+            return True
+    return False
+
+
+def _hook_named_store(bridge_dir: Path, workspace: str, turn_end: int) -> Path | None:
+    """Return the chat store this session's ``stop`` hook named for *turn_end*.
+
+    cursor's hook payload carries the chat id that ran the turn, which is the
+    only per-process link between this session and its chat store.
+    """
+    from omnigent.harnesses.cursor_native.main import is_valid_cursor_chat_id
+
+    chat_id = cursor_native_status.read_turn_chat_id(bridge_dir, turn_end)
+    if chat_id is None or not is_valid_cursor_chat_id(chat_id):
+        return None
+    root = _cursor_chats_root()
+    store = root / _workspace_hash(workspace) / chat_id / "store.db"
+    if store.is_file():
+        return store
+    matches = list(root.glob(f"*/{chat_id}/store.db")) if root.is_dir() else []
+    return matches[0] if len(matches) == 1 else None
 
 
 def _fd_exhaustion_errno(exc: BaseException) -> int | None:
@@ -374,6 +441,8 @@ def preseed_resume_state(
             store_path=str(store_path),
             last_rowid=last_rowid,
             launch_epoch_ms=launch_epoch_ms,
+            workspace=workspace,
+            confirmed=True,
         ),
     )
     return True
@@ -919,6 +988,8 @@ async def forward_cursor_store_to_session(
     persisted to ``bridge_dir`` so a supervisor restart resumes without
     re-posting; if discovery resolves a *different* store than the persisted one
     (a cold resume relaunched a fresh chat), the cursor resets to that store.
+    When another live, unbound session in the workspace could own the newest
+    chat, binding waits until this session's ``stop`` hook names its chat.
 
     A failed item POST never silently re-posts forever: a server *rejection* (a
     4xx, or a 5xx such as a failed DB insert) is retried for up to
@@ -943,6 +1014,8 @@ async def forward_cursor_store_to_session(
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0
+    confirmed = False
+    deferred_store: Path | None = None
     # Bounded-retry-then-skip guard (see the post loop below): the rowid whose
     # POST is currently being rejected and how many consecutive rejections it
     # has seen. Reset whenever the cursor advances past an item.
@@ -960,6 +1033,19 @@ async def forward_cursor_store_to_session(
     pending_turn_end: int | None = None
     outcome_parse_failures = 0
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
+
+    def persist() -> None:
+        _write_state(
+            bridge_dir,
+            _ForwardState(
+                store_path=None if store_path is None else str(store_path),
+                last_rowid=last_rowid,
+                launch_epoch_ms=launch_epoch_ms,
+                workspace=workspace,
+                confirmed=confirmed,
+            ),
+        )
+
     async with httpx.AsyncClient(
         base_url=base_url, headers=headers, auth=auth, timeout=timeout
     ) as client:
@@ -987,14 +1073,8 @@ async def forward_cursor_store_to_session(
                     if persisted.store_path and Path(persisted.store_path).exists():
                         store_path = Path(persisted.store_path)
                         last_rowid = persisted.last_rowid
-                        _write_state(
-                            bridge_dir,
-                            _ForwardState(
-                                store_path=str(store_path),
-                                last_rowid=last_rowid,
-                                launch_epoch_ms=launch_epoch_ms,
-                            ),
-                        )
+                        confirmed = persisted.confirmed
+                        persist()
                         persisted = _ForwardState()  # consumed
                         if not chat_id_patched:
                             chat_id_val = store_path.parent.name
@@ -1006,9 +1086,23 @@ async def forward_cursor_store_to_session(
                         resolved = await asyncio.to_thread(
                             _discover_store, workspace, launch_epoch_ms
                         )
-                        if resolved is not None and not await asyncio.to_thread(
+                        if resolved is not None and await asyncio.to_thread(
                             _chat_claimed_by_other, bridge_dir, resolved, launch_epoch_ms
                         ):
+                            resolved = None
+                        if resolved is not None and await asyncio.to_thread(
+                            _chat_contested_by_unbound_sibling, bridge_dir, resolved, workspace
+                        ):
+                            if resolved != deferred_store:
+                                _logger.info(
+                                    "cursor chat %s may belong to another live session; "
+                                    "waiting for this session's stop hook; session=%s",
+                                    resolved,
+                                    session_id,
+                                )
+                                deferred_store = resolved
+                            resolved = None
+                        if resolved is not None:
                             store_path = resolved
                             if persisted.store_path == str(resolved):
                                 last_rowid = persisted.last_rowid
@@ -1019,14 +1113,7 @@ async def forward_cursor_store_to_session(
                                 # current model is re-posted (server no-ops if
                                 # unchanged).
                                 model_state = _ModelMirrorState()
-                            _write_state(
-                                bridge_dir,
-                                _ForwardState(
-                                    store_path=str(resolved),
-                                    last_rowid=last_rowid,
-                                    launch_epoch_ms=launch_epoch_ms,
-                                ),
-                            )
+                            persist()
                             persisted = _ForwardState()  # consumed
                             # Persist the cursor chat id as external_session_id so
                             # a later cold resume can pass ``--resume <chatId>``
@@ -1037,14 +1124,30 @@ async def forward_cursor_store_to_session(
                                     client, session_id=session_id, chat_id=chat_id_val
                                 )
                                 chat_id_patched = True
+                # The stop hook names the chat that ran this turn; bind to it
+                # before reading so the transcript precedes the outcome.
+                if pending_turn_end is not None and not confirmed:
+                    hook_store = await asyncio.to_thread(
+                        _hook_named_store, bridge_dir, workspace, pending_turn_end
+                    )
+                    if hook_store is not None:
+                        if hook_store != store_path:
+                            store_path = hook_store
+                            last_rowid = 0
+                            model_state = _ModelMirrorState()
+                        confirmed = True
+                        persist()
+                        if not chat_id_patched:
+                            await _patch_external_session_id(
+                                client, session_id=session_id, chat_id=hook_store.parent.name
+                            )
+                            chat_id_patched = True
                 if store_path is not None and store_path.exists():
-                    # cursor keeps ONE chat per working dir, so two cursor-native
-                    # sessions launched in the same cwd discover the same store.
-                    # Yield to an earlier-launched live session rather than mirror
-                    # the same chat into a second conversation (the duplicate-
-                    # session bug); the released store is re-evaluated next poll.
+                    # Discovery can pick a chat another live session owns. Yield
+                    # rather than mirror it into a second conversation (the
+                    # duplicate-session bug); the store is re-evaluated next poll.
                     if await asyncio.to_thread(
-                        _chat_claimed_by_other, bridge_dir, store_path, launch_epoch_ms
+                        _chat_claimed_by_other, bridge_dir, store_path, launch_epoch_ms, confirmed
                     ):
                         _logger.warning(
                             "cursor chat %s already mirrored by another session; "
@@ -1053,6 +1156,7 @@ async def forward_cursor_store_to_session(
                             session_id,
                         )
                         store_path = None
+                        confirmed = False
                     else:
                         items = await asyncio.to_thread(
                             _read_new_items, store_path, last_rowid, agent_name
@@ -1101,14 +1205,7 @@ async def forward_cursor_store_to_session(
                                     )
                                 failed_rowid = failed_attempts = 0
                                 last_rowid = item.rowid
-                                _write_state(
-                                    bridge_dir,
-                                    _ForwardState(
-                                        store_path=str(store_path),
-                                        last_rowid=last_rowid,
-                                        launch_epoch_ms=launch_epoch_ms,
-                                    ),
-                                )
+                                persist()
                                 continue
                             if item.item_type:
                                 try:
@@ -1181,25 +1278,11 @@ async def forward_cursor_store_to_session(
                             # advance past this item and reset the failure counter.
                             failed_rowid = failed_attempts = 0
                             last_rowid = item.rowid
-                            _write_state(
-                                bridge_dir,
-                                _ForwardState(
-                                    store_path=str(store_path),
-                                    last_rowid=last_rowid,
-                                    launch_epoch_ms=launch_epoch_ms,
-                                ),
-                            )
+                            persist()
                         # Refresh the claim heartbeat every poll (even with no new
                         # items) so an idle owner keeps its claim and a peer can
                         # detect a dead session.
-                        _write_state(
-                            bridge_dir,
-                            _ForwardState(
-                                store_path=str(store_path),
-                                last_rowid=last_rowid,
-                                launch_epoch_ms=launch_epoch_ms,
-                            ),
-                        )
+                        persist()
                         # Mirror a terminal-side model switch (TUI ``/model``)
                         # back to the web picker. Polled alongside messages so
                         # the pill tracks the same cadence as the chat view.
@@ -1210,6 +1293,9 @@ async def forward_cursor_store_to_session(
                             state=model_state,
                             model=observed_model,
                         )
+                if store_path is None:
+                    # An unbound heartbeat stops siblings guessing this session's chat.
+                    persist()
                 # Deliver the hook outcome after its transcript, even without a
                 # bound store. Failed posts retain this snapshot for the next poll.
                 if not retrying_items and pending_turn_end is not None:

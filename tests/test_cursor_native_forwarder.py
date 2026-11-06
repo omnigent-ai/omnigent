@@ -16,7 +16,9 @@ import errno
 import hashlib
 import json
 import logging
+import os
 import sqlite3
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +26,7 @@ import httpx
 import pytest
 
 from omnigent.harnesses.cursor_native import forwarder as fwd
+from omnigent.harnesses.cursor_native import status
 from omnigent.harnesses.cursor_native.forwarder import _persist_native_compaction_item
 
 # Real cursor chat ids are UUIDs. Use UUID-shaped ids in fixtures so the
@@ -340,11 +343,16 @@ class TestDiscoverStore:
 class TestStateRoundTrip:
     def test_write_then_read(self, tmp_path: Path) -> None:
         assert fwd._write_state(
-            tmp_path, fwd._ForwardState(store_path="/x/store.db", last_rowid=7)
+            tmp_path,
+            fwd._ForwardState(
+                store_path="/x/store.db", last_rowid=7, workspace="/ws", confirmed=True
+            ),
         )
         got = fwd._read_state(tmp_path)
         assert got.store_path == "/x/store.db"
         assert got.last_rowid == 7
+        assert got.workspace == "/ws"
+        assert got.confirmed is True
 
     def test_cold_default_when_absent(self, tmp_path: Path) -> None:
         got = fwd._read_state(tmp_path)
@@ -362,9 +370,9 @@ class TestStateRoundTrip:
 class TestChatClaim:
     """``_chat_claimed_by_other`` keeps one cursor chat → one mirroring session.
 
-    cursor keeps one chat per working dir, so two cursor-native sessions in the
-    same cwd discover the same store; this guard stops both from mirroring it
-    into two conversations (the duplicate-session bug).
+    Timestamp discovery can pick the same store for two cursor-native sessions in
+    one cwd; this guard stops both from mirroring it into two conversations (the
+    duplicate-session bug).
     """
 
     def test_yields_to_earlier_live_session(self, tmp_path: Path) -> None:
@@ -386,6 +394,26 @@ class TestChatClaim:
             later, fwd._ForwardState(store_path=store, last_rowid=0, launch_epoch_ms=2_000)
         )
         assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is False
+
+    def test_hook_confirmed_claim_outranks_earlier_guess(self, tmp_path: Path) -> None:
+        root = tmp_path / "cursor-native"
+        earlier = root / "sessA"
+        later = root / "sessB"
+        earlier.mkdir(parents=True)
+        later.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        fwd._write_state(
+            earlier, fwd._ForwardState(store_path=store, last_rowid=3, launch_epoch_ms=1_000)
+        )
+        fwd._write_state(
+            later,
+            fwd._ForwardState(store_path=store, launch_epoch_ms=2_000, confirmed=True),
+        )
+        assert fwd._chat_claimed_by_other(earlier, Path(store), my_launch_ms=1_000) is True
+        assert (
+            fwd._chat_claimed_by_other(later, Path(store), my_launch_ms=2_000, my_confirmed=True)
+            is False
+        )
 
     def test_unrelated_store_is_not_claimed(self, tmp_path: Path) -> None:
         root = tmp_path / "cursor-native"
@@ -421,6 +449,40 @@ class TestChatClaim:
             encoding="utf-8",
         )
         assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
+
+
+class TestChatContestedByUnboundSibling:
+    """Discovery must not guess a chat a live, still-unbound sibling may have created."""
+
+    @pytest.mark.parametrize(
+        ("sibling", "contested"),
+        [
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000}, True),
+            ({"workspace": "/ws", "launch_epoch_ms": 60_000}, False),
+            ({"workspace": "/elsewhere", "launch_epoch_ms": 1_000}, False),
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000, "store_path": "/other.db"}, False),
+            ({"workspace": "/ws", "launch_epoch_ms": 1_000, "heartbeat_ms": 1}, False),
+        ],
+        ids=["unbound-peer", "launched-after-chat", "other-workspace", "bound-peer", "dead-peer"],
+    )
+    def test_contested_only_by_live_unbound_peer_in_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sibling: dict, contested: bool
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID
+        chat_dir.mkdir(parents=True)
+        (chat_dir / "store.db").write_bytes(b"")
+        (chat_dir / "meta.json").write_text(json.dumps({"createdAtMs": 5_000}))
+        root = tmp_path / "cursor-native"
+        (root / "me").mkdir(parents=True)
+        (root / "peer").mkdir()
+        state = {"store_path": None, "heartbeat_ms": int(time.time() * 1000), **sibling}
+        (root / "peer" / fwd._STATE_FILE).write_text(json.dumps(state), encoding="utf-8")
+        assert (
+            fwd._chat_contested_by_unbound_sibling(root / "me", chat_dir / "store.db", "/ws")
+            is contested
+        )
 
 
 class _RecordingClient:
@@ -1048,6 +1110,7 @@ class TestPreseedResumeState:
         assert state.store_path == str(store)
         assert state.last_rowid == 5  # all 5 rows already in store
         assert state.launch_epoch_ms == 99_000
+        assert state.confirmed is True
 
     def test_empty_store_seeds_rowid_zero(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1409,3 +1472,87 @@ async def test_persist_native_compaction_item_no_store_skips_messages() -> None:
     assert body["type"] == "compaction"
     assert body["data"]["last_item_id"] == "item_abc"
     assert "compacted_messages" not in body["data"]
+
+
+class TestSiblingSessionsInOneWorkspace:
+    """Each cursor-agent process creates its own chat; its stop hook names it."""
+
+    @pytest.mark.asyncio
+    async def test_unbound_earlier_sibling_does_not_take_new_sessions_chat(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        chats_root = tmp_path / "chats"
+        monkeypatch.setattr(fwd, "_cursor_chats_root", lambda: chats_root)
+        monkeypatch.setattr(fwd, "_read_last_used_model", lambda path: None)
+        posted: list[tuple[str, dict]] = []
+
+        def handle(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                posted.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(200)
+
+        real_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            fwd.httpx,
+            "AsyncClient",
+            lambda **kwargs: real_client(transport=httpx.MockTransport(handle), **kwargs),
+        )
+        now_ms = int(time.time() * 1000)
+        root = tmp_path / "cursor-native"
+        signed_out, reviewer = root / "sessA", root / "sessB"
+        tasks = [
+            asyncio.create_task(
+                fwd.forward_cursor_store_to_session(
+                    base_url="http://test",
+                    headers={},
+                    session_id=session_id,
+                    bridge_dir=bridge_dir,
+                    agent_name="cursor-native-ui",
+                    workspace="/ws",
+                    launch_epoch_ms=launch_ms,
+                    poll_interval_s=0.001,
+                )
+            )
+            for bridge_dir, session_id, launch_ms in (
+                (signed_out, "first", now_ms - 5_000),
+                (reviewer, "second", now_ms),
+            )
+        ]
+        try:
+            await asyncio.sleep(0.05)
+            staged = tmp_path / "staged"
+            staged.mkdir()
+            (staged / "meta.json").write_text(json.dumps({"createdAtMs": now_ms + 1_000}))
+            _make_store(
+                staged / "store.db",
+                [
+                    ("u", _user("<user_query>\nreview\n</user_query>")),
+                    ("a", _assistant([{"type": "text", "text": "REVIEW-DONE"}])),
+                ],
+            ).close()
+            chat_dir = chats_root / hashlib.md5(b"/ws").hexdigest() / _CHAT_ID
+            chat_dir.parent.mkdir(parents=True)
+            os.rename(staged, chat_dir)
+            await asyncio.sleep(0.05)
+            status.record_turn_end(reviewer, {"conversation_id": _CHAT_ID, "status": "completed"})
+            for _ in range(2000):
+                if status.read_posted_count(reviewer) == 1:
+                    break
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0.05)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        def events(session_id: str) -> list[dict]:
+            return [body for path, body in posted if path == f"/v1/sessions/{session_id}/events"]
+
+        second = events("second")
+        assert [body["type"] for body in second] == [
+            "external_conversation_item",
+            "external_conversation_item",
+            "external_session_status",
+        ]
+        assert second[1]["data"]["item_data"]["content"][0]["text"] == "REVIEW-DONE"
+        assert events("first") == []

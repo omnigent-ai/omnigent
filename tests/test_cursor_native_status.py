@@ -49,6 +49,18 @@ def test_record_turn_end_fires_without_usage(tmp_path: Path) -> None:
     assert status.count_turn_ends(bridge) == 2
 
 
+def test_turn_end_records_the_hook_chat_id(tmp_path: Path) -> None:
+    chat_id = "0ef42bbf-3b80-4bec-ac39-ca46531cbc47"
+    status.record_turn_end(tmp_path, {"generation_id": "g1"})
+    status.record_turn_end(tmp_path, {"conversation_id": chat_id, "generation_id": "g2"})
+    with (tmp_path / status.TURN_END_FILE).open("a", encoding="utf-8") as handle:
+        handle.write("{damaged\n")
+    assert status.read_turn_chat_id(tmp_path, 1) is None
+    assert status.read_turn_chat_id(tmp_path, 2) == chat_id
+    assert status.read_turn_chat_id(tmp_path, 3) is None
+    assert status.read_turn_chat_id(tmp_path, 4) is None
+
+
 def test_posted_count_roundtrip_and_clear(tmp_path: Path) -> None:
     bridge = tmp_path / "b"
     assert status.read_posted_count(bridge) == 0

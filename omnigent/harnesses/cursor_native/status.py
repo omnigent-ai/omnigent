@@ -49,13 +49,17 @@ def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
 
     :param bridge_dir: The cursor-native bridge dir (where the forwarder reads).
     :param payload: The cursor ``stop`` hook payload, if any — its
-        ``generation_id`` and authoritative ``status`` are retained when present.
+        ``generation_id``, ``conversation_id`` (the chat that ran the turn) and
+        authoritative ``status`` are retained when present.
     """
     line: dict[str, object] = {"ts": time.time()}
     if isinstance(payload, dict):
         gen_id = payload.get("generation_id") or payload.get("conversation_id")
         if isinstance(gen_id, str) and gen_id:
             line["generation_id"] = gen_id
+        chat_id = payload.get("conversation_id")
+        if isinstance(chat_id, str) and chat_id:
+            line["chat_id"] = chat_id
         hook_status = payload.get("status")
         if hook_status in ("completed", "aborted", "error"):
             line["status"] = hook_status
@@ -79,12 +83,8 @@ def count_turn_ends(bridge_dir: Path) -> int:
     return sum(1 for raw in text.splitlines() if raw.strip())
 
 
-def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
-    """Read the outcome at a snapshotted marker count, ignoring later appends.
-
-    Legacy markers without a status retain their completed-turn behavior.
-    Unreadable or corrupt markers raise so the forwarder can retry delivery.
-    """
+def _read_marker(bridge_dir: Path, turn_end: int) -> dict[str, object]:
+    """Parse the marker at a snapshotted count; raise if it is missing or corrupt."""
     if turn_end <= 0:
         raise ValueError("turn-end marker count must be positive")
     lines = (bridge_dir / TURN_END_FILE).read_text(encoding="utf-8").splitlines()
@@ -92,7 +92,16 @@ def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
     marker = json.loads(markers[turn_end - 1])
     if not isinstance(marker, dict):
         raise ValueError("turn-end marker must be an object")
-    hook_status = marker.get("status", "completed")
+    return marker
+
+
+def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
+    """Read the outcome at a snapshotted marker count, ignoring later appends.
+
+    Legacy markers without a status retain their completed-turn behavior.
+    Unreadable or corrupt markers raise so the forwarder can retry delivery.
+    """
+    hook_status = _read_marker(bridge_dir, turn_end).get("status", "completed")
     if hook_status == "aborted":
         return "cancelled"
     if hook_status == "error":
@@ -100,6 +109,18 @@ def read_turn_outcome(bridge_dir: Path, turn_end: int) -> str:
     if hook_status == "completed":
         return "completed"
     raise ValueError(f"unknown cursor turn outcome: {hook_status!r}")
+
+
+def read_turn_chat_id(bridge_dir: Path, turn_end: int) -> str | None:
+    """Return the chat id the stop hook reported for a marker, or ``None``.
+
+    Legacy, unreadable, or corrupt markers yield ``None``; never raises.
+    """
+    try:
+        chat_id = _read_marker(bridge_dir, turn_end).get("chat_id")
+    except (OSError, ValueError, IndexError):
+        return None
+    return chat_id if isinstance(chat_id, str) and chat_id else None
 
 
 def read_posted_count(bridge_dir: Path) -> int:
