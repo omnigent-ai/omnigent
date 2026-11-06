@@ -255,6 +255,21 @@ def test_ping_pong_round_trip() -> None:
     assert decoded_o.ts == 1709654400000
 
 
+@pytest.mark.parametrize("busy", [True, False])
+def test_pong_busy_round_trips(busy: bool) -> None:
+    assert decode_frame(encode_frame(PongFrame(ts=7, busy=busy))) == PongFrame(ts=7, busy=busy)
+
+
+def test_unreported_pong_busy_stays_off_the_wire() -> None:
+    # Older servers and peers that do not report see the pong unchanged.
+    assert json.loads(encode_frame(PongFrame(ts=7))) == {"kind": "pong", "ts": 7}
+    assert decode_frame('{"kind": "pong", "ts": 7}') == PongFrame(ts=7, busy=None)
+
+
+def test_non_boolean_pong_busy_is_treated_as_unreported() -> None:
+    assert decode_frame('{"kind": "pong", "ts": 7, "busy": "yes"}') == PongFrame(ts=7, busy=None)
+
+
 # ── Decode failure modes ─────────────────────────────────
 
 

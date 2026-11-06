@@ -1,12 +1,16 @@
 """Keep a managed sandbox warm while its agent is still running.
 
-The runner tunnel's ping loop already stamps ``runner_last_seen`` every
-``PING_INTERVAL_S`` for as long as a runner holds a live tunnel, and a live
-runner tunnel is the server's signal that an agent is still working on that
-sandbox: the runner exits itself once idle (``runner.idle_timeout_s``), so the
-signal disappears on its own when the session goes quiet.
+A runner reports on each tunnel pong whether it did work since its previous
+pong (``PongFrame.busy``, decided by
+:class:`~omnigent.runner.busy_check.RunnerBusyCheck`). A live tunnel alone is not
+enough: a runner stays connected until its idle timeout
+(``runner.idle_timeout_s``) runs out, long after the session went quiet. So a
+reporting runner is refreshed only for intervals in which a pong said busy, and
+the first busy pong after an idle one refreshes at once, because a platform idle
+timer does not see the work itself. A runner that never reports (an older
+runner) keeps the previous behaviour: refreshed for as long as its tunnel is up.
 
-This module turns that existing signal into a provider
+This module turns that signal into a provider
 :meth:`~omnigent.onboarding.sandboxes.base.SandboxHostLauncher.keep_alive` call,
 so a sandbox whose platform reaps on inactivity, or one that expects the
 operator to push an absolute deadline forward, stays up while work is happening
@@ -75,6 +79,14 @@ _last_kept: dict[str, float] = {}
 _inflight: set[str] = set()
 _inflight_lock = threading.Lock()
 
+# runner_id -> busy value of its latest pong.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_last_pong_busy: dict[str, bool] = {}
+# runner_id -> whether any pong since the last refresh reported busy. Absent for
+# runners that do not report.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_busy_since_kept: dict[str, bool] = {}
+
 
 def configure(
     conversation_store: ConversationStore,
@@ -118,7 +130,30 @@ def keepalive_interval_s(runner_id: str) -> float:
     return _interval_for(runner_id)
 
 
-def touch(runner_id: str) -> None:
+def record_pong(runner_id: str, busy: bool | None) -> None:
+    """Note whether *runner_id* is doing work, from one of its tunnel pongs.
+
+    Once a runner reports, :func:`touch` skips it for any interval in which no
+    pong said busy. The first busy pong after an idle one refreshes right away:
+    a platform idle timer does not see the work itself, so a turn that starts
+    late in a long idle stretch must not wait up to an interval for its refresh.
+
+    :param runner_id: Runner that sent the pong.
+    :param busy: The pong's busy report; ``None`` when the runner does not report.
+    """
+    if busy is None:
+        return
+    was_busy = _last_pong_busy.get(runner_id)
+    _last_pong_busy[runner_id] = busy
+    if not busy:
+        _busy_since_kept.setdefault(runner_id, False)
+        return
+    _busy_since_kept[runner_id] = True
+    if was_busy is False:
+        touch(runner_id, force=True)
+
+
+def touch(runner_id: str, *, force: bool = False) -> None:
     """Keep the sandbox behind *runner_id* warm, at most every :func:`keepalive_interval_s`.
 
     Non-blocking and fail-safe: the provider call runs on a worker thread so a
@@ -137,12 +172,18 @@ def touch(runner_id: str) -> None:
     on the other side of this ping loop.
 
     :param runner_id: Runner with a live tunnel, e.g. ``"runner_token_abc"``.
+    :param force: Skip the interval throttle (an idle-to-busy edge from
+        :func:`record_pong`).
     """
     if _sandbox_config is None or _host_store is None or _executor is None:
         return
     now = time.monotonic()
     last = _last_kept.get(runner_id)
-    if last is not None and now - last < _interval_for(runner_id):
+    if not force and last is not None and now - last < _interval_for(runner_id):
+        return
+    # A reporting runner idle for the whole interval is left alone, so the
+    # platform's idle stop can reclaim its sandbox.
+    if _busy_since_kept.get(runner_id) is False:
         return
     with _inflight_lock:
         if runner_id in _inflight:
@@ -152,6 +193,8 @@ def touch(runner_id: str) -> None:
             return
         _inflight.add(runner_id)
     _last_kept[runner_id] = now
+    if runner_id in _busy_since_kept:
+        _busy_since_kept[runner_id] = False
     if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
         _prune_throttle(now)
     ctx = contextvars.copy_context()
@@ -164,6 +207,8 @@ def _prune_throttle(now: float) -> None:
     for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
         _last_kept.pop(runner_id, None)
         _runner_interval_s.pop(runner_id, None)
+        _last_pong_busy.pop(runner_id, None)
+        _busy_since_kept.pop(runner_id, None)
 
 
 def _keep_alive_for_runner(runner_id: str) -> None:

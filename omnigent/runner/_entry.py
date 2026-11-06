@@ -32,6 +32,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
+from omnigent.runner.busy_check import RunnerBusyCheck
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
@@ -1974,6 +1975,17 @@ async def _run_tunnel_from_env() -> None:
         callback = getattr(app.state, "has_active_work", None)
         return event_dispatcher.has_pending or (callable(callback) and bool(callback()))
 
+    def _last_native_activity() -> float | None:
+        """Return native forwarding progress independently of tunnel polling.
+
+        :returns: Monotonic time of the last forwarded native event, or ``None``.
+        """
+        dispatch_at = event_dispatcher.last_dispatch_at
+        post_at = native_forwarder_last_post_at()
+        if dispatch_at is None:
+            return post_at
+        return dispatch_at if post_at is None else max(dispatch_at, post_at)
+
     # Human-readable reason for why the runner is shutting down, recorded
     # by whichever path wins the shutdown race and logged on the way out so
     # the runner log explains the exit instead of just stopping.
@@ -2041,6 +2053,8 @@ async def _run_tunnel_from_env() -> None:
                 extra={"session_id": runner_primary_session_id()},
             )
             direct_attach_listener = None
+    # The server extends a managed sandbox only while pongs report busy.
+    pong_busy = RunnerBusyCheck(_has_active_work, _last_native_activity)
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -2053,6 +2067,7 @@ async def _run_tunnel_from_env() -> None:
             event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
+            report_busy=pong_busy.check,
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
             direct_attach_port=(

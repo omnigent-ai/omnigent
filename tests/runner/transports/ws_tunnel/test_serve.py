@@ -34,11 +34,13 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     PingFrame,
+    PongFrame,
     RequestCancelFrame,
     RequestFrame,
     WSCloseFrame,
     WSFrame,
     WSOpenFrame,
+    decode_frame,
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import (
@@ -2066,6 +2068,42 @@ async def test_handle_tunnel_frame_drops_malformed_frame(
 
     assert dispatch_tasks == {}
     assert sent == []
+
+
+def _report_busy_failure() -> bool:
+    raise RuntimeError("activity state unavailable")
+
+
+@pytest.mark.parametrize(
+    ("report_busy", "expected"),
+    [
+        pytest.param(None, None, id="not-reported"),
+        pytest.param(lambda: True, True, id="busy"),
+        pytest.param(lambda: False, False, id="idle"),
+        # Keeping a sandbox warm one extra interval beats stopping an in-use one.
+        pytest.param(_report_busy_failure, True, id="failing-report-counts-as-busy"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pong_carries_the_runners_busy_report(
+    report_busy: Callable[[], bool] | None, expected: bool | None
+) -> None:
+    """A ping is answered with a pong carrying the runner's busy report.
+
+    :param report_busy: The runner's busy callback, or ``None``.
+    :param expected: The ``busy`` value the pong must carry.
+    :returns: None.
+    """
+    sent: list[str] = []
+
+    async def _send_text(text: str) -> None:
+        sent.append(text)
+
+    await _handle_tunnel_frame(
+        _noop_app, encode_frame(PingFrame(ts=123)), _send_text, {}, {}, report_busy=report_busy
+    )
+
+    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, busy=expected)]
 
 
 @pytest.mark.asyncio

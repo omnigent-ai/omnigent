@@ -349,3 +349,88 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
     (resolve,) = launcher.bound
     resolve()  # type: ignore[operator]
     assert seen == ["alice"]
+
+
+class _BusyGate:
+    """Drive touch()/record_pong() with a fake clock and a recording executor."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.submitted: list[str] = []
+        self.now = 1000.0
+        monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+        monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+        monkeypatch.setattr(
+            managed_host_keepalive, "_executor", SimpleNamespace(submit=self._submit)
+        )
+        for name in ("_last_kept", "_runner_interval_s", "_last_pong_busy", "_busy_since_kept"):
+            monkeypatch.setattr(managed_host_keepalive, name, {})
+        monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+        monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 600.0)
+        monkeypatch.setattr(managed_host_keepalive.time, "monotonic", lambda: self.now)
+
+    def _submit(self, *args: object) -> None:
+        # touch() submits ctx.run(fn, runner_id); the real job frees the in-flight slot.
+        runner_id = str(args[-1])
+        self.submitted.append(runner_id)
+        managed_host_keepalive._inflight.discard(runner_id)
+
+    def tick(self, runner_id: str = "r1") -> None:
+        """One _keepalive_loop iteration, a full interval after the last."""
+        self.now += 600.0
+        managed_host_keepalive.touch(runner_id)
+
+
+def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    gate.tick()
+    gate.tick()
+    assert gate.submitted == ["r1", "r1", "r1"]
+
+
+def test_idle_runner_is_not_refreshed_until_work_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")  # connect: nothing reported yet
+    managed_host_keepalive.record_pong("r1", False)
+    gate.tick()
+    gate.tick()
+    assert gate.submitted == ["r1"], "an idle runner must let its sandbox stop"
+
+    # The first busy pong after idle refreshes at once, not at the next tick.
+    gate.now += 30.0
+    managed_host_keepalive.record_pong("r1", True)
+    assert gate.submitted == ["r1", "r1"]
+
+
+def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    for _ in range(3):
+        managed_host_keepalive.record_pong("r1", True)
+        gate.tick()
+    assert gate.submitted == ["r1"] * 4
+
+    managed_host_keepalive.record_pong("r1", True)
+    managed_host_keepalive.record_pong("r1", True)
+    assert len(gate.submitted) == 4, "busy pongs inside an interval must not refresh on their own"
+
+
+def test_work_that_ended_inside_an_interval_is_refreshed_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", True)
+    managed_host_keepalive.record_pong("r1", False)
+    gate.tick()
+    gate.tick()
+    assert gate.submitted == ["r1", "r1"]
+
+
+def test_unreported_pong_changes_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.record_pong("r1", None)
+    assert gate.submitted == []
+    assert "r1" not in managed_host_keepalive._busy_since_kept

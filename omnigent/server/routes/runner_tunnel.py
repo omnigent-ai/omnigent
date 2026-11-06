@@ -1004,6 +1004,13 @@ async def _receive_loop(
                     runner_id,
                     int(time.time() * 1000) - resp_frame.ts,
                 )
+                # Gate managed-sandbox refreshes on the runner's own busy report.
+                try:
+                    managed_host_keepalive.record_pong(runner_id, resp_frame.busy)
+                except Exception:
+                    _logger.exception(
+                        "managed keepalive pong record failed for runner %s", runner_id
+                    )
                 continue
             if isinstance(resp_frame, (WSFrame, WSCloseFrame)):
                 registry.route_ws_inbound(runner_id, resp_frame, session=session)
@@ -1026,7 +1033,9 @@ async def _keepalive_loop(runner_id: str) -> None:
     what lets the sandbox's shutdown window be short) or slower to save calls.
     Fires once immediately so a freshly connected (or reconnected) runner
     extends its sandbox right away, then every
-    :func:`managed_host_keepalive.keepalive_interval_s`. Best-effort:
+    :func:`managed_host_keepalive.keepalive_interval_s`; a runner that reports
+    busy on its pongs is refreshed only while busy (see
+    :func:`managed_host_keepalive.record_pong`). Best-effort:
     :func:`managed_host_keepalive.touch` swallows its own errors and no-ops when
     the host has no extendable sandbox, so this loop only ever ends when it is
     cancelled at tunnel teardown.

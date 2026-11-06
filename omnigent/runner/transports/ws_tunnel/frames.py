@@ -154,9 +154,16 @@ class PingFrame:
 
 @dataclass
 class PongFrame:
-    """Either direction: keepalive response — echoes the ping's ts."""
+    """Either direction: keepalive response — echoes the ping's ts.
+
+    :param ts: The ping's timestamp, echoed back.
+    :param busy: Runner-to-server only. Whether the runner did work since its
+        previous pong, so the server extends a managed sandbox only while it is
+        in use. ``None`` (omitted on the wire) means the sender does not report it.
+    """
 
     ts: int
+    busy: bool | None = None
 
 
 @dataclass
@@ -329,7 +336,10 @@ def encode_frame(frame: Frame) -> str:
     if isinstance(frame, PingFrame):
         return json.dumps({"kind": FrameKind.PING.value, "ts": frame.ts})
     if isinstance(frame, PongFrame):
-        return json.dumps({"kind": FrameKind.PONG.value, "ts": frame.ts})
+        pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
+        if frame.busy is not None:
+            pong["busy"] = frame.busy
+        return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
             {
@@ -453,7 +463,10 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.PING:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
-            return PongFrame(ts=_required_int(msg, "ts"))
+            busy = msg.get("busy")
+            return PongFrame(
+                ts=_required_int(msg, "ts"), busy=busy if isinstance(busy, bool) else None
+            )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)
         case FrameKind.WS_FRAME:
