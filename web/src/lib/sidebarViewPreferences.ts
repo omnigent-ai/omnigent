@@ -6,7 +6,7 @@ export type SidebarGrouping = "default" | "status" | "harness" | "created" | "up
 export type SidebarOrdering = "updated" | "created" | "name" | "custom";
 /** An ordering the server sorts by itself. */
 export type SidebarBaseOrdering = Exclude<SidebarOrdering, "custom">;
-export type SidebarShowField = "updated" | "environment" | "repo" | "branch";
+export type SidebarShowField = "harness" | "updated" | "environment" | "repo" | "branch";
 
 /** Saved positions on top of the automatic order Custom started from. */
 export interface SidebarCustomOrder {
@@ -39,6 +39,7 @@ export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = [
   "custom",
 ];
 export const SIDEBAR_SHOW_FIELDS: readonly SidebarShowField[] = [
+  "harness",
   "updated",
   "environment",
   "repo",

@@ -126,6 +126,7 @@ async def test_session_created_logs_parent_session_id_for_child(
     ]
     assert len(parent_created) == 1
     assert "parent_session_id" not in parent_created[0]["attributes"]
+    assert "created_by_session_id" not in parent_created[0]["attributes"]
     assert parent_created[0]["attributes"]["harness"] == "claude-sdk"
 
     child_agent = await create_test_agent(

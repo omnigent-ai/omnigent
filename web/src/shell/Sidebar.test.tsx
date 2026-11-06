@@ -4155,6 +4155,31 @@ describe("Sidebar view options", () => {
     ]);
   });
 
+  it("leads each row with its harness icon when Harness is shown", () => {
+    mockConversations([
+      conv("conv_claude", "claude-native-ui", {
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+      conv("conv_custom", "custom_acp", { harness: "acp:private" }),
+    ]);
+    renderGroupingSidebar();
+    expect(screen.queryByTestId("session-row-harness")).toBeNull();
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-harness"));
+
+    const claude = within(screen.getByText("conv_claude").closest("li")!);
+    expect(claude.getByTestId("session-row-harness")).toHaveAccessibleName("Claude Code harness");
+    // An unrecognized harness still gets a glyph, like a project's folder fallback.
+    const custom = within(screen.getByText("conv_custom").closest("li")!);
+    expect(custom.getByTestId("session-row-harness")).toBeTruthy();
+    // The icon centers beside the title + meta column, like a project row.
+    const link = claude.getByTestId("session-row-harness").closest("a");
+    expect(link).toHaveClass("items-center");
+    expect(link).not.toHaveClass("flex-col");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual(["harness"]);
+  });
+
   it("resolves an unrecorded branch only when Branch is shown, without a GitHub lookup", () => {
     useSessionWorktreesMock.mockReturnValue({
       data: {
