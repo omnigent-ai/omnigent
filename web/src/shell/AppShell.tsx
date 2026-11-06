@@ -1606,7 +1606,8 @@ function AppShellImpl() {
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
     const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
-    (visibleSelectedTab ?? tabList)?.focus();
+    // The rail is still sliding in from past the window edge; scrolling to it would shift the page.
+    (visibleSelectedTab ?? tabList)?.focus({ preventScroll: true });
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;
