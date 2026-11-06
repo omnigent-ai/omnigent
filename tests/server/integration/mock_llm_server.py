@@ -897,8 +897,11 @@ class _ResponseQueue:
         if self.required_tools is not None:
             return self.required_tools <= tool_names
         if self.index < len(self.responses):
-            calls = self.responses[self.index].tool_calls or []
-            return not calls or bool(tool_names)
+            response = self.responses[self.index]
+            has_function_calls = bool(response.tool_calls) or any(
+                item.get("type") == "function_call" for item in response.native_items or []
+            )
+            return not has_function_calls or bool(tool_names)
         return True
 
     def next(self) -> QueuedResponse:

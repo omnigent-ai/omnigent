@@ -17068,6 +17068,42 @@ def test_usable_composer_height_does_not_deliver_after_resize_failure(
     assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
 
 
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (
+            "Welcome\n\n\x1b[31m! Plugin dev mode is active\x1b[0m\n",
+            " Last terminal output:\nWelcome\n! Plugin dev mode is active",
+        ),
+        (
+            "Authorization: Bearer dapi" + "x" * 32,
+            " Last terminal output:\nAuthorization: [REDACTED]",
+        ),
+    ],
+    ids=["terminal-escapes", "credential-redaction"],
+)
+def test_claude_pane_failure_tail_ends_like_other_readiness_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: str
+) -> None:
+    """The standard failure block redacts terminal escapes and credential values."""
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_read_json_file",
+        lambda _path: {"socket_path": "/tmp/s", "tmux_target": "%1"},
+    )
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda _socket, _target: pane)
+
+    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == expected
+
+
+def test_claude_pane_failure_tail_is_empty_without_an_advertised_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unadvertised pane yields no block rather than an error."""
+    monkeypatch.setattr(claude_native_bridge, "_read_json_file", lambda _path: None)
+    assert claude_native_bridge.claude_pane_failure_tail(tmp_path) == ""
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("approved", [True, False])
 async def test_relay_approval_outlives_execution_and_http_timeouts(

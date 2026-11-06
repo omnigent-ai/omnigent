@@ -142,6 +142,8 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         captured, or ``None`` for failures with no person-actionable cause.
     """
     from omnigent.harnesses.claude_native.bridge import (
+        ClaudeComposerNotCleared,
+        ClaudeInjectionCancelled,
         ClaudePromptTimeout,
         ClaudeSignInPending,
         ClaudeTerminalDialog,
@@ -170,6 +172,18 @@ def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
         next_step = (
             "Claude Code's input box never appeared. It may still be starting, or waiting "
             "on a prompt such as a password. Check the terminal, then switch models again."
+        )
+    elif isinstance(exc, ClaudeComposerNotCleared):
+        next_step = (
+            "A draft is left in Claude Code's input box, so the switch was not sent. Open "
+            "the terminal, clear the input box, then switch models again."
+        )
+    elif isinstance(exc, ClaudeInjectionCancelled):
+        # A pane that never became ready uses up the switch budget before it can type.
+        next_step = (
+            "Claude Code did not accept the switch before the request timed out. It may "
+            "still be starting, or showing a prompt. Check the terminal, then switch models "
+            "again."
         )
     else:
         return None
@@ -1226,7 +1240,9 @@ def build_native_controls(
     async def _prepare_claude_native_pane_for_injection(
         conv_id: str,
         bridge_dir: Path,
-    ) -> None:
+        *,
+        ready_deadline: float | None = None,
+    ) -> bool:
         """Heal a dead-but-registered Claude pane before typing into it.
 
         Registry membership is not liveness: a pane whose tmux server died
@@ -1250,42 +1266,45 @@ def build_native_controls(
         No terminal registry means there is nothing to heal, and a recreate that
         produced no pane is not waited on either (inject keeps its own short
         advertisement timeout in both cases).
+
+        :returns: ``False`` when pane preparation outlasts its deadline;
+            every other case is ``True``.
         """
         from omnigent.harnesses.claude_native.bridge import claude_pane_ready
 
-        terminal_registry = resource_registry.terminal_registry if resource_registry else None
-        if terminal_registry is None:
-            return
-        terminal_name = native_terminal_name("claude-native")
-        if terminal_name is None:
-            return
-        # This probe duplicates the ensure path's own detection on purpose: its
-        # only job is to decide whether the readiness poll below runs at all.
-        instance = terminal_registry.get(conv_id, terminal_name, "main")
-        if instance is not None and await instance.is_alive():
-            return
-        await _ensure_native_terminal_for_turn(conv_id, "claude-native")
-        if terminal_registry.get(conv_id, terminal_name, "main") is None:
-            # The ensure swallows its own failures, so an unregistered pane here
-            # means nothing was created and nothing is booting. Waiting cannot
-            # help; let the injection fail fast as it did before.
-            return
-        deadline = time.monotonic() + _CLAUDE_PANE_READY_TIMEOUT_S
-        while True:
-            if await asyncio.to_thread(claude_pane_ready, bridge_dir):
-                return
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
-        # Let the injection report its own failure, as it did before this heal
-        # existed. Logged, else a pane that recreates but never boots is
-        # indistinguishable from a plain slow request.
-        _logger.warning(
-            "claude-native pane not ready %ss after re-create for session=%s; injecting anyway",
-            _CLAUDE_PANE_READY_TIMEOUT_S,
-            conv_id,
-            extra={"session_id": conv_id},
-        )
+        started = time.monotonic()
+        pane_deadline = started + _CLAUDE_PANE_READY_TIMEOUT_S
+        if ready_deadline is not None:
+            pane_deadline = min(pane_deadline, ready_deadline)
+        try:
+            async with asyncio.timeout(max(0.0, pane_deadline - time.monotonic())):
+                terminal_registry = (
+                    resource_registry.terminal_registry if resource_registry else None
+                )
+                if terminal_registry is None:
+                    return True
+                terminal_name = native_terminal_name("claude-native")
+                if terminal_name is None:
+                    return True
+                instance = terminal_registry.get(conv_id, terminal_name, "main")
+                if instance is not None and await instance.is_alive():
+                    return True
+                await _ensure_native_terminal_for_turn(conv_id, "claude-native")
+                if terminal_registry.get(conv_id, terminal_name, "main") is None:
+                    # No registered pane can become ready; injection fails fast.
+                    return True
+                while True:
+                    if await asyncio.to_thread(claude_pane_ready, bridge_dir):
+                        return True
+                    await asyncio.sleep(_CLAUDE_PANE_READY_POLL_S)
+        except TimeoutError:
+            _logger.warning(
+                "claude-native pane not ready %ss after recovery started for session=%s",
+                time.monotonic() - started,
+                conv_id,
+                extra={"session_id": conv_id},
+            )
+            return False
 
     async def _handle_claude_native_effort_change(
         conv_id: str,
@@ -1389,6 +1408,7 @@ def build_native_controls(
             ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
+            claude_pane_failure_tail,
             confirm_dialog_if_open,
             inject_slash_command,
             model_switch_acknowledged,
@@ -1420,14 +1440,40 @@ def build_native_controls(
         # The server rolls the pick back after its forward timeout, so no key may
         # reach the terminal past this deadline.
         deadline = _ClaudeControlDeadline()
-        bridge_id = await _claude_native_bridge_id_for_session(
-            server_client=server_client,
-            session_id=conv_id,
-        )
-        bridge_dir = bridge_dir_for_bridge_id(bridge_id)
-        await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
+        bridge_dir: Path | None = None
+        claude_config: ClaudeNativeUcodeConfig | None = None
+        pane_ready = False
+        try:
+            async with asyncio.timeout(deadline.remaining_s()):
+                bridge_id = await _claude_native_bridge_id_for_session(
+                    server_client=server_client,
+                    session_id=conv_id,
+                )
+                bridge_dir = bridge_dir_for_bridge_id(bridge_id)
+                pane_ready = await _prepare_claude_native_pane_for_injection(
+                    conv_id, bridge_dir, ready_deadline=deadline.at
+                )
+                if pane_ready:
+                    claude_config = await _resolve_session_claude_launch_config(conv_id)
+        except TimeoutError:
+            deadline.set()
+        if bridge_dir is None or not pane_ready or deadline.is_set():
+            tail = ""
+            if bridge_dir is not None and not deadline.is_set():
+                try:
+                    async with asyncio.timeout(deadline.remaining_s()):
+                        tail = await asyncio.to_thread(claude_pane_failure_tail, bridge_dir)
+                except TimeoutError:
+                    pass
+            detail = (
+                "The Claude terminal is still starting, so the switch was not sent. "
+                "Retry in a moment." + tail
+            )
+            return JSONResponse(
+                status_code=503,
+                content={"error": "claude_native_model_failed", "detail": detail},
+            )
         selected_model = model.strip()
-        claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
