@@ -220,7 +220,14 @@ function buildLoginArgs(serverUrl) {
  * Arca, or `arca login` on this machine).
  *
  * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
- * @returns {{ ok: false, error: string, errorKind: ArcaErrorKind, authError?: boolean }}
+ * @returns {{
+ *   ok: false,
+ *   error: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   errorKind: ArcaErrorKind,
+ *   authError?: boolean,
+ * }}
  */
 function describeConnectFailure(run) {
   const output = `${run.stderr}\n${run.stdout}`;
@@ -231,6 +238,8 @@ function describeConnectFailure(run) {
       error:
         "Connecting to Arca timed out. The instance may still be starting — " +
         "check `arca status` and try again.",
+      errorMessage: "Connecting to Arca timed out. The instance may still be starting.",
+      errorAction: "Check `arca status` and try again.",
     };
   }
   // `omni host --non-interactive` fails loud with a sign-in hint when the
@@ -243,6 +252,9 @@ function describeConnectFailure(run) {
       error:
         "The Arca instance isn't signed in to this server. Run " +
         "`arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
+      errorMessage: "The Arca instance isn't signed in to this server.",
+      errorAction:
+        "Run `arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
     };
   }
   // The remote shell couldn't find isaac (or isaac couldn't find omni) on the
@@ -254,6 +266,9 @@ function describeConnectFailure(run) {
       error:
         "`isaac omni` isn't available on the Arca instance. " +
         "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
+      errorMessage: "`isaac omni` isn't available on the Arca instance.",
+      errorAction:
+        "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
     };
   }
   // This machine's arca credentials are missing or expired, so ssh never
@@ -264,6 +279,8 @@ function describeConnectFailure(run) {
       errorKind: "arca-auth",
       error:
         "Your arca sign-in on this machine has expired. Run `arca login` in a terminal, then try again.",
+      errorMessage: "Your arca sign-in on this machine has expired.",
+      errorAction: "Run `arca login` in a terminal, then try again.",
     };
   }
   if (/error connecting to arca/i.test(output)) {
@@ -273,6 +290,8 @@ function describeConnectFailure(run) {
       error:
         "Couldn't reach the Arca instance. Try `arca stop && arca start` in a terminal, " +
         "then connect again.",
+      errorMessage: "Couldn't reach the Arca instance.",
+      errorAction: "Try `arca stop && arca start` in a terminal, then connect again.",
     };
   }
   const detail = run.stderr.trim() || run.stdout.trim();

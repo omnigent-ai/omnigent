@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -134,6 +135,11 @@ def test_private_manager_launch_send_read_and_sharing(
                         "workspace": str(stack.workspace),
                     }
                     if harness == "codex-native":
+                        # Codex's own default asks before each Omnigent tool call;
+                        # the mocked automatic reviewer approves them instead.
+                        metadata["terminal_launch_args"] = PERMISSION_LAUNCH_ARGS["codex-native"][
+                            "approve-for-me"
+                        ]
                         created = create_native_session(
                             client,
                             stack.base_url,
@@ -278,6 +284,12 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
 
                 agent = client.get(f"/v1/sessions/{worker}").json()["agent_id"]
+                # A session the manager starts is filed beside it, in its project.
+                project = client.post("/v1/projects", json={"name": "Orchestration"})
+                assert project.status_code == 200, project.text
+                project_id = project.json()["id"]
+                filed = client.patch(f"/v1/sessions/{manager}", json={"project_id": project_id})
+                assert filed.status_code == 200, filed.text
                 configure("NEW_WORKER_TASK", [{"text": "NEW_WORKER_RESULT"}])
                 configure(
                     "MANAGER_SEND_READ_CREATE",
@@ -306,6 +318,7 @@ def test_private_manager_launch_send_read_and_sharing(
                 created = client.get(f"/v1/sessions/{created['id']}").json()
                 assert created["parent_session_id"] is None
                 assert created["labels"]["omnigent.created_by_session_id"] == manager
+                assert created["project_id"] == project_id
                 assert created["host_id"] == host_id
                 wait_text(created["id"], "NEW_WORKER_RESULT")
                 grants = client.get(f"/v1/sessions/{created['id']}/permissions").json()[
@@ -384,9 +397,10 @@ def test_private_manager_launch_send_read_and_sharing(
                     ]
                 } == before_managed
 
+                # Read-only viewers cannot add input; an editor could steer the manager.
                 shared = client.put(
                     f"/v1/sessions/{manager}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={"user_id": "bob", "level": 2},
                 )
                 assert shared.status_code == 200, shared.text
                 configure(
@@ -407,7 +421,7 @@ def test_private_manager_launch_send_read_and_sharing(
                 send(manager, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK")
                 wait_text(manager, "MANAGER_BLOCKED")
                 assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
-                assert "Shared sessions cannot" in json.dumps(get_mock_requests(mock))
+                assert "shared with edit access cannot" in json.dumps(get_mock_requests(mock))
 
                 configure(
                     "SCHEDULED_MANAGER_TASK",
@@ -446,6 +460,13 @@ def test_private_manager_launch_send_read_and_sharing(
                         "agent_id": agent,
                         "host_id": host_id,
                         "workspace": str(stack.workspace),
+                        # Nobody watches an automation's turn, so Codex's own
+                        # default would park on the first Omnigent tool call.
+                        **(
+                            {"permission_mode": "approve-for-me"}
+                            if harness == "codex-native"
+                            else {}
+                        ),
                     },
                 )
                 assert response.status_code == 200, response.text
@@ -511,4 +532,4 @@ def test_private_manager_launch_send_read_and_sharing(
                 assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 # Native tool results reach the model without entering the UI transcript.
                 side_chat_results = tool_results("side-chat-message")
-                assert "Shared sessions cannot" in json.dumps(side_chat_results)
+                assert "shared with edit access cannot" in json.dumps(side_chat_results)

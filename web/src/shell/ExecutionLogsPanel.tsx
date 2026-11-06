@@ -137,6 +137,8 @@ export function ExecutionLogsPanel({
       ref={ref}
       data-testid="execution-logs-panel"
       data-state={open ? "open" : "closed"}
+      // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
+      data-escape-owner={open ? "" : undefined}
       style={{ width: panelWidth }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",

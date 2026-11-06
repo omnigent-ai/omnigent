@@ -138,7 +138,12 @@ export interface ServerInfo {
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
+    {
+      multi_repo?: boolean;
+      inference_models?: boolean;
+      default_models?: boolean;
+      repo_catalog?: { name: string; url: string }[];
+    }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -220,6 +225,8 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /** True when scheduled tasks accept the optional random-worktree base ref. */
+  scheduled_task_worktrees?: boolean;
   /**
    * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
    * ignore it, so the palette lists one mixed search group there. Fails to
@@ -232,6 +239,12 @@ export interface ServerInfo {
    * Session control there. Fails to ``false``.
    */
   scheduled_task_session_modes?: boolean;
+  /** Connected hosts and continued sandboxes accept ten-minute schedules. */
+  scheduled_task_subhour?: boolean;
+  /** Server default for new trigger templates, from 10 to 240 minutes. */
+  automation_trigger_poll_minutes?: number;
+  /** Sandbox automations accept a repository URL as their workspace. */
+  scheduled_task_sandbox_workspaces?: boolean;
   /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
@@ -253,6 +266,11 @@ export interface ServerInfo {
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
   /**
+   * True when a claude-sdk `clear` continues in a new session. Older servers
+   * list `clear` for native sessions only; absent there (off).
+   */
+  session_claude_sdk_clear?: boolean;
+  /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
    */
@@ -264,6 +282,10 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Scheduled tasks accept a project; absent on older servers (off). */
   scheduled_task_projects?: boolean;
+  /** Latest sessionless automation failures can be listed for Inbox. */
+  scheduled_task_inbox?: boolean;
+  /** Scheduled permissions support native harnesses beyond Claude Code. */
+  scheduled_task_harness_settings?: boolean;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
   /**
@@ -396,9 +418,12 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   harness_install_enabled: false,
   installable_harnesses: [],
   dictation_available: false,
+  scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
+  scheduled_task_subhour: false,
+  scheduled_task_sandbox_workspaces: false,
   request_managed_sandbox_host_id: false,
   session_fork_workspaces: false,
   branding: null,
@@ -458,6 +483,44 @@ export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boole
 let cachedServerInfo: ServerInfo | null = null;
 let pendingServerInfo: Promise<ServerInfo> | null = null;
 
+function parseSandboxProviderCapabilities(
+  value: unknown,
+): NonNullable<ServerInfo["sandbox_provider_capabilities"]> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([provider, capabilities]) => {
+      if (
+        capabilities === null ||
+        typeof capabilities !== "object" ||
+        Array.isArray(capabilities)
+      ) {
+        return [];
+      }
+      return [
+        [
+          provider,
+          {
+            ...capabilities,
+            repo_catalog: Array.isArray(capabilities.repo_catalog)
+              ? capabilities.repo_catalog.filter(
+                  (repo: unknown): repo is { name: string; url: string } =>
+                    repo !== null &&
+                    typeof repo === "object" &&
+                    "name" in repo &&
+                    typeof repo.name === "string" &&
+                    repo.name.trim() !== "" &&
+                    "url" in repo &&
+                    typeof repo.url === "string" &&
+                    repo.url.trim() !== "",
+                )
+              : [],
+          },
+        ],
+      ];
+    }),
+  );
+}
+
 /**
  * Fetch ``/v1/info`` once and cache the result.
  *
@@ -492,14 +555,9 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           sandbox_providers: Array.isArray(data.sandbox_providers)
             ? data.sandbox_providers.filter((p): p is string => typeof p === "string")
             : [],
-          // Plain-object guard only; consumers read `?.[p]?.multi_repo === true`,
-          // so any stray shape reads as "unset" (off) rather than throwing.
-          sandbox_provider_capabilities:
-            data.sandbox_provider_capabilities !== null &&
-            typeof data.sandbox_provider_capabilities === "object" &&
-            !Array.isArray(data.sandbox_provider_capabilities)
-              ? (data.sandbox_provider_capabilities as ServerInfo["sandbox_provider_capabilities"])
-              : {},
+          sandbox_provider_capabilities: parseSandboxProviderCapabilities(
+            data.sandbox_provider_capabilities,
+          ),
           enabled_connections: Array.isArray(data.enabled_connections)
             ? data.enabled_connections.filter((p): p is string => typeof p === "string")
             : [],
@@ -521,9 +579,19 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             ? data.installable_harnesses.filter((h): h is string => typeof h === "string")
             : [],
           dictation_available: data.dictation_available === true,
+          scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
+          scheduled_task_subhour: data.scheduled_task_subhour === true,
+          automation_trigger_poll_minutes:
+            typeof data.automation_trigger_poll_minutes === "number" &&
+            Number.isInteger(data.automation_trigger_poll_minutes) &&
+            data.automation_trigger_poll_minutes >= 10 &&
+            data.automation_trigger_poll_minutes <= 240
+              ? data.automation_trigger_poll_minutes
+              : 10,
+          scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
           agent_install: data.agent_install === true,
@@ -532,9 +600,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
+          scheduled_task_inbox: data.scheduled_task_inbox === true,
+          scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           branding: parseBranding(data.branding),
           picker: parsePicker(data.picker),
         };
