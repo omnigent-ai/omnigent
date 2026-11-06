@@ -4289,7 +4289,7 @@
           },
           "user_authored": {
             "default": false,
-            "description": "Originated from an explicit user action; may be server-expanded, e.g. skill instructions. Independent of `is_meta`; client-settable by convention, not a trust signal.",
+            "description": "Originated from an explicit user action; may be server-expanded, e.g. skill instructions. Independent of `is_meta`; client-settable by convention, not a trust signal. Also exempts the message from legacy markup cleanup on import.",
             "title": "User Authored",
             "type": "boolean"
           }

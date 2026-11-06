@@ -326,7 +326,8 @@ class MessageData(BaseModel):
         suppress delayed preview chunks after the authoritative item.
     :param user_authored: Originated from an explicit user action; may be
         server-expanded, e.g. skill instructions. Independent of ``is_meta``;
-        client-settable by convention, not a trust signal.
+        client-settable by convention, not a trust signal. Also exempts the
+        message from legacy markup cleanup on import.
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
