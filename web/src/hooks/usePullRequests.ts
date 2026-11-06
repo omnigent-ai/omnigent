@@ -587,11 +587,16 @@ export function usePullRequestInfo(
   return useQuery(pullRequestInfoQueryOptions(context, options));
 }
 
-/** Linked PR details at the list cadence; the session's base query handles turn-end refresh. */
-export function usePullRequestInfos(rawConversationId: string | undefined, prUrls: string[]) {
+/** Linked PR details, by default at the list cadence; the session's base query handles turn-end refresh. */
+export function usePullRequestInfos(
+  rawConversationId: string | undefined,
+  prUrls: string[],
+  options?: { poll?: "list" | false },
+) {
   const context = usePullRequestQueryContext(rawConversationId);
+  const poll = options?.poll ?? "list";
   return useQueries({
-    queries: prUrls.map((prUrl) => pullRequestInfoQueryOptions(context, { poll: "list", prUrl })),
+    queries: prUrls.map((prUrl) => pullRequestInfoQueryOptions(context, { poll, prUrl })),
   });
 }
 

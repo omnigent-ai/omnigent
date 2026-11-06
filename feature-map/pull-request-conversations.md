@@ -7,7 +7,9 @@ together in Comments.
 ## Sub-features
 
 - `request-selection`: A single PR opens its details directly; multiple PRs open
-  a list with navigation back from details.
+  a list with navigation back from details. The list header's
+  **Filter pull requests by status** menu narrows it to Open, Draft, Merged or
+  Closed with per-status counts; the choice survives opening a PR and returning.
 - `commit-history`: Comments interleave commit and force-push entries by time,
   with short commit links and exact timestamps on hover. Missing history is
   marked incomplete; the Comments badge counts only comments.
