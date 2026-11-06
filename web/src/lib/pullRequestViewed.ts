@@ -75,32 +75,31 @@ function hunkText(file: FileDiffMetadata): string | null {
   if (!file.hunks?.length) return null;
   const lines: string[] = [];
   for (const hunk of file.hunks) {
-    const hunkLines: string[] = [];
+    lines.push(
+      `@@ -${hunk.deletionStart},${hunk.deletionCount} +${hunk.additionStart},${hunk.additionCount} @@`,
+    );
+    // One push per line: spreading a large hunk into push() exceeds the call-argument limit.
     let deletionTotal = 0;
     let additionTotal = 0;
     for (const part of hunk.hunkContent) {
       if (part.type === "context") {
         for (let offset = 0; offset < part.lines; offset++) {
-          hunkLines.push(` ${file.additionLines[part.additionLineIndex + offset]}`);
+          lines.push(` ${file.additionLines[part.additionLineIndex + offset]}`);
         }
         deletionTotal += part.lines;
         additionTotal += part.lines;
         continue;
       }
       for (let offset = 0; offset < part.deletions; offset++) {
-        hunkLines.push(`-${file.deletionLines[part.deletionLineIndex + offset]}`);
+        lines.push(`-${file.deletionLines[part.deletionLineIndex + offset]}`);
       }
       for (let offset = 0; offset < part.additions; offset++) {
-        hunkLines.push(`+${file.additionLines[part.additionLineIndex + offset]}`);
+        lines.push(`+${file.additionLines[part.additionLineIndex + offset]}`);
       }
       deletionTotal += part.deletions;
       additionTotal += part.additions;
     }
     if (deletionTotal !== hunk.deletionCount || additionTotal !== hunk.additionCount) return null;
-    lines.push(
-      `@@ -${hunk.deletionStart},${hunk.deletionCount} +${hunk.additionStart},${hunk.additionCount} @@`,
-      ...hunkLines,
-    );
   }
   return lines.join("\n");
 }
@@ -126,8 +125,9 @@ const storedSchema = z.object({
   updatedAt: z.number(),
 });
 
-// Values whose localStorage write failed. They win over storage until another tab changes it.
-const memoryFallback = new Map<string, string>();
+// This tab's changes that storage has not accepted, per key: each changed path's new hashes, or
+// null when the path was dropped. Reads apply them over what storage holds, so other tabs' writes show.
+const unsavedChanges = new Map<string, Map<string, string[] | null>>();
 const listeners = new Set<() => void>();
 // Bumped on every change this module can observe, so snapshots are recomputed only then.
 let version = 0;
@@ -154,17 +154,17 @@ if (typeof window !== "undefined") {
     } catch {
       // Unreadable storage: treat the event as ours and re-read.
     }
-    if (event.key === null) memoryFallback.clear();
-    else if (isStoredKey(event.key)) memoryFallback.delete(event.key);
-    else return;
+    // A cleared store discards unsaved changes. Another tab's write is applied under them on read.
+    if (event.key === null) unsavedChanges.clear();
+    else if (!isStoredKey(event.key)) return;
     notify();
   });
 }
 
-/** The entry under `key`, or null when it is absent, unreadable or not a version 2 entry. */
+/** The entry stored under `key`, or null when it is absent, unreadable or not a version 2 entry. */
 function readStored(key: string): z.infer<typeof storedSchema> | null {
   try {
-    const raw = memoryFallback.get(key) ?? window.localStorage.getItem(key);
+    const raw = window.localStorage.getItem(key);
     const result = storedSchema.safeParse(JSON.parse(raw ?? "null"));
     return result.success ? result.data : null;
   } catch {
@@ -172,12 +172,18 @@ function readStored(key: string): z.infer<typeof storedSchema> | null {
   }
 }
 
+/** The marks storage holds for `key`, with this tab's unsaved changes applied over them. */
 function readMarks(key: string): ViewedMarks {
-  return readStored(key)?.marks ?? {};
+  const marks = new Map(Object.entries(readStored(key)?.marks ?? {}));
+  for (const [path, hashes] of unsavedChanges.get(key) ?? []) {
+    if (hashes === null) marks.delete(path);
+    else marks.set(path, hashes);
+  }
+  return Object.fromEntries(marks);
 }
 
 function storedKeys(): string[] {
-  const keys = new Set(memoryFallback.keys());
+  const keys = new Set(unsavedChanges.keys());
   try {
     for (let position = 0; position < window.localStorage.length; position++) {
       const key = window.localStorage.key(position);
@@ -191,12 +197,12 @@ function storedKeys(): string[] {
 
 /**
  * Removes entries past the age or count limit, and every version 1 entry, which is never read.
- * Unreadable entries count as oldest. `keepKey` is never removed.
+ * Unreadable entries count as oldest. `keepKey` and entries with unsaved changes are never removed.
  */
 function pruneEntries(keepKey: string, now: number): void {
   // Parses every stored entry per write; cache their ages if this shows up in profiles.
   const entries = storedKeys()
-    .filter((key) => key !== keepKey && !memoryFallback.has(key))
+    .filter((key) => key !== keepKey && !unsavedChanges.has(key))
     .map((key) => [key, readStored(key)?.updatedAt ?? -Infinity] as const)
     .sort((a, b) => b[1] - a[1]);
   try {
@@ -210,7 +216,21 @@ function pruneEntries(keepKey: string, now: number): void {
   }
 }
 
-/** Store a pull request's marks under `key`. Keeps them in memory if storage fails. */
+/** The paths where `marks` differs from `stored`, as the changes `readMarks` applies over `stored`. */
+function changesOver(stored: ViewedMarks, marks: ViewedMarks): Map<string, string[] | null> {
+  const changes = new Map<string, string[] | null>();
+  for (const path of new Set([...Object.keys(stored), ...Object.keys(marks)])) {
+    if (JSON.stringify(stored[path] ?? null) !== JSON.stringify(marks[path] ?? null)) {
+      changes.set(path, marks[path] ?? null);
+    }
+  }
+  return changes;
+}
+
+/**
+ * Store a pull request's marks under `key`. If storage refuses, the changes stay in this tab over
+ * what storage holds until a write succeeds.
+ */
 export function writeViewed(key: string, marks: ViewedMarks): { persisted: boolean } {
   const updatedAt = Date.now();
   const value = JSON.stringify({ v: 2, marks, updatedAt });
@@ -218,10 +238,12 @@ export function writeViewed(key: string, marks: ViewedMarks): { persisted: boole
   let persisted = true;
   try {
     window.localStorage.setItem(key, value);
-    memoryFallback.delete(key);
+    unsavedChanges.delete(key);
   } catch {
-    memoryFallback.set(key, value);
     persisted = false;
+    const changes = changesOver(readStored(key)?.marks ?? {}, marks);
+    if (changes.size > 0) unsavedChanges.set(key, changes);
+    else unsavedChanges.delete(key);
   }
   notify();
   return { persisted };
@@ -255,7 +277,7 @@ interface ViewedSnapshot {
    * PR's list too, so callers show only the ones they render.
    */
   changed: ReadonlySet<string>;
-  /** False while the marks come only from memory because storage failed. */
+  /** False while this tab's changes to the pull request are not yet stored. */
   persisted: boolean;
 }
 
@@ -279,7 +301,7 @@ function snapshotReader(
     if (seenVersion !== version) {
       seenVersion = version;
       const { viewed, changed } = classify(readMarks(storageKey), fingerprintOf);
-      snapshot = { available: true, viewed, changed, persisted: !memoryFallback.has(storageKey) };
+      snapshot = { available: true, viewed, changed, persisted: !unsavedChanges.has(storageKey) };
     }
     return snapshot;
   };
@@ -311,21 +333,22 @@ export function useViewedFiles(
   const setMany = useCallback(
     (paths: string[], viewed: boolean) => {
       if (storageKey === null || head === null) return;
-      // Read what is stored now, so back-to-back calls and other tabs' writes are not lost.
+      // Start from what storage holds now plus this tab's unsaved changes, so other tabs' writes survive.
       const after = new Map(Object.entries(readMarks(storageKey)));
       let modified = false;
       for (const path of paths) {
+        if (!viewed) {
+          // Unmarking forgets every hash, including one a stale view of this file still shows.
+          if (after.delete(path)) modified = true;
+          continue;
+        }
         const hash = fingerprintOf(path);
         const hashes = after.get(path) ?? [];
-        if (viewed) {
-          if (hashes.includes(hash)) continue;
-          modified = true;
-          after.set(path, [...hashes, hash].slice(-MAX_HASHES_PER_PATH));
-        } else if (hashes.includes(hash)) {
-          // Unmarking forgets every hash, so an older head's hash can't bring the badge back.
-          modified = true;
-          after.delete(path);
-        }
+        if (hashes.includes(hash)) continue;
+        modified = true;
+        // Stand-ins from other heads can never match here, so they don't push out a comparable hash.
+        const comparable = hashes.filter(isVerified);
+        after.set(path, [...comparable, hash].slice(-MAX_HASHES_PER_PATH));
       }
       if (modified) writeViewed(storageKey, Object.fromEntries(after));
     },

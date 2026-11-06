@@ -156,13 +156,15 @@ Component coverage for these helpers and views lives in
   have not been exercised; these results come from the code paths.
 - **Viewed marks are browser-local.** They do not sync to GitHub or other browsers.
   They are separate for each Omnigent server, signed-in user and pull request, and
-  clearing site data removes them. If the browser refuses storage, marks stay in memory and a
-  reload drops them, with the toast `Viewed files can’t be saved on this device.`
+  clearing site data removes them. If the browser refuses storage, your changes stay in
+  this tab over the stored marks, so other tabs' writes still show. A reload drops them,
+  with the toast `Viewed files can’t be saved on this device.` Clearing site data also
+  discards them.
 - **Marks follow the content, not the head.** Each mark is the hash of a file's hunks
   as you viewed them. One mark per file covers every head of the pull request, and a
   tab still open on an older head adds its own hash without disturbing the newer
-  head's mark. A file keeps its three newest hashes. A file that changes back to a
-  version beyond those three shows as changed.
+  head's mark. A file keeps its three most recently marked hashes. A file that changes
+  back to a version beyond those three shows as changed.
 - **Unmarking forgets every head.** Unmarking a file clears all of its marks, including
   the hashes an older head's tab recorded. The file then reads as unviewed on every
   head, with no **Changed since viewed** badge.
@@ -170,7 +172,8 @@ Component coverage for these helpers and views lives in
   no text hunks, and a file whose hunks were cut short can't be compared. Its mark
   matches only on the head it was made for, and a mismatch shows no badge and no
   notice. A mark recorded only that way stays silent even after the file's hunks
-  become comparable; the badge needs at least one comparable mark. Files whose names
+  become comparable; the badge needs at least one comparable mark. Such marks never push
+  out a comparable one. Files whose names
   git quotes (non-ASCII or special characters) have no parsed diff in the Changes
   tab, so they always behave this way.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.

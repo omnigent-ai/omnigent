@@ -175,6 +175,21 @@ describe("patchFileHashes", () => {
     );
   });
 
+  it("hashes a hunk too large to pass as call arguments", () => {
+    const lines = Array.from({ length: 150_000 }, (_, index) => `+line ${index}`);
+    const patch = [
+      "diff --git a/big.ts b/big.ts",
+      "new file mode 100644",
+      "index 0000000..1111111",
+      "--- /dev/null",
+      "+++ b/big.ts",
+      `@@ -0,0 +1,${lines.length} @@`,
+      ...lines,
+      "",
+    ].join("\n");
+    expect(hashesOf(patch).has("big.ts")).toBe(true);
+  });
+
   it("leaves out a file whose hunks were cut short, so its marks stay unverified", () => {
     // The parser accepts a hunk that ends early; its header counts show the lines are missing.
     const truncated = PATCH_A.replace("+new\n", "");
@@ -312,6 +327,18 @@ describe("useViewedFiles", () => {
       rerender({ head, patchHashes: aAt(line) });
       expect(result.current.changed.size).toBe(0);
     }
+
+    // A view still shows the file viewed at h2 while another tab has replaced the history without
+    // that hash. The unmark, sent before that view hears of the change, still clears every hash.
+    rerender({ head: "h2", patchHashes: aAt("two") });
+    act(() => result.current.setMany(["a.ts"], true));
+    localStorage.setItem(
+      KEY,
+      stored({ "a.ts": [aAt("three").get("a.ts")!, aAt("four").get("a.ts")!] }),
+    );
+    expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+    act(() => result.current.setMany(["a.ts"], false));
+    expect(readMarksFromStorage()).toEqual({});
   });
 
   it("stays silent for history recorded only without comparable hunks", () => {
@@ -356,6 +383,22 @@ describe("useViewedFiles", () => {
     expect(result.current.changed).toEqual(new Set(["a.ts"]));
   });
 
+  it("keeps a comparable mark when later heads only record stand-ins", () => {
+    const { result, rerender } = renderHook(
+      ({ head, patchHashes }) => useViewedFiles(PR, head, patchHashes),
+      { initialProps: { head: "head1", patchHashes: hashes } },
+    );
+    act(() => result.current.setMany(["a.ts"], true));
+    for (const head of ["head2", "head3", "head4"]) {
+      rerender({ head, patchHashes: new Map() });
+      act(() => result.current.setMany(["a.ts"], true));
+    }
+    expect(readMarksFromStorage()["a.ts"]).toContain(hashes.get("a.ts"));
+
+    rerender({ head: "head1", patchHashes: hashes });
+    expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+  });
+
   it("keeps marks in memory when storage fails and reports them unsaved until a write succeeds", () => {
     const writes = failStorageWrites();
     const first = renderHook(({ pr }) => useViewedFiles(pr, "head1", hashes), {
@@ -383,36 +426,38 @@ describe("useViewedFiles", () => {
     expect(remounted.result.current.persisted).toBe(false);
     reads.mockRestore();
 
+    // Another tab persists c.ts while this tab's writes are refused, and no event reaches here yet.
     writes.mockRestore();
+    localStorage.setItem(KEY, stored({ "c.ts": ["c1"] }));
     act(() => remounted.result.current.setMany(["b.ts"], true));
     expect(remounted.result.current.persisted).toBe(true);
     expect(readMarksFromStorage()).toEqual({
       "a.ts": [hashes.get("a.ts")],
       "b.ts": [hashes.get("b.ts")],
+      "c.ts": ["c1"],
     });
   });
 
-  it("follows writes and clears from another tab, even over unsaved marks", () => {
+  it("applies another tab's writes under unsaved marks, and a clear discards them", () => {
     const { result } = renderHook(() => useViewedFiles(PR, "head1", hashes));
     localStorage.setItem(KEY, stored({ "a.ts": [hashes.get("a.ts")!] }));
     storageEvent(KEY);
     expect(result.current.viewed).toEqual(new Set(["a.ts"]));
 
-    // Unsaved local marks are replaced, not merged, when another tab writes this key.
     const writes = failStorageWrites();
     act(() => result.current.setMany(["b.ts"], true));
-    expect(result.current.viewed).toEqual(new Set(["a.ts", "b.ts"]));
     expect(result.current.persisted).toBe(false);
     writes.mockRestore();
-    localStorage.setItem(KEY, stored({ "a.ts": [hashes.get("a.ts")!] }));
+
+    // The unsaved b.ts stays on top of the other tab's write, which replaces the stored marks.
+    localStorage.setItem(KEY, stored({ "c.ts": [unverifiedPatchHash("head1")] }));
     storageEvent(KEY);
-    expect(result.current.viewed).toEqual(new Set(["a.ts"]));
-    expect(result.current.persisted).toBe(true);
+    expect(result.current.viewed).toEqual(new Set(["b.ts", "c.ts"]));
+    expect(result.current.persisted).toBe(false);
 
     localStorage.clear();
     storageEvent(null);
     expect(result.current.viewed.size).toBe(0);
-    act(() => result.current.setMany(["next.ts"], true));
     expect(result.current.persisted).toBe(true);
   });
 
