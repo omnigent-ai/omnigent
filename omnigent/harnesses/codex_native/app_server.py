@@ -1155,6 +1155,50 @@ def codex_resume_current_model_provider(exc: BaseException) -> str | None:
     return current if isinstance(current, str) and current else None
 
 
+def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the thread's provider when ``thread/resume`` refuses it as unconfigured.
+
+    Codex 0.166+ refuses a thread whose recorded provider has no
+    ``[model_providers.X]`` table, even when the resume names a configured
+    provider — e.g. a thread started under ``Databricks`` resumed after the
+    host switched to ``omnigent_databricks``.
+
+    :param exc: The exception raised by the resume request.
+    :returns: The thread's unconfigured provider, e.g. ``"Databricks"``, or
+        ``None`` for any other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    data = exc.error.get("data") if isinstance(exc.error, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "modelProviderNotConfigured":
+        return None
+    missing = data.get("modelProvider")
+    return missing if isinstance(missing, str) and missing else None
+
+
+async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
+    """
+    Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
+
+    :param client: Connected app-server client.
+    :param cwd: Working directory whose config layers apply.
+    :returns: The effective provider id, e.g. ``"omnigent_databricks"``.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.request("config/read", {"includeLayers": False, "cwd": str(cwd)}),
+            timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+    except (CodexAppServerResponseError, OSError, TimeoutError):
+        _logger.warning("Could not read Codex's effective model provider", exc_info=True)
+        return None
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    effective = config.get("model_provider") if isinstance(config, dict) else None
+    return effective if isinstance(effective, str) and effective else None
+
+
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex explicitly refused this RPC before submitting its input."""
     return (
@@ -5210,7 +5254,8 @@ async def preload_codex_thread_for_resume(
     :param model_provider: Launch-selected provider to apply over persisted thread settings.
         None preserves Codex's default resume behavior.
     :param rollout_path: Thread rollout to restamp when Codex refuses the resume
-        because its effective provider differs, e.g. under a managed config.
+        because its effective provider differs, e.g. under a managed config, or
+        because the thread's recorded provider is no longer configured.
         None surfaces that refusal.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
@@ -5267,8 +5312,19 @@ async def preload_codex_thread_for_resume(
         try:
             await client.request("thread/resume", resume_params)
         except CodexAppServerResponseError as exc:
+            if rollout_path is None:
+                raise
             current_provider = codex_resume_current_model_provider(exc)
-            if current_provider is None or rollout_path is None:
+            unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
+            if unconfigured_provider is not None:
+                # The refusal names only the thread's missing provider; move the
+                # thread to the one this launch runs so the session stays resumable.
+                current_provider = model_provider or await _codex_effective_model_provider(
+                    client, effective_cwd
+                )
+                if current_provider == unconfigured_provider:
+                    current_provider = None
+            if current_provider is None:
                 raise
             _logger.warning(
                 "Codex resumes thread %s only under its effective provider %r "
