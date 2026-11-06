@@ -967,15 +967,21 @@ def test_forwarder_backs_off_reads_for_steer_missing_from_transcript(tmp_path: P
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
-def test_forwarder_restarts_read_pacing_for_each_missed_steer(tmp_path: Path) -> None:
-    """Each missed steer of a turn is read for at the second reply after it, not backed off."""
-    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
-    first = _native_user_message("item_first", "fix the bug", "client-first")
-    steers = [
-        _native_user_message(f"item_steer_{index}", f"steer {index}", f"client-steer-{index}")
-        for index in range(1, 4)
-    ]
-    turns = [{"id": "turn_123", "items": [first, *steers]}]
+def _run_forwarder_turn(
+    bridge_dir: Path,
+    turn_items: list[dict[str, Any]],
+    events: Callable[[Callable[[dict[str, Any]], Awaitable[None]]], Awaitable[None]],
+) -> tuple[list[str], list[str]]:
+    """
+    Run ``events`` through the forwarder while transcript reads report ``turn_items``.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param turn_items: Items each ``thread/read`` reports for ``turn_123``.
+    :param events: Delivers Codex events through its ``deliver`` argument.
+    :returns: Transcript summary and app-server request methods, e.g. ``["thread/read"]``.
+    """
+    _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
+    turns = [{"id": "turn_123", "items": turn_items}]
     fake_client = _FakeCodexAppServerClient(
         response={"result": {"thread": {"id": "thread_123", "turns": turns}}}
     )
@@ -991,31 +997,44 @@ def test_forwarder_restarts_read_pacing_for_each_missed_steer(tmp_path: Path) ->
             async def deliver(event: dict[str, Any]) -> None:
                 await codex_native_forwarder._handle_event(
                     client,
-                    **_forwarder_context(client, tmp_path),
+                    **_forwarder_context(client, bridge_dir),
                     event=event,
                     expected_thread_id="thread_123",
                     forwarder_state=forwarder_state,
                 )
 
-            await deliver(_turn_item_event("item/completed", first))
-            for index, steer in enumerate(steers):
-                record_sent_steer(
-                    tmp_path,
-                    thread_id="thread_123",
-                    turn_id="turn_123",
-                    client_message_id=steer["clientId"],
-                )
-                for reply in (2 * index + 1, 2 * index + 2):
-                    agent_item = {"type": "agentMessage", "id": f"msg_{reply}"}
-                    await deliver(_turn_item_event("item/started", agent_item))
-                    await deliver(
-                        _agent_message_event("turn_123", f"msg_{reply}", f"reply {reply}")
-                    )
+            await events(deliver)
 
     asyncio.run(run())
+    return _transcript(posted), [method for method, _ in fake_client.requests]
 
-    assert [method for method, _ in fake_client.requests] == ["thread/read"] * 3
-    assert _transcript(posted) == [
+
+def test_forwarder_restarts_read_pacing_for_each_missed_steer(tmp_path: Path) -> None:
+    """Each missed steer of a turn is read for at the second reply after it, not backed off."""
+    first = _native_user_message("item_first", "fix the bug", "client-first")
+    steers = [
+        _native_user_message(f"item_steer_{index}", f"steer {index}", f"client-steer-{index}")
+        for index in range(1, 4)
+    ]
+
+    async def events(deliver: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        await deliver(_turn_item_event("item/completed", first))
+        for index, steer in enumerate(steers):
+            record_sent_steer(
+                tmp_path,
+                thread_id="thread_123",
+                turn_id="turn_123",
+                client_message_id=steer["clientId"],
+            )
+            for reply in (2 * index + 1, 2 * index + 2):
+                agent_item = {"type": "agentMessage", "id": f"msg_{reply}"}
+                await deliver(_turn_item_event("item/started", agent_item))
+                await deliver(_agent_message_event("turn_123", f"msg_{reply}", f"reply {reply}"))
+
+    transcript, requests = _run_forwarder_turn(tmp_path, [first, *steers], events)
+
+    assert requests == ["thread/read"] * 3
+    assert transcript == [
         "user: fix the bug",
         "assistant: reply 1",
         "user: steer 1 [delivery client-steer-1]",
@@ -1026,6 +1045,38 @@ def test_forwarder_restarts_read_pacing_for_each_missed_steer(tmp_path: Path) ->
         "assistant: reply 5",
         "user: steer 3 [delivery client-steer-3]",
         "assistant: reply 6",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_mirrors_steers_one_read_recovers_in_transcript_order(tmp_path: Path) -> None:
+    """Missed steers one read recovers are mirrored in Codex's transcript order, not send order."""
+    first = _native_user_message("item_first", "fix the bug", "client-first")
+    steers = [
+        _native_user_message(f"item_steer_{index}", f"steer {index}", f"client-steer-{index}")
+        for index in (1, 2)
+    ]
+
+    async def events(deliver: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        await deliver(_turn_item_event("item/completed", first))
+        for index in (2, 1):
+            record_sent_steer(
+                tmp_path,
+                thread_id="thread_123",
+                turn_id="turn_123",
+                client_message_id=f"client-steer-{index}",
+                input_stable_id=f"input-steer-{index}",
+            )
+        await deliver(_completed_event("turn_123", thread_id="thread_123"))
+
+    transcript, requests = _run_forwarder_turn(tmp_path, [first, *steers], events)
+
+    assert requests == ["thread/read"]
+    assert transcript == [
+        "user: fix the bug",
+        "user: steer 1 [delivery client-steer-1] [input input-steer-1]",
+        "user: steer 2 [delivery client-steer-2] [input input-steer-2]",
+        "status: idle",
     ]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
@@ -1157,34 +1208,30 @@ def test_forwarder_drops_unread_steer_once_next_turn_message_is_mirrored(tmp_pat
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
-def test_forwarder_does_not_read_transcript_for_steer_seen_live(tmp_path: Path) -> None:
-    """A steer whose live ``userMessage`` arrived is posted once, without a transcript read."""
-    transcript = _run_steered_turn(tmp_path, live_steer_copy=True, replies_after_steer=3)
-
-    assert transcript == [
-        "user: fix the bug",
-        "user: also update the docs",
-        "assistant: reply 1",
-        "assistant: reply 2",
-        "assistant: reply 3",
-        "status: idle",
-    ]
-    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
-
-
-def test_forwarder_posts_live_steer_without_client_id_once(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("steer_echoes_client_id", "expected_reads"),
+    [(True, []), (False, [_TRANSCRIPT_READ])],
+    ids=["client_id", "no_client_id"],
+)
+def test_forwarder_posts_steer_seen_live_once(
+    tmp_path: Path, steer_echoes_client_id: bool, expected_reads: list[str]
+) -> None:
     """
-    A live steer Codex reports without its ``clientId`` is posted once, and its record dropped.
+    A steer whose live ``userMessage`` arrived is posted once, and its record dropped.
 
-    Terminal input has no client id either, so a missed steer is still looked for ahead of it.
+    Terminal input has no client id either, so a missed steer is looked for ahead of a
+    live steer Codex reports without its ``clientId``.
     """
     transcript = _run_steered_turn(
-        tmp_path, live_steer_copy=True, replies_after_steer=3, steer_echoes_client_id=False
+        tmp_path,
+        live_steer_copy=True,
+        replies_after_steer=3,
+        steer_echoes_client_id=steer_echoes_client_id,
     )
 
     assert transcript == [
         "user: fix the bug",
-        _TRANSCRIPT_READ,
+        *expected_reads,
         "user: also update the docs",
         "assistant: reply 1",
         "assistant: reply 2",

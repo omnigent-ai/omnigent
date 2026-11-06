@@ -460,8 +460,11 @@ async def test_message_naming_a_restored_input_settles_its_saved_row(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "queued_text", ["see this log", "also update the docs"], ids=["other_text", "same_text"]
+)
 async def test_message_naming_a_settled_delivery_leaves_newer_input_queued(
-    db_uri: str, caplog: pytest.LogCaptureFixture
+    db_uri: str, caplog: pytest.LogCaptureFixture, queued_text: str
 ) -> None:
     store = SqlAlchemyConversationStore(db_uri)
     conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
@@ -488,7 +491,7 @@ async def test_message_naming_a_settled_delivery_leaves_newer_input_queued(
         conv.id,
         [
             {"type": "input_file", "file_id": "file_log", "filename": "build.log"},
-            {"type": "input_text", "text": "see this log"},
+            {"type": "input_text", "text": queued_text},
         ],
         stable_id="c" * 32,
         background_titles_enabled=False,
