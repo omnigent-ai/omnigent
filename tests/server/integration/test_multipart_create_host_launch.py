@@ -253,6 +253,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     session_id = resp.json()["session_id"]
     accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
     assert float(accepted["attributes"]["create_acl_ms"]) >= 0
+    assert float(accepted["attributes"]["create_host_launch_ms"]) >= 0
 
     conv = conv_store.get_conversation(session_id)
     assert conv is not None

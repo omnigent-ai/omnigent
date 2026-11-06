@@ -36,6 +36,37 @@ export const NativeEditPermission: Story = {
   },
 };
 
+const editDiffInput = {
+  file_path: "src/auth/callback.ts",
+  old_string: [
+    "export async function handleCallback(code: string) {",
+    "  const token = await exchange(code);",
+    "  return token;",
+    "}",
+  ].join("\n"),
+  new_string: [
+    "export async function handleCallback(code: string, state: string) {",
+    "  verifyState(state);",
+    "  const token = await exchange(code);",
+    "  return token;",
+    "}",
+  ].join("\n"),
+  replace_all: false,
+};
+
+export const NativeEditDiff: Story = {
+  // Out of visual snapshots until it has a committed baseline.
+  tags: ["!visual-snapshot"],
+  args: {
+    message: "Claude wants to call **Edit**",
+    phase: "pre_tool_use",
+    policyName: "claude_native_permission",
+    contentPreview: `Edit(${JSON.stringify(editDiffInput)})`,
+    fileEdit: { toolName: "Edit", toolInput: editDiffInput },
+    allowAllEdits: true,
+  },
+};
+
 export const AutoModePermission: Story = {
   args: {
     message: "Claude wants to run the project tests.",
