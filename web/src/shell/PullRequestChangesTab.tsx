@@ -773,14 +773,17 @@ export function PullRequestChangesTab({
   // the reader expands unchanged regions.
   const loadDiffFiles = useCallback(
     async (fd: FileDiffMetadata) => {
+      // The parser keeps git's quoting; the provider reads files by repository path.
+      const path = unquoteGitPath(fd.name);
+      const previousPath = fd.prevName ? unquoteGitPath(fd.prevName) : undefined;
       const { before, after } = prUrl
-        ? await fetchPullRequestFileContents(conversationId, fd.name, baseRef, {
+        ? await fetchPullRequestFileContents(conversationId, path, baseRef, {
             pr_url: prUrl,
-            previous_path: fd.prevName,
+            previous_path: previousPath,
             head_sha: headSha,
             base_sha: baseSha,
           })
-        : await fetchPullRequestFileContents(conversationId, fd.name, baseRef);
+        : await fetchPullRequestFileContents(conversationId, path, baseRef);
       return {
         oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
         newFile: { name: fd.name, contents: after ?? "" },
