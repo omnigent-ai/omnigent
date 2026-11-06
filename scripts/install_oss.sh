@@ -45,6 +45,8 @@ PYTHON_VERSION="3.12"
 INSTALL_URL=
 NON_INTERACTIVE=false
 VERBOSE=false
+# The original options, shell-quoted, for copy-pasteable rerun hints.
+INSTALL_ARGS=
 LEDGER_PROFILE=
 ESC=$(printf '\033')
 RESET=
@@ -173,7 +175,17 @@ run_with_spinner() {
   return "$status"
 }
 
+quote_args() {
+  for arg in "$@"; do
+    case "$arg" in
+      "" | *[!A-Za-z0-9_./:=,@+-]*) printf " '%s'" "$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")" ;;
+      *) printf ' %s' "$arg" ;;
+    esac
+  done
+}
+
 parse_args() {
+  INSTALL_ARGS="$(quote_args "$@")"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --non-interactive)
@@ -532,8 +544,11 @@ install_omnigent() {
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
   if ! run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"; then
+    if [ -n "${UV_DEFAULT_INDEX:-}${UV_INDEX_URL:-}" ]; then
+      fail "Omnigent could not be installed. Check the error above."
+    fi
     fail "Omnigent could not be installed. Check the error above. If your network blocks pypi.org, rerun with UV_DEFAULT_INDEX set to your package mirror, for example:
-  curl -fsSL https://omnigent.ai/install.sh | UV_DEFAULT_INDEX=https://pypi.example.com/simple sh"
+  curl -fsSL https://omnigent.ai/install.sh | UV_DEFAULT_INDEX=https://pypi.example.com/simple sh${INSTALL_ARGS:+ -s --$INSTALL_ARGS}"
   fi
 }
 

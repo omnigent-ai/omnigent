@@ -368,22 +368,42 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
     ]
 
 
-def test_failed_install_suggests_package_mirror(lib: Path) -> None:
+@pytest.mark.parametrize(
+    ("args", "index_env", "rerun"),
+    [
+        ("", {}, "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh\n"),
+        (
+            '--repo "https://example.com/it\'s here.git" --extra mcp',
+            {},
+            "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh -s -- "
+            "--repo 'https://example.com/it'\\''s here.git' --extra mcp\n",
+        ),
+        ("", {"UV_DEFAULT_INDEX": "https://mirror.example/simple"}, None),
+        ("", {"UV_INDEX_URL": "https://mirror.example/simple"}, None),
+    ],
+)
+def test_failed_install_suggests_package_mirror(
+    lib: Path, args: str, index_env: dict[str, str], rerun: str | None
+) -> None:
     r = run(
         lib,
-        """
-        uv() { echo 'error: Failed to fetch: https://pypi.org/simple/omnigent/' >&2; return 2; }
-        parse_args
+        f"""
+        uv() {{ echo 'error: Failed to fetch: https://pypi.org/simple/omnigent/' >&2; return 2; }}
+        parse_args {args}
         normalize_repo_url
         install_omnigent
         echo continued
         """,
+        env={"UV_DEFAULT_INDEX": "", "UV_INDEX_URL": "", **index_env},
     )
     assert r.returncode != 0
     assert "continued" not in r.stdout
     assert "Failed to fetch: https://pypi.org/simple/omnigent/" in r.stderr
-    assert "If your network blocks pypi.org" in r.stderr
-    assert "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh" in r.stderr
+    if rerun is None:
+        assert "pypi.example.com" not in r.stderr
+    else:
+        assert "If your network blocks pypi.org" in r.stderr
+        assert rerun in r.stderr
 
 
 _CLI_COMMANDS = """
