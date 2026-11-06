@@ -257,17 +257,31 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
     ] == ["new response"]
 
 
-def test_web_turn_start_racing_a_native_turn_keeps_that_turn_mirrored(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("turn_id", "acknowledged_turn_id", "events_before_ack"),
+    [("turn_native", "turn_unstarted", 1), ("turn_web", "turn_web", 3)],
+    ids=["busy-thread-ack", "turn-finished-before-ack"],
+)
+def test_late_web_turn_start_ack_keeps_the_forwarder_turn_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    turn_id: str,
+    acknowledged_turn_id: str,
+    events_before_ack: int,
 ) -> None:
     """
-    A web send that races a native turn start keeps that turn's output and end.
+    A late ``turn/start`` response keeps the turn state the forwarder recorded.
 
     Codex 0.142 acknowledges ``turn/start`` on a busy thread with a turn id that
-    never starts; the web input joins the running turn instead.
+    never starts, and a short web turn can finish before its response is read.
     """
     _write_forwarder_bridge(tmp_path, active_turn_id=None)
     posted: list[dict[str, Any]] = []
+    turn_events = [
+        _started_event(turn_id),
+        _agent_message_delta_event(turn_id, "item_agent", "reply"),
+        _completed_event(turn_id),
+    ]
 
     async def run() -> None:
         """Drive the web executor and the forwarder through one bridge directory."""
@@ -284,18 +298,21 @@ def test_web_turn_start_racing_a_native_turn_keeps_that_turn_mirrored(
                     delta_coalescer=coalescer,
                 )
 
-            class _BusyThreadClient(_FakeCodexAppServerClient):
+            class _LateAckClient(_FakeCodexAppServerClient):
                 def __init__(self, *_args: object, **_kwargs: object) -> None:
                     super().__init__()
 
                 async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
                     assert method == "turn/start", method
-                    await forward(_started_event("turn_native"))
-                    return {"result": {"turn": {"id": "turn_unstarted", "status": "inProgress"}}}
+                    for event in turn_events[:events_before_ack]:
+                        await forward(event)
+                    return {
+                        "result": {"turn": {"id": acknowledged_turn_id, "status": "inProgress"}}
+                    }
 
             monkeypatch.setattr(
                 "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
-                _BusyThreadClient,
+                _LateAckClient,
             )
             executor = CodexNativeExecutor(bridge_dir=tmp_path)
             events = [
@@ -308,15 +325,15 @@ def test_web_turn_start_racing_a_native_turn_keeps_that_turn_mirrored(
             ]
             assert [type(event) for event in events] == [TurnComplete]
 
-            await forward(_agent_message_delta_event("turn_native", "item_agent", "reply"))
-            await forward(_completed_event("turn_native"))
+            for event in turn_events[events_before_ack:]:
+                await forward(event)
             await coalescer.close()
 
     asyncio.run(run())
 
     assert [
         payload["data"] for payload in posted if payload["type"] == "external_output_text_delta"
-    ] == [_expected_delta_data("reply", "turn_native", "item_agent")]
+    ] == [_expected_delta_data("reply", turn_id, "item_agent")]
     assert [
         payload["data"]["status"]
         for payload in posted

@@ -670,29 +670,42 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
 
 
 @pytest.mark.parametrize(
-    ("active_turn_id", "expected_turn_id", "acknowledged_turn_id", "recorded", "active_after"),
+    ("sent_turn_id", "forwarder_events", "acknowledged_turn_id", "recorded", "active_after"),
     [
-        (None, None, "turn_a", True, "turn_a"),
-        ("turn_a", None, "turn_a", True, "turn_a"),
-        ("turn_native", None, "turn_unstarted", False, "turn_native"),
-        ("turn_a", "turn_a", "turn_a", True, "turn_a"),
-        (None, "turn_a", "turn_a", False, None),
-        ("turn_b", "turn_a", "turn_a", False, "turn_b"),
+        (None, [], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_a")], "turn_a", True, "turn_a"),
+        (None, [("started", "turn_native")], "turn_unstarted", False, "turn_native"),
+        (None, [("started", "turn_a"), ("completed", "turn_a")], "turn_a", False, None),
+        (
+            None,
+            [("started", "turn_native"), ("completed", "turn_native")],
+            "turn_unstarted",
+            False,
+            None,
+        ),
+        ("turn_a", [], "turn_a", True, "turn_a"),
+        ("turn_a", [("completed", "turn_a")], "turn_a", False, None),
+        ("turn_a", [("completed", "turn_a"), ("started", "turn_b")], "turn_a", False, "turn_b"),
     ],
 )
-def test_acknowledged_turn_does_not_replace_a_turn_recorded_meanwhile(
+def test_acknowledged_turn_keeps_turn_changes_recorded_meanwhile(
     bridge_dir: Path,
-    active_turn_id: str | None,
-    expected_turn_id: str | None,
+    sent_turn_id: str | None,
+    forwarder_events: list[tuple[str, str]],
     acknowledged_turn_id: str,
     recorded: bool,
     active_after: str | None,
 ) -> None:
-    _seed_active_turn(bridge_dir, active_turn_id)
+    _seed_active_turn(bridge_dir, sent_turn_id)
+    sent_state = read_bridge_state(bridge_dir)
+    assert sent_state is not None
+    for event, turn_id in forwarder_events:
+        if event == "started":
+            update_active_turn_id(bridge_dir, turn_id)
+        else:
+            assert clear_active_turn_id_if_matches(bridge_dir, turn_id)
 
-    assert (
-        record_acknowledged_turn_id(bridge_dir, expected_turn_id, acknowledged_turn_id) is recorded
-    )
+    assert record_acknowledged_turn_id(bridge_dir, sent_state, acknowledged_turn_id) is recorded
     state = read_bridge_state(bridge_dir)
     assert state is not None
     assert state.active_turn_id == active_after

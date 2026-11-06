@@ -572,11 +572,11 @@ async def _start_codex_turn(
     turn = _json_object(result.get("turn")) if result is not None else None
     turn_id = turn.get("id") if turn is not None else None
     if isinstance(turn_id, str) and turn_id:
-        if record_acknowledged_turn_id(bridge_dir, None, turn_id):
+        if record_acknowledged_turn_id(bridge_dir, state, turn_id):
             _logger.info("Codex native started turn: turn_id=%s", turn_id)
         else:
             _logger.info(
-                "Codex native turn start acknowledged during another active turn: turn_id=%s",
+                "Codex native turn start acknowledged after the active turn changed: turn_id=%s",
                 turn_id,
             )
 
@@ -604,8 +604,13 @@ async def _steer_codex_turn(
     result = _json_object(response.get("result")) if response is not None else None
     turn_id = result.get("turnId") if result is not None else None
     if isinstance(turn_id, str) and turn_id:
-        record_acknowledged_turn_id(bridge_dir, state.active_turn_id, turn_id)
-        _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        if record_acknowledged_turn_id(bridge_dir, state, turn_id):
+            _logger.info("Codex native steered active turn: turn_id=%s", turn_id)
+        else:
+            _logger.info(
+                "Codex native steer acknowledged after the active turn changed: turn_id=%s",
+                turn_id,
+            )
 
 
 # Bound reconciliation after shell submission before releasing the injection lock.
