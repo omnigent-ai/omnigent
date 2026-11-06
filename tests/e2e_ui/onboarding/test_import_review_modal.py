@@ -1,8 +1,10 @@
-"""E2E: the import modal opens once for a newly connected host.
+"""E2E: the import modal opens only for the host desktop onboarding set up.
 
 ``/v1/hosts``, host-scoped ``/v1/skills``, and the host MCP inventory are
 stubbed so the test controls exactly what the host's harnesses report while
-the rest of the real UI runs against the live e2e server.
+the rest of the real UI runs against the live e2e server. A minimal
+``window.omnigentDesktop`` stub stands in for the shell's one-time onboarding
+handoff.
 """
 
 from __future__ import annotations
@@ -52,6 +54,22 @@ _MCP_SERVERS = {
 }
 
 
+# Like the shell, hand over the onboarding runner once; later loads get null.
+_ONBOARDING_HANDOFF = f"""
+window.omnigentDesktop = {{
+  kind: "electron",
+  takeOnboardingRunner: async () => {{
+    if (sessionStorage.getItem("e2e-onboarding-taken")) return null;
+    sessionStorage.setItem("e2e-onboarding-taken", "1");
+    return "local";
+  }},
+  getHostIdentity: async () => ({{ cliInstalled: true, hostId: {_HOST_ID!r} }}),
+}};
+"""
+
+_TITLE = "Your setup is ready"
+
+
 async def _register_routes(page: Page) -> None:
     async def handle_hosts(route: Route) -> None:
         await route.fulfill(json=_HOSTS)
@@ -74,8 +92,8 @@ async def _register_routes(page: Page) -> None:
     await stub_empty_host_picker_data(page, _HOST_ID)
 
 
-def test_import_modal_opens_once_and_links_to_harnesses(live_server: str) -> None:
-    """A new host's imports link to Harnesses and stay dismissed on reload."""
+def test_import_modal_opens_after_onboarding(live_server: str) -> None:
+    """Onboarding's host shows its imports once, linking to Harnesses."""
     _run_in_fresh_loop(_drive(live_server))
 
 
@@ -84,10 +102,11 @@ async def _drive(base_url: str) -> None:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
+            await page.add_init_script(_ONBOARDING_HANDOFF)
             await _register_routes(page)
             await page.goto(f"{base_url}/")
 
-            dialog = page.get_by_role("dialog", name="Your setup is ready")
+            dialog = page.get_by_role("dialog", name=_TITLE)
             await expect(dialog).to_be_visible(timeout=30_000)
             await expect(dialog).to_contain_text("These carry over automatically.")
             await expect(dialog).to_contain_text("Databricks Unity Gateway")
@@ -118,8 +137,10 @@ async def _drive(base_url: str) -> None:
             )
             assert reviewed is not None
 
+            # The handoff is spent, so a reload opens nothing.
             await page.reload()
             await expect(page.get_by_role("heading", name="Harnesses", exact=True)).to_be_visible()
+            await page.wait_for_timeout(1_000)
             await expect(dialog).to_be_hidden()
 
             await page.goto(f"{base_url}/settings/import")
@@ -130,32 +151,25 @@ async def _drive(base_url: str) -> None:
             await browser.close()
 
 
-def test_import_modal_stays_closed_without_assets(live_server: str) -> None:
-    """A host whose harnesses bring nothing never opens the modal on its own."""
-    _run_in_fresh_loop(_drive_empty(live_server))
+def test_import_modal_never_opens_without_onboarding(live_server: str) -> None:
+    """An unreviewed online host with imports doesn't open the modal on its own."""
+    _run_in_fresh_loop(_drive_no_handoff(live_server))
 
 
-async def _drive_empty(base_url: str) -> None:
+async def _drive_no_handoff(base_url: str) -> None:
     async with async_playwright() as pw:
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         try:
-            await page.route("**/v1/info", lambda route: route.fulfill(json=_SERVER_INFO))
-            await page.route("**/v1/hosts", lambda route: route.fulfill(json=_HOSTS))
-            await page.route("**/v1/skills?*", lambda route: route.fulfill(json={"skills": []}))
-            await page.route(
-                f"**/v1/hosts/{_HOST_ID}/mcp-servers",
-                lambda route: route.fulfill(json={"mcp_servers": []}),
-            )
-            await stub_empty_host_picker_data(page, _HOST_ID)
-            async with page.expect_response(lambda r: r.url.endswith("/mcp-servers")):
+            await _register_routes(page)
+            async with page.expect_response(lambda r: r.url.endswith("/v1/hosts")):
                 await page.goto(f"{base_url}/")
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            # Give the gate a moment to act on the settled inventory.
+            # Give the gate a moment to act on the hosts it has.
             await page.wait_for_timeout(1_000)
-            await expect(page.get_by_role("dialog", name="Your setup is ready")).to_be_hidden()
+            await expect(page.get_by_role("dialog", name=_TITLE)).to_be_hidden()
             reviewed = await page.evaluate(
                 f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
             )
