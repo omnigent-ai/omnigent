@@ -16,6 +16,8 @@ export type ChangesMode = "changes" | "commits" | "commit";
 interface ChangesView {
   pathFilter: string;
   hideViewed: boolean;
+  /** The commit list's search, kept while the reader moves between commits and the list. */
+  commitQuery: string;
   /** The Changes tab's source; `commit` needs `commitSha`. */
   mode: ChangesMode;
   commitSha: string | null;
@@ -28,6 +30,7 @@ interface ChangesView {
 
 export interface ChangesViewState extends ChangesView {
   setPathFilter: (query: string) => void;
+  setCommitQuery: (query: string) => void;
   setHideViewed: (hide: boolean) => void;
   reveal: (path: string) => void;
   clearReveal: (path: string) => void;
@@ -41,6 +44,7 @@ export interface ChangesViewState extends ChangesView {
 const EMPTY_VIEW: ChangesView = {
   pathFilter: "",
   hideViewed: false,
+  commitQuery: "",
   mode: "changes",
   commitSha: null,
   revealedPaths: new Set(),
@@ -79,6 +83,7 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
   const actions = useMemo<Omit<ChangesViewState, keyof ChangesView>>(
     () => ({
       setPathFilter: (pathFilter) => update(key, () => ({ pathFilter })),
+      setCommitQuery: (commitQuery) => update(key, () => ({ commitQuery })),
       setHideViewed: (hideViewed) => update(key, () => ({ hideViewed })),
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),

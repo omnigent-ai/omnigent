@@ -2430,6 +2430,8 @@ describe("PullRequestPanel", () => {
       "github-review-threads",
       "github-changed-files",
       "github-pr-diff",
+      "github-pr-commits",
+      "github-pr-commit-diff",
       "session-pull-requests",
     ]);
   });

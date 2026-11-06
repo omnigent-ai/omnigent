@@ -1615,7 +1615,7 @@ def test_changes_commits_view_lists_and_opens_a_commit(
         re.compile(r"/resources/github/diff(?:\?|$)"),
         lambda route: route.fulfill(json={**_PR_DIFF, "head_sha": "head", "base_sha": "base"}),
     )
-    # Registered after _stub_github, so the commit route wins over the whole-PR diff stub.
+    # Each commit's patch is served by its sha.
     page.route(re.compile(r"/resources/github/commit-diff\?"), commit_patch)
     page.goto(f"{base_url}/c/{session_id}")
     open_right_rail(page)
