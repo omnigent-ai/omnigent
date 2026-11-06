@@ -63,11 +63,11 @@ function escapeBelongsElsewhere(target: EventTarget | null): boolean {
 /** How many mounted shells bind the chord; the standalone approval page has none. */
 const useApproveHotkeyBindings = create<{ count: number }>(() => ({ count: 0 }));
 
-// Pending prompts with a card on screen. Esc declines only one of these, so it can't
-// decline the open chat's prompt from Settings or Inbox, where its card isn't shown.
+// Pending prompts with a card in the open chat. Esc declines only one of these, so it
+// can't decline the chat's prompt from Settings, or from its copy in Inbox.
 const promptsOnScreen = new Map<string, number>();
 
-/** Marks a pending prompt's card as on screen while it is mounted. */
+/** Marks a pending prompt's card as shown in the open chat while it is mounted. */
 export function useApprovalPromptOnScreen(elicitationId: string, pending: boolean): void {
   useEffect(() => {
     if (!pending) return;
@@ -103,7 +103,6 @@ function isPendingElicitation(block: AnyBlock | undefined): block is Elicitation
 
 /** Whether ⌘↵ and Esc act on this prompt, so its buttons can name them. */
 export function useApprovesOnHotkey(elicitationId: string, pending: boolean): boolean {
-  useApprovalPromptOnScreen(elicitationId, pending);
   const bound = useApproveHotkeyBindings((state) => state.count > 0);
   const target = useChatStore(
     (state) => pending && approveHotkeyTarget(state.blocks) === elicitationId,

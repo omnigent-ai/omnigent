@@ -34,6 +34,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
@@ -49,6 +50,7 @@ import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   closeDesktopWindow,
+  confirmDesktopQuit,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -164,6 +166,7 @@ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
 import { CloseWindowDialog } from "./CloseWindowDialog";
+import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -586,7 +589,8 @@ function AppShellImpl() {
     rightPanelMotionTimerRef.current = window.setTimeout(() => {
       rightPanelMotionTimerRef.current = null;
       setRightPanelVisibilityAnimating(false);
-    }, 350);
+      // Just past the rail's 200 ms transition in index.css.
+    }, 250);
   }, []);
   useEffect(
     () => () => {
@@ -1620,12 +1624,9 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     terminalFirst,
   ]);
+  // One press toggles: a rail on screen closes, a closed or covered one opens
+  // with focus on its tabs.
   const toggleRightPanelFromHotkey = useCallback(() => {
-    if (rightPanelOpen && workspaceTabListRef.current?.contains(document.activeElement)) {
-      focusWorkspaceTabsOnOpenRef.current = false;
-      toggleRightPanel();
-      return;
-    }
     const hiddenByCompetingPanel =
       (!terminalFirst && panelOpen) || executionLogsOpen || filesPanelOpen;
     if (hiddenByCompetingPanel) {
@@ -1634,11 +1635,7 @@ function AppShellImpl() {
       revealRightPanel();
       return;
     }
-    if (rightPanelOpen) {
-      focusWorkspaceTabs();
-      return;
-    }
-    focusWorkspaceTabsOnOpenRef.current = !!conversationId && hasRailContent;
+    focusWorkspaceTabsOnOpenRef.current = !rightPanelOpen && !!conversationId && hasRailContent;
     toggleRightPanel();
   }, [
     rightPanelOpen,
@@ -1650,11 +1647,10 @@ function AppShellImpl() {
     hasRailContent,
     restoreSelectedFileUrl,
     revealRightPanel,
-    focusWorkspaceTabs,
     toggleRightPanel,
   ]);
 
-  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // The hotkey (⌘B, or ⌘⌥[ in a browser) and command-palette toggle for the left sidebar. A peeking
   // sidebar counts as open, so toggling collapses it; either way peek is
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
@@ -1785,9 +1781,9 @@ function AppShellImpl() {
     setRightPanelMaximized((prev) => !prev);
   }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, setSidebarOpen]);
 
-  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
-  // here where both panels' open-state lives. A grid route replaces this rail
-  // with the grid's own workspace, which binds ⌘⌥] itself.
+  // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
+  // right sidebars. Bound here where both panels' open-state lives. A grid route
+  // replaces this rail with the grid's own workspace, which binds its own toggle.
   const gridRoute =
     gridId !== undefined && isFeatureEnabled(serverInfo, "grid_sessions_display_ui");
   useSidebarToggleHotkeys({
@@ -1833,6 +1829,7 @@ function AppShellImpl() {
   );
   useNewSessionHotkey();
   useSettingsHotkey();
+  useHistoryNavigation();
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -2064,12 +2061,13 @@ function AppShellImpl() {
   // the selected file keeps the rail's single content slot unambiguous — a
   // shell tab and a file tab can't both be "active".
   const openTerminalTab = useCallback(
-    (key: string) => {
+    (key: string, { focus = true }: { focus?: boolean } = {}) => {
       // The tab already exists (tabs derive 1:1 from the terminal list); this
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
-      autoFocusTerminalKeyRef.current = key;
+      // `focus: false` shows the shell but leaves keyboard focus where it is.
+      autoFocusTerminalKeyRef.current = focus ? key : null;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -2134,6 +2132,14 @@ function AppShellImpl() {
     // An open file with unsaved edits asks before the session (and its viewer) goes away.
     else guardFileNavigation(null, undefined, () => navigateTo("/"));
   });
+  // Desktop Quit (⌘Q / Ctrl+Q) asks here first, over any page; a second ⌘Q
+  // leaves the open prompt to answer.
+  const [quitPrompt, setQuitPrompt] = useState<{ detail: string | null } | null>(null);
+  useDesktopCommand("quit", (event) =>
+    setQuitPrompt((current) => current ?? { detail: event.quitDetail }),
+  );
+  // Desktop Reload (⌘R) reloads the app unless a browser tab's toolbar took it.
+  useDesktopCommand("reload", () => window.location.reload());
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -3034,6 +3040,14 @@ function AppShellImpl() {
               void closeDesktopWindow();
             }}
             onCancel={() => setCloseWindowPrompt(null)}
+          />
+          <QuitDialog
+            prompt={quitPrompt}
+            onConfirm={(dontAskAgain) => {
+              setQuitPrompt(null);
+              void confirmDesktopQuit(dontAskAgain);
+            }}
+            onCancel={() => setQuitPrompt(null)}
           />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
