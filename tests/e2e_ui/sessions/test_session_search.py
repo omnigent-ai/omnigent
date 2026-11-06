@@ -66,7 +66,7 @@ def test_session_search_and_general_search(
     expect(picker).not_to_be_visible()
 
     search_container = (
-        page.locator(".electron-sidebar-header-actions")
+        page.locator(".sidebar-brand-row")
         if mac_electron
         else page.get_by_role("complementary", name="Conversations", exact=True)
     )
