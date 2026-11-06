@@ -97,7 +97,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
-  marked and the choice persists.
+  marked and the choice persists. For Codex, New Chat offers Default (Codex's own
+  default or the user's Codex config), Ask for approval, Approve for me, Full
+  Access, Read Only, and Bypass approvals & sandbox; a running session offers
+  Ask for approval, Approve for me, and Full Access.
 - `permissions-command`: in Codex native sessions, `/permissions` opens the
   composer's approval-mode menu instead of Codex's own popup. Other sessions,
   including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
@@ -135,9 +138,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI. Claude Code and
   Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
-  States: loading, error/retry, unavailable while disconnected, and an
-  incomplete catalog.
+  `session_event_types`; claude-sdk sessions only when it reports
+  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
+  as text. A claude-sdk `/clear` continues in a new, empty session on the same
+  machine and the view follows it. States: loading, error/retry,
+  unavailable while disconnected, and an incomplete catalog.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -175,7 +180,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
-  Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
+  Shift+Enter inserts a newline in both composers. The
   Inbox reply box follows the same shortcut.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
   setup. Clicking, tapping, or trying to submit pins that explanation until
@@ -188,8 +193,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
-  opens and focuses the new-session composer in browsers. Native shells retain
-  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+  opens and focuses the new-session composer in browsers. Native shells use
+  ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
@@ -248,7 +253,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - Hover the host chip (status dot and machine icon) to see the host and whether
-  it is connected; click it to open the host menu.
+  it is connected; click it to open the host menu. The status indicator remains
+  visible while connecting or without a selected host; the label describes
+  those states without claiming Online or Offline.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
 - With focus in the prompt, press Shift+Tab to step the permission mode without
@@ -410,12 +417,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
 
-**Mobile** (either composer on a phone-sized viewport): the same controls with
-collapsed labels.
+**Mobile** (either composer on a phone-sized viewport): host and harness/model
+controls live in the top-right glass group. The composer starts as one row with
+Add, hint text, microphone, and Send; focusing the textarea expands it into a
+stacked layout with permission controls. Add alone does not expand it. On the
+landing page, choose the working directory below the headline; in a session,
+find the current directory in the session-actions menu. Running background
+tasks remain accessible from the session header.
 
-**Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
-text. For native Codex, send the first message before using its model/effort
+**Side chat** (from an existing session you own): choose **+ → Start a new side
+chat** in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on
+selected text. Editors and viewers of a shared session don't get these. For native Codex, send the first message before using its model/effort
 pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
@@ -634,7 +646,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
-  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
+  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
+  Manually, in a claude-sdk session with one finished turn, type `/cle` and
+  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
+  Enter. Each time the view moves to an empty chat on the same machine, and the
+  original chat ends with a notice linking to it. Menu and typed entry, and the
+  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
@@ -711,8 +730,7 @@ Other connection providers alone do not enable the managed MCP picker.
   Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
   to restore the previous draft.
 - **`send-shortcut`:**
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
-  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
+  `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`
 - **`list-formatting`, both composers:** no browser-level coverage; the list
   cases in `web/src/components/composer/ChatComposer.test.tsx`
   (`pnpm --dir web test`). Manually: type `1.` then Space and expect ` 1.`;

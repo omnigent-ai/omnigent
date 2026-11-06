@@ -45,6 +45,7 @@ from omnigent.harness_plugins import (
     PI_NATIVE_CODING_AGENT,
     harness_capabilities,
 )
+from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
 from omnigent.runner.routing import RunnerRouter
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.schemas import (
@@ -526,7 +527,7 @@ _NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _PI_EXTENSION_UI_HOOK_TIMEOUT_S = 86400.0
 
 
-_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
+_HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = PRE_RESOLVED_ELICITATION_TTL_S
 
 
 _HARNESS_PRE_RESOLVED_ELICITATION_MAX_ENTRIES = 1024
