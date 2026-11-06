@@ -466,13 +466,10 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
-# The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
-# an action with "/", so the task details panels print "Esc/Enter/Space to
-# close". A screen without a composer that lacks it is not such a surface —
-# e.g. a launch wrapper's output before Claude Code has drawn its input box —
-# and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Surfaces drawn over the input box advertise their dismissal in the footer
+# ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
+# Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
 # question exits 0). Only the person may answer them.
@@ -524,6 +521,10 @@ _AUTO_MODE_BILLING_CONSENT = re.compile(
 # casing has already drifted across releases ("Search prompts" →
 # "search prompts:").
 _HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
+# Title row of the history search once it draws its own surface (2.1.295).
+_HISTORY_SEARCH_OVERLAY_TITLE = "search prompts"
+# Key hint in that surface's closing footer row, which no dialog carries.
+_HISTORY_SEARCH_OVERLAY_FOOTER_HINT = "enter to use"
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -4665,16 +4666,23 @@ def _paste_and_verify(
     bridge_dir: Path, socket_path: str, tmux_target: str, *, text: str, needle: str
 ) -> None:
     """Paste into a prepared composer and verify this submission without restarting it."""
+    transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
     )
+    box = _composer_box(pane)
+    # A TUI that submits the paste itself leaves an empty box and a new transcript line.
+    submitted_by_paste = bool(needle) and (
+        pane.count(needle) > transcript_before_paste.count(needle)
+    )
     if (
         not draft_seen
-        and _composer_box(pane) is None
+        and not submitted_by_paste
+        and (box is None or (box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH))
         and not _user_prompt_visible(pane)
         and not _has_approval_wait(bridge_dir)
     ):
-        # A resumed TUI can still be replaying its transcript after the first paste.
+        # A resuming TUI can drop the paste before remounting its empty composer.
         delivery_diagnostics.set_stage("waiting_for_composer")
         _wait_for_claude_prompt_ready(
             socket_path,
@@ -5439,6 +5447,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 # Whitespace is removed from footer hints because terminal wraps can split words.
 _BTW_FOOTER_CLOSE_HINT = "Esctoclose"
+# The footer opens with a scroll hint for one turn, or a history hint once side
+# turns stack: "←/→ to switch" in older Claude Code, "⇧←/→ to browse" in 2.1.283.
+_BTW_FOOTER_SHIFT_GLYPH = "⇧"
+_BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
@@ -5451,6 +5463,10 @@ _BTW_QUESTION_PREFIX = "/btw"
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
 _BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+# Claude Code 2.1.318 caps the answer so the overlay leaves this many pane rows
+# for the rest of its screen, but keeps at least 5 answer rows. A short pane
+# therefore clips below the span above; an overlay reaching the cap is flagged.
+_BTW_PANE_CHROME_ROWS = 5
 
 
 @dataclass(frozen=True)
@@ -5464,7 +5480,7 @@ class BtwOverlay:
     :param answer: The visible answer text, dedented and stripped.
     :param truncated: True when the overlay likely clipped a longer
         answer (best-effort heuristic; see
-        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS`).
+        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS` and :data:`_BTW_PANE_CHROME_ROWS`).
     """
 
     question: str | None
@@ -5498,14 +5514,18 @@ def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
         (
             index
             for index in range(len(lines) - 1, -1, -1)
-            if lines[index].lstrip().startswith(("↑/↓", "←/→"))
+            if lines[index]
+            .lstrip()
+            .lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+            .lstrip()
+            .startswith(("↑/↓", "←/→"))
         ),
         None,
     )
     if footer_idx is None:
         return None
-    footer = "".join("".join(lines[footer_idx:]).split())
-    if not footer.startswith(("↑/↓toscroll", "←/→toswitch")) or not footer.endswith(
+    footer = "".join("".join(lines[footer_idx:]).split()).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+    if not footer.startswith(("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)) or not footer.endswith(
         _BTW_FOOTER_CLOSE_HINT
     ):
         return None
@@ -5562,7 +5582,11 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = (
+        len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+        # The border and the footer's first row bracket the region.
+        or len(region) + 2 + _BTW_PANE_CHROME_ROWS >= len(pane.splitlines())
+    )
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5584,13 +5608,13 @@ def _btw_overlay_present(pane: str) -> bool:
     if parts is None:
         return False
     region, footer = parts
-    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # The /btw footer offers copy+fork (single, settled), history (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
     if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return True
-    if "toswitch" in footer:
+    if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
@@ -6163,10 +6187,9 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
     dead pane's exit code comes from the same answer — a second probe at
     failure time can race the session's teardown and come back empty.
 
-    ``list-panes`` rather than ``display-message``: the latter prints an
-    empty line and still exits 0 for a target it cannot resolve, which is
-    indistinguishable from an answer of "alive". ``list-panes`` fails
-    outright, so a rejected query stays a rejected query.
+    Targets are pane IDs (``%123``) or managed single-pane sessions (``main``).
+    Indexed targets are unsupported: tmux may resolve a removed pane's index
+    to a surviving pane. The missing marker identifies unresolved pane IDs.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -6188,11 +6211,11 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
                 "tmux",
                 "-S",
                 socket_path,
-                "list-panes",
+                "display-message",
+                "-p",
                 "-t",
                 tmux_target,
-                "-F",
-                "#{pane_dead} #{pane_dead_status}",
+                "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}",
             ],
             check=False,
             capture_output=True,
@@ -6206,6 +6229,8 @@ def _claude_pane_state(socket_path: str, tmux_target: str) -> _ClaudePaneState:
         # told us nothing about how the process finished.
         return _ClaudePaneState(False)
     fields = proc.stdout.split()
+    if fields == ["missing"]:
+        return _ClaudePaneState(False)
     if not fields:
         # tmux answered without saying anything about the pane.
         return _ClaudePaneState(None)
@@ -6231,12 +6256,15 @@ def _request_claude_repaint(
     from :func:`_composer_row`, and the readiness wait would reap a healthy
     pane. ``SIGCONT`` runs Claude Code's resume handler, which drops its
     cached frame and repaints everything, as after ``fg``. A running process
-    without a handler ignores it, so the whole tree under the pane gets it: a
-    launcher may run Claude Code as its child.
+    without a handler ignores it, so running processes under the pane get it:
+    a launcher may run Claude Code as its child. Suspended processes stay paused.
 
     A launcher may also run Claude Code outside that tree: isaac's fast launch
     pumps the pane to a pre-started worker's terminal. Claude Code's session
     registry still names its process, so that process gets the signal too.
+
+    Targets follow :func:`_claude_pane_state`: a pane ID or a managed
+    single-pane session, never a window/pane index that tmux can reinterpret.
 
     :param socket_path: Absolute path to the tmux socket, e.g.
         ``"/tmp/.../tmux.sock"``.
@@ -6258,7 +6286,7 @@ def _request_claude_repaint(
     _check_injection_cancelled()
     try:
         proc = subprocess.run(
-            ["tmux", "-S", socket_path, "list-panes", "-t", tmux_target, "-F", "#{pane_pid}"],
+            ["tmux", "-S", socket_path, "display-message", "-p", "-t", tmux_target, "#{pane_pid}"],
             check=False,
             capture_output=True,
             text=True,
@@ -6284,6 +6312,9 @@ def _request_claude_repaint(
     signalled = 0
     for process in tree:
         with contextlib.suppress(psutil.Error):
+            # SIGCONT must not resume a tool the person deliberately suspended.
+            if process.status() in {psutil.STATUS_STOPPED, psutil.STATUS_TRACING_STOP}:
+                continue
             process.send_signal(signal.SIGCONT)
             signalled += 1
     return signalled
@@ -6329,6 +6360,21 @@ def claude_pane_text_ready(pane: str) -> bool:
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):
         return False
     return _claude_prompt_rendered(pane)
+
+
+def claude_pane_input_box_shown(pane: str) -> bool:
+    """
+    Return whether Claude's input box is on screen in any input mode.
+
+    Broader than :func:`claude_pane_text_ready`: ``!`` shell mode and the
+    ctrl+r prompt-history search also count, since the person is typing
+    there rather than being held up by a dialog. Dialogs are told apart by the
+    missing input box frame, not their titles, which a draft or reply may quote.
+
+    :param pane: Captured pane text, e.g. the watcher's last capture.
+    :returns: ``False`` when a dialog or picker replaces the input box.
+    """
+    return _composer_box(pane) is not None or _history_search_overlay_shown(pane)
 
 
 def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
@@ -7342,6 +7388,33 @@ def _history_search_footer_shown(pane: str) -> bool:
     # spell the footer out again.
     fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
+
+
+def _history_search_overlay_shown(pane: str) -> bool:
+    """
+    Return whether the ctrl+r history search is drawn in place of the input box.
+
+    Claude Code 2.1.295 draws the search as its own surface: a full-width
+    rule, then a ``Search prompts · everywhere`` title row, closed by a
+    ``… Enter to use · Esc to cancel …`` footer. The region under the lowest
+    column-0 rule (the input box's closing rule while the box is up) must
+    open with the title and end with that footer, so neither transcript text
+    nor a scrollback row above a dialog drawn without such a rule can match.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the region under that rule, or the whole pane
+        when no such rule is on screen, is framed by the search's title and footer.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    last_rule = max(
+        (i for i, line in enumerate(lines) if _box_rule_start(line) == 0), default=None
+    )
+    region = lines[last_rule + 1 :] if last_rule is not None else lines
+    if not region or not region[0].strip().lower().startswith(_HISTORY_SEARCH_OVERLAY_TITLE):
+        return False
+    # A narrow pane may wrap the footer, so its last rows are read as one.
+    footer = " ".join(" ".join(region[-3:]).split()).lower()
+    return _HISTORY_SEARCH_OVERLAY_FOOTER_HINT in footer
 
 
 def _is_box_rule(line: str) -> bool:

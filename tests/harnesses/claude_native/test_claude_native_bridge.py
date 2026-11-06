@@ -5634,7 +5634,7 @@ def test_inject_user_message_raises_when_prompt_never_renders(
             return SimpleNamespace(returncode=0, stdout="120 24 latest\n", stderr="")
         # Read-only queries (pane capture, liveness probe) are not
         # keystrokes — only writes must be absent on this path.
-        if "capture-pane" in cmd or "list-panes" in cmd:
+        if "capture-pane" in cmd or "display-message" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -5834,16 +5834,23 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
     assert tui["enters"] == 2
 
 
+@pytest.mark.parametrize(
+    "replay_captures,recovered_draft",
+    [(8, ""), (25, ""), (8, "unfinished terminal edit")],
+    ids=["composer-returned", "still-replaying", "nonempty-composer"],
+)
 def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    replay_captures: int,
+    recovered_draft: str,
 ) -> None:
     """
     A paste that lands while a resumed TUI is still replaying must not be submitted blind.
 
-    The composer frame is absent when the paste wait ends, so an Enter would submit
-    nothing and report success. Delivery waits for the composer, clears, pastes once
-    more, and presses Enter only after the draft is visible in the input box.
+    The first paste is dropped while replaying; the composer may return before
+    the paste wait ends. Delivery pastes once more and presses Enter only after
+    the draft is visible in the input box.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -5852,6 +5859,7 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -5880,9 +5888,9 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         if "capture-pane" in cmd:
             if tui["replaying"]:
                 tui["replay_captures"] += 1
-                if tui["replay_captures"] > 25:
+                if tui["replay_captures"] > replay_captures:
                     tui["replaying"] = False
-                    tui["pane"] = _composer_pane()
+                    tui["pane"] = _composer_pane(recovered_draft)
                 else:
                     return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
@@ -5901,6 +5909,20 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _with_composer_cursor(_fake_run))
+    if recovered_draft:
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "has_pending_user_prompt",
+            lambda _bridge_dir: tui["pastes"] > 0 and not tui["replaying"],
+        )
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            inject_user_message(
+                bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8
+            )
+        assert tui["pastes"] == 1
+        assert tui["enter_saw_draft"] == []
+        assert tui["pane"] == _composer_pane(recovered_draft)
+        return
     inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
 
     assert tui["enter_saw_draft"] == [True], (
@@ -11695,18 +11717,15 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     short. The probe gets the shared tmux budget, not a bespoke 1s a
     starved server outlasts.
 
-    An answer carrying no usable flag is inconclusive too. This is why the
-    probe runs ``list-panes`` and not ``display-message``: the latter
-    prints an empty line and still exits 0 for a target it cannot
-    resolve, so "tmux told us nothing" would read as "the pane is dead"
-    and end a healthy slow boot at the base budget.
+    An answer carrying no usable flag is inconclusive too. The conditional
+    format reports an unresolved target explicitly, even though tmux exits 0.
     """
     responses: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
         assert kwargs["timeout"] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
-        assert "list-panes" in cmd
-        assert "#{pane_dead} #{pane_dead_status}" in cmd
+        assert "display-message" in cmd
+        assert "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}" in cmd
         outcome = responses["outcome"]
         if isinstance(outcome, Exception):
             raise outcome
@@ -11725,6 +11744,7 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     assert state(returncode=0, stdout="1 \n") == (False, True, None)
     # A rejected query ends the wait without claiming the process exited.
     assert state(returncode=1, stdout="") == (False, False, None)
+    assert state(returncode=0, stdout="missing\n") == (False, False, None)
     # Answered, but said nothing about the pane.
     assert state(returncode=0, stdout="\n") == (None, False, None)
     assert state(returncode=0, stdout="what\n") == (None, False, None)
@@ -12106,6 +12126,21 @@ _REVERSE_SEARCH_PANE = """\
   │ ⌕ Filter history…                            │
   ╰──────────────────────────────────────────────╯
   ↑/↓ to nav · Enter to use · Esc to cancel · ctrl+s to scope
+"""
+
+# The same search as Claude Code 2.1.295 draws it mid-reply, under the
+# full-width rule that replaces the input box. Widths shortened.
+_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s · ↓ 50 tokens)
+──────────────────────────────────────────────────────────────────────
+  Search prompts · everywhere
+                                  ╭──────────────────────────────╮
+                                  │ Write a long reply.          │
+  ❯ 24s ago  Write a long reply.  ╰──────────────────────────────╯
+  ╭──────────────────────────────────────────────────────────────╮
+  │ ⌕ Filter history…                                            │
+  ╰──────────────────────────────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to use · Esc to cancel · ctrl+s to scope
 """
 
 # The same ctrl+r search as Claude Code 2.1.212 renders it: the search rides
@@ -15004,18 +15039,23 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
     ]
 
 
-def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
+@pytest.mark.parametrize(
+    "hint", ["esc to cancel", "Esc to\n  cancel"], ids=["lowercase", "wrapped"]
+)
+def test_a_lowercase_or_wrapped_escape_hint_still_marks_a_surface_dismissible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    hint: str,
 ) -> None:
     """
-    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts.
+    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts,
+    as does a hint a narrow pane wrapped between words.
 
     A dismissible surface read as unclearable would be refused instead of
-    cleared, so the hint check must not depend on the capital E.
+    cleared, so the hint check must not depend on the capital E or one row.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", "esc to cancel")
+    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", hint)
     sends = _fake_tmux(
         monkeypatch,
         [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
@@ -15303,6 +15343,110 @@ def test_claude_pane_ready_is_true_only_at_an_idle_input_box(
     frames["pane"] = _EFFORT_DIALOG_PANE
     assert claude_native_bridge.claude_pane_ready(bridge_dir) is False
     assert claude_native_bridge.claude_pane_text_ready(frames["pane"]) is False
+
+
+# Claude Code 2.1.295 draws the switch confirmation under a ▔ border, with no input box.
+_SWITCH_MODEL_CONFIRM_PANE = """\
+  ⎿  Kept model as Opus 4.8
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔ Kept effort level as auto ▔
+   Switch model?
+   Your next response will be slower and use more tokens
+   This conversation is cached for the current model. Switching to Opus 5.5 (default)
+   means the full history gets re-read on your next message.
+   ❯ 1. Yes, switch to Opus 5.5 (default)
+     2. No, go back
+"""
+
+# A search title left in scrollback above the rule-less switch confirmation.
+_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE = (
+    "  Search prompts · everywhere\n" + _SWITCH_MODEL_CONFIRM_PANE
+)
+
+# The 2.1.295 search in a 40-column pane, its footer wrapped onto two rows.
+_NARROW_OVERLAY_REVERSE_SEARCH_PANE = """\
+✢ Jitterbugging… (29s)
+────────────────────────────────────────
+  Search prompts · everywhere
+  ❯ 24s ago  Write a long reply.
+  ╭────────────────────────────────────╮
+  │ ⌕ Filter history…                  │
+  ╰────────────────────────────────────╯
+  ↑/↓ to navigate · Enter to
+  use · Esc to cancel · ctrl+s to scope
+"""
+
+# A 2.1.295 draft quoting dialog titles, wrapped in a 28-column pane mid-turn.
+_DRAFT_QUOTING_DIALOGS_PANE = """\
+✢ Leavening… (25s)
+────────────────────────────
+❯ Explain Switch model?
+  and Change effort level?
+  and use this session
+  only
+────────────────────────────
+  ⏵⏵ auto mode on
+"""
+
+_REPLY_QUOTING_DIALOGS_PANE = """\
+⏺ Switch model? and Change effort level? confirm a switch; s to use this session only.
+──────────────────────────────
+❯
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (_IDLE_PANE, True),
+        (_SHELL_MODE_PANE, True),
+        (_INLINE_REVERSE_SEARCH_PANE, True),
+        (_REVERSE_SEARCH_PANE, True),
+        (_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_NARROW_OVERLAY_REVERSE_SEARCH_PANE, True),
+        (_SLIVER_MULTILINE_DRAFT_PANE, True),
+        (_DRAFT_QUOTING_DIALOGS_PANE, True),
+        (_REPLY_QUOTING_DIALOGS_PANE, True),
+        (_MODEL_PICKER_PANE, False),
+        (_EFFORT_DIALOG_PANE, False),
+        (_SWITCH_MODEL_CONFIRM_PANE, False),
+        (_SEARCH_TITLE_ABOVE_SWITCH_CONFIRM_PANE, False),
+        (_PERMISSION_PROMPT_PANE, False),
+        (_REWIND_PANE, False),
+        (_SETTINGS_PANEL_PANE, False),
+        (_TASK_DETAILS_PANE, False),
+        ("", False),
+    ],
+    ids=[
+        "idle",
+        "shell-mode",
+        "inline-history-search",
+        "history-search",
+        "history-search-overlay",
+        "narrow-history-search-overlay",
+        "sliver-draft",
+        "draft-quoting-dialogs",
+        "reply-quoting-dialogs",
+        "model-picker",
+        "effort-dialog",
+        "switch-model-confirm",
+        "search-title-above-switch-confirm",
+        "permission-prompt",
+        "rewind",
+        "settings-panel",
+        "task-details",
+        "empty",
+    ],
+)
+def test_claude_pane_input_box_shown_counts_every_input_mode(pane: str, expected: bool) -> None:
+    """
+    Shell mode and the history search keep the person at the input box.
+
+    Only a dialog or panel drawn in its place means the terminal may need them;
+    a draft or reply quoting a dialog's title does not.
+    """
+    assert claude_native_bridge.claude_pane_input_box_shown(pane) is expected
 
 
 def test_claude_pane_ready_is_false_without_an_advertised_pane(tmp_path: Path) -> None:
@@ -16625,19 +16769,21 @@ _BTW_BORDER = "▔" * 120
 _BTW_COMPLETE_FOOTER = "    ↑/↓ to scroll · c to copy · f to fork · Esc to close"
 
 
-def _btw_pane(*body_lines: str) -> str:
+def _btw_pane(*body_lines: str, rows: int = 40) -> str:
     """
     Build a captured-pane string with a ``/btw`` overlay at the bottom.
 
-    Prepends some inert scrollback and the ``▔`` overlay border, then the
-    supplied overlay body lines, mirroring the real capture layout.
+    Pads inert scrollback above the ``▔`` overlay border so the capture is
+    *rows* tall, as ``capture-pane`` returns every row of the pane.
 
     :param body_lines: Overlay lines below the border (questions, answer,
         footer), verbatim.
+    :param rows: Pane height, e.g. ``14``.
     :returns: A synthetic pane string for the parser under test.
     """
-    prefix = ["welcome banner line", "another line", _BTW_BORDER]
-    return "\n".join([*prefix, *body_lines])
+    overlay = [_BTW_BORDER, *"\n".join(body_lines).splitlines()]
+    scrollback = [f"scrollback line {n}" for n in range(rows - len(overlay))]
+    return "\n".join([*scrollback, *overlay])
 
 
 @pytest.mark.parametrize(
@@ -16678,7 +16824,32 @@ def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     assert overlay.truncated is False
 
 
-def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
+def test_btw_overlay_flags_an_answer_clipped_by_a_short_pane() -> None:
+    """A 14-row pane shows 5 rows of a 12-line answer, under the fixed span threshold."""
+    pane = _btw_pane(
+        "",
+        "    /btw list the numbers 1 to 12, one per line",
+        "",
+        *[f"      {n}" for n in range(1, 6)],
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        rows=14,
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.answer == "1\n2\n3\n4\n5"
+    assert overlay.truncated is True
+
+
+_BTW_HISTORY_HINTS = pytest.mark.parametrize(
+    "history_hint",
+    ["←/→ to switch", "⇧←/→ to browse", "⇧ ←/→ to browse"],
+    ids=["switch", "shift-browse", "shift-space-browse"],
+)
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_takes_current_turn_and_flags_truncation(history_hint: str) -> None:
     """
     With stacked side turns, only the LAST question is taken, and a tall
     overflowing overlay is flagged truncated.
@@ -16690,7 +16861,7 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
         "",
         *answer_lines,
         "",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · Esc to close",
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -16700,12 +16871,13 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
     assert overlay.truncated is True
 
 
-def test_btw_overlay_none_while_generating() -> None:
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_none_while_generating(history_hint: str) -> None:
     """An overlay still generating (Answering… / no copy·fork) is skipped."""
     pane = _btw_pane(
         "    /btw write a long thing",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    {history_hint} · x to clear history · Esc to close",
     )
     assert claude_native_bridge._btw_overlay_from_pane(pane) is None
 
@@ -16739,8 +16911,11 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
+@_BTW_HISTORY_HINTS
 @pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
-def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(
+    close_hint: str, history_hint: str
+) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
@@ -16754,16 +16929,25 @@ def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint
         "    /btw q2",
         "",
         "      A",
-        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        f"    ←/→ to switch · x to clear history · {close_hint}",
+        f"    {history_hint} · x to clear history · {close_hint}",
     )
-    assert claude_native_bridge._btw_overlay_present(settled) is True
-    assert claude_native_bridge._btw_overlay_present(multiturn) is True
-    assert claude_native_bridge._btw_overlay_present(generating) is True
+    for pane in (settled, multiturn, generating):
+        assert claude_native_bridge._btw_overlay_present(pane) is True
+        assert claude_native_bridge._ESCAPE_DISMISS_HINT.search(pane)
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_present_from_history_footer_alone(history_hint: str) -> None:
+    """Stacked side turns are recognised by the history hint without copy/fork or a spinner."""
+    pane = _btw_pane(
+        "    /btw q1", "    /btw q2", f"    {history_hint} · x to clear history · Esc to close"
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is True
 
 
 @pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])

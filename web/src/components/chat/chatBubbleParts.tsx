@@ -72,6 +72,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
@@ -525,6 +526,11 @@ export function workingIndicatorLabel(
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
+    if (blockedOn === TERMINAL_PROMPT_BLOCKED_ON) {
+      // Inferred from the terminal's screen, so the hint stays tentative.
+      const hint = "Something in the agent's terminal may need your input.";
+      return terminalView ? `${hint} Open the Terminal view to check.` : hint;
     }
     if (answerableInChat) return `Blocked on: ${blockedOn}`;
     const waiting =
@@ -2239,8 +2245,10 @@ export function ConversationScrollRefBridge({
     state: ConversationScroller["state"];
     stopScroll: () => void;
   };
-  useEffect(() => {
-    // Runs after commit, when StickToBottom has populated scrollRef.current.
+  // Before paint: the virtualized transcript renders no rows until it has the
+  // scroll element, so handing it over later paints a newly opened session blank.
+  // Render this after StickToBottom.Content so its scrollRef is attached by now.
+  useLayoutEffect(() => {
     const el = ctx.scrollRef?.current ?? null;
     onScroller(el ? { el, state: ctx.state, stopScroll: ctx.stopScroll } : null);
     return () => onScroller(null);
