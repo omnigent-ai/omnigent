@@ -737,6 +737,11 @@ export interface ConversationState {
     pendingId?: string;
     contentKey?: string;
   }[];
+  /**
+   * Pending-input ids a Stop session settled, whose bubbles are gone. A late
+   * POST ack or receipt naming one owns no bubble, so it must not take another.
+   */
+  stoppedPendingIds: string[];
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -1321,6 +1326,11 @@ export interface ChatActions {
   clearQueuedMessages: (conversationId: string) => QueuedMessage[];
   /** Put back messages taken by `clearQueuedMessages`, ahead of any queued since. */
   restoreQueuedMessages: (messages: QueuedMessage[]) => void;
+  /**
+   * Drop the bubbles of the inputs a Stop session settled (the response's
+   * `settledPendingIds`), which get no `session.input.consumed` receipt.
+   */
+  dropPendingUserMessages: (conversationId: string, pendingIds: readonly string[]) => void;
   /**
    * Flush the queue head if the session is idle and ready. Level-triggered:
    * safe to call on any state change (idempotent — no-ops when busy, when the
@@ -2176,6 +2186,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
+  stoppedPendingIds: [],
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2398,6 +2409,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
     }));
     return removed;
+  },
+
+  dropPendingUserMessages: (conversationId, pendingIds) => {
+    if (pendingIds.length === 0) return;
+    const settled = new Set(pendingIds);
+    setterFor(conversationId)((s) => ({
+      // A snapshot-replayed bubble carries the server id as its `tempId`.
+      pendingUserMessages: s.pendingUserMessages.filter(
+        (p) => !settled.has(p.tempId) && !(p.pendingId !== undefined && settled.has(p.pendingId)),
+      ),
+      stoppedPendingIds: [...s.stoppedPendingIds, ...pendingIds].slice(-MAX_SETTLED_INPUTS),
+    }));
   },
 
   restoreQueuedMessages: (messages) => {
@@ -2970,22 +2993,30 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // what releases this conversation's entry for eviction, since the
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId
-              ? {
-                  ...p,
-                  posted: true,
-                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
-                }
-              : p,
-          ),
-          settledShellInputs: s.settledShellInputs.map((entry) =>
-            entry.tempId === tempId && postResult.pendingId
-              ? { ...entry, pendingId: postResult.pendingId }
-              : entry,
-          ),
-        }));
+        setterFor(sessionId)((s) => {
+          // A Stop session settled this send before its POST returned.
+          if (postResult.pendingId && s.stoppedPendingIds.includes(postResult.pendingId)) {
+            return {
+              pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+            };
+          }
+          return {
+            pendingUserMessages: s.pendingUserMessages.map((p) =>
+              p.tempId === tempId
+                ? {
+                    ...p,
+                    posted: true,
+                    ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                  }
+                : p,
+            ),
+            settledShellInputs: s.settledShellInputs.map((entry) =>
+              entry.tempId === tempId && postResult.pendingId
+                ? { ...entry, pendingId: postResult.pendingId }
+                : entry,
+            ),
+          };
+        });
       }
       // Note: native-terminal messages return a `pending_id`, but the
       // optimistic bubble deliberately keeps its client temp id as its
@@ -5284,7 +5315,11 @@ async function bindStream(
       if (!hydratePending) {
         candidatePending = state.pendingUserMessages;
       } else {
-        const serverPending = (session.pendingInputs ?? []).map(toPending);
+        // A Stop that landed while this fetch was in flight already settled
+        // these entries; the metadata captured before it still lists them.
+        const serverPending = (session.pendingInputs ?? [])
+          .filter((p) => !state.stoppedPendingIds.includes(p.pendingId))
+          .map(toPending);
         // One-to-one consumption so two identical queued sends still match
         // pairwise. Content (not text) equality so image-only messages
         // correlate too.
@@ -8319,7 +8354,7 @@ function isShellCommandBubble(bubble: PendingUserMessage, command: string): bool
 }
 
 /** Bound replay protection to the server's maximum pending queue size. */
-const MAX_SETTLED_SHELL_INPUTS = 64;
+const MAX_SETTLED_INPUTS = 64;
 
 /**
  * Normalized texts of the committed user-message blocks in `blocks`,
@@ -9091,6 +9126,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 eventContent !== null &&
                 entry.contentKey === contentKeyOf(eventContent)),
           );
+        // The agent recorded a message whose bubble a Stop session dropped.
+        const stopped = !!named && s.stoppedPendingIds.includes(named);
         if (hasCommittedItem(s.blocks, event.itemId)) {
           // The committed copy is already in `blocks` — the forwarder-mirrored
           // item beat this event through the stream, or a snapshot merge
@@ -9112,7 +9149,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
             };
           }
-          if (settledShell) return {};
+          if (settledShell || stopped) return {};
           // FIFO-head fallback — same marker guard as the promote path below. A
           // mirrored system marker (the vendor CLI's own `[Request interrupted
           // by user]` record) is synthesized by the CLI, owns no pending entry,
@@ -9167,6 +9204,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         //    branch 1 and never reaches this fallback.
         const head =
           settledShell ||
+          stopped ||
           unmatchedEnvelope ||
           (eventContent !== null && isSystemUserContent(eventContent)) ||
           s.pendingUserMessages[0]?.initialDraft
@@ -9241,7 +9279,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               pendingId: popped?.pendingId,
               contentKey: popped ? contentKeyOf(popped.content) : undefined,
             },
-          ].slice(-MAX_SETTLED_SHELL_INPUTS),
+          ].slice(-MAX_SETTLED_INPUTS),
         };
       });
       return;
