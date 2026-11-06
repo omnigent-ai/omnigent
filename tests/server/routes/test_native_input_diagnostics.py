@@ -421,7 +421,10 @@ async def test_message_naming_a_restored_input_settles_its_saved_row(
                 stable_id=stable_id,
                 data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
             )
-            for stable_id, text in [("a" * 32, "also update the docs"), ("b" * 32, "run the tests")]
+            for stable_id, text in [
+                ("a" * 32, "also update the docs"),
+                ("b" * 32, "run the tests"),
+            ]
         ],
     )
     assert store.transition_pending_input(
