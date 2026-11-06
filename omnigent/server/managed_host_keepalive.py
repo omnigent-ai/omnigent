@@ -155,6 +155,24 @@ def record_pong(runner_id: str, keep_warm: bool | None) -> None:
         report.wake.set()
 
 
+def record_work_dispatched(runner_id: str) -> None:
+    """Treat a session event the server just sent to *runner_id* as a keep-warm report.
+
+    A user message or approval can start work at once, but the runner's next
+    pong may be up to a ping interval away, past the sandbox's deadline if its
+    last report was ``False``. So the connection counts as keep-warm until that
+    pong reports the truth, and its loop is woken to refresh now.
+
+    :param runner_id: Runner the server forwarded a session event to.
+    """
+    report = _reports.get(runner_id)
+    if report is None or (report.received and report.keep_warm is not False):
+        return  # not tracked, or already refreshing
+    report.received = True
+    report.keep_warm = True
+    report.wake.set()
+
+
 def _wants_refresh(runner_id: str) -> bool:
     """Whether *runner_id*'s tunnel reports allow a refresh now.
 
