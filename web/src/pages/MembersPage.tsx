@@ -23,7 +23,7 @@
  * accidentally caching secrets in a list endpoint.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CopyIcon, KeyRoundIcon, RefreshCwIcon, Trash2Icon, UserPlusIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
@@ -37,6 +37,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { showToast } from "@/components/ui/toast";
+import { restoreListItem } from "@/lib/restoreListItem";
 import {
   type AccountListEntry,
   type InviteCreated,
@@ -74,18 +76,25 @@ export function MembersPage() {
   const [deleteCandidate, setDeleteCandidate] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Deletes still in flight stay hidden even if a refresh lists them.
+  const pendingDeletes = useRef(new Set<string>());
+  const latestRefresh = useRef(0);
 
   const refresh = useCallback(async () => {
+    const request = ++latestRefresh.current;
     const list = await listUsers();
+    // Overlapping deletes each refresh; only the newest response may land.
+    if (request !== latestRefresh.current) return;
     if (list === null) {
       setLoadError(
         "Could not load members. You may not have admin permission, or the server is unreachable.",
       );
-      setUsers([]);
+      // Keep rows already shown; only a first load has nothing to keep.
+      setUsers((current) => current ?? []);
       return;
     }
     setLoadError(null);
-    setUsers(list);
+    setUsers(list.filter((u) => !pendingDeletes.current.has(u.id)));
   }, []);
 
   // Initial load: identity probe + members list. Skipped in single-user
@@ -170,15 +179,18 @@ export function MembersPage() {
 
   async function onConfirmDelete() {
     if (deleteCandidate === null) return;
-    setPendingAction(true);
-    setActionError(null);
-    const result = await deleteUser(deleteCandidate);
-    setPendingAction(false);
-    if (!result.ok) {
-      setActionError(result.error);
-      return;
-    }
+    const userId = deleteCandidate;
+    const shown = users ?? [];
+    // Close now and drop the row; a failed delete puts it back where it was.
     setDeleteCandidate(null);
+    pendingDeletes.current.add(userId);
+    setUsers((current) => current?.filter((u) => u.id !== userId) ?? null);
+    const result = await deleteUser(userId);
+    pendingDeletes.current.delete(userId);
+    if (!result.ok) {
+      showToast(`Couldn't remove ${userId}: ${result.error}`);
+      setUsers((current) => current && restoreListItem(current, shown, (u) => u.id, userId));
+    }
     await refresh();
   }
 
@@ -392,11 +404,7 @@ export function MembersPage() {
       <Dialog
         open={deleteCandidate !== null}
         onOpenChange={(open) => {
-          if (pendingAction) return;
-          if (!open) {
-            setDeleteCandidate(null);
-            setActionError(null);
-          }
+          if (!open) setDeleteCandidate(null);
         }}
       >
         <DialogContent>
@@ -408,27 +416,11 @@ export function MembersPage() {
               cannot be undone.
             </DialogDescription>
           </DialogHeader>
-          {actionError !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {actionError}
-            </div>
-          )}
           <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={() => setDeleteCandidate(null)}
-              disabled={pendingAction}
-            >
+            <Button variant="ghost" onClick={() => setDeleteCandidate(null)}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void onConfirmDelete()}
-              loading={pendingAction}
-            >
+            <Button variant="destructive" onClick={() => void onConfirmDelete()}>
               Remove
             </Button>
           </DialogFooter>

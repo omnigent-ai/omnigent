@@ -42,6 +42,7 @@ import {
   fetchPinnedConversations,
   usePinnedConversations,
   clearSessionTombstones,
+  isSessionArchiving,
   markRecentlyCreated,
   clearRecentlyCreated,
   PINNED_CONVERSATIONS_KEY,
@@ -3957,6 +3958,9 @@ describe("useDeleteProject", () => {
 
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["conversations"] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
+    // No list had loaded these members, so tombstones keep a lagging refetch from showing them.
+    expect(isSessionArchiving("conv_a")).toBe(true);
+    expect(isSessionArchiving("conv_b")).toBe(true);
   });
 
   it("throws with succeeded/failed split when some archives fail", async () => {
@@ -3990,6 +3994,209 @@ describe("useDeleteProject", () => {
       succeeded: ["conv_a"],
       total: 2,
     });
+  });
+
+  function collectToasts(): string[] {
+    const toasts: string[] = [];
+    const onToast = (e: Event) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    return toasts;
+  }
+
+  function seedProjectCaches() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const listKey = ["conversations", "", false, null, "mine"];
+    queryClient.setQueryData(["projects"], [{ id: "p_1", name: "Sprint 42" }]);
+    queryClient.setQueryData(
+      listKey,
+      infinitePage([
+        conversation({ id: "conv_a", project_id: "p_1" }),
+        conversation({ id: "conv_b", labels: { [PROJECT_LABEL_KEY]: "Sprint 42" } }),
+        conversation({ id: "conv_other" }),
+      ]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useDeleteProject(), { wrapper });
+    const visibleIds = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(listKey)!
+        .pages[0].data.filter((c) => c.archived !== true)
+        .map((c) => c.id);
+    return { queryClient, rendered, visibleIds };
+  }
+
+  it("hides the folder and its loaded members before the sweep settles", async () => {
+    fetchMock.mockReturnValueOnce(new Promise(() => {}));
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+
+    await waitFor(() => expect(queryClient.getQueryData(["projects"])).toEqual([]));
+    expect(visibleIds()).toEqual(["conv_other"]);
+  });
+
+  it("restores the folder and the unarchived members when the sweep partly fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_a" }, { id: "conv_b" }],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
+    const toasts = collectToasts();
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_1", name: "Sprint 42" }]);
+    // conv_a did archive, so only conv_b returns.
+    expect(visibleIds()).toEqual(["conv_b", "conv_other"]);
+    expect(toasts).toEqual([
+      `Couldn't delete project "Sprint 42": some sessions couldn't be archived (you may not own them).`,
+    ]);
+  });
+
+  it("keeps archived members hidden when only the project DELETE fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_a" }, { id: "conv_b" }, { id: "conv_unloaded" }],
+          first_id: "conv_a",
+          last_id: "conv_unloaded",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(archivedConv("conv_b"))
+      .mockResolvedValueOnce(archivedConv("conv_unloaded"))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    const toasts = collectToasts();
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    // The folder comes back, but every member did archive, so none of them do.
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_1", name: "Sprint 42" }]);
+    expect(visibleIds()).toEqual(["conv_other"]);
+    // Live tombstones make a lagging list refetch report them archived too.
+    for (const id of ["conv_a", "conv_b", "conv_unloaded"]) {
+      expect(isSessionArchiving(id)).toBe(true);
+    }
+    expect(toasts).toEqual([`Couldn't delete project "Sprint 42". Its sessions were archived.`]);
+  });
+  it("tombstones members no list had loaded while their archive is still pending", async () => {
+    let failArchive: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string) => {
+      if (url.startsWith("/v1/sessions?")) {
+        return Promise.resolve(
+          mockResponse({
+            data: [{ id: "conv_unloaded" }],
+            first_id: "conv_unloaded",
+            last_id: "conv_unloaded",
+            has_more: false,
+          }),
+        );
+      }
+      return new Promise<Response>((resolve) => {
+        failArchive = resolve;
+      });
+    });
+    const { rendered } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    // A list refetch mid-sweep applies this tombstone, so the row can't show as live.
+    await waitFor(() => expect(isSessionArchiving("conv_unloaded")).toBe(true));
+
+    failArchive(mockResponse({}, { ok: false, status: 403 }));
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+    expect(isSessionArchiving("conv_unloaded")).toBe(false);
+  });
+
+  /** Route the project sweep's requests; each project DELETE waits for the test to settle it. */
+  function routeEmptyProjects(server: { projects: { id: string; name: string }[] }) {
+    const settleDelete = new Map<string, (response: Response) => void>();
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (url === "/v1/sessions/projects") return Promise.resolve(mockResponse(server.projects));
+      if (url.startsWith("/v1/sessions?")) {
+        return Promise.resolve(
+          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+        );
+      }
+      if (init?.method === "DELETE") {
+        return new Promise<Response>((resolve) => {
+          settleDelete.set(url, resolve);
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    return settleDelete;
+  }
+
+  it("restores each failed folder without undoing another failed delete's restore", async () => {
+    const a = { id: "p_a", name: "Alpha" };
+    const b = { id: "p_b", name: "Beta" };
+    const settleDelete = routeEmptyProjects({ projects: [a, b] });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(["projects"], [a, b]);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+    const projects = () => queryClient.getQueryData(["projects"]);
+
+    result.current.mutate(a);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_a")).toBe(true));
+    result.current.mutate(b);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_b")).toBe(true));
+    expect(projects()).toEqual([]);
+
+    settleDelete.get("/v1/projects/p_a")!(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(projects()).toEqual([a]));
+    settleDelete.get("/v1/projects/p_b")!(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(projects()).toEqual([a, b]));
+  });
+
+  it("keeps a folder hidden from list refetches while its delete is in flight", async () => {
+    const a = { id: "p_a", name: "Alpha" };
+    const b = { id: "p_b", name: "Beta" };
+    // The server still lists Alpha until its DELETE lands.
+    const server = { projects: [a, b] };
+    const settleDelete = routeEmptyProjects(server);
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => ({ list: useProjects(), del: useDeleteProject() }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.list.data).toEqual([a, b]));
+
+    result.current.del.mutate(a);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_a")).toBe(true));
+    result.current.del.mutate(b);
+    await waitFor(() => expect(settleDelete.has("/v1/projects/p_b")).toBe(true));
+    server.projects = [a];
+    settleDelete.get("/v1/projects/p_b")!(mockResponse({ deleted: true }));
+
+    // Beta's settle refetches the list; Alpha is still on the server but stays hidden.
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.filter(([url]) => url === "/v1/sessions/projects")).toHaveLength(
+        2,
+      ),
+    );
+    await waitFor(() => expect(result.current.list.isFetching).toBe(false));
+    expect(result.current.list.data).toEqual([]);
+    server.projects = [];
+    settleDelete.get("/v1/projects/p_a")!(mockResponse({ deleted: true }));
+    await waitFor(() => expect(result.current.del.isSuccess).toBe(true));
   });
 });
 

@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
+import { restoreListItem } from "@/lib/restoreListItem";
 
 /** A server-wide default policy returned by the admin CRUD API. */
 export interface DefaultPolicy {
@@ -21,11 +23,14 @@ export interface DefaultPolicy {
 
 const QUERY_KEY = ["default-policies"];
 
+/** Policies whose DELETE is still in flight, hidden from refetched lists. */
+const deletingPolicyIds = new Set<string>();
+
 async function fetchDefaultPolicies(): Promise<DefaultPolicy[]> {
   const res = await authenticatedFetch("/v1/policies");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as { object: string; data: DefaultPolicy[] };
-  return body.data;
+  return body.data.filter((policy) => policy.id === null || !deletingPolicyIds.has(policy.id));
 }
 
 // ── Hooks ────────────────────────────────────────────────────────────────────
@@ -82,7 +87,10 @@ export function useUpdateDefaultPolicy() {
   });
 }
 
-/** DELETE /v1/policies/{id} — remove a default policy. */
+/**
+ * DELETE /v1/policies/{id} — remove a default policy. Optimistic: the row
+ * leaves the cached list at once; a failure restores it and toasts.
+ */
 export function useDeleteDefaultPolicy() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -92,7 +100,28 @@ export function useDeleteDefaultPolicy() {
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
-    onSuccess: () => {
+    onMutate: async (policyId) => {
+      deletingPolicyIds.add(policyId);
+      await queryClient.cancelQueries({ queryKey: QUERY_KEY });
+      const previous = queryClient.getQueryData<DefaultPolicy[]>(QUERY_KEY);
+      queryClient.setQueryData<DefaultPolicy[]>(QUERY_KEY, (old) =>
+        old?.filter((policy) => policy.id !== policyId),
+      );
+      return { previous };
+    },
+    onError: (err, policyId, context) => {
+      deletingPolicyIds.delete(policyId);
+      // Put back only this row: another removal may have landed since the snapshot.
+      const previous = context?.previous ?? [];
+      queryClient.setQueryData<DefaultPolicy[]>(
+        QUERY_KEY,
+        (old) => old && restoreListItem(old, previous, (policy) => policy.id, policyId),
+      );
+      const name = previous.find((policy) => policy.id === policyId)?.name ?? "policy";
+      showToast(`Couldn't remove ${name}: ${err.message}`);
+    },
+    onSettled: (_data, _err, policyId) => {
+      deletingPolicyIds.delete(policyId);
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     },
   });

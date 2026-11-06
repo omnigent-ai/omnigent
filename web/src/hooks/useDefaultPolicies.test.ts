@@ -6,7 +6,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   useAddDefaultPolicy,
   useDefaultPolicies,
@@ -162,6 +162,82 @@ describe("useDeleteDefaultPolicy", () => {
     expect(url).toBe("/v1/policies/p%201");
     expect(init.method).toBe("DELETE");
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["default-policies"] });
+  });
+
+  it("drops the row at once and restores only it when its DELETE fails", async () => {
+    let failFirst: (response: Response) => void = () => {};
+    fetchMock
+      .mockReturnValueOnce(
+        new Promise<Response>((resolve) => {
+          failFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse(undefined));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const seeded = [
+      { id: "p1", name: "block_canada" },
+      { id: "p2", name: "budget" },
+      { id: "p3", name: "audit" },
+    ] as DefaultPolicy[];
+    queryClient.setQueryData(["default-policies"], seeded);
+    const toasts: string[] = [];
+    const onToast = (e: Event) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    };
+    window.addEventListener("omnigent:toast", onToast);
+    onTestFinished(() => window.removeEventListener("omnigent:toast", onToast));
+    const { result } = renderDelete(queryClient);
+
+    result.current.mutate("p1");
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[1], seeded[2]]),
+    );
+    // A second removal lands while the first is still in flight.
+    result.current.mutate("p2");
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[2]]),
+    );
+
+    failFirst(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(toasts).toEqual(["Couldn't remove block_canada: 500 OK"]));
+    // Only the failed row returns, at its old position; the removed p2 stays gone.
+    expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[0], seeded[2]]);
+  });
+
+  it("keeps a policy hidden from list refetches while its DELETE is in flight", async () => {
+    const a = { id: "p1", name: "block_canada" } as DefaultPolicy;
+    const b = { id: "p2", name: "budget" } as DefaultPolicy;
+    let listed = [a, b]; // the server keeps p1 until its DELETE lands
+    let finishFirst: (response: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method !== "DELETE") {
+        return Promise.resolve(mockResponse({ object: "list", data: listed }));
+      }
+      if (url.endsWith("/p1")) {
+        return new Promise<Response>((resolve) => {
+          finishFirst = resolve;
+        });
+      }
+      listed = [a];
+      return Promise.resolve(mockResponse(undefined));
+    });
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const { result } = renderHook(
+      () => ({ list: useDefaultPolicies(), del: useDeleteDefaultPolicy() }),
+      { wrapper: wrapperWith(queryClient) },
+    );
+    await waitFor(() => expect(result.current.list.data).toEqual([a, b]));
+
+    result.current.del.mutate("p1");
+    result.current.del.mutate("p2");
+    // p2's settle refetches the list, which still contains p1.
+    await waitFor(() => expect(fetchMock.mock.calls.filter(([, i]) => !i?.method)).toHaveLength(2));
+    await waitFor(() => expect(result.current.list.isFetching).toBe(false));
+    expect(result.current.list.data).toEqual([]);
+
+    listed = [];
+    finishFirst(mockResponse(undefined));
+    await waitFor(() => expect(result.current.del.isSuccess).toBe(true));
   });
 
   it("throws on non-2xx", async () => {
