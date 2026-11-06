@@ -7691,8 +7691,12 @@ def test_list_conversations_project_none_disables_filter(
 
 def test_set_conversation_project_files_and_unfiles(
     conversation_store: SqlAlchemyConversationStore,
+    monkeypatch,
 ) -> None:
     """``set_conversation_project`` sets and clears first-class membership."""
+    from omnigent.db.db_models import SqlPreference, current_workspace_id
+    from omnigent.errors import OmnigentError
+
     project_id = "b" * 32
     conv = conversation_store.create_conversation()
     assert conv.project_id is None
@@ -7705,6 +7709,22 @@ def test_set_conversation_project_files_and_unfiles(
     unfiled = conversation_store.set_conversation_project(conv.id, None)
     assert unfiled is True
     assert conversation_store.get_conversation(conv.id).project_id is None
+    with Session(conversation_store._engine) as session:
+        assert (
+            session.get(SqlPreference, (current_workspace_id(), "__session_families__", conv.id))
+            is None
+        )
+
+    standalone = conversation_store.get_conversation(conv.id)
+    sibling = conversation_store.create_conversation()
+    conversation_store.add_new_sibling(conv.id, sibling.id, user_id="alice")
+    with monkeypatch.context() as patch:
+        patch.setattr(conversation_store, "get_conversation", lambda _: standalone)
+        with pytest.raises(OmnigentError, match="family changed"):
+            conversation_store.set_conversation_project(conv.id, project_id)
+    assert all(
+        member.project_id is None for member in conversation_store.get_session_family(conv.id)
+    )
 
 
 def test_set_conversation_project_unknown_session_returns_false(

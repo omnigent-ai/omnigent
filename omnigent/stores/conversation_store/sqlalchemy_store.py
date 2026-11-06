@@ -1822,7 +1822,7 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def _lock_session_family(self, session: Session, family_id: str) -> SqlPreference:
         """Keep the family lock after its original session is deleted."""
-        # ponytail: one retained lock per moved/grouped source; reclaim only with
+        # ponytail: one retained lock per family; reclaim only with
         # coordinated deletion and admission across split databases.
         from sqlalchemy.dialects.mysql import insert as mysql_insert
         from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -1943,7 +1943,9 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         def write(session: Session) -> None:
             family_lock = self._lock_session_family(session, family_id)
-            source_meta = session.get(SqlConversationMetadata, (current_workspace_id(), source_id))
+            source_meta = session.get(
+                SqlConversationMetadata, (current_workspace_id(), source_id), with_for_update=True
+            )
             target_meta = session.get(
                 SqlConversationMetadata, (current_workspace_id(), session_id)
             )
@@ -2094,7 +2096,24 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(conversation_id)
         if source is None:
             return False
-        family_id = source.family_id or source.id
+        if source.family_id is None:
+
+            def move_standalone(session: Session) -> bool:
+                result = session.execute(
+                    update(SqlConversationMetadata)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id == conversation_id,
+                        SqlConversationMetadata.family_id.is_(None),
+                    )
+                    .values(project_id=project_id)
+                )
+                if not cast(_RowCountResult, result).rowcount:
+                    raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
+                return True
+
+            return run_write_transaction(self._session_immediate, "move_session", move_standalone)
+        family_id = source.family_id
 
         def family_members(session: Session) -> list[str]:
             meta = session.get(SqlConversationMetadata, (current_workspace_id(), conversation_id))
