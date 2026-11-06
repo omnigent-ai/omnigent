@@ -2838,3 +2838,83 @@ def test_prune_orphaned_bridge_dirs_keeps_live_and_unmarked_bridges(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_agy_input_region_with_background_task_widget() -> None:
+    """The composer is correctly isolated even when a background task widget sits below it."""
+    sep = "─" * 60
+    content = "1 tinka variantas A. atlik naudojant subagent"
+    pane = (
+        f"previous conversation history\n"
+        f"{sep}\n"
+        f"> {content}\n"
+        f"{sep}\n"
+        f"  ● [18:07:39] cd /workspace/project && uv run pytest tests/... running\n"
+        f"{sep}\n"
+        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
+    )
+    extracted = _mod._agy_input_region(pane)
+    assert f"> {content}" in extracted
+    assert "pytest" not in extracted
+
+
+def test_draft_detected_when_background_task_running() -> None:
+    """Pasted draft is verified when a background task or command runs concurrently."""
+    sep = "─" * 60
+    content = "1 tinka variantas A. atlik naudojant subagent"
+    needle = _mod._submit_needle(content)
+    baseline_pane = (
+        f"previous conversation history\n"
+        f"{sep}\n"
+        f">\n"
+        f"{sep}\n"
+        f"  ● [18:07:39] pytest running\n"
+        f"{sep}\n"
+        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
+    )
+    baseline = _mod._agy_input_region(baseline_pane)
+    draft_pane = (
+        f"previous conversation history\n"
+        f"{sep}\n"
+        f"> {content}\n"
+        f"{sep}\n"
+        f"  ● [18:07:39] pytest running\n"
+        f"{sep}\n"
+        f"                                        Gemini 3.8 Flash · high · 1 task(s)"
+    )
+    assert _mod._draft_in_input_region(draft_pane, needle, baseline)
+
+
+def test_submit_needles_for_long_single_paragraph() -> None:
+    """A long single-line paragraph yields head, tail, and intermediate needles."""
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    assert len(needles) >= 2
+    assert needles[0] == "Here is a long prompt th"
+    assert _mod._submit_needle(content) == needles[0]
+
+
+def test_draft_detected_when_single_long_paragraph_scrolled_with_more_lines() -> None:
+    """A single long paragraph whose start scrolled out behind '↑ 2 more lines' is detected."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    content = (
+        "Here is a long prompt that tests how agy handles text when a single "
+        "long paragraph overflows the composer viewport and scrolls. "
+        "Some technical parameters and instructions are included to ensure "
+        "multiple chunks can be sampled across the entire prompt body."
+    )
+    needles = _mod._submit_needles(content)
+    pane = (
+        f"{sep}\n"
+        f"> ↑ 2 more lines\n"
+        f"  multiple chunks can be sampled across the entire prompt body.\n"
+        f"{sep}\n"
+        f"Gemini 3.8 Flash · high"
+    )
+    assert _mod._draft_in_input_region(pane, needles[0], baseline, tuple(needles[1:]))

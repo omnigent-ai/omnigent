@@ -32,6 +32,7 @@ from omnigent.harnesses.antigravity_native.steps import (
     map_step_to_events,
     output_reasoning_delta_event,
     pending_interaction,
+    terminal_error_text,
 )
 
 # ---------------------------------------------------------------------------
@@ -1263,3 +1264,43 @@ class TestStreamProjection:
                 item = event.data.get("item_data")
                 call_id = item.get("call_id", "") if isinstance(item, dict) else ""
                 assert "orphan" not in str(call_id), f"{path.stem} minted {call_id}"
+
+
+def test_terminal_error_text_ignores_empty_output_continuation_retry() -> None:
+    step = {
+        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "errorMessage": {
+            "error": {
+                "modelErrorMessage": (
+                    "model output error: model output must contain either "
+                    "output text or tool calls, these cannot both be empty, please try again"
+                ),
+                "fullError": (
+                    "model output error: model output must contain either "
+                    "output text or tool calls, these cannot both be empty, please try again\n"
+                    "(1) model output error\n"
+                    "Wraps: (2) attached stack trace\n"
+                    "  -- stack trace:\n"
+                    "  | google3/third_party/jetski/cortex/executors/posthooks/"
+                    "posthooks.NewEmptyOutputContinuationCheckHookWithMaxRetries.func1\n"
+                ),
+            }
+        },
+    }
+    assert terminal_error_text(step) is None
+    assert map_step_to_events(step, conversation_id=_CID) == []
+
+
+def test_terminal_error_text_extracts_fatal_quota_limit() -> None:
+    step = {
+        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "errorMessage": {
+            "error": {
+                "userErrorMessage": "Agent execution terminated due to error.",
+                "modelErrorMessage": "You have hit your weekly limit. It refreshes in 2 days.",
+            }
+        },
+    }
+    assert terminal_error_text(step) == "You have hit your weekly limit. It refreshes in 2 days."

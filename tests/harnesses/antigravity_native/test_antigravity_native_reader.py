@@ -4973,3 +4973,56 @@ async def test_subagent_idle_check_failure_keeps_mirroring(
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
     assert await reader._subagent_cascade_is_idle(4242, "child-aaa") is False
+
+
+@pytest.mark.asyncio
+async def test_empty_output_continuation_retry_turn_stays_running_and_closes_idle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patched_discovery: None,
+) -> None:
+    """An empty-output continuation retry must not fail the turn or emit an error box."""
+    retry = {
+        "type": "CORTEX_STEP_TYPE_ERROR_MESSAGE",
+        "status": "CORTEX_STEP_STATUS_DONE",
+        "metadata": {"sourceTrajectoryStepInfo": {"trajectoryId": _CASCADE_ID, "stepIndex": 5}},
+        "errorMessage": {
+            "error": {
+                "modelErrorMessage": (
+                    "model output error: model output must contain either "
+                    "output text or tool calls, these cannot both be empty, please try again"
+                ),
+                "fullError": (
+                    "google3/third_party/jetski/cortex/executors/posthooks/"
+                    "posthooks.NewEmptyOutputContinuationCheckHookWithMaxRetries.func1"
+                ),
+            }
+        },
+    }
+    sink = _PostSink()
+    await _run_stream(
+        bridge_dir=_bridge_dir(tmp_path),
+        sink=sink,
+        stream=_FrameScript(
+            [
+                _frame([_load("user_input")]),
+                _frame([retry]),
+                _frame([_load("stream_planner_tool_call")]),
+                _frame([_load("stream_run_command_done")]),
+                _frame([_load("stream_planner_text_done")]),
+            ]
+        ),
+        poll_steps=_StepScript([[]]),
+        monkeypatch=monkeypatch,
+        iterations=1,
+    )
+    assert sink.statuses() == ["running", "idle"]
+    messages = [
+        d
+        for kind, d in sink.posts
+        if kind == "external_conversation_item"
+        and d.get("item_type") == "message"
+        and d["item_data"].get("role") == "assistant"
+    ]
+    assert len(messages) == 1
+    assert "error" not in str(messages[0]).lower()

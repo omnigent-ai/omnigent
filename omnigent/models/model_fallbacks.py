@@ -283,3 +283,20 @@ BACKGROUND_TITLE_CLAUDE_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["claude"].mo
 
 #: The codex-family arm background session titles pin.
 BACKGROUND_TITLE_CODEX_ECONOMY_MODEL = _BACKGROUND_TITLE_FALLBACKS["codex"].model_ids[0]
+
+
+ANTIGRAVITY_LAUNCH_MODELS = StaticModelFallback(
+    model_ids=(
+        "gemini-3.8-flash-high",
+        "gemini-3.8-flash-medium",
+        "gemini-3.8-flash-low",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "claude-sonnet-4-6",
+        "claude-opus-4-6-thinking",
+        "gpt-oss-120b-medium",
+    ),
+    owner="Antigravity native launch catalog",
+    provenance="Launch picker fallback table when live RPC and agy models return no catalog",
+    discovery_gap="Fallback for offline / early startup before agy RPC connects",
+)
