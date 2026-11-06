@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { getAdminMode } from "./adminMode";
 import { getOmnigentServerIdentity } from "./host";
 import { getCurrentUserId } from "./identity";
 import type { NativeModelOption } from "./types";
@@ -38,7 +39,7 @@ export function modelCatalogCacheKey(
   const server = getOmnigentServerIdentity();
   const user = getCurrentUserId();
   if (server === null || user === null || !targetId || !harness) return null;
-  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
+  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null, getAdminMode()])}`;
 }
 
 export function readModelCatalogCache(key: string | null) {

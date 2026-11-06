@@ -16,6 +16,7 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { resolveAdminMode } from "./adminMode";
 import { getCachedServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
@@ -302,10 +303,8 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
 }
 
-// Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
-// `users.is_admin` column), so the SPA can gate admin chrome in EVERY
-// auth mode — including OIDC/SSO, where the accounts-only `/auth/me`
-// endpoint doesn't exist. Defaults false until the probe resolves.
+// Effective admin access from `/v1/me`, including the browser's active mode.
+// Works across auth providers and defaults false until identity resolves.
 let currentIsAdmin = false;
 let identityResolved = false;
 let identityPromise: Promise<string | null> | null = null;
@@ -423,9 +422,13 @@ async function probeIdentity(): Promise<boolean> {
       const data = (await res.json()) as {
         user_id: string | null;
         is_admin?: boolean;
+        can_enable_admin_mode?: boolean;
+        admin_mode_enabled?: boolean;
+        admin_mode_cookie_name?: string;
       };
       currentUserId = data.user_id;
       currentIsAdmin = data.is_admin ?? false;
+      resolveAdminMode(data);
       return true;
     }
     return !isTransientIdentityStatus(res.status);
@@ -506,7 +509,7 @@ export function getCurrentUserId(): string | null {
 }
 
 /**
- * Whether the current user is an admin, per the `/v1/me` probe.
+ * Whether the current user has active admin access, per the `/v1/me` probe.
  * Mode-agnostic — usable to gate admin chrome under header, accounts,
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */

@@ -9,6 +9,7 @@ import {
 } from "@/hooks/useConversations";
 import * as host from "@/lib/host";
 import * as identity from "@/lib/identity";
+import { getAdminMode } from "@/lib/adminMode";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import {
   applyLiveRows,
@@ -29,6 +30,7 @@ vi.mock("@/lib/identity", () => ({
 vi.mock("@/lib/host", () => ({
   getOmnigentServerIdentity: vi.fn(() => "server-a"),
 }));
+vi.mock("@/lib/adminMode", () => ({ getAdminMode: vi.fn(() => null) }));
 
 vi.mock("@/lib/sessionUpdatesSocket", () => ({
   sessionUpdatesSocket: { isConnected: vi.fn(() => false) },
@@ -77,6 +79,7 @@ function resolveViewer(viewerId = "me"): void {
 
 beforeEach(() => {
   vi.mocked(host.getOmnigentServerIdentity).mockReset().mockReturnValue("server-a");
+  vi.mocked(getAdminMode).mockReturnValue(null);
   vi.mocked(identity.authenticatedFetch).mockReset();
   vi.mocked(identity.getCurrentUserId).mockReset().mockReturnValue(null);
   vi.mocked(identity.resolveIdentity).mockReset().mockResolvedValue(null);
@@ -436,6 +439,23 @@ describe("useCanvasSessions", () => {
       complete: true,
       networkConfirmed: false,
     });
+  });
+
+  it("does not restore cached permissions after admin mode changes", async () => {
+    resolveViewer();
+    vi.mocked(getAdminMode).mockReturnValue(true);
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("a", 9, { permission_level: 4 })], null, false)),
+    );
+    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(new QueryClient()) });
+    await waitFor(() => expect(first.result.current.complete).toBe(true));
+    first.unmount();
+
+    vi.mocked(getAdminMode).mockReturnValue(false);
+    vi.mocked(identity.authenticatedFetch).mockReturnValueOnce(new Promise<Response>(() => {}));
+    const second = renderHook(() => useCanvasSessions(), { wrapper: wrapper(new QueryClient()) });
+    expect(second.result.current.sessions).toEqual([]);
+    expect(second.result.current.complete).toBe(false);
   });
 
   it("waits for identity before restoring only owned rows from a legacy reload cache", async () => {

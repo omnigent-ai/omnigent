@@ -1,4 +1,10 @@
-import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
+import {
+  PanelLeftOpenIcon,
+  PanelRightOpenIcon,
+  SearchIcon,
+  SettingsIcon,
+  ShieldCheckIcon,
+} from "lucide-react";
 
 import {
   ARIA_MOD_KEY,
@@ -14,6 +20,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { useAdminMode } from "@/lib/adminMode";
 import { MobileHeaderButton } from "./MobileHeaderButton";
 
 /**
@@ -174,6 +181,7 @@ export function SidebarSettingsButton({
   testId?: string;
 }) {
   const isMobile = useIsMobileViewport();
+  const adminMode = useAdminMode();
   return (
     <Tooltip delayDuration={750}>
       <TooltipTrigger asChild>
@@ -186,13 +194,21 @@ export function SidebarSettingsButton({
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
-            <SettingsIcon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
+            <span className="relative inline-flex">
+              <SettingsIcon className={cn(SIDEBAR_FLOAT_ICON, isMobile && "relative z-10")} />
+              {adminMode && (
+                <ShieldCheckIcon
+                  aria-label="Admin mode on"
+                  className="absolute -bottom-1 -right-1 z-10 size-3 rounded-full bg-sidebar text-primary"
+                />
+              )}
+            </span>
             {isMobile && <OmniGlassSurface width={44} height={44} borderRadius={22} />}
           </Link>
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
-        <span>Settings</span>
+        <span>{adminMode ? "Settings · Admin mode on" : "Settings"}</span>
       </TooltipContent>
     </Tooltip>
   );
