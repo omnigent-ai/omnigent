@@ -8184,6 +8184,7 @@ async def _dispatch_skill_slash_command_to_runner(
             role="user",
             content=meta_content,
             is_meta=True,
+            user_authored=True,
         ),
         created_by=created_by,
     )
