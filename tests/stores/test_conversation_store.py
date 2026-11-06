@@ -9842,7 +9842,9 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
         f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
     )
     source = store.create_conversation(conversation_id="1" * 32, title="Coordinator")
-    first = store.create_conversation(conversation_id="2" * 32, title="Research")
+    first = store.create_conversation(
+        conversation_id="2" * 32, title="Research", labels={"omni_project": "Other project"}
+    )
     second = store.create_conversation(conversation_id="3" * 32, title="Implementation")
     store.set_labels(
         source.id,
@@ -9932,10 +9934,13 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert await store.delete_conversation(source.id)
     assert [member.id for member in store.get_session_family(second.id)] == [first.id, second.id]
     assert store.get_conversation(second.id).labels[family_pinned_label_key(user_id)] == "345"
-    later = store.create_conversation(conversation_id="5" * 32, title="Follow-up")
+    later = store.create_conversation(
+        conversation_id="5" * 32, title="Follow-up", labels={"omni_project": "Other project"}
+    )
     store.add_new_sibling(second.id, later.id, user_id=user_id)
     assert store.get_conversation(later.id).family_id == source.id
     assert store.get_conversation(later.id).project_id == project_id
+    assert "omni_project" not in store.get_conversation(later.id).labels
     assert store.get_conversation(later.id).labels[family_pinned_label_key(user_id)] == "345"
     reopened = SqlAlchemyConversationStore(
         f"sqlite:///{tmp_path / 'metadata.db'}",
@@ -9958,8 +9963,10 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert store.get_conversation(candidate.id).family_id is None
 
     another = store.create_conversation()
-    another_sibling = store.create_conversation()
+    another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
     store.add_new_sibling(another.id, another_sibling.id, user_id=user_id)
+    assert store.get_conversation(another_sibling.id).project_id is None
+    assert "omni_project" not in store.get_conversation(another_sibling.id).labels
     monkeypatch.setattr(
         "omnigent.stores.conversation_store.sqlalchemy_store._FAMILY_READ_BATCH_SIZE", 1
     )

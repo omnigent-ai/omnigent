@@ -1926,6 +1926,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             updates: dict[str, str] = {}
             if project_id is None and PROJECT_LABEL_KEY in source_labels:
                 updates[PROJECT_LABEL_KEY] = source_labels[PROJECT_LABEL_KEY]
+            else:
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id.in_(member_ids),
+                        SqlConversationLabel.key == PROJECT_LABEL_KEY,
+                    )
+                )
             if promote_pin and pin_key in source_labels:
                 updates[family_pin_key] = source_labels[pin_key]
                 labels_session.execute(
