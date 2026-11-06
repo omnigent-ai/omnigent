@@ -974,6 +974,23 @@ class _ClaudeClientState:
     cli_launcher: str | None = None
 
 
+def _recording_consents(
+    gate: Callable[[str, ToolArgs, object], Awaitable[object]], consents: _RelayConsents
+) -> Callable[[str, ToolArgs, object], Awaitable[object]]:
+    """Wrap the CLI's permission gate so the relay honours what it approved."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    async def can_use_tool(tool_name: str, tool_input: ToolArgs, perm_ctx: object) -> object:
+        verdict = await gate(tool_name, tool_input, perm_ctx)
+        if tool_name.startswith(_OMNIGENT_MCP_PREFIX) and isinstance(
+            verdict, PermissionResultAllow
+        ):
+            consents.record(tool_name.removeprefix(_OMNIGENT_MCP_PREFIX), tool_input)
+        return verdict
+
+    return can_use_tool
+
+
 async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
     """Release a gone CLI's relay and launcher; the relay's shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
@@ -1097,6 +1114,43 @@ def _ensure_sdk() -> ModuleType:
 # ``_stable_tool_executor``. Every other tool (Claude Code's ``Skill`` and
 # ``ToolSearch``, or a user-configured MCP server) runs inside the CLI.
 _OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+# Permission modes in which Omnigent's tools are pre-approved (``allowed_tools``), so the
+# CLI asks no consent for them.
+_OMNIGENT_TOOLS_PREAPPROVED_MODES = ("auto", "bypassPermissions")
+
+
+class _RelayConsents:
+    """Omnigent tool calls the CLI's permission gate approved, each honoured once.
+
+    The managed relay accepts any caller holding its token, which anything in the
+    CLI's sandbox can read, so it asks consent for a call the gate did not approve.
+    A call the gate approved is not asked about again. An approval unused for
+    :attr:`TTL_S` lapses.
+    """
+
+    TTL_S = 300.0
+
+    def __init__(self) -> None:
+        self._approved: list[tuple[str, str, float]] = []
+
+    @staticmethod
+    def _key(arguments: Mapping[str, object]) -> str:
+        return json.dumps(arguments, sort_keys=True, default=str)
+
+    def record(self, tool_name: str, arguments: Mapping[str, object]) -> None:
+        """Remember that the gate approved ``tool_name`` with ``arguments``."""
+        self._approved.append((tool_name, self._key(arguments), time.monotonic()))
+
+    def consume(self, tool_name: str, arguments: Mapping[str, object]) -> bool:
+        """Use up one approval for this exact call; ``False`` when there is none."""
+        now = time.monotonic()
+        self._approved = [item for item in self._approved if now - item[2] < self.TTL_S]
+        key = self._key(arguments)
+        for index, (name, approved_key, _at) in enumerate(self._approved):
+            if name == tool_name and approved_key == key:
+                del self._approved[index]
+                return True
+        return False
 
 
 def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
@@ -2305,6 +2359,30 @@ class ClaudeSDKExecutor(Executor):
             state.model = model
         return state.client
 
+    def _consented_relay_executor(
+        self, tool_executor: ToolExecutor, consents: _RelayConsents
+    ) -> ToolExecutor:
+        """The executor a managed relay dispatches through, asking consent as the CLI would.
+
+        Outside a pre-approving permission mode a call runs only if the CLI's gate
+        approved it (see :class:`_RelayConsents`) or the same gate approves it now, so a
+        process that reads the relay's token cannot skip the consent the CLI asks for.
+        """
+        from claude_agent_sdk import PermissionResultAllow
+
+        async def dispatch(name: str, arguments: ToolArgs) -> ToolResult:
+            if self._permission_mode not in _OMNIGENT_TOOLS_PREAPPROVED_MODES and not (
+                consents.consume(name, arguments)
+            ):
+                verdict = await self._can_use_tool_gate(
+                    f"{_OMNIGENT_MCP_PREFIX}{name}", arguments, None
+                )
+                if not isinstance(verdict, PermissionResultAllow):
+                    return {"error": f"Omnigent tool {name!r} was not approved", "blocked": True}
+            return await tool_executor(name, arguments)
+
+        return dispatch
+
     def _prepare_managed_cli(
         self, options: SdkOptions, relay_tools: list[ToolSpec] | None
     ) -> tuple[_ManagedMcpRelay | None, str | None]:
@@ -2321,8 +2399,16 @@ class ClaudeSDKExecutor(Executor):
 
         relay = None
         if relay_tools is not None and self._tool_executor is not None:
-            relay = _ManagedMcpRelay(relay_tools, self._tool_executor, asyncio.get_running_loop())
+            consents = _RelayConsents()
+            relay = _ManagedMcpRelay(
+                relay_tools,
+                self._consented_relay_executor(self._tool_executor, consents),
+                asyncio.get_running_loop(),
+            )
             options.env.update(relay.env)
+            gate = getattr(options, "can_use_tool", None)
+            if gate is not None:
+                options.can_use_tool = _recording_consents(gate, consents)
         else:
             # Empty values make the entry's command fail instead of reaching a bridge.
             options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
@@ -3158,7 +3244,7 @@ class ClaudeSDKExecutor(Executor):
         # When ``allowed_tools`` is empty the SDK omits ``--allowedTools``
         # entirely, letting Claude's normal permission flow apply.
         allowed_tools: list[str] = []
-        if self._permission_mode in ("auto", "bypassPermissions"):
+        if self._permission_mode in _OMNIGENT_TOOLS_PREAPPROVED_MODES:
             # Allow all Omnigent MCP tools (no per-call human gate needed)
             for schema in tools:
                 raw_tname = schema.get("name")

@@ -3925,6 +3925,22 @@ def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: s
     return replies
 
 
+def _call_relay_directly(bridge_dir: Path, name: str) -> dict:
+    """POST one tool call to a relay with its own token, as a sandboxed process could."""
+    import urllib.request
+
+    relay = json.loads((bridge_dir / "tool_relay.json").read_text())
+    request = urllib.request.Request(
+        f"{relay['url']}/tool",
+        data=json.dumps({"name": name, "arguments": {}}).encode(),
+        method="POST",
+        headers={"Authorization": f"Bearer {relay['token']}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        # The relay streams blank heartbeat lines before its result.
+        return json.loads(next(line for line in response if line.strip()))
+
+
 def _deploy_managed_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, servers: dict[str, object]
 ) -> None:
@@ -3942,7 +3958,10 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Claude Code refuses ``--mcp-config`` under ``managed-mcp.json``; the static entry
-    reaches the session's tools instead, and without it the session starts tool-less."""
+    reaches the session's tools instead, and without it the session starts tool-less.
+
+    Anything in the CLI's sandbox can read the relay's token, so a call made straight to
+    the relay still needs the consent the CLI's permission gate would have asked for."""
     from omnigent.harnesses.claude_native import bridge
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
@@ -3966,6 +3985,14 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
     fake_sdk.create_sdk_mcp_server = _SDKTools.create_sdk_mcp_server
     executor = ClaudeSDKExecutor()
     executor._tool_executor = tool_executor
+    consent_asked: list[str] = []
+    consent_answers: list[bool] = []
+
+    async def elicitation_handler(tool_name: str, tool_input: dict) -> bool:
+        consent_asked.append(tool_name)
+        return consent_answers.pop(0)
+
+    executor._elicitation_handler = elicitation_handler
     messages: list[dict[str, object]] = []
 
     async def turn(text: str):
@@ -3996,6 +4023,33 @@ async def test_managed_mcp_config_serves_omnigent_tools_through_its_relay_entry(
         assert "mcp__omnigent__" in first.options.system_prompt
         # Policy Omnigent can't read may still drop the entry, so the prompt hedges.
         assert "if no `mcp__omnigent__` tool is available" in first.options.system_prompt
+
+        # A direct call with the relay's token, outside the CLI, asks for consent.
+        executor._permission_mode = "default"
+        consent_answers[:] = [False]
+        declined = await asyncio.to_thread(_call_relay_directly, bridge_dir, "sys_ping")
+        assert consent_asked == ["mcp__omnigent__sys_ping"]
+        assert called == ["sys_ping"] and "pong" not in json.dumps(declined)
+        consent_answers[:] = [True]
+        assert "pong" in json.dumps(
+            await asyncio.to_thread(_call_relay_directly, bridge_dir, "sys_ping")
+        )
+        assert called == ["sys_ping"] * 2
+        # A call the CLI's permission gate approved is not asked for twice.
+        consent_asked.clear()
+        consent_answers[:] = [True]
+        verdict = await first.options.can_use_tool("mcp__omnigent__sys_ping", {}, None)
+        assert type(verdict).__name__ == "PermissionResultAllow"
+        await asyncio.to_thread(_call_relay_directly, bridge_dir, "sys_ping")
+        assert consent_asked == ["mcp__omnigent__sys_ping"]
+        assert called == ["sys_ping"] * 3
+        # Bypass mode never asks, as the CLI pre-approves Omnigent tools there.
+        executor._permission_mode = "bypassPermissions"
+        await asyncio.to_thread(_call_relay_directly, bridge_dir, "sys_ping")
+        assert consent_asked == ["mcp__omnigent__sys_ping"]
+        assert called == ["sys_ping"] * 4
+        executor._permission_mode = "auto"
+        called.clear()
         # The live CLI keeps its relay; closing the session stops it.
         assert await turn("q1") is first
         await executor.close_session("managed")
