@@ -777,7 +777,12 @@ def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput 
         return _drained_input(entry)
 
 
-def mark_uncertain(conversation_id: str) -> None:
+def mark_uncertain(
+    conversation_id: str,
+    *,
+    pending_id: str | None = None,
+    delivery_attempt_id: str | None = None,
+) -> None:
     """
     Flag every queued, unheld entry as possibly already mirrored.
 
@@ -788,10 +793,18 @@ def mark_uncertain(conversation_id: str) -> None:
     jumps over them drains them as ``uncertain`` instead of ``skipped``.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+    :param pending_id: Restrict the update to one entry when supplied.
+    :param delivery_attempt_id: Preserve replacement attempts when supplied.
     """
     with _lock:
-        for entry in _pending.get(conversation_id, {}).values():
-            if not entry.held:
+        for identifier, entry in _pending.get(conversation_id, {}).items():
+            if (
+                not entry.held
+                and (pending_id is None or identifier == pending_id)
+                and (
+                    delivery_attempt_id is None or entry.delivery_attempt_id == delivery_attempt_id
+                )
+            ):
                 entry.uncertain = True
 
 

@@ -25,6 +25,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID, Conversation, ConversationItem, PagedList
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HOST_CAPABILITIES, HostHelloFrame
+from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime import (
     _globals,
@@ -9021,6 +9022,186 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
             ("runner_error", None)
         ]
     finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", ["exception", "not_accepted"])
+@pytest.mark.parametrize("with_attachment", [False, True])
+async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
+    monkeypatch: pytest.MonkeyPatch, refusal: str, with_attachment: bool
+) -> None:
+    """A re-send that cannot start records the failure the re-send replaced."""
+    from types import SimpleNamespace
+
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import _relay_runner_stream
+
+    pending_inputs.reset_for_tests()
+    orchestration_module._resent_native_inputs.clear()
+    orchestration_module._active_native_input_resends.clear()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    # Earlier relay tests leave this session's live status failed.
+    orchestration_module._session_status_cache.pop(session_id, None)
+    stable_id = "9c" * 16
+    content = [{"type": "input_text", "text": "run the tests"}]
+    if with_attachment:
+        content.append({"type": "input_file", "file_id": "file_original", "filename": "input.txt"})
+    pending_id = pending_inputs.record(
+        session_id,
+        content,
+        created_by="owner@example.test",
+        stable_id=stable_id,
+        background_titles_enabled=False,
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    attempts: list[str] = []
+
+    async def refuse(*args: Any) -> object:
+        attempts.append(args[0])
+        assert args[1].data == {"role": "user", "content": content, "stable_id": stable_id}
+        assert args[2:] == ("owner@example.test", False)
+        if refusal == "exception":
+            raise RuntimeError("runner unavailable")
+        return SimpleNamespace(accepted=False)
+
+    monkeypatch.setattr(orchestration_module, "_native_input_resender", refuse)
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        session_stream, "publish", lambda _session_id, event: published.append(event)
+    )
+    error = {
+        "code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+        "message": "The Claude Code terminal is no longer running.",
+        "undelivered": True,
+    }
+    store = _ConversationStore()
+    store._conversations[session_id].runner_id = "native-runner"
+    client = _ScriptedStreamingRunnerClient(
+        [
+            _sse_frame({"type": "response.in_progress", "response": {"id": "resp_untyped"}}),
+            _sse_frame(
+                {
+                    "type": "response.failed",
+                    **identity,
+                    "response": {"id": "resp_untyped", "error": error},
+                }
+            ),
+            _sse_frame(
+                {
+                    "type": "session.status",
+                    "status": "failed",
+                    "error": {"code": error["code"], "message": error["message"]},
+                    "response_id": "resp_untyped",
+                }
+            ),
+            "data: [DONE]\n\n",
+        ]
+    )
+    try:
+        await _relay_runner_stream(session_id, client, store, runner_id="native-runner")  # type: ignore[arg-type]
+        await asyncio.gather(*orchestration_module._resend_tasks)
+
+        assert attempts == [session_id]
+        assert [item.type for item in store.appended_items] == ["message", "error"]
+        assert store.appended_items[0].data.content == content
+        assert store.appended_items[1].data.code == error["code"]
+        persisted = orchestration_module._last_task_error_from_labels(
+            store._conversations[session_id].labels
+        )
+        assert persisted is not None
+        assert persisted["code"] == error["code"]
+        assert persisted["message"] == error["message"]
+        failed = [
+            event
+            for event in published
+            if event.get("type") == "session.status" and event.get("status") == "failed"
+        ]
+        assert [event["error"]["code"] for event in failed] == [error["code"]]
+        assert pending_inputs.snapshot_for(session_id) == []
+    finally:
+        orchestration_module._resent_native_inputs.clear()
+        orchestration_module._active_native_input_resends.clear()
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "missing_attempt",
+        "stale_attempt",
+        "same_stable_replaced",
+        "restored_owner",
+        "new_runner",
+        "stopped",
+        "new_input_queued",
+        "after_typing",
+    ],
+)
+async def test_pretyping_recovery_requires_the_exact_live_input_owner(
+    monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+
+    pending_inputs.reset_for_tests()
+    orchestration_module._resent_native_inputs.clear()
+    orchestration_module._active_native_input_resends.clear()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    orchestration_module._interrupt_fenced_sessions.discard(session_id)
+    orchestration_module._intentional_stop_sessions.pop(session_id, None)
+    orchestration_module._session_status_cache.pop(session_id, None)
+    stable_id = "7c" * 16
+    pending_id = pending_inputs.record(
+        session_id, [{"type": "input_text", "text": "original input"}], stable_id=stable_id
+    )
+    identity = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    error = {"code": TERMINAL_EXITED_BEFORE_DELIVERY_CODE, "undelivered": True}
+    event = {"type": "response.failed", **identity, "response": {"id": "resp_old", "error": error}}
+    store = _ConversationStore()
+    conv = store._conversations[session_id]
+    conv.runner_id = "native-runner"
+    monkeypatch.setattr(orchestration_module, "_native_input_resender", object())
+    if replacement == "missing_attempt":
+        event.pop("delivery_attempt_id")
+    elif replacement == "stale_attempt":
+        event["delivery_attempt_id"] = "f" * 32
+    elif replacement == "same_stable_replaced":
+        pending_inputs.resolve(session_id, pending_id)
+        assert (
+            pending_inputs.record(
+                session_id, [{"type": "input_text", "text": "new attempt"}], stable_id=stable_id
+            )
+            == pending_id
+        )
+    elif replacement == "restored_owner":
+        original = pending_inputs.resolve(session_id, pending_id)
+        assert original is not None
+        original.restored = True
+        original.delivery_attempt_id = None
+        pending_inputs.restore(session_id, original)
+    elif replacement == "new_runner":
+        conv.runner_id = "replacement-runner"
+    elif replacement == "stopped":
+        pending_inputs.mark_interrupted(session_id, [pending_id])
+    elif replacement == "new_input_queued":
+        pending_inputs.record(session_id, [{"type": "input_text", "text": "newer work"}])
+    else:
+        error["undelivered"] = False
+    before = pending_inputs.peek(session_id, pending_id)
+    try:
+        assert (
+            await orchestration_module._claim_native_input_resend(
+                store, session_id, event, "native-runner"
+            )
+            is None
+        )
+        assert pending_inputs.peek(session_id, pending_id) == before
+        assert not orchestration_module._resent_native_inputs
+    finally:
+        orchestration_module._active_native_input_resends.clear()
         pending_inputs.reset_for_tests()
 
 

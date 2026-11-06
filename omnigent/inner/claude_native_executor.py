@@ -62,6 +62,7 @@ from omnigent.inner.native_attachments import (
     framework_notices,
 )
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.native.input_diagnostics import TERMINAL_EXITED_BEFORE_DELIVERY_CODE
 
 _logger = logging.getLogger(__name__)
 
@@ -209,15 +210,19 @@ class ClaudeNativeExecutor(Executor):
                 # sessions. Runs to completion before the message
                 # inject below (same lock), so its confirm Enter can't
                 # race the message.
-                await self._inject(
-                    partial(
-                        inject_slash_command,
-                        self._bridge_dir,
-                        command=f"/model {wanted_model_arg}",
-                        auto_confirm=True,
-                        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                try:
+                    await self._inject(
+                        partial(
+                            inject_slash_command,
+                            self._bridge_dir,
+                            command=f"/model {wanted_model_arg}",
+                            auto_confirm=True,
+                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        )
                     )
-                )
+                except ClaudeTerminalExited as exc:
+                    exc.nothing_typed = True
+                    raise
                 # Track the routed id, not the alias: the next turn's
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
@@ -502,7 +507,14 @@ class ClaudeNativeExecutor(Executor):
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            # Nothing was typed, so a pane that died under the turn lets the
+            # server relaunch Claude and send the message once more.
+            resendable = exc.nothing_typed and not clean_exit and not exc.killed_by_omnigent
+            yield ExecutorError(
+                message=message,
+                code=TERMINAL_EXITED_BEFORE_DELIVERY_CODE if resendable else None,
+                undelivered=True,
+            )
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(

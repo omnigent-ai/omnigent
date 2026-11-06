@@ -654,12 +654,22 @@ class ClaudeTerminalExited(ClaudePromptTimeout):
     Subclasses :class:`ClaudePromptTimeout` so existing delivery handlers
     keep catching it, while callers that care about severity can tell a
     clean quit (``exit_status`` ``"0"`` — the person closed Claude Code)
-    from a crash.
+    from a crash. ``killed_by_omnigent`` tells a pane Omnigent ended itself from
+    one that died under it.
     """
 
-    def __init__(self, message: str, *, exit_status: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        exit_status: str | None = None,
+        killed_by_omnigent: bool = False,
+        nothing_typed: bool = False,
+    ) -> None:
         super().__init__(message)
         self.exit_status = exit_status
+        self.killed_by_omnigent = killed_by_omnigent
+        self.nothing_typed = nothing_typed
 
 
 class ClaudeTerminalDialog(RuntimeError):
@@ -4528,12 +4538,16 @@ def inject_user_message(
     # box mounts a few seconds later. Block until the prompt renders so
     # the first message isn't typed into a still-booting TUI and dropped.
     delivery_diagnostics.set_stage("waiting_for_prompt")
-    _wait_for_claude_prompt_ready(
-        info["socket_path"],
-        info["tmux_target"],
-        timeout_s=timeout_s,
-        bridge_dir=bridge_dir,
-    )
+    try:
+        _wait_for_claude_prompt_ready(
+            info["socket_path"],
+            info["tmux_target"],
+            timeout_s=timeout_s,
+            bridge_dir=bridge_dir,
+        )
+    except ClaudeTerminalExited as exc:
+        exc.nothing_typed = True
+        raise
     # Escape unsupported slash commands (e.g. ``/help``, ``/exit``) so the
     # Claude Code TUI treats them as user text instead of invoking a state
     # that Omnigent cannot drive. Allowed commands (``/clear``,
@@ -7539,6 +7553,7 @@ def _wait_for_claude_prompt_ready(
             "Relaunch the terminal to continue this conversation."
             + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
+            killed_by_omnigent=pane_killed_by_omnigent(bridge_dir or Path(socket_path).parent),
         )
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {waited_s:.1f}s "

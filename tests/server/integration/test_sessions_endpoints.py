@@ -10836,6 +10836,622 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
                 pending_inputs.resolve(session["id"], pending["pending_id"])
 
 
+async def _claude_turn_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: Exception | None
+) -> dict[str, Any] | None:
+    """Run one real Claude-native turn whose delivery raises *failure*; return its error."""
+    from omnigent.inner import claude_native_executor
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    def deliver(bridge_dir: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir, content, timeout_s
+        if failure is not None:
+            raise failure
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", deliver)
+    monkeypatch.setattr(claude_native_executor, "kill_session", lambda *_a, **_k: None)
+    adapter = ExecutorAdapter(
+        executor_factory=lambda: claude_native_executor.ClaudeNativeExecutor(tmp_path)
+    )
+    context = TurnContext(
+        response_id="resp_pane_died", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    try:
+        await adapter.run_turn(
+            CreateResponseRequest(
+                model="claude", input=[{"type": "input_text", "text": "run the tests"}]
+            ),
+            context,
+        )
+    except RuntimeError as exc:
+        return adapter._build_error_detail(exc).model_dump(exclude_none=True)
+    finally:
+        await adapter.on_shutdown()
+    return None
+
+
+def _failed_turn_frames(
+    input_identity: dict[str, Any], error: dict[str, Any], response_id: str = "resp_pane_died"
+) -> list[str]:
+    """The runner's relay frames for a turn that failed with *error*, then [DONE]."""
+    from omnigent.native.input_diagnostics import input_attributes
+    from tests.server.routes.test_session_resources import _sse_frame
+
+    return [
+        _sse_frame({"type": "response.in_progress", "response": {"id": response_id}}),
+        _sse_frame({"type": "session.status", "status": "running", "response_id": response_id}),
+        _sse_frame(
+            {
+                "type": "response.failed",
+                **input_attributes(input_identity),
+                "response": {"id": response_id, "error": error},
+            }
+        ),
+        # The runner's turn-end edge carries the turn's own code.
+        _sse_frame(
+            {
+                "type": "session.status",
+                "status": "failed",
+                "error": {"code": error["code"], "message": error["message"]},
+                "response_id": response_id,
+            }
+        ),
+        "data: [DONE]\n\n",
+    ]
+
+
+@pytest.mark.parametrize(
+    "pane_died",
+    [
+        "waiting_for_prompt",
+        "recovery_completes",
+        "after_submit",
+        "stop_during_resend",
+        "stop_then_replacement_finishes",
+        "replacement_finishes",
+        "runner_rebound",
+        "exact_http_retry",
+        "new_user_message",
+        "invalid_assistant_post",
+        "invalid_system_post",
+        "retry_session_during_recovery",
+        "deleted_during_resend",
+        "cancel_before_registration",
+        "stop_then_cancel",
+        "cancel_during_forward",
+        "retry_ensure_failure",
+        "retry_http_refused",
+        "retry_transport_ambiguous",
+        "retry_http_ambiguous",
+        "retry_marker_ambiguous",
+    ],
+)
+async def test_claude_pane_death_before_the_message_is_typed_sends_it_once_more(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    app: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    pane_died: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A message still waiting for Claude's prompt when its pane dies is delivered once.
+
+    Nothing was typed, so the server relaunches the terminal through the normal
+    send path and forwards the same message again instead of failing the turn.
+    It does that at most once per message, and a pane that died after the
+    message was submitted still fails as before: re-sending it could run it twice.
+    """
+    from omnigent.harnesses.claude_native.bridge import ClaudeTerminalExited
+    from omnigent.native.input_diagnostics import input_attributes
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions import orchestration as orchestration_module
+    from omnigent.server.routes.sessions import (
+        _persist_external_conversation_item,
+        _relay_runner_stream,
+        routes_events,
+    )
+    from omnigent.server.schemas import SessionEventInput
+    from tests.server.routes.test_session_resources import _ScriptedStreamingRunnerClient
+
+    caplog.set_level("INFO", logger="omnigent.server.routes.sessions")
+
+    agent = await create_test_agent(client, name="claude-native-ui")
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"},
+    )
+    session_id = session["id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.replace_runner_id(session_id, "native-runner")
+    terminals_path = f"/v1/sessions/{session_id}/resources/terminals"
+    events_path = f"/v1/sessions/{session_id}/events"
+    ensures: list[str] = []
+    forwarded: list[dict[str, Any]] = []
+
+    ensure_started = asyncio.Event()
+    ensure_release = asyncio.Event()
+    forward_started = asyncio.Event()
+    gate_ensure = False
+    retry_outcome = pane_died in {
+        "retry_ensure_failure",
+        "retry_http_refused",
+        "retry_transport_ambiguous",
+        "retry_http_ambiguous",
+        "retry_marker_ambiguous",
+    }
+    gated = (
+        pane_died not in {"waiting_for_prompt", "recovery_completes", "after_submit"}
+        and not retry_outcome
+    )
+    original_replacement_check = orchestration_module._native_input_resend_was_replaced
+    queue_gated = pane_died in {
+        "exact_http_retry",
+        "invalid_assistant_post",
+        "invalid_system_post",
+        "retry_session_during_recovery",
+    }
+
+    async def replacement_check(*args: Any) -> bool:
+        if (
+            queue_gated
+            and gate_ensure
+            and pending_inputs.pending_id_for_stable_id(session_id, stable_id) is not None
+        ):
+            ensure_started.set()
+            await ensure_release.wait()
+        return await original_replacement_check(*args)
+
+    monkeypatch.setattr(
+        orchestration_module, "_native_input_resend_was_replaced", replacement_check
+    )
+
+    async def runner(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201, json={"session_init_protocol_version": 2, "terminal_ready": False}
+            )
+        if request.url.path == terminals_path:
+            ensures.append(request.url.path)
+            if gate_ensure and pane_died == "retry_ensure_failure":
+                return httpx.Response(
+                    500,
+                    json={"error": "native_terminal_start_failed", "detail": "replacement failed"},
+                )
+            if gated and gate_ensure and pane_died != "cancel_during_forward" and not queue_gated:
+                ensure_started.set()
+                await ensure_release.wait()
+            return httpx.Response(200, json={})
+        if request.url.path == events_path:
+            payload = json.loads(request.content)
+            if payload.get("type") != "interrupt":
+                forwarded.append(payload)
+                if gate_ensure and pane_died == "retry_http_refused":
+                    return httpx.Response(
+                        409,
+                        json={
+                            "error": {
+                                "code": "invalid_input",
+                                "message": "replacement rejected before acceptance",
+                                "undelivered": True,
+                            }
+                        },
+                    )
+                if gate_ensure and pane_died == "retry_transport_ambiguous":
+                    raise httpx.ReadError("replacement acknowledgement lost", request=request)
+                if gate_ensure and pane_died == "retry_http_ambiguous":
+                    return httpx.Response(500, json={"error": "unknown processing outcome"})
+                if gate_ensure and pane_died == "retry_marker_ambiguous":
+                    return httpx.Response(
+                        409,
+                        json={
+                            "error": {
+                                "code": "invalid_input",
+                                "message": "untyped delivery metadata",
+                                "undelivered": "true",
+                            }
+                        },
+                    )
+                if gate_ensure and pane_died == "cancel_during_forward":
+                    forward_started.set()
+                    await ensure_release.wait()
+        return httpx.Response(202, json={})
+
+    stable_id = "5e" * 16
+    message = {
+        "type": "message",
+        "data": {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "run the tests"}],
+            "stable_id": stable_id,
+        },
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr(
+            routes_events, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        monkeypatch.setattr(
+            routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
+        )
+        bound = store.get_conversation(session_id)
+        assert bound is not None
+        await app.state.runner_session_initializer.initialize(
+            bound, runner_client, timeout=5, suppress_recovery_turn=True
+        )
+        try:
+            sent = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            assert sent.status_code == 202, sent.text
+            assert len(forwarded) == 1
+            assert {"input_stable_id", "pending_id", "delivery_attempt_id"} <= forwarded[0].keys()
+            pending_id = sent.json()["pending_id"]
+            ensures.clear()
+            gate_ensure = True
+
+            if pane_died != "after_submit":
+                # Delivery was still waiting for the prompt when tmux lost the pane.
+                refusal = ClaudeTerminalExited("The Claude Code terminal is no longer running.")
+                refusal.nothing_typed = True
+                error = await _claude_turn_failure(monkeypatch, tmp_path, refusal)
+            else:
+                # The message was submitted; the pane died while Claude worked on it.
+                assert await _claude_turn_failure(monkeypatch, tmp_path, None) is None
+                error = {"code": "required_terminal_exited", "message": "Claude exited."}
+            assert error is not None
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(_failed_turn_frames(forwarded[0], error)),  # type: ignore[arg-type]
+                store,
+                runner_id="native-runner",
+            )
+            if gated:
+                await asyncio.wait_for(
+                    (
+                        forward_started if pane_died == "cancel_during_forward" else ensure_started
+                    ).wait(),
+                    timeout=5,
+                )
+                waiting = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert waiting["status"] == "running"
+                assert (
+                    orchestration_module._active_native_input_resends[session_id][
+                        stable_id
+                    ].input.content
+                    == message["data"]["content"]
+                )
+                assert not any(item["type"] == "error" for item in waiting["items"])
+                if pane_died.startswith("stop"):
+                    stopped = await client.post(
+                        f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+                    )
+                    assert stopped.status_code == 202, stopped.text
+                if "cancel" in pane_died:
+                    tasks = list(orchestration_module._resend_tasks)
+                    assert len(tasks) == 1
+                    tasks[0].cancel()
+                    cancelled = await asyncio.gather(*tasks, return_exceptions=True)
+                    assert isinstance(cancelled[0], asyncio.CancelledError)
+                if "replacement_finishes" in pane_died:
+                    gate_ensure = False
+                    replacement_content = [{"type": "input_text", "text": "newer user request"}]
+                    replacement = await client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "stable_id": stable_id,
+                                "content": replacement_content,
+                            },
+                        },
+                    )
+                    assert replacement.status_code == 202, replacement.text
+                    current = store.get_conversation(session_id)
+                    assert current is not None
+                    await _persist_external_conversation_item(
+                        session_id,
+                        current,
+                        SessionEventInput(
+                            type="external_conversation_item",
+                            data={
+                                "item_type": "message",
+                                "source_id": "native:replacement",
+                                "item_data": {"role": "user", "content": replacement_content},
+                            },
+                        ),
+                        store,
+                    )
+                    # Completed replacement work can clear the transient Stop fence.
+                    orchestration_module._interrupt_fenced_sessions.discard(session_id)
+                    assert pending_inputs.pending_ids(session_id) == []
+                elif pane_died == "runner_rebound":
+                    store.replace_runner_id(session_id, "replacement-runner")
+                    orchestration_module._session_status_cache[session_id] = "running"
+                    orchestration_module._session_active_response_cache[session_id] = (
+                        "resp_new_owner"
+                    )
+                elif pane_died == "exact_http_retry":
+                    repeated = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+                    assert repeated.status_code == 202, repeated.text
+                    assert repeated.json()["pending_id"] == pending_id
+                elif pane_died == "new_user_message":
+                    gate_ensure = False
+                    newer_content = [{"type": "input_text", "text": "independent newer request"}]
+                    newer = await client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "user",
+                                "stable_id": "6e" * 16,
+                                "content": newer_content,
+                            },
+                        },
+                    )
+                    assert newer.status_code == 202, newer.text
+                    newer_pending = newer.json()["pending_id"]
+                    newer_identity = input_attributes(
+                        pending_inputs.delivery_attributes_for(session_id, newer_pending)
+                    )
+                    orchestration_module._session_status_cache[session_id] = "running"
+                    orchestration_module._session_active_response_cache[session_id] = (
+                        "resp_new_input"
+                    )
+                elif pane_died.startswith("invalid_"):
+                    invalid = await client.post(
+                        f"/v1/sessions/{session_id}/events",
+                        json={
+                            "type": "message",
+                            "data": {
+                                "role": "assistant"
+                                if pane_died == "invalid_assistant_post"
+                                else "system",
+                                "agent": "synthetic-agent",
+                                "stable_id": "6f" * 16,
+                                "content": [{"type": "output_text", "text": "invalid request"}],
+                            },
+                        },
+                    )
+                    assert invalid.status_code == 400, invalid.text
+                elif pane_died == "retry_session_during_recovery":
+                    refreshed = await asyncio.wait_for(
+                        client.post(
+                            f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
+                        ),
+                        timeout=5,
+                    )
+                    assert refreshed.status_code == 202, refreshed.text
+                    assert refreshed.json()["queued"] is True
+                    assert refreshed.json()["pending_id"] == pending_id
+                elif pane_died == "deleted_during_resend":
+                    assert await store.delete_conversation(session_id)
+                ensure_release.set()
+            await asyncio.gather(*getattr(orchestration_module, "_resend_tasks", set()))
+
+            if pane_died == "deleted_during_resend":
+                assert (await client.get(f"/v1/sessions/{session_id}")).status_code == 404
+                assert len(forwarded) == 1
+                assert pending_inputs.pending_ids(session_id) == []
+                assert orchestration_module._active_native_input_resends.get(session_id) is None
+                return
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            errors = [item for item in snapshot["items"] if item["type"] == "error"]
+            if retry_outcome:
+                users = [item for item in snapshot["items"] if item["type"] == "message"]
+                assert ensures == [terminals_path]
+                assert len(forwarded) == (1 if pane_died == "retry_ensure_failure" else 2)
+                assert len(errors) == 1
+                if "ambiguous" in pane_died:
+                    assert users == []
+                    assert errors[0]["data"]["code"] == "native_delivery_unconfirmed"
+                    assert "may already" in errors[0]["data"]["message"]
+                    assert "not delivered" not in errors[0]["data"]["message"]
+                    retained = pending_inputs.peek(session_id, pending_id)
+                    assert retained is not None and retained.uncertain
+                    assert retained.delivery_attempt_id == forwarded[-1]["delivery_attempt_id"]
+                    assert snapshot["status"] != "failed"
+                    assert not any(
+                        "session turn failed" in record.getMessage() for record in caplog.records
+                    )
+                else:
+                    assert len(users) == 1
+                    assert users[0]["data"]["content"] == message["data"]["content"]
+                    assert pending_inputs.snapshot_for(session_id) == []
+                    assert snapshot["status"] == "failed"
+                    assert errors[0]["data"]["code"] != "terminal_exited_before_delivery"
+                    if pane_died == "retry_http_refused":
+                        assert errors[0]["data"]["code"] == "invalid_input"
+                return
+            if gated:
+                if pane_died == "new_user_message":
+                    saved_original = SqlAlchemyConversationStore(db_uri).get_item(
+                        session_id, stable_id
+                    )
+                    assert saved_original is not None
+                    assert saved_original.data.content == message["data"]["content"]
+                    assert len(forwarded) == 2
+                    assert forwarded[-1]["content"] == newer_content
+                    assert [item["type"] for item in snapshot["items"]] == ["message", "error"]
+                    assert errors[0]["data"]["code"] == "native_input_superseded"
+                    assert snapshot["status"] == "running"
+                    assert (
+                        orchestration_module._session_active_response_cache[session_id]
+                        == "resp_new_input"
+                    )
+                    assert [
+                        entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)
+                    ] == [newer_pending]
+                    assert (
+                        input_attributes(
+                            pending_inputs.delivery_attributes_for(session_id, newer_pending)
+                        )
+                        == newer_identity
+                    )
+                    return
+                if pane_died == "runner_rebound":
+                    retained = SqlAlchemyConversationStore(db_uri).get_item(session_id, stable_id)
+                    assert retained is not None
+                    assert retained.data.content == message["data"]["content"]
+                    assert len(forwarded) == 1
+                    assert [item["type"] for item in snapshot["items"]] == ["message", "error"]
+                    assert errors[0]["data"]["code"] == "native_input_owner_changed"
+                    assert snapshot["status"] == "running"
+                    assert orchestration_module._session_active_response_cache[session_id] == (
+                        "resp_new_owner"
+                    )
+                    assert pending_inputs.snapshot_for(session_id) == []
+                    return
+                if pane_died in {
+                    "exact_http_retry",
+                    "retry_session_during_recovery",
+                } or pane_died.startswith("invalid_"):
+                    assert len(forwarded) == 2
+                    assert ensures == [terminals_path]
+                    assert errors == []
+                    current = store.get_conversation(session_id)
+                    assert current is not None
+                    await _persist_external_conversation_item(
+                        session_id,
+                        current,
+                        SessionEventInput(
+                            type="external_conversation_item",
+                            data={
+                                "item_type": "message",
+                                "source_id": "native:http-retry",
+                                "item_data": {
+                                    "role": "user",
+                                    "content": message["data"]["content"],
+                                },
+                            },
+                        ),
+                        store,
+                    )
+                    durable = (await client.get(f"/v1/sessions/{session_id}")).json()
+                    assert len(durable["items"]) == 1
+                    assert durable["items"][0]["data"]["content"] == message["data"]["content"]
+                    assert pending_inputs.snapshot_for(session_id) == []
+                    return
+                if "cancel" in pane_died:
+                    assert (
+                        orchestration_module._active_native_input_resends.get(session_id) is None
+                    )
+                    if pane_died == "cancel_before_registration":
+                        saved = SqlAlchemyConversationStore(db_uri).get_item(session_id, stable_id)
+                        assert saved is not None
+                        assert saved.data.content == message["data"]["content"]
+                        assert [item["type"] for item in snapshot["items"]] == ["message"]
+                        assert pending_inputs.snapshot_for(session_id) == []
+                        assert len(forwarded) == 1
+                    elif pane_died == "stop_then_cancel":
+                        assert snapshot["items"] == []
+                        assert pending_inputs.snapshot_for(session_id) == []
+                        assert len(forwarded) == 1
+                    else:
+                        retained = pending_inputs.peek(session_id, pending_id)
+                        assert retained is not None and retained.uncertain
+                        assert retained.delivery_attempt_id == forwarded[-1]["delivery_attempt_id"]
+                        assert retained.delivery_attempt_id != forwarded[0]["delivery_attempt_id"]
+                        assert len(forwarded) == 2
+                    return
+                replaced = "replacement_finishes" in pane_died
+                assert len(forwarded) == (2 if replaced else 1)
+                assert ensures == [terminals_path] * (2 if replaced else 1)
+                if replaced:
+                    assert forwarded[-1]["content"] == replacement_content
+                assert snapshot["status"] != "failed"
+                assert errors == []
+                assert pending_inputs.snapshot_for(session_id) == []
+                assert orchestration_module._active_native_input_resends.get(session_id) is None
+                assert not any(
+                    "session turn failed" in record.getMessage() for record in caplog.records
+                )
+                return
+            if pane_died == "after_submit":
+                assert len(forwarded) == 1
+                assert ensures == []
+                assert snapshot["status"] == "failed"
+                assert [item["data"]["code"] for item in errors] == ["required_terminal_exited"]
+                return
+
+            # Relaunched through the send path and forwarded once more, unchanged.
+            assert ensures == [terminals_path]
+            assert len(forwarded) == 2
+            assert forwarded[1]["content"] == forwarded[0]["content"]
+            assert snapshot["status"] != "failed"
+            assert errors == []
+            assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == [
+                pending_id
+            ]
+            assert not any(
+                "session turn failed" in record.getMessage() for record in caplog.records
+            )
+
+            # Replaying the original refusal cannot consume the replacement attempt.
+            orchestration_module._session_active_response_cache[session_id] = "resp_new_active"
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(_failed_turn_frames(forwarded[0], error)),  # type: ignore[arg-type]
+                store,
+                runner_id="native-runner",
+            )
+            assert len(forwarded) == 2
+            assert orchestration_module._session_active_response_cache[session_id] == (
+                "resp_new_active"
+            )
+            assert not any(
+                "session turn failed" in record.getMessage() for record in caplog.records
+            )
+            if pane_died == "recovery_completes":
+                current = store.get_conversation(session_id)
+                assert current is not None
+                await _persist_external_conversation_item(
+                    session_id,
+                    current,
+                    SessionEventInput(
+                        type="external_conversation_item",
+                        data={
+                            "item_type": "message",
+                            "source_id": "native:recovered",
+                            "item_data": {"role": "user", "content": message["data"]["content"]},
+                        },
+                    ),
+                    store,
+                )
+                snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert [item["data"]["content"] for item in snapshot["items"]] == [
+                    message["data"]["content"]
+                ]
+                assert pending_inputs.snapshot_for(session_id) == []
+                return
+
+            # The re-sent message dies the same way: no third send, the failure stands.
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(
+                    _failed_turn_frames(forwarded[-1], error, "resp_retry_failed")
+                ),  # type: ignore[arg-type]
+                store,
+                runner_id="native-runner",
+            )
+            await asyncio.gather(*orchestration_module._resend_tasks)
+            snapshot = (await client.get(f"/v1/sessions/{session_id}")).json()
+            assert len(forwarded) == 2
+            assert snapshot["status"] == "failed"
+            assert [item["type"] for item in snapshot["items"]] == ["message", "error"]
+            assert pending_inputs.snapshot_for(session_id) == []
+        finally:
+            ensure_release.set()
+            for pending in pending_inputs.snapshot_for(session_id):
+                pending_inputs.resolve(session_id, pending["pending_id"])
+
+
 async def test_retry_session_keeps_error_actionable_when_runner_is_unavailable(
     client: httpx.AsyncClient,
 ) -> None:

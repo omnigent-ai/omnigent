@@ -48,25 +48,40 @@ def test_dead_pane_is_checked_before_the_startup_budget(
 
 
 @pytest.mark.parametrize("timeout_s", [30.0, 180.0])
+@pytest.mark.parametrize("killed_by_omnigent", [False, True])
+@pytest.mark.parametrize("explicit_bridge", [False, True])
 def test_vanished_pane_is_reported_as_exited_not_as_unready(
-    monkeypatch: pytest.MonkeyPatch, timeout_s: float
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    timeout_s: float,
+    killed_by_omnigent: bool,
+    explicit_bridge: bool,
 ) -> None:
     """A pane tmux stops reporting ends the wait as an exit, not a readiness timeout.
 
     The terminal is gone (its tmux server or target vanished, so no exit status
     is known). Waiting out the startup budget and then saying the prompt never
     rendered sends the person to debug a box that never existed; the exit is
-    what they need to hear, and a relaunch is the fix.
+    what they need to hear, and a relaunch is the fix. The exit also says
+    whether Omnigent's own kill ended the pane.
     """
     clock = _Clock()
     monkeypatch.setattr(bridge, "time", clock)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "")
     monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(False))
+    bridge_dir = tmp_path / "bridge" if explicit_bridge else None
+    marker_dir = bridge_dir or tmp_path
+    marker_dir.mkdir(exist_ok=True)
+    if killed_by_omnigent:
+        (marker_dir / bridge._OMNIGENT_KILL_FILE).touch()
 
     with pytest.raises(bridge.ClaudeTerminalExited) as raised:
-        bridge._wait_for_claude_prompt_ready("/tmp/test.sock", "main", timeout_s=timeout_s)
+        bridge._wait_for_claude_prompt_ready(
+            str(tmp_path / "tmux.sock"), "main", timeout_s=timeout_s, bridge_dir=bridge_dir
+        )
 
     assert raised.value.exit_status is None
+    assert raised.value.killed_by_omnigent is killed_by_omnigent
     assert "is no longer running (exit status unknown)" in str(raised.value)
     assert "did not become ready" not in str(raised.value)
     assert clock.now <= bridge._CLAUDE_LIVENESS_POLL_INTERVAL_S + 0.15
@@ -156,8 +171,46 @@ def test_message_to_real_dead_terminal_reports_exit(
 
     assert time.monotonic() - started < 2.5
     assert raised.value.exit_status in {None, "1"}
+    assert raised.value.nothing_typed is True
     assert "Last terminal output:" in str(raised.value)
     assert any(
         marker in str(raised.value) for marker in ("Synthetic startup failure", "Pane is dead")
     )
     assert "MUST_NOT_DELIVER" not in str(raised.value)
+
+
+@pytest.mark.parametrize("pasted", [False, True], ids=["before-paste", "after-paste"])
+def test_terminal_exit_records_whether_user_typing_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pasted: bool
+) -> None:
+    """Only the first readiness gate proves that no user text was typed."""
+    clock = _Clock()
+    monkeypatch.setattr(bridge, "time", clock)
+    info = {"socket_path": str(tmp_path / "tmux.sock"), "tmux_target": "main"}
+    monkeypatch.setattr(bridge, "_wait_for_tmux_info", lambda *_a, **_k: info)
+    monkeypatch.setattr(bridge, "_restore_occupied_input", lambda *_a, **_k: None)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: "")
+    monkeypatch.setattr(bridge, "_claude_pane_state", lambda *_: bridge._ClaudePaneState(False))
+    original_wait = bridge._wait_for_claude_prompt_ready
+    readiness_calls = 0
+    writes: list[str] = []
+
+    def wait(*args, **kwargs):
+        nonlocal readiness_calls
+        readiness_calls += 1
+        if pasted and readiness_calls == 1:
+            return None
+        return original_wait(*args, **kwargs)
+
+    def paste(*_args, **kwargs):
+        assert kwargs["text"] == "original synthetic input"
+        writes.append("paste")
+        return False, "", 1, 0, clock.now
+
+    monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", wait)
+    monkeypatch.setattr(bridge, "_clear_composer", lambda *_a, **_k: writes.append("clear"))
+    monkeypatch.setattr(bridge, "_paste_and_await_draft", paste)
+    with pytest.raises(bridge.ClaudeTerminalExited) as raised:
+        bridge.inject_user_message(tmp_path, content="original synthetic input")
+    assert writes == (["clear", "paste"] if pasted else [])
+    assert raised.value.nothing_typed is (not pasted)

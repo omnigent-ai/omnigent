@@ -816,6 +816,27 @@ def test_pending_id_for_stable_id_finds_only_live_entries() -> None:
     assert pending_inputs.pending_id_for_stable_id("conv_a", stable_id) is None
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_mark_uncertain_can_target_only_the_owned_attempt(replacement: bool) -> None:
+    owned = pending_inputs.record("conv_a", [_text_block("original")], stable_id="a" * 32)
+    original = pending_inputs.peek("conv_a", owned)
+    assert original is not None
+    other = pending_inputs.record("conv_a", [_text_block("another input")])
+    if replacement:
+        pending_inputs.resolve("conv_a", owned)
+        assert (
+            pending_inputs.record("conv_a", [_text_block("replacement")], stable_id="a" * 32)
+            == owned
+        )
+    pending_inputs.mark_uncertain(
+        "conv_a", pending_id=owned, delivery_attempt_id=original.delivery_attempt_id
+    )
+    current = pending_inputs.peek("conv_a", owned)
+    unrelated = pending_inputs.peek("conv_a", other)
+    assert current is not None and current.uncertain is (not replacement)
+    assert unrelated is not None and unrelated.uncertain is False
+
+
 def test_mark_uncertain_keeps_jumped_over_entries_out_of_the_undelivered_set() -> None:
     """Entries queued during a positional drain are later drained as uncertain, not skipped."""
     first = pending_inputs.record("conv_a", [_text_block("first")])
