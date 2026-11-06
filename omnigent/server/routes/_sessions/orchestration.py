@@ -9344,9 +9344,11 @@ async def _relay_runner_stream_once(
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     heartbeat_seen = False
     try:
+        # Every connection reopens this stream, so the runner relearns that inferred
+        # status edges are handled below; an older runner ignores the parameter.
         async with runner_client.stream(
             "GET",
-            f"/v1/sessions/{session_id}/stream",
+            f"/v1/sessions/{session_id}/stream?accepts_inferred_status=true",
             timeout=_relay_timeout,
         ) as resp:
             resp.raise_for_status()
@@ -9408,6 +9410,25 @@ async def _relay_runner_stream_once(
                         continue
 
                     _record_native_input_lifecycle(session_id, event)
+
+                    # A pane-inferred reason only annotates a running turn. Publishing it
+                    # without yielding keeps a hook's concurrent completion authoritative.
+                    if evt_type == "session.status" and event.get("inferred") is True:
+                        inferred_blocked_on = event.get("blocked_on")
+                        if (
+                            event.get("status") == "running"
+                            and _session_status_cache.get(session_id) == "running"
+                        ):
+                            _publish_status(
+                                session_id,
+                                "running",
+                                blocked_on=(
+                                    inferred_blocked_on
+                                    if isinstance(inferred_blocked_on, str) and inferred_blocked_on
+                                    else None
+                                ),
+                            )
+                        continue
 
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"

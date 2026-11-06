@@ -384,6 +384,10 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+# Whether the server on the current connection said, in an init envelope or a
+# session stream request, that it accepts pane-inferred status edges. A
+# reconnect clears it.
+_server_accepts_inferred_status = False
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1820,6 +1824,7 @@ def create_runner_app(
         blocked_on: str | None = None,
         *,
         failure_detail: str | None = None,
+        inferred: bool = False,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
@@ -1852,9 +1857,14 @@ def create_runner_app(
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if inferred:
+            event["inferred"] = True
         _publish_event(session_id, event)
 
-    resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_status_publisher(
+        _publish_session_status,
+        accepts_inferred_status=lambda: _server_accepts_inferred_status,
+    )
     resource_registry.set_session_failure_publisher(
         lambda session_id, detail: _publish_session_status(
             session_id, "failed", failure_detail=detail
@@ -2351,8 +2361,9 @@ def create_runner_app(
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
-        global _server_version
+        global _server_version, _server_accepts_inferred_status
         _server_version = envelope.server_version
+        _server_accepts_inferred_status = envelope.accepts_inferred_status
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
@@ -3479,7 +3490,14 @@ def create_runner_app(
         )
 
     @app.get("/v1/sessions/{session_id}/stream")
-    async def stream_session(session_id: str) -> StreamingResponse:
+    async def stream_session(
+        session_id: str, accepts_inferred_status: bool = False
+    ) -> StreamingResponse:
+        global _server_accepts_inferred_status
+        # A reconnecting server reopens every bound session's stream, idle ones included.
+        if accepts_inferred_status:
+            _server_accepts_inferred_status = True
+
         async def _event_generator() -> AsyncIterator[bytes]:
             queue = _session_event_queues.get(session_id)
             if queue is None:
@@ -3497,6 +3515,9 @@ def create_runner_app(
                     continue
                 if event is None:
                     break
+                # Drop inferred edges queued before a reconnect until the new server accepts them.
+                if event.get("inferred") is True and not _server_accepts_inferred_status:
+                    continue
                 frame = "data: " + json.dumps(event) + "\n\n"
                 try:
                     yield frame.encode("utf-8")
@@ -8502,6 +8523,9 @@ def create_runner_app(
     )
 
     async def _catch_up_scan() -> None:
+        global _server_accepts_inferred_status
+        # The new connection may reach an older server; it must accept inferred status anew.
+        _server_accepts_inferred_status = False
         recreated_prompts = pending_approvals.notify_server_reconnect()
         if recreated_prompts:
             _logger.info(
