@@ -3789,7 +3789,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() ->
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3859,7 +3859,7 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
     hc = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3931,7 +3931,7 @@ async def test_events_clear_on_claude_sdk_releases_the_idle_client(
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_histories_ref
 
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
     finish_turn = asyncio.Event()
     if busy == "ingesting":
@@ -4043,7 +4043,7 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
         return build(**kwargs)
 
     monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "f5b4cad6e7f38d9e1f2a3b4c53647566"
     ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
     resolve_content = runner_app._resolve_forwarded_message_content
@@ -4147,7 +4147,7 @@ async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
         return build(**kwargs)
 
     monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
-    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "b7c6dce8f9a05b1c2d3e4f5a67584930"
     async with _runner_client(app) as client:
         created = await client.post(
@@ -4189,7 +4189,7 @@ async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
 @pytest.mark.asyncio
 async def test_deleting_a_session_the_runner_never_set_up_is_harmless() -> None:
     """The server's rollback of an unconfirmed continuation can repeat its delete."""
-    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     async with _runner_client(app) as client:
         responses = [
             await client.delete("/v1/sessions/a6b5cbd7e8f49a0b1c2d3e4f56473829") for _ in range(2)
@@ -4208,7 +4208,7 @@ async def test_events_legacy_clear_on_claude_sdk_stays_unsupported() -> None:
     """
     from omnigent.runner.app import _session_histories_ref
 
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "e4a3c9d5f6b27c8d0e1f2a3b42536455"
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -4271,7 +4271,7 @@ def _build_claude_sdk_compact_app(
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -4458,7 +4458,7 @@ async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() 
 
     hc = _ScriptedHarnessClient([])
     pm = _FailingProcessManager(hc)
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id

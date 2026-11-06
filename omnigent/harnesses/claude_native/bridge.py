@@ -2012,7 +2012,7 @@ def _account_home_dir() -> Path:
         :meth:`Path.home` where no password database exists.
     """
     try:
-        import pwd
+        import pwd  # noqa: FlagLocalImports - POSIX-only module
 
         return Path(pwd.getpwuid(os.getuid()).pw_dir)
     except (ImportError, KeyError):
@@ -4649,8 +4649,7 @@ def _paste_and_submit(
         preserve_draft=preserve_draft,
         ready_timeout_s=ready_timeout_s,
     ):
-        # Recovery can reveal older rejections. Baseline the same viewport
-        # retained through submission and the rejection watch.
+        # Recovery can reveal older rejections; baseline the prepared viewport.
         rejection_baseline = (
             _count_unknown_command_rejections(
                 _capture_pane(socket_path, tmux_target), rejection_needle
@@ -4669,10 +4668,13 @@ def _paste_and_verify(
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
     )
-    if not draft_seen and _composer_box(pane) is None:
-        # The composer frame is not mounted (a resumed TUI still replaying its
-        # transcript). An Enter now would submit nothing yet report success, so
-        # wait for the composer, clear what the first paste left, and paste once more.
+    if (
+        not draft_seen
+        and _composer_box(pane) is None
+        and not _user_prompt_visible(pane)
+        and not _has_approval_wait(bridge_dir)
+    ):
+        # A resumed TUI can still be replaying its transcript after the first paste.
         delivery_diagnostics.set_stage("waiting_for_composer")
         _wait_for_claude_prompt_ready(
             socket_path,
