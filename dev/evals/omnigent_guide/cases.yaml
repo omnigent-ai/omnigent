@@ -1,0 +1,211 @@
+# Cases for the omnigent-guide eval. Answers come from the docs at the commit
+# that added this file (docs/, README.md, `omnigent <cmd> --help`).
+#
+# This file was written before the omnigent-guide skill. Tune the skill on
+# `dev` cases only; `holdout` cases show whether a change generalizes. Edit a
+# case only to fix a broken check, and say why in the commit message.
+#
+# Regexes match case-insensitively. A check passes when any of its patterns
+# matches (any_of, command_ran) or when none does (none_of).
+
+global_traps:
+  - '\bap\s+(deploy|server|chat)\b'
+  - 'omnigent\s+(create|deploy)\b'
+
+cases:
+  - id: deny-shell
+    split: dev
+    should_trigger: true
+    prompt: How do I stop my Omnigent agent from running shell commands?
+    checks:
+      - any_of: ['ask_on_os_tools', 'sys_os_shell', '\bDENY\b', 'cel_policy', '\bos_env\b']
+      - any_of: ['policies:', 'guardrails', 'sys_add_policy', 'add (a|the) policy', '(info|settings)\s+(panel|window)']
+      - none_of:
+          - 'omnigent\s+polic(y|ies)\b'
+          - '\b(allow|disable|enable|no)_shell\s*:'
+          - 'shell_enabled\s*:'
+          - '--no-shell\b'
+    judge:
+      - Says to attach a policy to the agent (for example the built-in ask_on_os_tools policy, or a custom policy that denies the shell tool), or to leave os_env out of the agent config.
+
+  - id: data-dir
+    split: holdout
+    should_trigger: true
+    prompt: Where does Omnigent keep its data on my machine?
+    checks:
+      - any_of: ['~/\.omnigent', '\$HOME/\.omnigent', '/Users/[^/\s]+/\.omnigent', '/home/[^/\s]+/\.omnigent']
+      - any_of: ['chat\.db', 'config\.yaml', 'logs/', 'auth_tokens\.json', 'artifacts/', 'OMNIGENT_DATA_DIR']
+      - none_of: ['OMNIGENT_HOME\b', '~/\.omni/', '~/\.config/omnigent(?!/azure)', '/var/lib/omnigent', 'XDG_DATA_HOME']
+    judge:
+      - Names ~/.omnigent as the data directory and mentions OMNIGENT_DATA_DIR or at least one file it holds, such as chat.db or config.yaml.
+
+  - id: schedule-weekdays
+    split: dev
+    should_trigger: true
+    prompt: How can I make my Omnigent agent run automatically every weekday at 9am?
+    checks:
+      - any_of: ['automations?', '/tasks\b', 'scheduled[-_ ]tasks?', 'sys_scheduled_task_create']
+      - any_of: ['BYDAY=MO,TU,WE,TH,FR', '\bRRULE\b']
+      - any_of: ['time\s?zone', '\bUTC\b', '\bIANA\b']
+      - none_of: ['omnigent\s+(schedule|automations?|cron|tasks?)\b', 'BYDAY=MO-FR', 'crontab\s+-e']
+    judge:
+      - Recommends an Omnigent Automation (scheduled task) with a weekday RRULE such as FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9, rather than an operating-system cron job.
+
+  - id: azure-devops
+    split: holdout
+    should_trigger: true
+    prompt: How do I connect Omnigent to Azure DevOps?
+    checks:
+      - any_of: ['AZURE_DEVOPS_EXT_PAT', 'az\s+login']
+      - any_of: ['dev\.azure\.com', 'visualstudio\.com', 'git\s+remote', '\bremote\b']
+      - none_of: ['omnigent\s+(integration\s+)?(azure|ado|azdo|devops)\b', '\bAZURE_DEVOPS_(PAT|TOKEN)\b', '\bADO_PAT\b']
+    judge:
+      - Says to sign in on the host with az login or the AZURE_DEVOPS_EXT_PAT variable, and that Omnigent detects Azure DevOps from the workspace's git remote.
+      - Does not claim that Azure DevOps Server (on-premises) is supported.
+
+  - id: custom-skill
+    split: dev
+    should_trigger: true
+    prompt: How do I give my Omnigent agent a custom skill?
+    checks:
+      - any_of: ['SKILL\.md']
+      - any_of: ['skills/']
+      - any_of: ['\bname:', '\bdescription:', 'front[- ]?matter']
+      - none_of: ['omnigent\s+skills?\b', 'skills?\.(json|ya?ml)\b', 'skills/[A-Za-z0-9_-]+\.md\b']
+    judge:
+      - Describes a skills/<name>/SKILL.md file inside the agent directory, with name and description frontmatter.
+
+  - id: mcp-server
+    split: dev
+    should_trigger: true
+    prompt: How do I add an MCP server to my Omnigent agent?
+    checks:
+      - any_of: ['type:\s*mcp', 'tools/mcp/']
+      - any_of: ['\bcommand:', '\burl:']
+      - none_of: ['omnigent\s+mcp\b', '\bmcpServers\b', 'type:\s*(stdio|sse|http)\b']
+    judge:
+      - Shows a tools entry with type mcp in the agent config, using command and args for a local server or url for a remote one.
+
+  - id: sub-agent
+    split: holdout
+    should_trigger: true
+    prompt: How do I let my Omnigent agent hand work off to a sub-agent?
+    checks:
+      - any_of: ['type:\s*agent\b', 'tools\.agents', 'agents/']
+      - none_of: ['type:\s*(sub[-_]?agent|delegate)\b', '^\s*sub[-_]?agents\s*:', 'omnigent\s+(delegate|spawn|subagent)\b']
+    judge:
+      - Explains declaring the sub-agent as a tool with type agent, or listing it under tools.agents with its own agents/<dir>/config.yaml.
+
+  - id: upgrade
+    split: dev
+    should_trigger: true
+    prompt: How do I update Omnigent to the newest version?
+    checks:
+      - any_of: ['(omni|omnigent)\s+(upgrade|update)\b']
+      - none_of:
+          - 'omnigent\s+self[-_]?update'
+          - 'npm\s+(i|install|update|upgrade)\s+(-g\s+)?omnigent'
+          - '\bap\s+(upgrade|update)\b'
+          - 'omnigent\s+upgrade\s+--(latest|all|yes)\b'
+    judge:
+      - Recommends the omnigent upgrade command (omnigent update is an alias).
+
+  - id: sandbox
+    split: holdout
+    should_trigger: true
+    prompt: How do I run my Omnigent agent in a sandbox?
+    checks:
+      - any_of: ['os_env', 'sandbox:', 'omnigent\s+sandbox\s+(create|connect)', 'managed\s+(hosts?|sandbox)']
+      - any_of: ['linux_bwrap', 'darwin_seatbelt', 'bwrap|bubblewrap', 'seatbelt', '--provider', 'modal|daytona|e2b']
+      - none_of:
+          - 'omnigent\s+sandbox\s+(start|run|up|list|delete|stop|exec)\b'
+          - 'omnigent\s+run\b[^\n]*--sandbox\b'
+          - 'sandbox:\s*(true|yes|enabled|on)\b'
+          - 'type:\s*docker\b'
+    judge:
+      - Explains the os_env sandbox setting in the agent config (for example darwin_seatbelt on macOS or linux_bwrap on Linux), or the omnigent sandbox command for a remote sandbox.
+
+  - id: uninstall
+    split: holdout
+    should_trigger: true
+    prompt: How do I completely uninstall Omnigent?
+    checks:
+      - any_of: ['omnigent\s+uninstall', 'uninstall_oss\.sh']
+      - any_of: ['--purge(?!-)']
+      - any_of: ['--yes\b']
+      - none_of: ['omnigent\s+uninstall\b[^\n]*--all\b', 'omnigent\s+(remove|purge|delete)\b']
+    judge:
+      - Says that omnigent uninstall with no flags only previews, and that --purge with --yes also removes the data in ~/.omnigent.
+
+  - id: version
+    split: dev
+    should_trigger: true
+    prompt: Which version of Omnigent am I running?
+    checks:
+      - any_of: ['{installed_version}']
+
+  - id: use-codex
+    split: dev
+    should_trigger: true
+    prompt: How do I make Omnigent use Codex instead of Claude Code for a session?
+    checks:
+      - any_of: ['(omni|omnigent)\s+codex\b', '--harness[\s=]+codex\b', 'harness:\s*codex', 'harness=codex']
+      - none_of: ['--agent\s+codex\b', '--harness[\s=]+openai\b(?!-)', 'omnigent\s+(switch|use)\s+codex', 'OMNIGENT_HARNESS\b', '--codex\b']
+    judge:
+      - Gives a working way to start a Codex session, such as omnigent codex, omnigent run --harness codex, or choosing Codex in the new-session picker.
+
+  - id: author-agent
+    split: holdout
+    should_trigger: true
+    expect_skills: [build-omnigent, omnigent-guide]
+    prompt: >-
+      Create an Omnigent agent in ./pr-summarizer that summarizes GitHub pull
+      requests. Write the files; don't just describe them.
+    checks:
+      - valid_agent_dir: pr-summarizer
+
+  - id: configured-harnesses
+    split: dev
+    should_trigger: true
+    prompt: Which coding agents can Omnigent run on this machine right now?
+    checks:
+      - tool_called: [sys_session_get_info]
+    judge:
+      - Reports which harnesses are set up and ready on this machine, rather than only listing every harness Omnigent supports.
+
+  # Near misses: they share words with Omnigent topics but need no Omnigent knowledge.
+  - id: neg-pytest-git
+    split: dev
+    should_trigger: false
+    prompt: Write a pytest fixture that creates a temporary git repository with one commit.
+
+  - id: neg-mcp-concepts
+    split: dev
+    should_trigger: false
+    prompt: What's the difference between MCP resources and MCP tools?
+
+  - id: neg-claude-hooks
+    split: dev
+    should_trigger: false
+    prompt: In Claude Code, how do I add a PreToolUse hook to my settings.json?
+
+  - id: neg-yaml-json
+    split: dev
+    should_trigger: false
+    prompt: |-
+      Convert this YAML to JSON:
+
+      name: demo
+      tools:
+        - search
+        - fetch
+
+  - id: neg-gha-workflow
+    split: holdout
+    should_trigger: false
+    prompt: Write a GitHub Actions workflow that runs pytest on Python 3.12 for every pull request.
+
+  - id: neg-databricks-cli
+    split: holdout
+    should_trigger: false
+    prompt: How do I install the Databricks CLI on macOS?

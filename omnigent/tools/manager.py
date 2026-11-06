@@ -302,11 +302,15 @@ class ToolManager:
         Always registers ``load_skill`` — it discovers host-scope
         skills (``~/.claude/skills/``, ``.agents/skills/``, etc.)
         at init time even when the agent has no bundled skills.
+        The framework skills join the bundled ones, so the advertised
+        schema lists them for every harness.
         Registers ``read_skill_file`` only when at least one skill
         has bundled resource files.
         """
+        from omnigent.spec.framework_skills import with_framework_skills
+
         load_tool = LoadSkillTool(
-            self._spec.skills,
+            with_framework_skills(self._spec.skills),
             agent_root=self._workdir,
             skills_filter=self._spec.skills_filter,
         )

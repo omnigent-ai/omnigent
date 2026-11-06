@@ -37,6 +37,7 @@ from omnigent.runner.native.orchestration import (
     _resolve_sub_agent_spec_entry,
 )
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.spec.framework_skills import FRAMEWORK_SKILL_NAMES
 from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec, LocalToolInfo
 from omnigent.terminals import TerminalRegistry
@@ -318,15 +319,10 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
     """A child with no bundle dir gets a fresh dir, never parent content.
 
     Pins the native auto-create fallback: when no bundle dir resolves, the
-    runner mints an EMPTY temp dir and seeds at most the framework-owned
-    ``build-omnigent`` skill, which every agent gets unconditionally. It
-    never copies from the parent — which is why those two call sites need
-    no change. This fails loudly if that fallback ever starts sourcing a
-    parent bundle.
-
-    The seeding is a no-op in a source checkout (its skill source resolves
-    under ``omnigent/runner/onboarding``, which does not exist), so the
-    upper bound is asserted as a subset rather than an exact match.
+    runner mints an EMPTY temp dir and seeds only the framework skills,
+    which every agent gets unconditionally. It never copies from the
+    parent — which is why those two call sites need no change. This fails
+    loudly if that fallback ever starts sourcing a parent bundle.
     """
     root, _child = _bundle_with_child(tmp_path)
     isolated = tmp_path / "isolated-bundle"
@@ -336,7 +332,7 @@ def test_isolated_framework_bundle_carries_only_the_framework_skill(
 
     skills_dir = isolated / "skills"
     seeded = {p.name for p in skills_dir.iterdir()} if skills_dir.is_dir() else set()
-    assert seeded <= {"build-omnigent"}
+    assert seeded == set(FRAMEWORK_SKILL_NAMES)
     # No parent asset reached the isolated bundle by any route.
     assert not list(isolated.rglob("parent-only"))
     assert not list(isolated.rglob("config.yaml"))
