@@ -307,8 +307,10 @@ def test_unprompted_caption_claims_are_checked_against_driver_sends() -> None:
     lanes = " ".join((_RESOLVE_AGENT.parent / "recording-lanes.md").read_text().split())
     skills = {skill.name: " ".join(skill.content.split()) for skill in load(_RESOLVE_AGENT).skills}
     author = skills["resolve-author-fix"]
+    review = skills["resolve-review-pr"]
 
     assert "The driver's sends are user actions" in lanes
+    assert "Caption each message it types and any reload or retry" in lanes
     assert '("unprompted", "without another user message")' in lanes
     assert "it holds only between them" in lanes
     assert "may still send a step that worked around the bug" in lanes
@@ -316,7 +318,8 @@ def test_unprompted_caption_claims_are_checked_against_driver_sends() -> None:
     assert "list the messages and actions it sends" in author
     assert "the PR Demo and `fix_summary` may say the product acted" in author
     assert "only where the driver sent nothing" in author
-    assert "Check the driver's sends as 2B.5 describes" in skills["resolve-review-pr"]
+    assert "Check the driver's sends as 2B.5 describes" in review
+    assert "the same limit applies to claims in your review comment" in review
 
 
 def test_resolve_drives_both_reviews_and_preserves_incomplete_outcomes() -> None:
