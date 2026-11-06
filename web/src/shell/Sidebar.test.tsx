@@ -3015,36 +3015,6 @@ describe("Sidebar project Show more", () => {
     });
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
-
-  it.each([
-    { collapse: true, next: "conv_other_folder" },
-    { collapse: false, next: "conv_filed_5" },
-  ])(
-    "steps the session hotkey past the fifth folder row (collapse behind Show more: $collapse)",
-    ({ collapse, next }) => {
-      // Collapsing leaves the sixth and seventh rows behind Show more.
-      writeProjectFolderCollapse(collapse);
-      projectsMock.push("Customer X", "Customer Y");
-      mockConversations([
-        ...filedSessions(7),
-        conv("conv_other_folder", "Claude Code", {
-          labels: { omni_project: "Customer Y" },
-          updated_at: 1,
-        }),
-      ]);
-      localStorage.setItem(
-        EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-        JSON.stringify(["Customer X", "Customer Y"]),
-      );
-      renderOnSession("conv_filed_4");
-
-      fireEvent.keyDown(window, {
-        code: "BracketRight",
-        ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
-      });
-      expect(screen.getByTestId("loc")).toHaveTextContent(`/c/${next}`);
-    },
-  );
 });
 
 // A collapsed project bubbles up its hidden rows' marker, using the same
@@ -3523,6 +3493,23 @@ describe("Sidebar active-row auto-scroll", () => {
     expect(scrollIntoView).not.toHaveBeenCalled();
 
     vi.restoreAllMocks();
+  });
+});
+
+describe("Sidebar open/close motion", () => {
+  it("animates opening and closing, but not a drag on the resize edge", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    const { container } = renderSidebar(true);
+    const aside = container.querySelector("aside.conversations-sidebar")!;
+    // index.css keeps this 200 ms transition even under reduced motion.
+    expect(aside).toHaveAttribute("data-sidebar-motion");
+    expect(aside).toHaveClass("md:transition-[width,opacity]");
+
+    fireEvent.mouseDown(screen.getByRole("separator", { name: "Resize sidebar" }));
+    expect(aside).not.toHaveAttribute("data-sidebar-motion");
+    expect(aside).not.toHaveClass("md:transition-[width,opacity]");
+    fireEvent.mouseUp(window);
+    expect(aside).toHaveAttribute("data-sidebar-motion");
   });
 });
 

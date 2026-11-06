@@ -173,6 +173,14 @@ def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(
     first_card.click()
     expect(composer).to_have_value("Keep this draft while I check another session")
     page.get_by_role("button", name="Close sidebar", exact=True).click()
+    # The sidebar slides shut, widening the canvas as it goes; measure once it has closed.
+    page.wait_for_function(
+        "() => [...document.querySelectorAll('.conversations-sidebar')]"
+        ".every((sidebar) => sidebar.getBoundingClientRect().width === 0)"
+    )
+    page.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
 
     divider = page.get_by_role("separator", name="Resize canvas and conversation")
     before = float(divider.get_attribute("aria-valuenow") or "0")
