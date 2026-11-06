@@ -11,6 +11,8 @@ import {
   SANDBOX_WAKE_OPEN_DWELL_MS,
   SANDBOX_WAKE_REQUEST_MS,
   SANDBOX_WAKE_SETTLE_MS,
+  endPassiveSandboxWake,
+  useSandboxPassivelyWoken,
   useSandboxWake,
   useSandboxWakeOnSessionOpen,
   useSandboxWakeWhenOpened,
@@ -36,7 +38,8 @@ vi.mock("@/hooks/useSessionLiveness", async (importOriginal) => ({
 let sessionLoaded = true;
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id: string | undefined) => ({
-    session: id && sessionLoaded ? { id, permissionLevel: state.permissionLevel } : undefined,
+    // Like production, a loading snapshot is null.
+    session: id && sessionLoaded ? { id, permissionLevel: state.permissionLevel } : null,
   }),
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -169,6 +172,58 @@ describe("useSandboxWake", () => {
     expect(result.current.waking).toBe(false);
   });
 
+  it.each([
+    [
+      "fails",
+      (request: ReturnType<typeof deferred<PostEventResponse>>) => request.reject(new Error("x")),
+    ],
+    ["times out", () => vi.advanceTimersByTime(SANDBOX_WAKE_REQUEST_MS)],
+  ])(
+    "keeps automatic recovery off after a wake that %s, through a late-connecting runner",
+    async (_label, end) => {
+      vi.useFakeTimers();
+      const request = deferred<PostEventResponse>();
+      wakeMock.mockReturnValue(request.promise);
+      const { result, rerender } = renderHook(() => ({
+        wake: useSandboxWake("conv_sleepy"),
+        passive: useSandboxPassivelyWoken("conv_sleepy"),
+      }));
+      act(() => result.current.wake.wakeIfAsleep());
+      expect(result.current.passive).toBe(true);
+
+      await act(async () => end(request));
+      expect(result.current.wake.waking).toBe(false);
+      expect(result.current.passive).toBe(true);
+
+      // The runner the failed wake launched connects later.
+      state.liveness = "online";
+      state.runnerOnline = true;
+      rerender();
+      expect(result.current.passive).toBe(true);
+
+      // Only explicit work ends it.
+      act(() => endPassiveSandboxWake("conv_sleepy"));
+      expect(result.current.passive).toBe(false);
+    },
+  );
+
+  it("ends the passive wake when the sandbox sleeps again after coming online", () => {
+    const { result, rerender } = renderHook(() => ({
+      wake: useSandboxWake("conv_sleepy"),
+      passive: useSandboxPassivelyWoken("conv_sleepy"),
+    }));
+    act(() => result.current.wake.wakeIfAsleep());
+    state.liveness = "online";
+    state.runnerOnline = true;
+    rerender();
+    expect(result.current.passive).toBe(true);
+
+    state.liveness = "host_asleep";
+    state.runnerOnline = false;
+    rerender();
+    expect(result.current.passive).toBe(false);
+  });
+
   it("shares one wake across every view of the session", () => {
     const first = renderHook(() => useSandboxWake("conv_sleepy"));
     const second = renderHook(() => useSandboxWake("conv_sleepy"));
@@ -260,10 +315,15 @@ describe("useSandboxWakeOnSessionOpen", () => {
 
   it.each<[string, Partial<typeof state>]>([
     ["server capabilities", { eventTypes: "loading" }],
-    ["the session", { permissionLevel: undefined }],
+    // Sidebar health alone already resolves liveness (as stranded) before the snapshot.
+    ["the session", { permissionLevel: undefined, liveness: "local_stranded" }],
   ])("waits for %s that load after the dwell", (_label, loading) => {
     vi.useFakeTimers();
-    const loaded = { eventTypes: state.eventTypes, permissionLevel: state.permissionLevel };
+    const loaded = {
+      eventTypes: state.eventTypes,
+      permissionLevel: state.permissionLevel,
+      liveness: state.liveness,
+    };
     Object.assign(state, loading);
     if ("permissionLevel" in loading) sessionLoaded = false;
     const { rerender } = renderOpen("conv_sleepy");

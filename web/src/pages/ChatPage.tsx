@@ -80,6 +80,7 @@ import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import {
+  endPassiveSandboxWake,
   useSandboxWake,
   useSandboxWakeOnSessionOpen,
   useSandboxWakeWhenOpened,
@@ -1003,6 +1004,8 @@ export function ChatPage() {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
+      // A message asks for work, so automatic recovery may run again.
+      endPassiveSandboxWake(urlConvId);
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never

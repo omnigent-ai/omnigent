@@ -42,8 +42,10 @@ const listeners = new Set<() => void>();
 
 // Sessions whose sandbox this page woke without the user asking for work.
 // Automatic work recovery (the terminal view's auto-Resume) must not run on
-// them; an explicit Resume, a message, or the sandbox sleeping again ends it.
-const passiveWakes = new Set<string>();
+// them, even after a failed or timed-out wake whose runner connects late. The
+// agent terminal running (explicit Resume or a message) ends it, and so does
+// the sandbox sleeping again after the wake brought it online.
+const passiveWakes = new Map<string, { cameOnline: boolean }>();
 
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
@@ -73,7 +75,7 @@ function setAttemptWithDeadline(conversationId: string, attempt: WakeAttempt, ms
  */
 async function startSandboxWake(conversationId: string): Promise<void> {
   if (attempts.has(conversationId)) return;
-  passiveWakes.add(conversationId);
+  passiveWakes.set(conversationId, { cameOnline: false });
   const attempt: WakeAttempt = { step: "requesting" };
   setAttemptWithDeadline(conversationId, attempt, SANDBOX_WAKE_REQUEST_MS);
   try {
@@ -89,7 +91,8 @@ async function startSandboxWake(conversationId: string): Promise<void> {
       error.status === 400 &&
       error.code === "invalid_input" &&
       error.message.startsWith("Unknown event type");
-    passiveWakes.delete(conversationId);
+    // A rejected unknown event ran no recovery, so nothing can connect late.
+    if (unsupported) passiveWakes.delete(conversationId);
     setAttempt(conversationId, unsupported ? { step: "unsupported" } : undefined);
   }
 }
@@ -170,9 +173,15 @@ export function useSandboxWake(conversationId: string | undefined): SandboxWake 
 
   const step = attempt?.step;
   useEffect(() => {
-    // Asleep again with no wake running: that passive wake is over.
-    if (asleep && step === undefined) endPassiveSandboxWake(conversationId);
-  }, [asleep, conversationId, step]);
+    if (!conversationId) return;
+    const passive = passiveWakes.get(conversationId);
+    if (!passive) return;
+    if (runnerOnline === true) passive.cameOnline = true;
+    // Asleep again after the wake brought it online: that passive wake is over.
+    else if (asleep && step === undefined && passive.cameOnline) {
+      endPassiveSandboxWake(conversationId);
+    }
+  }, [asleep, conversationId, runnerOnline, step]);
   useEffect(() => {
     // Runner online, by this wake or any other: forget the attempt, even one still in flight.
     if (conversationId && runnerOnline === true && (step === "requesting" || step === "settling")) {
@@ -182,7 +191,7 @@ export function useSandboxWake(conversationId: string | undefined): SandboxWake 
 
   return {
     waking: step === "requesting" || step === "settling",
-    ready: session !== undefined && serverInfo !== "loading",
+    ready: session != null && serverInfo !== "loading",
     wakeIfAsleep,
   };
 }

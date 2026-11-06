@@ -4,6 +4,7 @@ import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
+import type * as UseSandboxAutoWakeModule from "@/hooks/useSandboxAutoWake";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 import type * as UseAgentsModule from "@/hooks/useAgents";
@@ -64,6 +65,11 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 });
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
+const wakeSandboxMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSandboxAutoWakeModule>()),
+  useSandboxWake: () => ({ waking: false, ready: true, wakeIfAsleep: wakeSandboxMock }),
+}));
 vi.mock("@/lib/mcpRegistry", () => ({
   registryRequest: vi.fn(),
   authorizeRegistryService: vi.fn(),
@@ -309,6 +315,20 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 }
 
 describe("Composer focus handle", () => {
+  it("wakes an asleep sandbox when clicked or typed in, without sending", () => {
+    wakeSandboxMock.mockClear();
+    const props = composerProps();
+    render(<Composer {...props} />);
+    act(() => textarea().focus());
+    expect(wakeSandboxMock).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(textarea());
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
+    fireEvent.change(textarea(), { target: { value: "h" } });
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
+    expect(props.onSend).not.toHaveBeenCalled();
+  });
+
   it("takes focus for typing, unless disabled or read-only", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
@@ -437,9 +457,12 @@ describe("Composer session drafts", () => {
   });
 
   it("focuses the composer on a switch unless an inline rename has focus", () => {
+    wakeSandboxMock.mockClear();
     render(<Composer {...composerProps()} />);
     act(() => useChatStore.setState({ conversationId: "conv_other" }));
     expect(textarea()).toHaveFocus();
+    // Focusing itself on a switch isn't the user reaching for the composer.
+    expect(wakeSandboxMock).not.toHaveBeenCalled();
 
     const rename = document.createElement("input");
     rename.setAttribute("data-inline-rename", "");
