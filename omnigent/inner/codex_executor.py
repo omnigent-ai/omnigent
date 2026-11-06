@@ -60,6 +60,7 @@ from omnigent.harnesses.codex_egress import (
     is_connection_failure_text,
     is_connection_retry,
 )
+from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
@@ -189,6 +190,9 @@ _STARTUP_EXIT_EXPLAIN_TIMEOUT_SECONDS = (
     _STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS + _STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS + 2.0
 )
 _STARTUP_EXIT_STDERR_LINE_LIMIT = 500
+_STDERR_TRUNCATION_MARKER = "...[truncated]"
+# Stands in for a line cut at capture, whose credentials redaction cannot see whole.
+_OVERSIZED_STDERR_LINE = "[oversized stderr line omitted]"
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
@@ -716,33 +720,56 @@ async def _codex_config_check_error(
 
 async def _first_error_line(stream: asyncio.StreamReader) -> str | None:
     """
-    Drain *stream*, keeping only its first ``Error:`` line.
+    Drain *stream*, keeping only its first ``Error:`` line, redacted.
 
-    Reads in chunks and holds at most one partial line, so a check that
-    floods stderr cannot grow the runner's memory.
+    Holds at most one ``_STDERR_CHUNK_LIMIT``-byte partial line, so a check
+    that floods stderr cannot grow the runner's memory. A longer line cannot
+    be redacted whole, so an error line that long is reported only as omitted.
 
     :param stream: The check's stderr.
-    :returns: The first line starting with ``Error:``, truncated to
-        ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters, or ``None``.
+    :returns: The first line starting with ``Error:``, redacted and
+        truncated to ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters, or
+        ``None``.
     """
     found: str | None = None
     partial = b""
+    # Inside a line too long to keep; its bytes are discarded up to its end.
+    skipping = False
     while chunk := await stream.read(_STREAM_READ_CHUNK_SIZE):
         if found is not None:
             continue
-        *lines, partial = (partial + chunk).split(b"\n")
+        *lines, rest = chunk.split(b"\n")
         for raw in lines:
-            text = raw.decode("utf-8", errors="replace").strip()
-            if text.startswith("Error:"):
-                found = text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+            line, partial = partial + raw, b""
+            if skipping:
+                skipping = False
+                continue
+            if len(line) > _STDERR_CHUNK_LIMIT:
+                if line.lstrip().startswith(b"Error:"):
+                    found = f"Error: {_OVERSIZED_STDERR_LINE}"
+                    break
+                continue
+            found = _redacted_error_line(line)
+            if found is not None:
                 break
-        # Only a line's start can decide whether it is an error line.
-        partial = partial[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
-    if found is None and partial:
-        text = partial.decode("utf-8", errors="replace").strip()
-        if text.startswith("Error:"):
-            found = text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+        if found is not None or (skipping and not lines):
+            continue
+        partial += rest
+        if len(partial) > _STDERR_CHUNK_LIMIT:
+            if partial.lstrip().startswith(b"Error:"):
+                found = f"Error: {_OVERSIZED_STDERR_LINE}"
+            partial = b""
+            skipping = True
+    if found is None and partial and not skipping:
+        found = _redacted_error_line(partial)
     return found
+
+
+def _redacted_error_line(raw: bytes) -> str | None:
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text.startswith("Error:"):
+        return None
+    return sanitize_diagnostic_text(text)[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
 
 
 def _startup_exit_stderr_tail(stderr_lines: Sequence[str]) -> list[str]:
@@ -752,12 +779,20 @@ def _startup_exit_stderr_tail(stderr_lines: Sequence[str]) -> list[str]:
     Codex prefixes its fatal message with ``Error:``; when such lines exist,
     only they are kept, so routine warnings do not bury the cause.
 
+    The surfaced error reaches clients, so each line is redacted whole
+    before it is shortened, and a line cut at capture is omitted.
+
     :param stderr_lines: The worker's recent stderr lines, oldest first.
-    :returns: At most the last five selected lines, each truncated to
-        ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters.
+    :returns: At most the last five selected lines, each redacted and
+        truncated to ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters.
     """
     error_lines = [line for line in stderr_lines if line.startswith("Error:")]
-    return [line[:_STARTUP_EXIT_STDERR_LINE_LIMIT] for line in (error_lines or stderr_lines)[-5:]]
+    return [
+        _OVERSIZED_STDERR_LINE
+        if len(line) > _STDERR_CHUNK_LIMIT and line.endswith(_STDERR_TRUNCATION_MARKER)
+        else sanitize_diagnostic_text(line)[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+        for line in (error_lines or stderr_lines)[-5:]
+    ]
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -4799,7 +4834,7 @@ class _CodexAppServerSession:
                 if not text:
                     continue
                 if len(text) >= _STDERR_CHUNK_LIMIT:
-                    text = text[:_STDERR_CHUNK_LIMIT] + "...[truncated]"
+                    text = text[:_STDERR_CHUNK_LIMIT] + _STDERR_TRUNCATION_MARKER
                 self._recent_stderr.append(text)
                 if len(self._recent_stderr) > 20:
                     self._recent_stderr.pop(0)

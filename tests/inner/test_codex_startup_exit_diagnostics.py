@@ -14,8 +14,10 @@ import pytest
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.inner import codex_executor
 from omnigent.inner.codex_executor import (
+    _STDERR_CHUNK_LIMIT,
     CodexExecutor,
     _codex_config_check_error,
+    _first_error_line,
     _startup_config_check,
     _startup_exit_stderr_tail,
 )
@@ -24,6 +26,12 @@ from tests.inner.test_codex_transport_closed import _session
 _PROVIDER = "example-provider"
 _APP_SERVER_ERROR = f"Error: Model provider `{_PROVIDER}` not found"
 _CONFIG_ERROR = "Error: unknown variant `example` for key `example_key` in config.toml"
+# Synthetic, API-key-shaped; never a real credential.
+_SYNTHETIC_KEY = "sk-SYNTHETIC_NOT_A_REAL_KEY_1234567890"
+_LEAKING_ERROR = (
+    f"Error: config.toml:5:12: unknown variant `{_SYNTHETIC_KEY}`, expected `responses`"
+)
+_REDACTED_ERROR = "Error: config.toml:5:12: unknown variant `[REDACTED]`, expected `responses`"
 
 
 def _write_scripted_codex(tmp_path: Path, *, mode: str) -> Path:
@@ -37,6 +45,8 @@ def _write_scripted_codex(tmp_path: Path, *, mode: str) -> Path:
     and sleeps.
     ``mode="check_floods"``: ``debug models`` writes 8 MB of noise, then the
     config error, and exits 1.
+    ``mode="check_leaks"``: ``debug models`` echoes a synthetic credential in
+    its error and exits 1.
     ``mode="mid_session"``: ``app-server`` answers ``initialize`` and
     ``thread/start``, then exits on ``turn/start`` without replying.
     """
@@ -70,6 +80,9 @@ def _write_scripted_codex(tmp_path: Path, *, mode: str) -> Path:
                 if mode == "check_floods":
                     for _ in range(8 * 1024):
                         sys.stderr.write("n" * 1023 + "\\n")
+                if mode == "check_leaks":
+                    sys.stderr.write({_LEAKING_ERROR!r} + "\\n")
+                    raise SystemExit(1)
                 if mode in ("config_error", "check_floods"):
                     sys.stderr.write({_CONFIG_ERROR!r} + "\\n")
                     raise SystemExit(1)
@@ -195,15 +208,17 @@ def test_contained_workers_get_no_out_of_sandbox_config_check(
     assert check is None
 
 
-def _hanging_check(tmp_path: Path):
-    return _startup_config_check(
+def _check(tmp_path: Path, mode: str):
+    check = _startup_config_check(
         sandboxed=False,
         signer_backed=False,
-        codex_path=str(_write_scripted_codex(tmp_path, mode="check_hangs")),
+        codex_path=str(_write_scripted_codex(tmp_path, mode=mode)),
         config_overrides=[],
         env={"PATH": os.environ.get("PATH", "")},
         cwd=str(tmp_path),
     )
+    assert check is not None
+    return check
 
 
 async def _check_pid(tmp_path: Path) -> int:
@@ -217,8 +232,7 @@ async def _check_pid(tmp_path: Path) -> int:
 
 @pytest.mark.timeout(60)
 async def test_config_check_timeout_kills_and_reaps_the_check(tmp_path: Path) -> None:
-    check = _hanging_check(tmp_path)
-    assert check is not None
+    check = _check(tmp_path, "check_hangs")
     task = asyncio.create_task(_codex_config_check_error(check, timeout=1.0))
     pid = await _check_pid(tmp_path)
 
@@ -228,8 +242,7 @@ async def test_config_check_timeout_kills_and_reaps_the_check(tmp_path: Path) ->
 
 @pytest.mark.timeout(60)
 async def test_cancelled_config_check_kills_the_check_and_propagates(tmp_path: Path) -> None:
-    check = _hanging_check(tmp_path)
-    assert check is not None
+    check = _check(tmp_path, "check_hangs")
     task = asyncio.create_task(_codex_config_check_error(check, timeout=30))
     pid = await _check_pid(tmp_path)
 
@@ -237,19 +250,6 @@ async def test_cancelled_config_check_kills_the_check_and_propagates(tmp_path: P
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not _pid_alive(pid)
-
-
-def _check(tmp_path: Path, mode: str):
-    check = _startup_config_check(
-        sandboxed=False,
-        signer_backed=False,
-        codex_path=str(_write_scripted_codex(tmp_path, mode=mode)),
-        config_overrides=[],
-        env={"PATH": os.environ.get("PATH", "")},
-        cwd=str(tmp_path),
-    )
-    assert check is not None
-    return check
 
 
 @pytest.mark.timeout(60)
@@ -310,3 +310,63 @@ async def test_failed_config_check_keeps_the_stderr_and_replay_safety(
 )
 def test_startup_exit_stderr_tail(lines: list[str], expected: list[str]) -> None:
     assert _startup_exit_stderr_tail(lines) == expected
+
+
+@pytest.mark.timeout(60)
+async def test_closing_the_session_kills_a_running_config_check(tmp_path: Path) -> None:
+    session, stream = _session()
+    session._explain_startup_exit = True
+    session._startup_config_check = _check(tmp_path, "check_hangs")
+    stream.feed_eof()
+    reader = asyncio.create_task(session._reader_loop())
+    session._reader_task = reader
+    pid = await _check_pid(tmp_path)
+
+    await asyncio.wait_for(session.close(), timeout=30)
+
+    assert reader.done()
+    assert not _pid_alive(pid)
+
+
+@pytest.mark.timeout(60)
+async def test_config_check_error_is_redacted(tmp_path: Path) -> None:
+    assert await _codex_config_check_error(_check(tmp_path, "check_leaks")) == _REDACTED_ERROR
+
+
+def test_worker_stderr_is_redacted_and_cut_lines_are_omitted() -> None:
+    cut = "Error: " + "x" * _STDERR_CHUNK_LIMIT + "...[truncated]"
+
+    assert _startup_exit_stderr_tail([_LEAKING_ERROR, cut]) == [
+        _REDACTED_ERROR,
+        "[oversized stderr line omitted]",
+    ]
+
+
+async def _first_error_line_of(data: bytes) -> str | None:
+    stream = asyncio.StreamReader()
+    stream.feed_data(data)
+    stream.feed_eof()
+    return await _first_error_line(stream)
+
+
+async def test_credential_spanning_a_read_boundary_is_redacted() -> None:
+    # Put the key across the first 64 KiB read so neither chunk holds it whole.
+    noise = b"n" * (_STDERR_CHUNK_LIMIT - len(_LEAKING_ERROR) // 2) + b"\n"
+
+    found = await _first_error_line_of(noise + _LEAKING_ERROR.encode() + b"\n")
+
+    assert found == _REDACTED_ERROR
+
+
+async def test_error_line_too_long_to_redact_is_omitted() -> None:
+    line = b"Error: " + b"x" * _STDERR_CHUNK_LIMIT + _SYNTHETIC_KEY.encode() + b"\n"
+
+    assert await _first_error_line_of(line + _LEAKING_ERROR.encode() + b"\n") == (
+        "Error: [oversized stderr line omitted]"
+    )
+
+
+async def test_long_noise_line_does_not_hide_a_later_error() -> None:
+    noise = b"n" * (3 * _STDERR_CHUNK_LIMIT) + b"\n"
+
+    assert await _first_error_line_of(noise + _LEAKING_ERROR.encode()) == _REDACTED_ERROR
