@@ -238,6 +238,20 @@ describe("takeOnboardingRunner", () => {
     expect(shellTake).toHaveBeenCalledOnce();
   });
 
+  it("shares a read still in flight", async () => {
+    let answer: (runner: "local" | "remote" | null) => void = () => {};
+    shellTake.mockReset().mockReturnValueOnce(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const picker = takeOnboardingRunner("hostPicker");
+    const review = takeOnboardingRunner("importReview");
+    answer("local");
+    expect(await Promise.all([picker, review])).toEqual(["local", "local"]);
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
   it("hands each consumer the runner only once per page load", async () => {
     expect(await takeOnboardingRunner("importReview")).toBe("remote");
     expect(await takeOnboardingRunner("importReview")).toBeNull();
@@ -247,6 +261,10 @@ describe("takeOnboardingRunner", () => {
 
   it("resolves null when the shell read fails or there's no shell", async () => {
     shellTake.mockReset().mockRejectedValue(new Error("ipc down"));
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    // An older shell without the handoff.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
     expect(await takeOnboardingRunner("hostPicker")).toBeNull();
     resetOnboardingRunnerForTests();
     setElectron(false);

@@ -2,6 +2,7 @@
 // explicit caller (e.g. desktop onboarding) wants the import modal opened for.
 
 import { useSyncExternalStore } from "react";
+import type { OnboardingRunner } from "@/lib/nativeBridge";
 
 const KEY_PREFIX = "omnigent:imports-reviewed:";
 
@@ -32,9 +33,9 @@ export type ImportReviewTarget =
   | {
       hostId: string;
       /** Where the host runs; words the loading copy until the host is listed. */
-      runner?: "remote" | "local";
+      runner?: OnboardingRunner;
     }
-  | { hostId?: undefined; runner: "remote" | "local" };
+  | { hostId?: undefined; runner: OnboardingRunner };
 
 // While set, the gate shows only this host, waiting for it to connect.
 let requestedTarget: ImportReviewTarget | null = null;
