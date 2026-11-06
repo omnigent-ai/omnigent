@@ -11639,8 +11639,8 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
             "plugin-wrapper" if with_launcher else expected_command, *prefix, "-p"
         )
         assert (command, *args)[: len(expected_argv)] == expected_argv
-        # No --settings without an apiKeyHelper to deliver.
-        assert "--settings" not in args
+        # Without an apiKeyHelper to deliver, the settings only disable hooks.
+        assert json.loads(args[args.index("--settings") + 1]) == {"disableAllHooks": True}
         return _FakeProcess()
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_exec)
@@ -11783,7 +11783,7 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
-    assert settings_payload == {"apiKeyHelper": "printf token"}
+    assert settings_payload == {"disableAllHooks": True, "apiKeyHelper": "printf token"}
     env = captured["env"]
     assert env["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
     assert env["DISABLE_TELEMETRY"] == "1"
