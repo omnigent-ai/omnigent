@@ -47,6 +47,14 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("shared glass fallback", () => {
+  it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
+    expect(indexCssSource).toMatch(
+      /@supports not \(\(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\)\s*\{\s*\.omni-glass-surface\s*\{\s*--omni-glass-background: var\(--card-solid\);/,
+    );
+  });
+});
+
 describe("composer picker single highlight", () => {
   const rules = cssBlocks
     .map(([block]) => block)
@@ -217,12 +225,12 @@ describe("palette-aware surface composition", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
     expect(darkTokens).not.toContain("#5c306c");
     expect(sidebarRule).toContain("background-color: var(--sidebar)");
     expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
-    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--overlay-surface-bg)");
     expect(cardRule).toContain("background-color: var(--card-surface-bg)");
   });
 
@@ -247,8 +255,8 @@ describe("palette-aware surface composition", () => {
     expect(generatedPaletteCssSource).not.toContain("--primary-cta");
   });
 
-  it("keeps menu surfaces white in light mode", () => {
-    expect(lightMenuRule).toContain("background-color: #fff");
+  it("uses the palette popover for menu surfaces in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: var(--popover)");
     expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
   });
 
@@ -845,7 +853,7 @@ describe("index.css sidebar canvas", () => {
   });
 
   it("uses the shared inset shadow with a dark-only right border", () => {
-    const shadow = "inset -8px 0 12px -8px rgb(0 0 0 / 5%)";
+    const shadow = "inset -4px 0 6px -4px rgb(0 0 0 / 5%)";
     expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
@@ -866,7 +874,7 @@ describe("index.css composer and menu surfaces", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
   });
 
@@ -879,9 +887,8 @@ describe("index.css composer and menu surfaces", () => {
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
- * parent's step. Anchoring the title ratios to the raw 13px preference instead
- * of a 16px-equivalent shrank every step ~19%, dragging the <code> under them
- * down to 9.75px.
+ * parent's step. Anchoring title ratios to the raw body preference instead of
+ * a 16px-equivalent shrinks every step, including nested code.
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
@@ -921,37 +928,30 @@ describe("index.css desktop typography ramp", () => {
   });
 });
 
-/* Contract for the two body text steps.
- *
- * text-sm used to be derived from --ui-ramp-anchor, which put it at 14.4px
- * against a 13px body — a caption tier LARGER than the text it captions. It
- * must come off the body step so it stays proportional at every size the
- * Appearance setting allows.
- */
+/* Captions derive from the raw body preference so they stay 1px smaller
+ * at every size the Appearance setting allows. */
 describe("index.css body text tokens", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
   const mobileMap = cssSource.match(
     /@media \(width < 48rem\) \{\s*(?:\/\*[\s\S]*?\*\/\s*)?:root \{[^}]*\}/,
   )?.[0];
-  const CAPTION_RATIO = 0.9;
-  const LINE_HEIGHT_RATIO = 1.6;
+  const BODY_LINE_HEIGHT_RATIO = 1.8;
+  const CAPTION_LINE_HEIGHT_RATIO = 1.4;
 
   it("derives the caption step from the body step on desktop", () => {
-    expect(desktopMap).toContain(`--text-sm: calc(var(--desktop-ui-font-size) * ${CAPTION_RATIO})`);
-    // The anchor is the 16px-equivalent grid for TITLE ratios only. Routing the
-    // caption factor through it is the inverted-hierarchy bug.
-    expect(desktopMap).not.toContain(`--text-sm: calc(var(--ui-ramp-anchor) * ${CAPTION_RATIO})`);
+    expect(desktopMap).toContain("--text-sm: calc(var(--desktop-ui-font-size) - 1px)");
+    expect(cssSource).toContain("--text-sm: calc(var(--text-ui) - 1px)");
   });
 
   it("derives the caption step from the body step on mobile too", () => {
     expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
-    expect(mobileMap).toContain(`--text-sm: calc(var(--mobile-ui-font-size) * ${CAPTION_RATIO})`);
+    expect(mobileMap).toContain("--text-sm: calc(var(--mobile-ui-font-size) - 1px)");
     expect(mobileMap).toContain("--text-ui: var(--mobile-ui-font-size)");
     expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: mobile gets its own unset default, while a saved Appearance
-   * value applies directly instead of being silently rescaled. */
+  /* Contract: a saved Appearance value applies directly on mobile instead of
+   * being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
     it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
@@ -961,8 +961,8 @@ describe("index.css body text tokens", () => {
     });
 
     it("keeps the desktop and mobile defaults distinct", () => {
-      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
-      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(14);
+      expect(UI_FONT_SIZE_DEFAULT).toBe(14);
+      expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
     });
 
     it("routes inherited body text through the same effective token", () => {
@@ -978,10 +978,26 @@ describe("index.css body text tokens", () => {
     });
   });
 
-  it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX])(
-    "keeps the caption step smaller than the body step at %ipx",
+  it.each([UI_FONT_SIZE_MIN, UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MOBILE_DEFAULT, UI_FONT_SIZE_MAX])(
+    "keeps the caption step 1px below the body step at %ipx",
     (px) => {
-      expect(px * CAPTION_RATIO).toBeLessThan(px);
+      for (const [mapping, preference] of [
+        [desktopMap, "--desktop-ui-font-size"],
+        [mobileMap, "--mobile-ui-font-size"],
+      ]) {
+        const captionSize = mapping?.match(/--text-sm:\s*([^;]+);/)?.[1];
+        expect(captionSize).toBeDefined();
+        const resolvedSize = captionSize!.replace(`var(${preference})`, `${px}px`);
+        const minified = new TextDecoder().decode(
+          transform({
+            filename: "caption.css",
+            code: new TextEncoder().encode(`.caption { font-size: ${resolvedSize}; }`),
+            minify: true,
+            targets: TARGETS,
+          }).code,
+        );
+        expect(minified).toContain(`font-size:${px - 1}px`);
+      }
     },
   );
 
@@ -996,12 +1012,17 @@ describe("index.css body text tokens", () => {
     expect(mobileMap).not.toContain("--text-xs:");
   });
 
-  it("gives both steps a unitless line height so the rhythm scales", () => {
-    // Unitless, not px: a fixed pair would re-freeze the line box at the
-    // larger settings. 1.6 puts the 13px default on ~21px.
+  it("shares the interface body size with messages across all viewports and input types", () => {
+    expect(cssSource.match(/--text-message:\s*[^;]+;/g)).toEqual([
+      "--text-message: var(--text-ui);",
+    ]);
+  });
+
+  it("gives body and caption text their shared unitless line heights", () => {
+    // Unitless line heights scale with the selected font size.
     const themeBlock = cssSource.match(/@theme \{[^}]*--text-ui:[^}]*\}/)?.[0];
-    expect(themeBlock).toContain(`--text-ui--line-height: ${LINE_HEIGHT_RATIO}`);
-    expect(themeBlock).toContain(`--text-sm--line-height: ${LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-ui--line-height: ${BODY_LINE_HEIGHT_RATIO}`);
+    expect(themeBlock).toContain(`--text-sm--line-height: ${CAPTION_LINE_HEIGHT_RATIO}`);
   });
 
   it("retires the duplicate 13px and caption tokens", () => {
@@ -1039,30 +1060,24 @@ describe("index.css shadow tokens", () => {
   });
 });
 
-/* Regression test for the "mobile sidebar is see-through" bug.
- * Below md the sidebar overlays the chat, so both canvas rules are followed
- * by an opaque fill. */
-describe("index.css mobile sidebar opacity", () => {
+describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
-    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}/,
   )?.[0];
 
-  it("keeps an opaque fill for the mobile sidebar overlay", () => {
-    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
-    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  it("keeps the drawer canvas transparent over its shared glass layer", () => {
+    expect(mobileRule).toBeDefined();
+    expect(mobileRule).toMatch(/background:\s*transparent !important/);
   });
 
-  it("declares it after both shared canvas rules so it wins the cascade", () => {
+  it("overrides the shared canvas after both theme rules", () => {
     const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
     const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
-    const mobile = cssSource.indexOf(mobileRule!);
+    const mobile = indexCssSource.indexOf(mobileRule!);
     expect(lightPalette).toBeGreaterThan(-1);
     expect(darkPalette).toBeGreaterThan(-1);
     expect(mobile).toBeGreaterThan(lightPalette);
     expect(mobile).toBeGreaterThan(darkPalette);
-    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
-    expect(mobileRule).not.toContain(":not(.dark)");
     expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });
@@ -1253,6 +1268,31 @@ describe("index.css electron-mac window drag region", () => {
     expect(shell.lastElementChild!.matches(controlsSelector)).toBe(false);
     unmarkMacShell();
     expect(strip.matches(dragSelector)).toBe(false);
+  });
+});
+
+describe("index.css shared UI font smoothing", () => {
+  const SMOOTHING_DECL = /-webkit-font-smoothing\s*:\s*antialiased/;
+  const smoothingRules = cssBlocks
+    .map(([block]) => block)
+    .filter((block) => /-webkit-font-smoothing\s*:/.test(block));
+
+  it("antialiases text across browsers and native shells", () => {
+    expect(smoothingRules.map(selectorOf)).toEqual(["html"]);
+    expect(smoothingRules[0]).toMatch(SMOOTHING_DECL);
+  });
+
+  it("keeps the declaration through build minification", () => {
+    const minified = new TextDecoder().decode(
+      transform({
+        filename: "index.css",
+        code: new TextEncoder().encode(indexCssSource),
+        minify: true,
+        targets: TARGETS,
+      }).code,
+    );
+    const rootRules = [...minified.matchAll(/(?:^|\})html\{([^}]*)\}/g)].map(([, body]) => body);
+    expect(rootRules.some((body) => /-webkit-font-smoothing:antialiased/.test(body))).toBe(true);
   });
 });
 
