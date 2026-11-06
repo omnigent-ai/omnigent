@@ -1,10 +1,19 @@
 // Running-session approval switcher for codex-native. Unlike the create-time
 // presets in `nativeHarnessModes` (which map to `terminal_launch_args`), the
 // live switch drives Codex's own `/permissions` popup by keystroke injection,
-// so its options and labels mirror that popup. Read Only isn't offered: the
-// popup lists it only for sessions already running a read-only permission
-// profile, so users start a new read-only session instead. The full-bypass
-// sandbox stance stays launch-only (the server 400s it on a runtime switch).
+// so its options and labels mirror that popup. The popup is version-dependent:
+// newer builds add a "Read Only" stance that 0.146 lacks, so the core popup
+// preset list keeps the common three rows while the broader running-session
+// picker also exposes Read Only. The full-bypass stance has no popup row of
+// its own — the runner delivers it through Full Access (same runtime
+// settings), and the server arms a bypass label so relaunches keep the real
+// launch flag.
+
+import {
+  CODEX_NATIVE_BYPASS_APPROVAL_OPTION,
+  CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+  CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+} from "@/lib/nativeHarnessModes";
 
 export interface CodexRuntimeApprovalPreset {
   value: string;
@@ -16,8 +25,9 @@ export interface CodexRuntimeApprovalPreset {
 export const CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY = "omnigent.codex_native.approval_mode";
 
 /**
- * The three runtime approval stances the picker can switch into, in Codex's
- * `/permissions` popup order.
+ * The common runtime approval stances Codex's `/permissions` popup offers, in
+ * its popup order. The running-session picker adds the version-dependent
+ * read-only stance separately below.
  */
 export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[] = [
   {
@@ -37,29 +47,49 @@ export const CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS: CodexRuntimeApprovalPreset[]
   },
 ];
 
-// A session launched read-only still reports it as its live mode, so it keeps
-// a label even though the picker can't switch into it.
-const CODEX_NATIVE_READ_ONLY_LABEL = "Read Only";
+const CODEX_NATIVE_READ_ONLY_OPTION: CodexRuntimeApprovalPreset = {
+  value: "read-only",
+  label: "Read Only",
+  description: "Read files only; approval required to edit files or access the internet",
+};
+
+/**
+ * Everything the running-session picker offers: the common popup presets, the
+ * version-dependent read-only stance, and the full-bypass stance.
+ */
+export const CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS: CodexRuntimeApprovalPreset[] = [
+  ...CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  CODEX_NATIVE_READ_ONLY_OPTION,
+  {
+    value: CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
+    label: CODEX_NATIVE_BYPASS_APPROVAL_OPTION.label,
+    description: CODEX_NATIVE_BYPASS_APPROVAL_OPTION.description,
+  },
+];
 
 /** Human label for an approval-mode value, falling back to the raw value. */
 export function codexApprovalModeLabel(mode: string | null | undefined): string {
   if (!mode) return "";
-  if (mode === "read-only") return CODEX_NATIVE_READ_ONLY_LABEL;
-  return CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.find((m) => m.value === mode)?.label ?? mode;
+  return CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS.find((m) => m.value === mode)?.label ?? mode;
 }
 
 /**
  * The live approval mode of a codex-native session, or null when unknown.
  *
- * Reads only the label the server stamps after a confirmed switch (web PATCH
- * or a `/permissions` change observed in the TUI). It does NOT reconstruct
- * from launch args — the runtime stance no longer rides them — so a session
- * that hasn't switched yet resolves to null and the picker shows an unset
- * state rather than a guessed default.
+ * Prefers the label the server stamps after a confirmed switch (web PATCH or
+ * a `/permissions` change observed in the TUI), then the armed bypass label
+ * (a bypass-launched session runs in bypass before any switch). It does NOT
+ * reconstruct from launch args — the runtime stance no longer rides them — so
+ * a session that hasn't switched yet resolves to null and the picker shows an
+ * unset state rather than a guessed default.
  */
 export function codexApprovalModeFromSession(
   session: { labels?: Record<string, string | null> | null } | null | undefined,
 ): string | null {
   const labelled = session?.labels?.[CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY];
-  return typeof labelled === "string" && labelled ? labelled : null;
+  if (typeof labelled === "string" && labelled) return labelled;
+  if (session?.labels?.[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] === "1") {
+    return CODEX_NATIVE_BYPASS_APPROVAL_VALUE;
+  }
+  return null;
 }
