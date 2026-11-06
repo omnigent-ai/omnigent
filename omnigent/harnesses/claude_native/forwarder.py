@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import io
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import NotRequired, TypedDict
+from typing import BinaryIO, NotRequired, TypedDict
 
 import httpx
 
@@ -2587,6 +2588,30 @@ async def _forward_one_subagent(
     await checkpoint.put(replace(new_entry, last_status=desired_status))
 
 
+class _TranscriptSnapshotReader(io.BufferedIOBase):
+    """Limit reads to the transcript descriptor's initial byte extent."""
+
+    def __init__(self, source: BinaryIO) -> None:
+        super().__init__()
+        self._source = source
+        self.name = source.name
+        self._remaining = os.fstat(source.fileno()).st_size
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int | None = -1) -> bytes:
+        limit = self._remaining if size is None or size < 0 else min(size, self._remaining)
+        if limit == 0:
+            return b""
+        data = self._source.read(limit)
+        self._remaining -= len(data)
+        return data
+
+    def read1(self, size: int = -1) -> bytes:
+        return self.read(size)
+
+
 def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
@@ -2606,8 +2631,13 @@ def _tool_use_ids_in_transcript(
     tool_use_ids: set[str] = set()
     try:
         # Decode one record at a time: tool output can make transcripts large.
-        # An incomplete UTF-8 tail is retried after the next file change.
-        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+        # Keep appends for the next poll rather than chasing a growing file.
+        with (
+            transcript_path.open("rb") as source,
+            io.TextIOWrapper(
+                _TranscriptSnapshotReader(source), encoding="utf-8", errors="replace"
+            ) as handle,
+        ):
             for line in handle:
                 try:
                     record = json.loads(line)

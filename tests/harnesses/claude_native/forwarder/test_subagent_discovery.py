@@ -9,9 +9,10 @@ import json
 import logging
 import os
 import tracemalloc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -1077,20 +1078,24 @@ def test_spawn_scan_memory_does_not_grow_with_tool_output(tmp_path: Path) -> Non
 
 
 @pytest.mark.parametrize("include_sidechains", [False, True])
-def test_spawn_scan_recovers_a_partial_utf8_tail(tmp_path: Path, include_sidechains: bool) -> None:
+@pytest.mark.parametrize("line_ending", [b"\n", b"\r\n", b"\r"], ids=["lf", "crlf", "cr"])
+def test_spawn_scan_recovers_a_partial_utf8_tail(
+    tmp_path: Path, include_sidechains: bool, line_ending: bytes
+) -> None:
     """Malformed rows and a split UTF-8 tail must not hide later complete spawns."""
     transcript_path = tmp_path / "session.jsonl"
     tail = json.dumps(
         _spawn_record("toolu_tail", "résumé", sidechain=False), ensure_ascii=False
     ).encode("utf-8")
     split_at = tail.index("é".encode()) + 1
-    transcript_path.write_bytes(
+    transcript = (
         json.dumps(_spawn_record("toolu_root", "spawn", sidechain=False)).encode()
-        + b'\ninvalid json\n[]\n{"message":{"content":"text"}}\n'
+        + b'\ninvalid json\n\xff\xfe\n[]\n{"message":{"content":"text"}}\n'
         + json.dumps(_spawn_record("toolu_child", "spawn", sidechain=True)).encode()
         + b"\n"
         + tail[:split_at]
     )
+    transcript_path.write_bytes(transcript.replace(b"\n", line_ending))
     expected = {"toolu_root", "toolu_child"} if include_sidechains else {"toolu_root"}
     assert (
         forwarder._spawn_tool_use_ids_cached(
@@ -1100,14 +1105,101 @@ def test_spawn_scan_recovers_a_partial_utf8_tail(tmp_path: Path, include_sidecha
     )
 
     with transcript_path.open("ab") as handle:
-        handle.write(tail[split_at:] + b"\n")
+        handle.write(tail[split_at:] + line_ending)
     assert forwarder._spawn_tool_use_ids_cached(
         transcript_path, include_sidechains=include_sidechains
     ) == expected | {"toolu_tail"}
 
 
-def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
+@pytest.mark.parametrize("separator", ["\x85", "\u2028", "\u2029"], ids=["nel", "ls", "ps"])
+def test_spawn_scan_accepts_unicode_separators_inside_json_strings(
+    tmp_path: Path, separator: str
+) -> None:
+    """JSON string separators belong to the record rather than delimit records."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            _spawn_record("toolu_unicode", f"before{separator}after", sidechain=False),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_unicode"
+    }
+
+
+def test_spawn_scan_defers_records_appended_while_parsing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan stops at its initial extent even when each parsed row adds another."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(_spawn_record("toolu_first", "spawn", sidechain=False))
+        + "\n"
+        + json.dumps(_spawn_record("toolu_second", "spawn", sidechain=False))
+        + "\n",
+        encoding="utf-8",
+    )
+    real_loads = json.loads
+    appended: set[str] = set()
+
+    def append_during_parse(line: str) -> Any:
+        record = real_loads(line)
+        if len(appended) < 10:
+            tool_use_id = f"toolu_appended_{len(appended)}"
+            appended.add(tool_use_id)
+            with transcript_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(_spawn_record(tool_use_id, "spawn", sidechain=False)))
+                handle.write("\n")
+        return record
+
+    with monkeypatch.context() as parsing:
+        parsing.setattr(forwarder.json, "loads", append_during_parse)
+        first = forwarder._spawn_tool_use_ids_cached(transcript_path, include_sidechains=False)
+
+    assert first == {"toolu_first", "toolu_second"}
+    assert len(appended) == 2
+    assert (
+        forwarder._spawn_tool_use_ids_cached(transcript_path, include_sidechains=False)
+        == first | appended
+    )
+
+
+def test_spawn_scan_snapshots_the_open_descriptor_after_path_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing a path after open must not change the original descriptor's limit."""
+    transcript_path = tmp_path / "session.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
+    transcript_path.write_text(
+        json.dumps(_spawn_record("toolu_original", "original", sidechain=False)) + "\n",
+        encoding="utf-8",
+    )
+    replacement.write_text(
+        json.dumps(_spawn_record("toolu_replaced", "new" * 100, sidechain=False)) + "\n",
+        encoding="utf-8",
+    )
+    real_fstat = os.fstat
+
+    def replace_before_fstat(descriptor: int) -> os.stat_result:
+        replacement.replace(transcript_path)
+        return real_fstat(descriptor)
+
+    with monkeypatch.context() as snapshot:
+        snapshot.setattr(forwarder.os, "fstat", replace_before_fstat)
+        first = forwarder._spawn_tool_use_ids_cached(transcript_path, include_sidechains=False)
+
+    assert first == {"toolu_original"}
+    assert forwarder._spawn_tool_use_ids_cached(transcript_path, include_sidechains=False) == {
+        "toolu_replaced"
+    }
+
+
+@pytest.mark.parametrize("fail_during_read", [False, True], ids=["open", "mid-read"])
+def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail_during_read: bool
 ) -> None:
     """A read that fails after a successful stat must not be remembered as a
     transcript without spawns; the next poll re-reads the unchanged file and
@@ -1121,15 +1213,28 @@ def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
         description="child whose parent read fails once",
         tool_use_id="toolu_child",
     )
+    with transcript_path.open("a", encoding="utf-8") as handle:
+        handle.write("{}\n")
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
     real_open = Path.open
     failures_left = [1]
 
-    def flaky_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+    @contextlib.contextmanager
+    def flaky_open(self: Path, *args: Any, **kwargs: Any) -> Iterator[Any]:
         if self == transcript_path and failures_left[0]:
             failures_left[0] -= 1
-            raise OSError(errno.EIO, "transient read failure")
-        return real_open(self, *args, **kwargs)
+            if not fail_during_read:
+                raise OSError(errno.EIO, "transient open failure")
+            with real_open(self, *args, **kwargs) as handle:
+                interrupted = Mock(wraps=handle)
+                interrupted.read.side_effect = [
+                    handle.readline(),
+                    OSError(errno.EIO, "transient mid-read failure"),
+                ]
+                yield interrupted
+        else:
+            with real_open(self, *args, **kwargs) as handle:
+                yield handle
 
     monkeypatch.setattr(Path, "open", flaky_open)
 
