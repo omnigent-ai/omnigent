@@ -10,9 +10,15 @@ export interface FindState {
   regex: boolean;
 }
 
+/** What the Changes tab shows: the PR's changed files, its commit list, or one commit's patch. */
+export type ChangesMode = "changes" | "commits" | "commit";
+
 interface ChangesView {
   pathFilter: string;
   hideViewed: boolean;
+  /** The Changes tab's source; `commit` needs `commitSha`. */
+  mode: ChangesMode;
+  commitSha: string | null;
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
   find: FindState;
@@ -27,11 +33,16 @@ export interface ChangesViewState extends ChangesView {
   clearReveal: (path: string) => void;
   setFind: (patch: Partial<FindState>) => void;
   setDismissedResetHead: (head: string | null) => void;
+  /** Shows the changed files or the commit list, leaving any open commit. */
+  setMode: (mode: "changes" | "commits") => void;
+  openCommit: (commitSha: string) => void;
 }
 
 const EMPTY_VIEW: ChangesView = {
   pathFilter: "",
   hideViewed: false,
+  mode: "changes",
+  commitSha: null,
   revealedPaths: new Set(),
   find: { open: false, query: "", matchCase: false, regex: false },
   dismissedResetHead: null,
@@ -73,6 +84,8 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
       setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
       setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
+      setMode: (mode) => update(key, () => ({ mode, commitSha: null })),
+      openCommit: (commitSha) => update(key, () => ({ mode: "commit", commitSha })),
     }),
     [key],
   );

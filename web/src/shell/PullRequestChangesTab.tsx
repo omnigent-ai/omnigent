@@ -31,7 +31,10 @@ import {
   type NormalizedPullRequestInfo,
   type PullRequest,
   type PullRequestChangedFile,
+  type PullRequestChangedFilesResult,
   type usePullRequestChangedFiles,
+  usePullRequestCommitDiff,
+  usePullRequestCommits,
   type usePullRequestDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -48,6 +51,9 @@ import {
   type DiffOptions,
   type FindHighlight,
 } from "./PullRequestFileSection";
+import { PullRequestCommitBar } from "./PullRequestCommitBar";
+import { PullRequestCommitsList } from "./PullRequestCommitsList";
+import { PullRequestChangesModeSwitch } from "./PullRequestChangesModeSwitch";
 import { PullRequestFileActions } from "./PullRequestFileActions";
 import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
@@ -55,6 +61,7 @@ import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequest
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
 import {
   buildSearchCorpus,
+  changedFilesFromPatch,
   filterChangedPaths,
   findMatches,
   firstMatchAtOrBelow,
@@ -264,6 +271,7 @@ function ChangesToolbar({
   onToggleAll,
   navigation,
   progress,
+  modeSwitch,
 }: {
   showFileControls: boolean;
   sidebarCollapsed: boolean;
@@ -280,10 +288,13 @@ function ChangesToolbar({
   onToggleAll: () => void;
   navigation?: React.ReactNode;
   progress?: React.ReactNode;
+  /** The Changes | Commits control, shown only where the provider lists commits. */
+  modeSwitch?: React.ReactNode;
 }) {
   return (
     <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
       <div className="flex min-w-0 flex-1 items-center gap-0.5">
+        {modeSwitch}
         {showFileControls && (
           <IconButton
             label={sidebarCollapsed ? "Show file list" : "Hide file list"}
@@ -453,6 +464,31 @@ export function PullRequestChangesTab({
   // poll never changes the link, and a list without one leaves Open disabled.
   const renderedHeadSha = changes.data?.head_sha ?? null;
   const renderedBaseSha = changes.data?.base_sha ?? null;
+  // Commits are listed at the pinned head, and the Changes view is the fallback without one.
+  const commitsSupported = !!data.capabilities.commit_history && !!prUrl && !!renderedHeadSha;
+  const mode = commitsSupported ? view.mode : "changes";
+  const commitsView = mode === "commits";
+  const commitView = mode === "commit";
+  const commits = usePullRequestCommits(
+    conversationId,
+    prUrl,
+    renderedHeadSha,
+    commitsSupported && mode !== "changes",
+  );
+  // An open commit's patch replaces the PR patch everywhere the diff is read.
+  const commitDiff = usePullRequestCommitDiff(
+    conversationId,
+    prUrl,
+    commitView ? view.commitSha : null,
+  );
+  const shownDiff = commitView ? commitDiff : prDiff;
+  // The list is oldest first, so the previous commit is the older one and the next is newer.
+  const commitList = commits.data?.data ?? [];
+  const commitIndex = commitList.findIndex((commit) => commit.sha === view.commitSha);
+  const selectedCommit = commitIndex >= 0 ? commitList[commitIndex] : undefined;
+  const previousCommit = commitIndex > 0 ? commitList[commitIndex - 1] : null;
+  const nextCommit =
+    commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
   const baseRepoUrl = pullRequestRepoUrl(data.provider, pr.url);
   const providerLabel = gitProviderCopy(data.provider, undefined, data.provider_display).label;
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -500,9 +536,49 @@ export function PullRequestChangesTab({
     });
   }, []);
 
-  const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
+  // Parse the shown patch (the whole PR, or one commit) into per-file diffs, keyed by path.
+  const { filesByPath, parseError } = useMemo(() => {
+    const map = new Map<string, FileDiffMetadata>();
+    const patch = shownDiff.data?.patch;
+    if (patch) {
+      try {
+        for (const parsed of parsePatchFiles(patch)) {
+          for (const f of parsed.files) map.set(f.name, f);
+        }
+      } catch {
+        return {
+          filesByPath: map,
+          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
+        };
+      }
+    }
+    return { filesByPath: map, parseError: undefined };
+  }, [shownDiff.data]);
+  // A commit's list is the files its patch changes; the PR's list is the provider's.
+  const commitFiles = useMemo(
+    () => (commitView ? changedFilesFromPatch(filesByPath) : []),
+    [commitView, filesByPath],
+  );
+  const listing = useMemo<{
+    data?: PullRequestChangedFilesResult;
+    isLoading: boolean;
+    error: Error | null;
+  }>(
+    () =>
+      commitView
+        ? {
+            data: { available: true, data: commitFiles, has_more: false },
+            isLoading: commitDiff.isLoading,
+            error: commitDiff.error,
+          }
+        : changes,
+    [commitView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
+  );
+  const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
+  // Viewed marks belong to the PR's changes, so their controls, filter and progress wait for Changes.
+  const viewedControls = mode === "changes";
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
-  const hiddenPaths = view.hideViewed ? viewedFiles.viewed : NO_HIDDEN_PATHS;
+  const hiddenPaths = view.hideViewed && viewedControls ? viewedFiles.viewed : NO_HIDDEN_PATHS;
   const visibleFiles = useMemo(
     () => selectVisibleFiles(files, { pathFilter: view.pathFilter, hiddenPaths }),
     [files, view.pathFilter, hiddenPaths],
@@ -512,14 +588,18 @@ export function PullRequestChangesTab({
   const changedListed = files.some((file) => viewedFiles.changed.has(file.path));
   // Hide viewed has emptied every file the path filter still matches.
   const matchingCount = filterChangedPaths(files, view.pathFilter).length;
-  const allViewed = view.hideViewed && visibleFiles.length === 0 && matchingCount > 0;
+  const allViewed =
+    view.hideViewed && viewedControls && visibleFiles.length === 0 && matchingCount > 0;
   // The sidebar groups the flat file list into a compacted folder tree (the
   // diff scroll below stays linear, in file order).
   const fileTree = useMemo(() => buildSidebarTree(visibleFiles), [visibleFiles]);
   const visiblePaths = useMemo(() => visibleFiles.map((file) => file.path), [visibleFiles]);
   // The toolbar, and with it the find bar, renders only when there is something to show.
   const toolbarShown =
-    files.length > 0 || reviews.isFetching || (reviews.page?.data ?? []).some((t) => !t.resolved);
+    files.length > 0 ||
+    commitsSupported ||
+    reviews.isFetching ||
+    (reviews.page?.data ?? []).some((t) => !t.resolved);
 
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
@@ -675,11 +755,12 @@ export function PullRequestChangesTab({
       disableFileHeader: true,
       // Expand unchanged context 10 lines at a time (default is 100). The
       // unchanged lines aren't in the patch, so expansion (and the exact
-      // trailing-region count) is served by loadDiffFiles on demand.
+      // trailing-region count) is served by loadDiffFiles on demand. A commit's
+      // unchanged lines would need its parent revision, so that view can't expand them.
       expansionLineCount: 10,
-      loadDiffFiles,
+      loadDiffFiles: commitView ? undefined : loadDiffFiles,
     }),
-    [themeType, diffStyle, loadDiffFiles],
+    [themeType, diffStyle, loadDiffFiles, commitView],
   );
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
@@ -869,14 +950,15 @@ export function PullRequestChangesTab({
   const patchFileCount = files.filter((file) => filesByPath.has(file.path)).length;
   const withoutText = files.length - patchFileCount;
   // Counts are meaningless until the patch has loaded and parsed.
-  const patchReady = !!prDiff.data?.patch && !parseError && !prDiff.isLoading;
+  const patchReady = !!shownDiff.data?.patch && !parseError && !shownDiff.isLoading;
   const coverageNote =
-    find.open && patchReady && (changes.data?.has_more || withoutText > 0)
-      ? `Search covers the fetched patch: ${patchFileCount} of ${changes.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
+    find.open && patchReady && (listing.data?.has_more || withoutText > 0)
+      ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
   // Header actions for one file. Deleted files open at the base revision; others
-  // at the rendered head, so a newer polled head never changes the link.
+  // at the rendered head, so a newer polled head never changes the link. A commit's
+  // files open at that commit, and a file the commit deletes has no page to open.
   const fileActions = (file: PullRequestChangedFile) => {
     const previous = file.previous_path ?? filesByPath.get(file.path)?.prevName ?? null;
     const renamedFrom = previous && previous !== file.path ? previous : null;
@@ -885,8 +967,8 @@ export function PullRequestChangesTab({
       provider: data.provider,
       headRepoUrl: pr.head_repository_url,
       baseRepoUrl,
-      headSha: renderedHeadSha,
-      baseSha: renderedBaseSha,
+      headSha: commitView ? view.commitSha : renderedHeadSha,
+      baseSha: commitView ? null : renderedBaseSha,
       path: file.path,
       previousPath: renamedFrom,
       status: file.status,
@@ -897,7 +979,11 @@ export function PullRequestChangesTab({
         previousPath={renamedFrom}
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
-        openUnavailableReason={openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)}
+        openUnavailableReason={
+          commitView && file.status === "deleted"
+            ? "Deleted in this commit"
+            : openUnavailableReason(providerLabel, !!baseRepoUrl, sourceRepoUrl)
+        }
       />
     );
   };
@@ -928,6 +1014,7 @@ export function PullRequestChangesTab({
     canReply: !!(canEdit && data.capabilities.review_thread_replies),
     canCreate: !!(
       canEdit &&
+      !commitView &&
       data.capabilities.review_thread_creation &&
       pr.state === "OPEN" &&
       pr.head_sha &&
@@ -941,18 +1028,19 @@ export function PullRequestChangesTab({
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
-  const threads = reviews.page?.data ?? [];
+  // Review conversations belong to the PR's head, so a commit's patch shows none.
+  const threads = commitView ? [] : (reviews.page?.data ?? []);
   const matchingRevision =
     !!reviews.page &&
     reviews.page.head_sha === prDiff.data?.head_sha &&
     reviews.page.base_sha === prDiff.data?.base_sha;
   const canShowFiles =
-    !changes.error &&
-    !prDiff.error &&
+    !listing.error &&
+    !shownDiff.error &&
     !parseError &&
-    !prDiff.data?.unavailable_reason &&
+    !shownDiff.data?.unavailable_reason &&
     files.length > 0 &&
-    !prDiff.isLoading;
+    !shownDiff.isLoading;
   const threadsByFile = new Map<string, ReviewThread[]>();
   const earlierThreads: ReviewThread[] = [];
   for (const thread of threads) {
@@ -1025,12 +1113,12 @@ export function PullRequestChangesTab({
             )}
           </div>
         )}
-      {(changes.data?.has_more || changes.data?.warning) && (
+      {!commitsView && (listing.data?.has_more || listing.data?.warning) && (
         <p
           role="status"
           className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
         >
-          {changes.data.warning || "The changed-file list is incomplete."}
+          {listing.data.warning || "The changed-file list is incomplete."}
         </p>
       )}
       {coverageNote && (
@@ -1055,40 +1143,50 @@ export function PullRequestChangesTab({
       )}
       {toolbarShown && (
         <ChangesToolbar
-          showFileControls={files.length > 0}
+          showFileControls={files.length > 0 && !commitsView}
           sidebarCollapsed={sidebarCollapsed}
           onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
           filterOpen={filterOpen}
           onToggleFilter={files.length > 0 && sidebarCollapsed ? toggleInlineFilter : undefined}
-          canNavigateThreads={unresolved.length > 0}
+          canNavigateThreads={unresolved.length > 0 && !commitsView}
           onNavigateThread={navigateThread}
           loadingThreads={reviews.isFetching}
           diffStyle={diffStyle}
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
           onToggleAll={toggleAll}
+          modeSwitch={
+            commitsSupported ? (
+              <PullRequestChangesModeSwitch
+                value={commitsView || commitView ? "commits" : "changes"}
+                onChange={view.setMode}
+              />
+            ) : undefined
+          }
           navigation={
-            <PullRequestFindBar
-              find={find}
-              inputRef={findInputRef}
-              position={activeIndex + 1}
-              total={matches.length}
-              truncated={search.truncated}
-              invalid={search.invalid}
-              hiddenCount={hiddenSearch.matches.length}
-              hiddenTruncated={hiddenSearch.truncated}
-              onOpen={() => view.setFind({ open: true })}
-              onClose={closeFind}
-              onQueryChange={(next) => changeFind({ query: next })}
-              onToggleOption={(option) =>
-                changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
-              }
-              onStep={stepMatch}
-              onShowHidden={showHidden}
-            />
+            commitsView ? undefined : (
+              <PullRequestFindBar
+                find={find}
+                inputRef={findInputRef}
+                position={activeIndex + 1}
+                total={matches.length}
+                truncated={search.truncated}
+                invalid={search.invalid}
+                hiddenCount={hiddenSearch.matches.length}
+                hiddenTruncated={hiddenSearch.truncated}
+                onOpen={() => view.setFind({ open: true })}
+                onClose={closeFind}
+                onQueryChange={(next) => changeFind({ query: next })}
+                onToggleOption={(option) =>
+                  changeFind(option === "matchCase" ? { matchCase: !matchCase } : { regex: !regex })
+                }
+                onStep={stepMatch}
+                onShowHidden={showHidden}
+              />
+            )
           }
           progress={
-            files.length > 0 && viewedFiles.available ? (
+            files.length > 0 && viewedFiles.available && viewedControls ? (
               <PullRequestViewedProgress
                 viewedCount={viewedCount}
                 totalCount={files.length}
@@ -1102,13 +1200,23 @@ export function PullRequestChangesTab({
         />
       )}
       {/* With the sidebar collapsed (narrow screens), the filter opens above the list. */}
-      {sidebarCollapsed && files.length > 0 && filterOpen && (
+      {sidebarCollapsed && files.length > 0 && filterOpen && !commitsView && (
         <div className="shrink-0 border-b border-border p-2">
           <PullRequestPathFilter value={view.pathFilter} onChange={view.setPathFilter} />
         </div>
       )}
+      {commitView && (
+        <PullRequestCommitBar
+          sha={view.commitSha ?? ""}
+          title={selectedCommit?.title ?? null}
+          previous={previousCommit}
+          next={nextCommit}
+          onBack={() => view.setMode("commits")}
+          onOpen={view.openCommit}
+        />
+      )}
       <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
-        {!sidebarCollapsed && (
+        {!sidebarCollapsed && !commitsView && (
           <ChangesSidebar
             width={sidebarWidth}
             handleProps={sidebarHandleProps}
@@ -1120,23 +1228,25 @@ export function PullRequestChangesTab({
               )
             }
           >
-            {changes.isLoading ? (
+            {listing.isLoading ? (
               <div className="flex items-center justify-center p-4 text-muted-foreground">
                 <Loader2Icon className="size-4 animate-spin" />
               </div>
-            ) : changes.error ? (
+            ) : listing.error ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
-                {changes.error instanceof RunnerOfflineError
+                {listing.error instanceof RunnerOfflineError
                   ? "Runner offline."
-                  : (changes.error as Error).message}
+                  : listing.error.message}
               </p>
             ) : files.length === 0 ? (
               <p className="px-2 py-1 text-ui text-muted-foreground">
-                {changes.data?.available === false ||
-                changes.data?.has_more ||
-                changes.data?.warning
+                {listing.data?.available === false ||
+                listing.data?.has_more ||
+                listing.data?.warning
                   ? "Changed files are unavailable."
-                  : "No changes vs base."}
+                  : commitView
+                    ? "This commit has no file changes."
+                    : "No changes vs base."}
               </p>
             ) : (
               fileTree.map((node) => (
@@ -1159,28 +1269,46 @@ export function PullRequestChangesTab({
           onScroll={onScroll}
           className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
         >
-          {changes.error || prDiff.error || parseError ? (
+          {commitsView ? (
+            <PullRequestCommitsList
+              commits={commitList}
+              hasMore={!!commits.data?.has_more}
+              loading={commits.isLoading}
+              errorMessage={
+                commits.error
+                  ? commits.error instanceof RunnerOfflineError
+                    ? "Runner offline."
+                    : commits.error.message
+                  : null
+              }
+              onSelect={view.openCommit}
+            />
+          ) : listing.error || shownDiff.error || parseError ? (
             <PanelMessage>
-              <p role="alert">{parseError || ((changes.error || prDiff.error) as Error).message}</p>
+              <p role="alert">
+                {parseError || ((listing.error || shownDiff.error) as Error).message}
+              </p>
             </PanelMessage>
-          ) : prDiff.data?.unavailable_reason ? (
+          ) : shownDiff.data?.unavailable_reason ? (
             <PanelMessage>
-              {prDiff.data.message ||
-                (prDiff.data.unavailable_reason === "pr_outside_workspace"
+              {shownDiff.data.message ||
+                (shownDiff.data.unavailable_reason === "pr_outside_workspace"
                   ? "Diff unavailable for a PR outside this workspace's repository"
                   : "Diff unavailable. Refresh or open the request on its provider.")}
             </PanelMessage>
-          ) : files.length === 0 || prDiff.isLoading ? (
+          ) : files.length === 0 || shownDiff.isLoading ? (
             <PanelMessage>
-              {changes.isLoading || prDiff.isLoading ? (
+              {listing.isLoading || shownDiff.isLoading ? (
                 <>
                   <Loader2Icon className="size-5 animate-spin" />
                   Loading changes…
                 </>
-              ) : changes.data?.available === false ||
-                changes.data?.has_more ||
-                changes.data?.warning ? (
+              ) : listing.data?.available === false ||
+                listing.data?.has_more ||
+                listing.data?.warning ? (
                 "Changed files are unavailable."
+              ) : commitView ? (
+                "This commit has no file changes."
               ) : (
                 "No changes vs base."
               )}
@@ -1216,7 +1344,7 @@ export function PullRequestChangesTab({
                 headerActions={
                   <>
                     {fileActions(file)}
-                    {viewedFiles.available && (
+                    {viewedControls && viewedFiles.available && (
                       <PullRequestViewedToggle
                         path={file.path}
                         viewed={viewedFiles.viewed.has(file.path)}

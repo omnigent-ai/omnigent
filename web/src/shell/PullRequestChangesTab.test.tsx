@@ -27,7 +27,14 @@ import { useChangesViewState } from "./useChangesViewState";
 const toast = vi.hoisted(() =>
   Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() }),
 );
-const mocks = vi.hoisted(() => ({ copyText: vi.fn(async () => {}), mobile: false }));
+const mocks = vi.hoisted(() => ({
+  copyText: vi.fn(async () => {}),
+  mobile: false,
+  /** The commit list the Commits view reads. */
+  commitList: { object: "list", has_more: false, data: [] as unknown[] },
+  /** Each commit's patch by sha, as the commit-diff query returns it. */
+  commitPatches: new Map<string, string>(),
+}));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
   toast,
@@ -45,6 +52,14 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     stale: false,
     selectLines: vi.fn(),
     cancel: vi.fn(),
+  }),
+  usePullRequestCommits: () => ({ data: mocks.commitList, isLoading: false, error: null }),
+  usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
+    data: sha
+      ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
+      : undefined,
+    isLoading: false,
+    error: null,
   }),
 }));
 vi.mock("@/components/theme/useResolvedThemeMode", () => ({
@@ -121,13 +136,16 @@ function renderTab({
   patch = PATCH,
   threads = [],
   listing = {},
+  commitHistory = false,
 }: {
   conversationId: string;
   files?: PullRequestChangedFile[];
   patch?: string;
   threads?: ReviewThread[];
-  /** Changed-file list fields beyond the file array, such as truncation. */
-  listing?: { has_more?: boolean; total_count?: number | null };
+  /** Changed-file list fields beyond the file array, such as truncation or the pinned head. */
+  listing?: { has_more?: boolean; total_count?: number | null; head_sha?: string | null };
+  /** The provider lists commits, so the Changes toolbar offers the Commits view. */
+  commitHistory?: boolean;
 }) {
   const prUrl = prUrlFor(conversationId);
   const tabProps = (current: string) =>
@@ -135,7 +153,7 @@ function renderTab({
       conversationId,
       data: {
         selected_pr_url: prUrl,
-        capabilities: {},
+        capabilities: commitHistory ? { commit_history: true } : {},
         auth: { selected_account: null },
       },
       pr: { url: prUrl, head_sha: "head", base_sha: "base", state: "OPEN" },
@@ -524,6 +542,7 @@ function viewedTab({
   diffHead = head,
   listHead = head,
   patch,
+  commitHistory = false,
 }: {
   conversationId: string;
   head?: string;
@@ -537,13 +556,14 @@ function viewedTab({
   listHead?: string | null;
   /** The whole-PR patch the diff reports. Without one, every file is unverified. */
   patch?: string;
+  commitHistory?: boolean;
 }) {
   const props = {
     conversationId,
     data: {
       selected_pr_url: PR_URL,
       base_ref: "main",
-      capabilities: {},
+      capabilities: commitHistory ? { commit_history: true } : {},
       auth: { selected_account: null },
     },
     pr: { url: PR_URL, number: 1, head_sha: head, base_sha: "base", state: "OPEN" },
@@ -1382,5 +1402,69 @@ describe("PullRequestChangesTab file actions and filter", () => {
     expect(container.querySelector('[data-review-thread="t-b"]')).toBeNull();
     expect(container.querySelector('[data-review-thread="t-a"]')).not.toBeNull();
     expect(screen.queryByText("Earlier conversations and unavailable diffs")).toBeNull();
+  });
+});
+
+describe("PullRequestChangesTab commits", () => {
+  const SHA_A = "a".repeat(40);
+  const SHA_B = "b".repeat(40);
+  const commit = (sha: string, title: string) => ({
+    object: "session.github.commit",
+    sha,
+    title,
+    author: "Ada",
+    date: "2026-11-01T10:00:00Z",
+  });
+
+  beforeEach(() => {
+    mocks.commitList = {
+      object: "list",
+      has_more: false,
+      data: [commit(SHA_A, "Add a.ts"), commit(SHA_B, "Add b.ts")],
+    };
+    mocks.commitPatches.clear();
+    mocks.commitPatches.set(SHA_A, A);
+    mocks.commitPatches.set(SHA_B, B);
+  });
+
+  it("lists commits, opens one with its own files, and steps between commits", () => {
+    renderTab({
+      conversationId: "commits-open",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    expect(isListed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+
+    expect(isListed("b.ts")).toBe(true);
+    expect(isListed("a.ts")).toBe(false);
+    expect(screen.getByRole("button", { name: "Next commit" })).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Previous commit" }));
+    expect(isListed("a.ts")).toBe(true);
+    expect(isListed("b.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
+    expect(screen.getByRole("button", { name: /Add a\.ts/ })).toBeInTheDocument();
+  });
+
+  it("hides the viewed controls in a commit view and restores them on Changes", () => {
+    render(viewedTab({ conversationId: "commits-viewed", commitHistory: true }));
+    expect(viewedBox("a.ts")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: /^Viewed / })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(viewedBox("a.ts")).toBeInTheDocument();
+  });
+
+  it("offers no Commits view when the provider does not list commits", () => {
+    renderTab({ conversationId: "commits-absent", listing: { head_sha: "head" } });
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
   });
 });

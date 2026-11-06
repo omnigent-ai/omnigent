@@ -229,6 +229,8 @@ export interface PullRequestCapabilities {
   details_editing?: boolean;
   /** Images and videos can be uploaded into the description; absent from older hosts. */
   attachment_uploads?: boolean;
+  /** The PR's commits can be listed and read one at a time; absent from older hosts. */
+  commit_history?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -770,6 +772,98 @@ export function usePullRequestDiff(
     queryKey: ["github-pr-diff", conversationId, ...(prUrl ? [prUrl, revision] : [])],
     queryFn: () => fetchPullRequestDiff(conversationId!, prUrl, revision),
     enabled: !!conversationId && hasPr && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+/** One commit of the pull request, as the Commits view lists it. */
+export interface PullRequestCommit {
+  object: "session.github.commit";
+  sha: string;
+  /** The first line of the commit message. */
+  title: string;
+  author: string | null;
+  /** The git author date, ISO 8601. */
+  date: string | null;
+}
+
+export interface PullRequestCommitsResult {
+  object: "list";
+  /** Oldest first; at most 250, with `has_more` when the PR has more. */
+  data: PullRequestCommit[];
+  has_more: boolean;
+}
+
+async function fetchPullRequestCommits(
+  conversationId: string,
+  prUrl: string,
+  headSha: string,
+): Promise<PullRequestCommitsResult> {
+  const query = new URLSearchParams({ pr_url: prUrl, head_sha: headSha });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/commits?${query}`,
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw await errorFromResponse(res);
+  return (await res.json()) as PullRequestCommitsResult;
+}
+
+/**
+ * The PR's commit list, pinned to the head the Changes list shows. Enabled only
+ * once that head is known, so the list and the file list describe one revision.
+ */
+export function usePullRequestCommits(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  headSha: string | null,
+  enabled: boolean,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commits", conversationId, prUrl, headSha],
+    queryFn: () => fetchPullRequestCommits(conversationId!, prUrl!, headSha!),
+    enabled: enabled && !!conversationId && !!prUrl && !!headSha && serveable !== false,
+    retry,
+    retryDelay: runnerOfflineRetryDelay,
+    staleTime: 30_000,
+    gcTime: 30 * 60_000,
+  });
+}
+
+async function fetchPullRequestCommitDiff(
+  conversationId: string,
+  prUrl: string,
+  commitSha: string,
+): Promise<PullRequestDiffResponse> {
+  const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff?${query}`,
+  );
+  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
+    throw new RunnerOfflineError();
+  }
+  if (!res.ok) throw await errorFromResponse(res);
+  return (await res.json()) as PullRequestDiffResponse;
+}
+
+/** One commit's patch, read by its full id. Enabled only while a commit is open. */
+export function usePullRequestCommitDiff(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+  commitSha: string | null,
+) {
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQuery({
+    queryKey: ["github-pr-commit-diff", conversationId, prUrl, commitSha],
+    queryFn: () => fetchPullRequestCommitDiff(conversationId!, prUrl!, commitSha!),
+    enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
     staleTime: 30_000,

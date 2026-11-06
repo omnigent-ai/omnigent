@@ -4,6 +4,7 @@ import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 import {
   MATCH_LIMIT,
   buildSearchCorpus,
+  changedFilesFromPatch,
   filterChangedPaths,
   findMatches,
   firstMatchAtOrBelow,
@@ -512,5 +513,89 @@ describe("pullRequestFileUrl", () => {
       ...override,
     });
     expect(link).toBeNull();
+  });
+});
+
+describe("changedFilesFromPatch", () => {
+  it("maps each file's status, path and line counts from one commit's patch", () => {
+    const patch = [
+      "diff --git a/new.ts b/new.ts",
+      "new file mode 100644",
+      "--- /dev/null",
+      "+++ b/new.ts",
+      "@@ -0,0 +1,2 @@",
+      "+one",
+      "+two",
+      "diff --git a/gone.ts b/gone.ts",
+      "deleted file mode 100644",
+      "--- a/gone.ts",
+      "+++ /dev/null",
+      "@@ -1 +0,0 @@",
+      "-bye",
+      "diff --git a/old/name.ts b/new/name.ts",
+      "similarity index 90%",
+      "rename from old/name.ts",
+      "rename to new/name.ts",
+      "--- a/old/name.ts",
+      "+++ b/new/name.ts",
+      "@@ -1 +1 @@",
+      "-x",
+      "+y",
+      "diff --git a/mod.ts b/mod.ts",
+      "--- a/mod.ts",
+      "+++ b/mod.ts",
+      "@@ -1,2 +1,2 @@",
+      " keep",
+      "-was",
+      "+now",
+      "",
+    ].join("\n");
+    const diffs = parsed(patch);
+
+    expect(
+      changedFilesFromPatch(diffs).map(
+        ({ path, name, status, lines_added, lines_removed, previous_path }) => ({
+          path,
+          name,
+          status,
+          lines_added,
+          lines_removed,
+          previous_path,
+        }),
+      ),
+    ).toEqual([
+      {
+        path: "new.ts",
+        name: "new.ts",
+        status: "created",
+        lines_added: 2,
+        lines_removed: 0,
+        previous_path: null,
+      },
+      {
+        path: "gone.ts",
+        name: "gone.ts",
+        status: "deleted",
+        lines_added: 0,
+        lines_removed: 1,
+        previous_path: null,
+      },
+      {
+        path: "new/name.ts",
+        name: "name.ts",
+        status: "renamed",
+        lines_added: 1,
+        lines_removed: 1,
+        previous_path: "old/name.ts",
+      },
+      {
+        path: "mod.ts",
+        name: "mod.ts",
+        status: "modified",
+        lines_added: 1,
+        lines_removed: 1,
+        previous_path: null,
+      },
+    ]);
   });
 });

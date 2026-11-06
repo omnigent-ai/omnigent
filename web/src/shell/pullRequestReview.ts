@@ -197,6 +197,33 @@ export function pullRequestRepoUrl(provider: string | null, prUrl: string): stri
   return match ? match[1] : null;
 }
 
+/** The files one commit's patch changes, in patch order, with their line counts. */
+export function changedFilesFromPatch(
+  diffs: ReadonlyMap<string, FileDiffMetadata>,
+): PullRequestChangedFile[] {
+  return [...diffs.values()].map((diff) => {
+    const previousPath = diff.prevName && diff.prevName !== diff.name ? diff.prevName : null;
+    const status: PullRequestChangedFile["status"] =
+      diff.type === "new"
+        ? "created"
+        : diff.type === "deleted"
+          ? "deleted"
+          : previousPath
+            ? "renamed"
+            : "modified";
+    return {
+      path: diff.name,
+      name: diff.name.split("/").pop() ?? diff.name,
+      status,
+      lines_added: diff.hunks.reduce((sum, hunk) => sum + hunk.additionLines, 0),
+      lines_removed: diff.hunks.reduce((sum, hunk) => sum + hunk.deletionLines, 0),
+      previous_path: previousPath,
+      bytes: null,
+      modified_at: null,
+    };
+  });
+}
+
 /**
  * The provider page for a changed file at the revision the list shows. Deleted files
  * link to the base repository at the base revision; others use the head (fork)

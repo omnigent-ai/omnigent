@@ -1520,3 +1520,119 @@ def test_changes_filter_copy_open(page: Page, seeded_session: tuple[str, str], e
     expect(page.get_by_role("menuitem", name="Open in GitHub")).to_have_attribute(
         "href", "https://example.com/fork/app/blob/head/README.md"
     )
+
+
+_COMMIT_ONE, _COMMIT_TWO = "1" * 40, "2" * 40
+# GET /resources/github/commits — oldest first; each commit's patch is served by sha below.
+_COMMITS = {
+    "object": "list",
+    "has_more": False,
+    "data": [
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_ONE,
+            "title": "Add the parser",
+            "author": "Ada",
+            "date": "2026-11-01T10:00:00Z",
+        },
+        {
+            "object": "session.github.commit",
+            "sha": _COMMIT_TWO,
+            "title": "Wire the README",
+            "author": "Grace",
+            "date": "2026-11-02T10:00:00Z",
+        },
+    ],
+}
+_COMMIT_PATCHES = {
+    _COMMIT_ONE: _PR_DIFF["patch"],
+    _COMMIT_TWO: (
+        "diff --git a/README.md b/README.md\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/README.md\n"
+        "@@ -0,0 +1 @@\n"
+        "+# Demo\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("entry", ["rail"])
+def test_changes_commits_view_lists_and_opens_a_commit(
+    page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
+) -> None:
+    """Switch the Changes tab to Commits, open one commit, and step between commits.
+
+    Only the commit's own files are listed, the viewed controls are absent there, and
+    Back returns to the commit list. The commit list and patches are stubbed routes.
+    """
+    base_url, session_id = seeded_session
+    pr_url = _INFO["pr"]["url"]
+    _stub_github(page)
+    # Commit history needs the Changes list pinned to a head, and the provider to support it.
+    page.route(
+        re.compile(r"/resources/github(?:\?|$)"),
+        lambda route: route.fulfill(
+            json={
+                **_INFO,
+                "tracking_available": True,
+                "selected_pr_url": pr_url,
+                "capabilities": {"commit_history": True},
+                "prs": [
+                    {
+                        "url": pr_url,
+                        "host": "example.com",
+                        "repository": "acme/app",
+                        "number": _PR_NUMBER,
+                        "relationship": "created",
+                    }
+                ],
+            }
+        ),
+    )
+    page.route(
+        re.compile(r"/resources/github/changes"),
+        lambda route: route.fulfill(json={**_CHANGES, "head_sha": "head", "base_sha": "base"}),
+    )
+    page.route(
+        re.compile(r"/resources/github/commits"), lambda route: route.fulfill(json=_COMMITS)
+    )
+
+    def commit_patch(route: Route) -> None:
+        sha = re.search(r"commit_sha=([0-9a-f]+)", route.request.url)
+        assert sha is not None, route.request.url
+        route.fulfill(
+            json={"object": "session.github.pr_diff", "patch": _COMMIT_PATCHES[sha.group(1)]}
+        )
+
+    # Registered after _stub_github, so the commit-specific match wins over the whole-PR diff.
+    page.route(re.compile(r"/resources/github/diff\?.*commit_sha="), commit_patch)
+    page.goto(f"{base_url}/c/{session_id}")
+    open_right_rail(page)
+    panel = page.get_by_role("complementary", name="Workspace")
+    panel.get_by_role("tab", name="Pull Requests").click()
+    panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
+    files = panel.locator("[data-github-file]")
+    expect(files).to_have_count(2, timeout=30_000)
+
+    panel.get_by_role("group", name="Show changes or commits").get_by_role(
+        "button", name="Commits", exact=True
+    ).click()
+    search = panel.get_by_role("searchbox", name="Search commits")
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
+    search.fill("readme")
+    expect(panel.get_by_role("button", name=re.compile("Wire the README"))).to_be_visible()
+    expect(panel.get_by_role("button", name=re.compile("Add the parser"))).to_have_count(0)
+    search.fill("")
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-list.png"), animations="disabled")
+
+    panel.get_by_role("button", name=re.compile("Add the parser")).click()
+    expect(files).to_have_count(1)
+    expect(files).to_have_attribute("data-github-file", "src/app/main.py")
+    expect(panel.get_by_role("checkbox", name="Hide viewed")).to_have_count(0)
+    page.screenshot(path=str(tmp_path / f"commits-{entry}-diff.png"), animations="disabled")
+
+    panel.get_by_role("button", name="Next commit").click()
+    expect(files).to_have_attribute("data-github-file", "README.md")
+    panel.get_by_role("button", name="Back to commits").click()
+    expect(panel.get_by_text("2 commits", exact=True)).to_be_visible()
