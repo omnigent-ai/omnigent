@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
@@ -52,6 +52,7 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
 from omnigent.terminals.ws_common import WS_CLOSE_INTERNAL_ERROR, WS_CLOSE_WRONG_REPLICA
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -683,23 +684,51 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
 
     :param app: The FastAPI app fixture.
     """
+    control = '{"type": "tmux-replies", "replies": []}'
     pty_bytes = b"\x1b[31mhello\x1b[0m"
-    conn = _FakeRunnerWSConn(outgoing=[pty_bytes])
+    more_bytes = b" world"
+    conn = _FakeRunnerWSConn(outgoing=[control, pty_bytes, more_bytes])
     factory = _FakeRunnerWSFactory(conn)
     set_runner_ws_factory(factory)
 
-    with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
-    ) as ws:
-        # The runner emits one binary frame, then closes cleanly.
-        msg = ws.receive_bytes()
-        assert msg == pty_bytes
+    with (
+        capture_debug_rows("server") as rows,
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+        ) as ws,
+    ):
+        # Control JSON leads, then two output frames, then a clean close.
+        assert ws.receive_text() == control
+        assert ws.receive_bytes() == pty_bytes
+        assert ws.receive_bytes() == more_bytes
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
 
     assert factory.calls == [
         "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
     ]
+    # One timing row per attach, for terminal output rather than the control frame.
+    (first_output,) = [row for row in rows if row["event_name"] == "terminal_attach_first_output"]
+    assert first_output["session_id"] == "conv_ws"
+    assert int(cast(dict[str, str], first_output["attributes"])["first_output_ms"]) >= 0
+
+
+async def test_attach_terminal_control_only_attach_logs_no_first_output(app: FastAPI) -> None:
+    """An attach that relays only control JSON reports no first-output timing."""
+    control = '{"type": "tmux-replies", "replies": []}'
+    set_runner_ws_factory(_FakeRunnerWSFactory(_FakeRunnerWSConn(outgoing=[control])))
+
+    with (
+        capture_debug_rows("server") as rows,
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+        ) as ws,
+    ):
+        assert ws.receive_text() == control
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert [row for row in rows if row["event_name"] == "terminal_attach_first_output"] == []
 
 
 async def test_attach_terminal_proxy_forwards_await_launch(app: FastAPI) -> None:
