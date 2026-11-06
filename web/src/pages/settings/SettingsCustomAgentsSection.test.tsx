@@ -24,6 +24,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 vi.mock("@/lib/agentLabels", () => ({
   BRAIN_HARNESS_LABELS: { "claude-sdk": "Claude SDK" },
+  capitalizeAgentName: (name: string) => name.charAt(0).toUpperCase() + name.slice(1),
   useAcpHarnessIds: () => new Set(["jcode"]),
   useHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),
   useBrainHarnessLabels: () => ({ "claude-sdk": "Claude SDK" }),

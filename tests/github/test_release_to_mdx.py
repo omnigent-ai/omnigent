@@ -63,7 +63,9 @@ def test_release_body_to_mdx_structure() -> None:
     assert "/pull/1132" in page  # PR refs linkified
     # The MLflow-style "What's Next" footer is appended after the body.
     assert "## What's Next" in page
-    assert "uv tool install" in page
+    # The site advertises only the installer, which checks for Node.js and tmux.
+    assert "curl -fsSL https://omnigent.ai/install.sh | sh" in page
+    assert "pip install" not in page
 
 
 def test_release_date_token_matches_site_index_regex() -> None:

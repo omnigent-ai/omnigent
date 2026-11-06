@@ -1,8 +1,8 @@
 """Helpers for seeding a managed Pi agent dir (``PI_CODING_AGENT_DIR``).
 
 Session model/auth files live in an isolated agent root. Preserve supported
-user resources there while keeping global instruction and session files out.
-Linked resources remain shared and writable, as in standalone Pi.
+user resources and context files there while keeping system prompt and session
+files out. Linked resources remain shared and writable, as in standalone Pi.
 """
 
 from __future__ import annotations
@@ -22,8 +22,11 @@ _Settings: TypeAlias = dict[str, object]
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 
 _PI_RESOURCE_TYPES = ("extensions", "skills", "prompts", "themes")
+# Pi loads the first of these per directory unless ``--no-context-files`` is set.
+PI_CONTEXT_FILE_NAMES = ("AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD")
 _PI_AGENT_RESOURCES = (
     *_PI_RESOURCE_TYPES,
+    *PI_CONTEXT_FILE_NAMES,
     "npm",
     "git",
     "mcp.json",
@@ -109,8 +112,9 @@ def _symlink_agent_resources(
         target = managed_dir / name
         try:
             # A reused managed dir may still link to a previous root or a removed source.
+            # Resolving rather than comparing paths keeps case-insensitive aliases stable.
             if target.is_symlink():
-                if target.readlink() == source and source.exists():
+                if source.exists() and target.exists() and target.samefile(source):
                     continue
                 target.unlink()
             elif target.exists():
@@ -139,7 +143,9 @@ def prepare_managed_pi_agent_dir(
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
     links supported resources, and preserves their relative settings paths.
     Linked resources are writable shared state; Pi may update MCP OAuth tokens.
-    Global instruction files and model credentials are not linked.
+    Global context files (``AGENTS.md`` et al.) are linked so Pi applies them
+    unless ``--no-context-files`` is set; ``SYSTEM.md``, ``APPEND_SYSTEM.md``
+    and model credentials are not linked.
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.

@@ -77,6 +77,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
     from omnigent.entities.environment_filesystem import FilesystemEntry
+    from omnigent.runner.environment_filesystem import CallerProcessFilesystem
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -1207,16 +1208,35 @@ def register_resource_routes(
             },
         )
 
+    async def _changes_registry(
+        session_id: str, environment_id: str, agent_spec: AgentSpec | None
+    ) -> FilesystemRegistry | None:
+        from omnigent.runtime.filesystem_registry import MultiRepositoryFilesystemRegistry
+
+        if environment_id != DEFAULT_ENVIRONMENT_ID:
+            try:
+                resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+            except ValueError as exc:
+                raise OmnigentError(str(exc), code=ErrorCode.NOT_FOUND) from exc
+        registry = await _resolve_session_fs_registry(session_id)
+        if isinstance(registry, MultiRepositoryFilesystemRegistry):
+            return registry.with_git_runner(
+                lambda argv, cwd, timeout: resource_registry.resolve_environment(
+                    session_id, environment_id, agent_spec
+                ).run_git(argv, cwd, timeout)
+            )
+        return registry
+
     @app.get("/v1/sessions/{session_id}/resources/environments/{environment_id}/changes")
     async def list_filesystem_changes(
         session_id: str,
-        environment_id: str,  # noqa: ARG001
+        environment_id: str,
     ) -> JSONResponse:
         from omnigent.runtime.filesystem_registry import GitStatusUnavailable
 
-        await _require_os_env(session_id)
+        agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
         try:
             # git status can take seconds; keep it off the loop (relay probes)
             # and off the default pool (native message delivery).
@@ -1244,6 +1264,9 @@ def register_resource_routes(
                 "modified_at": rec.get("modified_at"),
                 "lines_added": rec.get("lines_added"),
                 "lines_removed": rec.get("lines_removed"),
+                **(
+                    {"repository_root": rec["repository_root"]} if "repository_root" in rec else {}
+                ),
             }
             for rec in raw_changes
         ]
@@ -1263,7 +1286,7 @@ def register_resource_routes(
     ) -> JSONResponse:
         agent_spec = await _require_os_env(session_id)
         await _ensure_session_registered(session_id)
-        session_registry = await _resolve_session_fs_registry(session_id)
+        session_registry = await _changes_registry(session_id, environment_id, agent_spec)
 
         from omnigent.entities.environment_filesystem import InvalidPath
         from omnigent.runner.environment_filesystem import _validate_path
@@ -1301,6 +1324,11 @@ def register_resource_routes(
                 if session_registry is not None
                 else None
             )
+            before = (
+                await run_slow_io(session_registry.get_baseline, relative_path)
+                if session_registry is not None and record is not None
+                else None
+            )
         except GitStatusUnavailable as exc:
             return JSONResponse(
                 status_code=500,
@@ -1321,12 +1349,6 @@ def register_resource_routes(
             )
         is_deleted = record.get("status") == "deleted"
 
-        before: str | None = (
-            await run_slow_io(session_registry.get_baseline, relative_path)
-            if session_registry is not None
-            else None
-        )
-
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
         after: str | None = None
@@ -1341,8 +1363,13 @@ def register_resource_routes(
             content={
                 "object": "session.environment.filesystem.file_diff",
                 "path": relative_path,
-                "before": before,
+                "before": None if record.get("status") == "created" and before == "" else before,
                 "after": after,
+                **(
+                    {"baseline_state": "unknown"}
+                    if before is None and record.get("status") != "created"
+                    else {}
+                ),
             },
         )
 
@@ -1426,10 +1453,14 @@ def register_resource_routes(
         pr_url: str | None = None,
         server_tracked: bool = False,
         default_pr_url: str | None = None,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> JSONResponse:
         return await _github_call(
             session_id,
             "pr_changed_files",
+            head_sha=head_sha,
+            base_sha=base_sha,
             pr_url=pr_url,
             server_tracked=server_tracked,
             default_pr_url=default_pr_url,
@@ -1739,6 +1770,44 @@ def register_resource_routes(
             follow_outward_links=follow_outward_links,
         )
 
+    async def _read_editor_text(fs: CallerProcessFilesystem, relative_path: str) -> str | None:
+        """Return *relative_path*'s complete UTF-8 text, or ``None`` when it has none."""
+        try:
+            existing = await fs.read(relative_path, limit=None)
+        except Exception:  # noqa: BLE001
+            return None  # a new or unreadable file has no text to keep
+        if existing.encoding != "utf-8" or existing.truncated:
+            return None
+        return existing.data.decode("utf-8")
+
+    def _forget_other_environment_original(
+        relative_path: str, session_id: str, environment_id: str
+    ) -> None:
+        """Make the original unknown before a non-default environment changes the path."""
+        if filesystem_registry is not None and environment_id != DEFAULT_ENVIRONMENT_ID:
+            # Another environment may hold a different file at this relative path.
+            filesystem_registry.forget_original(relative_path, session_id=session_id)
+
+    async def _seed_editor_original(
+        fs: CallerProcessFilesystem, relative_path: str, session_id: str, environment_id: str
+    ) -> None:
+        """Seed the original an editor save replaces, when it is complete text."""
+        if filesystem_registry is None:
+            return
+        _forget_other_environment_original(relative_path, session_id, environment_id)
+        original = await _read_editor_text(fs, relative_path)
+        filesystem_registry.seed_snapshot(relative_path, original, session_id=session_id)
+
+    async def _record_editor_change(
+        fs: CallerProcessFilesystem, relative_path: str, operation: str, session_id: str
+    ) -> None:
+        """Record an editor save, passing its text when it may restore the original."""
+        if filesystem_registry is None:
+            return
+        await filesystem_registry.record_tracked_change(
+            relative_path, operation, session_id, lambda: _read_editor_text(fs, relative_path)
+        )
+
     @app.put(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -1763,23 +1832,13 @@ def register_resource_routes(
         encoding = body.get("encoding", "utf-8")
         create_parents = body.get("create_parents", True)
         content_bytes = content_str.encode(encoding)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         result = await fs.write(
             relative_path,
             content_bytes,
             create_parents=create_parents,
         )
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1812,16 +1871,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
-        try:
-            existing = await fs.read(relative_path, limit=None)
-            if existing.encoding and filesystem_registry is not None:
-                filesystem_registry.seed_snapshot(
-                    relative_path,
-                    existing.data.decode(existing.encoding, errors="replace"),
-                    session_id=session_id,
-                )
-        except Exception:  # noqa: BLE001
-            pass
+        await _seed_editor_original(fs, relative_path, session_id, environment_id)
         body = await request.json()
         edit_req = TextEditRequest(
             old_text=body.get("old_text"),
@@ -1829,8 +1879,7 @@ def register_resource_routes(
             replace_all=body.get("replace_all", False),
         )
         result = await fs.edit_text(relative_path, edit_req)
-        if filesystem_registry is not None:
-            filesystem_registry.record_change(relative_path, result.operation, session_id)
+        await _record_editor_change(fs, relative_path, result.operation, session_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -1863,6 +1912,7 @@ def register_resource_routes(
             agent_spec,
         )
         fs = CallerProcessFilesystem(env)
+        _forget_other_environment_original(relative_path, session_id, environment_id)
         result = await fs.delete(relative_path, recursive=recursive)
         if filesystem_registry is not None and result.type in ("file", "symlink"):
             filesystem_registry.record_change(relative_path, "deleted", session_id)
