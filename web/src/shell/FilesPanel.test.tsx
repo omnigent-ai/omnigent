@@ -630,6 +630,9 @@ describe("FilesPanel on an asleep sandbox", () => {
       listsLoaded: false,
     });
     expect(retrySessionMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
 
     vi.mocked(useSession).mockReturnValue({
       session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
@@ -685,11 +688,8 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(retrySessionMock).toHaveBeenLastCalledWith("conv_asleep", { wakeOnly: true });
   });
 
-  it.each<[string, ServerInfo | "loading"]>([
-    ["an older server", { ...FALLBACK_SERVER_INFO, retry_session_wake_only: undefined }],
-    ["the capability probe still loading", "loading"],
-  ])("keeps the send-a-message hint on %s", (_label, info) => {
-    serverInfo = info;
+  it("keeps the send-a-message hint on an older server", () => {
+    serverInfo = { ...FALLBACK_SERVER_INFO, retry_session_wake_only: undefined };
     useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
 

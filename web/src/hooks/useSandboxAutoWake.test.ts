@@ -52,34 +52,33 @@ afterEach(() => {
 });
 
 describe("useSandboxAutoWake", () => {
-  it("wakes an asleep sandbox once when the view opens and waits for it to come back", async () => {
-    const request = deferred<PostEventResponse>();
-    retryMock.mockReturnValue(request.promise);
-    const { result, rerender } = renderWake(asleepAndOpen);
+  it.each<[string, PostEventResponse]>([
+    ["relaunches it", recovered],
+    [
+      "finds the runner already connected",
+      { queued: false, recovered: false, recovery: "already_connected" },
+    ],
+  ])(
+    "wakes an asleep sandbox once when the server %s, and waits for it to come back",
+    async (_label, response) => {
+      const request = deferred<PostEventResponse>();
+      retryMock.mockReturnValue(request.promise);
+      const { result, rerender } = renderWake(asleepAndOpen);
 
-    expect(retryMock).toHaveBeenCalledTimes(1);
-    expect(retryMock).toHaveBeenCalledWith("conv_sleepy", { wakeOnly: true });
-    expect(result.current.phase).toBe("waking");
+      expect(retryMock).toHaveBeenCalledTimes(1);
+      expect(retryMock).toHaveBeenCalledWith("conv_sleepy", { wakeOnly: true });
+      expect(result.current.phase).toBe("waking");
 
-    await act(async () => request.resolve(recovered));
-    // Liveness hasn't caught up yet: still starting, and no second request.
-    expect(result.current.phase).toBe("waking");
-    rerender({ ...asleepAndOpen });
-    expect(retryMock).toHaveBeenCalledTimes(1);
+      await act(async () => request.resolve(response));
+      // Liveness hasn't caught up yet: still starting, and no second request.
+      expect(result.current.phase).toBe("waking");
+      rerender({ ...asleepAndOpen });
+      expect(retryMock).toHaveBeenCalledTimes(1);
 
-    rerender({ ...asleepAndOpen, ...online });
-    expect(result.current.phase).toBe("idle");
-  });
-
-  it("waits for liveness when the server finds the runner already connected", async () => {
-    retryMock.mockResolvedValue({ queued: false, recovered: false, recovery: "already_connected" });
-    const { result, rerender } = renderWake(asleepAndOpen);
-    await act(async () => {});
-
-    expect(result.current.phase).toBe("waking");
-    rerender({ ...asleepAndOpen, ...online });
-    expect(result.current.phase).toBe("idle");
-  });
+      rerender({ ...asleepAndOpen, ...online });
+      expect(result.current.phase).toBe("idle");
+    },
+  );
 
   it.each(["pending", "failed"])(
     "starts fresh for another session while the old wake is %s",
