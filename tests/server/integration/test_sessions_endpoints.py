@@ -10584,6 +10584,110 @@ async def test_stop_session_no_runner_lifts_stop_fence(
             _interrupt_fenced_sessions.discard(session_id)
 
 
+async def test_stop_session_marks_queued_native_messages_interrupted(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    A delivered stop settles the web messages queued when it was requested.
+
+    The stop kills the native process, so messages it had queued but not
+    recorded are gone. Left live, the first mirrored message after a relaunch
+    jumps over them and reports each as never recorded. A message sent while
+    the stop is in flight belongs to the next run and stays live.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    pending_inputs.reset_for_tests()
+    session_id: str | None = None
+    sent_after_stop: list[str] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Accept the stop; the person sends another message while it is in flight."""
+        if request.method == "POST" and session_id is not None:
+            sent_after_stop.append(
+                pending_inputs.record(session_id, [{"type": "input_text", "text": "after stop"}])
+            )
+        return httpx.Response(204)
+
+    try:
+        async with _runtime_runner(_handler):
+            agent = await create_test_agent(client)
+            session = await _create_session(client, agent["id"])
+            session_id = session["id"]
+            queued_at_stop = [
+                pending_inputs.record(session_id, [{"type": "input_text", "text": text}])
+                for text in ("first", "second")
+            ]
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+
+        assert resp.status_code == 202, resp.text
+        assert len(sent_after_stop) == 1
+        snapshot = pending_inputs.snapshot_for(session_id)
+        assert [entry["pending_id"] for entry in snapshot] == sent_after_stop
+        # The next run's mirror drains the cancelled entries without an undelivered record.
+        drain = pending_inputs.resolve_matching_text(session_id, "after stop")
+        assert drain.matched is not None
+        assert drain.matched.pending_id == sent_after_stop[0]
+        assert drain.skipped == []
+        assert [entry.pending_id for entry in drain.uncertain] == queued_at_stop
+    finally:
+        pending_inputs.reset_for_tests()
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+
+
+@pytest.mark.parametrize("failure_mode", ["runner_503", "no_runner"])
+async def test_stop_session_not_delivered_keeps_queued_native_messages_pending(
+    client: httpx.AsyncClient,
+    failure_mode: str,
+) -> None:
+    """
+    A stop that did not reach a runner leaves the queued web messages untouched.
+
+    No process was stopped, so the agent may still record those messages;
+    settling them quietly would hide a real undelivered report.
+    """
+    from omnigent.runtime import pending_inputs, set_runner_client
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Fail the stop POST the way the claude-native runner does."""
+        if request.method != "POST":
+            return httpx.Response(204)
+        return httpx.Response(503, json={"error": "claude_native_stop_failed"})
+
+    pending_inputs.reset_for_tests()
+    session_id: str | None = None
+    try:
+        async with _runtime_runner(_handler):
+            if failure_mode == "no_runner":
+                set_runner_client(None)
+            agent = await create_test_agent(client)
+            session = await _create_session(client, agent["id"])
+            session_id = session["id"]
+            queued = pending_inputs.record(
+                session_id, [{"type": "input_text", "text": "still live"}]
+            )
+
+            resp = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={"type": "stop_session", "data": {}},
+            )
+
+        assert resp.status_code == (503 if failure_mode == "runner_503" else 202), resp.text
+        assert [e["pending_id"] for e in pending_inputs.snapshot_for(session_id)] == [queued]
+        assert pending_inputs.has_pending(session_id)
+    finally:
+        pending_inputs.reset_for_tests()
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+
+
 async def test_retry_session_reports_live_runner_noop_without_mutating_history(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

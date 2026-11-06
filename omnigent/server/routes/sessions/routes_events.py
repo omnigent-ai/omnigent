@@ -2073,6 +2073,9 @@ def register_events_routes(
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
             _interrupt_fenced_sessions.add(session_id)
+            # Web messages the agent had queued but not recorded die with its
+            # process; read before the forward so one sent after Stop stays live.
+            queued_pending_ids = pending_inputs.pending_ids(session_id)
             # Harness-agnostic forward: the runner kills the external
             # process for harnesses that have one (claude-native
             # hard-kills its tmux pane) and 204s otherwise. Unlike the
@@ -2091,6 +2094,10 @@ def register_events_routes(
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
+            else:
+                # Cancelled like an interrupt's queue, so the next mirrored message
+                # after a relaunch does not report them as never recorded.
+                pending_inputs.mark_interrupted(session_id, queued_pending_ids)
             if (
                 stop_delivered
                 and not conv.host_id
