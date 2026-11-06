@@ -70,7 +70,7 @@ export function FileDownloadButton({ conversationId, path }: FileDownloadButtonP
           aria-label={`Download ${filename}`}
           className={cn(
             "shrink-0 cursor-pointer rounded p-0.5 transition-opacity",
-            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+            "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring pointer-coarse:pointer-events-none",
             downloadError
               ? "text-destructive opacity-100"
               : "text-muted-foreground hover:bg-muted hover:text-foreground opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
