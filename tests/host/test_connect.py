@@ -9533,14 +9533,11 @@ async def test_stop_frame_never_overtakes_launch(
             request_id=frame.request_id, status="launched", runner_id="runner_x"
         )
 
-    async def _recording_stop(
-        self_: HostProcess, frame: HostStopRunnerFrame
-    ) -> HostStopRunnerResultFrame:
+    def _recording_claim(self_: HostProcess, frame: HostStopRunnerFrame) -> None:
         order.append("stop")
-        return HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
 
     monkeypatch.setattr(HostProcess, "_handle_launch", _parked_launch)
-    monkeypatch.setattr(HostProcess, "_handle_stop", _recording_stop)
+    monkeypatch.setattr(HostProcess, "_claim_runner_for_stop", _recording_claim)
 
     host._start_frame_task(
         ws,  # type: ignore[arg-type] — duck-typed ws
@@ -9559,6 +9556,66 @@ async def test_stop_frame_never_overtakes_launch(
     release_launch.set()
     await _drain_frame_tasks(host)
     assert order == ["launch:start", "launch:end", "stop"]
+
+
+async def test_slow_runner_exit_does_not_hold_back_later_launches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stop waiting on its runner's exit must not queue launches behind it.
+
+    Deleting a batch of sessions and then creating a new batch would
+    otherwise leave each launch waiting for every earlier runner's exit
+    grace, past the server's launch timeout. The stop still reports
+    ``stopped`` only after its runner has exited.
+    """
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _reason: None)  # type: ignore[assignment]
+    ws = _CollectingWs()
+    exit_started = threading.Event()
+    release_exit = threading.Event()
+    launched = asyncio.Event()
+
+    def _slow_exit(_proc: object) -> None:
+        exit_started.set()
+        release_exit.wait(5.0)
+
+    async def _instant_launch(
+        self_: HostProcess, frame: HostLaunchRunnerFrame
+    ) -> HostLaunchRunnerResultFrame:
+        launched.set()
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_new"
+        )
+
+    monkeypatch.setattr(host, "_stop_runner_proc", _slow_exit)
+    monkeypatch.setattr(HostProcess, "_handle_launch", _instant_launch)
+    host._runners["runner_old"] = _RunnerHandle(
+        proc=SimpleNamespace(),  # type: ignore[arg-type] — only the patched exit sees it
+        log_path=tmp_path / "runner-old.log",
+    )
+
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostStopRunnerFrame(request_id="rq_stop", runner_id="runner_old")),
+    )
+    assert await asyncio.to_thread(exit_started.wait, 5.0)
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(
+            HostLaunchRunnerFrame(request_id="rq_launch", binding_token="tok", workspace="/w")
+        ),
+    )
+    try:
+        await asyncio.wait_for(launched.wait(), timeout=2.0)
+        assert "runner_old" not in host._runners
+        assert [decode_host_frame(sent).request_id for sent in ws.sent] == ["rq_launch"]
+    finally:
+        release_exit.set()
+    await _drain_frame_tasks(host)
+
+    stop_result = decode_host_frame(ws.sent[-1])
+    assert isinstance(stop_result, HostStopRunnerResultFrame)
+    assert (stop_result.request_id, stop_result.status) == ("rq_stop", "stopped")
 
 
 @pytest.mark.parametrize("operation", ["stat", "create_dir"])
@@ -9661,7 +9718,7 @@ async def test_filesystem_frame_keeps_host_control_responsive(
 async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An unrelated queued launch can proceed after the stopped runner exits."""
+    """A forked runner's stop completes and an unrelated queued launch proceeds."""
     host = _make_host_process()
     ws = _CollectingWs()
     manager = ZygoteManager()
@@ -9689,9 +9746,11 @@ async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
             assert child.poll() is not None
             assert "runner_old" not in host._runners
             replies = [decode_host_frame(raw) for raw in ws.sent]
-            assert [(reply.request_id, reply.status) for reply in replies] == [
-                ("stop", "stopped"),
+            # Launches don't wait for a stopped runner's exit, so the replies
+            # may arrive in either order.
+            assert sorted((reply.request_id, reply.status) for reply in replies) == [
                 ("launch", "launched"),
+                ("stop", "stopped"),
             ]
     finally:
         await _drain_frame_tasks(host)

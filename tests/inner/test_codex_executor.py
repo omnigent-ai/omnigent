@@ -4651,6 +4651,7 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
     if include_effective_providers:
         written = config_path.read_text()
         provider = tomllib.loads(written)["model_providers"]["Managed"]
+        assert provider["name"] == "Managed Gateway"
         assert provider["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
             "Databricks-Custom-Client-Surfaces": "omnigent, ug, inner",
@@ -4663,6 +4664,36 @@ def test_materialize_attributes_effective_gateway_without_copying_credentials(
     else:
         assert not config_path.exists()
     assert providers == tomllib.loads(resolved_config)["model_providers"]
+
+
+@pytest.mark.parametrize("existing_name", [None, "My Gateway", ""])
+def test_materialize_inherited_gateway_name_preserves_explicit_values(
+    tmp_path: Path, existing_name: str | None
+) -> None:
+    import tomllib
+
+    from omnigent.inner.codex_executor import materialize_codex_provider_config
+
+    private_home = tmp_path / "codex-home"
+    private_home.mkdir()
+    config_path = private_home / "config.toml"
+    config_path.write_text(
+        "[model_providers.Managed]\nrequest_max_retries = 2\n"
+        + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
+    )
+    materialize_codex_provider_config(
+        private_home,
+        [],
+        effective_providers={
+            "Managed": {
+                "name": "Managed Gateway",
+                "base_url": "https://ws.cloud.databricks.com/ai-gateway/codex/v1",
+            }
+        },
+    )
+    provider = tomllib.loads(config_path.read_text())["model_providers"]["Managed"]
+    assert provider["name"] == ("Managed Gateway" if existing_name is None else existing_name)
+    assert "base_url" not in provider
 
 
 def test_materialize_ignores_non_gateway_effective_providers(

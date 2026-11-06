@@ -30,7 +30,6 @@ import {
   useRef,
   useState,
   type ReactNode,
-  type RefObject,
 } from "react";
 import {
   AlertTriangleIcon,
@@ -79,6 +78,15 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ALT_KEY,
+  ARROW_LEFT_KEY,
+  ARROW_RIGHT_KEY,
+  CompactShortcutKeys,
+  ESC_KEY,
+  KeyboardShortcutTooltip,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
@@ -352,7 +360,6 @@ interface FileViewerProps {
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
-  closeTabRef?: RefObject<(() => void) | null>;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -394,7 +401,6 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
-  closeTabRef,
   onNavigateTo,
   permissionLevel,
   frameless,
@@ -761,15 +767,6 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  useLayoutEffect(() => {
-    if (!open || !onCloseTab || !closeTabRef) return;
-    const close = () => guardDirty(onCloseTab);
-    closeTabRef.current = close;
-    return () => {
-      if (closeTabRef.current === close) closeTabRef.current = null;
-    };
-  }, [open, onCloseTab, closeTabRef, guardDirty]);
-
   // Escape closes the active file tab (when search is not open).
   useEffect(() => {
     if (!open || !onCloseTab) return;
@@ -1027,11 +1024,15 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  // Mirrors the ref for rendering, which marks the viewer as owning Escape.
+  const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
     // Opening the viewer (or switching files within it) makes it the active
     // surface again. Keyed on `open` too, so reopening the same path after the
     // user had clicked into the chat re-seeds the ref instead of staying stale.
-    if (open) viewerIsActiveSurfaceRef.current = true;
+    if (!open) return;
+    viewerIsActiveSurfaceRef.current = true;
+    setViewerIsActiveSurface(true);
   }, [open, path]);
   useEffect(() => {
     if (!open) return;
@@ -1040,6 +1041,7 @@ function FileViewerBody({
       const target = e.target;
       if (root !== null && target instanceof Node) {
         viewerIsActiveSurfaceRef.current = root.contains(target);
+        setViewerIsActiveSurface(viewerIsActiveSurfaceRef.current);
       }
     };
     window.addEventListener("mousedown", track, true);
@@ -1157,6 +1159,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
+    /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
+    shortcut?: readonly string[];
   }
   interface ToolbarAction {
     key: string;
@@ -1331,6 +1335,8 @@ function FileViewerBody({
       icon: <SearchIcon className="size-4" />,
       active: false,
       onSelect: openSearch,
+      // Cmd+F only opens find on the Monaco and code surfaces (see isMonacoFindSurface).
+      shortcut: isMonacoFindSurface ? [MOD_KEY, "F"] : undefined,
     },
   ];
   if (revealTarget && !isDeletedFile) {
@@ -1474,6 +1480,9 @@ function FileViewerBody({
               >
                 {item.icon}
                 {item.label}
+                {item.shortcut && (
+                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                )}
                 {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
               </DropdownMenuItem>
             ))}
@@ -1551,49 +1560,57 @@ function FileViewerBody({
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Close file viewer"
-                      onClick={() => guardDirty(onClose)}
-                    >
-                      <ArrowLeftIcon className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Close</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
+              {/* Esc runs onCloseTab unless Find is open; the hint applies only when the
+                  back button runs that same handler. */}
+              <KeyboardShortcutTooltip
+                label="Close"
+                keys={
+                  onCloseTab !== undefined && onClose === onCloseTab && !searchOpen
+                    ? [ESC_KEY]
+                    : undefined
+                }
+              >
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Close file viewer"
+                  onClick={() => guardDirty(onClose)}
+                >
+                  <ArrowLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {showNavButtons && (
             <div ref={toolbarNavRef} className="flex items-center gap-0.5 shrink-0">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Previous file"
-                disabled={!prevPath}
-                onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
-              >
-                <ChevronLeftIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Previous file" keys={[ALT_KEY, ARROW_LEFT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Previous file"
+                  disabled={!prevPath}
+                  onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
+                >
+                  <ChevronLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
               <span className="text-[10px] text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Next file"
-                disabled={!nextPath}
-                onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
-              >
-                <ChevronRightIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Next file" keys={[ALT_KEY, ARROW_RIGHT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Next file"
+                  disabled={!nextPath}
+                  onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
+                >
+                  <ChevronRightIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
@@ -2008,11 +2025,16 @@ function FileViewerBody({
     </>
   );
 
+  // While the viewer is the surface last used, Escape closes its Find bar, or else its
+  // tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+
   if (frameless) {
     return (
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
+        data-escape-owner={ownsEscape ? "" : undefined}
         style={{ paddingBottom: keyboardInset || undefined }}
         className={cn(
           "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
@@ -2028,6 +2050,7 @@ function FileViewerBody({
     <aside
       ref={setFramedViewerRoot}
       data-testid="file-viewer"
+      data-escape-owner={ownsEscape ? "" : undefined}
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",
