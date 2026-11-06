@@ -3142,6 +3142,7 @@ describe("chatStore — send (first-send ordering)", () => {
   describe("a session snapshot that fails to load", () => {
     afterEach(() => {
       vi.useRealTimers();
+      vi.unstubAllEnvs();
     });
 
     /** Answer the session's next snapshot GETs with `statuses`; returns every GET made. */
@@ -3200,34 +3201,88 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(gets).toHaveLength(4);
     });
 
-    it("keeps the stream slot for the stream that replaced a failed load", async () => {
+    it("keeps the stream slot while the replacing bind waits on the session's host", async () => {
+      vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
       const slots = makeFakeSlotManager();
       setStreamSlotManagerForTest(slots);
-      seedSession("conv_slot", []);
-      failSnapshots("conv_slot", [404]);
-      const failing = fetchMock.getMockImplementation()!;
+      seedSession("conv_hostless", []);
+      let retrying = false;
+      let answerHost: (() => void) | null = null;
       fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        if (String(input) !== "/v1/sessions/conv_slot/stream") return failing(input, init);
-        // Like a real fetch, the body errors once its request is aborted.
-        const body = new ReadableStream<Uint8Array>({
-          start(controller) {
-            init?.signal?.addEventListener("abort", () => {
-              controller.error(new DOMException("Aborted", "AbortError"));
+        const url = String(input);
+        if (url.split("?")[0] === "/v1/sessions/conv_hostless/stream") {
+          // Like a real fetch, the body errors once its request is aborted.
+          const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+              init?.signal?.addEventListener("abort", () => {
+                controller.error(new DOMException("Aborted", "AbortError"));
+              });
+            },
+          });
+          return mockResponse(null, { bodyStream: body });
+        }
+        if (
+          url.split("?")[0] === "/v1/sessions/conv_hostless" &&
+          (init?.method ?? "GET") === "GET"
+        ) {
+          if (!retrying) return mockResponse({}, { ok: false, status: 404 });
+          if (answerHost === null) {
+            // The replacing bind looks up the session's host first; hold it.
+            return new Promise<Response>((resolve) => {
+              answerHost = () => resolve(defaultFetchHandler(input, init));
             });
-          },
-        });
-        return mockResponse(null, { bodyStream: body });
+          }
+        }
+        return defaultFetchHandler(input, init);
       });
-      await useChatStore.getState().switchTo("conv_slot");
+      await useChatStore.getState().switchTo("conv_hostless");
       expect(slots.heldByTab()).toBe(1);
 
-      await retryConversationLoad("conv_slot");
-      // Let the replaced pump finish exiting.
+      retrying = true;
+      const retried = retryConversationLoad("conv_hostless");
+      // The replaced pump exits while the new bind waits on the host lookup.
       await new Promise<void>((resolve) => {
         setTimeout(resolve, 50);
       });
+      answerHost!();
+      await retried;
 
+      expect(
+        conversationRegistry.peek("conv_hostless")!.getState().conversationLoadError,
+      ).toBeNull();
       expect(slots.heldByTab()).toBe(1);
+    });
+
+    it("keeps the session loading while it waits to retry", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_wait", []);
+      failSnapshots("conv_wait", [503]);
+
+      const switched = useChatStore.getState().switchTo("conv_wait");
+      await vi.advanceTimersByTimeAsync(100);
+      const entry = conversationRegistry.peek("conv_wait")!;
+      expect(entry.getState()).toMatchObject({
+        loadingConversation: true,
+        conversationLoadError: null,
+      });
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      await switched;
+      expect(entry.getState().loadingConversation).toBe(false);
+    });
+
+    it("stops retrying once the session is closed", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_closed", []);
+      const gets = failSnapshots("conv_closed", [503, 503, 503]);
+
+      const switched = useChatStore.getState().switchTo("conv_closed");
+      await vi.advanceTimersByTimeAsync(100);
+      releaseConversation("conv_closed");
+      await vi.advanceTimersByTimeAsync(10_000);
+      await switched;
+
+      expect(gets).toHaveLength(1);
     });
   });
 

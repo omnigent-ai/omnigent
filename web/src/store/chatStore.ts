@@ -4075,8 +4075,13 @@ const streamSlotOwners = new Map<string, AbortController>();
  * has nothing of its own to reclaim; the active conversation then opens over
  * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
-  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+async function acquireStreamSlot(id: string, owner: AbortController): Promise<boolean> {
+  // Rebinding a still-slotted stream: the new pump takes the slot over at once,
+  // so the pump it replaces can't release it while the new bind is waiting.
+  if (heldStreamSlots.has(id)) {
+    streamSlotOwners.set(id, owner);
+    return true;
+  }
   let slot = await getStreamSlotManager().tryAcquire();
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
@@ -4093,7 +4098,10 @@ async function acquireStreamSlot(id: string): Promise<boolean> {
     slot = await getStreamSlotManager().tryAcquire();
   }
   /* eslint-enable no-await-in-loop */
-  if (slot !== null) heldStreamSlots.set(id, slot);
+  if (slot !== null) {
+    heldStreamSlots.set(id, slot);
+    streamSlotOwners.set(id, owner);
+  }
   setStreamBudgetExceeded(slot === null);
   return slot !== null;
 }
@@ -4105,6 +4113,11 @@ function releaseStreamSlot(id: string): void {
   heldStreamSlots.delete(id);
   streamSlotOwners.delete(id);
   void slot.release();
+}
+
+/** Hand back `id`'s stream slot if `owner`'s pump still holds it. */
+function releaseOwnedStreamSlot(id: string, owner: AbortController): void {
+  if (streamSlotOwners.get(id) === owner) releaseStreamSlot(id);
 }
 
 /**
@@ -5051,11 +5064,11 @@ async function bindStream(
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
+  await acquireStreamSlot(id, controller);
   if (isConversationDisposed(id)) {
     // Switched away / evicted while awaiting the slot — don't open a dead
     // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+    releaseOwnedStreamSlot(id, controller);
     return;
   }
   set({ abortController: controller });
@@ -5086,7 +5099,7 @@ async function bindStream(
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
     if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+      releaseOwnedStreamSlot(id, controller);
       return;
     }
   }
@@ -5094,10 +5107,9 @@ async function bindStream(
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction) unless a
   // rebind's pump has taken it over.
-  streamSlotOwners.set(id, controller);
-  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() => {
-    if (streamSlotOwners.get(id) === controller) releaseStreamSlot(id);
-  });
+  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
+    releaseOwnedStreamSlot(id, controller),
+  );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on
@@ -5135,17 +5147,18 @@ async function bindStream(
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
     const client = queryClient;
-    const [session, page] = await withSnapshotRetries(id, () =>
-      Promise.all([
+    // Each request retries on its own, so a failed one doesn't repeat the other.
+    const [session, page] = await Promise.all([
+      withSnapshotRetries(id, () =>
         client.fetchQuery({
           queryKey: ["session", id],
           queryFn: () => getSessionSlim(id, { refreshState: true }),
           staleTime: 0,
           retry: false,
         }),
-        fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
-      ]),
-    );
+      ),
+      withSnapshotRetries(id, () => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS })),
+    ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);

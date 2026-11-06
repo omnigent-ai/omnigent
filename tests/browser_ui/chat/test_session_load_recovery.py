@@ -26,21 +26,6 @@ def _fail_snapshots(chat: ChatSessionContract, times: int) -> dict[str, int]:
     return left
 
 
-def test_a_session_whose_load_fails_once_still_opens(
-    page: Page,
-    chat_session_contract: ChatSessionContract,
-) -> None:
-    """A snapshot load that fails once with a 503 is retried, and the transcript shows."""
-    chat = chat_session_contract
-    chat.set_items([message_item("load-user", "user", _QUESTION, response_id="r1")])
-    _fail_snapshots(chat, 1)
-
-    page.goto(chat.url)
-
-    expect(page.get_by_text(_QUESTION)).to_be_visible(timeout=20_000)
-    expect(page.get_by_role("heading", name="Couldn't load this conversation")).to_have_count(0)
-
-
 def test_a_session_that_keeps_failing_to_load_can_be_loaded_again(
     page: Page,
     chat_session_contract: ChatSessionContract,
