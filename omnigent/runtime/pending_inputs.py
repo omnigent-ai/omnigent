@@ -942,17 +942,24 @@ def resolve_matching_text(
 
 
 def resolve_delivery_attempt(
-    conversation_id: str, delivery_attempt_id: str, *, hold: bool = False
+    conversation_id: str,
+    delivery_attempt_id: str,
+    *,
+    stable_id: str | None = None,
+    hold: bool = False,
 ) -> MatchedDrain:
     """
     Drain only the entry whose native delivery carried ``delivery_attempt_id``.
 
     A harness that echoes the delivery id back names its own entry, so no other
     entry is a candidate: older entries stay queued and a miss drains nothing.
+    A restored entry gets a new delivery id, so ``stable_id`` names it instead.
 
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param delivery_attempt_id: Delivery id the harness echoed, e.g.
         ``"0f1e2d3c4b5a69788796a5b4c3d2e1f0"``.
+    :param stable_id: Stable id of the input that delivery carried, matched
+        only when no entry carries ``delivery_attempt_id``.
     :param hold: Keep the entry in place, marked held, as in
         :func:`resolve_matching_text`.
     :returns: The matched entry with nothing skipped, or no match.
@@ -960,21 +967,30 @@ def resolve_delivery_attempt(
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         entries = _pending.get(conversation_id, {})
-        for pending_id, entry in entries.items():
-            if entry.held or entry.delivery_attempt_id != delivery_attempt_id:
-                continue
-            if hold:
-                entry.held = True
-            else:
-                del entries[pending_id]
-                if not entries:
-                    _pending.pop(conversation_id, None)
-            return MatchedDrain(
-                matched=_drained_input(entry),
-                skipped=[],
-                match_method="delivery_attempt_id",
+        unheld = [entry for entry in entries.values() if not entry.held]
+        match_method = "delivery_attempt_id"
+        entry = next(
+            (
+                candidate
+                for candidate in unheld
+                if candidate.delivery_attempt_id == delivery_attempt_id
+            ),
+            None,
+        )
+        if entry is None and stable_id is not None:
+            match_method = "input_stable_id"
+            entry = next(
+                (candidate for candidate in unheld if candidate.stable_id == stable_id), None
             )
-    return MatchedDrain(matched=None, skipped=[])
+        if entry is None:
+            return MatchedDrain(matched=None, skipped=[])
+        if hold:
+            entry.held = True
+        else:
+            del entries[entry.pending_id]
+            if not entries:
+                _pending.pop(conversation_id, None)
+        return MatchedDrain(matched=_drained_input(entry), skipped=[], match_method=match_method)
 
 
 def has_pending(conversation_id: str) -> bool:

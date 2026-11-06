@@ -382,6 +382,32 @@ def test_resolve_delivery_attempt_drains_only_its_own_entry() -> None:
     assert not pending_inputs.has_pending("conv_a")
 
 
+def test_resolve_delivery_attempt_falls_back_to_its_input_stable_id() -> None:
+    """A delivery id no entry carries settles the entry the input's stable id names."""
+    older = pending_inputs.record("conv_a", [_text_block("first")], stable_id="a" * 32)
+    restored = pending_inputs.record("conv_a", [_text_block("second")], stable_id="b" * 32)
+    restored_attempt_id = pending_inputs.delivery_attributes_for("conv_a", restored)[
+        "delivery_attempt_id"
+    ]
+    assert isinstance(restored_attempt_id, str)
+
+    unknown = pending_inputs.resolve_delivery_attempt("conv_a", "f" * 32, stable_id="c" * 32)
+    assert unknown.matched is None
+    exact = pending_inputs.resolve_delivery_attempt(
+        "conv_a", restored_attempt_id, stable_id="a" * 32, hold=True
+    )
+    assert exact.matched is not None and exact.matched.pending_id == restored
+    assert exact.match_method == "delivery_attempt_id"
+    pending_inputs.restore("conv_a", exact.matched)
+
+    drained = pending_inputs.resolve_delivery_attempt("conv_a", "f" * 32, stable_id="b" * 32)
+
+    assert drained.matched is not None and drained.matched.pending_id == restored
+    assert drained.skipped == [] and drained.match_method == "input_stable_id"
+    assert [entry["pending_id"] for entry in pending_inputs.snapshot_for("conv_a")] == [older]
+    pending_inputs.resolve("conv_a", older)
+
+
 def test_resolve_matching_text_does_not_match_on_unanchored_suffix() -> None:
     """A short pending entry must not be matched by an unrelated prompt that
     merely ends with its text (e.g. queued "ok" vs. an accepted "...still ok"),

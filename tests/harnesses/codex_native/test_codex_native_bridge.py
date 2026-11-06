@@ -1158,12 +1158,16 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
         SentSteer("turn_a", f"old_{index}") for index in range(2, 34)
     ]
 
-    for turn_id, client_message_id in [("turn_1", "steer_1"), ("turn_1", "steer_2")]:
+    for turn_id, client_message_id, input_stable_id in [
+        ("turn_1", "steer_1", None),
+        ("turn_1", "steer_2", "a" * 32),
+    ]:
         record_sent_steer(
             bridge_dir,
             thread_id="thread_new",
             turn_id=turn_id,
             client_message_id=client_message_id,
+            input_stable_id=input_stable_id,
         )
     record_sent_steer(
         bridge_dir, thread_id="thread_new", turn_id="turn_2", client_message_id="steer_3"
@@ -1177,7 +1181,7 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
 
     assert read_sent_steers(bridge_dir, thread_id="thread_old") == []
     assert read_sent_steers(bridge_dir, thread_id="thread_new") == [
-        SentSteer("turn_1", "steer_2", turn_ended=True),
+        SentSteer("turn_1", "steer_2", turn_ended=True, input_stable_id="a" * 32),
         SentSteer("turn_2", "steer_3"),
     ]
 
@@ -1187,7 +1191,7 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
         steers=[SentSteer("turn_2", "steer_2"), SentSteer("turn_2", "steer_3")],
     )
     assert read_sent_steers(bridge_dir, thread_id="thread_new") == [
-        SentSteer("turn_1", "steer_2", turn_ended=True),
+        SentSteer("turn_1", "steer_2", turn_ended=True, input_stable_id="a" * 32),
     ]
 
     settle_sent_steers(bridge_dir, thread_id="thread_new", steers=[SentSteer("turn_1", "steer_2")])
@@ -1203,7 +1207,7 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
         ('{"thread_id": "thread_a", "steers": {}}', []),
         (
             '{"thread_id": "thread_a", "steers": [{"turn_id": "turn_1",'
-            ' "client_message_id": "steer_1", "turn_ended": "yes"},'
+            ' "client_message_id": "steer_1", "turn_ended": "yes", "input_stable_id": 7},'
             ' {"turn_id": 1, "client_message_id": "steer_2"}, "junk"]}',
             [SentSteer("turn_1", "steer_1")],
         ),

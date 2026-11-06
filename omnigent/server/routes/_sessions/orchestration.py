@@ -3154,8 +3154,12 @@ async def _persist_external_conversation_item_unlocked(
         if not isinstance(delivery_attempt_id, str) or not delivery_attempt_id:
             delivery_attempt_id = None
         if delivery_attempt_id is not None:
+            input_stable_id = body.data.get("input_stable_id")
             matched = pending_inputs.resolve_delivery_attempt(
-                session_id, delivery_attempt_id, hold=True
+                session_id,
+                delivery_attempt_id,
+                stable_id=input_stable_id if isinstance(input_stable_id, str) else None,
+                hold=True,
             )
         else:
             matched = pending_inputs.resolve_matching_text(

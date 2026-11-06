@@ -103,7 +103,9 @@ Skipped inputs also carry a bounded `cause_class`:
 `match_method` is `normalized_text`, `attachment_normalized_text`,
 `fifo_fallback`, `input_stable_id`, or `delivery_attempt_id`. A mirror naming
 its `delivery_attempt_id`, such as a recovered Codex steer, settles only that
-input: older inputs stay queued and a miss uses no FIFO fallback.
+input: older inputs stay queued and a miss uses no FIFO fallback. A restored
+saved input gets a new delivery id, so such a mirror also names the input's
+`input_stable_id`, which settles it when the delivery id misses.
 `last_delivery_stage` records the last identity-linked stage the server
 observed: enqueue/forward stages, native turn start/terminal stages, or
 `rejected_before_handoff`. A transcript can arrive

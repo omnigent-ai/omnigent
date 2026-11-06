@@ -404,8 +404,9 @@ async def _native_delivery_request_once(
     thread_id = requested_thread if isinstance(requested_thread, str) else None
     # Only turn input carries an idempotency key; a shell command's receipt has
     # no userMessage item, so a lost shell ack stays ambiguous without a probe.
+    input_identity = current_input_attributes()
     client_message_id = (
-        current_input_attributes().get("delivery_attempt_id")
+        input_identity.get("delivery_attempt_id")
         if method in ("turn/start", "turn/steer")
         else None
     )
@@ -414,8 +415,10 @@ async def _native_delivery_request_once(
     else:
         client_message_id = None
     steer_client_id = client_message_id if method == "turn/steer" else None
+    input_stable_id = input_identity.get("input_stable_id")
+    steer_stable_id = input_stable_id if isinstance(input_stable_id, str) else None
     sent_steer = (
-        SentSteer(requested_turn_id, steer_client_id)
+        SentSteer(requested_turn_id, steer_client_id, input_stable_id=steer_stable_id)
         if steer_client_id is not None and requested_turn_id is not None
         else None
     )
@@ -426,6 +429,7 @@ async def _native_delivery_request_once(
             thread_id=state.thread_id,
             turn_id=sent_steer.turn_id,
             client_message_id=sent_steer.client_message_id,
+            input_stable_id=steer_stable_id,
         )
     log_input_event(
         _logger,
@@ -494,6 +498,7 @@ async def _native_delivery_request_once(
                             thread_id=state.thread_id,
                             turn_id=confirmed_turn,
                             client_message_id=steer_client_id,
+                            input_stable_id=steer_stable_id,
                         )
                     # The forwarder owns current turn state; this receipt can already be old.
                     return None
@@ -529,6 +534,7 @@ async def _native_delivery_request_once(
             thread_id=state.thread_id,
             turn_id=native_turn_id,
             client_message_id=steer_client_id,
+            input_stable_id=steer_stable_id,
         )
     return response
 

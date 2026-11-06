@@ -228,7 +228,7 @@ async def test_native_receipt_requires_exact_delivery_identity(
         "explicit-rejection",
     }
     assert read_sent_steers(tmp_path, thread_id="thread_receipt") == (
-        [SentSteer("turn_accepted", "c" * 32)] if recorded else []
+        [SentSteer("turn_accepted", "c" * 32, input_stable_id="a" * 32)] if recorded else []
     )
 
 

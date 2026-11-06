@@ -1329,11 +1329,14 @@ class SentSteer:
     :param turn_id: Steered Codex turn id, e.g. ``"turn_abc"``.
     :param client_message_id: ``clientUserMessageId`` sent with the steer.
     :param turn_ended: Whether its turn ended before the transcript could be checked.
+    :param input_stable_id: Web input's stable id, which survives the server
+        reissuing the delivery id, e.g. ``"0f1e2d3c4b5a69788796a5b4c3d2e1f0"``.
     """
 
     turn_id: str
     client_message_id: str
     turn_ended: bool = False
+    input_stable_id: str | None = None
 
 
 def _load_sent_steers(bridge_dir: Path) -> tuple[str | None, list[SentSteer]]:
@@ -1347,7 +1350,12 @@ def _load_sent_steers(bridge_dir: Path) -> tuple[str | None, list[SentSteer]]:
     if not isinstance(thread_id, str) or not isinstance(records, list):
         return None, []
     steers = [
-        SentSteer(record["turn_id"], record["client_message_id"], record.get("turn_ended") is True)
+        SentSteer(
+            record["turn_id"],
+            record["client_message_id"],
+            record.get("turn_ended") is True,
+            record["input_stable_id"] if isinstance(record.get("input_stable_id"), str) else None,
+        )
         for record in records
         if isinstance(record, dict)
         and isinstance(record.get("turn_id"), str)
@@ -1369,7 +1377,12 @@ def _write_sent_steers(bridge_dir: Path, thread_id: str, steers: list[SentSteer]
 
 
 def record_sent_steer(
-    bridge_dir: Path, *, thread_id: str, turn_id: str, client_message_id: str
+    bridge_dir: Path,
+    *,
+    thread_id: str,
+    turn_id: str,
+    client_message_id: str,
+    input_stable_id: str | None = None,
 ) -> None:
     """
     Record a steer before it is sent, replacing an earlier record of it (best-effort).
@@ -1378,6 +1391,7 @@ def record_sent_steer(
     :param thread_id: Codex thread id, e.g. ``"thread_abc"``.
     :param turn_id: Steered Codex turn id, e.g. ``"turn_abc"``.
     :param client_message_id: ``clientUserMessageId`` sent with the steer.
+    :param input_stable_id: Web input's stable id, when it has one.
     :returns: None.
     """
     try:
@@ -1386,7 +1400,7 @@ def record_sent_steer(
             if recorded_thread_id != thread_id:
                 steers = []
             steers = [steer for steer in steers if steer.client_message_id != client_message_id]
-            steers.append(SentSteer(turn_id, client_message_id))
+            steers.append(SentSteer(turn_id, client_message_id, input_stable_id=input_stable_id))
             _write_sent_steers(bridge_dir, thread_id, steers[-_MAX_SENT_STEERS:])
     except OSError:
         _logger.warning("Could not record sent Codex steer in %s", bridge_dir, exc_info=True)

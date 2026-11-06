@@ -1040,7 +1040,7 @@ def test_codex_delivery_records_input_and_accepted_native_turn(
     if active_turn_id is not None:
         # Recorded under the expected turn, then the turn Codex reports.
         steered_turn_id = "turn_steered" if rpc_reply is None else active_turn_id
-        expected_steers = [SentSteer(steered_turn_id, "c" * 32)]
+        expected_steers = [SentSteer(steered_turn_id, "c" * 32, input_stable_id="a" * 32)]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == expected_steers
 
 

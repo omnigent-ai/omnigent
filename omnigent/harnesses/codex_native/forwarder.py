@@ -7469,8 +7469,9 @@ async def _mirror_missed_steers(
     A steer whose ended turn could not be read is retried on a later read. The
     server reports inputs queued ahead of a mirrored user message as undelivered,
     so steers Codex recorded before ``before`` are mirrored ahead of it. A steer
-    a later user message was mirrored ahead of is dropped: a server ignoring
-    ``delivery_attempt_id`` would settle its late copy against another input.
+    a later user message was mirrored ahead of, or that a read could not place
+    relative to ``before``, is dropped: a server ignoring ``delivery_attempt_id``
+    would settle its late copy against another input.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -7556,7 +7557,7 @@ async def _post_missed_steers(
     :param thread_id: Parent Codex thread id, e.g. ``"thread_abc"``.
     :param steers: Recorded steers not yet mirrored.
     :param before: User message whose transcript position ends the search.
-    :returns: Whether the native transcript was read.
+    :returns: Whether the native transcript was read, with ``before`` found in it.
     """
     codex_client = forwarder_state.codex_client
     if codex_client is None:
@@ -7574,12 +7575,29 @@ async def _post_missed_steers(
             "Codex forwarder could not read steered input: thread=%s", thread_id, exc_info=True
         )
         return False
-    client_ids = {steer.client_message_id for steer in steers}
-    for turn_id, item in _thread_user_messages(response):
-        if before is not None and _is_same_user_message(item, before):
-            break
+    messages = _thread_user_messages(response)
+    if before is not None:
+        boundary = next(
+            (
+                index
+                for index, (_, item) in enumerate(messages)
+                if _is_same_user_message(item, before)
+            ),
+            None,
+        )
+        if boundary is None:
+            # A lagging read, or a resumed message's positional id, leaves the order unknown.
+            _logger.warning(
+                "Codex forwarder could not place steered input before a later message: thread=%s",
+                thread_id,
+            )
+            return False
+        messages = messages[:boundary]
+    steers_by_client_id = {steer.client_message_id: steer for steer in steers}
+    for turn_id, item in messages:
         client_id = item.get("clientId")
-        if not isinstance(client_id, str) or client_id not in client_ids:
+        steer = steers_by_client_id.get(client_id) if isinstance(client_id, str) else None
+        if steer is None:
             continue
         item_params: _JsonObject = {"threadId": thread_id, "turnId": turn_id, "item": item}
         source_id = _claim_completed_item(item_params, item, forwarder_state)
@@ -7589,7 +7607,8 @@ async def _post_missed_steers(
             item_params,
             item,
             source_id=source_id,
-            delivery_attempt_id=client_id,
+            delivery_attempt_id=steer.client_message_id,
+            input_stable_id=steer.input_stable_id,
         ):
             _logger.info(
                 "Codex forwarder recovered steered user message: thread=%s turn=%s",
@@ -7616,6 +7635,7 @@ async def _post_user_message(
     *,
     source_id: str | None = None,
     delivery_attempt_id: str | None = None,
+    input_stable_id: str | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -7627,6 +7647,8 @@ async def _post_user_message(
     :param source_id: Stable native item id used for server-side deduplication.
     :param delivery_attempt_id: Server delivery id the message carried, so the
         server settles only that queued input.
+    :param input_stable_id: Stable id of that input, for a server that has
+        since reissued its delivery id.
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
@@ -7662,6 +7684,7 @@ async def _post_user_message(
         response_id=_response_id(params),
         source_id=source_id or _source_id(params, item),
         delivery_attempt_id=delivery_attempt_id,
+        input_stable_id=input_stable_id,
     )
 
 
@@ -8294,6 +8317,7 @@ async def _post_external_item(
     message_id: str | None = None,
     source_id: str | None = None,
     delivery_attempt_id: str | None = None,
+    input_stable_id: str | None = None,
 ) -> bool:
     """
     Post one external conversation item to AP.
@@ -8310,6 +8334,7 @@ async def _post_external_item(
     :param message_id: Optional live-preview stream finalized by this item.
     :param source_id: Stable native source id for server-side idempotency.
     :param delivery_attempt_id: Server delivery id a user message carried.
+    :param input_stable_id: Stable id of the input that delivery carried.
     :returns: Whether the item was accepted by the server.
     """
     data: _JsonObject = {
@@ -8323,6 +8348,8 @@ async def _post_external_item(
         data["source_id"] = _bounded_source_id(source_id)
     if delivery_attempt_id is not None:
         data["delivery_attempt_id"] = delivery_attempt_id
+    if input_stable_id is not None:
+        data["input_stable_id"] = input_stable_id
 
     async def _post() -> httpx.Response | None:
         return await _post_session_event(

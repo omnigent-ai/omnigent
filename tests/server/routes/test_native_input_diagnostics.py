@@ -7,12 +7,15 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.debug_logging import record_to_row
+from omnigent.entities.conversation import MessageData, NewConversationItem
 from omnigent.runtime import pending_inputs, session_stream
 from omnigent.server.routes._sessions.orchestration import (
     _persist_external_conversation_item,
     _record_native_input_lifecycle,
 )
 from omnigent.server.schemas import SessionEventInput
+from omnigent.server.startup_inputs import STARTUP_LABEL, restore_pending_inputs
+from omnigent.stores.conversation_store import PENDING_INPUT_RESPONSE_ID
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
 
@@ -398,6 +401,59 @@ async def test_message_naming_its_delivery_settles_only_that_input(
     assert record.attributes["item_id"] == item_id
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [older]
     pending_inputs.resolve(conv.id, older)
+
+
+@pytest.mark.asyncio
+async def test_message_naming_a_restored_input_settles_its_saved_row(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(
+        title="Test", labels={"omnigent.wrapper": "codex-native", STARTUP_LABEL: "ready"}
+    )
+    steered, queued = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=PENDING_INPUT_RESPONSE_ID,
+                status="in_progress",
+                stable_id=stable_id,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for stable_id, text in [("a" * 32, "also update the docs"), ("b" * 32, "run the tests")]
+        ],
+    )
+    assert store.transition_pending_input(
+        conv.id, steered.id, expected="in_progress", status="incomplete"
+    )
+    await restore_pending_inputs(store, conv.id)
+    sent_pending_id = pending_inputs.pending_id_for_stable_id(conv.id, steered.id)
+    assert sent_pending_id is not None
+    sent = pending_inputs.delivery_attributes_for(conv.id, sent_pending_id)
+    # A restart restores the saved input under a new delivery id.
+    pending_inputs.resolve(conv.id, sent_pending_id)
+    caplog.set_level(logging.INFO)
+
+    await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        _mirrored_user_message(
+            "also update the docs",
+            "codex:recovered:0",
+            delivery_attempt_id=sent["delivery_attempt_id"],
+            input_stable_id=sent["input_stable_id"],
+        ),
+        store,
+    )
+
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "native_input_settled"
+    ]
+    assert record.attributes["match_method"] == "input_stable_id"
+    assert record.attributes["delivery_attempt_id"] != sent["delivery_attempt_id"]
+    assert store.list_pending_inputs(conv.id) == [queued]
+    assert pending_inputs.snapshot_for(conv.id) == []
 
 
 @pytest.mark.asyncio
