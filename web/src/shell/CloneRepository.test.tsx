@@ -3,13 +3,12 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { CLONE_UNSUPPORTED_MESSAGE } from "@/hooks/useCloneHostRepository";
 import {
-  CloneRepositoryDialog,
-  cloneDestination,
+  CLONE_UNSUPPORTED_MESSAGE,
   readLastCloneParent,
   rememberCloneParent,
-} from "./CloneRepository";
+} from "@/hooks/useCloneHostRepository";
+import { CloneRepositoryDialog, cloneDestination } from "./CloneRepository";
 
 const HOST_ID = "host_abc";
 
@@ -115,6 +114,38 @@ describe("CloneRepositoryDialog", () => {
     });
     expect(readLastCloneParent(HOST_ID)).toBe("~/code");
     expect(readLastCloneParent("other-host")).toBe("~");
+  });
+
+  it("remembers the folder when the dialog unmounts before the clone finishes", async () => {
+    let finishClone: (response: Response) => void = () => {};
+    fetchMock.mockReturnValue(
+      new Promise<Response>((resolve) => {
+        finishClone = resolve;
+      }),
+    );
+    const { unmount } = renderWithClient(
+      <CloneRepositoryDialog open onOpenChange={vi.fn()} hostId={HOST_ID} onCloned={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "git@github.com:acme/widgets.git" },
+    });
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "~/code" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+
+    unmount();
+    finishClone(
+      jsonResponse({
+        object: "repository_clone",
+        path: "/Users/me/code/widgets",
+        name: "widgets",
+        reused_existing: false,
+      }),
+    );
+
+    await waitFor(() => expect(readLastCloneParent(HOST_ID)).toBe("~/code"));
   });
 
   it("keeps the dialog open with the server's reason when the clone fails", async () => {

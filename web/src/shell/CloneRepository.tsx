@@ -10,67 +10,14 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { type ClonedHostRepository, useCloneHostRepository } from "@/hooks/useCloneHostRepository";
+import {
+  type ClonedHostRepository,
+  readLastCloneParent,
+  useCloneHostRepository,
+} from "@/hooks/useCloneHostRepository";
 import { deriveRepoName, isValidSandboxRepoUrl } from "@/lib/sandboxRepositories";
 import { isNavigablePath, joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
-
-const CLONE_PARENT_STORAGE_KEY = "omnigent:clone-repository-parent";
-const DEFAULT_CLONE_PARENT = "~";
-
-/**
- * Folder the user last cloned into on ``hostId``, or ``~``.
- *
- * @param hostId Host the clone targets.
- * @returns A ``~`` or absolute folder, e.g. ``"~/code"``.
- */
-export function readLastCloneParent(hostId: string | null): string {
-  if (hostId === null) return DEFAULT_CLONE_PARENT;
-  try {
-    const parent = readStoredCloneParents()[hostId];
-    return typeof parent === "string" && isNavigablePath(parent) ? parent : DEFAULT_CLONE_PARENT;
-  } catch {
-    return DEFAULT_CLONE_PARENT;
-  }
-}
-
-/**
- * The remembered per-host clone folders, or ``{}`` when storage holds anything
- * other than a JSON object.
- *
- * @returns Stored values keyed by host id.
- * @throws When storage is unavailable.
- */
-function readStoredCloneParents(): Record<string, unknown> {
-  const raw = localStorage.getItem(CLONE_PARENT_STORAGE_KEY);
-  let stored: unknown;
-  try {
-    stored = JSON.parse(raw ?? "{}");
-  } catch {
-    return {};
-  }
-  return typeof stored === "object" && stored !== null && !Array.isArray(stored)
-    ? (stored as Record<string, unknown>)
-    : {};
-}
-
-/**
- * Remember ``parent`` as the default clone folder for ``hostId``.
- *
- * @param hostId Host the clone targeted.
- * @param parent Folder that held the new checkout.
- */
-export function rememberCloneParent(hostId: string, parent: string): void {
-  try {
-    const stored = readStoredCloneParents();
-    localStorage.setItem(
-      CLONE_PARENT_STORAGE_KEY,
-      JSON.stringify({ ...stored, [hostId]: parent.trim() }),
-    );
-  } catch {
-    // Storage can be full or disabled; the default folder still works.
-  }
-}
 
 /**
  * Where a clone of ``url`` into ``parent`` will land, for the form preview.
@@ -277,15 +224,7 @@ function CloneRepositoryForm({
     !cloneRepository.isPending;
   const submit = () => {
     if (!ready || hostId === null) return;
-    cloneRepository.mutate(
-      { hostId, url, parentDirectory },
-      {
-        onSuccess: (clone) => {
-          rememberCloneParent(hostId, parentDirectory);
-          onCloned(clone);
-        },
-      },
-    );
+    cloneRepository.mutate({ hostId, url, parentDirectory }, { onSuccess: onCloned });
   };
 
   return (

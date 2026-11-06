@@ -172,7 +172,9 @@ def _delete_projects_named(base_url: str, name: str) -> None:
         contextlib.suppress(httpx.HTTPError),
         httpx.Client(base_url=base_url, trust_env=False, timeout=10.0) as client,
     ):
-        for project in client.get("/v1/projects").json()["data"]:
+        listed = client.get("/v1/projects")
+        listed.raise_for_status()
+        for project in listed.json()["data"]:
             if project["name"] == name:
                 client.delete(f"/v1/projects/{project['id']}")
 

@@ -19,17 +19,12 @@ import {
 } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { EmojiPicker } from "@/components/ProjectIconPicker";
-import { useCloneHostRepository } from "@/hooks/useCloneHostRepository";
+import { readLastCloneParent, useCloneHostRepository } from "@/hooks/useCloneHostRepository";
 import { useCreateProject } from "@/hooks/useConversations";
 import { useHosts } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { deriveRepoName } from "@/lib/sandboxRepositories";
-import {
-  CloneRepositoryFields,
-  cloneDestination,
-  readLastCloneParent,
-  rememberCloneParent,
-} from "./CloneRepository";
+import { CloneRepositoryFields, cloneDestination } from "./CloneRepository";
 
 /**
  * "New project" control in the Projects group header. Creates a project,
@@ -163,6 +158,8 @@ function NewProjectForm({
       createProject.mutate({ name: projectName, icon }, { onSuccess: (p) => onCreated(p.name) });
       return;
     }
+    // Pin the host so a retry stays on it even if another host becomes the default.
+    setCloneHostId(selectedCloneHostId);
     let workspace: string;
     try {
       ({ path: workspace } = await cloneRepository.mutateAsync({
@@ -173,7 +170,6 @@ function NewProjectForm({
     } catch {
       return;
     }
-    rememberCloneParent(selectedCloneHostId, cloneParent);
     createProject.mutate(
       { name: projectName, icon, config: { host_id: selectedCloneHostId, workspace } },
       { onSuccess: (p) => onCreated(p.name) },
@@ -309,6 +305,14 @@ function NewProjectForm({
                       ))}
                     </SelectContent>
                   </Select>
+                )}
+                {cloneHostId !== null && hosts !== undefined && !selectedCloneHost && (
+                  <p
+                    className="text-sm text-destructive"
+                    data-testid="new-project-clone-host-missing"
+                  >
+                    The chosen host is no longer connected. Choose another host.
+                  </p>
                 )}
                 {selectedCloneHost && !selectedCloneHostOnline && (
                   <p

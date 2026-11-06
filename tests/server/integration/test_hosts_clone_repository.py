@@ -272,3 +272,5 @@ async def test_clone_unknown_host_returns_404(clone_host: tuple[FastAPI, _FakeHo
     )
 
     assert response.status_code == 404
+    # The web client tells an unknown host from a missing route by this detail.
+    assert response.json()["detail"] == "host not found"

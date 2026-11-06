@@ -254,8 +254,9 @@ def clone_repository(
             if _existing_checkout_matches(destination, url):
                 if not _has_commit_checked_out(destination):
                     raise CloneError(
-                        f"{destination} holds an unfinished clone of this repository. "
-                        "Delete it, then try again.",
+                        f"{destination} holds a clone of this repository with no commits "
+                        "checked out (an interrupted clone, or an empty repository). Delete it "
+                        "to clone again, or choose the folder directly.",
                         conflict=True,
                     )
                 _logger.info("Reusing existing checkout of %s at %s", url, destination)

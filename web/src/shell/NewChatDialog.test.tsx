@@ -132,6 +132,7 @@ import {
 import { installAgentBundle } from "@/lib/agentsApi";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import type * as CloneHostRepositoryModule from "@/hooks/useCloneHostRepository";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -283,7 +284,8 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
 const cloneHostRepositoryMock = vi.hoisted(() => vi.fn());
-vi.mock("@/hooks/useCloneHostRepository", () => ({
+vi.mock("@/hooks/useCloneHostRepository", async (importOriginal) => ({
+  ...(await importOriginal<typeof CloneHostRepositoryModule>()),
   useCloneHostRepository: () => ({
     mutate: (
       variables: { hostId: string; url: string; parentDirectory: string },

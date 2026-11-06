@@ -115,11 +115,26 @@ def test_unfinished_clone_of_same_remote_is_a_conflict(remote: Path, tmp_path: P
     _git(unfinished, "init", "-q")
     _git(unfinished, "remote", "add", "origin", _URL)
 
-    with pytest.raises(CloneError, match="unfinished clone") as raised:
+    with pytest.raises(CloneError, match="no commits checked out") as raised:
         clone_repository(url=_URL, parent_directory=str(tmp_path), directory_name="widgets")
 
     assert raised.value.conflict is True
     assert (unfinished / ".git").is_dir()
+
+
+def test_retry_of_empty_repository_clone_is_a_conflict(remote: Path, tmp_path: Path) -> None:
+    """An empty remote clones once; a retry can't tell it from an interrupted clone."""
+    _git(tmp_path, "init", "-q", "--bare", str(remote / "acme" / "empty.git"))
+    url = f"{_REMOTE_BASE}acme/empty.git"
+    parent = tmp_path / "code"
+
+    first = clone_repository(url=url, parent_directory=str(parent), directory_name="empty")
+    assert first.reused_existing is False
+    with pytest.raises(CloneError, match="an empty repository") as raised:
+        clone_repository(url=url, parent_directory=str(parent), directory_name="empty")
+
+    assert raised.value.conflict is True
+    assert (parent / "empty" / ".git").is_dir()
 
 
 def test_existing_unrelated_folder_is_a_conflict_and_untouched(

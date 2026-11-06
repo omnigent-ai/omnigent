@@ -176,6 +176,36 @@ describe("NewProjectButton clone section", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("retries on the default host after a failed clone, even once it leaves", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Couldn't clone the repository." }), { status: 422 }),
+    );
+    hostsMock.data = [LAPTOP, DESKTOP];
+    const { rerenderWithHosts } = renderButton();
+
+    fireEvent.click(screen.getByTestId("new-project-clone-toggle"));
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: CLONE_URL },
+    });
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(await screen.findByTestId("new-project-clone-error")).toBeInTheDocument();
+
+    hostsMock.data = [{ ...LAPTOP, status: "offline" }, DESKTOP];
+    rerenderWithHosts();
+    expect(screen.getByTestId("new-project-clone-host")).toHaveTextContent("laptop (offline)");
+    expect(screen.getByTestId("new-project-confirm")).toBeDisabled();
+
+    hostsMock.data = [DESKTOP];
+    rerenderWithHosts();
+    expect(screen.getByTestId("new-project-clone-host-missing")).toHaveTextContent(
+      "The chosen host is no longer connected.",
+    );
+    expect(screen.getByTestId("new-project-confirm")).toBeDisabled();
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(requestsTo(fetchMock, "/repositories")).toHaveLength(1);
+    expect(requestsTo(fetchMock, "/v1/hosts/host_desktop/repositories")).toEqual([]);
+  });
+
   it("uses the remembered folder of the default host once hosts load", () => {
     localStorage.setItem(
       "omnigent:clone-repository-parent",
