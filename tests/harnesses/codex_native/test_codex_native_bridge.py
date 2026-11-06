@@ -1195,6 +1195,68 @@ def test_sent_steers_are_kept_per_thread_until_settled(bridge_dir: Path) -> None
     assert not (bridge_dir / "sent_steers.json").exists()
 
 
+@pytest.mark.parametrize(
+    ("contents", "readable"),
+    [
+        ("not json", []),
+        ("[]", []),
+        ('{"thread_id": "thread_a", "steers": {}}', []),
+        (
+            '{"thread_id": "thread_a", "steers": [{"turn_id": "turn_1",'
+            ' "client_message_id": "steer_1", "turn_ended": "yes"},'
+            ' {"turn_id": 1, "client_message_id": "steer_2"}, "junk"]}',
+            [SentSteer("turn_1", "steer_1")],
+        ),
+    ],
+    ids=["not-json", "not-object", "steers-not-list", "malformed-records"],
+)
+def test_malformed_sent_steers_record_keeps_only_valid_steers(
+    bridge_dir: Path, contents: str, readable: list[SentSteer]
+) -> None:
+    """A corrupt record yields only its valid steers, and recording a steer replaces it."""
+    (bridge_dir / "sent_steers.json").write_text(contents)
+    assert read_sent_steers(bridge_dir, thread_id="thread_a") == readable
+
+    record_sent_steer(
+        bridge_dir, thread_id="thread_a", turn_id="turn_2", client_message_id="steer_3"
+    )
+
+    assert read_sent_steers(bridge_dir, thread_id="thread_a") == [
+        *readable,
+        SentSteer("turn_2", "steer_3"),
+    ]
+
+
+def test_unreadable_sent_steers_record_is_logged_and_left_unchanged(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A storage error reads as no steers and leaves the record for a later settle."""
+    record_sent_steer(
+        bridge_dir, thread_id="thread_a", turn_id="turn_1", client_message_id="steer_1"
+    )
+
+    def storage_error(*args: object, **kwargs: object) -> bytes:
+        raise OSError(errno.EIO, "Input/output error")
+
+    with (
+        monkeypatch.context() as patch,
+        caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.bridge"),
+    ):
+        patch.setattr(Path, "read_bytes", storage_error)
+        assert read_sent_steers(bridge_dir, thread_id="thread_a") == []
+        record_sent_steer(
+            bridge_dir, thread_id="thread_a", turn_id="turn_1", client_message_id="steer_2"
+        )
+        settle_sent_steers(
+            bridge_dir, thread_id="thread_a", steers=[SentSteer("turn_1", "steer_1")]
+        )
+
+    assert read_sent_steers(bridge_dir, thread_id="thread_a") == [SentSteer("turn_1", "steer_1")]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Could not record sent Codex steer" in message for message in messages)
+    assert any("Could not settle sent Codex steers" in message for message in messages)
+
+
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
 
 
