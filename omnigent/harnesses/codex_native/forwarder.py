@@ -1082,7 +1082,7 @@ class _CodexForwarderState:
         Pace native transcript reads for a turn with an unmirrored sent steer.
 
         Codex records a steer at its next model step, so the first agent message
-        only arms the check; later reads back off exponentially.
+        only arms the check; later reads back off until the missed steers settle.
 
         :param turn_id: Codex turn id, e.g. ``"turn_abc"``.
         :returns: Whether this agent message should read the transcript.
@@ -7485,14 +7485,13 @@ async def _mirror_missed_steers(
     """
     if forwarder_state is None or not thread_id or not turn_id:
         return
-    if turn_ended:
-        forwarder_state.steer_recovery_checks.pop(turn_id, None)
     steers = [
         steer
         for steer in read_sent_steers(bridge_dir, thread_id=thread_id)
         if steer.turn_id == turn_id or steer.turn_ended
     ]
     if not steers:
+        forwarder_state.steer_recovery_checks.pop(turn_id, None)
         return
     mirrored = forwarder_state.mirrored_user_client_ids
     unmirrored = [
@@ -7518,7 +7517,8 @@ async def _mirror_missed_steers(
         )
     if overtaken:
         _logger.warning(
-            "Codex forwarder dropped steered input a later message overtook: thread=%s count=%d",
+            "Codex forwarder dropped steered input not mirrored ahead of a later message: "
+            "thread=%s count=%d",
             thread_id,
             len(overtaken),
         )
@@ -7530,6 +7530,8 @@ async def _mirror_missed_steers(
         or steer in overtaken
         or (transcript_read and (turn_ended or steer.turn_ended))
     ]
+    if turn_ended or all(steer in settled for steer in missed):
+        forwarder_state.steer_recovery_checks.pop(turn_id, None)
     if settled or turn_ended:
         settle_sent_steers(
             bridge_dir,

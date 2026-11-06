@@ -492,14 +492,6 @@ async def _native_delivery_request_once(
                         native_turn_id=confirmed_turn,
                         outcome="native_receipt_confirmed",
                     )
-                    if steer_client_id is not None and confirmed_turn != requested_turn_id:
-                        record_sent_steer(
-                            bridge_dir,
-                            thread_id=state.thread_id,
-                            turn_id=confirmed_turn,
-                            client_message_id=steer_client_id,
-                            input_stable_id=steer_stable_id,
-                        )
                     # The forwarder owns current turn state; this receipt can already be old.
                     return None
             raise InjectionDeliveryAmbiguous(str(exc)) from exc

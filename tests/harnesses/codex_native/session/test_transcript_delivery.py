@@ -633,6 +633,7 @@ def _run_steered_turn(
     late_live_steer_id: str | None = None,
     follow_up_ahead_of_steer: bool = False,
     first_read_items: int | None = None,
+    steer_echoes_client_id: bool = True,
 ) -> list[str]:
     """
     Run one turn that a web send steers, returning posts and forwarder reads in order.
@@ -650,11 +651,14 @@ def _run_steered_turn(
     :param late_live_steer_id: Item id of a live steer copy arriving after the replies.
     :param follow_up_ahead_of_steer: Whether Codex records the follow-up steer first.
     :param first_read_items: Steered-turn items the first transcript read holds, if it lags.
+    :param steer_echoes_client_id: Whether Codex reports the steer with its ``clientId``.
     :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
     first = _native_user_message("item_first", "fix the bug", "client-first")
     steer = _native_user_message("item_steer", "also update the docs", _STEER_CLIENT_ID)
+    if not steer_echoes_client_id:
+        del steer["clientId"]
     follow_up = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
     next_prompt = _native_user_message("item_next", "run the tests", "client-next")
     steered_items = [first, steer] if steer_in_transcript else [first]
@@ -963,6 +967,69 @@ def test_forwarder_backs_off_reads_for_steer_missing_from_transcript(tmp_path: P
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
+def test_forwarder_restarts_read_pacing_for_each_missed_steer(tmp_path: Path) -> None:
+    """Each missed steer of a turn is read for at the second reply after it, not backed off."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    first = _native_user_message("item_first", "fix the bug", "client-first")
+    steers = [
+        _native_user_message(f"item_steer_{index}", f"steer {index}", f"client-steer-{index}")
+        for index in range(1, 4)
+    ]
+    turns = [{"id": "turn_123", "items": [first, *steers]}]
+    fake_client = _FakeCodexAppServerClient(
+        response={"result": {"thread": {"id": "thread_123", "turns": turns}}}
+    )
+    forwarder_state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_123",
+        codex_client=fake_client,  # type: ignore[arg-type]
+    )
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+
+            async def deliver(event: dict[str, Any]) -> None:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+
+            await deliver(_turn_item_event("item/completed", first))
+            for index, steer in enumerate(steers):
+                record_sent_steer(
+                    tmp_path,
+                    thread_id="thread_123",
+                    turn_id="turn_123",
+                    client_message_id=steer["clientId"],
+                )
+                for reply in (2 * index + 1, 2 * index + 2):
+                    agent_item = {"type": "agentMessage", "id": f"msg_{reply}"}
+                    await deliver(_turn_item_event("item/started", agent_item))
+                    await deliver(
+                        _agent_message_event("turn_123", f"msg_{reply}", f"reply {reply}")
+                    )
+
+    asyncio.run(run())
+
+    assert [method for method, _ in fake_client.requests] == ["thread/read"] * 3
+    assert _transcript(posted) == [
+        "user: fix the bug",
+        "assistant: reply 1",
+        "user: steer 1 [delivery client-steer-1]",
+        "assistant: reply 2",
+        "assistant: reply 3",
+        "user: steer 2 [delivery client-steer-2]",
+        "assistant: reply 4",
+        "assistant: reply 5",
+        "user: steer 3 [delivery client-steer-3]",
+        "assistant: reply 6",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
 def test_forwarder_keeps_steer_recorded_under_new_turn_during_read(tmp_path: Path) -> None:
     """A steer the executor re-records under a later turn while its ended turn is read stays."""
 
@@ -1096,6 +1163,28 @@ def test_forwarder_does_not_read_transcript_for_steer_seen_live(tmp_path: Path) 
 
     assert transcript == [
         "user: fix the bug",
+        "user: also update the docs",
+        "assistant: reply 1",
+        "assistant: reply 2",
+        "assistant: reply 3",
+        "status: idle",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_posts_live_steer_without_client_id_once(tmp_path: Path) -> None:
+    """
+    A live steer Codex reports without its ``clientId`` is posted once, and its record dropped.
+
+    Terminal input has no client id either, so a missed steer is still looked for ahead of it.
+    """
+    transcript = _run_steered_turn(
+        tmp_path, live_steer_copy=True, replies_after_steer=3, steer_echoes_client_id=False
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        _TRANSCRIPT_READ,
         "user: also update the docs",
         "assistant: reply 1",
         "assistant: reply 2",
