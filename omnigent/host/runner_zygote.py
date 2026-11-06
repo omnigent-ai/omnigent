@@ -84,6 +84,7 @@ class ZygoteRunnerProc:
             manager._generation if zygote_generation is None else zygote_generation
         )
         self.returncode: int | None = None
+        self._poll_lock = threading.Lock()
         try:
             self._process: psutil.Process | None = psutil.Process(pid)
         except psutil.NoSuchProcess:
@@ -95,12 +96,14 @@ class ZygoteRunnerProc:
         Caches the first observed exit code in :attr:`returncode`, matching
         ``subprocess.Popen.poll`` semantics the daemon relies on.
         """
-        if self.returncode is not None:
+        # Publish a consumed exit status before another poll can replace it.
+        with self._poll_lock:
+            if self.returncode is not None:
+                return self.returncode
+            code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+            if code is not None:
+                self.returncode = code
             return self.returncode
-        code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
-        if code is not None:
-            self.returncode = code
-        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
         """Block until the runner exits or *timeout* elapses.
