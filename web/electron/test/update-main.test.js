@@ -48,6 +48,7 @@ function loadMainHarness({
     reloads: 0,
     windowCloses: 0,
     webContentsFocuses: 0,
+    globalShortcuts: [],
   };
 
   const sender = {
@@ -133,6 +134,13 @@ function loadMainHarness({
     },
     Notification: { isSupported: () => false },
     clipboard: {},
+    globalShortcut: {
+      register: (accelerator) => {
+        calls.globalShortcuts.push(accelerator);
+        return true;
+      },
+      unregister: () => {},
+    },
     dialog: {
       showSaveDialog: (...args) => {
         calls.showSaveDialog.push(args);
@@ -830,6 +838,92 @@ describe("close-window request", () => {
       false,
     );
     assert.equal(harness.calls.windowCloses, 0);
+  });
+});
+
+describe("global show shortcut IPC", () => {
+  it("refuses the shortcut handlers from a page off the pinned server and saves nothing", (t) => {
+    const harness = loadMainHarness();
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:get-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.throws(
+      () =>
+        harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.unpinned, {
+          enabled: true,
+          accelerator: "Control+Shift+K",
+        }),
+      /connected server page/,
+    );
+    assert.throws(
+      () => harness.ipcHandlers.get("omnigent:record-global-shortcut")(harness.events.unpinned),
+      /connected server page/,
+    );
+    assert.equal(
+      harness.ipcHandlers.get("omnigent:cancel-global-shortcut-recording")(harness.events.unpinned),
+      false,
+    );
+    assert.equal(harness.readSettings().global_shortcut, undefined);
+  });
+
+  it("asks natively before the pinned page sets a chord, and keeps nothing it refuses", async (t) => {
+    const setting = { enabled: true, accelerator: "Control+Shift+K" };
+    const refused = loadMainHarness({ dialogResponses: [{ response: 0 }] });
+    t.after(refused.cleanup);
+    refused.api.registerIpc();
+    const result = await refused.ipcHandlers.get("omnigent:set-global-shortcut")(
+      refused.events.pinned,
+      setting,
+    );
+    assert.equal(result.ok, false);
+    assert.equal(refused.calls.showMessageBox.length, 1);
+    const { options } = refused.calls.showMessageBox[0];
+    assert.match(options.message, /show Omnigent from any app/);
+    assert.match(options.detail, /system-wide shortcut/);
+    assert.deepEqual(plain(options.buttons), ["Don't Allow", "Allow"]);
+    assert.equal(options.cancelId, 0);
+    assert.equal(options.defaultId, 0);
+    assert.deepEqual(refused.calls.globalShortcuts, []);
+    assert.equal(refused.readSettings().global_shortcut, undefined);
+  });
+
+  it("registers and saves a page-recorded chord once the user allows it", async (t) => {
+    const allowed = loadMainHarness({ dialogResponses: [{ response: 1 }] });
+    t.after(allowed.cleanup);
+    allowed.api.registerIpc();
+    const setting = { enabled: true, accelerator: "Control+Shift+K" };
+    const result = await allowed.ipcHandlers.get("omnigent:set-global-shortcut")(
+      allowed.events.pinned,
+      setting,
+    );
+    assert.deepEqual(plain(result), { ok: true, setting });
+    assert.deepEqual(allowed.calls.globalShortcuts, ["Control+Shift+K"]);
+    assert.deepEqual(allowed.readSettings().global_shortcut, setting);
+  });
+
+  it("turns the shortcut off without asking, keeping the saved chord", async (t) => {
+    const harness = loadMainHarness({ dialogResponses: [{ response: 1 }] });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const set = (setting) =>
+      harness.ipcHandlers.get("omnigent:set-global-shortcut")(harness.events.pinned, setting);
+    await set({ enabled: true, accelerator: "Control+Shift+K" });
+
+    const result = await set({ enabled: false });
+
+    assert.deepEqual(plain(result), {
+      ok: true,
+      setting: { enabled: false, accelerator: "Control+Shift+K" },
+    });
+    assert.equal(harness.calls.showMessageBox.length, 1);
+    assert.deepEqual(harness.readSettings().global_shortcut, {
+      enabled: false,
+      accelerator: "Control+Shift+K",
+    });
   });
 });
 
