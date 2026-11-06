@@ -162,7 +162,8 @@ def test_hook_refusal_stops_only_the_matching_fresh_submit_retry(
         assert isinstance(caught.value, bridge.ClaudeSubmitBlockedUnconfirmed)
         assert caught.value.code == "prompt_blocked_by_hook"
         assert str(caught.value) == (
-            "A hook blocked this message, so the agent did not run it. Hook reason: Refused."
+            "A hook blocked a matching prompt, so this message may not have reached the agent. "
+            "Hook reason: Refused."
         )
     else:
         assert isinstance(caught.value, bridge.ClaudeMessageNotAccepted)

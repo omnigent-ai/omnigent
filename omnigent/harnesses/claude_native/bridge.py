@@ -4927,7 +4927,7 @@ def _fresh_matching_hook_block(
 
 def _hook_blocked_message(reason: str) -> str:
     """Word the hook's refusal for the user, keeping its reason on one line."""
-    message = "A hook blocked this message, so the agent did not run it."
+    message = "A hook blocked a matching prompt, so this message may not have reached the agent."
     collapsed = " ".join(reason.split())
     return f"{message} Hook reason: {collapsed}" if collapsed else message
 

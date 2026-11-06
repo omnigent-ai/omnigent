@@ -890,7 +890,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
-        ("prompt_blocked_by_hook", "hook blocked this message"),
+        ("prompt_blocked_by_hook", "may not have reached the agent"),
         ("codex_compaction_model_failed", "previous model"),
         ("codex_provider_auth_failed", "model provider's sign-in command"),
         ("harness_not_configured", "isn't set up on the host"),
