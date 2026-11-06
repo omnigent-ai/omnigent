@@ -29,6 +29,7 @@ export function ConversationBreadcrumb({
   conversationTitle,
   projectName,
   projectIcon,
+  projectLucideIcon,
   projectColor,
   projectTag,
   titleSlot,
@@ -51,6 +52,8 @@ export function ConversationBreadcrumb({
    * `projectTag` is omitted); the interactive tag carries its own icon.
    */
   projectIcon?: string | null;
+  /** The filed project's lucide icon name, or `null`/absent for the folder glyph. */
+  projectLucideIcon?: string | null;
   /** The filed project's palette color, or `null`/absent for a muted folder. */
   projectColor?: string | null;
   /**
@@ -127,6 +130,7 @@ export function ConversationBreadcrumb({
                   >
                     <ProjectRowIcon
                       icon={projectIcon}
+                      lucideIcon={projectLucideIcon}
                       color={projectColor}
                       className="size-4 text-[16px]"
                     />
@@ -138,6 +142,7 @@ export function ConversationBreadcrumb({
                     <div className="flex gap-1 text-muted-foreground">
                       <ProjectRowIcon
                         icon={projectIcon}
+                        lucideIcon={projectLucideIcon}
                         color={projectColor}
                         className="size-4 text-[16px]"
                       />

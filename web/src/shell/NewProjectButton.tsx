@@ -130,7 +130,7 @@ function friendlyCloneError(error: unknown): string {
   return "The repository couldn’t be cloned. Check the details and try again.";
 }
 
-const UNMARKED: ProjectAppearance = { icon: null, color: null };
+const UNMARKED: ProjectAppearance = { icon: null, lucideIcon: null, color: null };
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that
