@@ -152,11 +152,13 @@ def force_host_asleep(
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
 
 
-def hold_wake_requests(page: Page, session_id: str) -> list[Route]:
-    """Hold each ``retry_session`` POST until the test releases it.
+def hold_wake_requests(page: Page, session_id: str, *, wake_only: bool) -> list[Route]:
+    """Hold each ``retry_session`` POST of one kind until the test releases it.
 
     :param page: Playwright page, before the wake is requested.
     :param session_id: Session whose events endpoint to intercept.
+    :param wake_only: Hold the Files view's wake-only requests if true, else
+        plain ones such as Reconnect host; the other kind passes through.
     :returns: Held routes, in arrival order; other events pass through.
     """
     held: list[Route] = []
@@ -164,8 +166,10 @@ def hold_wake_requests(page: Page, session_id: str) -> list[Route]:
     def _hold(route: Route) -> None:
         request = route.request
         if request.method == "POST" and "retry_session" in (request.post_data or ""):
-            held.append(route)
-            return
+            data = request.post_data_json.get("data") or {}
+            if bool(data.get("wake_only")) == wake_only:
+                held.append(route)
+                return
         route.continue_()
 
     page.route(re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"), _hold)

@@ -121,7 +121,7 @@ def _open_asleep_session(
     force_host_asleep(page, session_id, host_online=recorder.host_online)
     _fail_workspace_reads_while_asleep(page, recorder)
     # The rail defaults open, so the panel can request the wake as the page loads.
-    held = hold_wake_requests(page, session_id)
+    held = hold_wake_requests(page, session_id, wake_only=True)
     page.on("request", recorder.on_request)
     page.on("response", recorder.on_response)
     page.goto(f"{base_url}/c/{session_id}")

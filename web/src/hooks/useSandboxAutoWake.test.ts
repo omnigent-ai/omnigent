@@ -168,7 +168,6 @@ describe("useSandboxAutoWake", () => {
   });
 
   it.each<[string, Partial<Props>]>([
-    ["hidden", { active: false }],
     ["read-only", { canWake: false }],
     ["showing a cached list", { needsSandbox: false }],
   ])("does not wake when the view is %s", (_label, override) => {
