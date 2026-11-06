@@ -145,6 +145,19 @@ def test_auth_block_is_a_failed_turn_while_a_prompt_block_is_work(tmp_path: Path
     assert reasons == [("running", "permission prompt"), ("idle", None)]
 
 
+def test_reports_idle_follows_the_osc_report(tmp_path: Path) -> None:
+    """Pane polling may back off only while OSC reads idle, never once retired."""
+    path = tmp_path / "program-status.json"
+    poller = _poller(tmp_path, path, [])
+    # No OSC report and no status file read yet: unknown is not idle.
+    assert poller.reports_idle is False
+    for state, idle in [("working", False), ("blocked", False), ("done", True), ("idle", True)]:
+        _write_report(path, {"state": state, "app": "claude-code"})
+        assert poller.reports_idle is idle, state
+    poller.retire()
+    assert poller.reports_idle is False
+
+
 def test_osc_owns_status_while_the_file_reports_background_shells(tmp_path: Path) -> None:
     """OSC says ``done`` once a turn ends with a shell still running; only the file says so."""
     path = tmp_path / "program-status.json"

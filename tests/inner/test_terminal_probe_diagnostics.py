@@ -111,7 +111,10 @@ async def test_unavailable_error_retains_both_probes_before_cleanup(
 
     assert not tmp_path.exists()
     assert not instance.running
-    assert commands == ["capture-pane", "has-session"] * 3
+    # The threaded watcher folds the liveness probe and capture into one
+    # `list-panes ; capture-pane` exec, so its first subcommand is list-panes.
+    capture_subcommand = "list-panes" if threaded else "capture-pane"
+    assert commands == [capture_subcommand, "has-session"] * 3
     records = [
         r
         for r in caplog.records
@@ -176,6 +179,9 @@ async def test_probe_history_resets_on_recovery(
     def run(cmd, **kwargs):
         nonlocal tick
         command = cmd[5]
+        if threaded and command == "list-panes":
+            # Folded `list-panes ; capture-pane` exec stands in for the capture probe.
+            command = "capture-pane"
         if command == "capture-pane":
             tick += 1
         if tick == 3 and (
