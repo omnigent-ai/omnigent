@@ -6095,11 +6095,19 @@ describe("Composer reply quotes", () => {
 
 describe("Composer side-chat entry points", () => {
   beforeEach(() => {
-    setComposerState({ conversationId: "conv_test", skills: [], sessionHarness: "openai-agents" });
+    setComposerState({
+      conversationId: "conv_test",
+      skills: [],
+      sessionHarness: "openai-agents",
+      sideChatToOpen: null,
+      sideChatDrafts: {},
+      sideChatComposers: {},
+    });
   });
   afterEach(() => {
     cleanup();
     composerSessionSnapshot.sideChatAllowed = null;
+    vi.restoreAllMocks();
   });
 
   // An admin has owner level, but only the root session's owner starts side chats.
@@ -6115,6 +6123,27 @@ describe("Composer side-chat entry points", () => {
     fireEvent.change(textarea(), { target: { value: "" } });
     fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
     expect(screen.queryByTestId("composer-side-chat-action") !== null).toBe(offered);
+  });
+
+  it("opens a focused pending tab immediately from the add menu", () => {
+    const authenticatedFetch = vi
+      .spyOn(identity, "authenticatedFetch")
+      .mockImplementation(() => new Promise<Response>(() => {}));
+    composerSessionSnapshot.sideChatAllowed = true;
+    renderWithTooltips(<Composer {...composerProps({ permissionLevel: 4 })} />);
+
+    fireEvent.keyDown(screen.getByRole("button", { name: "Add" }), { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-side-chat-action"));
+
+    const { sideChatToOpen, sideChatComposers, sideChatDrafts } = useChatStore.getState();
+    expect(sideChatToOpen).toEqual({
+      childId: expect.stringMatching(/^pending:/),
+      parentId: "conv_test",
+    });
+    expect(sideChatComposers[sideChatToOpen!.childId]).toMatchObject({ autoFocus: true });
+    expect(sideChatDrafts[sideChatToOpen!.childId]).toBeUndefined();
+    expect(textarea()).toHaveValue("");
+    expect(authenticatedFetch).not.toHaveBeenCalled();
   });
 });
 
