@@ -1952,7 +1952,7 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 const MAX_TRANSIENT_404_RETRIES = 10;
 // An auth layer answering the stream with its login page means the sign-in
 // expired, which no retry can renew. A maintenance page during a restart looks
-// the same, so give up only once those answers outlast a restart.
+// the same, so give up only once an unbroken run of those answers outlasts a restart.
 const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
 
 /**
@@ -6589,7 +6589,7 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // When login-page answers began since the last successful open.
+  // When the current unbroken run of login-page answers began.
   let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
@@ -6654,6 +6654,7 @@ export async function startStreamPump(
           }
           if (isConversationDisposed(id)) break;
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
+          nonSseAnswersSince = null;
           failedOpens += 1;
           continue;
         }
@@ -6663,6 +6664,7 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
+          nonSseAnswersSince = null;
           // 401/403 won't fix themselves by retrying — give up and settle the
           // local send lifecycle so the user isn't left on a silent spinner.
           // `sessionStatus` is NOT touched: losing our stream says nothing
