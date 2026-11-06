@@ -5952,7 +5952,7 @@ type ReconnectBackfill = "applied" | "failed" | "skipped";
  * re-hydrate. Swallows fetch errors, resolving "failed" so the caller can
  * retry. All writes are `historyGeneration`-guarded so a window reset
  * mid-fetch voids them. `settleStatus: false` skips the status patch; a live
- * turn edge that arrives during the reads skips only its turn lifecycle.
+ * turn edge or send latch change during the reads skips only its turn lifecycle.
  */
 async function reconcileOnReconnect(
   id: string,
@@ -6000,7 +6000,7 @@ async function reconcileOnReconnect(
   }
   if (stale()) return "skipped";
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
-  // A turn edge the live stream delivered during these reads owns the turn lifecycle.
+  // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
     settleStatus
       ? reconnectStatusPatch(
@@ -6008,7 +6008,9 @@ async function reconcileOnReconnect(
           s,
           launchBeforeFetch,
           stateBeforeFetch,
-          (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch,
+          (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch &&
+            s.sendLatchedAt === stateBeforeFetch.sendLatchedAt &&
+            s.sendLatchSeenRunning === stateBeforeFetch.sendLatchSeenRunning,
         )
       : {};
 
