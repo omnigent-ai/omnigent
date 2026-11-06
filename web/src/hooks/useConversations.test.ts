@@ -3991,6 +3991,68 @@ describe("useDeleteProject", () => {
       total: 2,
     });
   });
+
+  function seedProjectCaches() {
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const listKey = ["conversations", "", false, null, "mine"];
+    queryClient.setQueryData(["projects"], [{ id: "p_1", name: "Sprint 42" }]);
+    queryClient.setQueryData(
+      listKey,
+      infinitePage([
+        conversation({ id: "conv_a", project_id: "p_1" }),
+        conversation({ id: "conv_b", labels: { [PROJECT_LABEL_KEY]: "Sprint 42" } }),
+        conversation({ id: "conv_other" }),
+      ]),
+    );
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const rendered = renderHook(() => useDeleteProject(), { wrapper });
+    const visibleIds = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(listKey)!
+        .pages[0].data.filter((c) => c.archived !== true)
+        .map((c) => c.id);
+    return { queryClient, rendered, visibleIds };
+  }
+
+  it("hides the folder and its loaded members before the sweep settles", async () => {
+    fetchMock.mockReturnValueOnce(new Promise(() => {}));
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+
+    await waitFor(() => expect(queryClient.getQueryData(["projects"])).toEqual([]));
+    expect(visibleIds()).toEqual(["conv_other"]);
+  });
+
+  it("restores the folder and the unarchived members when the sweep partly fails", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [{ id: "conv_a" }, { id: "conv_b" }],
+          first_id: "conv_a",
+          last_id: "conv_b",
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("conv_a"))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    const { queryClient, rendered, visibleIds } = seedProjectCaches();
+
+    rendered.result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(rendered.result.current.isError).toBe(true));
+
+    expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_1", name: "Sprint 42" }]);
+    // conv_a did archive, so only conv_b returns.
+    expect(visibleIds()).toEqual(["conv_b", "conv_other"]);
+    expect(toasts).toEqual([
+      `Couldn't delete project "Sprint 42": some sessions couldn't be archived (you may not own them).`,
+    ]);
+  });
 });
 
 describe("undoArchiveConversations optimistic restore", () => {

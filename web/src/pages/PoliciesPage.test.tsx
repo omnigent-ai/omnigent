@@ -186,7 +186,9 @@ describe("PoliciesPage actions", () => {
     expect(within(dialog).getByText("Remove block_canada?")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
 
-    expect(deleteMutate).toHaveBeenCalledWith("p1", expect.anything());
+    expect(deleteMutate).toHaveBeenCalledWith("p1");
+    // The dialog closes without waiting on the DELETE.
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
   });
 
   it("adds array (multi-select) values via the model combobox as a coerced list", async () => {

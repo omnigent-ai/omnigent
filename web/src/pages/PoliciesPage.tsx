@@ -436,8 +436,6 @@ export function PoliciesPage() {
   const deletePolicy = useDeleteDefaultPolicy();
   const [addOpen, setAddOpen] = useState(false);
   const [deleteCandidate, setDeleteCandidate] = useState<DefaultPolicy | null>(null);
-  const [pendingAction, setPendingAction] = useState(false);
-  const [actionError, setActionError] = useState<string | null>(null);
 
   const registryByHandler = new Map(registry.map((r) => [r.handler, r]));
 
@@ -480,20 +478,11 @@ export function PoliciesPage() {
     );
   }
 
-  async function onConfirmDelete() {
+  function onConfirmDelete() {
     if (deleteCandidate === null || deleteCandidate.id === null) return;
-    setPendingAction(true);
-    setActionError(null);
-    deletePolicy.mutate(deleteCandidate.id, {
-      onSuccess: () => {
-        setPendingAction(false);
-        setDeleteCandidate(null);
-      },
-      onError: (err) => {
-        setPendingAction(false);
-        setActionError(err.message);
-      },
-    });
+    // The row leaves the list optimistically; a failure restores it and toasts.
+    setDeleteCandidate(null);
+    deletePolicy.mutate(deleteCandidate.id);
   }
 
   return (
@@ -568,7 +557,6 @@ export function PoliciesPage() {
                           className="size-8 text-muted-foreground hover:text-destructive"
                           title="Remove policy"
                           onClick={() => setDeleteCandidate(p)}
-                          disabled={pendingAction}
                         >
                           <TrashIcon className="size-3.5" />
                         </Button>
@@ -617,11 +605,7 @@ export function PoliciesPage() {
       <Dialog
         open={deleteCandidate !== null}
         onOpenChange={(open) => {
-          if (pendingAction) return;
-          if (!open) {
-            setDeleteCandidate(null);
-            setActionError(null);
-          }
+          if (!open) setDeleteCandidate(null);
         }}
       >
         <DialogContent>
@@ -632,27 +616,11 @@ export function PoliciesPage() {
               the same handler are unaffected.
             </DialogDescription>
           </DialogHeader>
-          {actionError !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {actionError}
-            </div>
-          )}
           <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={() => setDeleteCandidate(null)}
-              disabled={pendingAction}
-            >
+            <Button variant="ghost" onClick={() => setDeleteCandidate(null)}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void onConfirmDelete()}
-              loading={pendingAction}
-            >
+            <Button variant="destructive" onClick={onConfirmDelete}>
               Remove
             </Button>
           </DialogFooter>

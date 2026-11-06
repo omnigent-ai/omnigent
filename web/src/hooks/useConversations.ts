@@ -56,6 +56,7 @@ import { showToast } from "@/components/ui/toast";
 import {
   conversationDisplayLabel,
   readPinnedConversationIds,
+  sessionBelongsToProject,
   setLegacyPinnedConversationId,
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
@@ -2697,6 +2698,24 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
   return (await res.json()) as Conversation;
 }
 
+/** Ids of the project's member sessions already loaded in any sidebar list. */
+function cachedProjectMemberIds(queryClient: QueryClient, project: ProjectSummary): string[] {
+  const viewerId = getCurrentUserId();
+  const ids = new Set<string>();
+  const add = (c: Conversation) => {
+    if (sessionBelongsToProject(c, project, viewerId)) ids.add(c.id);
+  };
+  for (const queryKey of [["conversations"], ["project-sessions"]]) {
+    for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey })) {
+      data?.pages.forEach((page) => page.data.forEach(add));
+    }
+  }
+  queryClient
+    .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+    ?.conversations.forEach(add);
+  return [...ids];
+}
+
 /**
  * Delete a project: archive AND unfile every member session, then delete the
  * first-class `projects` row (when the folder has one). Sessions are never
@@ -2706,10 +2725,48 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
  * `?project=`), `id` deletes the container (skipped for a label-only folder,
  * which has none). Throws a `BulkConversationMutationError` if any member
  * failed (e.g. a shared session the user can't modify), leaving those in place.
+ *
+ * Optimistic: `onMutate` hides the folder and its loaded members at once, so
+ * the caller can close its dialog without waiting out the sweep. A failure
+ * puts back the folder and the members that weren't archived, then toasts.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
+    onMutate: async (project: ProjectSummary) => {
+      await queryClient.cancelQueries({ queryKey: ["projects"] });
+      const memberIds = cachedProjectMemberIds(queryClient, project);
+      // Hide the members before the folder, so they never fall into the flat list.
+      const painted = await paintConversationsArchived(queryClient, memberIds, true);
+      const projects = queryClient.getQueryData<ProjectSummary[]>(["projects"]);
+      queryClient.setQueryData<ProjectSummary[]>(["projects"], (old) =>
+        old?.filter((p) => p.name !== project.name),
+      );
+      return { ...painted, memberIds, projects };
+    },
+    onError: (err, { name }, context) => {
+      if (context === undefined) return;
+      const failed = new Set(
+        err instanceof BulkConversationMutationError ? err.failed : context.memberIds,
+      );
+      const succeeded = context.memberIds.filter((id) => !failed.has(id));
+      if (context.marked !== undefined) {
+        unmarkSessionsArchiving(failed, context.marked);
+        expireSessionsArchiving(context.marked, succeeded);
+      }
+      restoreArchiveLists(queryClient, context.snapshot);
+      reapplyLiveSessionTombstones(queryClient);
+      queryClient.setQueryData(["projects"], context.projects);
+      showToast(
+        err instanceof BulkConversationMutationError
+          ? `Couldn't delete project "${name}": some sessions couldn't be archived (you may not own them).`
+          : `Couldn't delete project "${name}".`,
+      );
+    },
+    onSuccess: (_data, _project, context) => {
+      if (context.marked !== undefined) expireSessionsArchiving(context.marked, context.memberIds);
+      for (const id of context.memberIds) settleOpenSessionRow(queryClient, id, { archived: true });
+    },
     mutationFn: async ({ id, name }: ProjectSummary) => {
       const ids = await fetchAllProjectSessionIds(name);
       const results = await Promise.allSettled(ids.map((sid) => archiveAndUnfileConversation(sid)));

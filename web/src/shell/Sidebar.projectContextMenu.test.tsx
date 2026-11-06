@@ -217,10 +217,10 @@ describe("project folder header context menu", () => {
     fireEvent.click(screen.getByTestId("delete-project"));
     fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
 
-    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith(
-      { id: PROJECT_ID, name: PROJECT_NAME },
-      expect.anything(),
-    );
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledWith({
+      id: PROJECT_ID,
+      name: PROJECT_NAME,
+    });
   });
 
   it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {

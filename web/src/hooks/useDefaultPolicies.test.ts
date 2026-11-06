@@ -164,6 +164,36 @@ describe("useDeleteDefaultPolicy", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["default-policies"] });
   });
 
+  it("drops the row at once and restores it with a toast when the DELETE fails", async () => {
+    let settle: (response: Response) => void = () => {};
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const seeded = [
+      { id: "p1", name: "block_canada" },
+      { id: "p2", name: "budget" },
+    ] as DefaultPolicy[];
+    queryClient.setQueryData(["default-policies"], seeded);
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    const { result } = renderDelete(queryClient);
+
+    result.current.mutate("p1");
+    await waitFor(() =>
+      expect(queryClient.getQueryData(["default-policies"])).toEqual([seeded[1]]),
+    );
+
+    settle(mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(queryClient.getQueryData(["default-policies"])).toEqual(seeded);
+    expect(toasts).toEqual(["Couldn't remove block_canada: 500 OK"]);
+  });
+
   it("throws on non-2xx", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 403 }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });

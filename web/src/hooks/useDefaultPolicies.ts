@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { showToast } from "@/components/ui/toast";
 import { authenticatedFetch } from "@/lib/identity";
 
 /** A server-wide default policy returned by the admin CRUD API. */
@@ -82,7 +83,10 @@ export function useUpdateDefaultPolicy() {
   });
 }
 
-/** DELETE /v1/policies/{id} — remove a default policy. */
+/**
+ * DELETE /v1/policies/{id} — remove a default policy. Optimistic: the row
+ * leaves the cached list at once; a failure restores it and toasts.
+ */
 export function useDeleteDefaultPolicy() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -92,7 +96,20 @@ export function useDeleteDefaultPolicy() {
       });
       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     },
-    onSuccess: () => {
+    onMutate: async (policyId) => {
+      await queryClient.cancelQueries({ queryKey: QUERY_KEY });
+      const previous = queryClient.getQueryData<DefaultPolicy[]>(QUERY_KEY);
+      queryClient.setQueryData<DefaultPolicy[]>(QUERY_KEY, (old) =>
+        old?.filter((policy) => policy.id !== policyId),
+      );
+      return { previous };
+    },
+    onError: (err, policyId, context) => {
+      queryClient.setQueryData(QUERY_KEY, context?.previous);
+      const name = context?.previous?.find((policy) => policy.id === policyId)?.name ?? "policy";
+      showToast(`Couldn't remove ${name}: ${err.message}`);
+    },
+    onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
     },
   });

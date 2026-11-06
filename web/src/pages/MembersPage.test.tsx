@@ -182,6 +182,38 @@ describe("MembersPage actions", () => {
     expect(await screen.findByText("No members yet.")).toBeInTheDocument();
   });
 
+  it("closes the dialog and drops the row before the delete settles", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    vi.mocked(accountsApi.deleteUser).mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    const bobRow = (await screen.findByText("bob")).closest("tr")!;
+    fireEvent.click(within(bobRow).getByRole("button", { name: /Remove/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(screen.queryByText("bob")).toBeNull();
+  });
+
+  it("restores the row and toasts when the delete fails", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    vi.mocked(accountsApi.deleteUser).mockResolvedValue({ ok: false, error: "nope", status: 500 });
+    const toasts: string[] = [];
+    window.addEventListener("omnigent:toast", (e) => {
+      toasts.push(String((e as CustomEvent<{ content: unknown }>).detail.content));
+    });
+    renderPage();
+
+    const bobRow = (await screen.findByText("bob")).closest("tr")!;
+    fireEvent.click(within(bobRow).getByRole("button", { name: /Remove/ }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^Remove$/ }));
+
+    await waitFor(() => expect(toasts).toEqual(["Couldn't remove bob: nope"]));
+    expect(await screen.findByText("bob")).toBeInTheDocument();
+  });
+
   it("creates an invite and surfaces the single-use URL", async () => {
     renderPage();
     await screen.findByText("No members yet.");

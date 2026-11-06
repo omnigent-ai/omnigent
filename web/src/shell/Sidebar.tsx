@@ -6731,34 +6731,19 @@ function useProjectFolderMenu(
               is kept. You can find and restore them anytime from Settings.
             </DialogDescription>
           </DialogHeader>
-          {deleteProject.isError && (
-            <p className="text-ui text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
-            </p>
-          )}
           <DialogFooter className="border-t-0 bg-transparent">
-            <Button
-              type="button"
-              variant="ghost"
-              onClick={() => setDeleteOpen(false)}
-              disabled={deleteProject.isPending}
-            >
+            <Button type="button" variant="ghost" onClick={() => setDeleteOpen(false)}>
               Cancel
             </Button>
             <Button
               type="button"
               variant="destructive"
-              loading={deleteProject.isPending}
               onClick={() => {
-                deleteProject.mutate(
-                  { id: projectId, name: projectName },
-                  {
-                    onSuccess: () => {
-                      setDeleteOpen(false);
-                      setMenuOpen(false);
-                    },
-                  },
-                );
+                // Close now: the folder leaves the sidebar optimistically and a
+                // failure toasts from the hook, since this menu unmounts with it.
+                setDeleteOpen(false);
+                setMenuOpen(false);
+                deleteProject.mutate({ id: projectId, name: projectName });
               }}
             >
               Delete project

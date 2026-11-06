@@ -37,6 +37,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { showToast } from "@/components/ui/toast";
 import {
   type AccountListEntry,
   type InviteCreated,
@@ -170,15 +171,12 @@ export function MembersPage() {
 
   async function onConfirmDelete() {
     if (deleteCandidate === null) return;
-    setPendingAction(true);
-    setActionError(null);
-    const result = await deleteUser(deleteCandidate);
-    setPendingAction(false);
-    if (!result.ok) {
-      setActionError(result.error);
-      return;
-    }
+    const userId = deleteCandidate;
+    // Close now and drop the row; the refresh puts it back if the delete failed.
     setDeleteCandidate(null);
+    setUsers((current) => current?.filter((u) => u.id !== userId) ?? null);
+    const result = await deleteUser(userId);
+    if (!result.ok) showToast(`Couldn't remove ${userId}: ${result.error}`);
     await refresh();
   }
 
@@ -392,11 +390,7 @@ export function MembersPage() {
       <Dialog
         open={deleteCandidate !== null}
         onOpenChange={(open) => {
-          if (pendingAction) return;
-          if (!open) {
-            setDeleteCandidate(null);
-            setActionError(null);
-          }
+          if (!open) setDeleteCandidate(null);
         }}
       >
         <DialogContent>
@@ -408,27 +402,11 @@ export function MembersPage() {
               cannot be undone.
             </DialogDescription>
           </DialogHeader>
-          {actionError !== null && (
-            <div
-              role="alert"
-              className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-            >
-              {actionError}
-            </div>
-          )}
           <DialogFooter>
-            <Button
-              variant="ghost"
-              onClick={() => setDeleteCandidate(null)}
-              disabled={pendingAction}
-            >
+            <Button variant="ghost" onClick={() => setDeleteCandidate(null)}>
               Cancel
             </Button>
-            <Button
-              variant="destructive"
-              onClick={() => void onConfirmDelete()}
-              loading={pendingAction}
-            >
+            <Button variant="destructive" onClick={() => void onConfirmDelete()}>
               Remove
             </Button>
           </DialogFooter>
