@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
@@ -100,10 +101,26 @@ class ZygoteRunnerProc:
         with self._poll_lock:
             if self.returncode is not None:
                 return self.returncode
-            code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+            code = self._manager.poll(
+                self.pid, zygote_generation=self._zygote_generation, is_alive=self._is_alive
+            )
             if code is not None:
                 self.returncode = code
             return self.returncode
+
+    def _is_alive(self) -> bool:
+        """Probe the captured runner identity, never a recycled PID alone."""
+        process = self._process
+        if process is None:
+            return False
+        try:
+            if not process.is_running():
+                return False
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied:
+            pass
+        return _proc.process_alive(self.pid)
 
     def wait(self, timeout: float | None = None) -> int:
         """Block until the runner exits or *timeout* elapses.
@@ -326,11 +343,18 @@ class ZygoteManager:
             raise ZygoteUnavailable(f"zygote returned no pid: {reply!r}")
         return ZygoteRunnerProc(pid, self, zygote_generation=generation)
 
-    def poll(self, pid: int, *, zygote_generation: int | None = None) -> int | None:
+    def poll(
+        self,
+        pid: int,
+        *,
+        zygote_generation: int | None = None,
+        is_alive: Callable[[], bool] | None = None,
+    ) -> int | None:
         """Return the exit code for a forked runner, or ``None`` if still live.
 
         :param pid: The forked runner pid.
         :param zygote_generation: The child's forkserver generation, if pinned.
+        :param is_alive: Optional probe retaining the caller's process identity.
         :returns: Exit code once the zygote has reaped it, else ``None``.
         """
         try:
@@ -338,9 +362,10 @@ class ZygoteManager:
                 {"cmd": "poll", "pid": pid}, zygote_generation=zygote_generation
             )
         except ZygoteUnavailable:
-            # An unavailable control channel cannot supply exit status. Probe
-            # the PID directly, reporting a sentinel only once it is gone.
-            return None if _proc.process_alive(pid) else _ZYGOTE_LOST_EXIT_CODE
+            # Control loss cannot supply exit status. Prefer the captured runner
+            # identity when probing liveness; only a gone runner gets the sentinel.
+            alive = is_alive() if is_alive is not None else _proc.process_alive(pid)
+            return None if alive else _ZYGOTE_LOST_EXIT_CODE
         code = reply.get("returncode")
         return code if isinstance(code, int) else None
 
