@@ -85,6 +85,7 @@ import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/Appearance
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { FontFamilyCombobox } from "@/components/FontFamilyCombobox";
 import {
   Select,
   SelectContent,
@@ -120,6 +121,7 @@ import {
 } from "@/lib/databricksIntegration";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useOmnigentAnalytics, useOmnigentPageView } from "@/lib/analytics";
 import {
   type Conversation,
@@ -155,6 +157,7 @@ import {
 import {
   clampCodeFontSizePx,
   CODE_FONT_FAMILY_DEFAULT,
+  CODE_FONT_FAMILY_FALLBACK,
   CODE_FONT_SIZE_DEFAULT,
   CODE_FONT_SIZE_MAX,
   CODE_FONT_SIZE_MIN,
@@ -169,6 +172,11 @@ import {
   writeCodeFontSizePx,
   writeCodeFontWeight,
 } from "@/lib/codeFontPreferences";
+import {
+  applyFixedWidthFontFamily,
+  readFixedWidthFontFamily,
+  writeFixedWidthFontFamily,
+} from "@/lib/fixedWidthFontPreferences";
 import {
   readTerminalThemeMode,
   TERMINAL_THEME_DEFAULT,
@@ -1057,10 +1065,12 @@ function AppearanceSection() {
     writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
+    applyFixedWidthFontFamily("");
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
     writeCodeFontFamily(CODE_FONT_FAMILY_DEFAULT);
     writeCodeFontWeight(CODE_FONT_WEIGHT_DEFAULT);
+    writeFixedWidthFontFamily("");
 
     // Remove the persisted keys so this device has no appearance overrides at
     // all. Some write helpers already remove the key for the default value;
@@ -1071,6 +1081,7 @@ function AppearanceSection() {
         for (const key of [
           "omnigent:ui-font-size",
           "omnigent:ui-font-family",
+          "omnigent:fixed-width-font-family",
           "omnigent:code-font-size",
           "omnigent:code-font-family",
           "omnigent:code-font-weight",
@@ -1176,6 +1187,9 @@ function AppearanceSection() {
             <UiFontSizeControl />
             <div className="mt-4 border-t border-border pt-4">
               <UiFontFamilyControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <FixedWidthFontFamilyControl />
             </div>
           </SettingsGroup>
 
@@ -2121,6 +2135,7 @@ function UiFontSizeControl() {
  */
 function UiFontFamilyControl() {
   const [family, setFamily] = useState(() => readUiFontFamily());
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
@@ -2128,42 +2143,62 @@ function UiFontFamilyControl() {
     applyUiFontFamily(next);
   }, []);
 
-  const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
-
   return (
-    <div
-      role="group"
-      aria-label="Font family"
-      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
-    >
+    <div role="group" aria-label="Font family" className="flex items-center justify-between gap-6">
       <SettingsLabel
         label="Font family"
-        className="md:mr-4"
-        description="Use an installed font. Leave blank for the system default."
+        className="flex-1"
+        description={
+          catalogEnabled
+            ? "Interface text font. Pick from the catalog or type any font installed on this device."
+            : "Use any font installed on this device. Leave blank for the system default."
+        }
       />
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        data-testid="ui-font-family-reset"
-        disabled={isDefault}
-        className={cn("h-9", isDefault && "invisible")}
-        onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
-        componentId="settings.appearance.ui_font_family_reset"
-      >
-        Reset
-      </Button>
-      <Input
-        type="text"
-        aria-label="UI font family"
-        data-testid="ui-font-family-input"
-        placeholder="System default"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-        className="col-span-2 h-9 w-full md:col-span-1 md:w-56"
+      <FontFamilyCombobox
+        category="sans"
+        catalogEnabled={catalogEnabled}
         value={family}
-        onChange={(e) => update(e.target.value)}
+        onChange={update}
+        defaultLabel="System default"
+        ariaLabel="UI font family"
+        testId="ui-font-family"
+        previewFallback="var(--font-sans)"
+      />
+    </div>
+  );
+}
+
+/**
+ * Styles chrome monospace text (paths, hashes, inline code chips, log rows) with
+ * --ui-mono-font-family / font-mono; distinct from editor/terminal. Catalog faces load
+ * only when webfonts is enabled; "Monospace default" uses --font-mono; typed families stay honored.
+ */
+function FixedWidthFontFamilyControl() {
+  const [family, setFamily] = useState(() => readFixedWidthFontFamily());
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
+
+  const update = useCallback((next: string) => {
+    setFamily(next);
+    writeFixedWidthFontFamily(next);
+    applyFixedWidthFontFamily(next);
+  }, []);
+
+  return (
+    <div className="flex items-center justify-between gap-6">
+      <SettingsLabel
+        label="Fixed width font"
+        className="flex-1"
+        description="Monospace font for file paths, hashes, and inline code in the interface."
+      />
+      <FontFamilyCombobox
+        category="fixedWidth"
+        catalogEnabled={catalogEnabled}
+        value={family}
+        onChange={update}
+        defaultLabel="Monospace default"
+        ariaLabel="Fixed width font family"
+        testId="fixed-width-font-family"
+        previewFallback="var(--font-mono)"
       />
     </div>
   );
@@ -2280,48 +2315,37 @@ function UiCodeFontSizeControl() {
  */
 function UiCodeFontFamilyControl() {
   const [family, setFamily] = useState(() => readCodeFontFamily());
+  const catalogEnabled = isFeatureEnabled(useServerInfo(), "webfonts");
 
   const update = useCallback((next: string) => {
     setFamily(next);
     writeCodeFontFamily(next);
   }, []);
 
-  const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
-
   return (
     <div
       role="group"
       aria-label="Code font family"
-      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
+      className="flex items-center justify-between gap-6"
     >
       <SettingsLabel
         label="Code font family"
-        className="md:mr-4"
-        description="Font for the editor and terminal. Leave blank for the default."
+        className="flex-1"
+        description={
+          catalogEnabled
+            ? "Font for the code editor and terminal. Pick from the catalog or type any installed font."
+            : "Font for the code editor and terminal. Leave blank for the default."
+        }
       />
-      <Button
-        type="button"
-        variant="ghost"
-        size="sm"
-        data-testid="code-font-family-reset"
-        disabled={isDefault}
-        className={cn("h-9", isDefault && "invisible")}
-        onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
-        componentId="settings.appearance.code_font_family_reset"
-      >
-        Reset
-      </Button>
-      <Input
-        type="text"
-        aria-label="Code font family"
-        data-testid="code-font-family-input"
-        placeholder="Editor default"
-        spellCheck={false}
-        autoCapitalize="off"
-        autoCorrect="off"
-        className="col-span-2 h-9 w-full md:col-span-1 md:w-56"
+      <FontFamilyCombobox
+        category="code"
+        catalogEnabled={catalogEnabled}
         value={family}
-        onChange={(e) => update(e.target.value)}
+        onChange={update}
+        defaultLabel="Editor default"
+        ariaLabel="Code font family"
+        testId="code-font-family"
+        previewFallback={CODE_FONT_FAMILY_FALLBACK}
       />
     </div>
   );
