@@ -171,7 +171,10 @@ describe("HeaderConversationMenu", () => {
         },
       });
       openMenu();
-      expect(screen.getByTestId("add-sibling-session")).toBeVisible();
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(addAgent).toBeVisible();
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
       expect(screen.queryByTestId("header-move-to-project")).not.toBeInTheDocument();
     },
   );
@@ -203,12 +206,12 @@ describe("HeaderConversationMenu", () => {
     // Rename and Move session live in the kebab on desktop too, alongside the
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
       "Export",
       "Rename",
-      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -224,7 +227,7 @@ describe("HeaderConversationMenu", () => {
     trigger.focus();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
 
-    expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Add nested agent" })).toHaveFocus();
   });
 
   it.each([false, "missing"] as const)(
@@ -233,6 +236,9 @@ describe("HeaderConversationMenu", () => {
       render(menuTree({}, capability));
       openMenu();
       expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
+      expect(screen.getByRole("menu").firstElementChild).toBe(
+        screen.getByRole("menuitem", { name: "Pin" }),
+      );
     },
   );
 
@@ -617,12 +623,12 @@ describe("HeaderConversationMenu", () => {
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
       "Export",
       "Rename",
-      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Archive",
@@ -635,17 +641,19 @@ describe("HeaderConversationMenu", () => {
     // and Delete must stay last so a mis-tap doesn't land on them.
     mocks.isMobile = true;
     renderMenu({
+      viewItems: <DropdownMenuItem>Terminal</DropdownMenuItem>,
       workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
     });
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
+      "Terminal",
       "Pin",
       "Share",
       "Fork",
       "Export",
       "Rename",
-      "Add nested agent",
       "Mark as unread",
       "Add to project",
       "Files",

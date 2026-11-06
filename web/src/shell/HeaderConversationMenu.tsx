@@ -287,8 +287,21 @@ export function HeaderConversationMenu({
 
   const mainItems = (
     <>
-      {/* Chat/Terminal switch leads the menu on terminal-first sessions; it
-          renders its own trailing separator (null on other sessions). */}
+      {canAddAgent && (
+        <>
+          <DropdownMenuItem
+            data-testid="add-sibling-session"
+            className={itemClass}
+            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
+            onSelect={() => navigate(addAgentPath)}
+          >
+            <PlusIcon className="size-3.5" />
+            Add nested agent
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+        </>
+      )}
+      {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
       <DropdownMenuItem
         data-testid="header-pin-conversation"
@@ -367,17 +380,6 @@ export function HeaderConversationMenu({
         <PencilIcon className="size-3.5" />
         Rename
       </DropdownMenuItem>
-      {canAddAgent && (
-        <DropdownMenuItem
-          data-testid="add-sibling-session"
-          className={itemClass}
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+A`}
-          onSelect={() => navigate(addAgentPath)}
-        >
-          <PlusIcon className="size-3.5" />
-          Add nested agent
-        </DropdownMenuItem>
-      )}
       <DropdownMenuItem
         data-testid="header-mark-unread-conversation"
         className={itemClass}

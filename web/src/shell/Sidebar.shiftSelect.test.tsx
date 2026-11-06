@@ -10,9 +10,13 @@ import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as IdentityModule from "@/lib/identity";
 import { ARIA_MOD_KEY } from "@/components/KeyboardShortcut";
-import { useSessionSwitchHotkey } from "@/hooks/useSessionSwitchHotkey";
+import { useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
+import type * as SessionNumberHotkeysModule from "@/hooks/useSessionNumberHotkeys";
 
-vi.mock("@/hooks/useSessionSwitchHotkey", () => ({ useSessionSwitchHotkey: vi.fn() }));
+vi.mock("@/hooks/useSessionNumberHotkeys", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionNumberHotkeysModule>()),
+  useSessionNumberHotkeys: vi.fn(),
+}));
 import { writeProjectFolderCollapse } from "@/lib/projectFolderPaginationPreferences";
 
 // ── Pure unit tests ─────────────────────────────────────────────────────────
@@ -165,7 +169,7 @@ describe("Sidebar shift-click selection", () => {
       fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
       expect(screen.queryByRole("link", { name: "b" })).toBeNull();
       expect(screen.queryByRole("link", { name: "c" })).toBeNull();
-      expect(vi.mocked(useSessionSwitchHotkey).mock.lastCall?.[0]).toEqual(["a", "x"]);
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "x"]);
       expect(screen.getByRole("link", { name: "x" })).toHaveAttribute(
         "aria-keyshortcuts",
         `${ARIA_MOD_KEY}+Alt+2`,
@@ -192,7 +196,7 @@ describe("Sidebar shift-click selection", () => {
 
       fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(screen.getByRole("link", { name: "b" })).toBeVisible();
-      expect(vi.mocked(useSessionSwitchHotkey).mock.lastCall?.[0]).toEqual(["a", "b", "c", "x"]);
+      expect(vi.mocked(useSessionNumberHotkeys).mock.lastCall?.[0]).toEqual(["a", "b", "c", "x"]);
     },
   );
 

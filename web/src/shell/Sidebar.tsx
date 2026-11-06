@@ -4572,6 +4572,17 @@ function ConversationMenuItems({
 
   return (
     <>
+      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
+        <>
+          <C.Item asChild data-testid="add-sibling-session">
+            <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
+              <PlusIcon className="size-3.5" />
+              Add nested agent
+            </Link>
+          </C.Item>
+          <C.Separator />
+        </>
+      )}
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
@@ -4672,14 +4683,6 @@ function ConversationMenuItems({
             Only the session owner can rename this session
           </TooltipContent>
         </Tooltip>
-      )}
-      {isOwner && !isArchived && info !== "loading" && info.sibling_sessions && (
-        <C.Item asChild data-testid="add-sibling-session">
-          <Link to={`/?sibling=${encodeURIComponent(conversation.id)}`} onClick={onNavigate}>
-            <PlusIcon className="size-3.5" />
-            Add nested agent
-          </Link>
-        </C.Item>
       )}
       {/* Every row offers one read-state action: "Mark as unread" re-lights
           the pink dot so a session can be flagged to revisit (including the
@@ -5809,7 +5812,10 @@ function ConversationRowImpl({
           selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
         )}
         onClick={(e) => {
-          recentClickTimesRef.current = [...recentClickTimesRef.current.slice(-1), performance.now()];
+          recentClickTimesRef.current = [
+            ...recentClickTimesRef.current.slice(-1),
+            performance.now(),
+          ];
           if (selectionMode) {
             e.preventDefault();
             e.stopPropagation();
