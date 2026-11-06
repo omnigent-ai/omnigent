@@ -6786,7 +6786,9 @@ describe("chatStore — delivered-but-unacked send", () => {
     let answerPost: () => void = () => {};
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
-        return new Promise<Response>((resolve) => {
+        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
+        return new Promise<Response>((resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
           answerPost = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
         });
       }
@@ -13976,6 +13978,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     return sinks;
   }
 
+  /** A 200 text/html login page, as an expired auth ingress answers a stream open. */
+  function loginPageResponse(): Response {
+    const html = pushableStream();
+    html.push("<!doctype html><title>Login</title>");
+    html.close();
+    return mockResponse(null, { bodyStream: html.stream, contentType: "text/html" });
+  }
+
   async function advanceWithHeartbeats(
     sink: StreamSink | (() => StreamSink),
     durationMs: number,
@@ -14864,49 +14874,69 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(state.activeResponse).toMatchObject({
       responseId: "resp_401_blank",
       state: "failed",
-      error: "stream unavailable (401)",
+      error: null,
     });
     const errors = state.blocks.filter((block) => block.type === "error");
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ code: "stream_unavailable" });
   });
 
-  it("renders a 401 failure on an existing assistant bubble without a standalone error", async () => {
-    const response = assistantMessage("resp_401_visible", "Partial reply");
-    seedSession("conv_401_visible", [response]);
-    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
-        return mockResponse({}, { ok: false, status: 401 });
-      }
-      return defaultFetchHandler(input, init);
-    });
-    const controller = new AbortController();
-    useChatStore.setState({
-      conversationId: "conv_401_visible",
-      abortController: controller,
-      sessionStatus: "running",
-      blocks: itemsToBlocks([response]),
-      activeResponse: { responseId: "resp_401_visible", state: "streaming", error: null },
-    });
+  const isStreamOpen = (url: string) => /\/v1\/sessions\/[^/]+\/stream$/.test(url);
+  it.each([
+    [
+      "a 401",
+      6_000,
+      (url: string) => (isStreamOpen(url) ? mockResponse({}, { ok: false, status: 401 }) : null),
+    ],
+    // An expired sign-in answers every API read with the login page, not just the stream.
+    [
+      "persistent login pages",
+      70_000,
+      (url: string) => (url.includes("/v1/") ? loginPageResponse() : null),
+    ],
+  ])(
+    "fails a streaming reply with one connection card after %s",
+    async (_answer, giveUpAfterMs, answerRequest) => {
+      const response = assistantMessage("resp_unavailable_visible", "Partial reply");
+      seedSession("conv_unavailable_visible", [response]);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        return answerRequest(url) ?? defaultFetchHandler(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_unavailable_visible",
+        abortController: controller,
+        sessionStatus: "running",
+        blocks: itemsToBlocks([response]),
+        activeResponse: { responseId: "resp_unavailable_visible", state: "streaming", error: null },
+      });
 
-    const loop = startStreamPump("conv_401_visible", controller, setState, getState);
-    await vi.advanceTimersByTimeAsync(6_000);
-    await loop;
+      const loop = startStreamPump("conv_unavailable_visible", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(giveUpAfterMs);
+      await loop;
 
-    const state = useChatStore.getState();
-    expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(0);
-    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
-      expect.arrayContaining([
+      const state = useChatStore.getState();
+      expect(state.blocks.filter((block) => block.type === "error")).toEqual([
         expect.objectContaining({
-          kind: "assistant",
-          responseId: "resp_401_visible",
-          lifecycle: "failed",
-          error: "stream unavailable (401)",
+          code: "stream_unavailable",
+          title: "The live connection to the assistant is unavailable",
+          message: "Reload the page to reconnect.",
         }),
-      ]),
-    );
-  });
+      ]);
+      // The bubble carries no banner of its own, so the card is the only notice.
+      expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "assistant",
+            responseId: "resp_unavailable_visible",
+            lifecycle: "failed",
+            error: null,
+          }),
+        ]),
+      );
+    },
+  );
 
   it("gives up after exhausting the transient-404 retry cap", async () => {
     seedSession("conv_404", []);
@@ -16621,12 +16651,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
         const url = typeof input === "string" ? input : input.toString();
         if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
           opens += 1;
-          // An expired auth ingress: the fetch follows its redirect to a 200
-          // text/html login page instead of the SSE body.
-          const html = pushableStream();
-          html.push("<!doctype html><title>Login</title>");
-          html.close();
-          return mockResponse(null, { bodyStream: html.stream, contentType: "text/html" });
+          return loginPageResponse();
         }
         return defaultFetchHandler(input, init);
       });
@@ -16642,9 +16667,16 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       // Rejected as a failed open → retried WITH backoff. Pumping the HTML
       // instead would read as a clean drop and reconnect with no delay.
       expect(opens).toBe(1);
-      await vi.advanceTimersByTimeAsync(6_000);
+      // A maintenance page during a restart answers the same way, so a short
+      // run of them keeps retrying without a notice.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(opens).toBeGreaterThan(3);
+      expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
 
-      expect(opens).toBe(3);
+      await vi.advanceTimersByTimeAsync(40_000);
+      const opensAtGiveUp = opens;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(opens).toBe(opensAtGiveUp);
       const state = useChatStore.getState();
       expect(state.status).toBe("idle");
       expect(state.activeResponse).toEqual(activeResponse);
@@ -16659,6 +16691,41 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await loop;
     },
   );
+
+  it("times login-page answers only from the last successful stream open", async () => {
+    seedSession("conv_html_reset", []);
+    let answerLoginPage = true;
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        if (answerLoginPage) return loginPageResponse();
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_html_reset", abortController: controller });
+    const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+    const loop = startStreamPump("conv_html_reset", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(50_000);
+    answerLoginPage = false;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(sinks).toHaveLength(1);
+
+    answerLoginPage = true;
+    sinks[0]!.close();
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(errorBlocks()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
+
+    controller.abort();
+    await loop;
+  });
 
   it("recycles a stale stream on tab-visible / network-online, but never a fresh one", async () => {
     seedSession("conv_wake", []);
