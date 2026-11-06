@@ -3,7 +3,8 @@
 Move through a pull request's Changes tab: filter the changed files by path, find
 text in the fetched patch, copy and open files at the reviewed revision, and mark
 files viewed with progress and hide-viewed controls. Viewed marks are kept in this
-browser only and reset when the pull request gets a new head.
+browser only. A file stays viewed on a new head while its diff hunks are unchanged,
+and a changed file is flagged.
 
 ## Sub-features
 
@@ -32,10 +33,13 @@ browser only and reset when the pull request gets a new head.
 - `hide-viewed`: **Hide viewed** toggle, off by default. When every file the path
   filter still matches is viewed, the list reads `All N files viewed` with
   **Show viewed**.
-- `head-reset`: A new head starts with no marks. A notice reads `New commits since
-  you last viewed — viewed marks were reset.` until **Dismiss** or until you mark a
-  file on the new head. Files collapsed by
-  the previous head's marks open again once the new diff renders.
+- `head-reset`: A new head keeps each file's mark while its hunks are unchanged. A
+  file whose hunks changed loses its mark, shows **Changed since viewed** until you
+  mark it on the new head, and opens for review. A notice reads `New commits since
+  you last viewed — changed files lost their viewed marks.` while a listed file has
+  changed, until **Dismiss** or until every changed file is marked. A file that can't
+  be compared (binary, pure rename, missing from the fetched diff, or cut short) loses
+  its mark without a badge or notice.
 
 ## How to get to it (user POV)
 
@@ -52,7 +56,7 @@ the thread navigation buttons, the filter button when the file list is hidden,
 and the progress row. The toolbar appears once the list has files or an unresolved
 conversation exists. The viewed controls need a pinned list and a fetched diff that
 reports the same head as that list (see the gotchas). While the two heads differ
-during a refresh, the Viewed checkboxes, the progress row, Hide viewed and the reset
+during a refresh, the Viewed checkboxes, the progress row, Hide viewed and the changed-files
 notice are hidden.
 
 ## Driving it with the repro environment
@@ -97,15 +101,19 @@ Ctrl/Cmd+F reopening the bar.
 ### viewed, progress, hide-viewed and head-reset
 
 `tests/e2e_ui/github/test_github_tab.py::test_changes_viewed_progress_persists_and_resets`
-covers `rail` and `composer-mobile`. It marks a file (which collapses it), checks
-`1 / 2 files viewed`, reloads and checks the mark survives, switches to a new head
-and checks the reset notice, dismisses it, then uses **Hide viewed** until
-`All 2 files viewed` appears and **Show viewed** brings the files back.
+covers `rail` and `composer-mobile`. It marks both files (which collapses them),
+checks `2 / 2 files viewed`, reloads and checks the marks survive, then switches to a
+new head where only `main.py` changes. `README.md` keeps its mark, `main.py` shows
+**Changed since viewed**, and the notice appears. It dismisses the notice, marks
+`main.py` again, then uses **Hide viewed** until `All 2 files viewed` appears and
+**Show viewed** brings the files back.
 
 - `composer-desktop` and `canvas`: Open Changes and tick **Viewed** on one file.
   The file should collapse and the progress should read `1 / N files viewed`.
   Reload the page, and the mark should still be there. On a live PR, push a new
-  commit and reload; the marks should be gone and the reset notice should show.
+  commit that changes that file and reload. Its mark should be gone, the file should
+  show **Changed since viewed**, and the notice should show. Files the commit leaves
+  alone keep their marks.
 
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,
@@ -147,13 +155,22 @@ Component coverage for these helpers and views lives in
   request selected) behaves the same way. Real GitLab and Azure DevOps pull requests
   have not been exercised; these results come from the code paths.
 - **Viewed marks are browser-local.** They do not sync to GitHub or other browsers.
-  They are separate for each Omnigent server and signed-in user, and clearing site
-  data removes them. If the browser refuses storage, marks stay in memory and a
+  They are separate for each Omnigent server, signed-in user and pull request, and
+  clearing site data removes them. If the browser refuses storage, marks stay in memory and a
   reload drops them, with the toast `Viewed files can’t be saved on this device.`
-- **New head, new marks.** Marks from an older head never appear on the new one. The
-  notice shows while the pull request has marks recorded on another head and nothing
-  recorded on the current one. It ends when you dismiss it or mark a file on the new
-  head; unmarking everything afterwards does not bring it back.
+- **Marks follow the content, not the head.** Each mark is the hash of a file's hunks
+  as you viewed them. One mark per file covers every head of the pull request, and a
+  tab still open on an older head adds its own hash without disturbing the newer
+  head's mark. A file keeps its three newest hashes. A file that changes back to a
+  version beyond those three shows as changed.
+- **Unmarking on a head can leave a changed badge.** Unmarking removes only the current
+  hash. If the file was viewed at an older hash, it reads **Changed since viewed**
+  until you mark it again.
+- **Unverified marks drop silently.** A file the fetched diff leaves out, a file with
+  no text hunks, and a file whose hunks were cut short can't be compared. Its mark
+  matches only on the head it was made for, and a mismatch shows no badge and no
+  notice. Files whose names git quotes (non-ASCII or special characters) have no parsed
+  diff in the Changes tab, so they always behave this way.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.
 - **Thread navigation can clear a filter.** Previous and Next unresolved
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
