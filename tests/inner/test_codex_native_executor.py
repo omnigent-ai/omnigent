@@ -761,6 +761,70 @@ def test_similar_draining_errors_are_not_retried(
 
 
 @pytest.mark.parametrize(
+    ("data", "expected_message"),
+    [
+        pytest.param(
+            {"input_error_code": "input_too_large", "max_chars": 1048576, "actual_chars": 1271319},
+            "This message is too long for Codex (1,271,319 characters; the limit is "
+            "1,048,576), so it was not delivered.",
+            id="with-sizes",
+        ),
+        pytest.param(
+            {"input_error_code": "input_too_large"},
+            "This message is too long for Codex, so it was not delivered.",
+            id="without-sizes",
+        ),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_input_too_large_refusal_is_undelivered(
+    draining_client,
+    data: dict[str, object],
+    expected_message: str,
+    active_turn_id: str | None,
+    tmp_path: Path,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {
+                "code": -32602,
+                "message": "Input exceeds the maximum length of 1048576 characters.",
+                "data": data,
+            }
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "huge paste")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.preserve_session is True
+    assert failure.code == "codex_input_too_large"
+    assert failure.message == expected_message
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+def test_other_invalid_params_error_is_not_undelivered(draining_client, tmp_path: Path) -> None:
+    _seed_bridge(tmp_path)
+    draining_client.delivery_errors = [
+        CodexAppServerResponseError(
+            {"code": -32602, "message": "invalid params", "data": {"input_error_code": "other"}}
+        )
+    ]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+
+
+@pytest.mark.parametrize(
     "error",
     [
         pytest.param(ConnectionRefusedError("server stopped"), id="refused-connection"),
