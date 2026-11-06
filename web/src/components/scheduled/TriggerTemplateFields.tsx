@@ -1,7 +1,9 @@
 // Trigger-template fields shown in place of the scheduled-task prompt.
 
+import { useState } from "react";
 import { PlusIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -11,6 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Label } from "@/components/scheduled/Label";
 import {
   MAX_INSTRUCTIONS_CHARS,
@@ -30,9 +33,6 @@ import { cn } from "@/lib/utils";
 /** Tinted, compact styling shared by the builder's selects, inputs and fixed words. */
 const CHIP = "h-7 rounded-md border-0 bg-primary/10 px-2 text-sm text-primary shadow-none";
 
-const LINK_BACK = "link";
-const NO_LINK_BACK = "none";
-
 export function TriggerTemplateFields({
   source,
   fields,
@@ -40,6 +40,7 @@ export function TriggerTemplateFields({
   renderedPrompt,
   onEditAsPrompt,
   onSelectOpenChange,
+  toolsProvided = false,
 }: {
   source: TriggerSource;
   fields: TriggerFields;
@@ -50,7 +51,10 @@ export function TriggerTemplateFields({
   onEditAsPrompt: () => void;
   /** Forwarded to each Select so the dialog's dismiss guard knows one is open. */
   onSelectOpenChange: (open: boolean) => void;
+  /** Where the task runs already gives the agent the service's tools, so skip that warning. */
+  toolsProvided?: boolean;
 }) {
+  const [warningsOpen, setWarningsOpen] = useState(false);
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
   const authorAction = (
@@ -117,17 +121,46 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
-            <span className="text-muted-foreground">{template.scopeLabel}</span>
-            <span className={cn(CHIP, "flex items-center")}>equals</span>
+            <span className="text-muted-foreground">where {template.scopeLabel}</span>
+            <Select
+              value={fields.scopeOperator ?? "in"}
+              onValueChange={(operator) =>
+                onChange({ ...fields, scopeOperator: operator as "is" | "in" })
+              }
+              onOpenChange={onSelectOpenChange}
+            >
+              <SelectTrigger
+                size="sm"
+                className={CHIP}
+                aria-label="Scope operator"
+                data-testid="task-trigger-scope-operator"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent position="popper" align="start">
+                <SelectItem value="is">equals</SelectItem>
+                <SelectItem value="in">in</SelectItem>
+              </SelectContent>
+            </Select>
             <Input
               value={fields.scope}
-              placeholder={template.scopePlaceholder}
+              placeholder={
+                fields.scopeOperator === "is"
+                  ? template.scopePlaceholder.split(",")[0]
+                  : template.scopePlaceholder
+              }
               aria-label={template.scopeLabel}
               data-testid="task-trigger-scope"
               className={cn(CHIP, "min-w-28 flex-1 placeholder:text-primary/50")}
               onChange={(e) => onChange({ ...fields, scope: e.target.value })}
             />
           </div>
+
+          {fields.scopeOperator === "is" && fields.scope.includes(",") && (
+            <p className="pl-6 text-sm text-destructive" role="alert">
+              Equals matches one value. Choose in to match a comma-separated list.
+            </p>
+          )}
 
           {fields.conditions.map((condition, index) => {
             const field =
@@ -248,32 +281,6 @@ export function TriggerTemplateFields({
               Add condition
             </Button>
           </div>
-
-          <div className="flex flex-wrap items-center gap-1.5 pl-6 text-sm">
-            <span className="text-muted-foreground">then</span>
-            <Select
-              value={fields.linkBack ? LINK_BACK : NO_LINK_BACK}
-              onValueChange={(v) => onChange({ ...fields, linkBack: v === LINK_BACK })}
-              onOpenChange={onSelectOpenChange}
-            >
-              <SelectTrigger
-                size="sm"
-                className={CHIP}
-                aria-label="Then"
-                data-testid="task-trigger-then"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value={LINK_BACK} data-testid="task-trigger-then-link">
-                  {template.linkBackLabel}
-                </SelectItem>
-                <SelectItem value={NO_LINK_BACK} data-testid="task-trigger-then-none">
-                  Only start the session
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </div>
         </div>
         {fields.conditions.some(
           (c) => !VALUELESS_OPERATORS.has(c.operator) && c.value.trim() === "",
@@ -282,10 +289,49 @@ export function TriggerTemplateFields({
             Fill in or remove each condition.
           </p>
         )}
+        <div className="mt-1 flex items-center gap-2">
+          <Checkbox
+            id="task-trigger-link-back"
+            checked={fields.linkBack}
+            onCheckedChange={(checked) => onChange({ ...fields, linkBack: checked === true })}
+            data-testid="task-trigger-link-back"
+            componentId="tasks.scheduled.trigger_link_back"
+          />
+          <label htmlFor="task-trigger-link-back" className="cursor-pointer text-sm">
+            {template.linkBackLabel}
+          </label>
+        </div>
       </div>
 
       <div className="flex flex-col gap-1.5">
-        <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
+        <div className="flex items-center gap-1.5">
+          <Label htmlFor="task-trigger-instructions">Instructions for each session</Label>
+          {!toolsProvided && (
+            <TooltipProvider>
+              <Tooltip open={warningsOpen} onOpenChange={setWarningsOpen}>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="Session instructions warnings"
+                    className="inline-flex size-4 shrink-0 cursor-pointer items-center justify-center rounded-sm text-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    onClick={(event) => {
+                      event.preventDefault();
+                      setWarningsOpen(true);
+                    }}
+                  >
+                    <TriangleAlertIcon className="size-3.5" aria-hidden="true" />
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="block max-w-xs space-y-2 text-warning">
+                  <p data-testid="task-trigger-tools-note">
+                    This only works if the agent has {template.toolsExample} where this task runs.
+                    Without one, each run stops and says so in its reply.
+                  </p>
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          )}
+        </div>
         <Textarea
           id="task-trigger-instructions"
           value={fields.instructions}
@@ -296,44 +342,29 @@ export function TriggerTemplateFields({
           className="resize-none text-ui"
           onChange={(e) => onChange({ ...fields, instructions: e.target.value })}
         />
-        {instructionsTooLong ? (
+        {instructionsTooLong && (
           <p className="text-sm text-destructive" role="alert" data-testid="task-trigger-too-long">
             Keep instructions to {MAX_INSTRUCTIONS_CHARS.toLocaleString("en-US")} characters or
             fewer so each session&apos;s first message has room for the item.
           </p>
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            Each run handles up to {MAX_SESSIONS_PER_RUN} new {template.itemPlural}, oldest first.
-            The rest are picked up on the next run.
-          </p>
         )}
+        <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">
+          Up to {MAX_SESSIONS_PER_RUN} matches per run; remaining matches wait for the next run ·
+          Posts include &quot;
+          {OMNIGENT_ATTRIBUTION}&quot;.
+        </p>
       </div>
-
-      <p
-        className="flex items-start gap-1.5 text-sm text-warning"
-        data-testid="task-trigger-tools-note"
-      >
-        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
-        <span>
-          This only works if the agent has {template.toolsExample} where this task runs. Without
-          one, each run stops and says so in its reply.
-        </span>
-      </p>
 
       <p
         className="flex items-start gap-1.5 text-sm text-warning"
         data-testid="task-trigger-untrusted-note"
       >
-        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" />
+        <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
         <span>
-          Anyone who can {authorAction} can add instructions that the agent may follow. The agent
-          runs with your tools and your permissions. Make sure you trust them.
+          Anyone who can {authorAction} may direct the agent using your tools and permissions. Only
+          use trusted sources.
+          {fields.linkBack && ` Links are posted with your ${triggerServiceName(source)} account.`}
         </span>
-      </p>
-
-      <p className="text-sm text-muted-foreground" data-testid="task-trigger-attribution-note">
-        {fields.linkBack && `Link-back posts to ${triggerServiceName(source)} with your account. `}
-        Anything posted with your account ends with &quot;{OMNIGENT_ATTRIBUTION}&quot;.
       </p>
 
       {renderedPrompt !== "" && (
