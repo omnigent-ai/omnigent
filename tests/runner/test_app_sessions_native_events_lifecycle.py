@@ -2693,6 +2693,73 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("publish_during_stop", [False, True])
+@pytest.mark.parametrize("fence_writable", [False, True])
+async def test_events_codex_stop_before_first_bridge_records_its_session_fence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    event_type: str,
+    publish_during_stop: bool,
+    fence_writable: bool,
+) -> None:
+    import json
+
+    from omnigent.harnesses.codex_native import app_server
+
+    conv_id = "cold_codex_session"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    state = codex_native_bridge.CodexNativeBridgeState(
+        session_id=conv_id,
+        thread_id="first_thread",
+        socket_path=str(tmp_path / "app-server.sock"),
+        codex_home=str(tmp_path / "codex-home"),
+        active_turn_id="newer_turn",
+    )
+    record = codex_native_bridge.record_codex_interrupt
+
+    def checkpoint(*args, **kwargs):
+        assert kwargs["expected"] is None and kwargs["session_id"] == conv_id
+        if publish_during_stop:
+            codex_native_bridge.write_bridge_state(bridge_dir, state)
+        return record(*args, **kwargs)
+
+    def refuse_checkpoint(*_args, **_kwargs):
+        raise OSError("Synthetic unavailable Stop checkpoint")
+
+    def refuse_rpc(*_args, **_kwargs):
+        raise AssertionError("Stop without an observed native owner must not open an RPC target")
+
+    monkeypatch.setattr(codex_native_bridge, "record_codex_interrupt", checkpoint)
+    monkeypatch.setattr(app_server, "client_for_transport", refuse_rpc)
+    app, _ = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert created.status_code == 201, created.text
+        if not fence_writable:
+            monkeypatch.setattr(codex_native_bridge, "_replace_bridge_record", refuse_checkpoint)
+        response = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": event_type})
+    if not fence_writable:
+        assert response.status_code == 503, response.text
+        assert response.json()["error"] == "codex_native_interrupt_failed"
+        assert not (bridge_dir / codex_native_bridge._INTERRUPT_GENERATIONS_FILE).exists()
+        return
+    assert response.status_code == 204, response.text
+    checkpoint_path = bridge_dir / codex_native_bridge._INTERRUPT_GENERATIONS_FILE
+    assert checkpoint_path.exists()
+    assert json.loads(checkpoint_path.read_text()) == {conv_id: 1}
+    if not publish_during_stop:
+        codex_native_bridge.write_bridge_state(bridge_dir, state)
+    current = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert current is not None and current.interrupt_generation == 1
+    assert current.active_turn_id == "newer_turn"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["running", "idle", "newer_turn", "missing_turn", "rpc_failure"])
 async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     monkeypatch: pytest.MonkeyPatch,

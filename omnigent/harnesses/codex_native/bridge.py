@@ -1098,7 +1098,7 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
-        generation = _read_interrupt_generations(bridge_dir).get(state.session_id, 0)
+        generation = read_interrupt_generations(bridge_dir).get(state.session_id, 0)
         if current is not None and current.session_id == state.session_id:
             generation = max(generation, current.interrupt_generation)
         state = replace(state, interrupt_generation=max(state.interrupt_generation, generation))
@@ -1184,7 +1184,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
         if current is not None and current.interrupt_generation:
-            generations = _read_interrupt_generations(bridge_dir)
+            generations = read_interrupt_generations(bridge_dir)
             generations[current.session_id] = max(
                 generations.get(current.session_id, 0), current.interrupt_generation
             )
@@ -1758,7 +1758,7 @@ def _bridge_owner_matches(
     )
 
 
-def _read_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
+def read_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
     """Read durable session Stop counters; corrupt checkpoints cannot authorize input."""
     try:
         generations = json.loads(
@@ -1779,29 +1779,41 @@ def _read_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
 def codex_input_was_interrupted(bridge_dir: Path, expected: CodexNativeBridgeState) -> bool:
     """Check the session Stop fence even while native state is absent during relaunch."""
     return (
-        _read_interrupt_generations(bridge_dir).get(expected.session_id, 0)
+        read_interrupt_generations(bridge_dir).get(expected.session_id, 0)
         > expected.interrupt_generation
     )
 
 
 def record_codex_interrupt(
-    bridge_dir: Path, *, expected: CodexNativeBridgeState
+    bridge_dir: Path,
+    *,
+    expected: CodexNativeBridgeState | None = None,
+    session_id: str | None = None,
 ) -> CodexNativeBridgeState | None:
     """Retire session input durably; target only the native owner observed by Stop."""
+    if expected is not None:
+        if session_id is not None and session_id != expected.session_id:
+            raise ValueError("Codex Stop session does not match its observed owner")
+        session_id = expected.session_id
+    if not session_id:
+        raise ValueError("Codex Stop requires a session identity")
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
-        generations = _read_interrupt_generations(bridge_dir)
-        generation = max(generations.get(expected.session_id, 0), expected.interrupt_generation)
-        if current is not None and current.session_id == expected.session_id:
+        generations = read_interrupt_generations(bridge_dir)
+        generation = max(
+            generations.get(session_id, 0), expected.interrupt_generation if expected else 0
+        )
+        if current is not None and current.session_id == session_id:
             generation = max(generation, current.interrupt_generation)
-        generations[expected.session_id] = generation + 1
+        generations[session_id] = generation + 1
         _replace_bridge_record(bridge_dir, _INTERRUPT_GENERATIONS_FILE, generations)
-        if current is None or current.session_id != expected.session_id:
+        if current is None or current.session_id != session_id:
             return None
         updated = replace(current, interrupt_generation=generation + 1)
         _write_bridge_state_unlocked(bridge_dir, updated)
         if (
-            not _bridge_owner_matches(current, expected)
+            expected is None
+            or not _bridge_owner_matches(current, expected)
             or current.active_turn_id != expected.active_turn_id
         ):
             return None

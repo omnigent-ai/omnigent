@@ -380,7 +380,7 @@ class ExecutorAdapter(HarnessApp):
                     system_prompt=system_prompt,
                     config=config,
                 ):
-                    if ctx.cancelled.is_set():
+                    if ctx.cancelled.is_set() and not isinstance(event, TurnCancelled):
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",

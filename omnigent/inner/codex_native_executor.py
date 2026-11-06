@@ -42,7 +42,6 @@ from omnigent.harnesses.codex_native.bridge import (
     cancel_pending_mcp_startup,
     clear_active_turn_id_if_matches,
     clear_pending_shell_command,
-    codex_input_was_interrupted,
     mark_shell_command_pending,
     mcp_startup_waiting_detail,
     mirror_applied_codex_settings,
@@ -53,6 +52,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state_result,
     read_codex_config_effort,
     read_codex_config_model,
+    read_interrupt_generations,
     read_mcp_startup,
     read_unmirrored_codex_settings,
     reconcile_shell_command_state,
@@ -315,10 +315,10 @@ def _codex_binding_matches(
     )
 
 
-def _input_was_interrupted(bridge_dir: Path, expected: CodexNativeBridgeState) -> bool:
+def _input_interrupt_generations(bridge_dir: Path) -> dict[str, int]:
     """Keep input undelivered when its durable Stop fence cannot be read."""
     try:
-        return codex_input_was_interrupted(bridge_dir, expected)
+        return read_interrupt_generations(bridge_dir)
     except OSError as exc:
         raise _CodexNativeInputUndelivered(
             CodexStartupFailure(
@@ -330,6 +330,14 @@ def _input_was_interrupted(bridge_dir: Path, expected: CodexNativeBridgeState) -
             ),
             preserve_session=True,
         ) from exc
+
+
+def _input_was_interrupted(bridge_dir: Path, expected: CodexNativeBridgeState) -> bool:
+    """Compare input with the original session's durable Stop generation."""
+    return (
+        _input_interrupt_generations(bridge_dir).get(expected.session_id, 0)
+        > expected.interrupt_generation
+    )
 
 
 def _require_codex_binding(bridge_dir: Path, expected: CodexNativeBridgeState) -> None:
@@ -1096,6 +1104,47 @@ class CodexNativeExecutor(Executor):
         """:returns: ``True`` to preserve attachments and text provenance when steering."""
         return True
 
+    def _require_prepared_input_owner(
+        self, observed: CodexNativeBridgeState | None, generations: Mapping[str, int]
+    ) -> None:
+        """Bind a cold launch to its earlier Stop fence, without inventing a native owner."""
+        current = read_bridge_state(self._bridge_dir)
+        current_generations = _input_interrupt_generations(self._bridge_dir)
+        session_id = (
+            observed.session_id
+            if observed is not None
+            else self._request_session_id or (current.session_id if current is not None else None)
+        )
+        if session_id is not None and current_generations.get(session_id, 0) > generations.get(
+            session_id, 0
+        ):
+            raise _CodexNativeInputStopped("Codex input was retired by Stop")
+        if observed is not None:
+            _require_codex_binding(self._bridge_dir, observed)
+
+    async def _prepare_input(
+        self,
+        content: EnqueuedContent,
+        *,
+        goal_objective: str | None = None,
+    ) -> tuple[CodexNativeBridgeState | None, dict[str, int], list[dict[str, object]]]:
+        generations = _input_interrupt_generations(self._bridge_dir)
+        observed = read_bridge_state(self._bridge_dir)
+        try:
+            input_items: list[dict[str, object]] = (
+                [{"type": "text", "text": goal_objective}]
+                if goal_objective is not None
+                else await asyncio.to_thread(
+                    _content_to_input_items,
+                    content,
+                    self._bridge_dir,
+                    session_id=self._request_session_id,
+                )
+            )
+        finally:
+            self._require_prepared_input_owner(observed, generations)
+        return observed, generations, input_items
+
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:
         """
         Steer an active native Codex turn.
@@ -1106,27 +1155,19 @@ class CodexNativeExecutor(Executor):
         :returns: ``True`` when Codex accepted the steering message.
         """
         del session_key
-        observed = read_bridge_state(self._bridge_dir)
-        input_items = await asyncio.to_thread(
-            _content_to_input_items, content, self._bridge_dir, session_id=self._request_session_id
-        )
+        try:
+            observed, generations, input_items = await self._prepare_input(content)
+        except _CodexNativeInputUndelivered:
+            return False
         if not input_items:
             return False
         # Serialized against run_turn so the read-decide-RPC-write below
         # is atomic with respect to the initiating-message injection.
         async with self._inject_lock:
             state = read_bridge_state(self._bridge_dir)
-            if observed is not None:
-                try:
-                    if _input_was_interrupted(self._bridge_dir, observed):
-                        raise _CodexNativeInputStopped("Codex input was retired by Stop")
-                except _CodexNativeInputUndelivered:
-                    return False
-            if (
-                state is not None
-                and observed is not None
-                and not _codex_binding_matches(state, observed)
-            ):
+            try:
+                self._require_prepared_input_owner(observed, generations)
+            except _CodexNativeInputUndelivered:
                 return False
             if state is None or not _session_is_active(state.session_id, self._request_session_id):
                 _logger.info("Codex native injection skipped: bridge state missing or inactive")
@@ -1196,9 +1237,11 @@ class CodexNativeExecutor(Executor):
         """
         del session_key
         observed = read_bridge_state(self._bridge_dir)
-        if observed is None or not _session_is_active(
-            observed.session_id, self._request_session_id
-        ):
+        if observed is None:
+            if self._request_session_id is not None:
+                record_codex_interrupt(self._bridge_dir, session_id=self._request_session_id)
+            return False
+        if not _session_is_active(observed.session_id, self._request_session_id):
             return False
         state = record_codex_interrupt(self._bridge_dir, expected=observed)
         if state is None:
@@ -1280,7 +1323,6 @@ class CodexNativeExecutor(Executor):
         :returns: Async iterator yielding one terminal event.
         """
         del tools, system_prompt
-        state = read_bridge_state(self._bridge_dir)
         settings_overrides = _model_effort_overrides(config)
         latest_user_content = _latest_user_content(messages)
         try:
@@ -1316,16 +1358,23 @@ class CodexNativeExecutor(Executor):
                     undelivered=True,
                 )
                 return
-        input_items: list[dict[str, object]] = (
-            [{"type": "text", "text": goal_objective}]
-            if goal_objective is not None
-            else await asyncio.to_thread(
-                _content_to_input_items,
-                latest_user_content,
-                self._bridge_dir,
-                session_id=self._request_session_id,
+        try:
+            state, generations, input_items = await self._prepare_input(
+                latest_user_content, goal_objective=goal_objective
             )
-        )
+        except _CodexNativeInputStopped:
+            yield TurnCancelled(reason="native_input_retired")
+            return
+        except _CodexNativeInputUndelivered as exc:
+            yield ExecutorError(
+                message=exc.failure.message,
+                code=exc.failure.code,
+                remediation=exc.failure.remediation,
+                undelivered=True,
+                preserve_session=True,
+            )
+            return
+        prepared_owner = state
         if not input_items:
             yield ExecutorError(
                 message="Codex native turn had no user input to send", undelivered=True
@@ -1382,9 +1431,13 @@ class CodexNativeExecutor(Executor):
                 state_read = read_bridge_state_result(self._bridge_dir)
                 state = state_read.state
                 try:
+                    self._require_prepared_input_owner(prepared_owner, generations)
                     if observed is not None and _input_was_interrupted(self._bridge_dir, observed):
                         input_cancelled = True
                         break
+                except _CodexNativeInputStopped:
+                    input_cancelled = True
+                    break
                 except _CodexNativeInputUndelivered as exc:
                     startup_failure = exc.failure
                     error_msg = exc.failure.message

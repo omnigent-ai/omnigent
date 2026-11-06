@@ -724,10 +724,10 @@ class NativeInterruptRunner:
         )
 
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
-        if state is None or state.session_id != conv_id:
+        if state is not None and state.session_id != conv_id:
             return Response(status_code=204)
         try:
-            state = record_codex_interrupt(bridge_dir, expected=state)
+            state = record_codex_interrupt(bridge_dir, expected=state, session_id=conv_id)
         except OSError as exc:
             return JSONResponse(
                 status_code=503,
