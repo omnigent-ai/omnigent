@@ -373,10 +373,10 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
     [
         ("", {}, "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh\n"),
         (
-            '--repo "https://example.com/it\'s here.git" --extra mcp',
+            "--repo https://user:s3cr3t-token@example.com/org/repo.git --extra mcp",
             {},
             "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh -s -- "
-            "--repo 'https://example.com/it'\\''s here.git' --extra mcp\n",
+            "<your original options>\n",
         ),
         ("", {"UV_DEFAULT_INDEX": "https://mirror.example/simple"}, None),
         ("", {"UV_INDEX_URL": "https://mirror.example/simple"}, None),
@@ -399,6 +399,7 @@ def test_failed_install_suggests_package_mirror(
     assert r.returncode != 0
     assert "continued" not in r.stdout
     assert "Failed to fetch: https://pypi.org/simple/omnigent/" in r.stderr
+    assert "s3cr3t-token" not in r.stdout + r.stderr
     if rerun is None:
         assert "pypi.example.com" not in r.stderr
     else:
