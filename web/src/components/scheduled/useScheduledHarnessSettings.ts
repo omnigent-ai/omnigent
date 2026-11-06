@@ -15,7 +15,6 @@ import {
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
 import {
-  CODEX_NATIVE_REVIEWER_MODE_VALUES,
   nativePermissionOptions,
   UNATTENDED_DISALLOWED_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
@@ -120,16 +119,9 @@ export function useScheduledHarnessSettings(
   const supportsHarnessPermissions =
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
-  // Older servers reject the Codex reviewer modes, so offer (and prefill) them only when advertised.
-  const codexReviewerModes =
-    info !== "loading" && info.scheduled_task_codex_reviewer_modes === true;
   const permissions = supportsHarnessPermissions
     ? nativePermissionOptions(harness).filter(
-        (option) =>
-          !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(option.value) &&
-          (codexReviewerModes ||
-            harness !== "codex-native" ||
-            !CODEX_NATIVE_REVIEWER_MODE_VALUES.has(option.value)),
+        (option) => !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(option.value),
       )
     : [];
   const loading = sandbox ? sandboxModels.isLoading : hostModels.isLoading;

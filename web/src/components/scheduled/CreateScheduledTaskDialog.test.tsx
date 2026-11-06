@@ -246,7 +246,6 @@ function render(ui: Parameters<typeof renderBase>[0], { expandAdvanced = true } 
           ...SERVER_INFO_OFFLINE_FALLBACK,
           features: { automations_v2: true },
           scheduled_task_harness_settings: true,
-          scheduled_task_codex_reviewer_modes: true,
           scheduled_task_worktrees: true,
         }}
       >
@@ -600,8 +599,9 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    // This server doesn't advertise the Codex reviewer modes, so nothing is prefilled.
-    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
+    // A new automation starts on Approve for me; model and effort keep the agent's defaults.
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
+    for (const override of ["modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -4270,27 +4270,6 @@ describe("automation harness settings", () => {
       <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
     );
     await choose("permission", "Default");
-    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
-    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
-    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
-  });
-
-  it("hides and never prefills the Codex reviewer modes on an older server", async () => {
-    mockHarness("codex-native");
-    render(
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_harness_settings: true }}
-      >
-        <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />
-      </CapabilitiesProvider>,
-    );
-    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
-    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
-    const offered = (await screen.findAllByRole("option")).map((option) => option.textContent);
-    expect(offered).toContain("Read Only");
-    expect(offered).not.toContain("Ask for approval");
-    expect(offered).not.toContain("Approve for me");
-    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
