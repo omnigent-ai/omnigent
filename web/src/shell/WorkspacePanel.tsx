@@ -34,7 +34,6 @@ import {
 import { cn } from "@/lib/utils";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
-  ALT_KEY,
   ARIA_MOD_KEY,
   CompactShortcutKeys,
   MOD_KEY,
@@ -71,7 +70,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
-import { useNewBrowserHotkey } from "@/hooks/useNewBrowserHotkey";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -111,7 +109,6 @@ import { Button } from "../components/ui/button";
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
 );
-const NEW_BROWSER_KEYS = [MOD_KEY, ALT_KEY, "B"] as const;
 const workspacePanels = {
   "content-search": { label: "Content search", icon: SearchIcon },
   files: { label: "Files", icon: FolderTreeIcon },
@@ -359,10 +356,10 @@ function NewTabMenu({
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
             Browser
-            <WorkspaceMenuShortcut
-              keys={supportsDesktopCommands() ? NEW_BROWSER_TAB_KEYS : NEW_BROWSER_KEYS}
-              className="ml-auto pl-4"
-            />
+            {/* ⌘T is the desktop menu's New Browser Tab; older shells have no chord. */}
+            {supportsDesktopCommands() && (
+              <WorkspaceMenuShortcut keys={NEW_BROWSER_TAB_KEYS} className="ml-auto pl-4" />
+            )}
           </DropdownMenuItem>
         )}
         {onOpenSideChat && (
@@ -1096,7 +1093,6 @@ function WorkspacePanelImpl({
       openBrowser();
     }
   };
-  useNewBrowserHotkey(addBrowser, showBrowserTab && !pending && !contained);
   useDesktopCommand(
     "new-browser-tab",
     showBrowserTab && !pending && !contained ? (event) => addBrowser(event.browserViewId) : null,

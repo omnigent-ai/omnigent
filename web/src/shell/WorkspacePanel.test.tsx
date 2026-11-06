@@ -979,7 +979,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     expect(screen.queryByRole("button", { name: "Open new" })).toBeNull();
   });
 
-  it("shows the Browser and Shell shortcuts as keycaps", async () => {
+  it("shows the Shell shortcut, and no Browser chord without the desktop menu's ⌘T", async () => {
     declaresShell();
     renderWorkspace({ showBrowserTab: true });
 
@@ -989,7 +989,7 @@ describe('WorkspacePanel "+" new-tab menu', () => {
     const keycaps = (item: HTMLElement) =>
       Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
 
-    expect(keycaps(browser)).toEqual(["Ctrl", "Alt", "B"]);
+    expect(keycaps(browser)).toEqual([]);
     expect(keycaps(shell)).toEqual(["Ctrl", "`"]);
   });
 
@@ -1414,16 +1414,13 @@ describe("WorkspacePanel browser tab", () => {
     );
   });
 
-  it("opens a browser tab with Ctrl+Alt+B", () => {
-    const { onRightRailTabChange, onReveal } = renderWorkspace({
-      showBrowserTab: true,
-    });
+  it("leaves Ctrl+Alt+B alone, since ⌘T opens a browser tab", () => {
+    const { onRightRailTabChange } = renderWorkspace({ showBrowserTab: true });
 
     fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
 
-    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
-    expect(onRightRailTabChange).toHaveBeenCalledWith("browser");
-    expect(onReveal).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("tab", { name: "Browser 1" })).toBeNull();
+    expect(onRightRailTabChange).not.toHaveBeenCalledWith("browser");
   });
 
   it("offers browsers without shell access and creates multiple closable tabs", async () => {

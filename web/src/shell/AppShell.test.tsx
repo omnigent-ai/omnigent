@@ -3032,12 +3032,22 @@ describe("Right workspace card visibility", () => {
     expect(screen.getByTestId("url-params")).toHaveTextContent("file=README.md");
   });
 
-  it("reveals a collapsed workspace when the Browser hotkey opens a tab", async () => {
+  it("reveals a collapsed workspace when New Browser Tab opens a tab", async () => {
     writeWorkspacePanelDefault("collapsed");
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -3049,7 +3059,9 @@ describe("Right workspace card visibility", () => {
       renderShell("/c/conv_browser_hotkey");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
         "aria-selected",
@@ -3059,14 +3071,25 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
   it("reveals a Browser tab over an open Terminal panel", async () => {
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
       browserOpenOrNavigate: vi.fn(),
       setBadgeCount: vi.fn(),
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
     });
     sessionStorage.setItem(
       "omnigent.web.panel-key:conv_browser_terminal",
@@ -3083,7 +3106,9 @@ describe("Right workspace card visibility", () => {
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "open");
       expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
-      fireEvent.keyDown(window, { code: "KeyB", ctrlKey: true, altKey: true });
+      act(() =>
+        sendCommand({ command: "new-browser-tab", browserViewId: null, closingQuits: false }),
+      );
 
       expect(screen.getByTestId("terminals-panel")).toHaveAttribute("data-state", "closed");
       expect(await screen.findByRole("tab", { name: "Browser 1" })).toHaveAttribute(
@@ -3094,6 +3119,7 @@ describe("Right workspace card visibility", () => {
     } finally {
       cleanup();
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     }
   });
 
