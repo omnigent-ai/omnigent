@@ -391,6 +391,15 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByText("@readme.md")).toBeInTheDocument();
   });
 
+  it("Alt+Enter neither opens nor attaches the highlighted row", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    fireEvent.keyDown(textarea(), { key: "Enter", altKey: true });
+    expect(screen.queryByText("@readme.md")).not.toBeInTheDocument();
+    expect(textarea()).toHaveValue("@");
+  });
+
   it("ArrowUp from the top row wraps to the last row", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
