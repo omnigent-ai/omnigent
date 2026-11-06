@@ -1358,6 +1358,51 @@ def test_format_pane_debug_tail_redacts_email_and_secrets() -> None:
     assert _mod._format_pane_debug_tail("") == "<empty pane>"
 
 
+def test_agy_input_region_skips_background_task_widget() -> None:
+    """Agy composer is located above background task widgets (#12833).
+
+    When a background task runs in tmux, agy inserts a task status widget
+    framed by separator lines below the composer. The composer check must scan
+    upwards to locate the actual input box rather than matching the task widget.
+    """
+    sep = "─" * 60
+    pane = (
+        f"{sep}\n"
+        "> my draft prompt\n"
+        f"{sep}\n"
+        "  ● [13:27:20] uv run mypy running\n"
+        f"{sep}\n"
+        "               Gemini 3.8 Flash · high · 1 task(s)"
+    )
+    assert _mod._agy_input_region(pane) == "> my draft prompt"
+
+
+def test_agy_input_region_skips_task_widget_for_collapsed_paste() -> None:
+    """A collapsed paste placeholder is recognized above a background task widget."""
+    sep = "─" * 60
+    pane = (
+        f"{sep}\n"
+        "  [Pasted text #1 +17 lines]\n"
+        f"{sep}\n"
+        "  ● uv run pytest running\n"
+        f"{sep}\n"
+        "? for shortcuts"
+    )
+    assert _mod._agy_input_region(pane) == "  [Pasted text #1 +17 lines]"
+
+
+def test_draft_in_input_region_detects_draft_when_background_task_running() -> None:
+    """A draft is detected when an active background task widget is rendered below."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(
+        f"{sep}\n>\n{sep}\n  ● uv run mypy running\n{sep}\n? for shortcuts"
+    )
+    content = "please run tests"
+    needle = _mod._submit_needle(content)
+    pane = f"{sep}\n> {content}\n{sep}\n  ● uv run mypy running\n{sep}\n? for shortcuts"
+    assert _mod._draft_in_input_region(pane, needle, baseline)
+
+
 def test_inject_user_message_via_tui_delivers_short_message(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

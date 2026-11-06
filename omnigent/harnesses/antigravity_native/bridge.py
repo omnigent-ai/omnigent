@@ -1451,12 +1451,22 @@ def _agy_input_region(pane: str) -> str:
     agy renders the editable composer between horizontal separator lines. After
     a successful submit, the submitted prompt remains in transcript history
     above a fresh empty composer, so checking the full pane would falsely think
-    the draft is still present. The last separator pair scopes matching to the
-    currently editable input box, mirroring Kiro's input-region guard.
+    the draft is still present. Scans candidate separator sections from the bottom
+    up looking for the active prompt box (> ... or paste placeholder), properly
+    skipping any background task status widgets rendered below it.
     """
     lines = pane.splitlines()
     separator_indexes = [index for index, line in enumerate(lines) if _agy_separator_line(line)]
     if len(separator_indexes) >= 2:
+        for index in range(len(separator_indexes) - 2, -1, -1):
+            start = separator_indexes[index] + 1
+            end = separator_indexes[index + 1]
+            candidate = lines[start:end]
+            if any(
+                line.strip().startswith(">") or bool(_AGY_PASTE_PLACEHOLDER_RE.search(line))
+                for line in candidate
+            ):
+                return "\n".join(candidate)
         start = separator_indexes[-2] + 1
         end = separator_indexes[-1]
         return "\n".join(lines[start:end])
