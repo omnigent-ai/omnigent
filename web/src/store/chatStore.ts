@@ -59,7 +59,6 @@ import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
-import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   acknowledgeLocalElicitationResolution,
@@ -1952,8 +1951,9 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 // gives up rather than polling it forever.
 const MAX_TRANSIENT_404_RETRIES = 10;
 // An auth layer answering the stream with its login page means the sign-in
-// expired, which no background retry can renew; give up after this many.
-const MAX_NON_SSE_STREAM_ANSWERS = 3;
+// expired, which no retry can renew. A maintenance page during a restart looks
+// the same, so give up only once those answers outlast a restart.
+const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -6589,8 +6589,8 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // Login-page answers since the last successful open.
-  let nonSseAnswers = 0;
+  // When login-page answers began since the last successful open.
+  let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
@@ -6671,7 +6671,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
+            failUnavailableStream(set);
             set({ status: "idle" });
             break;
           }
@@ -6701,22 +6701,17 @@ export async function startStreamPump(
           failedOpens += 1;
           continue;
         }
-        // An auth layer in front of the server (e.g. an expired app-ingress
-        // session) can answer with a redirect the fetch follows to a 200
-        // text/html login page. Pumping that body would end instantly
-        // without `[DONE]` and reconnect with no backoff — a hot loop that
-        // leaves the transcript silently frozen. Treat a non-SSE content
-        // type as a failed open so it backs off, and give up like a 401 once
-        // it repeats so the chat says the connection is gone.
+        // A login page from an auth layer would pump as a clean drop and reconnect
+        // in a hot loop; back off on it instead, and give up like a 401 once it persists.
         const contentType = streamRes.headers.get("content-type") ?? "";
         if (!contentType.toLowerCase().includes("text/event-stream")) {
           void streamRes.body.cancel().catch(() => {});
-          nonSseAnswers += 1;
-          if (nonSseAnswers >= MAX_NON_SSE_STREAM_ANSWERS) {
+          nonSseAnswersSince ??= Date.now();
+          if (Date.now() - nonSseAnswersSince >= NON_SSE_STREAM_GIVE_UP_MS) {
             console.warn(
-              `Session ${id}: stream open returned '${contentType}' ${nonSseAnswers} times, giving up`,
+              `Session ${id}: stream open returned '${contentType}' for ${NON_SSE_STREAM_GIVE_UP_MS} ms, giving up`,
             );
-            failUnavailableStream(set, "stream unavailable (sign-in required)");
+            failUnavailableStream(set);
             set({ status: "idle" });
             break;
           }
@@ -6732,7 +6727,7 @@ export async function startStreamPump(
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
-        nonSseAnswers = 0;
+        nonSseAnswersSince = null;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
         maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
@@ -9771,36 +9766,31 @@ function finalizeActive(
 
 const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
 
-/** Fail a live turn and surface one fallback when no bubble can show it. */
-function failUnavailableStream(set: Setter, error: string): void {
-  set((s) => {
-    // A turn that already settled keeps its outcome; the fallback reports the lost connection.
-    const activeResponse =
-      s.activeResponse?.state === "streaming"
-        ? { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() }
-        : null;
-    const blocks = s.blocks.filter(
-      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
-    );
-    const hasVisibleFailure =
-      activeResponse !== null &&
-      buildBubbles(blocks, activeResponse).some(
-        (bubble) => bubble.kind === "assistant" && bubble.responseId === activeResponse.responseId,
-      );
-    if (hasVisibleFailure) {
-      return blocks.length === s.blocks.length ? { activeResponse } : { activeResponse, blocks };
-    }
-    return {
-      ...(activeResponse !== null ? { activeResponse } : {}),
-      blocks: [
-        ...blocks,
-        {
-          ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
-          title: "The live connection to the assistant is unavailable",
-        },
-      ],
-    };
-  });
+/** Fail a live turn and surface one notice that the connection is gone. */
+function failUnavailableStream(set: Setter): void {
+  set((s) => ({
+    // A settled turn keeps its outcome; a live one fails without its own banner, so the
+    // card is the only notice.
+    ...(s.activeResponse?.state === "streaming"
+      ? {
+          activeResponse: {
+            ...s.activeResponse,
+            state: "failed" as const,
+            error: null,
+            completedAt: Date.now(),
+          },
+        }
+      : {}),
+    blocks: [
+      ...s.blocks.filter(
+        (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+      ),
+      {
+        ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
+        title: "The live connection to the assistant is unavailable",
+      },
+    ],
+  }));
 }
 
 /**
