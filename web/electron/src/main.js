@@ -3702,6 +3702,13 @@ function buildMenu() {
         enabled: canRun("new-browser-tab"),
         click: () => runCommand("new-browser-tab"),
       },
+      {
+        id: "focus_address_bar",
+        label: "Focus Address Bar",
+        accelerator: "CmdOrCtrl+L",
+        enabled: canRun("focus-address-bar"),
+        click: () => focusAddressBar(),
+      },
       { type: "separator" },
       // Windows and Linux have no app menu, so Settings and Quit live here.
       ...(!isMac ? [settingsItem, { type: "separator" }] : []),
@@ -3758,7 +3765,12 @@ function buildMenu() {
   template.push({
     label: "View",
     submenu: [
-      { role: "reload" },
+      {
+        id: "reload",
+        label: "Reload",
+        accelerator: "CmdOrCtrl+R",
+        click: () => reloadFocused(),
+      },
       { role: "forceReload" },
       { type: "separator" },
       { role: "resetZoom" },
@@ -5625,6 +5637,30 @@ function goInHistory(win, command) {
     return;
   }
   sendDesktopCommand(win, command);
+}
+
+/**
+ * Reload (⌘R). A focused embedded web page reloads itself instead of the app
+ * around it; otherwise the page decides (its browser toolbar, else the app).
+ */
+function reloadFocused() {
+  const focused = BrowserWindow.getFocusedWindow();
+  if (!focused || focused.isDestroyed()) return;
+  const target = desktopCommandTarget("reload");
+  const viewId = target ? focusedBrowserViewId(target) : null;
+  const view = viewId ? windows.get(target).browserRegistry.get(viewId)?.view : null;
+  if (view) view.webContents.reload();
+  // A hung page can't run its own reload, so its window reloads directly.
+  else if (target && !windows.get(target).unresponsive) sendDesktopCommand(target, "reload");
+  else (target ?? focused).webContents.reload();
+}
+
+/** Focus Address Bar (⌘L): take focus back from an embedded page, then let the page focus its address bar. */
+function focusAddressBar() {
+  const target = desktopCommandTarget("focus-address-bar");
+  if (!target) return;
+  target.webContents.focus();
+  sendDesktopCommand(target, "focus-address-bar");
 }
 
 /**
