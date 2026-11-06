@@ -2070,29 +2070,28 @@ async def test_handle_tunnel_frame_drops_malformed_frame(
     assert sent == []
 
 
-def _report_busy_failure() -> tuple[bool, float | None]:
+def _report_keep_warm_failure() -> bool:
     raise RuntimeError("activity state unavailable")
 
 
 @pytest.mark.parametrize(
-    ("report_busy", "expected"),
+    ("report_keep_warm", "expected"),
     [
-        pytest.param(None, (None, None), id="not-reported"),
-        pytest.param(lambda: (True, 0.0), (True, 0.0), id="busy"),
-        pytest.param(lambda: (False, 12.5), (False, 12.5), id="idle"),
+        pytest.param(None, None, id="not-reported"),
+        pytest.param(lambda: True, True, id="keep-warm"),
+        pytest.param(lambda: False, False, id="let-it-stop"),
         # Keeping a sandbox warm one extra interval beats stopping an in-use one.
-        pytest.param(_report_busy_failure, (True, None), id="failing-report-counts-as-busy"),
+        pytest.param(_report_keep_warm_failure, True, id="failing-report-keeps-warm"),
     ],
 )
 @pytest.mark.asyncio
-async def test_pong_carries_the_runners_busy_report(
-    report_busy: Callable[[], tuple[bool, float | None]] | None,
-    expected: tuple[bool | None, float | None],
+async def test_pong_carries_the_runners_keep_warm_report(
+    report_keep_warm: Callable[[], bool] | None, expected: bool | None
 ) -> None:
-    """A ping is answered with a pong carrying the runner's busy report.
+    """A ping is answered with a pong carrying the runner's keep-warm report.
 
-    :param report_busy: The runner's busy callback, or ``None``.
-    :param expected: The ``busy`` value the pong must carry.
+    :param report_keep_warm: The runner's keep-warm callback, or ``None``.
+    :param expected: The ``keep_warm`` value the pong must carry.
     :returns: None.
     """
     sent: list[str] = []
@@ -2101,11 +2100,15 @@ async def test_pong_carries_the_runners_busy_report(
         sent.append(text)
 
     await _handle_tunnel_frame(
-        _noop_app, encode_frame(PingFrame(ts=123)), _send_text, {}, {}, report_busy=report_busy
+        _noop_app,
+        encode_frame(PingFrame(ts=123)),
+        _send_text,
+        {},
+        {},
+        report_keep_warm=report_keep_warm,
     )
 
-    busy, idle_s = expected
-    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, busy=busy, idle_s=idle_s)]
+    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, keep_warm=expected)]
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""Whether a runner counts as busy for keeping its sandbox awake.
+"""Whether a runner counts as busy, and whether its sandbox should be kept warm.
 
 A runner is busy while it has active work (a turn running or an event dispatch
 pending) or while its work progress advanced since the previous check: a session
@@ -7,20 +7,16 @@ counts) or mirrored native events kept flowing after the parent went idle. A
 runner that is merely connected does not count: viewing a session keeps it
 connected without any work.
 
-The runner reports this on each tunnel pong (``PongFrame.busy``), and the server
-extends a managed sandbox while the runner was recently busy, and for a
-keep-warm grace (by default the runner idle timeout) after its last work (see
-:mod:`omnigent.server.managed_host_keepalive`).
+The runner reports :meth:`RunnerBusyCheck.keep_warm` on each tunnel pong
+(``PongFrame.keep_warm``), and the server extends a managed sandbox only while
+the latest report says so (see :mod:`omnigent.server.managed_host_keepalive`).
 """
 
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Callable
-
-# The runner's built-in idle timeout, used when no runner.idle_timeout_s is set.
-# Here (not in omnigent.runner._entry) so the server can read it cheaply.
-DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 
 
 class RunnerBusyCheck:
@@ -44,8 +40,9 @@ class RunnerBusyCheck:
         self._has_active_work = has_active_work
         self._get_last_activity = get_last_activity
         self._last_activity_at: float | None = None
-        self._last_busy_at: float | None = None
-        self._started_at = time.monotonic()
+        # Like the runner's own idle timeout, the warm window first counts from
+        # the runner's start.
+        self._last_busy_at = time.monotonic()
 
     def check(self) -> bool:
         """Return whether the runner is busy now or made progress since the last call.
@@ -64,19 +61,15 @@ class RunnerBusyCheck:
             self._last_busy_at = time.monotonic()
         return busy
 
-    def report(self) -> tuple[bool, float | None]:
-        """Return :meth:`check` and the seconds since this check last saw work.
+    def keep_warm(self, grace_s: float) -> bool:
+        """Return whether the runner's sandbox should be kept warm.
 
-        The idle time lets a server that lost its own history (a restart, or a
-        reconnect to another replica) resume a keep-warm grace where it was.
-        Before any work it counts from this check's creation, as the runner's own
-        idle timeout does, so a reconnect cannot restart an expired grace.
-
-        :returns: ``(busy, idle_s)``.
+        :param grace_s: Seconds to stay warm after the last work (or the
+            runner's start); ``math.inf`` keeps it warm while connected.
+        :returns: ``True`` while busy (see :meth:`check`) or within *grace_s*
+            of the last work.
         """
         busy = self.check()
-        if busy:
-            return busy, 0.0
-        return busy, time.monotonic() - (
-            self._started_at if self._last_busy_at is None else self._last_busy_at
-        )
+        if busy or math.isinf(grace_s):
+            return True
+        return time.monotonic() - self._last_busy_at < grace_s

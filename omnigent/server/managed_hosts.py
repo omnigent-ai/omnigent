@@ -206,7 +206,6 @@ from omnigent.onboarding.sandboxes.base import (
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
 from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
-from omnigent.runner.busy_check import DEFAULT_RUNNER_IDLE_TIMEOUT_S
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -739,11 +738,6 @@ class ManagedSandboxConfig:
     # Request-scoped reference; teardown must not depend on launch authorization.
     profile_selection: dict[str, Any] | None = None
     manages_profiles: bool = False
-    # Seconds the server keeps refreshing a sandbox after its runner's last work
-    # (see managed_host_keepalive): the runner idle timeout, so a sandbox stays
-    # warm as long as an idle runner would stay alive. Zero leaves the platform's
-    # own idle window as the only grace.
-    keep_warm_after_work_s: float = float(DEFAULT_RUNNER_IDLE_TIMEOUT_S)
 
 
 class NoReachableModels(Exception):
@@ -1314,24 +1308,6 @@ def _parse_keep_warm_s(raw: dict[str, object]) -> int | None:
     if not 1 <= value <= _MAX_KEEP_WARM_S:
         raise ValueError(_bad)
     return int(value)
-
-
-def _keep_warm_after_work_s(host_config: dict[str, object] | None) -> float:
-    """Seconds a sandbox stays warm after its runner's last work: the runner idle timeout.
-
-    For agent_sandbox, ``keep_warm_s`` has already been folded into
-    ``host_config.runner.idle_timeout_s`` by :func:`_apply_keep_warm`. An explicit
-    ``0`` disables the runner's idle shutdown, so the sandbox stays warm for as
-    long as the runner is connected.
-    """
-    runner = (host_config or {}).get("runner")
-    idle = runner.get("idle_timeout_s") if isinstance(runner, dict) else None
-    if isinstance(idle, (int, float)) and not isinstance(idle, bool):
-        if idle == 0:
-            return math.inf
-        if idle > 0:
-            return float(idle)
-    return float(DEFAULT_RUNNER_IDLE_TIMEOUT_S)
 
 
 def _apply_keep_warm(
@@ -2003,7 +1979,6 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         manages_profiles=manages_profiles,
-        keep_warm_after_work_s=_keep_warm_after_work_s(host_config),
     )
 
 

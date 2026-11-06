@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import base64
 import json
-import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import cast
@@ -158,16 +157,13 @@ class PongFrame:
     """Either direction: keepalive response — echoes the ping's ts.
 
     :param ts: The ping's timestamp, echoed back.
-    :param busy: Runner-to-server only. Whether the runner did work since its
-        previous pong, so the server extends a managed sandbox only while it is
-        in use. ``None`` (omitted on the wire) means the sender does not report it.
-    :param idle_s: Runner-to-server only. Seconds since the runner last did work,
-        or ``None`` before any work or when not reported.
+    :param keep_warm: Runner-to-server only. Whether the runner wants its managed
+        sandbox kept warm (it is working, or within its idle timeout of the last
+        work). ``None`` (omitted on the wire) means the runner does not report it.
     """
 
     ts: int
-    busy: bool | None = None
-    idle_s: float | None = None
+    keep_warm: bool | None = None
 
 
 @dataclass
@@ -341,10 +337,8 @@ def encode_frame(frame: Frame) -> str:
         return json.dumps({"kind": FrameKind.PING.value, "ts": frame.ts})
     if isinstance(frame, PongFrame):
         pong: dict[str, object] = {"kind": FrameKind.PONG.value, "ts": frame.ts}
-        if frame.busy is not None:
-            pong["busy"] = frame.busy
-        if frame.idle_s is not None:
-            pong["idle_s"] = round(frame.idle_s, 1)
+        if frame.keep_warm is not None:
+            pong["keep_warm"] = frame.keep_warm
         return json.dumps(pong)
     if isinstance(frame, WSOpenFrame):
         return json.dumps(
@@ -395,21 +389,6 @@ def encode_frame(frame: Frame) -> str:
             }
         )
     raise TypeError(f"unknown frame type: {type(frame).__name__}")
-
-
-def _optional_seconds(value: object) -> float | None:
-    """A finite, non-negative number of seconds, else ``None`` (unreported).
-
-    An optional field must never fail the frame: ``float()`` of a huge JSON
-    integer raises ``OverflowError``, which would end the tunnel's receive loop.
-    """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        return None
-    try:
-        seconds = float(value)
-    except OverflowError:
-        return None
-    return seconds if math.isfinite(seconds) and seconds >= 0 else None
 
 
 def decode_frame(text: str) -> Frame:
@@ -484,11 +463,10 @@ def _decode_known_frame(kind: FrameKind, msg: _JsonObject) -> Frame:
         case FrameKind.PING:
             return PingFrame(ts=_required_int(msg, "ts"))
         case FrameKind.PONG:
-            busy = msg.get("busy")
+            keep_warm = msg.get("keep_warm")
             return PongFrame(
                 ts=_required_int(msg, "ts"),
-                busy=busy if isinstance(busy, bool) else None,
-                idle_s=_optional_seconds(msg.get("idle_s")),
+                keep_warm=keep_warm if isinstance(keep_warm, bool) else None,
             )
         case FrameKind.WS_OPEN:
             return _decode_ws_open(msg)

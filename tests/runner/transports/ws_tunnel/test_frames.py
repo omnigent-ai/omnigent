@@ -255,28 +255,22 @@ def test_ping_pong_round_trip() -> None:
     assert decoded_o.ts == 1709654400000
 
 
-@pytest.mark.parametrize("busy", [True, False])
-def test_pong_busy_round_trips(busy: bool) -> None:
-    assert decode_frame(encode_frame(PongFrame(ts=7, busy=busy))) == PongFrame(ts=7, busy=busy)
+@pytest.mark.parametrize("keep_warm", [True, False])
+def test_pong_keep_warm_round_trips(keep_warm: bool) -> None:
+    frame = PongFrame(ts=7, keep_warm=keep_warm)
+    assert decode_frame(encode_frame(frame)) == frame
 
 
-def test_unreported_pong_busy_stays_off_the_wire() -> None:
+def test_unreported_pong_keep_warm_stays_off_the_wire() -> None:
     # Older servers and peers that do not report see the pong unchanged.
     assert json.loads(encode_frame(PongFrame(ts=7))) == {"kind": "pong", "ts": 7}
-    assert decode_frame('{"kind": "pong", "ts": 7}') == PongFrame(ts=7, busy=None)
+    assert decode_frame('{"kind": "pong", "ts": 7}') == PongFrame(ts=7, keep_warm=None)
 
 
-def test_non_boolean_pong_busy_is_treated_as_unreported() -> None:
-    assert decode_frame('{"kind": "pong", "ts": 7, "busy": "yes"}') == PongFrame(ts=7, busy=None)
-
-
-def test_pong_idle_seconds_round_trip_and_reject_invalid_values() -> None:
-    frame = PongFrame(ts=7, busy=False, idle_s=12.34)
-    assert decode_frame(encode_frame(frame)) == PongFrame(ts=7, busy=False, idle_s=12.3)
-    # Oversized and non-finite values must not fail the frame (and so the tunnel).
-    for raw in ('"x"', "-1", "true", "1" + "0" * 400, "1e999", "NaN", "Infinity"):
-        decoded = decode_frame('{"kind": "pong", "ts": 7, "busy": false, "idle_s": ' + raw + "}")
-        assert decoded == PongFrame(ts=7, busy=False, idle_s=None)
+def test_non_boolean_pong_keep_warm_is_treated_as_unreported() -> None:
+    for raw in ('"yes"', "1", "null"):
+        decoded = decode_frame('{"kind": "pong", "ts": 7, "keep_warm": ' + raw + "}")
+        assert decoded == PongFrame(ts=7, keep_warm=None)
 
 
 # ── Decode failure modes ─────────────────────────────────

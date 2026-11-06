@@ -345,8 +345,6 @@ def test_parse_valid_modal_config_builds_image_parameterized_factory(
     cfg = cfg.default
     assert cfg.server_url == "https://srv.example.com"
     assert cfg.token_ttl_s == MODAL_MANAGED_TOKEN_TTL_S
-    # Every provider stays warm for the runner idle timeout after its last work.
-    assert cfg.keep_warm_after_work_s == 3600.0
     # modal is in PROVIDERS_WITH_MANAGED_LAUNCH, so the parsed config
     # advertises managed launch (drives /v1/info's capability flag).
     assert cfg.managed_launch_supported is True
@@ -6130,8 +6128,6 @@ def test_agent_sandbox_reuses_the_kubernetes_config_block() -> None:
     assert cfg.provider == "agent_sandbox"
     assert cfg.managed_launch_supported is True
     assert cfg.token_ttl_s == KUBERNETES_MANAGED_TOKEN_TTL_S
-    # No keep_warm_s: warm for the runner's default idle timeout after work.
-    assert cfg.keep_warm_after_work_s == 3600.0
     launcher = cfg.launcher_factory()
     assert isinstance(launcher, AgentSandboxLauncher)
     assert launcher.provider == "agent_sandbox"
@@ -6166,17 +6162,6 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
     assert _apply_keep_warm({"x": 1}, None) == {"x": 1}
     with pytest.raises(ValueError):
         _parse_keep_warm_s({"keep_warm_s": -5})
-
-
-def test_keep_warm_after_work_is_the_runner_idle_timeout() -> None:
-    """A sandbox stays warm for the runner idle timeout after its last work."""
-    from omnigent.server.managed_hosts import _keep_warm_after_work_s
-
-    assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": 300}}) == 300.0
-    assert _keep_warm_after_work_s(None) == 3600.0
-    assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": True}}) == 3600.0
-    # 0 disables the runner's idle shutdown: warm for as long as it is connected.
-    assert _keep_warm_after_work_s({"runner": {"idle_timeout_s": 0}}) == float("inf")
 
 
 @pytest.mark.parametrize("relaunch", [False, True])

@@ -2434,11 +2434,11 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
 
     monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 0.02)
     monkeypatch.setattr(runner_tunnel, "PING_MISS_THRESHOLD", 1000)
-    busy_reports: list[tuple[str, bool | None, float | None]] = []
+    reports: list[tuple[str, bool | None]] = []
     monkeypatch.setattr(
         managed_host_keepalive,
         "record_pong",
-        lambda runner_id, busy, idle_s=None: busy_reports.append((runner_id, busy, idle_s)),
+        lambda runner_id, keep_warm: reports.append((runner_id, keep_warm)),
     )
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
     route_app = _tunnel_route_app()
@@ -2450,7 +2450,7 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         await communicator.send_input(
             {
                 "type": "websocket.receive",
-                "text": encode_frame(PongFrame(ts=ping.ts, busy=False, idle_s=42.0)),
+                "text": encode_frame(PongFrame(ts=ping.ts, keep_warm=False)),
             }
         )
         session = route_app.registry.get(_RUNNER_ID)
@@ -2464,8 +2464,8 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
         communicator.stop(exceptions=False)
         await asyncio.gather(communicator.future, return_exceptions=True)
 
-    # The pong's busy report and idle time reach the managed-sandbox keepalive gate.
-    assert busy_reports == [(_RUNNER_ID, False, 42.0)]
+    # The pong's keep-warm report reaches the managed-sandbox keepalive gate.
+    assert reports == [(_RUNNER_ID, False)]
     row = _tunnel_end_events(caplog)[0]
     assert row["connection_id"] == "conn-heartbeat"
     assert row["app_ping_rtt_s"] >= 0
@@ -2476,9 +2476,9 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
 
 
 async def test_first_app_ping_is_sent_at_connect(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With managed sandboxes, the first pong carries the runner's first busy
-    report, so it must not wait a whole ping interval; later pings keep the
-    normal interval."""
+    """With managed sandboxes, the first pong carries the runner's first
+    keep-warm report, so it must not wait a whole ping interval; later pings keep
+    the normal interval."""
     from omnigent.server import managed_host_keepalive
     from omnigent.server.routes import runner_tunnel
 

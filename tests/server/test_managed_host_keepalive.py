@@ -8,6 +8,7 @@ few attributes off each, so a real store would add setup without adding cover.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ import pytest
 
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server import managed_host_keepalive
+from tests.budgets import budget
 
 
 class _Launcher:
@@ -114,8 +116,6 @@ def test_touch_is_rate_limited_per_runner(monkeypatch: pytest.MonkeyPatch) -> No
     )
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-    # Runners whose pongs carry no busy report, so touch() refreshes them.
-    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
 
     managed_host_keepalive.touch("r1")
     managed_host_keepalive.touch("r1")  # inside the window: dropped
@@ -160,8 +160,6 @@ def test_worker_runs_inside_the_callers_workspace_scope(
     monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-    # Runners whose pongs carry no busy report, so touch() refreshes them.
-    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
     with ThreadPoolExecutor(max_workers=1) as pool:
         monkeypatch.setattr(managed_host_keepalive, "_executor", pool)
         with workspace_scope(4242):
@@ -213,8 +211,6 @@ def test_a_runner_already_in_flight_is_not_queued_twice(
     )
     monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
     monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-    # Runners whose pongs carry no busy report, so touch() refreshes them.
-    monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", {"r1", "r2"})
 
     managed_host_keepalive.touch("r1")
     # Past the throttle window, but the first attempt has not finished.
@@ -357,403 +353,99 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
     assert seen == ["alice"]
 
 
-class _BusyGate:
-    """Drive touch()/record_pong() with a fake clock and a recording executor.
+def _wire_recording_executor(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Enable the keepalive with an executor that records submissions."""
+    submitted: list[str] = []
 
-    The refresh interval is 600s, so with no grace (the default here) a runner's
-    window is 600 + 2 * 30 = 660s after its last work.
-    """
-
-    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        self.submitted: list[str] = []
-        self.now = 1000.0
-        monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
-        monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
-        monkeypatch.setattr(
-            managed_host_keepalive, "_executor", SimpleNamespace(submit=self._submit)
-        )
-        for name in (
-            "_last_kept",
-            "_runner_interval_s",
-            "_last_busy_at",
-            "_runner_warm_grace_s",
-            "_last_report_at",
-        ):
-            monkeypatch.setattr(managed_host_keepalive, name, {})
-        monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
-        monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", set())
-        # Provider grace already resolved (no grace) unless a test sets its own.
-        managed_host_keepalive._runner_warm_grace_s["r1"] = 0.0
-        monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 600.0)
-        monkeypatch.setattr(managed_host_keepalive.time, "monotonic", lambda: self.now)
-
-    def _submit(self, *args: object) -> None:
+    def _submit(*args: object) -> None:
         # touch() submits ctx.run(fn, runner_id); the real job frees the in-flight slot.
         runner_id = str(args[-1])
-        self.submitted.append(runner_id)
+        submitted.append(runner_id)
         managed_host_keepalive._inflight.discard(runner_id)
 
-    def tick(self, runner_id: str = "r1") -> None:
-        """One _keepalive_loop iteration, a full interval after the last."""
-        self.now += 600.0
-        managed_host_keepalive.touch(runner_id)
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_host_keepalive, "_executor", SimpleNamespace(submit=_submit))
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    monkeypatch.setattr(managed_host_keepalive, "_reports", {})
+    return submitted
 
 
-def test_pong_interval_matches_the_runner_tunnel() -> None:
+@pytest.mark.parametrize(
+    ("keep_warm", "refreshed"),
+    [(True, True), (False, False), (None, True)],
+    ids=["keep-warm", "let-it-stop", "older-runner"],
+)
+def test_touch_follows_the_runners_latest_report(
+    monkeypatch: pytest.MonkeyPatch, keep_warm: bool | None, refreshed: bool
+) -> None:
+    submitted = _wire_recording_executor(monkeypatch)
+    managed_host_keepalive.open_report("r1")
+    assert managed_host_keepalive.touch("r1") is False, "no refresh before the first pong"
+    managed_host_keepalive.record_pong("r1", keep_warm)
+    assert managed_host_keepalive.touch("r1") is refreshed
+    assert submitted == (["r1"] if refreshed else [])
+
+
+def test_a_pong_wakes_the_loop_only_when_a_refresh_becomes_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wire_recording_executor(monkeypatch)
+    report = managed_host_keepalive.open_report("r1")
+    for keep_warm, woken in (
+        (False, True),  # the first pong: the loop can now decide
+        (False, False),
+        (True, True),  # work resumed
+        (True, False),
+        (None, False),  # still refreshing
+        (False, False),
+        (None, True),  # an older runner took over the id
+    ):
+        report.wake.clear()
+        managed_host_keepalive.record_pong("r1", keep_warm)
+        assert report.wake.is_set() is woken, (keep_warm, woken)
+
+
+def test_a_reconnect_starts_from_its_own_first_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    _wire_recording_executor(monkeypatch)
+    old = managed_host_keepalive.open_report("r1")
+    managed_host_keepalive.record_pong("r1", True)
+    new = managed_host_keepalive.open_report("r1")  # the runner reconnected
+    managed_host_keepalive.close_report("r1", old)  # the old tunnel's teardown
+    assert managed_host_keepalive._reports == {"r1": new}
+    assert managed_host_keepalive.touch("r1") is False, "the new tunnel waits for its pong"
+    managed_host_keepalive.close_report("r1", new)
+    assert managed_host_keepalive._reports == {}
+
+
+async def test_keepalive_loop_refreshes_on_reports_and_keeps_its_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from omnigent.server.routes import runner_tunnel
 
-    assert managed_host_keepalive._PONG_INTERVAL_S == runner_tunnel.PING_INTERVAL_S
+    submitted = _wire_recording_executor(monkeypatch)
+    interval = 0.4
+    monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _rid: interval)
 
+    async def _until(count: int) -> None:
+        async with asyncio.timeout(budget(2)):
+            while len(submitted) < count:
+                await asyncio.sleep(0.01)
 
-def test_nothing_is_refreshed_before_the_first_pong(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The connect-time tick cannot yet tell a reporting runner from an older one.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    assert gate.submitted == []
-
-
-def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")  # connect
-    managed_host_keepalive.record_pong("r1", None)  # first pong: refreshed from now on
-    managed_host_keepalive.record_pong("r1", None)
-    gate.tick()
-    gate.tick()
-    assert gate.submitted == ["r1", "r1", "r1"]
-
-
-def test_work_that_resumes_while_a_job_is_in_flight_is_refreshed_when_it_ends(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A job already deciding not to renew an idle runner must not swallow the
-    # forced refresh for work dispatched meanwhile.
-    gate = _BusyGate(monkeypatch)
-    monkeypatch.setattr(managed_host_keepalive, "_pending_forced", set())
-    _wire(monkeypatch, launcher=_Launcher(), host=None)
-    queued: list[object] = []
-    monkeypatch.setattr(
-        managed_host_keepalive, "_executor", SimpleNamespace(submit=lambda *a: queued.append(a))
-    )
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    managed_host_keepalive._inflight.add("r1")  # a job for r1 is running
-    managed_host_keepalive.record_work_dispatched("r1")
-    assert queued == [], "deduplicated while the job runs"
-    managed_host_keepalive._keep_alive_for_runner("r1")  # that job finishes
-    assert len(queued) == 1, "the pending forced refresh runs without waiting for a tick"
-    assert managed_host_keepalive._pending_forced == set()
-    assert gate.now == 1000.0
-
-
-def test_a_failure_before_submission_does_not_strand_the_runner(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Nothing would ever clear an in-flight mark left by a job that was never
-    # submitted, and every later touch would skip the runner.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", True)  # refreshed
-    assert gate.submitted == ["r1"]
-
-    def _broken_prune(_now: float) -> None:
-        raise RuntimeError("Set changed size during iteration")
-
-    monkeypatch.setattr(managed_host_keepalive, "_THROTTLE_MAX_ENTRIES", -1)  # always prune
-    monkeypatch.setattr(managed_host_keepalive, "_prune_throttle", _broken_prune)
-    gate.now += 300.0
-    with pytest.raises(RuntimeError):
-        managed_host_keepalive.touch("r1", force=True)  # e.g. a deferred forced refresh
-    assert managed_host_keepalive._inflight == set()
-
-    monkeypatch.setattr(managed_host_keepalive, "_THROTTLE_MAX_ENTRIES", 4096)
-    managed_host_keepalive.record_pong("r1", True)  # still working
-    gate.tick()
-    assert gate.submitted == ["r1", "r1"], "the runner can still be renewed"
-
-
-def test_pruning_reads_snapshots_of_the_shared_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A job finishing on the worker thread can prune while the event loop
-    # records pongs; pruning must not iterate the live collections.
-    gate = _BusyGate(monkeypatch)
-    for rid in ("r1", "r2", "r3"):
-        managed_host_keepalive.record_pong(rid, None)
-
-    class _ShrinkingSet(set):
-        def __iter__(self):  # a concurrent record_pong removes a legacy runner mid-scan
-            items = super().__iter__()
-            first = next(items)
-            self.discard(next(rid for rid in set.copy(self) if rid != first))
-            yield first
-            yield from items
-
-    monkeypatch.setattr(
-        managed_host_keepalive,
-        "_unreporting_runners",
-        _ShrinkingSet(managed_host_keepalive._unreporting_runners),
-    )
-    managed_host_keepalive._prune_throttle(gate.now + 5000.0)  # must not raise
-    assert managed_host_keepalive._last_kept == {}
-
-
-def test_pruning_drops_a_legacy_runner_gone_before_its_first_tick(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", None)  # forced refresh, no timestamp
-    managed_host_keepalive._prune_throttle(gate.now + 5000.0)
-    assert managed_host_keepalive._unreporting_runners == set()
-    # Still connected after all: its next pong registers it again.
-    managed_host_keepalive.record_pong("r1", None)
-    assert managed_host_keepalive._unreporting_runners == {"r1"}
-
-
-def test_reconnect_to_a_fresh_replica_does_not_renew_an_expired_grace(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A replica without this runner's history: an idle reconnect alone must not
-    # extend the sandbox, but dispatched work must renew it at once.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = 300.0
-    managed_host_keepalive.touch("r1")  # the new tunnel's first tick
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    gate.tick()
-    assert gate.submitted == [], "an idle reconnect must let the sandbox stop"
-    gate.now += 5.0
-    managed_host_keepalive.record_work_dispatched("r1")
-    assert gate.submitted == ["r1"]
-
-
-def test_idle_runner_is_not_refreshed_until_work_resumes(monkeypatch: pytest.MonkeyPatch) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    gate.tick()
-    gate.tick()
-    assert gate.submitted == [], "an idle runner must let its sandbox stop"
-
-    # Work after the window ran out refreshes at once, not at the next tick.
-    gate.now += 30.0
-    managed_host_keepalive.record_pong("r1", True)
-    assert gate.submitted == ["r1"]
-
-
-def test_runner_with_no_work_yet_stays_warm_for_its_grace_after_its_start(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Its pongs report the idle time since it started, like its own idle timeout.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
-    managed_host_keepalive.touch("r1")  # t=1000, the runner starts
-    gate.now += 30.0
-    managed_host_keepalive.record_pong("r1", False, idle_s=30.0)  # refreshed: in its grace
-    gate.tick()  # 630s after start
-    gate.tick()  # 1230s
-    gate.tick()  # 1830s: past the grace
-    assert gate.submitted == ["r1"] * 3
-
-
-def test_busy_runner_is_refreshed_once_per_interval(monkeypatch: pytest.MonkeyPatch) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.touch("r1")
-    for _ in range(3):
-        managed_host_keepalive.record_pong("r1", True)  # the first one refreshes
-        gate.tick()
-    assert gate.submitted == ["r1"] * 4
-
-    managed_host_keepalive.record_pong("r1", True)
-    managed_host_keepalive.record_pong("r1", True)
-    assert len(gate.submitted) == 4, "busy pongs inside an interval must not refresh on their own"
-
-
-@pytest.mark.parametrize(
-    ("busy", "idle_s", "grace"),
-    [(True, None, 0.0), (None, None, 0.0), (False, 30.0, 1500.0)],
-    ids=["busy", "legacy", "idle-within-grace"],
-)
-def test_a_first_pong_refresh_keeps_the_periodic_schedule(
-    monkeypatch: pytest.MonkeyPatch, busy: bool | None, idle_s: float | None, grace: float
-) -> None:
-    # The keepalive loop ticks at connect and every interval after; a first pong
-    # lands between ticks. Its refresh must not push the next tick's refresh out
-    # by almost an interval.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = grace
-    managed_host_keepalive.touch("r1")  # t=1000: connect tick, no pong yet
-    gate.now += 1.0
-    managed_host_keepalive.record_pong("r1", busy, idle_s=idle_s)  # t=1001: refreshed
-    gate.now = 1600.0
-    managed_host_keepalive.touch("r1")  # the loop's next tick
-    assert gate.submitted == ["r1", "r1"]
-
-
-def test_busy_runner_is_refreshed_on_every_tick_between_pongs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # A 5s refresh interval with 30s pongs: a runner still busy at its last pong
-    # must be refreshed on every tick until well past the next pong, or a short
-    # platform window expires between pongs.
-    gate = _BusyGate(monkeypatch)
-    monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 5.0)
-    managed_host_keepalive.record_pong("r1", True)
-    for _ in range(5):
-        gate.now += 5.0
-        managed_host_keepalive.touch("r1")
-    assert gate.submitted == ["r1"] * 6
-
-    managed_host_keepalive.record_pong("r1", False, idle_s=25.0)
-    gate.now = 1000.0 + 5.0 + 60.0  # the window: one interval plus two pongs
-    managed_host_keepalive.touch("r1")
-    assert len(gate.submitted) == 6, "refreshes stop once the window after the last work ends"
-
-
-def test_pongs_record_nothing_without_managed_keepalive(monkeypatch: pytest.MonkeyPatch) -> None:
-    gate = _BusyGate(monkeypatch)
-    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", None)
-    managed_host_keepalive.record_pong("r1", True)
-    managed_host_keepalive.record_pong("r1", None)
-    assert managed_host_keepalive._last_busy_at == {}
-    assert managed_host_keepalive._last_report_at == {}
-    assert managed_host_keepalive._unreporting_runners == set()
-    assert gate.submitted == []
-
-
-def test_runner_stays_warm_for_its_grace_after_the_last_busy_report(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Work that ended inside an interval is refreshed at the next tick; a 1500s
-    # grace (the runner idle timeout, e.g. agent_sandbox keep_warm_s) keeps
-    # refreshing after it, and with no grace the window ends a tick later.
-    for grace, expected in ((0.0, 2), (1500.0, 3)):
-        gate = _BusyGate(monkeypatch)
-        managed_host_keepalive._runner_warm_grace_s["r1"] = grace
-        managed_host_keepalive.record_pong("r1", True)  # t=1000: refreshed
-        managed_host_keepalive.record_pong("r1", False, idle_s=0.0)
-        gate.tick()  # t=1600: work since the last refresh
-        gate.tick()  # t=2200: only within the grace
-        gate.tick()  # t=2800: past both
-        assert gate.submitted == ["r1"] * expected, grace
-
-
-def test_forced_refresh_keeps_the_periodic_schedule(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Work resuming between ticks must not push the next periodic refresh a
-    # whole interval later.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", True)  # t=1000: refreshed
-    gate.tick()  # t=1600: refreshed
-    gate.tick()  # t=2200: idle, skipped
-    gate.now += 61.0
-    managed_host_keepalive.record_pong("r1", True)  # forced at t=2261
-    gate.now += 539.0
-    managed_host_keepalive.touch("r1")  # periodic tick at t=2800 still refreshes
-    assert gate.submitted == ["r1"] * 4
-
-
-def test_dispatched_work_refreshes_before_the_next_pong(monkeypatch: pytest.MonkeyPatch) -> None:
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    gate.now += 1.0
-    managed_host_keepalive.record_work_dispatched("r1")  # a message right after an idle pong
-    assert gate.submitted == ["r1"], "new work must not wait for the next pong"
-    gate.tick()
-    assert gate.submitted == ["r1"] * 2
-
-
-def test_pruning_preserves_live_idle_reporting_state(monkeypatch: pytest.MonkeyPatch) -> None:
-    # An idle reporting runner is not refreshed, while its pongs keep coming;
-    # pruning must not turn it back into a runner that gets refreshed.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    gate.now += 5000.0
-    managed_host_keepalive.record_pong("r1", False, idle_s=5900.0)
-    managed_host_keepalive._prune_throttle(gate.now)
-    managed_host_keepalive.touch("r1")
-    assert gate.submitted == []
-
-
-def test_an_idle_runner_stays_idle_across_a_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The new tunnel's immediate first tick must not refresh a runner that
-    # reported idle, or every tunnel reconnect would extend its sandbox.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    gate.now += 900.0
-    managed_host_keepalive.touch("r1")  # reconnect: _keepalive_loop's first touch
-    assert gate.submitted == []
-
-
-def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # An older runner build may reconnect under the same id; its pongs carry no busy.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
-    managed_host_keepalive.record_pong("r1", None)
-    managed_host_keepalive.record_work_dispatched("r1")
-    assert "r1" not in managed_host_keepalive._last_report_at, "it stays a non-reporting runner"
-    gate.tick()
-    assert gate.submitted == ["r1", "r1"]
-
-
-@pytest.mark.parametrize(("configured", "expected"), [(1500.0, 1500.0), (None, 3600.0)])
-def test_provider_grace_reaches_the_runner_cache(
-    monkeypatch: pytest.MonkeyPatch, configured: float | None, expected: float
-) -> None:
-    # Duck-typed configs without the field get the default runner idle timeout.
-    launcher = _Launcher()
-    _wire(
-        monkeypatch,
-        launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
-    )
-    config = SimpleNamespace(launcher_factory=lambda: launcher)
-    if configured is not None:
-        config.keep_warm_after_work_s = configured
-    monkeypatch.setattr(
-        managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=lambda _p: config)
-    )
-    monkeypatch.setattr(managed_host_keepalive, "_runner_warm_grace_s", {})
-    managed_host_keepalive._keep_alive_for_runner("r1")
-    assert managed_host_keepalive._runner_warm_grace_s == {"r1": expected}
-
-
-@pytest.mark.parametrize(
-    ("grace", "idle_s", "renewed"),
-    [(3600.0, 300.0, True), (300.0, 900.0, False), (float("inf"), 5000.0, True)],
-    ids=["within-grace", "grace-expired", "unlimited"],
-)
-def test_a_fresh_server_learns_the_grace_before_deciding(
-    monkeypatch: pytest.MonkeyPatch, grace: float, idle_s: float, renewed: bool
-) -> None:
-    # A restarted server (or another replica) has no cached grace for this
-    # runner: it must resolve the provider's grace, then renew only if the
-    # runner's reported idle time is still within it. Idle time is not new work.
-    gate = _BusyGate(monkeypatch)
-    monkeypatch.setattr(managed_host_keepalive, "_runner_warm_grace_s", {})
-    launcher = _Launcher()
-    _wire(
-        monkeypatch,
-        launcher=launcher,
-        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
-    )
-    config = SimpleNamespace(launcher_factory=lambda: launcher, keep_warm_after_work_s=grace)
-    monkeypatch.setattr(
-        managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=lambda _p: config)
-    )
-    # Run the worker inline: touch() submits ctx.run(_keep_alive_for_runner, runner_id).
-    monkeypatch.setattr(
-        managed_host_keepalive, "_executor", SimpleNamespace(submit=lambda fn, *args: fn(*args))
-    )
-    managed_host_keepalive.touch("r1")  # the new tunnel's first tick: no pong yet
-    managed_host_keepalive.record_pong("r1", False, idle_s=idle_s)
-    assert managed_host_keepalive._runner_warm_grace_s == {"r1": grace}
-    assert managed_host_keepalive._last_busy_at["r1"] == gate.now - idle_s
-    assert launcher.calls == (["sbx1"] if renewed else [])
-
-
-def test_an_unlimited_grace_keeps_an_idle_runner_warm(monkeypatch: pytest.MonkeyPatch) -> None:
-    # runner.idle_timeout_s 0: the runner never idles out, so neither does its sandbox.
-    gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = float("inf")
-    managed_host_keepalive.record_pong("r1", False, idle_s=5000.0)
-    gate.tick()
-    gate.tick()
-    assert gate.submitted == ["r1"] * 3
+    task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
+    try:
+        await asyncio.sleep(0.05)
+        assert submitted == [], "the connect tick waits for the first pong"
+        managed_host_keepalive.record_pong("r1", True)
+        await _until(1)  # woken at once, not a tick later
+        await _until(2)  # then the next tick, a full interval on
+        managed_host_keepalive.record_pong("r1", False)
+        await asyncio.sleep(interval * 2)
+        assert len(submitted) == 2, "no refreshes while the runner says not to"
+        managed_host_keepalive.record_pong("r1", True)
+        await _until(3)  # resumed work refreshes at once
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert managed_host_keepalive._reports == {}, "the loop releases its report"

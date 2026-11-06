@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from omnigent.runner.busy_check import RunnerBusyCheck
 
 
@@ -24,21 +26,27 @@ def test_native_progress_is_busy_only_when_it_advances() -> None:
     assert busy.check()
 
 
-def test_report_gives_seconds_since_the_last_work(monkeypatch) -> None:
+def test_keep_warm_lasts_the_grace_after_the_last_work(monkeypatch) -> None:
     from omnigent.runner import busy_check
 
     clock = [100.0]
     monkeypatch.setattr(busy_check.time, "monotonic", lambda: clock[0])
     active = False
     busy = RunnerBusyCheck(lambda: active)
-    clock[0] = 110.0
-    # No work yet: idle since the check was created, like the runner idle timeout.
-    assert busy.report() == (False, 10.0)
+    # No work yet: the grace counts from the runner's start, like its idle timeout.
+    clock[0] = 159.0
+    assert busy.keep_warm(60.0)
+    clock[0] = 160.0
+    assert not busy.keep_warm(60.0)
     active = True
-    assert busy.report() == (True, 0.0)
+    assert busy.keep_warm(60.0)
     active = False
-    clock[0] = 130.0
-    assert busy.report() == (False, 20.0)
+    clock[0] = 219.0
+    assert busy.keep_warm(60.0), "within the grace after the last work"
+    clock[0] = 220.0
+    assert not busy.keep_warm(60.0)
+    assert not busy.keep_warm(0.0)
+    assert busy.keep_warm(math.inf), "an unlimited grace keeps it warm while connected"
 
 
 def test_each_consumer_tracks_progress_independently() -> None:

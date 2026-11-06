@@ -15,6 +15,7 @@ import gc
 import hashlib
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -32,7 +33,7 @@ from fastapi import FastAPI
 from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
-from omnigent.runner.busy_check import DEFAULT_RUNNER_IDLE_TIMEOUT_S, RunnerBusyCheck
+from omnigent.runner.busy_check import RunnerBusyCheck
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
@@ -58,7 +59,7 @@ _RUNNER_PREWARM_SPEC_PATH_ENV_VAR = "RUNNER_PREWARM_SPEC_PATH"
 # with the CLI/server/host) instead of a hard-coded placeholder.
 _RUNNER_VERSION = VERSION
 _RUNNER_CONFIG_HOME_ENV_VAR = "OMNIGENT_CONFIG_HOME"
-_DEFAULT_RUNNER_IDLE_TIMEOUT_S = DEFAULT_RUNNER_IDLE_TIMEOUT_S
+_DEFAULT_RUNNER_IDLE_TIMEOUT_S = 60 * 60
 _RUNNER_IDLE_MONITOR_MAX_POLL_INTERVAL_S = 60.0
 _AUTH_DISCOVERY_RETRY_INTERVAL_S = 5.0
 # The runner offloads short native-CLI/IPC ops via asyncio.to_thread. Python's
@@ -2075,8 +2076,12 @@ async def _run_tunnel_from_env() -> None:
             return _has_active_work()
         return event_dispatcher.has_pending or bool(callback())
 
-    # The server extends a managed sandbox only while pongs report busy.
-    pong_busy = RunnerBusyCheck(_has_sandbox_work, _last_work_progress)
+    # Each pong tells the server whether to keep a managed sandbox warm: while
+    # the runner works, and for its idle timeout after (0: while connected), so
+    # the sandbox lives as long as an idle runner would, but viewing alone does
+    # not count.
+    sandbox_busy = RunnerBusyCheck(_has_sandbox_work, _last_work_progress)
+    keep_warm_grace_s = idle_timeout_s if idle_timeout_s > 0 else math.inf
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy
@@ -2089,7 +2094,7 @@ async def _run_tunnel_from_env() -> None:
             event_dispatcher=event_dispatcher,
             on_reconnect=getattr(app.state, "catch_up_scan", None),
             on_activity=_mark_activity,
-            report_busy=pong_busy.report,
+            report_keep_warm=lambda: sandbox_busy.keep_warm(keep_warm_grace_s),
             shutdown_event=tunnel_shutdown_event,
             on_graceful_shutdown=getattr(app.state, "drain_session_streams", None),
             direct_attach_port=(
