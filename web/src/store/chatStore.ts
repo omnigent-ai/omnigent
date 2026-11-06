@@ -737,6 +737,12 @@ export interface ConversationState {
     pendingId?: string;
     contentKey?: string;
   }[];
+  /**
+   * Latest content a `session_input_edited` event gave each queued input, by
+   * pending id; `null` once merged into another. A send's acknowledgement
+   * applies an edit that named its pending id first.
+   */
+  queuedInputEdits: Record<string, MessageContentBlock[] | null>;
   /** Lifecycle of the most recent send. `null` when idle pre-send. */
   activeResponse: ActiveResponse | null;
   /**
@@ -1452,6 +1458,12 @@ export interface ChatActions {
   compact: () => Promise<void>;
   /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
+  /**
+   * Replace the text of a queued claude-native message, as Up does in the
+   * terminal. Rejects, with the bubble keeping its original text, when the
+   * message is no longer queued or the terminal edit failed.
+   */
+  editQueuedMessage: (pendingId: string, text: string) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -2176,6 +2188,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
+  queuedInputEdits: {},
   btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
@@ -2971,15 +2984,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // server can now replay it. The bubble keeps rendering until its
         // consumed event pops it.
         setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.map((p) =>
-            p.tempId === tempId
-              ? {
-                  ...p,
-                  posted: true,
-                  ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
-                }
-              : p,
-          ),
+          pendingUserMessages: s.pendingUserMessages.flatMap((p) => {
+            if (p.tempId !== tempId) return [p];
+            const edit = postResult.pendingId
+              ? s.queuedInputEdits[postResult.pendingId]
+              : undefined;
+            if (edit === null) return [];
+            return [
+              {
+                ...p,
+                posted: true,
+                ...(postResult.pendingId ? { pendingId: postResult.pendingId } : {}),
+                ...(edit ? { content: edit } : {}),
+              },
+            ];
+          }),
           settledShellInputs: s.settledShellInputs.map((entry) =>
             entry.tempId === tempId && postResult.pendingId
               ? { ...entry, pendingId: postResult.pendingId }
@@ -3643,6 +3662,36 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ? { redirectToConversationId: sessionId }
         : {},
     );
+  },
+  editQueuedMessage: async (pendingId, text) => {
+    const { conversationId, pendingUserMessages } = get();
+    const original = pendingUserMessages.find((p) => isPendingInput(p, pendingId))?.content;
+    if (!conversationId || original === undefined) {
+      throw new ApiError("This message is no longer queued.", 409, "conflict");
+    }
+    const edited: MessageContentBlock[] = [{ type: "input_text", text }];
+    setterFor(conversationId)((s) => ({
+      pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, edited),
+    }));
+    try {
+      await postEvent(conversationId, {
+        type: "queued_message_edit",
+        data: { pending_id: pendingId, content: text },
+      });
+    } catch (error) {
+      // An edit event already confirmed this text, so only the response was lost.
+      const state = setterForState(conversationId);
+      if (state !== null && queuedEditConfirmed(state, pendingId, text)) return;
+      setterFor(conversationId)((s) => {
+        // Keep newer text that a session.input.edited event wrote meanwhile.
+        const current = s.pendingUserMessages.find((p) => isPendingInput(p, pendingId));
+        if (current?.content !== edited) return {};
+        return {
+          pendingUserMessages: withPendingContent(s.pendingUserMessages, pendingId, original),
+        };
+      });
+      throw error;
+    }
   },
 
   refreshSessionState: async (conversationId) => {
@@ -7759,13 +7808,7 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
-  const content = raw.filter(
-    (b): b is MessageContentBlock =>
-      typeof b === "object" &&
-      b !== null &&
-      "type" in b &&
-      (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
-  );
+  const content = userInputBlocksOf(raw);
   if (event.isMeta !== true && isHumanAuthoredInput(event)) return content;
   // A Claude background-task wake is hidden context (`is_meta`) that still
   // has to start a new turn on screen: render it as a system marker. Every
@@ -7774,6 +7817,51 @@ function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentB
   if (marker !== null) return marker;
   if (event.isMeta === true) return null;
   return content;
+}
+
+function userInputBlocksOf(raw: unknown[]): MessageContentBlock[] {
+  return raw.filter(
+    (b): b is MessageContentBlock =>
+      typeof b === "object" &&
+      b !== null &&
+      "type" in b &&
+      (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
+  );
+}
+
+/** Whether a bubble is the server pending input `pendingId` (replayed bubbles use it as `tempId`). */
+export function isPendingInput(message: PendingUserMessage, pendingId: string): boolean {
+  return message.pendingId === pendingId || message.tempId === pendingId;
+}
+
+/**
+ * Whether the latest edit event gave queued input `pendingId` the text `text`,
+ * ignoring whitespace runs as Claude Code's queue matching does.
+ *
+ * @param state - The conversation's state, read for its `queuedInputEdits`.
+ * @param pendingId - The server pending id, e.g. `"pending_1"`.
+ * @param text - The edited text, e.g. `"Then summarize the logs"`.
+ */
+export function queuedEditConfirmed(
+  state: Pick<ConversationState, "queuedInputEdits">,
+  pendingId: string,
+  text: string,
+): boolean {
+  const content = state.queuedInputEdits[pendingId];
+  return (
+    content != null &&
+    messageContentText(content) === messageContentText([{ type: "input_text", text }])
+  );
+}
+
+function withPendingContent(
+  messages: PendingUserMessage[],
+  pendingId: string,
+  content: MessageContentBlock[],
+): PendingUserMessage[] {
+  return messages.some((p) => isPendingInput(p, pendingId))
+    ? messages.map((p) => (isPendingInput(p, pendingId) ? { ...p, content } : p))
+    : messages;
 }
 
 export function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
@@ -9003,6 +9091,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // here — a single "flush on the idle event" is fragile: a message queued
       // just after the idle edge, or an SSE reconnect that replays state
       // without a fresh transition, would strand the queue forever.
+      return;
+    }
+    case "session_input_edited": {
+      const content = userInputBlocksOf(event.content);
+      applyToConversation((s) => {
+        const kept =
+          event.mergedPendingIds.length === 0
+            ? s.pendingUserMessages
+            : s.pendingUserMessages.filter(
+                (p) => !event.mergedPendingIds.some((id) => isPendingInput(p, id)),
+              );
+        const queuedInputEdits = { ...s.queuedInputEdits, [event.pendingId]: content };
+        for (const id of event.mergedPendingIds) queuedInputEdits[id] = null;
+        return {
+          pendingUserMessages: withPendingContent(kept, event.pendingId, content),
+          queuedInputEdits,
+        };
+      });
       return;
     }
     case "session_input_consumed": {

@@ -7373,6 +7373,128 @@ describe("chatStore — stop", () => {
   });
 });
 
+describe("chatStore — queued native message edits", () => {
+  const text = (value: string) => [{ type: "input_text" as const, text: value }];
+
+  beforeEach(() => {
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      pendingUserMessages: [
+        { tempId: "tmp_1", pendingId: "pending_1", content: text("Then summarize") },
+        { tempId: "pending_2", content: text("and list them") },
+      ],
+    });
+  });
+
+  it("session_input_edited replaces the bubble's text and drops the merged bubbles", () => {
+    handleSessionEvent({
+      type: "session_input_edited",
+      pendingId: "pending_1",
+      content: [{ type: "input_text", text: "Then summarize the logs" }],
+      mergedPendingIds: ["pending_2"],
+    });
+
+    expect(useChatStore.getState().pendingUserMessages).toEqual([
+      { tempId: "tmp_1", pendingId: "pending_1", content: text("Then summarize the logs") },
+    ]);
+  });
+
+  it("editQueuedMessage posts the edit and shows the new text", async () => {
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_2", "and list the errors"),
+    ).resolves.toBeUndefined();
+
+    const events = fetchMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/v1/sessions/conv_abc/events"),
+    );
+    expect(events.map(([, init]) => JSON.parse((init as RequestInit).body as string))).toEqual([
+      {
+        type: "queued_message_edit",
+        data: { pending_id: "pending_2", content: "and list the errors" },
+      },
+    ]);
+    expect(useChatStore.getState().pendingUserMessages[1]?.content).toEqual(
+      text("and list the errors"),
+    );
+  });
+
+  it("editQueuedMessage restores the original text when the edit is refused", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        return mockResponse(
+          { error: { code: "conflict", message: "This message is no longer queued." } },
+          { ok: false, status: 409 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
+    ).rejects.toMatchObject({ status: 409, message: "This message is no longer queued." });
+
+    expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(text("Then summarize"));
+  });
+
+  it("editQueuedMessage treats an edit confirmed while its request was failing as applied", async () => {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_abc/events")) {
+        handleSessionEvent({
+          type: "session_input_edited",
+          pendingId: "pending_1",
+          content: [{ type: "input_text", text: "Then  summarize the logs" }],
+          mergedPendingIds: [],
+        });
+        return mockResponse(
+          { error: { code: "runner_unavailable", message: "It may still apply." } },
+          { ok: false, status: 503 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().editQueuedMessage("pending_1", "Then summarize the logs"),
+    ).resolves.toBeUndefined();
+
+    expect(useChatStore.getState().pendingUserMessages[0]?.content).toEqual(
+      text("Then  summarize the logs"),
+    );
+  });
+
+  it.each([
+    ["applies an edit", [], [text("Then summarize the logs")]],
+    ["drops a merge", ["pending_new"], []],
+  ])(
+    "a send's acknowledgement %s that named its pending id first",
+    async (_name, mergedPendingIds, expected) => {
+      useChatStore.setState({ pendingUserMessages: [], abortController: new AbortController() });
+      let resolvePost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).endsWith("/v1/sessions/conv_abc/events") && init?.method === "POST") {
+          return new Promise<Response>((resolve) => {
+            resolvePost = () => resolve(mockResponse({ queued: true, pending_id: "pending_new" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("Then summarize", "agent_xyz");
+      await vi.waitFor(() => expect(resolvePost).not.toBeNull());
+
+      handleSessionEvent({
+        type: "session_input_edited",
+        pendingId: mergedPendingIds.length ? "pending_old" : "pending_new",
+        content: [{ type: "input_text", text: "Then summarize the logs" }],
+        mergedPendingIds,
+      });
+      resolvePost!();
+      await sending;
+
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.content)).toEqual(expected);
+    },
+  );
+});
+
 describe("chatStore — handleSessionEvent (session.* events)", () => {
   // These cases call `handleSessionEvent` directly, without the stream that
   // normally names the delivering conversation. Bind `conv_abc` — the id their

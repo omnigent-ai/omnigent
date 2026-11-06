@@ -14,6 +14,7 @@ import {
   type ChangeEvent,
   type FormEvent,
   type KeyboardEvent,
+  type SetStateAction,
   forwardRef,
   memo,
   useCallback,
@@ -100,8 +101,10 @@ import {
   composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
+  isPendingInput,
   isStaleTempConvId,
   isTempConvId,
+  queuedEditConfirmed,
   retryConversationLoad,
   type ChatState,
   type PendingInitialPrompt,
@@ -2426,16 +2429,33 @@ function ComposerImpl(
   const {
     draft,
     value,
-    setValue,
+    setValue: setDraftValue,
     fullText,
     storedReplyDraft,
     activeTextId,
     focusText,
     editText,
-    replaceText,
+    replaceText: replaceDraftText,
     appendQuote,
     removeQuote,
   } = useReplyDraft();
+  // Pending id of the queued Claude Code message ArrowUp recalled for editing.
+  // Typing and dictation keep editing it; setting the draft any other way ends the edit.
+  const editingQueuedIdRef = useRef<string | null>(null);
+  const setValue = useCallback(
+    (next: SetStateAction<string>) => {
+      editingQueuedIdRef.current = null;
+      setDraftValue(next);
+    },
+    [setDraftValue],
+  );
+  const replaceText = useCallback(
+    (text: string, saved?: StoredReplyDraft) => {
+      editingQueuedIdRef.current = null;
+      replaceDraftText(text, saved);
+    },
+    [replaceDraftText],
+  );
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
   const [planModeBusy, setPlanModeBusy] = useState(false);
@@ -2511,7 +2531,7 @@ function ComposerImpl(
   }, []);
   // Declared after textareaRef so dictation can place the caret after the
   // text it inserts (and insert at the caret rather than the draft's end).
-  const dictation = useDictationInsert(value, setValue, textareaRef);
+  const dictation = useDictationInsert(value, setDraftValue, textareaRef);
   // Highlight overlay mirroring the textarea; scroll-synced so the tinted
   // `/skill` token stays aligned once the draft grows past the visible rows.
   const backdropRef = useRef<HTMLDivElement>(null);
@@ -2574,6 +2594,7 @@ function ComposerImpl(
   const steerMessage = useChatStore((s) => s.steerMessage);
   const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
   const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const editQueuedMessage = useChatStore((s) => s.editQueuedMessage);
   // Drain the queue whenever idle with a waiting head — level-triggered so a
   // message queued right after the turn ended (or after an SSE reconnect that
   // carries no fresh idle transition) still sends instead of stranding. Hold
@@ -2964,6 +2985,11 @@ function ComposerImpl(
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
   const composerServerInfo = useServerInfo();
   const showClear = composerOffersClear(sessionHarness, composerServerInfo);
+  // Older servers reject queued_message_edit, so Up keeps browsing history there.
+  const canEditQueuedInput =
+    sessionHarness === "claude-native" &&
+    composerServerInfo !== "loading" &&
+    !!composerServerInfo.session_event_types?.includes("queued_message_edit");
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3105,7 +3131,7 @@ function ComposerImpl(
     mentionEntries,
     text: value,
     setText: (next) => {
-      setValue(next);
+      setDraftValue(next);
       dirtyRef.current = true;
     },
     textareaRef,
@@ -3644,6 +3670,24 @@ function ComposerImpl(
   // Allow continued navigation through recalled entries with quote cards.
   // User edits and quote changes leave recall mode.
   const recallingRef = useRef(false);
+  // An edit put back after its request failed, retracted if Claude Code applies it anyway.
+  const restoredQueuedEditRef = useRef<{ pendingId: string; text: string } | null>(null);
+  // Sessions whose runner predates queued edits, so Up browses history there.
+  const queuedEditUnsupportedRef = useRef(new Set<string>());
+  useEffect(() => {
+    editingQueuedIdRef.current = null;
+    restoredQueuedEditRef.current = null;
+  }, [conversationId]);
+  const queuedInputEdits = useChatStore((s) => s.queuedInputEdits);
+  useEffect(() => {
+    const restored = restoredQueuedEditRef.current;
+    if (restored === null) return;
+    if (!queuedEditConfirmed({ queuedInputEdits }, restored.pendingId, restored.text)) return;
+    restoredQueuedEditRef.current = null;
+    if (valueRef.current !== restored.text || filesRef.current.length > 0) return;
+    replaceText("");
+    toast.success("Claude Code applied your edit.");
+  }, [queuedInputEdits, replaceText]);
 
   const replyQuoteInsertedRef = useRef(false);
   useImperativeHandle(ref, () => ({
@@ -3735,10 +3779,60 @@ function ComposerImpl(
     )
       return;
 
+    // Commands run as usual, and text for a message Claude has taken sends anew.
+    const editingQueuedId = editingQueuedIdRef.current;
+    editingQueuedIdRef.current = null;
+    restoredQueuedEditRef.current = null;
+    const queuedEditId =
+      editingQueuedId !== null &&
+      trimmed &&
+      !trimmed.startsWith("!") &&
+      !isSlashCommandText(trimmed) &&
+      useChatStore.getState().pendingUserMessages.some((m) => isPendingInput(m, editingQueuedId))
+        ? editingQueuedId
+        : null;
+    if (
+      queuedEditId !== null &&
+      (files.length > 0 || mentionedItems.length > 0 || draft.quotes.length > 0)
+    ) {
+      editingQueuedIdRef.current = queuedEditId;
+      setCommandError(
+        "A queued message can only be edited as text. Remove the attachments, mentions and quotes, or clear the composer to send a new message.",
+      );
+      return;
+    }
+
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+
+    if (queuedEditId !== null) {
+      const edited = fullText.trimEnd();
+      const editedIn = conversationId;
+      appendEntry(edited);
+      dirtyRef.current = true;
+      setValue("");
+      setCommandError(null);
+      void editQueuedMessage(queuedEditId, edited).catch((error: unknown) => {
+        const refusal = error instanceof ApiError && error.code !== null;
+        // Restore the edit to resend it, unless the user has moved on.
+        const restored =
+          useChatStore.getState().conversationId === editedIn && !tailTextareaRef.current?.value;
+        const unsupported = refusal && error.code === "runner_capability_mismatch";
+        if (unsupported && editedIn) queuedEditUnsupportedRef.current.add(editedIn);
+        const reason = refusal ? error.message : "Couldn't edit the queued message.";
+        toast.error(restored ? `${reason} Your edit is back in the composer.` : reason);
+        if (!restored) return;
+        replaceText(edited);
+        restoredQueuedEditRef.current = { pendingId: queuedEditId, text: edited };
+        // Enter retries the edit only after a failure that may pass.
+        if (!refusal || (error.status >= 500 && !unsupported)) {
+          editingQueuedIdRef.current = queuedEditId;
+        }
+      });
+      return;
+    }
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -4000,6 +4094,23 @@ function ComposerImpl(
             applyRecall(ta, target);
             return;
           }
+          // Like Claude Code's own Up, recall a message it has queued for editing.
+          const queued =
+            canEditQueuedInput &&
+            conversationId &&
+            !queuedEditUnsupportedRef.current.has(conversationId)
+              ? editableQueuedInput(
+                  useChatStore.getState().pendingUserMessages,
+                  getCurrentAuthorId(),
+                )
+              : null;
+          if (queued !== null) {
+            e.preventDefault();
+            resetCursor();
+            applyRecall(ta, { text: queued.text });
+            editingQueuedIdRef.current = queued.pendingId;
+            return;
+          }
         }
         const recalled = recallPrevious(fullText, storedReplyDraft);
         if (recalled !== null) {
@@ -4019,6 +4130,7 @@ function ComposerImpl(
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
     slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
+    if (!e.target.value) editingQueuedIdRef.current = null;
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
@@ -4501,7 +4613,7 @@ function ComposerImpl(
                   voiceSnapshotRef.current = value;
                 }}
                 onVoiceDiscard={() => {
-                  setValue(voiceSnapshotRef.current);
+                  setDraftValue(voiceSnapshotRef.current);
                 }}
                 onListeningChange={setDictating}
                 onTranscript={(text) => {
@@ -4604,6 +4716,48 @@ export function hasSentNativeInputPending(
       (message) => message.initialDraft === undefined && message.createdAtS !== undefined,
     )
   );
+}
+
+/**
+ * The latest queued native message, when the composer can edit it in place: the
+ * viewer sent it, the server has accepted it (so it holds a pending id), its
+ * content is plain text, and no other queued message has the same text.
+ *
+ * @param pendingUserMessages - The conversation's optimistic and replayed bubbles.
+ * @param viewer - The viewer's author id from `getCurrentAuthorId()`, e.g.
+ *   `"alice@example.com"`, or `null` when unattributed.
+ * @returns Its server pending id and text, or `null` when it is not editable.
+ */
+export function editableQueuedInput(
+  pendingUserMessages: PendingUserMessage[],
+  viewer: string | null,
+): { pendingId: string; text: string } | null {
+  const message = pendingUserMessages.at(-1);
+  if (message === undefined || message.initialDraft !== undefined) return null;
+  if ((message.author ?? null) !== viewer) return null;
+  const pendingId =
+    message.pendingId ?? (message.tempId.startsWith("pending_") ? message.tempId : null);
+  if (pendingId === null || message.content.length === 0) return null;
+  if (!message.content.every((block) => block.type === "input_text")) return null;
+  const text = message.content.map((block) => block.text).join("\n");
+  if (!text.trim() || text.startsWith("!")) return null;
+  // Claude Code's queue holds only text, so it can't tell identical messages apart.
+  const collapsed = collapseWhitespace(text);
+  const duplicated = pendingUserMessages.some(
+    (other) =>
+      other !== message &&
+      other.initialDraft === undefined &&
+      collapseWhitespace(
+        other.content
+          .flatMap((block) => (block.type === "input_text" ? [block.text] : []))
+          .join("\n"),
+      ) === collapsed,
+  );
+  return duplicated ? null : { pendingId, text };
+}
+
+function collapseWhitespace(text: string): string {
+  return text.trim().split(/\s+/).join(" ");
 }
 
 /**

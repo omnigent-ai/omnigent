@@ -19,6 +19,7 @@ import type {
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
+  SessionInputEditedEvent,
   SessionInterruptedEvent,
   SessionModelEvent,
   SessionPermissionModeEvent,
@@ -198,6 +199,42 @@ describe("session.input.consumed (NESTED envelope)", () => {
     });
     // null (not undefined) so the store's `if (cleared)` guard reads cleanly.
     expect((out[0] as SessionInputConsumedEvent).clearedPendingId).toBeNull();
+  });
+});
+
+describe("session.input.edited (NESTED envelope)", () => {
+  it("lifts the edited pending id, its content, and the merged ids", () => {
+    const out = parse("session.input.edited", {
+      type: "session.input.edited",
+      data: {
+        pending_id: "pending_2",
+        content: [{ type: "input_text", text: "Then summarize the logs" }, "not a block"],
+        merged_pending_ids: ["pending_3", 7],
+      },
+    });
+    expect(out).toEqual([
+      {
+        type: "session_input_edited",
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "Then summarize the logs" }],
+        mergedPendingIds: ["pending_3"],
+      } satisfies SessionInputEditedEvent,
+    ]);
+  });
+
+  it("rejects a payload without a pending id or content", () => {
+    expect(
+      parse("session.input.edited", {
+        type: "session.input.edited",
+        data: { content: [{ type: "input_text", text: "x" }] },
+      }),
+    ).toEqual([]);
+    expect(
+      parse("session.input.edited", {
+        type: "session.input.edited",
+        data: { pending_id: "pending_2" },
+      }),
+    ).toEqual([]);
   });
 });
 
