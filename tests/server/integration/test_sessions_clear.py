@@ -1035,8 +1035,12 @@ async def test_claude_sdk_clear_tells_an_offline_runner_from_one_on_another_repl
 
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", launch_runner_on_host)
     sent = await client.post(f"/v1/sessions/{new_id}/events", json=_MESSAGE_INPUT)
-    assert sent.status_code == 202, sent.text
+    assert sent.status_code == 412, sent.text
+    assert sent.json()["error"]["code"] == "harness_not_configured"
     assert launches == [(new_id, _HOST_ID, "/work/repo")]
+    snapshot = (await client.get(f"/v1/sessions/{new_id}")).json()
+    assert snapshot["status"] != "failed"
+    assert not any(item.type == "error" for item in store.list_items(new_id).data)
 
 
 @pytest.mark.parametrize(
