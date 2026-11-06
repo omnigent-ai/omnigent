@@ -467,13 +467,10 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
-# The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
-# an action with "/", so the task details panels print "Esc/Enter/Space to
-# close". A screen without a composer that lacks it is not such a surface —
-# e.g. a launch wrapper's output before Claude Code has drawn its input box —
-# and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Surfaces drawn over the input box advertise their dismissal in the footer
+# ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
+# Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
 # question exits 0). Only the person may answer them.
@@ -4629,61 +4626,25 @@ def _paste_and_submit(
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
-    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
-    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
-    # client→server command at ~16KB, so per-byte hex argv blew up with
-    # "command too long" on large payloads (a PR diff in a sub-agent
-    # dispatch). ``load-buffer`` streams the file without that cap, and
-    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
-    # interior newlines (mapped to CR below) stay data instead of becoming
-    # per-line submits. See anthropics/claude-code#52126.
-    paste_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
-        ) as paste_file:
-            paste_path = paste_file.name
-            paste_file.write(_paste_payload_bytes(text + "\n"))
-        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
-        _run_tmux(
+    draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+        bridge_dir, socket_path, tmux_target, text=text, needle=needle
+    )
+    if not draft_seen and _composer_box(pane) is None:
+        # The composer frame is not mounted (a resumed TUI still replaying its
+        # transcript). An Enter now would submit nothing yet report success, so
+        # wait for the composer, clear what the first paste left, and paste once more.
+        delivery_diagnostics.set_stage("waiting_for_composer")
+        _wait_for_claude_prompt_ready(
             socket_path,
-            "paste-buffer",
-            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
-            "-d",  # drop the buffer after pasting (no stale copies server-side)
-            "-b",
-            "omnigent-paste",
-            "-t",
             tmux_target,
+            timeout_s=_TMUX_READY_TIMEOUT_S,
+            bridge_dir=bridge_dir,
+            extend_for_slow_boot=False,
         )
-        delivery_diagnostics.record_details(paste_sent=True)
-    finally:
-        if paste_path is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    delivery_diagnostics.set_stage("waiting_for_draft")
-    draft_seen = False
-    pane = ""
-    polls = 0
-    empty_captures = 0
-    paste_wait_started = time.monotonic()
-    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        polls += 1
-        empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+        draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
+            bridge_dir, socket_path, tmux_target, text=text, needle=needle
+        )
     delivery_diagnostics.record_draft(
         pane=pane,
         needle=needle,
@@ -4744,6 +4705,78 @@ def _paste_and_submit(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(the draft is still in the input box). The message was not delivered."
     )
+
+
+def _paste_and_await_draft(
+    bridge_dir: Path,
+    socket_path: str,
+    tmux_target: str,
+    *,
+    text: str,
+    needle: str,
+) -> tuple[bool, str, int, int, float]:
+    """
+    Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
+
+    :param bridge_dir: Bridge directory whose temp paste file is written here.
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string.
+    :param text: Exact text to paste.
+    :param needle: Draft marker from :func:`_submit_needle`.
+    :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
+    # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
+    # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
+    # client→server command at ~16KB, so per-byte hex argv blew up with
+    # "command too long" on large payloads (a PR diff in a sub-agent
+    # dispatch). ``load-buffer`` streams the file without that cap, and
+    # ``paste-buffer -p`` wraps it in the same bracketed-paste markers so
+    # interior newlines (mapped to CR below) stay data instead of becoming
+    # per-line submits. See anthropics/claude-code#52126.
+    paste_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=bridge_dir, prefix="paste_", suffix=".bin", delete=False
+        ) as paste_file:
+            paste_path = paste_file.name
+            paste_file.write(_paste_payload_bytes(text + "\n"))
+        _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
+        _run_tmux(
+            socket_path,
+            "paste-buffer",
+            "-p",  # bracketed-paste markers — the TUI keeps newlines as data
+            "-d",  # drop the buffer after pasting (no stale copies server-side)
+            "-b",
+            "omnigent-paste",
+            "-t",
+            tmux_target,
+        )
+        delivery_diagnostics.record_details(paste_sent=True)
+    finally:
+        if paste_path is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(paste_path)
+    # Wait until the TUI has visibly committed the paste into its input box
+    # before submitting. An Enter that races a paste burst becomes a newline
+    # inside the draft instead of a submit. Best-effort: a draft that never
+    # becomes identifiable falls through after the timeout.
+    delivery_diagnostics.set_stage("waiting_for_draft")
+    draft_seen = False
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    wait_started = time.monotonic()
+    deadline = wait_started + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        if _draft_in_input_box(pane, needle):
+            draft_seen = True
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    return draft_seen, pane, polls, empty_captures, wait_started
 
 
 def _verify_submit_accepted(
@@ -5345,6 +5378,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 # Whitespace is removed from footer hints because terminal wraps can split words.
 _BTW_FOOTER_CLOSE_HINT = "Esctoclose"
+# The footer opens with a scroll hint for one turn, or a history hint once side
+# turns stack: "←/→ to switch" in older Claude Code, "⇧←/→ to browse" in 2.1.283.
+_BTW_FOOTER_SHIFT_GLYPH = "⇧"
+_BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
@@ -5357,6 +5394,10 @@ _BTW_QUESTION_PREFIX = "/btw"
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
 _BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+# Claude Code 2.1.318 caps the answer so the overlay leaves this many pane rows
+# for the rest of its screen, but keeps at least 5 answer rows. A short pane
+# therefore clips below the span above; an overlay reaching the cap is flagged.
+_BTW_PANE_CHROME_ROWS = 5
 
 
 @dataclass(frozen=True)
@@ -5370,7 +5411,7 @@ class BtwOverlay:
     :param answer: The visible answer text, dedented and stripped.
     :param truncated: True when the overlay likely clipped a longer
         answer (best-effort heuristic; see
-        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS`).
+        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS` and :data:`_BTW_PANE_CHROME_ROWS`).
     """
 
     question: str | None
@@ -5404,14 +5445,18 @@ def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
         (
             index
             for index in range(len(lines) - 1, -1, -1)
-            if lines[index].lstrip().startswith(("↑/↓", "←/→"))
+            if lines[index]
+            .lstrip()
+            .lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+            .lstrip()
+            .startswith(("↑/↓", "←/→"))
         ),
         None,
     )
     if footer_idx is None:
         return None
-    footer = "".join("".join(lines[footer_idx:]).split())
-    if not footer.startswith(("↑/↓toscroll", "←/→toswitch")) or not footer.endswith(
+    footer = "".join("".join(lines[footer_idx:]).split()).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+    if not footer.startswith(("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)) or not footer.endswith(
         _BTW_FOOTER_CLOSE_HINT
     ):
         return None
@@ -5468,7 +5513,11 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = (
+        len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+        # The border and the footer's first row bracket the region.
+        or len(region) + 2 + _BTW_PANE_CHROME_ROWS >= len(pane.splitlines())
+    )
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5490,13 +5539,13 @@ def _btw_overlay_present(pane: str) -> bool:
     if parts is None:
         return False
     region, footer = parts
-    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # The /btw footer offers copy+fork (single, settled), history (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
     if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return True
-    if "toswitch" in footer:
+    if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
@@ -6361,6 +6410,39 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
         return False
     pane = _capture_pane(socket_path, target)
     return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
+
+
+# Claude Code echoes a ``/model`` command, then prints this acknowledgement
+# under it ("Set model to Opus 5.5 and saved as your default for new sessions").
+_MODEL_SWITCH_ACKNOWLEDGEMENT = "Set model to "
+
+
+def model_switch_acknowledged(bridge_dir: Path, *, command: str) -> bool:
+    """
+    Check whether Claude Code acknowledged a ``/model`` command on the pane.
+
+    A second confirmation source next to the statusLine snapshot: the
+    acknowledgement Claude Code prints under the echoed command says the
+    switch took effect even when the snapshot spells the model differently
+    or has not been rewritten yet.
+
+    :param bridge_dir: The session's native bridge directory.
+    :param command: The injected command, e.g. ``"/model opus[1m]"``.
+    :returns: ``True`` when the acknowledgement follows the command's last
+        echo on the pane; ``False`` when it does not, the echo is not on
+        screen, or the pane cannot be read.
+    """
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    if not isinstance(info, dict):
+        return False
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if not isinstance(socket_path, str) or not isinstance(target, str):
+        return False
+    lines = _capture_pane(socket_path, target).splitlines()
+    echoes = [index for index, line in enumerate(lines) if command in line]
+    if not echoes:
+        return False
+    return any(_MODEL_SWITCH_ACKNOWLEDGEMENT in line for line in lines[echoes[-1] + 1 :])
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
@@ -8391,15 +8473,16 @@ def _tool_relay_handler_factory(
             if len(detail) > _POLICY_PROXY_ERROR_DETAIL_MAX:
                 detail = detail[: _POLICY_PROXY_ERROR_DETAIL_MAX - 3] + "..."
             message = f"omnigent policy-eval proxy could not reach the Omnigent server: {detail}"
-            # Keep the full exception (with traceback) in the runner log; the
-            # user-facing body is capped and can drop a diagnostically useful tail.
-            _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
             body = message.encode("utf-8", "replace")
-            self.send_response(HTTPStatus.BAD_GATEWAY)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(HTTPStatus.BAD_GATEWAY)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            finally:
+                # Slow traceback rendering must not delay the fail-closed response.
+                _logger.warning("policy-eval proxy forward failed: %s", detail, exc_info=exc)
 
         def _read_json_body(self) -> _JsonObject | None:
             """
@@ -8940,7 +9023,30 @@ def _call_mcp_tool(
         conversation_id=read_active_session_id(bridge_dir),
     )
     result = tools[name].invoke(json.dumps(arguments), ctx)
-    return {"content": [{"type": "text", "text": result}]}
+    response: _JsonObject = {"content": [{"type": "text", "text": result}]}
+    if _local_result_is_error(result):
+        response["isError"] = True
+    return response
+
+
+def _local_result_is_error(result: object) -> bool:
+    """Whether a bridge-local tool's JSON result reports an error.
+
+    Relay-routed calls get ``isError`` from
+    :func:`omnigent.runtime.mcp_tool_result.mcp_response_from_tool_result`;
+    the local ``sys_os_*`` tools served outside an active turn return the same
+    ``{"error": ...}`` / ``{"blocked": true}`` shapes and must flag them the
+    same way, or the model reads a failure as a result.
+    """
+    if not isinstance(result, str):
+        return False
+    try:
+        payload = json.loads(result)
+    except ValueError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return payload.get("blocked") is True or bool(payload.get("error"))
 
 
 def _read_relay_tool_names(bridge_dir: Path) -> set[str]:
