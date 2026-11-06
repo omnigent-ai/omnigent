@@ -37,6 +37,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_DIR_ENV_VAR,
     CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR,
     CODEX_NATIVE_STARTUP_PUBLICATION_GRACE_SECONDS,
+    CodexInterruptPersistenceError,
     CodexNativeBridgeState,
     CodexStartupFailure,
     cancel_pending_mcp_startup,
@@ -45,6 +46,7 @@ from omnigent.harnesses.codex_native.bridge import (
     mark_shell_command_pending,
     mcp_startup_waiting_detail,
     mirror_applied_codex_settings,
+    pending_mcp_servers,
     read_bridge_startup_error,
     read_bridge_startup_failure,
     read_bridge_startup_timeout,
@@ -1245,27 +1247,48 @@ class CodexNativeExecutor(Executor):
         observed = read_bridge_state(self._bridge_dir)
         if observed is None:
             if self._request_session_id is not None:
-                record_codex_interrupt(self._bridge_dir, session_id=self._request_session_id)
+                try:
+                    record_codex_interrupt(self._bridge_dir, session_id=self._request_session_id)
+                except CodexInterruptPersistenceError as error:
+                    raise error.original_error from None
             return False
         if not _session_is_active(observed.session_id, self._request_session_id):
             return False
-        state = record_codex_interrupt(self._bridge_dir, expected=observed)
+        persistence_error: OSError | None = None
+        try:
+            state = record_codex_interrupt(self._bridge_dir, expected=observed)
+        except OSError as error:
+            _logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            persistence_error = (
+                error.original_error
+                if isinstance(error, CodexInterruptPersistenceError)
+                else error
+            )
+            state = error.target if isinstance(error, CodexInterruptPersistenceError) else None
         if state is None:
+            if persistence_error is not None:
+                raise persistence_error
             return False
         # Flip the local map first: the cancelled record is what the web
         # band and turn-error text read, even if Codex never acknowledges.
         # Unlike the runner's Stop handler, the flipped map is not
         # published here — the inner process has no server client; web
         # Stop routes through the runner handler, which does publish.
-        pending = cancel_pending_mcp_startup(self._bridge_dir)
+        try:
+            pending = cancel_pending_mcp_startup(self._bridge_dir)
+        except OSError as error:
+            persistence_error = persistence_error or error
+            pending = pending_mcp_servers(read_mcp_startup(self._bridge_dir))
         if state.active_turn_id is None and not pending:
+            if persistence_error is not None:
+                raise persistence_error
             return False
         client = client_for_transport(
             state.socket_path,
             client_name="omnigent-codex-native",
         )
-        await client.connect()
         try:
+            await client.connect()
             if pending:
                 # Startup interrupt first and best-effort: the local
                 # cancel above already updated what Omnigent shows, and a
@@ -1275,7 +1298,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except Exception:  # Local cancellation already took effect.
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
@@ -1295,14 +1318,28 @@ class CodexNativeExecutor(Executor):
                         raise
                     # Drop the stale record unless a newer turn/started already
                     # replaced it.
-                    clear_active_turn_id_if_matches(self._bridge_dir, state.active_turn_id)
+                    clear_active_turn_id_if_matches(
+                        self._bridge_dir,
+                        state.active_turn_id,
+                        expected_owner=state,
+                    )
                     _logger.info(
                         "Codex native interrupt skipped: recorded turn %s already superseded (%s)",
                         state.active_turn_id,
                         error.message,
                     )
+        except Exception:
+            if persistence_error is not None:
+                raise persistence_error from None
+            raise
         finally:
-            await client.close()
+            if persistence_error is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            else:
+                await client.close()
+        if persistence_error is not None:
+            raise persistence_error
         return True
 
     async def run_turn(

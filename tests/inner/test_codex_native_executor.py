@@ -4993,6 +4993,10 @@ def test_interrupt_with_active_turn_and_pending_mcp_stops_both(
         ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"}),
     ]
     assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id == "turn_active"
 
 
 def test_interrupt_with_no_active_turn_cancels_mcp_startup(
@@ -5028,6 +5032,8 @@ def test_interrupt_with_no_active_turn_cancels_mcp_startup(
         ("turn/interrupt", {"threadId": "thread_123", "turnId": ""})
     ]
     assert read_mcp_startup(tmp_path)["storage-console"]["status"] == "cancelled"
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None and stopped.interrupt_generation == 1
 
 
 def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
@@ -5054,6 +5060,87 @@ def test_interrupt_with_no_active_turn_and_no_pending_mcp_is_noop(
 
     assert interrupted is False
     assert _FakeCodexNativeClient.requests == []
+    stopped = read_bridge_state(tmp_path)
+    assert stopped is not None
+    assert stopped.interrupt_generation == 1
+    assert stopped.interrupted_turn_id is None
+
+
+def test_interrupt_fences_the_owner_before_connecting(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A slow native connection starts only after the durable Stop generation."""
+
+    class _FenceCheckingClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+
+        async def connect(self) -> None:
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.interrupt_generation == 1
+            assert state.interrupted_turn_id == "turn_active"
+            await super().connect()
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FenceCheckingClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+
+    assert asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert _FenceCheckingClient.requests == [
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_active"})
+    ]
+
+
+@pytest.mark.parametrize("transferred", [False, True])
+def test_interrupt_without_locked_target_proof_never_opens_a_native_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transferred: bool,
+) -> None:
+    """A failure before locked target proof cannot authorize an observed stale owner."""
+    from dataclasses import replace
+
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+
+    storage_failure = OSError("disk full")
+
+    def fail_fence(path: Path, *, expected: CodexNativeBridgeState):
+        assert path == tmp_path and expected == observed
+        if transferred:
+            write_bridge_state(
+                tmp_path,
+                replace(
+                    observed,
+                    session_id="replacement-session",
+                    active_turn_id="replacement-turn",
+                ),
+            )
+        raise storage_failure
+
+    monkeypatch.setattr("omnigent.inner.codex_native_executor.record_codex_interrupt", fail_fence)
+
+    with pytest.raises(OSError) as raised:
+        asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert raised.value is storage_failure
+    assert _FakeCodexNativeClient.requests == []
+    assert _FakeCodexNativeClient.created == []
+    if transferred:
+        successor = read_bridge_state(tmp_path)
+        assert successor is not None
+        assert successor.active_turn_id == "replacement-turn"
+        assert successor.interrupt_generation == 0
 
 
 @pytest.mark.parametrize(
@@ -5662,3 +5749,24 @@ async def test_cold_native_input_keeps_its_checkpoint_through_bridge_startup(
     assert [method for method, _ in draining_client.requests] == (
         [] if stop_during_startup else ["turn/start"]
     )
+
+
+def test_interrupt_actual_lock_acquisition_failure_never_opens_a_native_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _FakeCodexNativeClient
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_active")
+    observed = read_bridge_state(tmp_path)
+    lock = tmp_path / "state.lock"
+    lock.unlink()
+    lock.mkdir()
+    with pytest.raises(IsADirectoryError):
+        asyncio.run(CodexNativeExecutor(bridge_dir=tmp_path).interrupt_session("key"))
+    assert _FakeCodexNativeClient.requests == []
+    assert _FakeCodexNativeClient.created == []
+    assert read_bridge_state(tmp_path) == observed
+    assert not (tmp_path / "interrupt_generations.json").exists()

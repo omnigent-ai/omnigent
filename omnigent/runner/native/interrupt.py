@@ -717,8 +717,10 @@ class NativeInterruptRunner:
             is_stale_active_turn_error,
         )
         from omnigent.harnesses.codex_native.bridge import (
+            CodexInterruptPersistenceError,
             cancel_pending_mcp_startup,
             clear_active_turn_id_if_matches,
+            pending_mcp_servers,
             read_mcp_startup,
             record_codex_interrupt,
         )
@@ -726,28 +728,55 @@ class NativeInterruptRunner:
         state, bridge_dir = await self._codex_bridge_state_for_session(conv_id, action="interrupt")
         if state is not None and state.session_id != conv_id:
             return Response(status_code=204)
-        try:
-            state = record_codex_interrupt(bridge_dir, expected=state, session_id=conv_id)
-        except OSError as exc:
+        observed = state
+        persistence_error: OSError | None = None
+
+        def persistence_failure() -> Response:
+            assert persistence_error is not None
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "codex_native_interrupt_failed",
                     "detail": self._client_safe_error_detail(
-                        exc, context="codex-native interrupt"
+                        persistence_error, context="codex-native interrupt"
                     ),
                 },
             )
+
+        try:
+            state = record_codex_interrupt(bridge_dir, expected=observed, session_id=conv_id)
+        except OSError as error:
+            self._logger.warning("Could not persist the Codex Stop fence", exc_info=True)
+            persistence_error = (
+                error.original_error
+                if isinstance(error, CodexInterruptPersistenceError)
+                else error
+            )
+            state = error.target if isinstance(error, CodexInterruptPersistenceError) else None
         if state is None:
-            return Response(status_code=204)
-        pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+            return (
+                persistence_failure()
+                if persistence_error is not None
+                else Response(status_code=204)
+            )
+        mcp_cancel_saved = True
+        try:
+            pending_mcp = cancel_pending_mcp_startup(bridge_dir)
+        except OSError as error:
+            persistence_error = persistence_error or error
+            mcp_cancel_saved = False
+            pending_mcp = pending_mcp_servers(read_mcp_startup(bridge_dir))
         if state.active_turn_id is None and not pending_mcp:
             self._logger.info(
                 "Codex-native interrupt skipped for %s: no active turn or MCP startup.",
                 conv_id,
             )
-            return Response(status_code=204)
-        if pending_mcp:
+            return (
+                persistence_failure()
+                if persistence_error is not None
+                else Response(status_code=204)
+            )
+        if pending_mcp and mcp_cancel_saved:
             self._logger.info(
                 "Codex-native interrupt for %s cancels MCP startup: %s",
                 conv_id,
@@ -762,7 +791,7 @@ class NativeInterruptRunner:
                     },
                     timeout=10.0,
                 )
-            except Exception:  # the bridge flip already took effect locally.
+            except Exception:  # The bridge flip already took effect locally.
                 self._logger.warning(
                     "Failed to publish cancelled MCP startup for %s", conv_id, exc_info=True
                 )
@@ -780,7 +809,7 @@ class NativeInterruptRunner:
                             "turn/interrupt",
                             {"threadId": state.thread_id, "turnId": ""},
                         )
-                    except Exception:  # the local cancel already took effect.
+                    except Exception:  # Local cancellation already took effect.
                         self._logger.warning(
                             "Codex-native MCP startup interrupt failed for session=%s thread=%s",
                             conv_id,
@@ -799,6 +828,8 @@ class NativeInterruptRunner:
                     except CodexAppServerResponseError as exc:
                         if not is_stale_active_turn_error(exc):
                             raise
+                        if persistence_error is not None:
+                            return persistence_failure()
 
                         if is_no_active_turn_error(exc):
                             # The turn ended and no idle edge is coming. Clear it only
@@ -814,7 +845,7 @@ class NativeInterruptRunner:
                                     self._resource_registry.note_external_session_status(
                                         conv_id, "idle"
                                     )
-                                except Exception:  # the clear already succeeded.
+                                except Exception:  # The clear already succeeded.
                                     self._logger.warning(
                                         "Codex-native idle publish failed for session=%s",
                                         conv_id,
@@ -822,7 +853,10 @@ class NativeInterruptRunner:
                                     )
 
                             cleared = clear_active_turn_id_if_matches(
-                                bridge_dir, state.active_turn_id, on_cleared=_publish_idle
+                                bridge_dir,
+                                state.active_turn_id,
+                                on_cleared=_publish_idle,
+                                expected_owner=state,
                             )
                             self._logger.info(
                                 "Codex-native interrupt reconciled an already-ended turn "
@@ -849,7 +883,7 @@ class NativeInterruptRunner:
                         # deferred parent-wake cancel. A dropped sub-agent completion
                         # can still leave its parent waiting; reconciled separately.
                         return Response(status_code=204)
-        except Exception as exc:  # surface active-turn interrupt failures.
+        except Exception as exc:  # Surface all native control failures.
             self._logger.warning(
                 "Codex-native turn/interrupt failed for session=%s thread=%s turn=%s",
                 conv_id,
@@ -871,6 +905,8 @@ class NativeInterruptRunner:
                 await asyncio.wait_for(
                     codex_client.close(), timeout=_CODEX_INTERRUPT_CLOSE_TIMEOUT_S
                 )
+        if persistence_error is not None:
+            return persistence_failure()
         self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 

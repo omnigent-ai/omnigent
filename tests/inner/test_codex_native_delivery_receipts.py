@@ -77,8 +77,6 @@ async def test_native_receipt_requires_exact_delivery_identity(
     reply_timeout = receipt_kind.startswith("reply-timeout-")
     if reply_timeout:
         monkeypatch.setattr(native_executor, "_DELIVERY_RPC_TIMEOUT_SECONDS", 0.1, raising=False)
-    if receipt_kind == "read-timeout":
-        monkeypatch.setattr(native_executor, "_DELIVERY_RECEIPT_TIMEOUT_SECONDS", 0.05)
 
     async def handle(websocket: ServerConnection) -> None:
         async for raw in websocket:

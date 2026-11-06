@@ -22,6 +22,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
+from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
@@ -34,6 +35,7 @@ from omnigent.runner.resource_registry import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.budgets import budget
+from tests.harnesses.codex_native.forwarder._support import _RecordingClient
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -2567,6 +2569,17 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
             raise OSError("Synthetic unavailable bridge storage")
 
         monkeypatch.setattr(codex_native_bridge, "record_codex_interrupt", refuse_fence)
+
+    original_connect = fake_client.connect
+
+    async def connect_after_stop_fence() -> None:
+        fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+        assert fenced is not None
+        assert fenced.interrupt_generation == int(fence_writable)
+        assert fenced.interrupted_turn_id == ("turn_codex" if fence_writable else None)
+        await original_connect()
+
+    monkeypatch.setattr(fake_client, "connect", connect_after_stop_fence)
     close_cancelled: list[bool] = []
     if stalled_close:
         from omnigent.runner.native import interrupt as native_interrupt
@@ -2596,7 +2609,7 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         :returns: Fake client that records JSON-RPC calls.
         """
         current = codex_native_bridge.read_bridge_state(bridge_dir)
-        assert current is not None and current.interrupt_generation == 1
+        assert current is not None and current.interrupt_generation == int(fence_writable)
         assert transport == fake_client.transport
         assert client_name == fake_client.client_name
         return fake_client
@@ -2642,8 +2655,9 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
     if not fence_writable:
         assert int_resp.status_code == 503, int_resp.text
         assert int_resp.json()["error"] == "codex_native_interrupt_failed"
-        assert fake_client.requests == []
         assert fake_client.connected is False
+        assert fake_client.requests == []
+        assert conv_id not in app.state.interrupted_sessions
         return
 
     assert int_resp.status_code == 204, (
@@ -2667,6 +2681,10 @@ async def test_events_interrupt_on_codex_native_uses_turn_interrupt_without_mark
         f"codex-native interrupt must call turn/interrupt with the active "
         f"thread/turn ids; got {fake_client.requests!r}."
     )
+    fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert fenced is not None
+    assert fenced.interrupt_generation == 1
+    assert fenced.interrupted_turn_id == "turn_codex"
 
     # 2) NO marker persisted — a synthesized [System: interrupted] would diverge
     # the web UI from Codex's own session (the mismatch this revert removes).
@@ -2963,6 +2981,10 @@ async def test_events_stop_session_on_codex_native_uses_turn_interrupt_without_m
         f"codex-native stop_session must call turn/interrupt with the active "
         f"thread/turn ids; got {fake_client.requests!r}."
     )
+    fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert fenced is not None
+    assert fenced.interrupt_generation == 1
+    assert fenced.interrupted_turn_id == "turn_codex_stop"
 
     # 2) NO marker persisted — the in-process floor would have synthesized one.
     marker_texts = [
@@ -6069,3 +6091,312 @@ async def test_events_stop_session_during_delivery_cancels_the_turn(
     assert "failed" not in statuses, events
     assert "idle" in statuses
     assert session_id not in app.state.interrupted_sessions
+
+
+async def _forward_codex_recovery_event(
+    client: httpx.AsyncClient,
+    native: Any,
+    state: Any,
+    bridge_dir: Path,
+    *,
+    session_id: str,
+    thread_id: str,
+    method: str,
+    params: dict[str, Any],
+) -> None:
+    """Deliver native evidence through the forwarder to the caller-owned AP recorder."""
+    await codex_native_forwarder._handle_event(
+        client,
+        session_id=session_id,
+        bridge_dir=bridge_dir,
+        event={"method": method, "params": params},
+        expected_thread_id=thread_id,
+        usage_coalescer=codex_native_forwarder._SessionUsageCoalescer(client, session_id),
+        elicitation_tracker=codex_native_forwarder._CodexElicitationTaskTracker(),
+        codex_client=native,
+        forwarder_state=state,
+    )
+
+
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("blocked_stage", ["connect", "rpc"])
+async def test_events_codex_stop_fences_delayed_output_limit_before_native_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, event_type: str, blocked_stage: str
+) -> None:
+    """HTTP Stop retires the old response before any slow native control await."""
+    session_id = uuid.uuid4().hex
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    starts: list[dict[str, Any]] = []
+
+    class Control(_RecordingCodexAppServerClient):
+        supports_user_message_ids = True
+
+        async def connect(self) -> None:
+            if blocked_stage == "connect":
+                blocked.set()
+                await release.wait()
+            await super().connect()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method == "turn/start":
+                starts.append(params)
+                return {"result": {"turn": {"id": "unexpected_continuation"}}}
+            if blocked_stage == "rpc" and method == "turn/interrupt":
+                blocked.set()
+                await release.wait()
+            return await super().request(method, params)
+
+    native = Control("ws://127.0.0.1:43221", "omnigent-codex-native-runner")
+    app, _, bridge_dir = _build_codex_native_runner_for_stale_turn(
+        monkeypatch,
+        tmp_path,
+        session_id,
+        active_turn_id="turn_source",
+        thread_id="thread_codex",
+        socket_path=native.transport,
+        fake_client=native,
+    )
+    state = codex_native_forwarder._CodexForwarderState()
+    ap_client = _RecordingClient()
+    error = {"message": "Incomplete response returned, reason: max_output_tokens"}
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test_agent"}
+        )
+        assert created.status_code == 201
+        await _forward_codex_recovery_event(
+            ap_client,
+            native,
+            state,
+            bridge_dir,
+            session_id=session_id,
+            thread_id="thread_codex",
+            method="error",
+            params={
+                "threadId": "thread_codex",
+                "turnId": "turn_source",
+                "willRetry": False,
+                "error": error,
+            },
+        )
+        control = asyncio.create_task(
+            client.post(f"/v1/sessions/{session_id}/events", json={"type": event_type})
+        )
+        try:
+            await asyncio.wait_for(blocked.wait(), timeout=2)
+            fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert fenced is not None
+            await _forward_codex_recovery_event(
+                ap_client,
+                native,
+                state,
+                bridge_dir,
+                session_id=session_id,
+                thread_id="thread_codex",
+                method="turn/completed",
+                params={
+                    "threadId": "thread_codex",
+                    "turn": {"id": "turn_source", "status": "failed", "error": error},
+                },
+            )
+            assert starts == []
+            assert fenced.interrupt_generation == 1
+            assert fenced.interrupted_turn_id == "turn_source"
+            assert codex_native_bridge.read_bridge_state(bridge_dir).active_turn_id is None
+        finally:
+            release.set()
+            response = await asyncio.wait_for(control, timeout=2)
+            await state.close_output_limit_errors()
+        assert response.status_code == 204
+
+
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize("storage_fault", [None, "checkpoint", "bridge_state", "lock"])
+@pytest.mark.parametrize(
+    "observed_pending", [False, True], ids=["source-observation", "pending-observation"]
+)
+async def test_events_codex_stop_targets_its_continuation_if_ack_wins_owner_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    storage_fault: str | None,
+    observed_pending: bool,
+) -> None:
+    """A source-targeted Stop also owns the proven continuation accepted just before fencing."""
+    session_id = uuid.uuid4().hex
+    native = _RecordingCodexAppServerClient("ws://127.0.0.1:43221", "omnigent-codex-native-runner")
+    app, _, bridge_dir = _build_codex_native_runner_for_stale_turn(
+        monkeypatch,
+        tmp_path,
+        session_id,
+        active_turn_id="turn_source",
+        thread_id="thread_codex",
+        socket_path=native.transport,
+        fake_client=native,
+    )
+    real_record = codex_native_bridge.record_codex_interrupt
+
+    def acknowledge_before_fence(path, *, expected, session_id=None):
+        assert session_id == expected.session_id
+        claimed = (
+            expected
+            if observed_pending
+            else codex_native_bridge.claim_codex_automatic_input(
+                path, expected, client_message_id="recovery_receipt"
+            )
+        )
+        assert claimed is not None
+        assert codex_native_bridge.record_codex_automatic_input_receipt(
+            path,
+            session_id=expected.session_id,
+            thread_id=expected.thread_id,
+            turn_id="owned_continuation",
+            client_message_id="recovery_receipt",
+        )
+        assert codex_native_bridge.settle_codex_automatic_input(
+            path, expected=claimed, outcome="accepted"
+        )
+        if storage_fault == "checkpoint":
+
+            def fail_checkpoint(*_args: object) -> None:
+                raise OSError("Synthetic unavailable session Stop checkpoint")
+
+            monkeypatch.setattr(codex_native_bridge, "_replace_bridge_record", fail_checkpoint)
+        elif storage_fault == "bridge_state":
+
+            def fail_state(*_args: object) -> None:
+                raise OSError("Synthetic unavailable bridge state")
+
+            monkeypatch.setattr(codex_native_bridge, "_write_bridge_state_unlocked", fail_state)
+        elif storage_fault == "lock":
+            lock_path = path / "state.lock"
+            lock_path.unlink()
+            lock_path.mkdir()
+        return real_record(path, expected=expected, session_id=session_id)
+
+    monkeypatch.setattr(codex_native_bridge, "record_codex_interrupt", acknowledge_before_fence)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test_agent"}
+        )
+        assert created.status_code == 201
+        if observed_pending:
+            source = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert source is not None
+            assert (
+                codex_native_bridge.claim_codex_automatic_input(
+                    bridge_dir, source, client_message_id="recovery_receipt"
+                )
+                is not None
+            )
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": event_type}
+        )
+        assert response.status_code == (503 if storage_fault else 204)
+    assert native.requests == (
+        []
+        if storage_fault == "lock"
+        else [("turn/interrupt", {"threadId": "thread_codex", "turnId": "owned_continuation"})]
+    )
+    fenced = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert fenced.interrupt_generation == (0 if storage_fault else 1)
+    assert fenced.interrupted_turn_id == (None if storage_fault else "owned_continuation")
+    assert codex_native_bridge.read_interrupt_generations(bridge_dir).get(session_id, 0) == (
+        0 if storage_fault in {"checkpoint", "lock"} else 1
+    )
+
+
+@pytest.mark.parametrize("observation", ["idle", "different_claim", "same_claim"])
+async def test_events_codex_stop_requires_its_claim_before_turn_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observation: str
+) -> None:
+    session_id = uuid.uuid4().hex
+    native = _RecordingCodexAppServerClient("ws://127.0.0.1:43221", "omnigent-codex-native-runner")
+    app, _, bridge_dir = _build_codex_native_runner_for_stale_turn(
+        monkeypatch,
+        tmp_path,
+        session_id,
+        active_turn_id=None if observation == "idle" else "source",
+        thread_id="thread_codex",
+        socket_path=native.transport,
+        fake_client=native,
+    )
+    real_record = codex_native_bridge.record_codex_interrupt
+
+    def receipt_before_fence(path, *, expected, session_id=None):
+        assert expected.active_turn_id is None
+        if observation == "same_claim":
+            source = expected
+            client_id = "old-client"
+        else:
+            if observation == "different_claim":
+                assert (
+                    codex_native_bridge.record_codex_automatic_input_receipt(
+                        path,
+                        session_id=expected.session_id,
+                        thread_id=expected.thread_id,
+                        turn_id="old-accepted",
+                        client_message_id="old-client",
+                    )
+                    is not None
+                )
+                assert (
+                    codex_native_bridge.settle_codex_automatic_input(
+                        path, expected=expected, outcome="completed"
+                    )
+                    is not None
+                )
+            codex_native_bridge.update_active_turn_id(path, "new-source")
+            source = codex_native_bridge.read_bridge_state(path)
+            assert source is not None
+            client_id = "new-client"
+            assert (
+                codex_native_bridge.claim_codex_automatic_input(
+                    path, source, client_message_id=client_id
+                )
+                is not None
+            )
+        assert (
+            codex_native_bridge.record_codex_automatic_input_receipt(
+                path,
+                session_id=source.session_id,
+                thread_id=source.thread_id,
+                turn_id="receipt-turn",
+                client_message_id=client_id,
+            )
+            is not None
+        )
+        current = codex_native_bridge.read_bridge_state(path)
+        assert current is not None and current.active_turn_id is None
+        return real_record(path, expected=expected, session_id=session_id)
+
+    monkeypatch.setattr(codex_native_bridge, "record_codex_interrupt", receipt_before_fence)
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": session_id, "agent_id": "test_agent"}
+        )
+        assert created.status_code == 201
+        if observation != "idle":
+            source = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert source is not None
+            assert (
+                codex_native_bridge.claim_codex_automatic_input(
+                    bridge_dir, source, client_message_id="old-client"
+                )
+                is not None
+            )
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+        )
+    assert response.status_code == 204
+    assert native.requests == (
+        [("turn/interrupt", {"threadId": "thread_codex", "turnId": "receipt-turn"})]
+        if observation == "same_claim"
+        else []
+    )
+    current = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert current is not None and current.active_turn_id is None
+    assert current.interrupt_generation == 1
+    assert current.interrupted_turn_id == ("receipt-turn" if observation == "same_claim" else None)
+    assert codex_native_bridge.read_interrupt_generations(bridge_dir)[session_id] == 1
