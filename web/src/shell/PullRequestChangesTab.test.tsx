@@ -38,6 +38,8 @@ const mocks = vi.hoisted(() => ({
   commitDiffError: null as Error | null,
   /** The commit list's query cannot run here, so it has no data. */
   commitsUnavailable: false,
+  /** The PR's server lacks the commit routes. */
+  commitsUnsupported: false,
   /** A saved review draft, anchored to one file's line, as the composer hook reports it. */
   draftAnchor: null as null | {
     path: string;
@@ -80,6 +82,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     isLoading: false,
     error: null,
   }),
+  usePullRequestCommitsUnsupported: () => mocks.commitsUnsupported,
   usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
     data: sha
       ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
@@ -1455,6 +1458,7 @@ describe("PullRequestChangesTab commits", () => {
     mocks.commitPatches.set(SHA_B, B);
     mocks.commitDiffError = null;
     mocks.draftAnchor = null;
+    mocks.commitsUnsupported = false;
   });
 
   it("lists commits, opens one with its own files, and steps between commits", () => {
@@ -1544,6 +1548,34 @@ describe("PullRequestChangesTab commits", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Changes" }));
     expect(screen.getByRole("region", { name: "New review conversation" })).toBeInTheDocument();
+  });
+
+  it("returns a saved commit view to Changes and hides the switch when the server lacks the routes", () => {
+    const { rerender } = renderTab({
+      conversationId: "commits-unsupported",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    expect(screen.getByText("2 commits")).toBeInTheDocument();
+
+    // A capable host behind an older server: the 404 from the commit routes marks the PR.
+    mocks.commitsUnsupported = true;
+    rerender(PATCH);
+
+    expect(screen.queryByRole("button", { name: "Commits" })).toBeNull();
+    expect(screen.queryByText("2 commits")).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+    expect(toast).toHaveBeenCalledWith(
+      "Commits need an updated Omnigent server.",
+      expect.objectContaining({ id: "pr-commits-unsupported" }),
+    );
+
+    // The saved commit view did not survive: once the server has the routes, Changes is shown.
+    mocks.commitsUnsupported = false;
+    rerender(PATCH);
+    expect(screen.getByRole("button", { name: "Commits" })).toBeInTheDocument();
+    expect(screen.queryByText("2 commits")).toBeNull();
   });
 
   it("keeps the commit search while the reader moves between the list and a commit", () => {

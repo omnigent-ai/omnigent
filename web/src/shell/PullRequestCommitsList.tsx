@@ -49,7 +49,9 @@ export function PullRequestCommitsList({
     }
     if (visible.length === 0) {
       return (
-        <p className="p-3 text-ui text-muted-foreground">{`No commits match "${query.trim()}"`}</p>
+        <p className="p-3 text-ui text-muted-foreground">
+          {`No commits match "${query.trim()}"${hasMore ? ` among the first ${PULL_REQUEST_COMMITS_LIMIT}` : ""}`}
+        </p>
       );
     }
     return (

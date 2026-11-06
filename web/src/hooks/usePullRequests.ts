@@ -42,6 +42,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
+import { useSyncExternalStore } from "react";
 import {
   appendReviewReply,
   type ReviewComment,
@@ -802,6 +803,50 @@ export interface PullRequestCommit {
 /** The most commits the server lists for one pull request (GitHub's own limit). */
 export const PULL_REQUEST_COMMITS_LIMIT = 250;
 
+/**
+ * The server or runner predates the commit routes. A 404 is the only answer they give to a commit
+ * read; every other failure is a 400, 502 or 503 and keeps its own error.
+ */
+export class PullRequestCommitsUnsupportedError extends Error {
+  constructor() {
+    super(
+      "This Omnigent server doesn't support pull request commits. Update it to browse commits.",
+    );
+  }
+}
+
+// PRs whose server lacks the commit routes, kept for the page's life so the switch stays hidden.
+const commitsUnsupportedPrs = new Set<string>();
+const commitsUnsupportedListeners = new Set<() => void>();
+
+function commitsKey(conversationId: string, prUrl: string | undefined): string {
+  return JSON.stringify([conversationId, prUrl ?? ""]);
+}
+
+/** Classifies a failed commit read: a 404 marks the PR unsupported, and any other error passes through. */
+function commitReadError(error: unknown, conversationId: string, prUrl: string): unknown {
+  if (!(error instanceof PullRequestApiError) || error.status !== 404) return error;
+  commitsUnsupportedPrs.add(commitsKey(conversationId, prUrl));
+  for (const listener of commitsUnsupportedListeners) listener();
+  return new PullRequestCommitsUnsupportedError();
+}
+
+/** Whether this PR's server lacks the commit routes, so its Commits view is unavailable. */
+export function usePullRequestCommitsUnsupported(
+  conversationId: string | undefined,
+  prUrl: string | undefined,
+): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      commitsUnsupportedListeners.add(listener);
+      return () => {
+        commitsUnsupportedListeners.delete(listener);
+      };
+    },
+    () => commitsUnsupportedPrs.has(commitsKey(conversationId ?? "", prUrl)),
+  );
+}
+
 export interface PullRequestCommitsResult {
   object: "list";
   /** Oldest first; at most {@link PULL_REQUEST_COMMITS_LIMIT}, with `has_more` when the PR has more. */
@@ -821,7 +866,7 @@ async function fetchPullRequestCommits(
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
-  if (!res.ok) throw await errorFromResponse(res);
+  if (!res.ok) throw commitReadError(await errorFromResponse(res), conversationId, prUrl);
   return (await res.json()) as PullRequestCommitsResult;
 }
 
@@ -854,7 +899,11 @@ async function fetchPullRequestCommitDiff(
   commitSha: string,
 ): Promise<PullRequestDiffResponse> {
   const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
-  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`);
+  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`).catch(
+    (error: unknown) => {
+      throw commitReadError(error, conversationId, prUrl);
+    },
+  );
 }
 
 /**

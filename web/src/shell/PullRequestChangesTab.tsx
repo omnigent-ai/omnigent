@@ -35,6 +35,7 @@ import {
   type usePullRequestChangedFiles,
   usePullRequestCommitDiff,
   usePullRequestCommits,
+  usePullRequestCommitsUnsupported,
   type usePullRequestDiff,
 } from "@/hooks/usePullRequests";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
@@ -429,6 +430,13 @@ function readErrorText(error: Error): string {
   return error instanceof RunnerOfflineError ? "Runner offline." : error.message;
 }
 
+/** What an empty file list says: an unreadable commit, a commit without changes, or a PR without any. */
+function emptyChangesText(commitView: boolean, commitUnavailable: boolean): string {
+  if (commitUnavailable) return "This commit's diff can't be read here.";
+  if (commitView) return "This commit has no file changes.";
+  return "No changes vs base.";
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -471,8 +479,10 @@ export function PullRequestChangesTab({
   // poll never changes the link, and a list without one leaves Open disabled.
   const renderedHeadSha = changes.data?.head_sha ?? null;
   const renderedBaseSha = changes.data?.base_sha ?? null;
-  // Commits are listed at the pinned head, and the Changes view is the fallback without one.
-  const commitsSupported = !!data.capabilities.commit_history && !!prUrl && !!renderedHeadSha;
+  // Commits need the host's capability, a pinned head, and a server that has the routes.
+  const commitsUnsupported = usePullRequestCommitsUnsupported(conversationId, prUrl);
+  const commitsSupported =
+    !!data.capabilities.commit_history && !!prUrl && !!renderedHeadSha && !commitsUnsupported;
   const mode = commitsSupported ? view.mode : "changes";
   const commitsView = mode === "commits";
   const commitView = mode === "commit";
@@ -501,6 +511,12 @@ export function PullRequestChangesTab({
   useEffect(() => {
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);
+  // A server without the commit routes leaves Changes as the only view, so a saved commit view ends.
+  useEffect(() => {
+    if (!commitsUnsupported || view.mode === "changes") return;
+    setMode("changes");
+    toast("Commits need an updated Omnigent server.", { id: "pr-commits-unsupported" });
+  }, [commitsUnsupported, view.mode, setMode]);
   const baseRepoUrl = pullRequestRepoUrl(data.provider, pr.url);
   const providerLabel = gitProviderCopy(data.provider, undefined, data.provider_display).label;
   const findInputRef = useRef<HTMLInputElement>(null);
@@ -594,8 +610,7 @@ export function PullRequestChangesTab({
     [commitView, commitFiles, commitDiff.isLoading, commitDiff.error, changes],
   );
   const files = useMemo<PullRequestChangedFile[]>(() => listing.data?.data ?? [], [listing.data]);
-  // Viewed marks belong to the PR's changes, so their controls, filter and progress wait for Changes.
-  // Review features (threads, drafts, the viewed controls and their marks) belong to Changes only.
+  // Review features (threads, drafts, viewed controls, marks and progress) apply only in Changes.
   const reviewing = mode === "changes";
   // One filtered list drives the tree, sections, threads and collapse all so they never disagree.
   const hiddenPaths = view.hideViewed && reviewing ? viewedFiles.viewed : NO_HIDDEN_PATHS;
@@ -1004,13 +1019,9 @@ export function PullRequestChangesTab({
   // A disabled commit query has no data, which is not a commit without changes.
   const commitUnavailable =
     commitView && !commitDiff.data && !commitDiff.isLoading && !commitDiff.error;
-  const emptyChangesMessage = commitUnavailable
-    ? "This commit's diff can't be read here."
-    : commitView
-      ? "This commit has no file changes."
-      : "No changes vs base.";
+  const emptyChangesMessage = emptyChangesText(commitView, commitUnavailable);
   const coverageNote =
-    findOpen && !commitsView && patchReady && (listing.data?.has_more || withoutText > 0)
+    findOpen && patchReady && (listing.data?.has_more || withoutText > 0)
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
@@ -1139,7 +1150,8 @@ export function PullRequestChangesTab({
   // A controls row, then the sidebar (jump-to-file) + one scroll of all files' diffs.
   return (
     <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col" onKeyDown={onTabKeyDown}>
-      {data.capabilities.review_threads &&
+      {reviewing &&
+        data.capabilities.review_threads &&
         (reviews.page?.has_more ||
           reviews.historyStale ||
           reviews.page?.warning ||
@@ -1183,7 +1195,7 @@ export function PullRequestChangesTab({
           {coverageNote}
         </p>
       )}
-      {changedListed && view.dismissedResetHead !== renderedHead && (
+      {reviewing && changedListed && view.dismissedResetHead !== renderedHead && (
         <div
           role="status"
           className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1 text-ui text-muted-foreground"
@@ -1209,7 +1221,7 @@ export function PullRequestChangesTab({
           }
           canNavigateThreads={unresolved.length > 0}
           onNavigateThread={navigateThread}
-          loadingThreads={reviews.isFetching}
+          loadingThreads={reviewing && reviews.isFetching}
           diffStyle={diffStyle}
           onToggleDiffStyle={toggleDiffStyle}
           allCollapsed={allCollapsed}
