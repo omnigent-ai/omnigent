@@ -130,6 +130,8 @@ from omnigent.util.session_lifecycle import (
 _logger = logging.getLogger(__name__)
 
 _EventPublisher = Callable[[str, _JsonObject], None]
+# (session_id, handle_id, tool_name, status) once a background result is in the inbox.
+AsyncResultWake = Callable[[str, str, str, str], None]
 
 
 class _UnsetLocalToolWorkdir:
@@ -3329,7 +3331,6 @@ def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
     title: object,
-    message: object,
     model: object = None,
     reasoning_effort: object = None,
 ) -> _JsonObject:
@@ -3337,10 +3338,10 @@ def _build_session_create_body(
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
     ``parent_session_id`` defaults to ``conversation_id``; independent
-    placements remove it before using the gated endpoint. A non-empty ``title``, ``message``,
-    ``model``, and ``reasoning_effort`` are included when provided; the
-    message becomes the child's first queued user turn via
-    ``initial_items``.
+    placements remove it before using the gated endpoint. A non-empty ``title``,
+    ``model``, and ``reasoning_effort`` are included when provided. The first
+    message is not part of the body: callers send it after the create, except
+    that a managed placement carries it as ``initial_input``.
 
     ``model`` and ``reasoning_effort`` are passed through unvalidated:
     this path never resolves the child's harness (the agent is named by
@@ -3352,56 +3353,53 @@ def _build_session_create_body(
     :param conversation_id: The caller's session id — the forced parent.
     :param title: Optional session label; included only when a non-empty
         string.
-    :param message: Optional first user message; included only when a
-        non-empty string.
     :param model: Optional model override, e.g. ``"databricks-glm-5-2"``;
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
     :returns: The JSON request body.
     """
-    body: _JsonObject = {
+    return {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
         **_session_create_fields(
             {"title": title, "model": model, "reasoning_effort": reasoning_effort}
         ),
     }
-    if isinstance(message, str) and message:
-        body["initial_items"] = [
-            {
-                "type": "message",
-                "data": {"role": "user", "content": [{"type": "input_text", "text": message}]},
-            }
-        ]
-    return body
 
 
-def _finalize_created_session(
+async def _finalize_created_session(
     data: _JsonObject,
     *,
     conversation_id: str,
     agent_id: str,
     title: object,
+    message: object,
+    server_client: httpx.AsyncClient,
     publish_event: Callable[[str, _JsonObject], None] | None,
 ) -> str:
     """
-    Register fan-out, emit ``session.created``, and build the handle.
+    Register fan-out, emit ``session.created``, send any first message, and build the handle.
 
     Records the child→parent mapping so the child's status/preview
     deltas fan out onto the caller's stream, publishes a transient
     ``session.created`` event (durability comes from the server's
     conversation row), and returns the handle the orchestrator uses to
-    drive / monitor the child.
+    drive / monitor the child. A first ``message`` goes through the
+    by-id ``sys_session_send`` path, so the child's turn is tracked as
+    sub-agent work whose completion reaches the caller's inbox and wakes it.
 
     :param data: The :class:`SessionResponse` JSON from the create call.
     :param conversation_id: The caller (parent) session id.
     :param agent_id: The launched agent id, e.g. ``"ag_abc123"``.
     :param title: The caller-supplied title (or non-str when absent).
+    :param message: The caller-supplied first message (or non-str when absent).
+    :param server_client: HTTP client pointed at the Omnigent server.
     :param publish_event: Callback that enqueues an SSE event on the
         caller's outbound queue; ``None`` for in-process callers.
     :returns: JSON handle ``{conversation_id, kind, agent_id,
-        agent_name, title, status}``.
+        agent_name, title, status}``, plus the send handle's ``handle_id``
+        and ``launching`` status when a message was sent.
     """
     from omnigent.runner import subagent_work as _subagent_work
     from omnigent.server.schemas import SessionCreatedEvent
@@ -3428,16 +3426,44 @@ def _finalize_created_session(
     )
     if publish_event is not None:
         publish_event(conversation_id, evt.model_dump())
-    return json.dumps(
-        {
-            "conversation_id": child_id,
-            "kind": "sub_agent",
-            "agent_id": agent_id,
-            "agent_name": data.get("agent_name"),
-            "title": title if isinstance(title, str) else None,
-            "status": data.get("status") or "created",
-        }
-    )
+    handle: _JsonObject = {
+        "conversation_id": child_id,
+        "kind": "sub_agent",
+        "agent_id": agent_id,
+        "agent_name": data.get("agent_name"),
+        "title": title if isinstance(title, str) else None,
+        "status": data.get("status") or "created",
+    }
+    if isinstance(message, str) and message:
+        sent = await _send_to_existing_session(
+            child_id,
+            message,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            publish_event=publish_event,
+            created_by=await _session_turn_actor(
+                server_client=server_client, conversation_id=conversation_id
+            ),
+        )
+        try:
+            send_handle = json.loads(sent)
+        except ValueError:
+            send_handle = None
+        if not isinstance(send_handle, dict) or "error" in send_handle:
+            return json.dumps(
+                {
+                    "error": f"child session created but message failed: {sent}",
+                    "conversation_id": child_id,
+                }
+            )
+        handle.update(
+            {
+                key: send_handle[key]
+                for key in ("task_id", "handle_id", "status", "message")
+                if key in send_handle
+            }
+        )
+    return json.dumps(handle)
 
 
 async def _execute_session_create(
@@ -3463,8 +3489,10 @@ async def _execute_session_create(
 
     The default placement forces ``parent_session_id`` to the caller.
     Independent placements use the server's gated orchestration endpoint.
-    A child inherits the caller's runner (server-side affinity), so a
-    queued initial message starts a turn immediately. Returns a handle
+    A child inherits the caller's runner (server-side affinity), so an
+    initial message starts a turn immediately; it is sent like a by-id
+    ``sys_session_send``, so the child's completion reaches the caller's
+    inbox and wakes it. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
@@ -3538,7 +3566,6 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
@@ -3552,11 +3579,14 @@ async def _execute_session_create(
         if placement == "managed":
             body["host_type"] = "managed"
             body.update(selection)
-            initial_items = body.pop("initial_items", None)
-            if isinstance(initial_items, list) and initial_items:
-                body["initial_input"] = initial_items[0]
-        else:
-            body.pop("initial_items", None)
+            if isinstance(message, str) and message:
+                body["initial_input"] = {
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": message}],
+                    },
+                }
     unconfirmed_creation = {
         "error": "Session creation could not be confirmed; "
         "inspect your sessions before creating another. Use sys_session_list's sessions "
@@ -3666,11 +3696,13 @@ async def _execute_session_create(
                     "do not automatically resend the task."
                 )
         return json.dumps(handle)
-    return _finalize_created_session(
+    return await _finalize_created_session(
         data,
         conversation_id=conversation_id,
         agent_id=str(agent_id),
         title=args.get("title"),
+        message=message,
+        server_client=server_client,
         publish_event=publish_event,
     )
 
@@ -3714,58 +3746,6 @@ def _bundle_local_agent_source(source: Path) -> bytes:
                         arcname=str(file_path.relative_to(bundle_dir)),
                     )
         return buf.getvalue()
-
-
-async def _post_child_first_message(
-    child_session_id: str,
-    message: str,
-    server_client: httpx.AsyncClient,
-) -> str | None:
-    """
-    Queue a bundle-created child's first user message.
-
-    Posted as a separate event so the server's post_event forwards it
-    to the runner and starts the child turn (same pattern as
-    named-mode ``sys_session_send``).
-
-    :param child_session_id: The new child session id,
-        e.g. ``"conv_abc123"``.
-    :param message: The first user message text.
-    :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: ``None`` on success; a JSON error string (carrying the
-        created ``conversation_id`` so the orchestrator can retry via
-        ``sys_session_send``) on failure.
-    """
-    try:
-        msg_resp = await server_client.post(
-            f"{_session_url(child_session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": message}],
-                },
-            },
-            timeout=30.0,
-        )
-    except httpx.HTTPError as exc:
-        return json.dumps(
-            {
-                "error": f"child session created but message failed: {exc}",
-                "conversation_id": child_session_id,
-            }
-        )
-    if msg_resp.status_code >= 400:
-        return json.dumps(
-            {
-                "error": (
-                    "child session created but message failed: "
-                    f"{msg_resp.status_code} {msg_resp.text[:200]}"
-                ),
-                "conversation_id": child_session_id,
-            }
-        )
-    return None
 
 
 async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -> str | None:
@@ -3933,9 +3913,9 @@ async def _session_create_from_config_path(
 
     Delegates the resolve/bundle/upload pipeline to
     :func:`_upload_config_bundle`, validates the server's
-    ``CreatedSessionResponse``, queues the optional first ``message``
-    via :func:`_post_child_first_message`, and returns the
-    orchestrator handle.
+    ``CreatedSessionResponse``, and hands off to
+    :func:`_finalize_created_session`, which sends the optional first
+    ``message`` and returns the orchestrator handle.
 
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
@@ -3974,13 +3954,7 @@ async def _session_create_from_config_path(
             }
         )
 
-    message = args.get("message")
-    if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
-        if message_error is not None:
-            return message_error
-
-    return _finalize_created_session(
+    return await _finalize_created_session(
         # Adapt the multipart CreatedSessionResponse shape to the
         # session-snapshot keys _finalize_created_session reads.
         {
@@ -3991,6 +3965,8 @@ async def _session_create_from_config_path(
         conversation_id=conversation_id,
         agent_id=created_agent_id,
         title=args.get("title"),
+        message=args.get("message"),
+        server_client=server_client,
         publish_event=publish_event,
     )
 
@@ -6972,6 +6948,7 @@ async def execute_tool(
     publish_event: Callable[[str, _JsonObject], None] | None = None,
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -6999,6 +6976,9 @@ async def execute_tool(
         caller knows it (the server's per-session override outranks the
         spec's declaration). Decides whether the native relay's
         unconditional ``sys_os_*`` counts toward the granted surface.
+    :param wake_on_async_result: Callback a ``sys_call_async`` background
+        task invokes after queueing its completed or failed result, so the
+        runner can wake a session that is no longer in a turn.
     :returns: Tool output string.
     """
     if not arguments.strip():
@@ -7101,6 +7081,7 @@ async def execute_tool(
                 mcp_manager=mcp_manager,
                 filesystem_registry=filesystem_registry,
                 effective_harness=effective_harness,
+                wake_on_async_result=wake_on_async_result,
             )
         elif tool_name in _SUBAGENT_TOOLS:
             output = await _execute_subagent_tool(
@@ -8300,6 +8281,7 @@ async def _execute_async_inbox_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Runner-local dispatch for async inbox tools.
@@ -8322,6 +8304,7 @@ async def _execute_async_inbox_tool(
     :param effective_harness: Harness the session actually runs, forwarded to
         ``_spawn_async_tool`` so the target is judged against the surface the
         session was advertised.
+    :param wake_on_async_result: Forwarded to ``_spawn_async_tool``.
     :returns: Tool output string.
     """
     del harness_client
@@ -8350,6 +8333,7 @@ async def _execute_async_inbox_tool(
             mcp_manager=mcp_manager,
             filesystem_registry=filesystem_registry,
             effective_harness=effective_harness,
+            wake_on_async_result=wake_on_async_result,
         )
 
     if tool_name == SysCancelAsyncTool.name():
@@ -8861,13 +8845,15 @@ def _spawn_async_tool(
     filesystem_registry: FilesystemRegistry | None = None,
     local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
+    wake_on_async_result: AsyncResultWake | None = None,
 ) -> str:
     """
     Spawn a tool as a background asyncio.Task.
 
     Returns a handle immediately. On completion, the result is
     pushed to the session's inbox queue for ``sys_read_inbox``
-    to drain.
+    to drain, and a completed or failed result is reported through
+    ``wake_on_async_result`` so the runner can wake the session.
 
     :param args: Must contain ``"tool"`` (target tool name) and
         ``"args"`` (JSON string of target tool arguments).
@@ -8879,6 +8865,9 @@ def _spawn_async_tool(
         async terminal-tool launches.
     :param effective_harness: Harness the session actually runs, used to judge
         the target against the surface the session was advertised.
+    :param wake_on_async_result: Called with ``(session_id, handle_id,
+        tool_name, status)`` after a completed or failed result is queued.
+        Cancelled results are not reported: whoever cancelled is not waiting.
     :returns: JSON handle string with canonical ``handle_id``,
         plus compatibility ``task_id`` (identical value; remove in 0.8.0),
         ``tool_name``, ``status``, and ``message``. Prefer
@@ -8902,6 +8891,17 @@ def _spawn_async_tool(
 
     handle_id = f"handle_{uuid.uuid4().hex[:12]}"
     cancel_event = asyncio.Event()
+
+    def _report(status: str, output: str) -> None:
+        session_inbox.put_nowait(
+            {"handle_id": handle_id, "tool_name": target_tool, "status": status, "output": output}
+        )
+        if status == "cancelled" or wake_on_async_result is None or conversation_id is None:
+            return
+        try:
+            wake_on_async_result(conversation_id, handle_id, target_tool, status)
+        except Exception:
+            _logger.exception("async tool %s result wake failed", target_tool)
 
     async def _bg() -> str:
         """
@@ -8928,14 +8928,7 @@ def _spawn_async_tool(
                 )
                 if not allowed:
                     result = "[Result suppressed by policy: PHASE_TOOL_CALL denied]"
-                    session_inbox.put_nowait(
-                        {
-                            "handle_id": handle_id,
-                            "tool_name": target_tool,
-                            "status": "failed",
-                            "output": result,
-                        }
-                    )
+                    _report("failed", result)
                     return result
 
             # Race the tool execution against the cancel event.
@@ -8969,49 +8962,21 @@ def _spawn_async_tool(
                 # asyncio.to_thread, so that thread may run to completion.
                 for fut in pending:
                     fut.cancel()
-                session_inbox.put_nowait(
-                    {
-                        "handle_id": handle_id,
-                        "tool_name": target_tool,
-                        "status": "cancelled",
-                        "output": "",
-                    }
-                )
+                _report("cancelled", "")
                 return ""
             # Drop the losing future (cancel_event.wait()) so it doesn't
             # linger as a pending task for the life of the session.
             for fut in pending:
                 fut.cancel()
             result = execution_task.result()
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "completed",
-                    "output": result,
-                }
-            )
+            _report("completed", result)
             return result
         except asyncio.CancelledError:
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "cancelled",
-                    "output": "",
-                }
-            )
+            _report("cancelled", "")
             raise
         except Exception as exc:
             _logger.exception("async tool %s failed", target_tool)
-            session_inbox.put_nowait(
-                {
-                    "handle_id": handle_id,
-                    "tool_name": target_tool,
-                    "status": "failed",
-                    "output": str(exc),
-                }
-            )
+            _report("failed", str(exc))
             return f"Error: {exc}"
         finally:
             session_async_tasks.pop(handle_id, None)
@@ -9029,8 +8994,12 @@ def _spawn_async_tool(
             "message": (
                 f"[System: {target_tool} dispatched as background "
                 f"task {handle_id}. Result will appear in your "
-                f"inbox — call sys_read_inbox to check. To abort, "
-                f"call sys_cancel_async with handle_id={handle_id!r}.]"
+                f"inbox — call sys_read_inbox to check. If your turn "
+                f"ends first, the runtime posts a `[System: background "
+                f"task {handle_id} ... finished ...]` wake notice into "
+                f"this session; that notice comes from the runtime, not "
+                f"from a person. To abort, call sys_cancel_async with "
+                f"handle_id={handle_id!r}.]"
             ),
         }
     )

@@ -18,7 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.runner import app as runner_app
-from omnigent.runner import create_runner_app, subagent_work
+from omnigent.runner import create_runner_app, subagent_work, tool_dispatch
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
@@ -1593,6 +1593,154 @@ async def test_subagent_completion_during_parent_wake_turn_posts_followup_wake()
     followup_text = server_client.wake_posts[1]["data"]["content"][0]["text"]
     assert "sub-agent codex/followup finished (completed)" in followup_text
     assert "sys_read_inbox" in followup_text
+
+
+async def _wait_for_turn_end(app: Any, session_id: str) -> None:
+    """
+    Wait until the runner no longer tracks an active turn for *session_id*.
+
+    :param app: Runner app under test.
+    :param session_id: Session whose turn is ending.
+    :returns: None.
+    """
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while session_id in app.state.active_turns:
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"turn for {session_id} did not end within 5s")
+        await asyncio.sleep(0.01)
+
+
+class _PolicyAllowingWakeRecordingServerClient(_WakeRecordingServerClient):
+    """Allows the ``PHASE_TOOL_CALL`` check a background task makes before it runs."""
+
+    async def post(self, url: str, **kwargs: Any) -> Any:
+        """Allow policy evaluations, else record wakes like the base.
+
+        :param url: Request URL, e.g. ``"/v1/sessions/<id>/policies/evaluate"``.
+        :param kwargs: Request kwargs.
+        :returns: An allow verdict for policy evaluations, else the base response.
+        """
+        if url.endswith("/policies/evaluate"):
+            return httpx.Response(200, json={"result": "POLICY_ACTION_ALLOW"})
+        return await super().post(url, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finishes", "drained_mid_turn", "wakes"),
+    [
+        pytest.param("after_turn", False, True, id="finishes-after-turn-end"),
+        pytest.param("mid_turn", False, True, id="finishes-mid-turn-undrained"),
+        pytest.param("mid_turn", True, False, id="finishes-mid-turn-drained"),
+    ],
+)
+async def test_background_task_result_wakes_session_whose_turn_ended(
+    monkeypatch: pytest.MonkeyPatch, finishes: str, drained_mid_turn: bool, wakes: bool
+) -> None:
+    """
+    A finished ``sys_call_async`` task wakes its session once no turn can collect it.
+
+    A native harness dispatches ``sys_call_async`` through ``/mcp/execute`` and
+    its turn usually ends before the task finishes. The result lands in the
+    session inbox, and the runner must post a wake notice to the session's own
+    ``/events`` so it takes a turn and calls ``sys_read_inbox``. A result that
+    lands mid-turn defers that decision to turn end: the turn may drain it
+    itself, in which case a wake would only start an empty extra turn.
+    """
+    session_id = "b7e0c4a1d2f34e5a9c8b7a6f5e4d3c2b"
+    agent_id = "0c1d2e3f4a5b4c6d8e9f0a1b2c3d4e5f"
+    spec = AgentSpec(spec_version=1, name="background-agent", async_enabled=True)
+    server_client = _PolicyAllowingWakeRecordingServerClient(session_id)
+    gate = asyncio.Event()
+    harness_client = _BlockingHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_dispatch"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_dispatch"}}),
+        ],
+        gate,
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    release = asyncio.Event()
+
+    async def _slow_session_list(*_args: Any, **_kwargs: Any) -> str:
+        await release.wait()
+        return "BACKGROUND_DONE"
+
+    monkeypatch.setattr(tool_dispatch, "_execute_session_query_tool", _slow_session_list)
+
+    async def _call(client: Any, name: str, arguments: dict[str, Any]) -> str:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/call", "params": {"name": name, "arguments": arguments}},
+        )
+        assert resp.status_code == 200, resp.text
+        return str(resp.json()["result"]["output"])
+
+    try:
+        async with _runner_client(app) as client:
+            init = await client.post(
+                "/v1/sessions",
+                json={"session_id": session_id, "agent_id": agent_id, "sub_agent_name": None},
+            )
+            assert init.status_code == 201, init.text
+            turn = await client.post(
+                f"/v1/sessions/{session_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": agent_id,
+                    "model": "background-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "start the background task"}],
+                },
+            )
+            assert turn.status_code == 202, turn.text
+            await asyncio.wait_for(harness_client.post_seen.wait(), timeout=5.0)
+            handle = json.loads(
+                await _call(client, "sys_call_async", {"tool": "sys_session_list", "args": "{}"})
+            )
+            inbox = subagent_work._session_inboxes_ref[session_id]
+
+            if finishes == "after_turn":
+                gate.set()
+                await _wait_for_turn_end(app, session_id)
+                release.set()
+            else:
+                release.set()
+                while inbox.empty():
+                    await asyncio.sleep(0.01)
+                if drained_mid_turn:
+                    assert "BACKGROUND_DONE" in await _call(client, "sys_read_inbox", {})
+                # The turn is still active, so it could collect the result itself.
+                assert server_client.wake_posts == []
+                gate.set()
+                await _wait_for_turn_end(app, session_id)
+
+            if wakes:
+                await asyncio.wait_for(server_client.wake_seen.wait(), timeout=5.0)
+            else:
+                for _ in range(20):
+                    await asyncio.sleep(0)
+    finally:
+        gate.set()
+        release.set()
+        subagent_work._session_inboxes_ref.pop(session_id, None)
+
+    if not wakes:
+        assert server_client.wake_posts == []
+        return
+    [wake] = server_client.wake_posts
+    wake_text = wake["data"]["content"][0]["text"]
+    assert (
+        f"background task {handle['handle_id']} (sys_session_list) finished (completed)"
+        in wake_text
+    )
+    assert "1 result waiting in inbox" in wake_text
+    assert "sys_read_inbox" in wake_text
 
 
 @pytest.mark.asyncio
