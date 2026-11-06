@@ -89,6 +89,7 @@ from omnigent.databricks_ai_gateway import (
     is_databricks_ai_gateway_url,
     is_ug_route,
     with_gateway_attribution_lines,
+    with_isaac_client_surface,
 )
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
@@ -7025,6 +7026,7 @@ def _claude_terminal_request(
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)
+    args = with_isaac_client_surface(command, args, client_surface="cli")
     spec: _JsonObject = {
         "command": command,
         "args": args,

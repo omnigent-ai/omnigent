@@ -560,8 +560,18 @@ async def test_discovery_early_exit_error_carries_redacted_codex_stderr() -> Non
     assert "[REDACTED]" in message
 
 
+@pytest.mark.parametrize(
+    ("command", "launch_args", "expected_prefix"),
+    [
+        ("/test/codex", [], []),
+        ("isaac", ["codex", "--"], ["--surface", "omnigent-desktop", "codex", "--"]),
+    ],
+)
 async def test_discovery_process_captures_stderr_in_memory(
     monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    launch_args: list[str],
+    expected_prefix: list[str],
 ) -> None:
     """The probe drains stderr through a pipe rather than a filesystem log."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
@@ -570,7 +580,8 @@ async def test_discovery_process_captures_stderr_in_memory(
 
     async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
         nonlocal captured_stderr
-        del args
+        assert kwargs["executable"] == command
+        assert args[1:] == (*expected_prefix, "app-server", "--listen", "ws://127.0.0.1:12345")
         captured_stderr = kwargs["stderr"]
         stderr = asyncio.StreamReader()
         stderr.feed_data(b"Error: provider unavailable\n")
@@ -590,10 +601,11 @@ async def test_discovery_process_captures_stderr_in_memory(
     )
 
     discovery = await codex_native_app_server._start_codex_model_discovery_process(
-        codex_path="/test/codex",
+        codex_path=command,
         listen_url="ws://127.0.0.1:12345",
-        env={},
+        env={"OMNIGENT_CLIENT_SURFACE": "desktop"},
         cwd=Path("/work"),
+        launch_args=launch_args,
     )
 
     assert captured_stderr == asyncio.subprocess.PIPE

@@ -52,6 +52,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent.databricks_ai_gateway import with_isaac_client_surface
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -9860,6 +9861,11 @@ async def _auto_create_claude_terminal(
     _harness_cfg = load_effective_config(workspace=workspace)
     launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
+    launch_args = with_isaac_client_surface(
+        launch_command,
+        launch_args,
+        client_surface=resource_registry.client_surface(session_id),
+    )
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare
     # name resolves against this process's inherited PATH (same lookup tmux's

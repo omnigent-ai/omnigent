@@ -17,9 +17,60 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution,
     with_gateway_attribution_lines,
     with_gateway_attribution_pairs,
+    with_isaac_client_surface,
 )
 
 _GW = "https://dbc-1.cloud.databricks.com/ai-gateway/anthropic"
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "expected"),
+    [
+        ("isaac", [], ["--surface", "omnigent-web"]),
+        ("/custom tools/isaac", ["codex", "--"], ["--surface", "omnigent-web", "codex", "--"]),
+        (
+            "/usr/local/bin/dbexec",
+            ["repo", "run", "isaac", "--", "--"],
+            ["repo", "run", "isaac", "--", "--surface", "omnigent-web", "--"],
+        ),
+        ("codex", ["--", "isaac"], ["--", "isaac"]),
+        ("claude", ["--resume", "session"], ["--resume", "session"]),
+        ("isaac-wrapper", ["codex"], ["codex"]),
+        ("dbexec", ["repo", "run", "other", "--"], ["repo", "run", "other", "--"]),
+    ],
+)
+def test_isaac_surface_targets_only_the_launcher(
+    command: str, args: list[str], expected: list[str]
+) -> None:
+    original = list(args)
+    assert with_isaac_client_surface(command, args, client_surface="web") == expected
+    assert args == original
+
+
+def test_isaac_surface_preserves_caller_attribution_and_harness_args() -> None:
+    args = ["codex", "--surface", "arcaterm", "--", "--surface", "prompt text"]
+    desktop = with_isaac_client_surface("isaac", args, client_surface="desktop")
+    web = with_isaac_client_surface("isaac", args, client_surface="web")
+    assert desktop == [
+        "--surface",
+        "omnigent-desktop",
+        "codex",
+        "--surface",
+        "arcaterm",
+        "--",
+        "--surface",
+        "prompt text",
+    ]
+    assert web == [
+        "--surface",
+        "omnigent-web",
+        "codex",
+        "--surface",
+        "arcaterm",
+        "--",
+        "--surface",
+        "prompt text",
+    ]
 
 
 @pytest.mark.parametrize("via_ug", [False, True])
@@ -43,6 +94,11 @@ def test_gateway_attribution_names_the_creating_interface(
     via_ug: bool,
 ) -> None:
     expected = [qualified_surface or "omnigent"]
+    assert with_isaac_client_surface("isaac", ["--"], client_surface=client_surface) == [
+        "--surface",
+        expected[0],
+        "--",
+    ]
     if via_ug:
         expected.append("ug")
     assert gateway_attribution_headers("codex", via_ug=via_ug, client_surface=client_surface) == {

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec, RetryPolicy
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.databricks_ai_gateway import with_isaac_client_surface
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
@@ -1631,6 +1632,9 @@ async def _start_codex_model_discovery_process(
 ) -> _CodexModelDiscoveryProcess:
     """Start the isolated Codex process used only for model discovery."""
     registry_tag = f"codex-model-probe-{uuid.uuid4().hex}"
+    launch_args = with_isaac_client_surface(
+        codex_path, launch_args, client_surface=env.get(CLIENT_SURFACE_ENV_VAR)
+    )
     argv = _build_native_codex_app_server_argv(
         tagged_argv0=_tagged_codex_argv0(codex_path, registry_tag),
         listen_url=listen_url,
@@ -2479,6 +2483,9 @@ class CodexNativeAppServer:
         """
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         executable, *launch_args = self.app_server_command or (self.codex_path,)
+        launch_args = with_isaac_client_surface(
+            executable, launch_args, client_surface=self.env.get(CLIENT_SURFACE_ENV_VAR)
+        )
         argv = _build_native_codex_app_server_argv(
             tagged_argv0=_tagged_codex_argv0(executable, self.process_registry_tag),
             listen_url=resolved_listen,
