@@ -295,6 +295,19 @@ def test_cli_recording_covers_message_only_changes() -> None:
     assert "A missing before-clip is not a reason to skip the after-clip" in normalized
 
 
+def test_inherited_before_clip_captions_are_not_restated_unchecked() -> None:
+    skills = {skill.name: " ".join(skill.content.split()) for skill in load(_RESOLVE_AGENT).skills}
+    author = skills["resolve-author-fix"]
+    review = skills["resolve-review-pr"]
+
+    assert "Its caption is Repro's claim, not your observation" in author
+    assert "in `root_cause`, the PR or the ticket unless you inspected the frames" in author
+    assert "attribute the description to Repro and say you did not check the frames" in author
+    assert "Report frames that contradict the caption in `evidence`" in author
+    assert "Restate its caption as the observed symptom only after inspecting" in review
+    assert "attribute it to Repro and say you did not check them" in review
+
+
 def test_recording_blockers_are_explicit_and_do_not_block_delivery() -> None:
     normalized = _normalized_resolve_instructions()
 

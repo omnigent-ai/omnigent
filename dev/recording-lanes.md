@@ -356,6 +356,14 @@ labels do not establish what the screen displayed. Describe icon-only controls
 by their visible appearance. If frame inspection is unavailable, disclose that
 and limit claims to states the recording driver actually verified.
 
+A DOM, layout or pixel probe verifies only what it measured, even when its
+result is named for visibility. Another layer can paint the same content (a
+command draft's textarea text is transparent while an overlay draws it), and a
+few pixels of offset or clipping may not be noticeable at the clip's resolution.
+When a claim rests on such a probe, caption the measurement ("the overlay text
+sits 8px below the caret"), not a symptom the frames were not seen to show
+("typed text never appears").
+
 A driver check covers only the element it targets. The screen can show one
 state in several places: a session's activity appears as the chat pane's
 working indicator, a spinner on its sidebar row, and a sub-agent count badge.

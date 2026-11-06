@@ -116,3 +116,17 @@ def test_caption_absence_claims_stay_scoped_to_the_checked_element() -> None:
     assert "name the checked element" in instructions
     assert "after checking only the chat pane" in instructions
     assert "unless every place showing that state was checked" in instructions
+
+
+def test_probe_based_captions_state_the_measurement_not_a_visible_symptom() -> None:
+    lanes = _normalized(_DEV / "recording-lanes.md")
+    instructions = _loaded_repro_instructions()
+    assert "A DOM, layout or pixel probe verifies only what it measured" in lanes
+    assert "even when its result is named for visibility" in lanes
+    assert "Another layer can paint the same content" in lanes
+    assert "not be noticeable at the clip's resolution" in lanes
+    assert "A DOM, layout or pixel probe verifies only what it measured" in instructions
+    assert '("the overlay text sits 8px below the caret")' in instructions
+    assert 'not a symptom the frames were not seen to show ("typed text never appears")' in (
+        instructions
+    )
