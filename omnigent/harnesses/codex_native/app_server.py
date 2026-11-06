@@ -1961,6 +1961,7 @@ async def prepare_codex_provider_config(
     cwd: Path,
     env: Mapping[str, str],
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
 ) -> list[str]:
@@ -1970,7 +1971,11 @@ async def prepare_codex_provider_config(
     resolves inherited providers itself only when Omnigent didn't pick the provider.
     """
     overrides = materialize_codex_provider_config(
-        codex_home, config_overrides, retry_policy=retry_policy, client_surface=client_surface
+        codex_home,
+        config_overrides,
+        retry_policy=retry_policy,
+        source_home=source_home,
+        client_surface=client_surface,
     )
     if not _codex_may_inherit_provider(overrides, app_server_command):
         return overrides
@@ -2005,6 +2010,7 @@ async def prepare_codex_provider_config(
         codex_home,
         overrides,
         retry_policy=retry_policy,
+        source_home=source_home,
         client_surface=client_surface,
         effective_providers=providers,
     )
@@ -2652,6 +2658,7 @@ class CodexNativeAppServer:
         self.config_overrides = await prepare_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            source_home=config_source,
             codex_path=self.codex_path,
             cwd=self.cwd,
             env=self.env,
