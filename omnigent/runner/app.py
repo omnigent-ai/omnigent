@@ -5021,9 +5021,23 @@ def create_runner_app(
             is_rewake=is_rewake,
         )
 
+    def _unread_async_result(session_id: str) -> tuple[float, str, str, str] | None:
+        latest = _latest_async_results.get(session_id)
+        inbox = _session_inboxes.get(session_id)
+        if latest is None or inbox is None:
+            return None
+        # asyncio.Queue has no peek; cycling it without awaiting keeps its order.
+        items = [inbox.get_nowait() for _ in range(inbox.qsize())]
+        for item in items:
+            inbox.put_nowait(item)
+        if any(item.get("handle_id") == latest[1] for item in items):
+            return latest
+        _latest_async_results.pop(session_id, None)
+        return None
+
     def _schedule_latest_inbox_wake(session_id: str, *, is_rewake: bool = False) -> None:
         latest_work = latest_wake_eligible_subagent_work(list_subagent_work(session_id))
-        latest_async = _latest_async_results.get(session_id)
+        latest_async = _unread_async_result(session_id)
         if latest_async is not None and (
             latest_work is None or latest_async[0] >= (latest_work.completed_at or 0.0)
         ):

@@ -3442,16 +3442,20 @@ async def _finalize_created_session(
         "status": data.get("status") or "created",
     }
     if isinstance(message, str) and message:
-        sent = await _send_to_existing_session(
-            child_id,
-            message,
-            server_client=server_client,
-            conversation_id=conversation_id,
-            publish_event=publish_event,
-            created_by=await _session_turn_actor(
-                server_client=server_client, conversation_id=conversation_id
-            ),
-        )
+        try:
+            sent = await _send_to_existing_session(
+                child_id,
+                message,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                publish_event=publish_event,
+                created_by=await _session_turn_actor(
+                    server_client=server_client, conversation_id=conversation_id
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _subagent_work.unregister_subagent_work(child_id)
+            sent = f"Error: {type(exc).__name__}: {exc}"
         try:
             send_handle = json.loads(sent)
         except ValueError:
