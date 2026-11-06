@@ -511,6 +511,42 @@ describe("useCreateTerminal launch", () => {
     await vi.waitFor(() => expect(isClosedDuringLaunch(opened.id)).toBe(false));
   });
 
+  it("lists a shell again when its deferred close fails", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        requestBody = init.body as string;
+        return new Promise<Response>((resolve) => {
+          respond = resolve;
+        });
+      }
+      return Promise.resolve(mockResponse({}, { ok: false, status: 503 }));
+    });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client }, children);
+    const create = renderHook(() => useCreateTerminal("conv_close_fails"), { wrapper });
+    const remove = renderHook(() => useDeleteTerminal("conv_close_fails"), { wrapper });
+    const cached = () => client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_close_fails"));
+    const onOpen = vi.fn();
+
+    act(() => create.result.current.launch("zsh", { onOpen }));
+    const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+    await act(async () => {
+      await remove.result.current.mutateAsync(opened.id);
+    });
+    expect(cached()).toEqual([]);
+
+    await act(async () => respond(createdResponse(requestBody)));
+
+    // The DELETE failed, so the still-running shell is listed again.
+    await vi.waitFor(() => expect(cached()?.map((t) => t.id)).toEqual([opened.id]));
+    expect(isClosedDuringLaunch(opened.id)).toBe(false);
+  });
+
   it("removes the early-opened terminal and reports it when the create fails", async () => {
     runnerOnlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValueOnce(
