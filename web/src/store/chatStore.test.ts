@@ -16692,14 +16692,20 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
-  it("times login-page answers only from the last successful stream open", async () => {
+  it.each([
+    ["a successful stream open", "open"],
+    ["a 503", "503"],
+    ["a failed connection", "network"],
+  ] as const)("restarts the login-page window after %s", async (_label, interruption) => {
     seedSession("conv_html_reset", []);
-    let answerLoginPage = true;
+    let answer: "login" | typeof interruption = "login";
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
-        if (answerLoginPage) return loginPageResponse();
+        if (answer === "login") return loginPageResponse();
+        if (answer === "503") return mockResponse(null, { ok: false, status: 503 });
+        if (answer === "network") return Promise.reject(new TypeError("Failed to fetch"));
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
@@ -16709,15 +16715,18 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     const controller = new AbortController();
     useChatStore.setState({ conversationId: "conv_html_reset", abortController: controller });
     const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+    const streamOpens = () =>
+      fetchMock.mock.calls.filter(([input]) => /\/stream$/.test(String(input))).length;
 
     const loop = startStreamPump("conv_html_reset", controller, setState, getState);
     await vi.advanceTimersByTimeAsync(50_000);
-    answerLoginPage = false;
+    answer = interruption;
+    const opensBeforeInterruption = streamOpens();
     await vi.advanceTimersByTimeAsync(6_000);
-    expect(sinks).toHaveLength(1);
+    expect(streamOpens()).toBeGreaterThan(opensBeforeInterruption);
 
-    answerLoginPage = true;
-    sinks[0]!.close();
+    answer = "login";
+    sinks[0]?.close();
     await vi.advanceTimersByTimeAsync(50_000);
     expect(errorBlocks()).toEqual([]);
     await vi.advanceTimersByTimeAsync(20_000);
