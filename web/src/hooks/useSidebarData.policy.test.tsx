@@ -98,7 +98,9 @@ beforeEach(() => {
   view = "mine";
   mounted = true;
   config = { ...sidebarConfig, inboxIncludesShared: false, pinsIncludeShared: false };
-  client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0, gcTime: Infinity } },
+  });
   fetchMock.mockReset().mockImplementation(async (url: string) => {
     const p = params(url);
     const shared = p.get("visibility") === "shared";

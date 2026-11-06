@@ -1,7 +1,34 @@
 import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { ConversationsInfiniteData } from "./sessionListCache";
 
-export type ScopeCacheData = ConversationsInfiniteData & { windowSize: number };
+/** The cursor row's sort key as of the fetch that returned it. */
+export type ScopeBoundary = Pick<Conversation, "id" | "updated_at" | "created_at"> &
+  Partial<Pick<Conversation, "title">>;
+
+// `boundary` is the next page's cursor as it sorted when fetched. Pushed updates
+// move rows in place, so the live cursor row can sort higher than the point the
+// server stopped at; the merge must keep using the fetched position.
+export type ScopeCacheData = ConversationsInfiniteData & {
+  windowSize: number;
+  boundary?: ScopeBoundary;
+};
+
+/**
+ * The row a scope's completeness is measured against: the cursor row, or the
+ * last loaded row when the server filtered the cursor row out of the page
+ * (e.g. side chats) but kept it as the cursor.
+ */
+export function scopeBoundaryRow<T extends ScopeBoundary>(
+  rows: readonly T[],
+  cursor: string | null | undefined,
+): T | undefined {
+  return rows.find((row) => row.id === cursor) ?? rows.at(-1);
+}
+
+function boundaryOf(page: ConversationsPage): ScopeBoundary | undefined {
+  const row = scopeBoundaryRow(page.data, page.last_id);
+  return row && { id: row.id, updated_at: row.updated_at, created_at: row.created_at };
+}
 
 /** Replace the refreshed window; retain older history only beyond the refresh cap. */
 export function refreshScopeWindow(
@@ -21,6 +48,7 @@ export function refreshScopeWindow(
       pages: [{ ...incoming, data: rows, first_id: rows[0]?.id ?? null }],
       pageParams: [undefined],
       windowSize,
+      boundary: boundaryOf(incoming),
     };
   }
   const previous = current?.pages.flatMap((page) => page.data) ?? [];
@@ -41,6 +69,7 @@ export function refreshScopeWindow(
     ],
     pageParams: [undefined],
     windowSize,
+    boundary: overlaps ? current?.boundary : boundaryOf(incoming),
   };
 }
 
@@ -59,6 +88,7 @@ export function appendScopePage(
     pageParams: [undefined],
     windowSize:
       (current.windowSize ?? current.pages.flatMap((page) => page.data).length) + pageSize,
+    boundary: boundaryOf(incoming),
   };
 }
 
@@ -98,8 +128,8 @@ export function compareCodePoints(a: string, b: string): number {
 }
 
 export function compareSessionRows(
-  a: Conversation,
-  b: Conversation,
+  a: ScopeBoundary,
+  b: ScopeBoundary,
   sortBy: SessionSortBy = "updated_at",
 ): number {
   if (sortBy === "title") {
@@ -118,9 +148,7 @@ const TITLE_CURSOR_PREFIX = "title.";
  * is ``"title."`` plus base64url JSON of ``[title_sort_key, id]``.
  */
 function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
-  if (!cursor?.startsWith(TITLE_CURSOR_PREFIX)) {
-    return rows.find((row) => row.id === cursor) ?? rows.at(-1);
-  }
+  if (!cursor?.startsWith(TITLE_CURSOR_PREFIX)) return scopeBoundaryRow(rows, cursor);
   try {
     const base64 = cursor.slice(TITLE_CURSOR_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/");
     const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
@@ -149,12 +177,23 @@ export function mergeScopeRows(
   mineCursor?: string | null,
   sharedCursor?: string | null,
   sortBy: SessionSortBy = "updated_at",
-): { rows: Conversation[]; watermark: Conversation | undefined } {
-  const compare = (a: Conversation, b: Conversation) => compareSessionRows(a, b, sortBy);
-  const mineTail = scopeTail(mine, mineCursor);
-  const sharedTail = scopeTail(shared, sharedCursor);
+  mineBoundary?: ScopeBoundary,
+  sharedBoundary?: ScopeBoundary,
+): { rows: Conversation[]; watermark: ScopeBoundary | undefined } {
+  const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
+  // Prefer the cursor as fetched: a pushed bump can lift the live cursor row,
+  // and a watermark taken from it would hide every row below. A Name token is
+  // already the fetched position.
+  const tailOf = (
+    rows: Conversation[],
+    cursor?: string | null,
+    boundary?: ScopeBoundary,
+  ): ScopeBoundary | undefined =>
+    sortBy === "title" ? scopeTail(rows, cursor) : (boundary ?? scopeBoundaryRow(rows, cursor));
+  const mineTail = tailOf(mine, mineCursor, mineBoundary);
+  const sharedTail = tailOf(shared, sharedCursor, sharedBoundary);
   const tails = [mineHasMore ? mineTail : undefined, sharedHasMore ? sharedTail : undefined]
-    .filter((row): row is Conversation => row !== undefined)
+    .filter((row): row is ScopeBoundary => row !== undefined)
     .sort(compare);
   const watermark = tails[0];
   const rows = dedupeSessionRows([...mine, ...shared]).sort(compare);

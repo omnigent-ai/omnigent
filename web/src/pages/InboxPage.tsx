@@ -98,17 +98,18 @@ import {
   type InboxFilter,
 } from "@/lib/inboxFilterPreferences";
 import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
-import {
-  isComposerAltNewlineKey,
-  isComposerSendKey,
-  readSubmitWithModEnter,
-} from "@/lib/composerSendShortcutPreferences";
-import { insertComposerText } from "@/lib/composerText";
+import { isComposerSendKey, readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { latestOutput } from "@/lib/lastAssistantText";
 import { isEditorLevel } from "@/lib/permissionsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { describeSendFailure } from "@/lib/sendFailure";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { relativeTime } from "@/lib/relativeTime";
 import { Link } from "@/lib/routing";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -206,7 +207,9 @@ export function InboxPage() {
   }, [queryClient]);
   const {
     inbox: conversationsQuery,
-    inboxRows: allRows,
+    // Server counts, not the answer overlay: a card answered here stays listed,
+    // with its delivery state, until the server drops the prompt.
+    serverInboxRows: allRows,
     comments: commentInbox,
     automationInbox,
   } = useSidebarData();
@@ -427,6 +430,15 @@ export function InboxPage() {
       };
       pendingSubmissions.current.set(elicitationId, verdict);
       setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
+      const holdToken = beginLocalElicitationResolution(
+        elicitationId,
+        affectedSessionIds(
+          [item.row.id, item.resolveSessionId],
+          (knownSessionId) =>
+            queryClient.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+        ),
+        { nativeDelivery: Boolean(item.elicitation.nativeDelivery) },
+      );
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
@@ -435,6 +447,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          acknowledgeLocalElicitationResolution(elicitationId, holdToken);
           clearAskUserQuestionDraft(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
           if (item.elicitation.nativeDelivery) {
@@ -447,6 +460,7 @@ export function InboxPage() {
         () => {
           if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
           pendingSubmissions.current.delete(elicitationId);
+          cancelLocalElicitationResolution(elicitationId, holdToken);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
@@ -557,6 +571,7 @@ export function InboxPage() {
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
+            fileEdit={item.elicitation.fileEdit}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
@@ -1177,8 +1192,7 @@ function InboxReplyField({
         // Read-only rather than disabled, so focus stays put for a retry.
         readOnly={sending}
         aria-busy={sending}
-        // `setRangeText` (Alt+Enter's fallback) ignores `readonly`, and an edit
-        // would drop the sending state, so the box takes no input while it sends.
+        // An edit would drop the sending state, so the box takes no input while it sends.
         onChange={(event) => {
           if (!sending) onChange(event.target.value);
         }}
@@ -1189,12 +1203,6 @@ function InboxReplyField({
           }
           if (isImeCompositionKeyEvent(event, isComposingRef.current)) return;
           const keyEvent = { ...event, isComposing: event.nativeEvent.isComposing };
-          // Alt+Enter is a newline in the composer too; browsers insert nothing for it.
-          if (isComposerAltNewlineKey(keyEvent)) {
-            event.preventDefault();
-            insertComposerText(event.currentTarget, "\n");
-            return;
-          }
           // Same send chord as the chat composer, including the Mod+Enter preference.
           if (!isComposerSendKey(keyEvent, submitWithModEnter, preventsKeyboardSubmit)) {
             return;

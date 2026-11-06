@@ -35,6 +35,82 @@ describe("scope merge", () => {
       mergeScopeRows(mine, [...shared, row("s3", 10)], true, true).rows.map((r) => r.id),
     ).toEqual(["m1", "s1", "m2", "s2", "m3"]);
   });
+  it("keeps the fetched boundary when a pushed update bumps a scope's cursor row", () => {
+    const mine = [row("m1", 100), row("m2", 80), row("m3", 20)];
+    // Fetched as s1@90, s2@70; s2 is the shared cursor.
+    const mineBoundary = { id: "m3", updated_at: 20, created_at: 0 };
+    const sharedBoundary = { id: "s2", updated_at: 70, created_at: 0 };
+    // The shared cursor row's agent becomes active; the stream patches it in place.
+    const bumped = [row("s1", 90), row("s2", 200)];
+    const ids = mergeScopeRows(
+      mine,
+      bumped,
+      true,
+      true,
+      "m3",
+      "s2",
+      "updated_at",
+      mineBoundary,
+      sharedBoundary,
+    ).rows.map((r) => r.id);
+    // Rows above the fetched shared cursor stay visible, the bumped row moves
+    // up, and m3 (below that cursor) is still buffered until shared advances.
+    expect(ids).toEqual(["s2", "m1", "s1", "m2"]);
+    // Without the fetched boundary the live bumped row would hide everything else.
+    expect(mergeScopeRows(mine, bumped, true, true, "m3", "s2").rows.map((r) => r.id)).toEqual([
+      "s2",
+    ]);
+  });
+  it("records the cursor row's fetched position as the scope boundary", () => {
+    const page = sessionRowsPage([row("a", 30), row("b", 20)], true);
+    expect(refreshScopeWindow(undefined, page, 30).boundary).toMatchObject({
+      id: "b",
+      updated_at: 20,
+    });
+    const appended = appendScopePage(
+      refreshScopeWindow(undefined, page, 30),
+      sessionRowsPage([row("c", 10)], true),
+      30,
+    );
+    expect(appended.boundary).toMatchObject({ id: "c", updated_at: 10 });
+  });
+  it("keeps the older boundary when a capped refresh overlaps the loaded window", () => {
+    const loaded = refreshScopeWindow(
+      undefined,
+      sessionRowsPage([row("a", 50), row("b", 40), row("old", 10)], true),
+      100,
+    );
+    const capped = { ...loaded, windowSize: 240 };
+    // The refresh returns only the newest rows and ends inside the loaded window,
+    // so the older cursor (and its fetched position) still marks completeness.
+    const next = refreshScopeWindow(
+      capped,
+      sessionRowsPage([row("a", 60), row("b", 40)], true),
+      100,
+    );
+    expect(next.pages[0].last_id).toBe("old");
+    expect(next.boundary).toMatchObject({ id: "old", updated_at: 10 });
+  });
+  it("falls back to the last loaded row when the cursor row was filtered out", () => {
+    const page = { ...sessionRowsPage([row("a", 30), row("b", 20)], true), last_id: "side_chat" };
+    const window = refreshScopeWindow(undefined, page, 30);
+    expect(window.boundary).toMatchObject({ id: "b", updated_at: 20 });
+    // b's agent becomes active; the merge still measures against b as fetched.
+    const bumped = [row("a", 30), row("b", 90)];
+    expect(
+      mergeScopeRows(
+        bumped,
+        [row("s1", 25), row("s2", 10)],
+        true,
+        true,
+        "side_chat",
+        "s2",
+        "updated_at",
+        window.boundary,
+        { id: "s2", updated_at: 10, created_at: 0 },
+      ).rows.map((r) => r.id),
+    ).toEqual(["b", "a", "s1"]);
+  });
   it("ignores exhausted and disabled scopes as pagination boundaries", () => {
     expect(
       mergeScopeRows([row("m", 20)], [row("s", 100)], true, false).rows.map((r) => r.id),
@@ -184,6 +260,7 @@ it("bounds a Name merge at each token's position after a capped refresh", () => 
   const mine = refreshed.pages[0];
   expect(mine.data.map((r) => r.id)).toEqual(["a0", "a1", "b0", "b1", "b2"]);
   expect(mine.last_id).toBe(titleToken(prefix[1]));
+  // The sidebar also passes the fetched boundary; Name bounds at the token instead.
   const mergeIds = (mineRows: Conversation[], shared: Conversation[], sharedCursor?: string) =>
     mergeScopeRows(
       mineRows,
@@ -193,6 +270,7 @@ it("bounds a Name merge at each token's position after a capped refresh", () => 
       mine.last_id,
       sharedCursor,
       "title",
+      refreshed.boundary,
     ).rows.map((r) => r.id);
   expect(mergeIds(mine.data, [])).toEqual(["a0", "a1"]);
   // A shared tail before Mine's sets the boundary instead.

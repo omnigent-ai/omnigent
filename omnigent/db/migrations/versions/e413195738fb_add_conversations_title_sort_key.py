@@ -13,7 +13,7 @@ Builds from before this revision ignore the column; until the rollout finishes,
 sessions they title keep the ``"1"`` default or their earlier key, so Name
 ordering lists them as untitled or under their old name until the next rename,
 and sub-agents they create are missing from sub-agent Name pages. After the last
-older build stops, recompute those keys with Alembic: ``stamp d0a1f879a01d``,
+older build stops, recompute those keys with Alembic: ``stamp f1c7a9e2b406``,
 ``upgrade e413195738fb``, then stamp the revision the database was at before.
 The backfill skips rows renamed while it runs. Downgrade drops the index and the
 column.
@@ -30,7 +30,7 @@ from alembic import op
 from sqlalchemy.dialects.mysql import VARCHAR as MySQLVarchar
 
 revision: str = "e413195738fb"
-down_revision: str | None = "d0a1f879a01d"
+down_revision: str | None = "f1c7a9e2b406"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

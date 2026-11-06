@@ -14,7 +14,7 @@ from omnigent.db.db_models import title_sort_key
 from omnigent.db.utils import _build_alembic_config, get_or_create_engine
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
-_PREVIOUS = "d0a1f879a01d"
+_PREVIOUS = "f1c7a9e2b406"
 _REVISION = "e413195738fb"
 _MIGRATION = "omnigent.db.migrations.versions.e413195738fb_add_conversations_title_sort_key"
 _INDEX = "ix_conversations_archived_title"

@@ -184,6 +184,43 @@ def _collect_turn_events(
     return asyncio.run(run())
 
 
+@pytest.mark.asyncio
+async def test_side_command_attachment_is_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "/side explain this"},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "attachments" in error.message
+    assert error.undelivered is True
+    assert error.preserve_session is True
+    assert _FakeCodexNativeClient.requests == []
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
+
+
 @pytest.fixture
 def draining_client(monkeypatch: pytest.MonkeyPatch):
     # The external RPC peer is scripted; the executor and bridge files stay real.
@@ -1283,8 +1320,14 @@ def test_shell_input_wait_for_its_turn_is_bounded(
 
 
 @pytest.mark.parametrize("previous_turn", [None, "turn_finishing"])
+@pytest.mark.parametrize(
+    "replacement_field", [None, "codex_home", "socket_path", "thread_id", "session_id"]
+)
 def test_unobserved_shell_blocks_followup_after_executor_restart(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, previous_turn: str | None
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    previous_turn: str | None,
+    replacement_field: str | None,
 ) -> None:
     """An old turn finishing cannot erase a shell RPC awaiting its first item."""
     _FakeCodexNativeClient.requests = []
@@ -1333,6 +1376,27 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         # A passive idle snapshot can precede queued shell startup; the fence cannot.
         idle_bridge = read_bridge_state(tmp_path)
         assert idle_bridge is not None and idle_bridge.active_turn_id is None
+        if replacement_field is not None:
+            replacement = replace(
+                idle_bridge,
+                **{
+                    replacement_field: str(tmp_path / f"replacement-{replacement_field}"),
+                    "active_turn_id": "replacement_turn",
+                    "pending_shell_command_id": None,
+                    "active_shell_turn_id": None,
+                },
+            )
+            write_bridge_state(tmp_path, replacement)
+            replacement_snapshot = read_bridge_state(tmp_path)
+            assert replacement_snapshot is not None
+            shell_started.set()
+            [error] = await asyncio.wait_for(pending, 2)
+            assert isinstance(error, ExecutorError)
+            assert error.undelivered is True
+            assert error.preserve_session is True
+            assert "session changed" in error.message
+            assert read_bridge_state(tmp_path) == replacement_snapshot
+            return
         update_active_turn_id(tmp_path, "turn_shell")
         shell_started.set()
         await asyncio.wait_for(shell_observed.wait(), 2)
@@ -1351,8 +1415,7 @@ def test_unobserved_shell_blocks_followup_after_executor_restart(
         method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
     ] == [
         "thread/shellCommand",
-        "turn/start",
-    ]
+    ] + (["turn/start"] if replacement_field is None else [])
 
 
 @pytest.mark.parametrize("ambiguous", [False, True], ids=["rejected", "connection-lost"])
