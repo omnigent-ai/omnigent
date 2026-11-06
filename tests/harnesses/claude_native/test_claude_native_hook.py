@@ -1318,6 +1318,47 @@ def test_permission_request_hook_leaves_other_unforwarded_tools_to_the_terminal(
     assert windows == [None], "other tools keep the bounded retry and terminal fallback"
 
 
+def test_question_answer_outlasts_a_silently_dead_poll() -> None:
+    """
+    A dead socket is noticed only at the read timeout, so the answer must outlive it.
+
+    The server stores an answer at submit time when the poll's connection is
+    dead but still looks attached; the hook re-POSTs only after
+    :data:`_PERMISSION_POLL_READ_TIMEOUT_S`. The reconnect needs room on top.
+    """
+    reconnect_s = (
+        claude_native_hook._PERMISSION_RETRY_INITIAL_BACKOFF_S
+        + claude_native_hook._PERMISSION_CONNECT_TIMEOUT_S
+    )
+    assert (
+        claude_native_hook._PERMISSION_POLL_READ_TIMEOUT_S + reconnect_s
+        < PRE_RESOLVED_ELICITATION_TTL_S
+    )
+
+
+def test_question_answered_during_silently_dead_poll_reaches_claude(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """
+    An answer submitted as the poll's socket silently dies is still claimed.
+
+    The worst case submits at the poll's start; the hook only re-POSTs when
+    its read timeout fires, which must land before the server drops the answer.
+    """
+    client = _run_scripted_permission_hook(
+        tmp_path,
+        monkeypatch,
+        tool_name="AskUserQuestion",
+        script=[("silent", 0.0), ("ok", 0.0)],
+    )
+
+    assert json.loads(capsys.readouterr().out) == {"ok": True}
+    assert len(client.calls) == 2
+    assert client.calls[-1] < PRE_RESOLVED_ELICITATION_TTL_S
+
+
 def _run_scripted_permission_hook(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1425,8 +1466,13 @@ def test_permission_request_hook_moves_a_question_to_chat_after_its_answer_windo
             claude_native_hook, "_PERMISSION_MAX_CONSECUTIVE_FAILURES", max_retries
         )
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
-    # Retries at +1, 3, 7, 15, 31 s, then every 30 s until the window closes at +270 s.
-    retries_in_window = 13
+    window_s = PRE_RESOLVED_ELICITATION_TTL_S - claude_native_hook._QUESTION_ANSWER_WINDOW_MARGIN_S
+    # Retries back off 1, 2, 4 ... capped at 30 s; the last one lands as the window closes.
+    retries_in_window, since_loss, backoff = 0, 0.0, 1.0
+    while since_loss < window_s:
+        since_loss = min(since_loss + backoff, window_s)
+        backoff = min(backoff * 2, claude_native_hook._PERMISSION_RETRY_MAX_BACKOFF_S)
+        retries_in_window += 1
     script = [("severed", held)] + [("5xx", 0.0)] * (retries_in_window - 1) + [(last_retry, 0.0)]
 
     client = _run_scripted_permission_hook(

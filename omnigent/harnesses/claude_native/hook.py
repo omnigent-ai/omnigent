@@ -34,6 +34,10 @@ from omnigent.harnesses.claude_native.bridge import (
     url_component,
     write_active_session_id,
 )
+from omnigent.native.elicitation_reattach import (
+    HELD_POLL_READ_TIMEOUT_S,
+    PRE_RESOLVED_ELICITATION_TTL_S,
+)
 
 # The observer path (the default, most frequent invocation — Claude blocks
 # on it per Stop/UserPromptSubmit/TaskCreated/...) must not pay the
@@ -67,7 +71,7 @@ _PERMISSION_RETRY_MAX_BACKOFF_S = 30.0
 _PERMISSION_CONNECT_TIMEOUT_S = 30.0
 # Re-POST a silent held poll just past the gateway's 300s idle cut: after a
 # host network outage the gateway's reply never arrives and the socket is dead.
-_PERMISSION_POLL_READ_TIMEOUT_S = 330.0
+_PERMISSION_POLL_READ_TIMEOUT_S = HELD_POLL_READ_TIMEOUT_S
 # Claude starts its matching command-hook timeout before this process starts,
 # so retrying stops early enough to still write a final decision.
 _PERMISSION_DEADLINE_MARGIN_S = 60.0
@@ -1047,7 +1051,6 @@ def _main_permission_request(argv: list[str]) -> int:
         to its terminal prompt; an ``AskUserQuestion`` is denied instead so
         Claude asks it in chat text.
     """
-    from omnigent.native.elicitation_reattach import PRE_RESOLVED_ELICITATION_TTL_S
     from omnigent.native.native_policy_hook import policy_hook_reauth
 
     args = _parse_permission_args(argv)
