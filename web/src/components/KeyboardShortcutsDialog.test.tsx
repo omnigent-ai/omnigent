@@ -64,12 +64,11 @@ function keysFor(label: string): string[] {
 }
 
 describe("KeyboardShortcutsList composer rows", () => {
-  it("shows Enter to send and Shift+Enter or Alt+Enter for a new line by default", () => {
+  it("shows Enter to send and Shift+Enter for a new line by default", () => {
     render(<KeyboardShortcutsList />);
 
     expect(keysFor("Send message")).toEqual(["↵"]);
-    expect(keysFor("New line in message")).toEqual(["⇧", "↵", "Alt", "↵"]);
-    expect(screen.getByText("New line in message").closest("li")).toHaveTextContent("⇧↵orAlt↵");
+    expect(keysFor("New line in message")).toEqual(["⇧", "↵"]);
   });
 
   it("shows Ctrl+Enter to send and Enter for a new line in alternate mode", () => {
@@ -142,6 +141,8 @@ describe("KeyboardShortcutsDialog", () => {
     isNativeShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList variant="settings" />);
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);
   });
 
   it("renders nothing until opened", () => {
@@ -165,27 +166,32 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Previous session")).toBeTruthy();
-    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    expect(screen.getByText("Go back")).toBeTruthy();
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
-    expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
+    expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
-    const workspaceTabRow = screen.getByText("Select a workspace tab").closest("li");
-    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "Alt", "]", "1…4"]);
-    expect(workspaceTabRow?.textContent?.match(/\+/g)).toHaveLength(1);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "Alt", "["]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "Alt", "]"]);
+    // Ctrl+digit opens sidebar sessions off macOS, so the tab chord takes Alt.
+    expect(keysFor("Select a workspace tab")).toEqual(["Alt", "1…4"]);
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
-  it("shows the Browser shortcut only when the desktop bridge supports it", () => {
+  it("shows the Browser shortcut only when the desktop menu owns ⌘T", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
 
     supportsBrowser.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
-    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
+
+    supportsDesktopCommands.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T"]);
   });
 
   it("toggles closed on a second hotkey press", async () => {
@@ -237,9 +243,9 @@ describe("KeyboardShortcutsDialog", () => {
     ).toHaveTextContent("Switch recent sessions");
   });
 
-  it("lists ⌃` for a new shell, keeping ⌘⌥T as the alternate", () => {
+  it("lists ⌃` for a new shell", () => {
     render(<KeyboardShortcutsList />);
-    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "`", "Ctrl", "Alt", "T"]);
+    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "`"]);
   });
 
   it("lists the desktop menu commands only when the shell hands them to the page", () => {
@@ -247,7 +253,8 @@ describe("KeyboardShortcutsDialog", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Close tab, or leave the session")).toBeNull();
     expect(screen.queryByText("Quit Omnigent")).toBeNull();
-    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
+    expect(screen.queryByText("Reload the browser tab")).toBeNull();
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
 
     supportsDesktopCommands.mockReturnValue(true);
@@ -259,7 +266,11 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Archive current session")).toEqual(["Ctrl", "⇧", "A"]);
     expect(keysFor("Fork current session")).toEqual(["Ctrl", "Alt", "F"]);
     expect(keysFor("Quit Omnigent")).toEqual(["Ctrl", "Q"]);
-    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T", "Ctrl", "Alt", "B"]);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T"]);
+    expect(keysFor("Reload the browser tab")).toEqual(["Ctrl", "R"]);
+    expect(keysFor("Focus the browser address bar")).toEqual(["Ctrl", "L"]);
+    expect(keysFor("Show the next workspace tab")).toEqual(["Ctrl", "⇧", "]"]);
+    expect(keysFor("Reopen the last closed tab")).toEqual(["Ctrl", "⇧", "T"]);
   });
 });
 

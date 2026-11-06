@@ -297,14 +297,14 @@ describe("shared composer controls", () => {
         value="Read only"
         harness="codex-native"
         selectedValue="read-only"
-        options={[{ value: "default", label: "Automatic" }]}
+        options={[{ value: "approve-for-me", label: "Approve for me" }]}
         onSelect={vi.fn()}
       />,
     );
     const trigger = screen.getByRole("button", { name: "Permission mode: Read only" });
     expect(trigger).toHaveAttribute("data-permission-concept", "read-only");
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
-    expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute(
+    expect(screen.getByRole("menuitemradio", { name: "Approve for me" })).toHaveAttribute(
       "data-permission-concept",
       "automatic",
     );
