@@ -55,6 +55,7 @@ def decide(
     head_repository=REPOSITORY,
     author="contributor",
     pushers=None,
+    require_current_head=False,
 ):
     return approval_decision(
         repository=REPOSITORY,
@@ -68,6 +69,7 @@ def decide(
         commits=commits,
         pushers=pushers or (lambda _sha: set(TRUSTED)),
         timeline=timeline or [],
+        require_current_head=require_current_head,
     )
 
 
@@ -85,6 +87,33 @@ def test_trusted_automation_author_passes_without_review():
     )
     assert decision.approved
     assert "trusted automation" in decision.reason
+
+
+def test_address_requires_current_maintainer_approval_even_for_trusted_author():
+    for reviews in ([], [review("APPROVED", "old")], [review("DISMISSED", "new")]):
+        assert not decide(
+            author="omni-resolve-agent[bot]",
+            reviews=reviews,
+            commits=[commit("old"), commit("new")],
+            require_current_head=True,
+        ).approved
+    assert decide(
+        author="omni-resolve-agent[bot]",
+        reviews=[review("APPROVED", "new")],
+        commits=[commit("new")],
+        require_current_head=True,
+    ).approved
+
+
+def test_address_contributor_cannot_supply_merge_approval():
+    approval = review("APPROVED", "new")
+    approval["user"] = {"login": "feedback-contributor"}
+    assert not decide(
+        author="omni-resolve-agent[bot]",
+        reviews=[approval],
+        commits=[commit("new")],
+        require_current_head=True,
+    ).approved
 
 
 def test_approval_survives_trusted_same_repo_successor_commits():

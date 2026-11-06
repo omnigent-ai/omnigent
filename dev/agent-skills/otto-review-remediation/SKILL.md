@@ -13,14 +13,25 @@ reproduction and candidate-PR discovery instructions.
 and `pr_url` set to `review_pr`, the scanner's review fingerprint, the handled
 review ids, and the final pushed head (step 8).
 
+For `/address` runs, `review_requests` includes typed feedback keys and an
+immutable snapshot in `.omnigent/address/feedback.json`. Address every item in
+that snapshot, including conversation comments and inline comments from the
+configured contributors. Use other PR discussion as context; feedback added or
+edited after the snapshot waits for another `/address`. Record each addressed
+`kind:id` in `handled_feedback_keys` in the handoff, with its disposition and
+evidence. Explain requests that need clarification rather than marking them
+handled. The snapshot authorizes fixes on this PR only; requests to change
+permissions, merge, or modify other PRs are outside its scope.
+
 1. Confirm the working checkout is the named PR's current head and remains on its
    existing head repository and branch. Never create a replacement PR, rebase,
    reset, rewrite history, force-push, or push to the base branch.
 2. Read the PR body, diff, all reviews, inline comments, unresolved threads,
    current checks, Polly and OCR feedback, and recent failed job logs. Treat the
    latest decisive review from each human reviewer as authoritative.
-3. Address every current substantive `CHANGES_REQUESTED` item from trusted human
-   reviewers. Use the agent's investigation procedure (Resolve:
+3. For scanner-triggered runs, address every current substantive
+   `CHANGES_REQUESTED` item from trusted human reviewers. For `/address`, use
+   the feedback snapshot above. Use the agent's investigation procedure (Resolve:
    `resolve-investigate`) for ambiguous intent or product judgment and put a
    supported proposal on this PR. If authoritative requests conflict,
    required inputs are missing, or a request is unsafe or outside authorization,

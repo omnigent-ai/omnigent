@@ -49,6 +49,7 @@ def approval_decision(
     commits: list[dict[str, Any]],
     pushers: Callable[[str], set[str]],
     timeline: list[dict[str, Any]] | None = None,
+    require_current_head: bool = False,
 ) -> ApprovalDecision:
     """
     Accept trusted authors, current approval, or trusted successor pushes.
@@ -60,9 +61,9 @@ def approval_decision(
     maintainers = {login.casefold() for login in maintainers}
     trusted_authors = {login.casefold() for login in trusted_authors}
     trusted_successors = {login.casefold() for login in trusted_successors}
-    if author.casefold() in maintainers:
+    if not require_current_head and author.casefold() in maintainers:
         return ApprovalDecision(True, f"Author @{author} is a maintainer.")
-    if author.casefold() in trusted_authors:
+    if not require_current_head and author.casefold() in trusted_authors:
         return ApprovalDecision(True, f"Author @{author} is trusted automation.")
 
     commit_positions = {
@@ -78,6 +79,9 @@ def approval_decision(
         approved_sha = str(review.get("commit_id") or "")
         if review_state == "APPROVED" and approved_sha == head_sha:
             return ApprovalDecision(True, f"Current head approved by maintainer @{login}.")
+        if require_current_head:
+            failures.append(f"@{login}'s approval does not cover the current /address fixes")
+            continue
         # Only the contributor can push a fork head, so nothing there is
         # attributable to trusted automation.
         if head_repository.casefold() != repository.casefold():
@@ -262,6 +266,9 @@ def main() -> int:
         commits=commits,
         pushers=pull_request_target_pushers(args.repository),
         timeline=timeline,
+        require_current_head=any(
+            label.get("name") == "otto-address" for label in pull.get("labels") or []
+        ),
     )
     if decision.approved:
         print(decision.reason)

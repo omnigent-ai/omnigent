@@ -1,0 +1,59 @@
+name: Address PR feedback
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+concurrency:
+  group: otto-address-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      github.event.issue.pull_request && startsWith(github.event.comment.body, '/address')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: .github/scripts/otto-address.js
+          sparse-checkout-cone-mode: false
+      - name: Authorize command
+        id: authorize
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            await require('./.github/scripts/otto-address.js')({ github, context, core });
+      - name: Mint private workflow dispatch token
+        if: steps.authorize.outputs.authorized == 'true'
+        id: dispatch-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.OMNIGENT_BOT_APP_ID }}
+          private-key: ${{ secrets.OMNIGENT_BOT_APP_KEY }}
+          owner: omnigent-ai
+          repositories: omnigent-internal
+          permission-actions: write
+      - name: Dispatch Otto review
+        if: steps.authorize.outputs.authorized == 'true'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ steps.dispatch-token.outputs.token }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: 'omnigent-ai', repo: 'omnigent-internal',
+              workflow_id: 'otto-address.yml', ref: 'main',
+              inputs: {
+                pr_number: String(context.payload.issue.number),
+                comment_id: String(context.payload.comment.id),
+              },
+            });

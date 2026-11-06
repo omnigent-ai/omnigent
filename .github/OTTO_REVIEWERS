@@ -1,0 +1,3 @@
+# GitHub usernames allowed to request Otto fixes with /address.
+# One username per line. This grants no repository write or merge permission.
+# Users in .github/MAINTAINER are also allowed.

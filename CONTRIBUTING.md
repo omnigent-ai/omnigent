@@ -466,6 +466,24 @@ cannot discard it. Adding the label directly uses the same path.
 To cancel the request, remove the `automerge` label and disable GitHub auto-merge
 if it is already enabled.
 
+### Requesting Otto fixes
+
+On an open, ready-for-review PR authored by `omni-resolve-agent`, submit your
+review comments and then post `/address` as a new PR conversation comment.
+Maintainers and people listed in [`.github/OTTO_REVIEWERS`](.github/OTTO_REVIEWERS)
+can use this command without granting contributors repository Write access.
+
+Otto collects outstanding feedback from all listed reviewers and maintainers,
+including conversation comments, submitted reviews, and unresolved inline
+comments. It pushes applicable fixes to the existing branch, runs checks, and
+reports the result. Comments added or edited after `/address` wait for the next
+command. Submit pending review comments before posting the command.
+
+`/address` does not authorize merging. These PRs retain the `otto-address` label
+and require a maintainer's approval of the current commit, including after
+subsequent bot pushes. Contributors cannot grant that approval through the
+feedback allowlist.
+
 ### Database migration reviews
 
 Follow the [database best practices](docs/DATABASE_BEST_PRACTICES.md) when

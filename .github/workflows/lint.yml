@@ -93,8 +93,11 @@ jobs:
       - name: Set up pnpm
         uses: ./.github/actions/setup-pnpm
 
-      - name: Test Merge Ready expiry sweep
-        run: node --test .github/scripts/merge-ready/sweep.test.js
+      - name: Test PR automation
+        run: node --test .github/scripts/merge-ready/sweep.test.js .github/scripts/otto-address.test.js
+
+      - name: Test maintainer approval policy
+        run: uv run --no-sync pytest -q .github/scripts/maintainer_approval_test.py
 
       - name: Check Merge Ready shell syntax
         run: |
