@@ -184,6 +184,9 @@ def sandbox() -> None:
       islo     Uses the built-in HTTP client. Needs ISLO_API_KEY
                (and optionally ISLO_BASE_URL for non-default API
                endpoints).
+      boxd     No lifetime cap; machines sleep in place and resume.
+               Needs `pip install 'omnigent[boxd]'` + BOXD_API_KEY
+               (and optionally BOXD_ORG).
 
     For provider-side sandbox lifecycle (list / status / delete /
     start / stop), use the provider's own CLI or dashboard directly
