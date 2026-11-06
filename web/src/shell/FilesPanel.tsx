@@ -91,6 +91,26 @@ interface FilesPanelProps {
   active?: boolean;
 }
 
+interface QueryStatus {
+  data: unknown;
+  isLoading: boolean;
+  isError: boolean;
+  error: Error | null;
+}
+
+/**
+ * A file list's query waits for the workspace environment, so until either has
+ * data the list reports the environment's load or failure instead of empty.
+ */
+export function fileListStatus(list: QueryStatus, environment: QueryStatus) {
+  const waiting = list.data === undefined && environment.data === undefined;
+  return {
+    isLoading: list.isLoading || (waiting && environment.isLoading),
+    isError: list.isError || (waiting && environment.isError),
+    error: list.error ?? (waiting ? environment.error : null),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // HiddenFilesToggle
 // ---------------------------------------------------------------------------
@@ -718,9 +738,7 @@ export function FilesPanel({
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
-            isLoading={changedQuery.isLoading}
-            isError={changedQuery.isError}
-            error={changedQuery.error}
+            {...fileListStatus(changedQuery, envQuery)}
             onFileSelect={onFileSelect}
             showHidden={showHidden}
             onShowHidden={() => onShowHiddenChange(true)}
@@ -733,9 +751,7 @@ export function FilesPanel({
         {!showAsleepHint && !flatView && (
           <FolderTree
             files={allFilesQuery.data?.data}
-            isLoading={allFilesQuery.isLoading}
-            isError={allFilesQuery.isError}
-            error={allFilesQuery.error}
+            {...fileListStatus(allFilesQuery, envQuery)}
             onFileSelect={openTreeFile}
             conversationId={conversationId}
             showHidden={showHidden}

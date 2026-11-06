@@ -241,6 +241,8 @@ export interface ServerInfo {
   scheduled_task_session_modes?: boolean;
   /** Connected hosts and continued sandboxes accept ten-minute schedules. */
   scheduled_task_subhour?: boolean;
+  /** Server default for new trigger templates, from 10 to 240 minutes. */
+  automation_trigger_poll_minutes?: number;
   /** Sandbox automations accept a repository URL as their workspace. */
   scheduled_task_sandbox_workspaces?: boolean;
   /**
@@ -268,6 +270,11 @@ export interface ServerInfo {
   agent_config_edit?: boolean;
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
+  /**
+   * True when a claude-sdk `clear` continues in a new session. Older servers
+   * list `clear` for native sessions only; absent there (off).
+   */
+  session_claude_sdk_clear?: boolean;
   /**
    * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
    * and ``Conversation.pull_request``); absent on older servers (off).
@@ -583,6 +590,13 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
+          automation_trigger_poll_minutes:
+            typeof data.automation_trigger_poll_minutes === "number" &&
+            Number.isInteger(data.automation_trigger_poll_minutes) &&
+            data.automation_trigger_poll_minutes >= 10 &&
+            data.automation_trigger_poll_minutes <= 240
+              ? data.automation_trigger_poll_minutes
+              : 10,
           scheduled_task_sandbox_workspaces: data.scheduled_task_sandbox_workspaces === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           session_fork_workspaces: data.session_fork_workspaces === true,
@@ -593,6 +607,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_claude_sdk_clear: data.session_claude_sdk_clear === true,
           session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,

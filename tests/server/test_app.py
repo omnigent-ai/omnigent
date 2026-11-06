@@ -636,6 +636,23 @@ async def test_info_evaluates_a_callable_policy_per_request(
     assert second["all_types"] is True
 
 
+@pytest.mark.asyncio
+async def test_automation_trigger_poll_minutes_are_advertised(
+    db_uri: str, runtime_init: None, tmp_path: Path
+) -> None:
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "trigger-polling",
+        server_config={"automation_trigger_poll_minutes": 240},
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/v1/info")
+    assert response.status_code == 200
+    assert response.json()["automation_trigger_poll_minutes"] == 240
+
+
 def test_session_title_instructions_are_wired_into_coordinator(
     db_uri: str,
     runtime_init: None,

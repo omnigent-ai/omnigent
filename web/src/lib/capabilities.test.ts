@@ -272,6 +272,22 @@ describe.each([
   });
 });
 
+it.each([
+  [undefined, 10],
+  [10, 10],
+  [30, 30],
+  [240, 240],
+  [9, 10],
+  [241, 10],
+  [10.5, 10],
+  ["30", 10],
+  [true, 10],
+])("parses trigger polling minutes %j as %j", async (advertised, expected) => {
+  expect(
+    (await probe({ automation_trigger_poll_minutes: advertised })).automation_trigger_poll_minutes,
+  ).toBe(expected);
+});
+
 describe("resolveServerInfo scheduled_task_session_modes", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ scheduled_task_session_modes: true })).scheduled_task_session_modes).toBe(
@@ -314,6 +330,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   ])("parses %s strictly as %s", async (advertised, expected) => {
     const parsed = await probe({ session_fork_workspaces: advertised });
     expect(parsed.session_fork_workspaces).toBe(expected);
+  });
+});
+
+describe("resolveServerInfo session_claude_sdk_clear", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_claude_sdk_clear: advertised });
+    expect(parsed.session_claude_sdk_clear).toBe(expected);
   });
 });
 

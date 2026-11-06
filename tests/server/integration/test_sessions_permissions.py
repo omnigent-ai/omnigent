@@ -3048,9 +3048,11 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
 # ── child_sessions: enumeration is gated on parent READ ──────
 
 
+@pytest.mark.parametrize("descendants", [False, True], ids=["one-level", "descendants"])
 async def test_list_child_sessions_blocks_cross_user(
     auth_client: httpx.AsyncClient,
     db_uri: str,
+    descendants: bool,
 ) -> None:
     """
     A user without READ on the parent cannot enumerate its child sub-agents.
@@ -3065,6 +3067,7 @@ async def test_list_child_sessions_blocks_cross_user(
 
     :param auth_client: Permission-enabled test client.
     :param db_uri: Per-test SQLite database URI, used to seed the child.
+    :param descendants: Ask for the whole subtree, which must be gated the same way.
     """
     agent = await create_test_agent(auth_client, user="user-a")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
@@ -3083,6 +3086,7 @@ async def test_list_child_sessions_blocks_cross_user(
     # isn't leaked. The pre-fix bug returned 200 with the full child listing.
     denied = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-b"},
     )
     assert denied.status_code == 404, (
@@ -3099,6 +3103,7 @@ async def test_list_child_sessions_blocks_cross_user(
     # happy path, and this is exactly the data user-b was denied.
     owned = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-a"},
     )
     assert owned.status_code == 200, f"owner list failed: {owned.text}"
@@ -3108,9 +3113,11 @@ async def test_list_child_sessions_blocks_cross_user(
     )
 
 
+@pytest.mark.parametrize("descendants", [False, True], ids=["one-level", "descendants"])
 async def test_list_child_sessions_allows_read_grant(
     auth_client: httpx.AsyncClient,
     db_uri: str,
+    descendants: bool,
 ) -> None:
     """
     A user granted READ on the parent may enumerate its children.
@@ -3120,6 +3127,7 @@ async def test_list_child_sessions_allows_read_grant(
 
     :param auth_client: Permission-enabled test client.
     :param db_uri: Per-test SQLite database URI, used to seed the child.
+    :param descendants: Ask for the whole subtree, which must be gated the same way.
     """
     agent = await create_test_agent(auth_client, user="user-a")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
@@ -3138,6 +3146,7 @@ async def test_list_child_sessions_allows_read_grant(
 
     resp = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-b"},
     )
     assert resp.status_code == 200, (

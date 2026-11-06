@@ -47,7 +47,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             draft = page.get_by_test_id("new-chat-landing-input")
             await expect(draft).to_be_visible(timeout=30_000)
             await expect(draft).to_have_css("font-size", "16px")
-            await expect(draft).to_have_css("line-height", "25.6px")
+            await expect(draft).to_have_css("line-height", "28.8px")
             trigger = page.get_by_test_id("new-chat-landing-agent-select")
             await trigger.click()
             harness = page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")

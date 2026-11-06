@@ -2,7 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 import type { HarnessAccount, Host } from "@/hooks/useHosts";
 import { harnessReadinessOnHost, type HarnessCredentialKind } from "@/lib/harnessSetup";
 
-export type HarnessFixMode = "reconfigure" | "update" | "install" | "switch";
+export type HarnessFixMode = "reconfigure" | "update" | "install" | "switch" | "tmux";
 
 export interface HarnessFixResult {
   configuredHarnesses: Record<string, boolean | string>;
@@ -30,6 +30,8 @@ export function harnessStatus(harness: string, host: Host | null) {
 
 export function harnessFixMode(reason: string | null): HarnessFixMode {
   if (reason === "version-too-low") return "update";
+  // tmux is a host prerequisite, not the vendor CLI, so never offer the CLI installer.
+  if (reason === "tmux-unavailable") return "tmux";
   if (reason === "binary-missing" || reason === "unconfigured") return "install";
   return "reconfigure";
 }

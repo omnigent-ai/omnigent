@@ -21,6 +21,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME, CODEX_NATIVE_AGENT_NAME
 from omnigent.runner.identity import (
@@ -384,11 +385,20 @@ async def test_automations_gate_is_checked_per_request(
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
 
+    session_id = _owned_session(db_uri)
+
     async with _serve(app, mock_llm, tmp_path) as client:
 
         async def enabled_in_info() -> bool:
             info = (await client.get("/v1/info", headers=_headers())).json()
             assert info["scheduled_task_inbox"] == info["automations_enabled"]
+            # The runner reads the same gate off its bundle download to hide the tools.
+            bundle = await client.get(
+                f"/v1/sessions/{session_id}/agent/contents", headers=_headers()
+            )
+            assert bundle.status_code == 200, bundle.text
+            expected = "1" if info["automations_enabled"] else "0"
+            assert bundle.headers[AUTOMATIONS_HEADER] == expected
             return info["automations_enabled"]
 
         created = await client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
@@ -741,7 +751,7 @@ async def test_create_rejects_invalid_reasoning_effort(
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
     + [
         (CODEX_NATIVE_AGENT_NAME, mode)
-        for mode in ("default", "full-access", "read-only", "bypass")
+        for mode in ("default", "ask-for-approval", "approve-for-me", "read-only")
     ],
 )
 async def test_create_persists_permission_mode(
@@ -762,7 +772,8 @@ async def test_create_persists_permission_mode(
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
-    if mode == "full-access":
+    if mode == "default":
+        # Patch to a different allowed mode so the read-back proves the update was saved.
         changed = await auth_client.patch(
             f"/v1/scheduled-tasks/{task_id}",
             json={"permission_mode": "read-only"},
@@ -770,6 +781,44 @@ async def test_create_persists_permission_mode(
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["permission_mode"] == "read-only"
+        reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+        assert reread.json()["permission_mode"] == "read-only"
+
+
+@pytest.mark.parametrize(
+    ("agent_name", "mode"),
+    [
+        (CLAUDE_NATIVE_AGENT_NAME, "bypassPermissions"),
+        (CLAUDE_NATIVE_AGENT_NAME, "dontAsk"),
+        (CODEX_NATIVE_AGENT_NAME, "full-access"),
+        (CODEX_NATIVE_AGENT_NAME, "bypass"),
+    ],
+)
+async def test_save_rejects_unattended_disallowed_permission_mode(
+    auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
+) -> None:
+    """Create and update refuse modes that would run unattended without approval."""
+    _make_user(db_uri)
+    agent_id = builtin_agent_id(agent_name)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(agent_id=agent_id, permission_mode=mode),
+        headers=_headers(),
+    )
+    assert created.status_code == 400, created.text
+    assert "unattended" in created.text
+
+    ok = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(agent_id=agent_id), headers=_headers()
+    )
+    assert ok.status_code == 200, ok.text
+    patched = await auth_client.patch(
+        f"/v1/scheduled-tasks/{ok.json()['id']}",
+        json={"permission_mode": mode},
+        headers=_headers(),
+    )
+    assert patched.status_code == 400, patched.text
+    assert "unattended" in patched.text
 
 
 @pytest.mark.parametrize("operation", ["create", "update"])
@@ -1231,7 +1280,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         await auth_client.post(
             "/v1/scheduled-tasks",
             json=_create_body(
-                permission_mode="bypassPermissions",
+                permission_mode="acceptEdits",
                 model_override="databricks-claude-sonnet-4-6",
                 reasoning_effort="high",
             ),
@@ -1239,7 +1288,7 @@ async def test_update_agent_switch_clears_the_old_harnesss_settings(
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "bypassPermissions"
+    assert created["permission_mode"] == "acceptEdits"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
@@ -1405,20 +1454,20 @@ async def test_update_clears_permission_mode_with_explicit_null(
     """PATCH ``permission_mode: null`` clears a previously-set mode end-to-end.
 
     The edit dialog resets the control to Default by sending an explicit null,
-    so a task launched with ``bypassPermissions`` must actually revert to the
-    agent default (not silently keep the dangerous mode). Asserts the PERSISTED
+    so a task launched with ``acceptEdits`` must actually revert to the
+    agent default (not silently keep the old mode). Asserts the PERSISTED
     value via a read-back, not just the response.
     """
     _make_user(db_uri)
     created = (
         await auth_client.post(
             "/v1/scheduled-tasks",
-            json=_create_body(permission_mode="bypassPermissions"),
+            json=_create_body(permission_mode="acceptEdits"),
             headers=_headers(),
         )
     ).json()
     task_id = created["id"]
-    assert created["permission_mode"] == "bypassPermissions"
+    assert created["permission_mode"] == "acceptEdits"
 
     patched = await auth_client.patch(
         f"/v1/scheduled-tasks/{task_id}",
@@ -1796,8 +1845,11 @@ async def test_list_runs_includes_conversation_read_state_fields(
     so the frontend can compute the unread dot without per-row session GETs.
     Runs with no conversation (skipped/failed host-less) get null for all three.
     """
+    import time
     import uuid
 
+    from omnigent.runtime import pending_elicitations
+    from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     _make_user(db_uri)
@@ -1817,7 +1869,27 @@ async def test_list_runs_includes_conversation_read_state_fields(
     # A known session the viewer saw but never flagged, waiting on its harness.
     waiting = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
     conv_store.set_session_live_status(waiting.id, "waiting")
+    conv_store.set_pending_elicitation_count(waiting.id, 2)
+    runner_id = f"runner_{uuid.uuid4().hex}"
+    conv_store.set_runner_id(waiting.id, runner_id)
+    conv_store.touch_runner_liveness([runner_id], now=int(time.time()))
     _set_read_state("alice@example.com", waiting.id, 1_700_000_100, False)
+
+    in_process = conv_store.create_conversation(conversation_id=uuid.uuid4().hex)
+    elicitation_id = uuid.uuid4().hex
+    pending_elicitations.record_publish(
+        in_process.id,
+        {"type": "response.elicitation_request", "elicitation_id": elicitation_id},
+    )
+    in_process_run_id = uuid.uuid4().hex
+    _seed_run(
+        db_uri,
+        task_id,
+        in_process_run_id,
+        scheduled_at=1600,
+        status="running",
+        conversation_id=in_process.id,
+    )
 
     succeeded_id = uuid.uuid4().hex
     running_id = uuid.uuid4().hex
@@ -1859,6 +1931,7 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert succ["viewer_last_seen"] == conv.updated_at - 1
     assert succ["viewer_unread"] is True
     assert succ["session_cost_usd"] == 1.234
+    assert succ["conversation_pending_approvals"] == 0
 
     # Status reads as the sessions list reports it ("waiting" is "running"), and
     # an unflagged session is explicitly not unread rather than unknown.
@@ -1867,6 +1940,9 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert running["viewer_last_seen"] == 1_700_000_100
     assert running["viewer_unread"] is False
     assert running["session_cost_usd"] is None
+    assert running["conversation_pending_approvals"] == 2
+    assert runs[in_process_run_id]["conversation_pending_approvals"] == 1
+    pending_elicitations.resolve(in_process.id, elicitation_id)
 
     # The skipped run (no conversation_id) gets null for all three fields.
     skip = runs[skipped_id]
@@ -1875,6 +1951,36 @@ async def test_list_runs_includes_conversation_read_state_fields(
     assert skip["viewer_last_seen"] is None
     assert skip["viewer_unread"] is None
     assert skip["session_cost_usd"] is None
+    assert skip["conversation_pending_approvals"] == 0
+
+    # Another replica's fresh runner remains actionable; stale/disconnected runners do not.
+    now = int(time.time())
+    for last_seen, pending in (
+        (now - 5, 2),
+        (now - RUNNER_LIVENESS_TTL_S - 5, 0),
+        (None, 0),
+        (now, 2),
+    ):
+        if last_seen is None:
+            conv_store.clear_runner_liveness(runner_id)
+        else:
+            conv_store.touch_runner_liveness([runner_id], now=last_seen)
+        resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+        assert resp.status_code == 200
+        waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+        assert waiting_run["conversation_pending_approvals"] == pending
+        assert (
+            conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count
+            == 2
+        )
+
+    conv_store.clear_runner_id(waiting.id)
+    assert pending_elicitations.count_for(waiting.id) == 0
+    resp = await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    assert resp.status_code == 200
+    waiting_run = next(row for row in resp.json()["runs"] if row["id"] == running_id)
+    assert waiting_run["conversation_pending_approvals"] == 0
+    assert conv_store.get_session_activity([waiting.id])[waiting.id].pending_elicitation_count == 2
 
     # Continuing the same session reports its current total on every run.
     _seed_run(
@@ -2547,6 +2653,23 @@ async def test_run_now_triggers_and_records_a_run(
     list_body = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
     row = next(t for t in list_body["scheduled_tasks"] if t["id"] == task_id)
     assert row["last_run_status"] == "running"
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_returns_recorded_run_id(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    task_id = created.json()["id"]
+    response = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert response.status_code == 202, response.text
+    runs = (
+        await auth_client.get(f"/v1/scheduled-tasks/{task_id}/runs", headers=_headers())
+    ).json()["runs"]
+    assert len(runs) == 1
+    assert response.json() == {"triggered": True, "id": task_id, "run_id": runs[0]["id"]}
 
 
 async def test_run_now_allows_paused_task(
