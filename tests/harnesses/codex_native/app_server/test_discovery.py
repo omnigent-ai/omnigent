@@ -226,15 +226,13 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[
-                    'model="databricks-gpt-5-4"',
-                    'model_provider="omnigent_databricks"',
-                ],
-                model="databricks-gpt-5-4",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[
+                'model="databricks-gpt-5-4"',
+                'model_provider="omnigent_databricks"',
+            ],
+            model="databricks-gpt-5-4",
+            host="https://ws.example",
         ),
     )
     monkeypatch.setattr(codex_native_app_server, "_clean_codex_env", lambda: {"PATH": "/bin"})
@@ -350,6 +348,9 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     ambient = NativeCodexLaunch(
         config_overrides=['model_provider="openai"'], model=None, profile=None
     )
@@ -959,7 +960,7 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     if outcome == "inherited":
         assert providers["Inherited.Provider"]["http_headers"] == {
             "Databricks-Custom-Coding-Agent": "codex",
-            "Databricks-Custom-Client-Surfaces": "omnigent, omnigent-desktop, ug",
+            "Databricks-Custom-Client-Surfaces": "omnigent-desktop, ug",
         }
         assert "base_url" not in providers["Inherited.Provider"]
     else:

@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -610,6 +610,32 @@ def test_session_added_for_inaccessible_session_is_not_pushed(
                 f"expected only heartbeats, got {frame['type']} "
                 f"(a changed frame would mean Bob's session leaked to Alice)"
             )
+
+
+def test_session_added_for_watched_session_pushes_access_changed(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A share of a session the client already watches pushes ``access_changed``.
+
+    Bob has Alice's session open (so it is watched) through read access, and
+    Alice then shares it with him directly at the same level. His row is
+    unchanged, so the interval diff emits nothing; without ``access_changed``
+    his Shared list would not learn the session now belongs there.
+    """
+    shared = _seed_session(stores, owner=ALICE, title="alice")
+    permission_store = stores[2]
+    permission_store.ensure_user(BOB)
+    permission_store.grant(BOB, shared, LEVEL_READ)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": BOB}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [shared]}))
+        _recv_until(ws, {"snapshot"})
+        sessions_routes.user_session_stream.publish(
+            BOB, {"type": "session_added", "session_id": shared}
+        )
+        frame = _recv_until(ws, {"access_changed", "changed"})
+        assert frame == {"type": "access_changed", "ids": [shared]}
 
 
 def test_pin_label_collapses_to_canonical_key_on_the_wire(

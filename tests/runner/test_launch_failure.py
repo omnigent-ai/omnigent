@@ -443,12 +443,17 @@ def test_codex_provider_auth_diagnosis_names_the_command_to_sign_in(message: str
     ],
 )
 @pytest.mark.parametrize("hint", ["", _CODEX_LOGIN_HINT])
-def test_codex_provider_auth_diagnosis_explains_exhausted_storage(failure: str, hint: str) -> None:
+@pytest.mark.parametrize(
+    "trailer", ["", "\n(See https://github.com/pex-tool/pex/issues/1027 for known breaks.)"]
+)
+def test_codex_provider_auth_diagnosis_explains_exhausted_storage(
+    failure: str, hint: str, trailer: str
+) -> None:
     message = (
         "provider auth command `isaac` exited with status exit status: 1: "
         "Traceback (most recent call last):\n"
         '  File "/opt/token-helper/bootstrap.py", line 10, in create_venv\n'
-        f"    tempfile.mkdtemp()\n{failure}{hint}"
+        f"    tempfile.mkdtemp()\n{failure}{trailer}{hint}"
     )
 
     diagnosis = diagnose_codex_provider_auth_failure(message)
@@ -892,6 +897,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
         ("codex_provider_auth_failed", "model provider's sign-in command"),
+        ("harness_not_configured", "isn't set up on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:

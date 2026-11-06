@@ -407,6 +407,10 @@ async def test_codex_launch_catalog_is_stale_reads_the_default_shape(
     from omnigent.models import model_catalog_store
 
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: "/fixture/codex")
     monkeypatch.setattr(
         codex_native_app_server,
         "resolve_native_codex_launch",

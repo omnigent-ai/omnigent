@@ -449,14 +449,21 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _provider_auth_helper_output(remainder: str) -> str | None:
-    """Return the token command's last output line from the text after Codex's outcome."""
+    """Return a relevant helper error line, preferring explicit storage failures."""
     lines = [
         line.strip()
         for line in _EXIT_STATUS_PREFIX.sub("", remainder.lstrip(": "), count=1).splitlines()
         # Older runners append a `codex login` hint after the helper's output.
         if line.strip() and "`codex login`" not in line
     ]
-    return lines[-1] if lines else None
+    return next(
+        (
+            line
+            for line in reversed(lines)
+            if any(fragment in line.lower() for fragment in _STORAGE_EXHAUSTED_FRAGMENTS)
+        ),
+        lines[-1] if lines else None,
+    )
 
 
 def diagnose_codex_provider_auth_failure(message: str) -> FailureDiagnosis | None:
@@ -701,6 +708,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
         "host, then start a new session."
     ),
     "host_disk_full": "The host's disk is full, so the agent can't save the conversation.",
+    "harness_not_configured": "The harness isn't set up on the host, so this session can't start.",
     "session_agent_missing": SESSION_AGENT_MISSING_MESSAGE,
 }
 

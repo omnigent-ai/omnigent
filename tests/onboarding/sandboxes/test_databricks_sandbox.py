@@ -581,3 +581,37 @@ def test_exec_foreground_ctrl_c_stops_the_remote_command() -> None:
 
     (kill,) = api.exec_calls()
     assert "kill -TERM 4242" in kill["body"]["args"][1]
+
+
+def test_workspace_client_tags_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    import databricks.sdk
+    import databricks.sdk.config
+
+    from omnigent.version import VERSION
+
+    captured: dict[str, Any] = {"extra": []}
+
+    class _Cfg:
+        def __init__(self, **kwargs: Any) -> None:
+            captured["init"] = kwargs
+
+        def with_user_agent_extra(self, key: str, value: str) -> _Cfg:
+            captured["extra"].append((key, value))
+            return self
+
+    class _WorkspaceClient:
+        def __init__(self, *, config: Any) -> None:
+            captured["config"] = config
+
+    monkeypatch.setattr(mod, "_sandbox_sdk", lambda: None)
+    monkeypatch.setattr(databricks.sdk, "WorkspaceClient", _WorkspaceClient)
+    monkeypatch.setattr(databricks.sdk.config, "Config", _Cfg)
+
+    launcher = DatabricksSandboxLauncher()
+    launcher.bind_owner_credential(
+        lambda: {"token": "tok", "workspace_host": "https://example.cloud.databricks.com"}
+    )
+    launcher._workspace_client()
+
+    assert ("omnigent-oss", VERSION) in captured["extra"]
+    assert captured["config"] is not None

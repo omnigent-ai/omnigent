@@ -67,6 +67,7 @@ from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
     EXTENDED_MODEL_DEFAULT_EFFORT,
     EXTENDED_MODEL_EFFORTS,
+    EXTENDED_MODEL_INPUT_MODALITIES,
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
@@ -1354,13 +1355,14 @@ def materialize_codex_provider_config(
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
     :param effective_providers: Provider tables resolved by Codex's ``config/read``.
-        Only attribution headers are copied from inherited providers.
+        Only display names and attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
     """
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
     from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    from omnigent.onboarding.ucode_setup import refresh_ucode_auth_config
 
     gateway_providers = {
         name: provider
@@ -1405,11 +1407,16 @@ def materialize_codex_provider_config(
         for provider_name, provider_config in generated.items():
             providers[provider_name] = provider_config
 
-    for provider_name in gateway_providers:
-        if provider_name in providers or provider_name in CODEX_BUILTIN_PROVIDERS:
+    for provider_name, effective_provider in gateway_providers.items():
+        if provider_name in CODEX_BUILTIN_PROVIDERS:
             continue
-        # A partial table adds metadata; Codex still owns routing and auth.
-        providers[provider_name] = tomlkit.inline_table()
+        if provider_name not in providers:
+            providers[provider_name] = tomlkit.inline_table()
+        provider_config = providers[provider_name]
+        name = effective_provider.get("name")
+        # Codex validates names when persisting hook trust, even for inherited providers.
+        if isinstance(provider_config, MutableMapping) and isinstance(name, str) and name.strip():
+            provider_config.setdefault("name", name)
 
     policy = retry_policy if retry_policy is not None else RetryPolicy()
     for provider_name, provider_config in list(providers.items()):
@@ -1431,6 +1438,12 @@ def materialize_codex_provider_config(
         effective = resolved if isinstance(resolved, Mapping) else provider_config
         base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            auth = provider_config.get("auth")
+            if isinstance(auth, (tomlkit.items.Table, tomlkit.items.InlineTable)):
+                original_auth = auth.unwrap()
+                repaired_auth = refresh_ucode_auth_config(original_auth)
+                if repaired_auth is not original_auth:
+                    provider_config["auth"] = repaired_auth
             headers = provider_config.get("http_headers")
             effective_headers = effective.get("http_headers")
             attributed = with_gateway_attribution(
@@ -1867,6 +1880,8 @@ def extended_model_catalog(
                 "upgrade": None,
             }
         )
+        if modalities := EXTENDED_MODEL_INPUT_MODALITIES.get(bare):
+            entry["input_modalities"] = list(modalities)
         added.append(entry)
     if not added:
         return None
@@ -3237,7 +3252,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # never block session startup
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3340,7 +3355,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # cleanup must continue
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3407,7 +3422,13 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # cleanup must continue
+                    except (
+                        OSError,
+                        RuntimeError,
+                        ValueError,
+                        TypeError,
+                        subprocess.SubprocessError,
+                    ):
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3515,7 +3536,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # any signer failure invalidates the worker
+        except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3546,7 +3567,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # cleanup state records failure
+            except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
