@@ -1701,7 +1701,7 @@ def _keep_warm_for_pong(report_keep_warm: Callable[[], bool] | None) -> bool | N
         return None
     try:
         return bool(report_keep_warm())
-    except Exception:  # noqa: BLE001 — a keep-warm report must never break the pong
+    except Exception:  # a keep-warm report must never break the pong
         _logger.debug("runner keep-warm report failed; reporting True", exc_info=True)
         return True
 
