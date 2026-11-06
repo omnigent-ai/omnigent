@@ -1275,11 +1275,25 @@ def test_changes_find_reveals_collapsed_and_filtered(
     page.screenshot(path=str(tmp_path / f"find-{entry}-reopened.png"))
 
 
+# README.md's hunk, so its viewed mark has a patch to be checked against.
+_README_PATCH = (
+    "diff --git a/README.md b/README.md\n"
+    "new file mode 100644\n"
+    "index 0000000..4c2d3e1\n"
+    "--- /dev/null\n"
+    "+++ b/README.md\n"
+    "@@ -0,0 +1,2 @@\n"
+    "+# Demo\n"
+    "+Adds the GitHub tab.\n"
+)
+
+
 @pytest.mark.parametrize("entry", ["rail", "composer-mobile"])
 def test_changes_viewed_progress_persists_and_resets(
     page: Page, seeded_session: tuple[str, str], tmp_path: Path, entry: str
 ) -> None:
-    """Viewed marks collapse files, survive a reload, and reset when the PR gets a new head."""
+    """Viewed marks collapse files and survive a reload. A new head keeps the mark on an
+    unchanged file and flags a changed one as "Changed since viewed"."""
     base_url, session_id = seeded_session
     mobile = entry == "composer-mobile"
     page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
@@ -1287,6 +1301,11 @@ def test_changes_viewed_progress_persists_and_resets(
     pr_url = _INFO["pr"]["url"]
     # The PR's head moves mid-test, so every resource answers for the current head.
     head = {"sha": "head1"}
+    # head2 reworks main.py's hunk and leaves README.md's hunk as it was.
+    patches = {
+        "head1": _PR_DIFF["patch"] + _README_PATCH,
+        "head2": _PR_DIFF["patch"].replace("+added line", "+reworked line") + _README_PATCH,
+    }
 
     def info_at_head(route: Route) -> None:
         route.fulfill(
@@ -1314,7 +1333,14 @@ def test_changes_viewed_progress_persists_and_resets(
     )
     page.route(
         re.compile(r"/resources/github/diff(?:\?|$)"),
-        lambda r: r.fulfill(json={**_PR_DIFF, "head_sha": head["sha"], "base_sha": "base"}),
+        lambda r: r.fulfill(
+            json={
+                **_PR_DIFF,
+                "patch": patches[head["sha"]],
+                "head_sha": head["sha"],
+                "base_sha": "base",
+            }
+        ),
     )
 
     def open_changes() -> Locator:
@@ -1334,11 +1360,12 @@ def test_changes_viewed_progress_persists_and_resets(
     panel = open_changes()
     expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
     panel.get_by_role("checkbox", name="Viewed README.md").click()
+    panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
     if not mobile:  # Mobile shows the count without the bar.
         expect(panel.get_by_role("progressbar", name="Files viewed")).to_have_attribute(
-            "aria-valuenow", "50"
+            "aria-valuenow", "100"
         )
     # Marking collapses the file's diff.
     expect(
@@ -1350,22 +1377,26 @@ def test_changes_viewed_progress_persists_and_resets(
     page.reload()
     panel = open_changes()
     expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked(timeout=30_000)
-    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible()
+    expect(panel.get_by_text("2 / 2 files viewed", exact=True)).to_be_visible()
 
-    # A new head starts with no marks and says so until the notice is dismissed.
+    # The new head changes main.py's hunk. README.md keeps its mark, and main.py loses its
+    # mark and is flagged until it is marked again.
     head["sha"] = "head2"
     page.reload()
     panel = open_changes()
-    expect(panel.get_by_text("0 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("checkbox", name="Viewed README.md")).not_to_be_checked()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_be_visible()
+    expect(panel.get_by_text("1 / 2 files viewed", exact=True)).to_be_visible(timeout=30_000)
+    expect(panel.get_by_role("checkbox", name="Viewed README.md")).to_be_checked()
+    expect(panel.get_by_role("checkbox", name="Viewed src/app/main.py")).not_to_be_checked()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(1)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_be_visible()
     page.screenshot(path=str(tmp_path / f"viewed-{entry}-reset.png"), animations="disabled")
     panel.get_by_role("button", name="Dismiss", exact=True).click()
-    expect(panel.get_by_text(re.compile("viewed marks were reset"))).to_have_count(0)
+    expect(panel.get_by_text(re.compile("changed files lost their viewed marks"))).to_have_count(0)
 
-    # Hiding viewed files, once every file is viewed, shows the all-viewed state.
-    panel.get_by_role("checkbox", name="Viewed README.md").click()
+    # Marking the changed file on the new head clears its badge. Then hiding viewed files,
+    # once every file is viewed, shows the all-viewed state.
     panel.get_by_role("checkbox", name="Viewed src/app/main.py").click()
+    expect(panel.get_by_text("Changed since viewed", exact=True)).to_have_count(0)
     panel.get_by_role("checkbox", name="Hide viewed").click()
     expect(panel.get_by_text("All 2 files viewed", exact=True)).to_be_visible()
     if not mobile:
