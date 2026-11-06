@@ -1456,6 +1456,11 @@ async def test_auto_create_claude_terminal_logs_stage_timings(
     )
     # Stop right after the launch row: the steps past it need a live pane.
     publish_event = Mock(side_effect=RuntimeError("stop after launch"))
+    # Keep the real trust seeder away from the developer's ~/.claude.json.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted",
+        lambda *_args, **_kwargs: None,
+    )
 
     with (
         caplog.at_level(logging.INFO, logger="omnigent.runner.app"),
