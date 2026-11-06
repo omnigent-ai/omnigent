@@ -106,6 +106,7 @@ import {
   terminalDisplayLabel,
   useCreateTerminal,
   useDeleteTerminal,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
@@ -236,6 +237,29 @@ const CHAT_VIEW_STORAGE_VALUE = "__chat__";
  * :param agentKey: The session's agent-terminal key (or the no-target sentinel).
  * :returns: The terminal key the view should open on.
  */
+/**
+ * The rail open-state a session restores to: its saved choice, else the Appearance
+ * default. A deep link to a file, a comment or the Agents tab reveals the rail
+ * without rewriting the saved choice.
+ */
+function restoredRailOpen(
+  conversationId: string,
+  canvasMode: boolean,
+  searchParams: URLSearchParams,
+): boolean {
+  const file = searchParams.get("file");
+  const comment = searchParams.get("comment");
+  const hasWorkspaceUrlSignal =
+    searchParams.get("panel") === "agents" ||
+    (file !== null && file !== "") ||
+    (comment !== null && comment !== "");
+  return (
+    (readSessionWorkspaceState(conversationId).open ??
+      (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
+    hasWorkspaceUrlSignal
+  );
+}
+
 function resolveTerminalViewKey(stored: string | null, agentKey: string): string {
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
@@ -562,6 +586,16 @@ function AppShellImpl() {
   const rightPanelOpenRef = useRef(rightPanelOpen);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
+  // Take the incoming session's rail open-state during render, so its first frame
+  // doesn't show the outgoing session's rail. The restore effect applies the rest.
+  const [railOpenConversationId, setRailOpenConversationId] = useState(conversationId);
+  if (railOpenConversationId !== conversationId) {
+    setRailOpenConversationId(conversationId);
+    setRightPanelOpen(
+      conversationId ? restoredRailOpen(conversationId, canvasMode, searchParams) : false,
+    );
+    setRightPanelVisibilityAnimating(false);
+  }
   const rightPanelMotionTimerRef = useRef<number | null>(null);
   const cancelRightPanelVisibilityMotion = useCallback(() => {
     if (rightPanelMotionTimerRef.current !== null) {
@@ -898,14 +932,57 @@ function AppShellImpl() {
   // a waking (runner-asleep) session resolves well after the reconcile poll /
   // SSE has already surfaced the tab.
   const pendingShellCreateRef = useRef<Set<string> | null>(null);
+  // The rail as it stood before a "+"→Shell create: the new shell's tab is
+  // selected before its create returns, so a failed create puts this back.
+  const railSelection = {
+    conversationId,
+    terminalKey: selectedTerminalKey,
+    filePath: selectedFilePath,
+    executionLogsKey,
+    filesPanelOpen,
+    subagentsPanelOpen,
+    shellsPanelOpen,
+    rightPanelOpen,
+  };
+  const railSelectionRef = useRef(railSelection);
+  railSelectionRef.current = railSelection;
+  const railBeforeShellCreateRef = useRef<typeof railSelection | null>(null);
   const markShellCreateStarted = useCallback(() => {
     pendingShellCreateRef.current = new Set(openTerminals);
+    railBeforeShellCreateRef.current = railSelectionRef.current;
   }, [openTerminals]);
   // The create POST failed — disarm the focus snapshot so a later
-  // agent-spawned shell isn't mistaken for the one the user tried to open.
-  const clearShellCreatePending = useCallback(() => {
-    pendingShellCreateRef.current = null;
-  }, []);
+  // agent-spawned shell isn't mistaken for the one the user tried to open,
+  // and restore the rail if the failed shell is still what it shows.
+  const clearShellCreatePending = useCallback(
+    (failed?: TerminalInfo) => {
+      pendingShellCreateRef.current = null;
+      const before = railBeforeShellCreateRef.current;
+      railBeforeShellCreateRef.current = null;
+      const now = railSelectionRef.current;
+      if (!failed || !before || before.conversationId !== now.conversationId) return;
+      if (now.terminalKey !== terminalTabKey(failed)) return;
+      setSelectedTerminalKey(before.terminalKey);
+      setExecutionLogsKey(before.executionLogsKey);
+      setFilesPanelOpen(before.filesPanelOpen);
+      setSubagentsPanelOpen(before.subagentsPanelOpen);
+      setShellsPanelOpen(before.shellsPanelOpen);
+      const filePath = before.filePath;
+      if (filePath) {
+        setSelectedFilePath(filePath);
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev);
+            params.set("file", filePath);
+            return params;
+          },
+          { replace: true },
+        );
+      }
+      if (!before.rightPanelOpen) setRightPanelOpenAnimated(false);
+    },
+    [setSearchParams, setRightPanelOpenAnimated],
+  );
   // Whether the agent's spec declares shell access (a ``terminals:`` block).
   // The desktop rail's Shells TAB shows only once a shell exists (creation is
   // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
@@ -1305,15 +1382,8 @@ function AppShellImpl() {
     // carries a workspace signal — a file to open (?file=) or a comment to
     // surface (?comment=) — reveals the rail even when this session was last
     // left closed; otherwise the linked file/comment would render into a
-    // collapsed, invisible panel. This is transient: it doesn't rewrite the
-    // session's saved open-state.
-    const commentParam = searchParams.get("comment");
-    const hasWorkspaceUrlSignal =
-      showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
-    setRightPanelOpenImmediately(
-      (persisted.open ?? (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
-        hasWorkspaceUrlSignal,
-    );
+    // collapsed, invisible panel.
+    setRightPanelOpenImmediately(restoredRailOpen(conversationId, canvasMode, searchParams));
 
     stateConvRef.current = conversationId;
   }, [conversationId, canvasMode]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1606,7 +1676,8 @@ function AppShellImpl() {
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
     const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
-    (visibleSelectedTab ?? tabList)?.focus();
+    // The rail is still sliding in from past the window edge; scrolling to it would shift the page.
+    (visibleSelectedTab ?? tabList)?.focus({ preventScroll: true });
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;
@@ -2102,9 +2173,9 @@ function AppShellImpl() {
     const name = resolveDefaultShell(boundAgent?.terminals ?? []);
     if (name === null) return;
     markShellCreateStarted();
-    createTerminal.mutate(name, {
-      onSuccess: (info) => openTerminalTab(terminalTabKey(info)),
-      onError: () => clearShellCreatePending(),
+    createTerminal.launch(name, {
+      onOpen: (info) => openTerminalTab(terminalTabKey(info)),
+      onError: (_error, opened) => clearShellCreatePending(opened),
     });
   }, [
     boundAgent,
