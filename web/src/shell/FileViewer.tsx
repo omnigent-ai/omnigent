@@ -78,6 +78,15 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ALT_KEY,
+  ARROW_LEFT_KEY,
+  ARROW_RIGHT_KEY,
+  CompactShortcutKeys,
+  ESC_KEY,
+  KeyboardShortcutTooltip,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { isVideoFile } from "@/lib/video";
@@ -102,7 +111,7 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { type ChangedSort, compareChangedFiles } from "./FlatFileList";
+import { type ChangedSort, groupChangedFiles } from "./FlatFileList";
 import { CodeViewer } from "./CodeViewer";
 import {
   MONACO_SPLIT_BREAKPOINT,
@@ -349,7 +358,7 @@ interface FileViewerProps {
   mobileOverlay?: boolean;
   /** Only the active viewport mounts the diff editor and synchronizes the URL. */
   viewport?: "desktop" | "mobile";
-  /** Called when the user presses Escape to close the active file tab. */
+  /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
@@ -437,18 +446,27 @@ function FileViewerBody({
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
   const onScreen = open && isActiveViewport && mediaActive;
-  // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
-    visible: onScreen,
-  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
+  const isDeletedFile =
+    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  // Video playback reads the complete binary on demand, never the capped JSON preview.
+  const fileQuery = useFileContent(
+    conversationId,
+    isVideoFile(path) || isDeletedFile ? null : path,
+    {
+      visible: onScreen,
+    },
+  );
 
   // Build the navigable file list from all changed files (including deleted),
   // sorted the same way FilesPanel sorts its flat view so the "X/N" index
   // matches the Changes list position. Memoized so the sort runs only when the
   // changed-files list or sort order changes, not on every viewer re-render.
   const navigableFiles = useMemo(
-    () => [...(changedFiles.data?.data ?? [])].sort(compareChangedFiles(sort)).map((f) => f.path),
+    () =>
+      groupChangedFiles(changedFiles.data?.data ?? [], sort).flatMap((group) =>
+        group.files.map((file) => file.path),
+      ),
     [changedFiles.data?.data, sort],
   );
   const currentNavIdx = navigableFiles.indexOf(path);
@@ -458,6 +476,7 @@ function FileViewerBody({
       ? navigableFiles[currentNavIdx + 1]
       : null;
   const commentsQuery = useComments(conversationId, path);
+  const sessionCommentsQuery = useComments(conversationId);
   const addComment = useAddComment(conversationId);
   const updateComment = useUpdateComment(conversationId);
   const deleteComment = useDeleteComment(conversationId);
@@ -655,6 +674,20 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
+  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Until both lists load, a send would silently skip the unloaded list's drafts.
+  const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
+    if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
+    const ids = new Set(openComments.map((c) => c.id));
+    const paths = new Set(openComments.length > 0 ? [path] : []);
+    for (const c of sessionCommentsQuery.data) {
+      if (c.status === "draft" && c.path !== path) {
+        ids.add(c.id);
+        paths.add(c.path);
+      }
+    }
+    return { ids: [...ids], fileCount: paths.size };
+  }, [openComments, commentsQuery.data, sessionCommentsQuery.data, path]);
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {
     // Comment navigation supersedes a citation, including clicks outside the editor.
@@ -798,8 +831,6 @@ function FileViewerBody({
     !isVideo &&
     !isModel &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
-  const isDeletedFile =
-    changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
@@ -818,8 +849,9 @@ function FileViewerBody({
   const [diffActive, setDiffActive] = useState(
     () => initialDiffRef.current || persistedPrefsRef.current.diffActive,
   );
+  const effectiveDiffActive = diffActive || isDeletedFile;
   const requestedDiff =
-    open && isActiveViewport && diffActive && !isImage && !isPdf && !isVideo && !isModel;
+    open && isActiveViewport && effectiveDiffActive && !isImage && !isPdf && !isVideo && !isModel;
   // A saved preference also applies to unchanged files; only explicit links skip discovery.
   const linkedDiff =
     requestedDiff &&
@@ -915,7 +947,7 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    diffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
@@ -992,11 +1024,15 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  // Mirrors the ref for rendering, which marks the viewer as owning Escape.
+  const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
     // Opening the viewer (or switching files within it) makes it the active
     // surface again. Keyed on `open` too, so reopening the same path after the
     // user had clicked into the chat re-seeds the ref instead of staying stale.
-    if (open) viewerIsActiveSurfaceRef.current = true;
+    if (!open) return;
+    viewerIsActiveSurfaceRef.current = true;
+    setViewerIsActiveSurface(true);
   }, [open, path]);
   useEffect(() => {
     if (!open) return;
@@ -1005,6 +1041,7 @@ function FileViewerBody({
       const target = e.target;
       if (root !== null && target instanceof Node) {
         viewerIsActiveSurfaceRef.current = root.contains(target);
+        setViewerIsActiveSurface(viewerIsActiveSurfaceRef.current);
       }
     };
     window.addEventListener("mousedown", track, true);
@@ -1122,6 +1159,8 @@ function FileViewerBody({
     /** Suppress the active check mark — for toggles whose icon already reflects
      * state (e.g. the whitespace eye flips open/closed). */
     noActiveCheck?: boolean;
+    /** Chord shown beside the item; omit when the viewer surface doesn't bind it. */
+    shortcut?: readonly string[];
   }
   interface ToolbarAction {
     key: string;
@@ -1260,7 +1299,7 @@ function FileViewerBody({
       setCommentsOpen((prev) => !prev);
     },
   });
-  if (!isPdf && isDiffAvailable) {
+  if (!isPdf && !isDeletedFile && isDiffAvailable) {
     toolbarActions.push({
       key: "diff",
       label: viewMode === "diff" ? "Exit diff view" : "Show diff",
@@ -1296,6 +1335,8 @@ function FileViewerBody({
       icon: <SearchIcon className="size-4" />,
       active: false,
       onSelect: openSearch,
+      // Cmd+F only opens find on the Monaco and code surfaces (see isMonacoFindSurface).
+      shortcut: isMonacoFindSurface ? [MOD_KEY, "F"] : undefined,
     },
   ];
   if (revealTarget && !isDeletedFile) {
@@ -1439,6 +1480,9 @@ function FileViewerBody({
               >
                 {item.icon}
                 {item.label}
+                {item.shortcut && (
+                  <CompactShortcutKeys keys={item.shortcut} className="ml-auto pl-4" />
+                )}
                 {item.active && !item.noActiveCheck && <CheckIcon className="ml-auto size-4" />}
               </DropdownMenuItem>
             ))}
@@ -1516,49 +1560,57 @@ function FileViewerBody({
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              <TooltipProvider>
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label="Close file viewer"
-                      onClick={() => guardDirty(onClose)}
-                    >
-                      <ArrowLeftIcon className="size-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Close</TooltipContent>
-                </Tooltip>
-              </TooltipProvider>
+              {/* Esc runs onCloseTab unless Find is open; the hint applies only when the
+                  back button runs that same handler. */}
+              <KeyboardShortcutTooltip
+                label="Close"
+                keys={
+                  onCloseTab !== undefined && onClose === onCloseTab && !searchOpen
+                    ? [ESC_KEY]
+                    : undefined
+                }
+              >
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Close file viewer"
+                  onClick={() => guardDirty(onClose)}
+                >
+                  <ArrowLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {showNavButtons && (
             <div ref={toolbarNavRef} className="flex items-center gap-0.5 shrink-0">
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Previous file"
-                disabled={!prevPath}
-                onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
-              >
-                <ChevronLeftIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Previous file" keys={[ALT_KEY, ARROW_LEFT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Previous file"
+                  disabled={!prevPath}
+                  onClick={() => prevPath && guardDirty(() => onNavigateTo(prevPath))}
+                >
+                  <ChevronLeftIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
               <span className="text-[10px] text-muted-foreground tabular-nums">
                 {currentNavIdx + 1}/{navigableFiles.length}
               </span>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Next file"
-                disabled={!nextPath}
-                onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
-              >
-                <ChevronRightIcon className="size-4" />
-              </Button>
+              <KeyboardShortcutTooltip label="Next file" keys={[ALT_KEY, ARROW_RIGHT_KEY]}>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Next file"
+                  disabled={!nextPath}
+                  onClick={() => nextPath && guardDirty(() => onNavigateTo(nextPath))}
+                >
+                  <ChevronRightIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
             </div>
           )}
           {/* Always show the file path/name in the toolbar, in every view. */}
@@ -1798,6 +1850,13 @@ function FileViewerBody({
               <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
                 Loading diff…
               </div>
+            ) : diffQuery.data.baseline_state === "unknown" ? (
+              <div
+                role="status"
+                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
+              >
+                Original content unavailable
+              </div>
             ) : (
               // Keep viewer state on resize without computing the CSS-hidden copy's diff.
               isActiveViewport && (
@@ -1880,10 +1939,11 @@ function FileViewerBody({
               );
             }}
             canAddress={canEdit && sender !== null}
+            addressCount={addressableCommentIds.length}
+            addressFileCount={addressableFileCount}
             onAddressAll={() => {
-              if (!sender) return;
-              const ids = openComments.map((c) => c.id);
-              sender.mutate({ comment_ids: ids });
+              if (!sender || addressableCommentIds.length === 0) return;
+              sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
               handleSetActiveSelection({
@@ -1965,11 +2025,16 @@ function FileViewerBody({
     </>
   );
 
+  // While the viewer is the surface last used, Escape closes its Find bar, or else its
+  // tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+
   if (frameless) {
     return (
       <div
         ref={setViewerRoot}
         data-testid="file-viewer"
+        data-escape-owner={ownsEscape ? "" : undefined}
         style={{ paddingBottom: keyboardInset || undefined }}
         className={cn(
           "flex flex-col flex-1 min-h-0 overflow-hidden bg-card",
@@ -1985,6 +2050,7 @@ function FileViewerBody({
     <aside
       ref={setFramedViewerRoot}
       data-testid="file-viewer"
+      data-escape-owner={ownsEscape ? "" : undefined}
       style={{ width: panelWidth, paddingBottom: keyboardInset || undefined }}
       className={cn(
         "flex flex-col overflow-hidden bg-card transition-[translate,border-color,border-width] duration-150 ease-out",

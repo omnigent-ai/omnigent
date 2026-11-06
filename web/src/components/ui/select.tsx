@@ -7,6 +7,7 @@ import { getEmbedRoot } from "@/lib/host";
 import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { ChevronDownIcon, CheckIcon, ChevronUpIcon } from "lucide-react";
+import { MobileMenuGlassSurface } from "@/components/MobileMenuGlassSurface";
 
 function Select({
   componentId,
@@ -82,6 +83,7 @@ function SelectContent({
         data-slot="select-content"
         data-align-trigger={position === "item-aligned"}
         className={cn(
+          "mobile-menu-glass",
           "menu-surface relative z-50 max-h-(--radix-select-content-available-height) min-w-36 origin-(--radix-select-content-transform-origin) overflow-x-hidden overflow-y-auto rounded-[12px] border border-border bg-popover text-popover-foreground shadow-menu duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] data-[align-trigger=true]:animate-none data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
           position === "popper" &&
             "data-[side=bottom]:translate-y-1 data-[side=left]:-translate-x-1 data-[side=right]:translate-x-1 data-[side=top]:-translate-y-1",
@@ -91,6 +93,7 @@ function SelectContent({
         align={align}
         {...props}
       >
+        <MobileMenuGlassSurface />
         <SelectScrollUpButton />
         <SelectPrimitive.Viewport
           data-slot="select-viewport"

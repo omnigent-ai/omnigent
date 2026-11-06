@@ -582,11 +582,16 @@ function isPathologicalText(text: string): boolean {
  * break opportunity inside an otherwise unbreakable token. Over-long payloads
  * are elided so the DOM node itself can't grow without bound.
  */
-function PlainTextFallback({ text }: { text: string }) {
+function PlainTextFallback({ text, className }: { text: string; className?: string }) {
   const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
   const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
   return (
-    <div className="whitespace-pre-wrap break-all font-mono text-sm">
+    <div
+      className={cn(
+        "plain-text-fallback whitespace-pre-wrap break-all font-mono text-sm",
+        className,
+      )}
+    >
       {shown}
       {truncated && (
         <span className="text-muted-foreground">
@@ -632,6 +637,7 @@ export function FilePathAwareMessageResponse({
   children,
   breaks = false,
   literalHtml = false,
+  isStreaming = false,
   ...props
 }: React.ComponentProps<typeof MessageResponse> & { breaks?: boolean; literalHtml?: boolean }) {
   const components = FILE_PATH_AWARE_COMPONENTS;
@@ -673,11 +679,18 @@ export function FilePathAwareMessageResponse({
     [isString, children],
   );
   if (pathological) {
-    return <PlainTextFallback text={children as string} />;
+    return <PlainTextFallback text={children as string} className={props.className} />;
   }
 
   return (
-    <MessageResponse {...props} components={components} remarkPlugins={remarkPlugins} markFileLinks>
+    <MessageResponse
+      {...props}
+      components={components}
+      remarkPlugins={remarkPlugins}
+      markFileLinks
+      // The shown text can trail the latest by one interval after the stream ends.
+      isStreaming={isStreaming || throttledText !== normalizedText}
+    >
       {isString ? throttledText : children}
     </MessageResponse>
   );
