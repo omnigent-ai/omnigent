@@ -654,7 +654,7 @@ async def test_server_expiry(scenario, monkeypatch, setting):
     monkeypatch.setattr(uploads.config, "workspace_upload_" + setting, lambda: 0.01)
     url = await scenario.url()
     scenario.requests.clear()
-    await asyncio.sleep(0.02)
+    await asyncio.sleep(0.02)  # custom-lint: disable=sleep-then-assert -- outlive the 10 ms expiry
     assert (await scenario.client.head(url)).status_code == 410
     assert scenario.requests == []
 
