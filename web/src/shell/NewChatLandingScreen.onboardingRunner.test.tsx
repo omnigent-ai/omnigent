@@ -44,8 +44,10 @@ import { readLastHostChoice, writeLastHostChoice } from "@/lib/hostPreferences";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 
 let searchParams = new URLSearchParams();
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => vi.fn(),
   useSearchParams: () => [searchParams, vi.fn()],
 }));

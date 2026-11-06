@@ -72,8 +72,10 @@ const REPO = "/Users/corey/projects/alpha";
 // Mutable so a test can simulate clicking another project's pencil (the
 // screen stays mounted; only the param changes).
 let searchParams = new URLSearchParams("project=Alpha");
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => navigateMock,
   useSearchParams: () => [searchParams, vi.fn()],
 }));
