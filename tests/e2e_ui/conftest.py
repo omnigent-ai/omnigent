@@ -2812,6 +2812,7 @@ def _create_native_codex_session(
     *,
     model: str | None = None,
     labels: dict[str, str] | None = None,
+    terminal_launch_args: list[str] | None = None,
 ) -> str:
     """Register the ``codex-native`` wrapper agent and bind its session.
 
@@ -2836,15 +2837,19 @@ def _create_native_codex_session(
     :param runner_id: The token-bound runner id to bind.
     :param model: Optional Codex model to pin in the wrapper spec.
     :param labels: Extra session labels set at create, before Codex launches.
+    :param terminal_launch_args: Codex launch flags, e.g. a permission preset's.
     :returns: The new session/conversation id.
     """
     # Keep workspace session-local; runner-wide cwd changes other file surfaces.
+    metadata: dict[str, object] = {"workspace": str(_REPO_ROOT), "labels": labels or {}}
+    if terminal_launch_args is not None:
+        metadata["terminal_launch_args"] = terminal_launch_args
     created = create_native_session(
         httpx,
         base_url,
         harness="codex",
         model=model,
-        metadata={"workspace": str(_REPO_ROOT), "labels": labels or {}},
+        metadata=metadata,
     )
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)

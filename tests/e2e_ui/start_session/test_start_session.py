@@ -1440,9 +1440,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
                 await page.get_by_test_id("new-chat-button").click()
             await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await expect(chip).to_have_attribute(
-                "aria-label", re.compile("No host selected, Offline")
-            )
+            await expect(chip).to_have_attribute("aria-label", "Host: No host selected")
 
             # A later host refresh reports the continuously preferred VM again.
             # The empty slot lets that saved choice heal automatically.
@@ -1549,12 +1547,8 @@ async def _drive_managed_repository_workspace_bar(
                 "aria-label", f"Sandbox repositories: {repo_name}"
             )
             repository_label = repository.locator("[data-workspace-collapse-label]")
-            if viewport_width == 390:
-                await expect(controls).to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_hidden()
-            else:
-                await expect(controls).not_to_have_attribute("data-labels", "collapsed")
-                await expect(repository_label).to_be_visible()
+            await expect(controls).not_to_have_attribute("data-labels", "collapsed")
+            await expect(repository_label).to_be_visible()
 
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
@@ -2090,7 +2084,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
 def test_start_session_select_approval_mode(seeded_session: tuple[str, str]) -> None:
     """A safer approval preset clears bypass and reaches the create call.
 
-    Selecting "Full access" in the composer's permissions dropdown must clear
+    Selecting "Full Access" in the composer's permissions dropdown must clear
     a previous bypass choice and reach
     ``POST /v1/sessions`` as
     ``terminal_launch_args: ["--sandbox", "danger-full-access",
@@ -2224,7 +2218,14 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             approval = page.get_by_test_id("new-chat-landing-permission-chip")
             await expect(approval).to_be_visible()
             await approval.click()
-            for label in ("Default", "Full access", "Read only", "Bypass approvals & sandbox"):
+            for label in (
+                "Default",
+                "Ask for approval",
+                "Approve for me",
+                "Full Access",
+                "Read Only",
+                "Bypass approvals & sandbox",
+            ):
                 await expect(
                     page.get_by_role("menuitemradio", name=label, exact=True)
                 ).to_be_visible()
@@ -2234,8 +2235,8 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
                 page.get_by_test_id("new-chat-landing-permission-menu")
             ).not_to_be_visible()
             await approval.click()
-            await page.get_by_role("menuitemradio", name="Full access", exact=True).click()
-            await expect(approval).to_contain_text("Full access")
+            await page.get_by_role("menuitemradio", name="Full Access", exact=True).click()
+            await expect(approval).to_contain_text("Full Access")
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()

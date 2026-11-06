@@ -1,7 +1,9 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ComponentProps } from "react";
+import type { ComponentProps, ReactNode } from "react";
 
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
@@ -66,7 +68,10 @@ function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
-function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
+function renderPalette(
+  overrides: Partial<ComponentProps<typeof CommandPalette>> = {},
+  queryClient = new QueryClient(),
+) {
   const props = {
     open: true,
     onOpenChange: vi.fn(),
@@ -74,8 +79,14 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
+  render(<CommandPalette {...props} />, { wrapper: withQueryClient(queryClient) });
   return props;
+}
+
+function withQueryClient(queryClient = new QueryClient()) {
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
 }
 
 beforeEach(() => {
@@ -140,7 +151,9 @@ describe("CommandPalette — sessions", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
     expect(fetchNextPage).toHaveBeenCalledOnce();
     useConversations.mockReturnValue({
@@ -226,6 +239,25 @@ describe("CommandPalette — sessions", () => {
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/c99");
   });
+  it("shows each action's chord beside its row, and hides the workspace chord on grid routes", () => {
+    const chordsFor = (label: string) =>
+      Array.from(
+        screen
+          .getByText(label)
+          .closest("[cmdk-item]")!
+          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
+      ).map((key) => key.textContent);
+    renderPalette();
+    expect(chordsFor("Go to Settings")).toEqual([MOD_KEY, ALT_KEY, ","]);
+    expect(chordsFor("Toggle conversations sidebar")).toEqual([MOD_KEY, ALT_KEY, "["]);
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    expect(chordsFor("Go to Inbox")).toEqual([]);
+    cleanup();
+
+    renderPalette({ rightSidebarShortcutEnabled: false });
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([]);
+  });
+
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();
@@ -682,6 +714,24 @@ describe("CommandPalette — title and content groups", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("keeps the picked search row, with its owner, for the sidebar to list", () => {
+    const sharedRetro = {
+      ...conv("retro", "Kestrel retro"),
+      archived: true,
+      owner: "teammate",
+      permission_level: 2,
+    };
+    setSearchGroups({ title: searchPages([sharedRetro]) });
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+    search("kestrel");
+
+    fireEvent.click(labelRow("Kestrel retro"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/retro");
+    expect(queryClient.getQueryData(["conversation-backfill", "retro"])).toEqual(sharedRetro);
+  });
+
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
     expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
@@ -706,7 +756,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     setSearchGroups({
       title: searchPages([conv("title", "Kestrel plan")]),
@@ -732,7 +784,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     const input = screen.getByTestId("command-palette-input");
     fireEvent.keyDown(input, { key: "ArrowDown" });
@@ -757,7 +811,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "ArrowDown" });
     rerender(<CommandPalette {...props} open={false} />);
     rerender(<CommandPalette {...props} />);
@@ -777,7 +833,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     fireEvent.pointerMove(screen.getByText("In messages"));
     setSearchGroups({
@@ -805,7 +863,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
     fireEvent.click(screen.getByText("Show more"));
     expect(fetchContentPage).toHaveBeenCalledOnce();
@@ -828,7 +888,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
 
     // Nothing is enabled yet, and the palette shows it is still searching.
@@ -854,7 +916,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
     const enabledScopes = () =>
       new Set(
