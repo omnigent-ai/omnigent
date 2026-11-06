@@ -31,7 +31,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import StageTimings, debug_event
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -1564,6 +1564,7 @@ def register_resources_routes(
             declared by the agent spec (or the agent has no
             ``terminals:`` block at all).
         """
+        timings = StageTimings()
         conv = await _validate_session(session_id, request, LEVEL_EDIT)
         body = await request.json()
         is_native_bootstrap = (
@@ -1596,6 +1597,7 @@ def register_resources_routes(
                     ),
                     code=ErrorCode.INVALID_INPUT,
                 )
+        timings.mark("authorize")
         # A session whose runner merely went to sleep (host still up, or a
         # resumable managed sandbox) is transparently reconnected here, so
         # opening a shell from the web wakes it instead of dead-ending on a
@@ -1612,6 +1614,7 @@ def register_resources_routes(
             conversation_store=conversation_store,
             runner_router=runner_router or get_server_runner_router(),
         )
+        timings.mark("ensure_runner")
         path = f"/v1/sessions/{session_id}/resources/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
@@ -1621,6 +1624,18 @@ def register_resources_routes(
             path,
             body,
             conv,
+        )
+        timings.mark("runner_launch")
+        _logger.info(
+            "Terminal create finished",
+            extra=debug_event(
+                "terminal_create_finished",
+                session_id=session_id,
+                terminal=body.get("terminal"),
+                native_bootstrap=is_native_bootstrap,
+                status_code=status,
+                **timings.attributes(),
+            ),
         )
         if status >= 400:
             error = payload.get("error", {})
