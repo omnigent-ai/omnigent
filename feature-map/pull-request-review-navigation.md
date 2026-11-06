@@ -195,8 +195,7 @@ Component coverage for these helpers and views lives in
   notice. A mark recorded only that way stays silent even after the file's hunks
   become comparable; the badge needs at least one comparable mark. Stand-ins from other
   heads are discarded before the current mark is recorded, and the current mark counts
-  toward the three-hash limit. Files whose names git quotes (non-ASCII or special
-  characters) have no parsed diff in the Changes tab, so they always behave this way.
+  toward the three-hash limit.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.
 - **Thread navigation can clear a filter.** Previous and Next unresolved
   conversation reveal a conversation on a file the path filter or Hide viewed hides,
