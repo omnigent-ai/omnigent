@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -172,6 +174,74 @@ def test_fork_drops_per_user_pin_labels(
     assert pinned_label_key("bob") not in fork.labels
 
 
+def test_side_chats_page_by_parent_in_id_order(tmp_path: Path) -> None:
+    """A parent's side chats, generic and Codex, page in id order and nothing else is listed."""
+    # Split databases: the listing must read only the Omnigent side.
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path}/omnigent.db", f"sqlite:///{tmp_path}/conversations.db"
+    )
+    parent = store.create_conversation()
+    generic = [store.create_conversation(side_chat_parent_id=parent.id) for _ in range(2)]
+    codex = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, side_chat_parent_id=parent.id
+    )
+    store.create_conversation(side_chat_parent_id=store.create_conversation().id)
+    store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+    store.set_labels(codex.id, {"omnigent.closed": "true"})
+
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        first = store.list_side_chat_ids(parent.id, limit=2)
+        rest = store.list_side_chat_ids(parent.id, after=first[-1], limit=2)
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+
+    side_chats = [*generic, codex]
+    assert first + rest == sorted(side_chat.id for side_chat in side_chats)
+    assert len(queries) == 2
+    with store._engine.connect() as conn:
+        for statement, parameters in queries:
+            plan = str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            assert "ix_conversation_metadata_side_chat_parent_id" in plan, plan
+            assert "TEMP B-TREE" not in plan, plan
+
+
+def test_fork_lists_a_side_chat_and_marks_what_it_copied(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A side chat records its parent and its copies carry its id prefix; a fork of it doesn't."""
+    source = conversation_store.create_conversation()
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=f"resp_{index}",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+            for index in range(3)
+        ],
+    )
+
+    side_chat = conversation_store.fork_conversation(source.id, side_chat_parent_id=source.id)
+
+    stored = conversation_store.get_conversation(side_chat.id)
+    assert stored is not None and stored.side_chat_parent_id == source.id
+    copied = [item.id for item in conversation_store.list_items(side_chat.id).data]
+    assert len(copied) == 3
+    assert all(item_id.startswith(side_chat.id[:12]) for item_id in copied)
+    ordinary = conversation_store.fork_conversation(side_chat.id)
+    assert ordinary.side_chat_parent_id is None
+    recopied = [item.id for item in conversation_store.list_items(ordinary.id).data]
+    assert not any(item_id.startswith(ordinary.id[:12]) for item_id in recopied)
+
+
 def test_create_and_get(conversation_store: SqlAlchemyConversationStore) -> None:
     conv = conversation_store.create_conversation()
     assert len(conv.id) == 32
@@ -329,6 +399,8 @@ def test_get_session_activity(
     a = conversation_store.create_conversation(title="alpha")
     b = conversation_store.create_conversation(title="beta")
     conversation_store.set_session_live_status(a.id, "waiting")
+    conversation_store.set_runner_id(a.id, "runner_activity")
+    conversation_store.set_pending_elicitation_count(a.id, 2)
     conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
     child = conversation_store.create_conversation(
@@ -343,10 +415,13 @@ def test_get_session_activity(
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
     assert result[a.id].live_status == "waiting"
+    assert result[a.id].runner_id == "runner_activity"
+    assert result[a.id].pending_elicitation_count == 2
     assert result[a.id].total_cost_usd == cost
     assert result[child.id].total_cost_usd == 5.0
     # A session that never reported a status has none recorded.
     assert result[b.id].live_status is None
+    assert result[b.id].runner_id is None
     assert result[b.id].total_cost_usd is None
     assert conversation_store.get_session_activity([]) == {}
 
@@ -4795,6 +4870,28 @@ def test_update_conversation_share_workspace_files_round_trips(
     assert conversation_store.get_conversation(conv_id).share_workspace_files is False
 
 
+@pytest.mark.parametrize("continue_source", [True, False])
+def test_only_a_continuation_keeps_the_shared_workspace_files(
+    conversation_store: SqlAlchemyConversationStore, continue_source: bool
+) -> None:
+    """A continuation of a session sharing its files shares them too; a fork starts unshared.
+
+    The continuation carries on the same chat in the same workspace and is
+    shared exactly as its source, so the owner's opt-in carries over. An
+    ordinary fork is a new session the owner has not shared files for.
+    """
+    source = conversation_store.create_conversation(host_id=uuid.uuid4().hex, workspace="/work")
+    conversation_store.update_conversation(source.id, share_workspace_files=True)
+
+    fork = conversation_store.fork_conversation(
+        source.id, copy_items=False, continue_source=continue_source
+    )
+
+    forked = conversation_store.get_conversation(fork.id)
+    assert forked is not None
+    assert forked.share_workspace_files is continue_source
+
+
 def test_set_host_id_no_workspace_fails_when_row_has_none(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -6372,6 +6469,126 @@ def test_fork_conversation_up_to_unknown_response_raises(
 
     with pytest.raises(ValueError, match="resp_nope"):
         conversation_store.fork_conversation(source.id, up_to_response_id="resp_nope")
+
+
+def test_fork_conversation_before_item_drops_the_item_and_later_history(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+) -> None:
+    """``before_item_id`` copies only the items positioned before that item.
+
+    The fork keeps everything before the item, drops the item and the turns
+    after it, and never resumes the source's full native transcript. The
+    first item leaves nothing to copy; unknown or combined cutoffs fail. A
+    fork that copies no items behaves the same and accepts no cutoff.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b",
+        name="fork-before-item",
+        bundle_location="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b/fakehash",
+    )
+    source = conversation_store.create_conversation(agent_id="5b0d3c5e1f7a4f6e9a2b8c4d1e3f5a7b")
+    conversation_store.set_external_session_id(source.id, "claude-uuid-before")
+    _append_three_responses(conversation_store, source.id)
+    source_items = conversation_store.list_items(source.id).data
+    second_prompt, first_prompt = source_items[2], source_items[0]
+
+    def fork_texts(fork_id: str) -> list[str]:
+        return [
+            part["text"]
+            for item in conversation_store.list_items(fork_id).data
+            for part in item.data.content  # type: ignore[union-attr]
+        ]
+
+    fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
+    assert fork_texts(fork.id) == ["Q1", "A1"]
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
+    assert fork_texts(first.id) == []
+    assert len(conversation_store.list_items(source.id).data) == 6
+
+    missing_item_id = "f" * 32
+    with pytest.raises(ValueError, match=missing_item_id):
+        conversation_store.fork_conversation(source.id, before_item_id=missing_item_id)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        conversation_store.fork_conversation(
+            source.id, up_to_response_id="resp_001", before_item_id=second_prompt.id
+        )
+
+    # ``copy_items=False`` copies nothing and, as a truncation, never resumes
+    # the source's native transcript; it takes no cutoff.
+    empty = conversation_store.fork_conversation(source.id, copy_items=False)
+    assert fork_texts(empty.id) == []
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in empty.labels
+    for cutoff in ({"before_item_id": second_prompt.id}, {"up_to_response_id": "resp_001"}):
+        with pytest.raises(ValueError, match="copy_items=False"):
+            conversation_store.fork_conversation(source.id, copy_items=False, **cutoff)
+
+
+def test_continuation_fork_and_host_teardown_serialize_on_the_host_row(
+    conversation_store: SqlAlchemyConversationStore, db_uri: str
+) -> None:
+    """A teardown racing a continuation's fork waits for it, then keeps the host.
+
+    The continuation copies its source's host while holding the host row lock
+    that host deletion takes. Deleting the source and its host while the
+    continuation's metadata is mid-insert must block on that lock and then see
+    the continuation, rather than tear the host down under it. (SQLite already
+    serializes the two writes; the row lock matters on Postgres and MySQL.)
+    """
+    from omnigent.db.utils import now_epoch
+
+    hosts = HostStore(db_uri)
+    host_id = uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="continued-sandbox",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id="sb-continued",
+        token_expires_at=now_epoch() + 3600,
+    )
+    source = conversation_store.create_conversation(host_id=host_id, workspace="/work")
+    torn_down: list[object] = []
+
+    def delete_source_and_host() -> None:
+        asyncio.run(conversation_store.delete_conversation(source.id))
+        torn_down.append(hosts.delete_host(host_id, keep_if_bound=True))
+
+    deleter = threading.Thread(target=delete_source_and_host)
+
+    def race_the_insert(_conn: object, _cursor: object, statement: str, *_args: object) -> None:
+        if (
+            deleter.is_alive()
+            or torn_down
+            or not statement.lstrip()
+            .upper()
+            .startswith("INSERT INTO OMNIGENT_CONVERSATION_METADATA")
+        ):
+            return
+        deleter.start()
+        # A teardown that skipped the host lock would finish in this window.
+        deleter.join(timeout=1.0)
+
+    event.listen(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    try:
+        fork = conversation_store.fork_conversation(
+            source.id, copy_items=False, continue_source=True
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", race_the_insert)
+    deleter.join(timeout=30)
+
+    assert not deleter.is_alive()
+    assert torn_down == [None]
+    assert hosts.get_host(host_id) is not None
+    continuation = conversation_store.get_conversation(fork.id)
+    assert continuation is not None
+    assert (continuation.host_id, continuation.workspace) == (host_id, "/work")
 
 
 def test_fork_clone_agent_is_session_scoped(

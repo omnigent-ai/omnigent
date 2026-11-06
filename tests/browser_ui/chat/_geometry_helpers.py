@@ -154,6 +154,10 @@ GEOMETRY_PROBE = """() => {
         lastMessageBottom: Math.round(sections.at(-1).getBoundingClientRect().bottom),
         composerHeight: Math.round(ta.getBoundingClientRect().height),
         composerTop,
+        mobileOverlay: card.hasAttribute('data-mobile-composer'),
+        overlayHeight: Math.round(parseFloat(getComputedStyle(
+            form.closest('[data-chat-surface]')
+        ).getPropertyValue('--session-composer-height')) || 0),
         transcriptBottom,
         overlap: transcriptBottom - composerTop,
         formMarginTop: Math.round(parseFloat(getComputedStyle(form).marginTop) || 0),
