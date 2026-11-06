@@ -2064,6 +2064,9 @@ def test_create_app_native_pane_idle_windows_follow_runner_config(
     reaper = app.state.native_pane_reaper
     assert reaper is not None
     assert reaper._idle_timeout_s == timeout_s
+    if not timeout_s:
+        assert reaper._sub_agent_idle_timeout_s == 0
+        return
     resource_registry = app.state.session_resource_registry
     for conv in ("conv_idle", "conv_child"):
         resource_registry.terminal_registry._by_conversation[conv] = {
@@ -2086,8 +2089,7 @@ def test_create_app_native_pane_idle_windows_follow_runner_config(
         assert reapable_at(0.0) == set()
         assert reapable_at(3599.0) == set()
         assert reapable_at(3600.0) == {"conv_child"}
-        if timeout_s:
-            assert reapable_at(float(timeout_s)) == {"conv_idle", "conv_child"}
+        assert reapable_at(float(timeout_s)) == {"conv_idle", "conv_child"}
     finally:
         subagent_work.unregister_child_session("conv_child")
 

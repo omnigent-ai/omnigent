@@ -151,21 +151,6 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
     assert f.busy_calls == 2  # classify + re-check
 
 
-async def test_scan_reaps_sub_agent_pane_while_top_level_reaping_is_disabled(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
-    f = _Fakes()
-    child = _pane("conv_child", "codex")._replace(sub_agent=True)
-    f.panes = [_pane("conv_top", "codex"), child]
-    r = _make(f, timeout=0.0)
-    idle_since = time.monotonic() - _DEFAULT_IDLE_TIMEOUT_S - 1
-    r._last_busy_at = {"conv_top": idle_since, "conv_child": idle_since}
-    await r._scan_once()
-    assert f.reaped == ["conv_child"]
-    assert f.busy_calls == 2  # the child's classify + re-check; the top-level pane is not probed
-
-
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
@@ -203,8 +188,8 @@ def test_resolve_invalid_falls_back(
     [
         (None, 86400.0, _DEFAULT_IDLE_TIMEOUT_S),
         (None, 600.0, 600.0),
-        (None, 0.0, _DEFAULT_IDLE_TIMEOUT_S),
-        ("120", 120.0, 120.0),
+        (None, 0.0, 0.0),
+        ("120", 86400.0, 120.0),
         ("7200", 7200.0, 7200.0),
         ("0", 0.0, 0.0),
     ],
@@ -239,7 +224,7 @@ async def test_loop_reaps_idle_pane() -> None:
 
 async def test_loop_disabled_when_timeout_non_positive() -> None:
     f = _Fakes()
-    f.panes = [_pane("conv_a")]
+    f.panes = [_pane("conv_a"), _pane("conv_child")._replace(sub_agent=True)]
     r = _make(f, timeout=0.0, interval=0.01)  # 0 disables
     await r.start()
     try:
@@ -247,6 +232,7 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     finally:
         await r.shutdown()
     assert f.reaped == []
+    assert f.busy_calls == 0
 
 
 def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
