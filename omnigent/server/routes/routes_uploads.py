@@ -703,6 +703,7 @@ def register_upload_routes(
                 conversation_store=conversation_store,
                 runner_router=runner_router or get_server_runner_router(),
                 raise_host_refusal=True,
+                request=request,
             )
         except OmnigentError as exc:
             raise OmnigentError("Session runner could not connect", code=exc.code) from exc
