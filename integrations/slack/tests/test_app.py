@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
 from omnigent_slack import app as app_module
-from omnigent_slack.app import _register_error_handler
+from omnigent_slack.app import _register_error_handler, register_handlers
 from slack_bolt.async_app import AsyncApp
+from slack_bolt.authorization import AuthorizeResult
+from slack_bolt.request.async_request import AsyncBoltRequest
 
 
 class _StartupReached(Exception):
@@ -103,3 +106,71 @@ async def test_run_passes_the_operator_setup_defaults_to_the_setup_flow(
 
     assert captured["default_agent_id"] == "ag_standard"
     assert captured["default_host_type"] == "managed"
+
+
+@pytest.mark.asyncio
+async def test_run_passes_the_agent_sessions_setting_to_the_service(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_SLACK_BOT_TOKEN", "xoxb-dummy")
+    monkeypatch.setenv("OMNIGENT_SLACK_APP_TOKEN", "xapp-dummy")
+    monkeypatch.setenv("OMNIGENT_SERVER_URL", "https://omnigent.example.com")
+    monkeypatch.setenv("OMNIGENT_SLACK_DATABASE_PATH", str(tmp_path / "bot.sqlite3"))
+    monkeypatch.setenv("OMNIGENT_SLACK_AGENT_SESSIONS", "true")
+
+    captured: dict[str, Any] = {}
+    real_service = app_module.SlackOmnigentService
+
+    def _record(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_service(**kwargs)
+
+    class _StopHandler:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def start_async(self) -> None:
+            raise _StartupReached
+
+    monkeypatch.setattr(app_module, "SlackOmnigentService", _record)
+    monkeypatch.setattr(app_module, "AsyncSocketModeHandler", _StopHandler)
+
+    with pytest.raises(_StartupReached):
+        await app_module.run()
+
+    assert captured["agent_sessions"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_session_stopped_event_reaches_the_service() -> None:
+    """Slack's stop-button event is routed to the service's stop handler."""
+    stopped = asyncio.Event()
+    received: list[dict[str, Any]] = []
+
+    class _Service:
+        async def handle_agent_session_stopped(self, **kwargs: Any) -> None:
+            received.append(kwargs["event"])
+            stopped.set()
+
+    async def _authorize(**_kwargs: Any) -> AuthorizeResult:
+        return AuthorizeResult(
+            enterprise_id=None, team_id="T1", bot_user_id="B1", bot_token="xoxb-dummy"
+        )
+
+    app = AsyncApp(authorize=_authorize, request_verification_enabled=False)
+    register_handlers(app, _Service())  # type: ignore[arg-type]
+    event = {
+        "type": "agent_session_stopped",
+        "channel": "C1",
+        "thread_ts": "100.1",
+        "user": "U1",
+        "streaming_message_ts": [],
+        "event_ts": "200.2",
+    }
+    body = {"type": "event_callback", "team_id": "T1", "event_id": "Ev1", "event": event}
+
+    response = await app.async_dispatch(AsyncBoltRequest(body=body, mode="socket_mode"))
+    await asyncio.wait_for(stopped.wait(), timeout=5)
+
+    assert response.status == 200
+    assert received == [event]

@@ -494,6 +494,13 @@ class OmnigentClient:
         await _raise_for_status(response)
         self._logger.debug("Submitted Omnigent message session_id=%s", session_id)
 
+    async def interrupt(self, session_id: str) -> None:
+        """Cancel the session's running turn, as the web UI's stop button does."""
+        self._logger.info("Interrupting Omnigent session session_id=%s", session_id)
+        payload = {"type": "interrupt", "data": {}}
+        response = await self._request("POST", f"/v1/sessions/{session_id}/events", json=payload)
+        await _raise_for_status(response)
+
     async def resolve_elicitation(
         self,
         session_id: str,

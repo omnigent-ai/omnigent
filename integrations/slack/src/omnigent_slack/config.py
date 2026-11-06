@@ -155,6 +155,14 @@ class Settings(BaseSettings):
         validation_alias="OMNIGENT_SLACK_DEFAULT_HOST_TYPE",
     )
 
+    # Slack agent sessions, for an app declared an agent (``agent_view``; see the
+    # README): each thread's session in Slack's agent UI gets a title and a status
+    # that follows the turn. Off by default: the calls need an agent app.
+    agent_sessions: bool = Field(
+        default=False,
+        validation_alias="OMNIGENT_SLACK_AGENT_SESSIONS",
+    )
+
     # Fernet key (urlsafe-base64, 32 bytes) that encrypts the delegated
     # Omnigent access/refresh tokens at rest in the local SQLite store.
     # Generate with ``python -c "from cryptography.fernet import Fernet;

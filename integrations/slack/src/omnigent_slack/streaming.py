@@ -22,10 +22,12 @@ from omnigent_slack.text import GENERIC_FAILURE_TEXT, truncate_for_slack
 class SlackStreamProtocol(Protocol):
     async def append(self, *, markdown_text: str | None = ..., chunks: Any = ...) -> Any: ...
 
-    async def stop(self, *, markdown_text: str | None = ...) -> Any: ...
+    async def stop(self, *, markdown_text: str | None = ..., session_status: str = ...) -> Any: ...
 
 
 class SlackClientProtocol(Protocol):
+    async def api_call(self, api_method: str, *, json: dict[str, Any] | None = ...) -> Any: ...
+
     async def chat_postMessage(self, **kwargs: Any) -> dict[str, Any]: ...
 
     async def chat_postEphemeral(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -154,7 +156,7 @@ class _LiveReply:
                 await self._open()
                 await self._stop_current(markdown_text)
 
-    async def seal(self) -> None:
+    async def seal(self, *, session_status: str | None = None) -> None:
         """Finalize the current streaming segment so a later message sorts after it.
 
         Slack orders messages by the timestamp fixed when a streaming message
@@ -163,7 +165,8 @@ class _LiveReply:
         policy/file notice), seal the current answer segment: it ends here, the
         out-of-band message sorts after it, and the next append opens a fresh
         segment that sorts after *that* — keeping chronological order across an
-        interruption. No-op when nothing is streaming.
+        interruption. No-op when nothing is streaming. ``session_status`` is the
+        agent-session status the stop leaves; unset, Slack's default (``active``).
         """
         if self._stream is None:
             return
@@ -173,7 +176,10 @@ class _LiveReply:
         self._stream = None
         self._pending_unflushed = False
         try:
-            await stream.stop()
+            if session_status:
+                await stream.stop(session_status=session_status)
+            else:
+                await stream.stop()
         except SlackApiError as exc:
             if not _is_stream_closed_error(exc):
                 raise
@@ -213,12 +219,15 @@ class _AnswerReply:
         recipient_user_id: str,
         ack_ts: str | None,
         logger: logging.Logger,
+        seal_session_status: str | None = None,
     ) -> None:
         self._reply = _LiveReply(client, key, recipient_user_id=recipient_user_id)
         self._client = client
         self._key = key
         self._ack_ts = ack_ts
         self._logger = logger
+        # Agent-session status a mid-turn seal leaves (see ``_LiveReply.seal``).
+        self._seal_session_status = seal_session_status
         self._streamed = ""
         self._final: str | None = None
         # The ``message_id`` of the delta stream currently being appended. Native
@@ -337,7 +346,7 @@ class _AnswerReply:
         if shown:
             self._delivered_texts.append(shown)
         await self._clear_ack()
-        await self._reply.seal()
+        await self._reply.seal(session_status=self._seal_session_status)
         self._streamed, self._final = "", None
 
     async def finalize(self, *, errored: bool) -> bool:
@@ -413,6 +422,15 @@ class _AnswerReply:
             thread_ts=self._key.reply_ts,
             text=truncate_for_slack(text),
         )
+
+    async def halt(self, text: str) -> None:
+        """End the reply after Slack's stop button: post ``text``, reopen nothing.
+
+        Slack has already stopped the segment it showed. A segment the reply
+        reopened before the stop arrived is finalized here instead of left open.
+        """
+        await self.stop_with(text)
+        await self._reply.seal()
 
     async def _clear_ack(self) -> None:
         # Best-effort, idempotent: a failed delete must not abort the turn.

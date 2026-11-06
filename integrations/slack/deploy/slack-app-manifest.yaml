@@ -32,6 +32,11 @@ features:
     messages_tab_read_only_enabled: false
     # The bot publishes no Home view.
     home_tab_enabled: false
+  # Agent sessions ONLY (OMNIGENT_SLACK_AGENT_SESSIONS=true; see the README):
+  # declares the app an agent, so each thread it answers becomes a session in
+  # Slack's agent UI. Slack documents no way to undo this declaration.
+  # agent_view:
+  #   agent_description: Runs Omnigent agent sessions. Each thread is one session, owned by whoever starts it.
   slash_commands:
     - command: /omnigent
       # Socket Mode delivers the payload over the websocket and ignores this
@@ -69,6 +74,8 @@ oauth_config:
       # against the OAuth-authenticated one. Omit for accounts/oidc servers.
       # - users:read
       # - users:read.email
+      # Agent sessions ONLY: the scope Slack gives an app declared an agent.
+      # - assistant:write
 
 settings:
   event_subscriptions:
@@ -79,6 +86,9 @@ settings:
       - message.channels
       - message.groups
       - message.mpim
+      # Agent sessions ONLY: the session's stop button. Without it Slack shows
+      # a loading indicator nobody can stop.
+      # - agent_session_stopped
   interactivity:
     # Required: approval and AskUserQuestion cards are interactive, and Socket
     # Mode delivers their payloads over the same websocket.
