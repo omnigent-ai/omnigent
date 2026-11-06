@@ -424,6 +424,28 @@ def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
     assert gate.submitted == ["r1", "r1", "r1"]
 
 
+def test_work_that_resumes_while_a_job_is_in_flight_is_refreshed_when_it_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A job already deciding not to renew an idle runner must not swallow the
+    # forced refresh for work dispatched meanwhile.
+    gate = _BusyGate(monkeypatch)
+    monkeypatch.setattr(managed_host_keepalive, "_pending_forced", set())
+    _wire(monkeypatch, launcher=_Launcher(), host=None)
+    queued: list[object] = []
+    monkeypatch.setattr(
+        managed_host_keepalive, "_executor", SimpleNamespace(submit=lambda *a: queued.append(a))
+    )
+    managed_host_keepalive.record_pong("r1", False, idle_s=900.0)
+    managed_host_keepalive._inflight.add("r1")  # a job for r1 is running
+    managed_host_keepalive.record_work_dispatched("r1")
+    assert queued == [], "deduplicated while the job runs"
+    managed_host_keepalive._keep_alive_for_runner("r1")  # that job finishes
+    assert len(queued) == 1, "the pending forced refresh runs without waiting for a tick"
+    assert managed_host_keepalive._pending_forced == set()
+    assert gate.now == 1000.0
+
+
 def test_pruning_drops_a_legacy_runner_gone_before_its_first_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

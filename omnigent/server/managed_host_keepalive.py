@@ -85,6 +85,11 @@ _last_kept: dict[str, float] = {}
 # provider from stacking a second job for the same runner behind the first.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _inflight: set[str] = set()
+# Runners whose forced refresh arrived while a job was in flight. That job may
+# already have decided not to renew (an idle runner), so the refresh is run once
+# it finishes rather than dropped.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_pending_forced: set[str] = set()
 _inflight_lock = threading.Lock()
 
 # Seconds between runner pongs (runner_tunnel.PING_INTERVAL_S; not imported, as
@@ -281,7 +286,10 @@ def touch(runner_id: str, *, force: bool = False) -> None:
         if runner_id in _inflight:
             # Previous attempt for this runner has not finished; skip rather than
             # queue a duplicate. Deliberately leaves _last_kept untouched so the
-            # next tick retries as soon as the in-flight one clears.
+            # next tick retries as soon as the in-flight one clears. A forced
+            # refresh (new work) is kept and run when that attempt finishes.
+            if force:
+                _pending_forced.add(runner_id)
             return
         _inflight.add(runner_id)
     if not force:
@@ -418,3 +426,7 @@ def _keep_alive_for_runner(runner_id: str) -> None:
     finally:
         with _inflight_lock:
             _inflight.discard(runner_id)
+            pending = runner_id in _pending_forced
+            _pending_forced.discard(runner_id)
+        if pending:
+            touch(runner_id, force=True)
