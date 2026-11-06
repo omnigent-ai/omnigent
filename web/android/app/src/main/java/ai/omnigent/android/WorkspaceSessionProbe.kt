@@ -54,12 +54,25 @@ internal class WorkspaceSessionProbe(
                 return WorkspaceSessionCheck.Unknown
             }
         return when {
-            response.status in 200..299 -> WorkspaceSessionCheck.Valid
-            response.status == 401 -> WorkspaceSessionCheck.Rejected(null)
-            response.status == 403 -> WorkspaceSessionCheck.Rejected(403)
-            response.status in REDIRECT_STATUSES && redirectsToSignIn(request.uri, response) ->
+            response.status in 200..299 -> {
+                WorkspaceSessionCheck.Valid
+            }
+
+            response.status == 401 -> {
                 WorkspaceSessionCheck.Rejected(null)
-            else -> WorkspaceSessionCheck.Unknown
+            }
+
+            response.status == 403 -> {
+                WorkspaceSessionCheck.Rejected(403)
+            }
+
+            response.status in REDIRECT_STATUSES && redirectsToSignIn(request.uri, response) -> {
+                WorkspaceSessionCheck.Rejected(null)
+            }
+
+            else -> {
+                WorkspaceSessionCheck.Unknown
+            }
         }
     }
 
