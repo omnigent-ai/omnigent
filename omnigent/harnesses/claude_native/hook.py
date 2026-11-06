@@ -844,8 +844,9 @@ def _post_hook_with_reattach(
     :param answer_window_s: For prompts with no useful terminal-only fallback:
         after a held poll is lost, keep retrying hard failures past the cap for
         this many seconds, while the server can still hand back an answer
-        submitted meanwhile. An auth lapse that can't be renewed then stops
-        retrying too, instead of waiting for the deadline. ``None`` keeps the
+        submitted meanwhile. After it, a failure from a reachable server or an
+        auth lapse that can't be renewed ends retries whatever the cap, while a
+        parked wait still rides out an unreachable server. ``None`` keeps the
         count-based cap alone.
     :returns: The successful (2xx) response, or ``None`` when the server
         rejects the request (a 4xx, including an auth rejection that can't be
@@ -1012,6 +1013,14 @@ def _post_hook_with_reattach(
                 # The server can still hand back an answer submitted since the
                 # poll was lost, so the cap waits for the window to end.
                 retry_by = min(deadline, answer_window_ends_at)
+            elif answer_window_ends_at is not None and not never_connected:
+                # That answer has expired, so a raised cap can't recover it.
+                print(
+                    f"omnigent {hook_label} hook: Omnigent still failing after the "
+                    "answer window — failing ask",
+                    file=sys.stderr,
+                )
+                return None
             elif consecutive_hard_failures >= _PERMISSION_MAX_CONSECUTIVE_FAILURES:
                 print(
                     f"omnigent {hook_label} hook: giving up after "

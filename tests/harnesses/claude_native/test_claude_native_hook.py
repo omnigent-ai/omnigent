@@ -1401,20 +1401,29 @@ def test_permission_request_hook_question_answer_survives_a_server_outage(
         assert len(client.calls) == cap + 1, "other prompts keep the hard-failure cap"
 
 
-@pytest.mark.parametrize("last_retry", ["5xx", "ok"], ids=["outage-continues", "answer-claimed"])
+@pytest.mark.parametrize(
+    ("last_retry", "max_retries"),
+    [("5xx", None), ("5xx", 20), ("ok", None)],
+    ids=["outage-continues", "outage-continues-raised-cap", "answer-claimed"],
+)
 def test_permission_request_hook_moves_a_question_to_chat_after_its_answer_window(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     last_retry: str,
+    max_retries: int | None,
 ) -> None:
     """
     An outage that outlasts the server's stored answer moves the question to chat.
 
     The last re-POST still lands before the server drops an answer submitted
     when the poll was lost and can claim it; after that the hook denies instead
-    of exiting silently.
+    of exiting silently, even when operators raise the retry cap.
     """
+    if max_retries is not None:
+        monkeypatch.setattr(
+            claude_native_hook, "_PERMISSION_MAX_CONSECUTIVE_FAILURES", max_retries
+        )
     held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
     # Retries at +1, 3, 7, 15, 31 s, then every 30 s until the window closes at +270 s.
     retries_in_window = 13
