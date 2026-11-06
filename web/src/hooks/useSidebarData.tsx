@@ -10,7 +10,7 @@ import {
   type ReactNode,
 } from "react";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled } from "@/lib/capabilities";
+import { isFeatureEnabled, sessionTitleSortSupported } from "@/lib/capabilities";
 import {
   DEFAULT_SIDEBAR_VIEW,
   readSidebarViewPreferences,
@@ -57,6 +57,22 @@ export type SidebarListQuery = Pick<
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
 
+/**
+ * The view the sidebar lists by. A server that rejects sort_by=title lists by
+ * Updated; the stored Name choice is kept so it returns once the server supports it.
+ */
+function effectiveSidebarView(
+  stored: SidebarViewPreferences,
+  groupingUi: boolean,
+  titleSort: boolean,
+): SidebarViewPreferences {
+  if (!groupingUi) return DEFAULT_SIDEBAR_VIEW;
+  if (stored.ordering === "name" && !titleSort) {
+    return { ...stored, ordering: DEFAULT_SIDEBAR_VIEW.ordering };
+  }
+  return stored;
+}
+
 /** Apply `apply` to every page's rows; returns `data` itself when no row changed. */
 function overlayPageRows(
   data: ScopeCacheData | undefined,
@@ -87,9 +103,12 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
   const client = useQueryClient();
   const serverInfo = useServerInfo();
   const [storedView, setView] = useState(readSidebarViewPreferences);
-  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
-    ? storedView
-    : DEFAULT_SIDEBAR_VIEW;
+  const groupingUi = isFeatureEnabled(serverInfo, "sidebar_grouping_ui");
+  const titleSort = sessionTitleSortSupported(serverInfo);
+  const view = useMemo(
+    () => effectiveSidebarView(storedView, groupingUi, titleSort),
+    [groupingUi, titleSort, storedView],
+  );
   const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
   const customOrder = useMemo(
     () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
@@ -99,8 +118,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     (patch: Partial<SidebarViewPreferences>) => {
       const next = { ...storedView, ...patch };
       writeSidebarViewPreferences(next);
-      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(storedView)) {
-        const nextSortBy = sidebarSortBy(sidebarBaseOrdering(next));
+      const nextBase = sidebarBaseOrdering(effectiveSidebarView(next, groupingUi, titleSort));
+      if (nextBase !== sidebarBaseOrdering(view)) {
+        const nextSortBy = sidebarSortBy(nextBase);
         // Clear the destination snapshots before observers switch to the selected order.
         for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
           void client.invalidateQueries({ queryKey, refetchType: "none" });
@@ -116,7 +136,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       }
       setView(next);
     },
-    [storedView, client],
+    [storedView, view, groupingUi, titleSort, client],
   );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";

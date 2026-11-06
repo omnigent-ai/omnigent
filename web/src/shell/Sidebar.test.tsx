@@ -3569,10 +3569,11 @@ it("caps Shared display independently of Mine while revealing cached rows", asyn
 });
 
 /** Render the sidebar with the sidebar_grouping_ui release flag on. */
-function renderGroupingSidebar() {
+function renderGroupingSidebar(sessionTitleSort = true) {
   return renderSidebar(true, "/", undefined, {
     ...FALLBACK_SERVER_INFO,
     features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
+    session_title_sort: sessionTitleSort,
   });
 }
 
@@ -4010,6 +4011,105 @@ describe("Sidebar view options", () => {
       ).toEqual(["conv_project_new", "conv_project_old", "conv_new", "conv_old"]);
     },
   );
+
+  it("orders sessions and project folders by Name through the menu, untitled last", () => {
+    projectsMock.push("Customer X");
+    const project = { omni_project: "Customer X" };
+    mockConversations([
+      conv("conv_untitled", "Codex", { title: null, updated_at: 600 }),
+      conv("conv_z", "Codex", { title: "conv_zeta", updated_at: 500 }),
+      conv("conv_b", "Codex", { title: "conv_beta", updated_at: 400 }),
+      conv("conv_a", "Codex", { title: "Conv_Alpha", updated_at: 100 }),
+      conv("conv_pm", "Codex", { title: "conv_mango", updated_at: 300, labels: project }),
+      conv("conv_pk", "Codex", { title: "Conv_Kiwi", updated_at: 200, labels: project }),
+    ]);
+    renderGroupingSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const sessionTitles = () =>
+      within(groupSection("Sessions"))
+        .getAllByRole("link")
+        .map((link) => link.textContent)
+        .filter(Boolean);
+    expect(sessionTitles()).toEqual(["New session", "conv_zeta", "conv_beta", "Conv_Alpha"]);
+
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Name (A to Z)" }));
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
+    expect(
+      screen.getAllByRole("link", { name: /^conv_/i }).map((link) => link.textContent),
+    ).toEqual(["Conv_Kiwi", "conv_mango", "Conv_Alpha", "conv_beta", "conv_zeta"]);
+    expect(sessionTitles()).toEqual(["Conv_Alpha", "conv_beta", "conv_zeta", "New session"]);
+  });
+
+  it("hides Name and lists by Updated on a server that can't sort by title", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+    mockConversations([
+      conv("conv_z", "Codex", { title: "conv_zeta", updated_at: 500 }),
+      conv("conv_a", "Codex", { title: "conv_alpha", updated_at: 100 }),
+    ]);
+    renderGroupingSidebar(false);
+    expect(
+      within(groupSection("Sessions"))
+        .getAllByRole("link")
+        .map((link) => link.textContent)
+        .filter(Boolean),
+    ).toEqual(["conv_zeta", "conv_alpha"]);
+    openViewSubmenu("session-ordering-menu");
+    expect(screen.queryByRole("menuitemradio", { name: "Name (A to Z)" })).toBeNull();
+    expect(screen.getByRole("menuitemradio", { name: "Updated" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
+  });
+
+  it("starts Custom from the Updated window, not the Name window it leaves", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+    const banana = conv("conv_banana", "Codex", { created_at: 2, updated_at: 20 });
+    mockConversations([conv("conv_apple", "Codex", { created_at: 1, updated_at: 10 }), banana]);
+    const view = renderGroupingSidebar();
+    const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view")!);
+    const rowTitles = () =>
+      within(groupSection("Sessions"))
+        .getAllByRole("link", { name: /^conv_/ })
+        .map((link) => link.textContent);
+    expect(rowTitles()).toEqual(["conv_apple", "conv_banana"]);
+
+    // Updated's first page arrives after the switch, with a newer session in it.
+    openViewSubmenu("session-ordering-menu");
+    mockConversations([conv("conv_zulu", "Codex", { created_at: 3, updated_at: 30 }), banana]);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+    expect(rowTitles()).toEqual(["conv_zulu", "conv_banana"]);
+    expect(saved().ordering).toBe("custom");
+    expect(saved()).not.toHaveProperty("custom");
+
+    // A reload before the first move keeps Custom selected.
+    view.unmount();
+    renderGroupingSidebar();
+    expect(rowTitles()).toEqual(["conv_zulu", "conv_banana"]);
+    openViewSubmenu("session-ordering-menu");
+    expect(screen.getByRole("menuitemradio", { name: "Custom" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+
+    // The first move saves positions from the Updated rows on screen.
+    const zulu = screen.getByRole("link", { name: "conv_zulu" }).closest("li")!;
+    fireEvent.keyDown(within(zulu).getByTestId("conversation-actions"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    expect(rowTitles()).toEqual(["conv_banana", "conv_zulu"]);
+    const positions = { base: "updated", since: 30, ids: ["conv_banana", "conv_zulu"] };
+    expect(saved().custom).toEqual(positions);
+
+    // Leaving Name again restores those positions rather than Updated's order.
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Name (A to Z)" }));
+    openViewSubmenu("session-ordering-menu");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Custom" }));
+    expect(rowTitles()).toEqual(["conv_banana", "conv_zulu"]);
+    expect(saved()).toMatchObject({ ordering: "custom", custom: positions });
+  });
 
   it("shows the toggled metadata under the title and the updated time in the trailing slot", () => {
     useHostsMock.mockReturnValue({

@@ -58,8 +58,10 @@ status.
 | id | String(64) PK | "conv_" + uuid4().hex |
 | created_at | Integer NOT NULL | |
 | title | Text | nullable, user-settable conversation title |
+| title_sort_key | String(512) NOT NULL, binary collation | Name-ordering key derived from `title`, prefixed with `"2"` for sub-agents so they sort after top-level sessions; default `"1"` (untitled) |
 
-**Indexes:** `ix_conversations_archived_updated` (backs the default sidebar list)
+**Indexes:** `ix_conversations_archived_updated` (backs the default sidebar list),
+`ix_conversations_archived_title` (backs Name ordering)
 
 ---
 

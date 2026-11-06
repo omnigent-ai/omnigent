@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import heapq
+import itertools
 import json
 import logging
 from collections.abc import Iterator, Mapping
@@ -15,8 +18,10 @@ from sqlalchemy import (
     Select,
     and_,
     asc,
+    case,
     delete,
     desc,
+    false,
     func,
     insert,
     literal,
@@ -24,6 +29,7 @@ from sqlalchemy import (
     or_,
     select,
     text,
+    true,
     tuple_,
     update,
 )
@@ -37,6 +43,8 @@ from omnigent.db.compression import encode as compress_text
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
+    SUB_AGENT_TITLE_SORT_KEY_PREFIX,
+    TITLE_SORT_KEY_MAX_CHARS,
     SqlAgent,
     SqlComment,
     SqlConversation,
@@ -50,6 +58,7 @@ from omnigent.db.db_models import (
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
+    title_sort_key,
     uuid_to_bytes,
 )
 from omnigent.db.enum_codecs import (
@@ -203,6 +212,68 @@ def _like_contains_pattern(query: str) -> str:
         .replace("_", f"{_LIKE_ESCAPE}_")
     )
     return f"%{escaped}%"
+
+
+# Name-ordering page cursors carry the boundary row's sort key, so renaming that
+# row between page fetches cannot move the cursor and skip sessions.
+_TITLE_CURSOR_PREFIX = "title."
+# json.dumps spends at most six bytes per key character, and base64 adds a third.
+_TITLE_CURSOR_MAX_CHARS = 8 * TITLE_SORT_KEY_MAX_CHARS + 128
+
+
+def _encode_title_cursor(row: SqlConversation) -> str:
+    """
+    Return the ``sort_by="title"`` continuation token for a row's position.
+
+    The bundled web sidebar decodes this format (``scopeTail`` in
+    ``web/src/lib/sidebarData.ts``), so change both together.
+
+    :param row: A listed conversation row.
+    :returns: ``"title."`` plus unpadded base64url JSON of
+        ``[title_sort_key, id]``.
+    """
+    payload = json.dumps([row.title_sort_key, row.id], ensure_ascii=False, separators=(",", ":"))
+    encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    return _TITLE_CURSOR_PREFIX + encoded.rstrip("=")
+
+
+def _decode_title_cursor(cursor: str, dialect: str) -> tuple[str, str] | None:
+    """
+    Return the ``(title_sort_key, id)`` position a title token carries.
+
+    :param cursor: An ``after`` or ``before`` value: a token from
+        :func:`_encode_title_cursor` or a conversation id.
+    :param dialect: The conversation database's SQLAlchemy dialect name.
+    :returns: The carried position, or ``None`` for a conversation id.
+    :raises OmnigentError: ``INVALID_INPUT`` if the token is malformed.
+    """
+    if not cursor.startswith(_TITLE_CURSOR_PREFIX):
+        return None
+    encoded = cursor.removeprefix(_TITLE_CURSOR_PREFIX)
+    try:
+        if len(encoded) > _TITLE_CURSOR_MAX_CHARS:
+            raise ValueError("cursor is too long")
+        sort_key, conversation_id = json.loads(
+            base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        )
+        if not isinstance(sort_key, str) or not isinstance(conversation_id, str):
+            raise ValueError("cursor position must be strings")
+        if len(sort_key) > TITLE_SORT_KEY_MAX_CHARS:
+            raise ValueError("cursor sort key is too long")
+        top_level_key = sort_key.removeprefix(SUB_AGENT_TITLE_SORT_KEY_PREFIX)
+        if top_level_key != "1" and not top_level_key.startswith("0"):
+            raise ValueError("cursor sort key was not issued by the store")
+        # Lone surrogates can't be bound, and PostgreSQL-family text never holds NUL.
+        sort_key.encode("utf-8")
+        if is_postgresql_family(dialect) and "\x00" in sort_key:
+            raise ValueError("cursor sort key contains NUL")
+        uuid_to_bytes(conversation_id)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise OmnigentError(
+            "Malformed session list cursor; pass first_id or last_id unchanged.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    return sort_key, conversation_id
 
 
 # Upper bound on rows fetched per SQL statement when listing conversation
@@ -381,6 +452,7 @@ def _new_session_conversation_row(
         created_at=now,
         updated_at=now,
         title=title or "",  # None → '' for top-level conversations
+        title_sort_key=title_sort_key(title, sub_agent=parent_conversation_id is not None),
         parent_conversation_id=parent_conversation_id,
         # Top-level row: ``root_conversation_id`` mirrors the
         # primary key so tree-scoped lookups treat it as its own
@@ -1210,6 +1282,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     created_at=now,
                     updated_at=now,
                     title=title or "",
+                    title_sort_key=title_sort_key(
+                        title, sub_agent=parent_conversation_id is not None
+                    ),
                     parent_conversation_id=parent_conversation_id,
                     root_conversation_id=root_id,
                     agent_id=agent_id,
@@ -3072,12 +3147,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         List conversations with cursor-based pagination.
 
         :param limit: Maximum number of conversations to return.
-        :param after: Cursor conversation ID; return
-            conversations appearing after this one in sort
-            order, e.g. ``"conv_abc123"``.
-        :param before: Cursor conversation ID; return
-            conversations appearing before this one in sort
-            order.
+        :param after: Cursor; return conversations appearing after
+            it in sort order. A conversation ID, e.g.
+            ``"conv_abc123"``, or a page's ``last_id``.
+        :param before: Cursor; return conversations appearing
+            before it in sort order. A conversation ID or a page's
+            ``first_id``.
         :param kind: Filter to conversations of this kind.
         :param parent_conversation_id: Phase 4 — when set, only
             return conversations whose parent matches. ``None``
@@ -3097,8 +3172,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None``. Powers ``GET /v1/sessions`` — sessions
             always have an agent binding. ``None`` disables.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"``,
-            ``"updated_at"``, or ``"id"``.
+        :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
+            ``"title"`` (ignoring ASCII letter case, untitled last
+            when ascending), or ``"id"``.
         :param search_query: Case-insensitive substring filter on
             the session title OR conversation item content.
             ``None`` or empty string disables the filter;
@@ -3140,14 +3216,18 @@ class SqlAlchemyConversationStore(ConversationStore):
             by another user. Requires ``accessible_by`` to be set.
             ``False`` (default) disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
-            objects.
+            objects. With ``sort_by="title"``, ``first_id`` and
+            ``last_id`` are title tokens (see :func:`_encode_title_cursor`).
         :raises ValueError: If ``search_scope`` is not a known scope.
-        :raises StaleCursorError: If a cursor names a vanished conversation,
-            or one that ``accessible_by``/``owned_by`` has no grant on.
+        :raises StaleCursorError: If a conversation-id cursor names a
+            vanished conversation, or one that ``accessible_by``/``owned_by``
+            has no grant on.
+        :raises OmnigentError: ``INVALID_INPUT`` for a malformed title
+            token or one used with another sort.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
-        sort_col = self._resolve_sort_column(sort_by)
+        sort_col, tiebreaker_col = self._resolve_sort_columns(sort_by)
         is_desc = order == "desc"
         sort_fn = desc if is_desc else asc
 
@@ -3225,12 +3305,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
 
         # A permission-scoped page only lists sessions the viewer has a grant
-        # on, so a cursor without one didn't come from a page. Resolving it
-        # anyway would reveal where that session sorts.
+        # on, so resolving another session's id would reveal where it sorts.
+        # Title tokens carry their own position and resolve nothing.
         cursor_viewer = accessible_by if accessible_by is not None else owned_by
         if cursor_viewer is not None:
             for cursor_id in (after, before):
-                if cursor_id:
+                if cursor_id and not cursor_id.startswith(_TITLE_CURSOR_PREFIX):
                     self._require_cursor_grant(cursor_id, cursor_viewer)
 
         with self._conv_session("list_conversations") as session:
@@ -3305,13 +3385,19 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_not(None))
             elif kind_requires_parent is False:
                 stmt = stmt.where(SqlConversation.parent_conversation_id.is_(None))
+            # The title index has no parent column, so bound the scan to this
+            # kind's key range instead of filtering the other kind row by row.
+            if sort_by == "title" and kind_requires_parent is not None:
+                sub_agent_keys = SqlConversation.title_sort_key >= SUB_AGENT_TITLE_SORT_KEY_PREFIX
+                stmt = stmt.where(sub_agent_keys if kind_requires_parent else ~sub_agent_keys)
 
             # archived lives on the AP conversations table, so exclude it inline
-            # (no metadata prefetch, no post-fetch filtering).
+            # (no metadata prefetch, no post-fetch filtering). MySQL can seek the
+            # archived-led indexes on ``= false`` but not on ``IS false``.
             if archived_only:
-                stmt = stmt.where(SqlConversation.archived.is_(True))
+                stmt = stmt.where(SqlConversation.archived == true())
             elif not include_archived:
-                stmt = stmt.where(SqlConversation.archived.is_(False))
+                stmt = stmt.where(SqlConversation.archived == false())
 
             if parent_conversation_id is not None:
                 stmt = stmt.where(
@@ -3475,8 +3561,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     after,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=True,
+                    title_sort=sort_by == "title",
                 )
             if before:
                 stmt = self._apply_cursor(
@@ -3485,18 +3572,36 @@ class SqlAlchemyConversationStore(ConversationStore):
                     before,
                     sort_col,
                     is_desc,
-                    tiebreaker_col=self._tiebreaker_col,
+                    tiebreaker_col=tiebreaker_col,
                     forward=False,
+                    title_sort=sort_by == "title",
                 )
             stmt = stmt.order_by(
                 sort_fn(sort_col),
-                sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
+                sort_fn(tiebreaker_col),
             ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            if sort_by == "title" and include_archived and not archived_only:
+                # The title index leads with archived, so read each state in
+                # index order and merge the two bounded pages.
+                partitions = [
+                    session.execute(stmt.where(SqlConversation.archived == state)).scalars().all()
+                    for state in (false(), true())
+                ]
+                merged = heapq.merge(
+                    *partitions, key=lambda row: (row.title_sort_key, row.id), reverse=is_desc
+                )
+                rows = list(itertools.islice(merged, limit + 1))
+            else:
+                rows = list(session.execute(stmt).scalars().all())
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
             row_ids = [r.id for r in rows]
+            first_cursor = row_ids[0] if rows else None
+            last_cursor = row_ids[-1] if rows else None
+            if rows and sort_by == "title":
+                first_cursor = _encode_title_cursor(rows[0])
+                last_cursor = _encode_title_cursor(rows[-1])
             # Fetch labels for all returned conversations in a single IN-clause
             # query so the list-path is O(1) queries regardless of page size.
             # The agent binding + overrides ride on each conversation row.
@@ -3539,8 +3644,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             conv.search_snippet = snippets.get(conv.id)
         return PagedList(
             data=convs,
-            first_id=convs[0].id if convs else None,
-            last_id=convs[-1].id if convs else None,
+            first_id=first_cursor,
+            last_id=last_cursor,
             has_more=has_more,
         )
 
@@ -3605,90 +3710,99 @@ class SqlAlchemyConversationStore(ConversationStore):
             has_more=page.has_more,
         )
 
-    @staticmethod
-    def _resolve_sort_column(sort_by: str) -> QueryableAttribute[Any]:
+    def _resolve_sort_columns(self, sort_by: str) -> tuple[ColumnElement[Any], ColumnElement[Any]]:
         """
-        Map a ``sort_by`` string to the corresponding
-        :class:`SqlConversation` column.
+        Map a ``sort_by`` string to the expressions the listing orders on.
 
-        :param sort_by: ``"created_at"``, ``"updated_at"``, or ``"id"``
-            (index order, for bounded reads of one spawn tree).
-        :returns: The mapped column attribute.
-        :raises ValueError: If ``sort_by`` is not a valid column
-            name.
+        ``"title"`` orders on the stored ``title_sort_key`` by code point and
+        breaks ties by id, which the web client reproduces to merge pages.
+
+        :param sort_by: ``"created_at"``, ``"updated_at"``, ``"title"``, or
+            ``"id"`` (index order, for bounded reads of one spawn tree).
+        :returns: The primary sort expression and its tiebreaker column.
+        :raises ValueError: If ``sort_by`` is not a valid sort key.
         """
-        allowed = {
-            "created_at": SqlConversation.created_at,
-            "updated_at": SqlConversation.updated_at,
-            "id": SqlConversation.id,
-        }
-        col = allowed.get(sort_by)
-        if col is None:
+        if sort_by == "created_at":
+            return cast(ColumnElement[Any], SqlConversation.created_at), self._tiebreaker_col
+        if sort_by == "updated_at":
+            return cast(ColumnElement[Any], SqlConversation.updated_at), self._tiebreaker_col
+        if sort_by == "id":
+            return cast(ColumnElement[Any], SqlConversation.id), self._tiebreaker_col
+        if sort_by != "title":
             raise ValueError(f"invalid sort_by: {sort_by!r}")
-        return col
+        # Ids are raw uuid bytes, so they order like their lowercase hex form.
+        return (
+            cast(ColumnElement[Any], SqlConversation.title_sort_key),
+            cast(ColumnElement[Any], SqlConversation.id),
+        )
 
     @staticmethod
     def _apply_cursor(
         session: Session,
         stmt: Select[tuple[SqlConversation]],
-        cursor_id: str,
-        sort_col: QueryableAttribute[Any],
+        cursor: str,
+        sort_col: ColumnElement[Any],
         is_desc: bool,
         tiebreaker_col: ColumnElement[Any],
         forward: bool,
+        title_sort: bool,
     ) -> Select[tuple[SqlConversation]]:
         """
         Add a cursor-based WHERE clause to the query.
 
         Add a ``(sort_col, tiebreaker_col)`` composite WHERE clause so
-        that cursor pagination is consistent with the ORDER BY key. The
-        cursor row's position is resolved here with a point lookup and
-        embedded as literal bounds (a keyset cursor) rather than left as a
-        correlated scalar subquery: on a row deleted between two page
-        fetches the subquery yields NULL, every comparison evaluates to
-        NULL, and the page reads as empty with ``has_more=False`` — silent
-        truncation indistinguishable from a completed enumeration. A
+        that cursor pagination is consistent with the ORDER BY key. A
+        conversation-id cursor's position is resolved here with a point
+        lookup and embedded as literal bounds (a keyset cursor) rather than
+        left as a correlated scalar subquery: on a row deleted between two
+        page fetches the subquery yields NULL, every comparison evaluates
+        to NULL, and the page reads as empty with ``has_more=False`` —
+        silent truncation indistinguishable from a completed enumeration. A
         vanished cursor row now raises instead, and a delete landing after
-        the lookup still pages from the resolved position.
+        the lookup still pages from the resolved position. A title token
+        carries its position, so it is used without a lookup.
 
         :param session: Open conversation-DB session used to resolve the
             cursor row's position.
         :param stmt: The current SELECT statement to augment.
-        :param cursor_id: The conversation ID acting as the page cursor,
-            e.g. ``"conv_abc123"``.
-        :param sort_col: Primary sort column (``created_at`` or ``updated_at``).
+        :param cursor: The page cursor: a conversation ID, e.g.
+            ``"conv_abc123"``, or with ``title_sort`` a token from
+            :func:`_encode_title_cursor`.
+        :param sort_col: Primary sort expression from :meth:`_resolve_sort_columns`.
         :param is_desc: ``True`` for descending, ``False`` for ascending.
         :param tiebreaker_col: Secondary sort column; must match the
-            secondary ORDER BY column. See ``_tiebreaker_col`` in
-            ``__init__`` for the SQLite/non-SQLite choice.
+            secondary ORDER BY column. See :meth:`_resolve_sort_columns`.
         :param forward: ``True`` for ``after`` cursors, ``False`` for
             ``before`` cursors.
+        :param title_sort: Whether the listing is ``sort_by="title"``.
         :returns: The statement with the cursor WHERE clause applied.
-        :raises StaleCursorError: If the cursor row no longer exists (it
-            was deleted between two page fetches).
+        :raises StaleCursorError: If a conversation-id cursor's row no
+            longer exists (it was deleted between two page fetches).
+        :raises OmnigentError: ``INVALID_INPUT`` for a malformed title
+            token or one used with another sort.
         """
-        # Point lookup on the (workspace_id, id) key. For the non-SQLite id
-        # tiebreaker this re-selects cursor_id; for SQLite it fetches rowid.
-        cursor_row = session.execute(
-            select(sort_col, tiebreaker_col).where(
-                SqlConversation.workspace_id == current_workspace_id(),
-                SqlConversation.id == cursor_id,
+        dialect = session.bind.dialect.name if session.bind is not None else ""
+        position: tuple[Any, ...] | None = _decode_title_cursor(cursor, dialect)
+        if position is not None and not title_sort:
+            raise OmnigentError(
+                "This session list cursor requires sort_by=title.",
+                code=ErrorCode.INVALID_INPUT,
             )
-        ).first()
-        if cursor_row is None:
-            raise StaleCursorError(cursor_id)
-        sort_val, tiebreaker_val = cursor_row
-        # "after" (forward=True) = further in sort direction;
-        # "before" (forward=False) = opposite of sort direction.
-        #
-        # Emitted as a ROW-VALUES comparison — ``(sort, tiebreak) < (:ts, :id)``
-        # — not the equivalent ``sort < :ts OR (sort = :ts AND tiebreak < :id)``.
-        # The two are semantically identical, but PostgreSQL can only turn the
-        # row-values form into an index range condition; the OR form is left as
-        # a residual Filter, so a deep cursor re-reads and discards every row
-        # between the index start and the cursor (cost growing with cursor
-        # depth, not page size). Row values are supported by every dialect the
-        # store targets (PostgreSQL, SQLite >= 3.15, MySQL).
+        if position is None:
+            # Point lookup on the (workspace_id, id) key. For the non-SQLite id
+            # tiebreaker this re-selects cursor; for SQLite it fetches rowid.
+            cursor_row = session.execute(
+                select(sort_col, tiebreaker_col).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id == cursor,
+                )
+            ).first()
+            if cursor_row is None:
+                raise StaleCursorError(cursor)
+            position = tuple(cursor_row)
+        sort_val, tiebreaker_val = position
+        # "after" continues in the sort direction and "before" against it. PostgreSQL
+        # range-scans only the row-values form, and MySQL only the expanded OR form.
         row = tuple_(sort_col, tiebreaker_col)
         # Bind the tiebreaker with its column's type. Inside ``tuple_`` a bare
         # Python value gets no type context, so the ``Uuid16`` decorator never
@@ -3701,8 +3815,21 @@ class SqlAlchemyConversationStore(ConversationStore):
             if isinstance(tiebreaker_col, QueryableAttribute)
             else tiebreaker_val
         )
-        cursor_row_values = tuple_(literal(sort_val, sort_col.type), cursor_tiebreaker)
+        cursor_sort = literal(sort_val, sort_col.type)
         descending_scan = is_desc if forward else not is_desc
+        if dialect == "mysql":
+            if descending_scan:
+                beyond_sort, beyond_tiebreaker = (
+                    sort_col < cursor_sort,
+                    tiebreaker_col < cursor_tiebreaker,
+                )
+            else:
+                beyond_sort, beyond_tiebreaker = (
+                    sort_col > cursor_sort,
+                    tiebreaker_col > cursor_tiebreaker,
+                )
+            return stmt.where(or_(beyond_sort, and_(sort_col == cursor_sort, beyond_tiebreaker)))
+        cursor_row_values = tuple_(cursor_sort, cursor_tiebreaker)
         return stmt.where(row < cursor_row_values if descending_scan else row > cursor_row_values)
 
     def update_conversation_with_changes(
@@ -3796,6 +3923,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             ap_changed = False
             if title is not None:
                 row.title = title or ""
+                row.title_sort_key = title_sort_key(
+                    title, sub_agent=row.parent_conversation_id is not None
+                )
                 ap_changed = True
             # This pure JSON merge stays beside the locked read so partial updates
             # preserve keys changed by another writer. It is deterministic on replay.
@@ -4067,6 +4197,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .values(
                         title=title,
+                        title_sort_key=case(
+                            (
+                                SqlConversation.parent_conversation_id.is_(None),
+                                title_sort_key(title),
+                            ),
+                            else_=title_sort_key(title, sub_agent=True),
+                        ),
                         updated_at=updated_at,
                     )
                 ),
@@ -5677,6 +5814,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "created_at": now,
                 "updated_at": now,
                 "title": fork_title or "",  # None → empty string at DB layer
+                "title_sort_key": title_sort_key(fork_title),
                 # A fork is a fresh top-level conversation, so its
                 # root mirrors its own id (matches the
                 # ``_new_session_conversation_row`` invariant).

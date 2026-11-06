@@ -6,10 +6,10 @@ import { vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { Sidebar } from "@/shell/Sidebar";
 
-/** `features` serves the fallback server info with those flags; omitted, info stays loading. */
+/** `features` serves the fallback server info with those flags and any `serverInfo`; omitted, it loads. */
 export function renderSidebar(
   props: {
     open?: boolean;
@@ -17,10 +17,13 @@ export function renderSidebar(
     route?: string;
     dragProgress?: number | null;
     features?: Record<string, boolean>;
+    serverInfo?: Partial<ServerInfo>;
   } = {},
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const info = props.features ? { ...FALLBACK_SERVER_INFO, features: props.features } : "loading";
+  const info = props.features
+    ? { ...FALLBACK_SERVER_INFO, ...props.serverInfo, features: props.features }
+    : "loading";
   const onClose = props.onClose ?? vi.fn();
   const tree = (open: boolean) => (
     <QueryClientProvider client={qc}>

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
+import string
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -18,7 +20,7 @@ from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
-from omnigent.db.utils import get_or_create_engine
+from omnigent.db.utils import get_or_create_engine, is_postgresql_family
 from omnigent.entities import (
     CompactionData,
     Conversation,
@@ -27,6 +29,7 @@ from omnigent.entities import (
     FunctionCallOutputData,
     MessageData,
     NewConversationItem,
+    PagedList,
     ReasoningData,
     ResourceEventData,
 )
@@ -3193,6 +3196,285 @@ def test_list_conversations_sort_by_updated_at_with_pagination(
     assert len(page2.data) == 1
     assert page2.has_more is False
     assert page2.data[0].id == ids[1]
+
+
+def test_list_conversations_sort_by_title(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``sort_by="title"`` folds ASCII case only, compares by code point, lists
+    untitled conversations last when ascending, breaks ties by id, and pages
+    without gaps. The web client reproduces this exact order.
+    """
+    titles = ["beta", "", "Alpha", "ab", "a-c", "alpha", "Gamma", "", "  "]
+    titles += ["\u00e9clair", "\u00c9clair", "\uff21 wide", "\U0001f600 smile"]
+    for title in titles:
+        conversation_store.create_conversation(title=title)
+    # "b " gets the smaller id, so a padded comparison that ties it with "b"
+    # would list it first.
+    conversation_store.create_conversation(title="b ", conversation_id="0" * 32)
+    conversation_store.create_conversation(title="b", conversation_id="f" * 32)
+
+    full = conversation_store.list_conversations(sort_by="title", order="asc", kind=None)
+    ascii_fold = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+    expected = sorted(
+        full.data,
+        key=lambda c: ("0" + c.title.translate(ascii_fold) if c.title else "1", c.id),
+    )
+    assert [c.id for c in full.data] == [c.id for c in expected]
+    # Spaces and "-" sort before letters, trailing spaces count, accented
+    # capitals stay unfolded, and the emoji follows U+FF21 by code point (a
+    # UTF-16 comparison would invert it).
+    listed = [c.title or "" for c in full.data]
+    assert sorted(listed[3:5]) == ["Alpha", "alpha"], listed
+    assert listed[:3] + listed[5:] == [
+        "  ",
+        "a-c",
+        "ab",
+        "b",
+        "b ",
+        "beta",
+        "Gamma",
+        "\u00c9clair",
+        "\u00e9clair",
+        "\uff21 wide",
+        "\U0001f600 smile",
+        "",
+        "",
+    ], listed
+
+    descending = conversation_store.list_conversations(sort_by="title", order="desc", kind=None)
+    assert [c.id for c in descending.data] == [c.id for c in reversed(full.data)]
+
+    # Pages of two split both folded ties ("Alpha"/"alpha" and the untitled
+    # pair) across a cursor.
+    walked: list[str] = []
+    after: str | None = None
+    while True:
+        page = conversation_store.list_conversations(
+            limit=2, after=after, sort_by="title", order="asc", kind=None
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert walked == [c.id for c in full.data]
+    full_ids = [c.id for c in full.data]
+    for index, cursor in enumerate(full_ids):
+        preceding = conversation_store.list_conversations(
+            before=cursor, sort_by="title", order="asc", kind=None
+        )
+        assert [c.id for c in preceding.data] == full_ids[:index], index
+
+
+def test_title_listings_keep_each_kind_in_its_own_key_range(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Sub-agents sort after every top-level session, and Name pages of each kind walk."""
+    top_level = [
+        conversation_store.create_conversation(title=title).id
+        for title in ("alpha", "Middle", "Zulu", None)
+    ]
+    parent_id = top_level[1]
+    children = [
+        conversation_store.create_conversation(
+            kind="sub_agent", title=title, parent_conversation_id=parent_id
+        ).id
+        for title in ("Beta", "", "yankee")
+    ]
+
+    def walk(kind: str | None, order: str) -> list[str]:
+        walked: list[str] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                limit=1, after=after, sort_by="title", order=order, kind=kind
+            )
+            walked.extend(c.id for c in page.data)
+            if not page.has_more:
+                return walked
+            after = page.last_id
+
+    assert walk("default", "asc") == top_level
+    assert walk("sub_agent", "asc") == children
+    assert walk(None, "asc") == top_level + children
+    assert walk(None, "desc") == list(reversed(top_level + children))
+
+
+def _stored_title_sort_keys(store: SqlAlchemyConversationStore, ids: list[str]) -> dict[str, str]:
+    """Read the stored ``title_sort_key`` of each conversation in *ids*."""
+    from sqlalchemy import select
+
+    from omnigent.db.db_models import SqlConversation as _Conv
+
+    with store._conv_session("test_setup") as session:
+        rows = session.execute(
+            select(_Conv.id, _Conv.title_sort_key).where(_Conv.id.in_(ids))
+        ).all()
+    return {row.id: row.title_sort_key for row in rows}
+
+
+def test_title_sort_key_follows_every_title_write(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Each write path that sets a title also stores the matching Name key."""
+    created = conversation_store.create_conversation(title="Plan B")
+    untitled = conversation_store.create_conversation()
+    bundled = conversation_store.create_session_with_agent(
+        agent_id="7a1e2d3c4b5a49688f7e6d5c4b3a2918",
+        agent_name="bundled-agent",
+        agent_bundle_location="7a1e2d3c4b5a49688f7e6d5c4b3a2918/bundle1",
+        agent_description=None,
+        title="Atlas",
+    ).conversation
+    child = conversation_store.create_conversation(
+        kind="sub_agent", parent_conversation_id=created.id
+    )
+    bundled_child = conversation_store.create_session_with_agent(
+        agent_id="5d0c3b1f2e4a4c6b8d9e0f1a2b3c4d5e",
+        agent_name="bundled-child-agent",
+        agent_bundle_location="5d0c3b1f2e4a4c6b8d9e0f1a2b3c4d5e/bundle1",
+        agent_description=None,
+        title="Scout",
+        parent_conversation_id=created.id,
+    ).conversation
+    renamed = conversation_store.create_conversation(title="old")
+    conversation_store.update_conversation(renamed.id, title="Q" * 600)
+    renamed_child = conversation_store.create_conversation(
+        kind="sub_agent", title="Worker", parent_conversation_id=created.id
+    )
+    conversation_store.update_conversation(renamed_child.id, title="Lead")
+    cleared = conversation_store.create_conversation(title="temporary")
+    conversation_store.update_conversation(cleared.id, title="")
+    swapped = conversation_store.create_conversation(title="Draft")
+    assert conversation_store.rename_conversation_if_title_matches(swapped.id, "Draft", "Final")
+    swapped_child = conversation_store.create_conversation(
+        kind="sub_agent", title="Draft", parent_conversation_id=created.id
+    )
+    assert conversation_store.rename_conversation_if_title_matches(
+        swapped_child.id, "Draft", "Final"
+    )
+    fork = conversation_store.fork_conversation(created.id, title="Fork Of Plan")
+
+    expected = {
+        created.id: "0plan b",
+        untitled.id: "1",
+        bundled.id: "0atlas",
+        child.id: f"20untitled:{child.id}",
+        bundled_child.id: "20scout",
+        renamed.id: "0" + "q" * 511,
+        renamed_child.id: "20lead",
+        cleared.id: "1",
+        swapped.id: "0final",
+        swapped_child.id: "20final",
+        fork.id: "0fork of plan",
+    }
+    assert _stored_title_sort_keys(conversation_store, list(expected)) == expected
+
+
+def test_title_cursor_survives_renaming_the_boundary_row(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Renaming a page's last row forward must not skip the sessions after it.
+
+    The renamed row reappears at its new position, as any keyset cursor shows a
+    row that moved past it; every other session is still listed exactly once.
+    """
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(9)]
+
+    first = conversation_store.list_conversations(limit=3, sort_by="title", order="asc", kind=None)
+    assert [c.id for c in first.data] == ids[:3]
+    assert first.last_id is not None
+    conversation_store.update_conversation(ids[2], title="z")
+
+    walked = [c.id for c in first.data]
+    after = first.last_id
+    while True:
+        page = conversation_store.list_conversations(
+            limit=3, after=after, sort_by="title", order="asc", kind=None
+        )
+        walked.extend(c.id for c in page.data)
+        if not page.has_more:
+            break
+        after = page.last_id
+    assert walked == [*ids, ids[2]]
+
+
+@pytest.mark.asyncio
+async def test_title_cursor_does_not_go_stale_when_its_row_is_deleted(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A Name page token keeps its position after the boundary row is deleted."""
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(5)]
+    first = conversation_store.list_conversations(limit=2, sort_by="title", order="asc", kind=None)
+    assert first.first_id is not None and first.last_id is not None
+    assert await conversation_store.delete_conversation(ids[1])
+    assert await conversation_store.delete_conversation(ids[0])
+
+    after = conversation_store.list_conversations(
+        after=first.last_id, sort_by="title", order="asc", kind=None
+    )
+    assert [c.id for c in after.data] == ids[2:]
+    before = conversation_store.list_conversations(
+        before=first.first_id, sort_by="title", order="desc", kind=None
+    )
+    assert [c.id for c in before.data] == list(reversed(ids[2:]))
+
+
+def test_title_cursor_tokens_are_validated(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Name pages return tokens, other sorts keep ids, and bad tokens are 400s."""
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.stores.conversation_store.sqlalchemy_store import _TITLE_CURSOR_MAX_CHARS
+
+    ids = [conversation_store.create_conversation(title=f"a{index}").id for index in range(3)]
+    by_title = conversation_store.list_conversations(
+        limit=2, sort_by="title", order="asc", kind=None
+    )
+    by_created = conversation_store.list_conversations(limit=2, order="asc", kind=None)
+    assert by_title.last_id is not None and by_title.last_id.startswith("title.")
+    assert by_created.last_id == by_created.data[-1].id
+
+    # A plain id still pages a Name listing, through the cursor row's live key.
+    plain = conversation_store.list_conversations(
+        after=ids[0], sort_by="title", order="asc", kind=None
+    )
+    assert [c.id for c in plain.data] == ids[1:]
+
+    def token(sort_key: str) -> str:
+        payload = base64.urlsafe_b64encode(json.dumps([sort_key, ids[0]]).encode("ascii"))
+        return "title." + payload.decode("ascii").rstrip("=")
+
+    malformed = ["title.", "title.!!", "title.bm90IGpzb24", "title.WzEsMl0", "title.WyJ4IiwiYiJd"]
+    # Keys the store never issues, and a lone surrogate no driver can bind.
+    malformed += [token(""), token("2"), token("2a"), token("0a\ud800")]
+    # The deepest nesting the length cap admits; a low C recursion limit raises RecursionError.
+    deepest = base64.urlsafe_b64encode(b"[" * (_TITLE_CURSOR_MAX_CHARS * 3 // 4)).decode()
+    malformed += ["title." + deepest, "title." + "W" * (_TITLE_CURSOR_MAX_CHARS + 1)]
+    # Sub-agent keys are valid positions, after every top-level session.
+    sub_agent_page = conversation_store.list_conversations(
+        after=token("20a"), sort_by="title", order="asc", kind=None
+    )
+    assert sub_agent_page.data == []
+    nul_key = token("0a\x00")
+    if is_postgresql_family(conversation_store._conv_engine.dialect.name):
+        malformed.append(nul_key)
+    else:
+        # Titles there can hold NUL, so a stored key can too.
+        nul_page = conversation_store.list_conversations(
+            after=nul_key, sort_by="title", order="asc", kind=None
+        )
+        assert [c.id for c in nul_page.data] == ids
+    for cursor in malformed:
+        with pytest.raises(OmnigentError) as exc_info:
+            conversation_store.list_conversations(
+                after=cursor, sort_by="title", order="asc", kind=None
+            )
+        assert exc_info.value.code == ErrorCode.INVALID_INPUT, cursor
+    with pytest.raises(OmnigentError) as exc_info:
+        conversation_store.list_conversations(after=by_title.last_id, order="asc", kind=None)
+    assert exc_info.value.code == ErrorCode.INVALID_INPUT
 
 
 # ─── Phase 4: parent_conversation_id + name uniqueness ──────
@@ -8493,8 +8775,8 @@ def _capture_driver_sql(store: SqlAlchemyConversationStore):
 def _explain_driver(store: SqlAlchemyConversationStore, statement: str, parameters: object) -> str:
     """``EXPLAIN`` the exact statement+parameters the store executed.
 
-    Returns the plan as one string: PostgreSQL JSON, or SQLite's
-    ``EXPLAIN QUERY PLAN`` rows joined.
+    Returns the plan as one string: PostgreSQL JSON, MySQL's tree, or
+    SQLite's ``EXPLAIN QUERY PLAN`` rows joined.
     """
     dialect = store._conv_engine.dialect.name
     with store._conv_session("test_setup") as session:
@@ -8506,6 +8788,11 @@ def _explain_driver(store: SqlAlchemyConversationStore, statement: str, paramete
                 "EXPLAIN (ANALYZE, FORMAT JSON) " + statement, parameters
             ).scalar_one()
             return json.dumps(raw if isinstance(raw, (list, dict)) else json.loads(raw))
+        if dialect == "mysql":
+            conn.exec_driver_sql("ANALYZE TABLE conversations, session_permissions").all()
+            return str(
+                conn.exec_driver_sql("EXPLAIN FORMAT=TREE " + statement, parameters).scalar_one()
+            )
         rows = conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
     return " | ".join(str(row) for row in rows)
 
@@ -8529,16 +8816,19 @@ def _bulk_seed_conversations_and_grants(
     count: int,
     granted_ratio: float,
     tie_size: int = 1,
+    parent_conversation_id: str | None = None,
 ) -> None:
     """Insert *count* conversations (and grants for a fraction of them).
 
     Core bulk inserts, not per-row store calls, so a plan test can reach a
     realistic row count without a slow fixture.
 
-    :param tie_size: How many rows share one ``created_at`` value. The
+    :param tie_size: How many rows share one ``created_at`` value and title. The
         default of 1 gives every row a distinct timestamp; a larger value
         creates ties, which is what makes the cursor's tiebreaker term
         load-bearing (without ties, dropping it changes nothing).
+    :param parent_conversation_id: Parent to seed sub-agents under, or ``None``
+        for top-level rows.
     """
     import uuid as _uuid
 
@@ -8546,6 +8836,7 @@ def _bulk_seed_conversations_and_grants(
 
     from omnigent.db.db_models import SqlConversation as _Conv
     from omnigent.db.db_models import SqlSessionPermission as _Perm
+    from omnigent.db.db_models import title_sort_key
 
     base = 1_900_000_000
     conv_rows = []
@@ -8559,9 +8850,12 @@ def _bulk_seed_conversations_and_grants(
                 "id": cid,
                 "created_at": stamp,
                 "updated_at": stamp,
-                "title": f"seed-{i}",
-                "parent_conversation_id": None,
-                "root_conversation_id": cid,
+                "title": f"seed-{i // tie_size}",
+                "title_sort_key": title_sort_key(
+                    f"seed-{i // tie_size}", sub_agent=parent_conversation_id is not None
+                ),
+                "parent_conversation_id": parent_conversation_id,
+                "root_conversation_id": parent_conversation_id or cid,
                 "next_position": 0,
                 # The endpoint filters has_agent_id=True, so an all-NULL
                 # agent_id seed would exclude every row and the plan under
@@ -8704,7 +8998,7 @@ def test_list_conversations_acl_with_cursor_pagination(
         )
 
 
-@pytest.mark.parametrize("sort_by", ["updated_at", "created_at"])
+@pytest.mark.parametrize("sort_by", ["updated_at", "created_at", "title"])
 @pytest.mark.parametrize("direction", ["after", "before"])
 @pytest.mark.parametrize("scope", ["accessible_by", "owned_by"])
 @pytest.mark.parametrize("store_fixture", ["conversation_store", "split_db_conversation_store"])
@@ -8728,25 +9022,24 @@ def test_list_cursor_on_ungranted_session_reveals_nothing(
     secret = store.create_conversation(title="secret")
     perms.grant("bob@example.com", secret.id, LEVEL_OWNER)
 
-    def _page(**cursor: str) -> list[str]:
-        return [
-            c.id
-            for c in store.list_conversations(
-                **{scope: "alice@example.com"},  # type: ignore[arg-type]
-                **cursor,  # type: ignore[arg-type]
-                sort_by=sort_by,
-                order="asc",
-            ).data
-        ]
+    def _page(**cursor: str) -> PagedList[Conversation]:
+        return store.list_conversations(
+            **{scope: "alice@example.com"},  # type: ignore[arg-type]
+            **cursor,  # type: ignore[arg-type]
+            sort_by=sort_by,
+            order="asc",
+        )
 
     with pytest.raises(StaleCursorError):
         _page(**{direction: secret.id})
-    # The caller's own cursors still page.
-    first, second = _page()
+    # The caller's own page cursors still page, including Name tokens.
+    listed = _page()
+    first, second = (c.id for c in listed.data)
+    assert listed.first_id is not None and listed.last_id is not None
     if direction == "after":
-        assert _page(after=first) == [second]
+        assert [c.id for c in _page(after=listed.first_id).data] == [second]
     else:
-        assert _page(before=second) == [first]
+        assert [c.id for c in _page(before=listed.last_id).data] == [first]
 
 
 def test_list_projects_single_db_uses_exists_pushdown(
@@ -8800,7 +9093,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     """
     ACL and cursor contracts against a realistically sized table.
 
-    Two contracts share one seed because seeding is the expensive part:
+    Three contracts share one seed because seeding is the expensive part:
 
     1. The default listing pushes the ACL into a correlated EXISTS, with no id
        round-trip through Python.
@@ -8809,10 +9102,13 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
        compatible index. The equivalent
        ``ts < :ts OR (ts = :ts AND id < :id)`` form is left as a residual
        filter, so a deep cursor reads and discards every row above it, at a
-       cost that grows with cursor depth.
+       cost that grows with cursor depth. MySQL is the reverse, so it gets the
+       OR form.
+    3. A top-level Name page reads one title index range per archived state,
+       without sorting, and skips sub-agents that share every title.
 
-    The SQL shape is asserted for both sort columns. The PLAN assertion is
-    limited to ``updated_at``, which has an existing compatible index; a
+    The SQL shape is asserted for every sort. The PLAN assertion is limited to
+    ``updated_at`` and ``title``, which have compatible indexes; a
     ``created_at`` plan may rationally sort or hash-join without one. EXPLAIN
     uses the driver form because the cursor binds a 16-byte identifier that
     cannot be written as a SQL literal, and re-binding raw values to a
@@ -8820,11 +9116,12 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     first row-values attempt fail only on PostgreSQL.
 
     Plan assertions are dialect-specific by nature (PostgreSQL EXPLAIN JSON,
-    SQLite EXPLAIN QUERY PLAN); other dialects keep the behavioural coverage
-    from the cursor-walk and row-set tests, which run everywhere.
+    MySQL EXPLAIN FORMAT=TREE, SQLite EXPLAIN QUERY PLAN); other dialects keep
+    the behavioural coverage from the cursor-walk and row-set tests, which run
+    everywhere.
     """
-    if conversation_store._conv_engine.dialect.name not in ("postgresql", "sqlite"):
-        pytest.skip("plan-shape assertions are written for PostgreSQL and SQLite EXPLAIN output")
+    if conversation_store._conv_engine.dialect.name not in ("postgresql", "mysql", "sqlite"):
+        pytest.skip("plan-shape assertions are written for PostgreSQL, MySQL and SQLite EXPLAIN")
     _acl_perms(db_uri)
     # Tied timestamps: with one row per timestamp the cursor's tiebreaker term
     # is decorative and dropping it loses nothing, so the walk below could not
@@ -8905,15 +9202,15 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
     expected_ids = [c.id for c in baseline.data]
     deep = int(len(expected_ids) * 0.7)
 
-    tiebreaker_col = conversation_store._tiebreaker_col
-    # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
-    # otherwise the uuid id) — assert against the store's own choice rather
-    # than hard-coding one dialect's spelling.
-    tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
-
     first = None
     second = None
-    for sort_by in ("created_at", "updated_at"):
+    for sort_by in ("created_at", "updated_at", "title"):
+        sort_column = "title_sort_key" if sort_by == "title" else sort_by
+        # The tiebreaker column is dialect-chosen (SQLite rowid = insertion order,
+        # otherwise the uuid id) — assert against the store's own choice rather
+        # than hard-coding one dialect's spelling.
+        _, tiebreaker_col = conversation_store._resolve_sort_columns(sort_by)
+        tiebreaker = str(getattr(tiebreaker_col, "expression", tiebreaker_col))
         for order in ("desc", "asc"):
             for direction in ("after", "before"):
                 page = conversation_store.list_conversations(
@@ -8925,7 +9222,7 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                     order=order,
                 )
                 assert page.has_more, "seed must be deeper than one page"
-                cursor_id = page.data[-1].id
+                cursor = page.last_id
                 with _capture_conversation_selects(conversation_store) as clauses:
                     with _capture_driver_sql(conversation_store) as driver_captured:
                         cursor_page = conversation_store.list_conversations(
@@ -8935,20 +9232,31 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                             kind="default",
                             sort_by=sort_by,
                             order=order,
-                            **{direction: cursor_id},
+                            **{direction: cursor},
                         )
                 where = f"{sort_by}/{order}/{direction}"
-                if sort_by == "updated_at":
-                    # With the existing compatible index, the row value must
-                    # become a range condition rather than a residual filter.
-                    cursor_plan = _plan_of(driver_captured, sort_by)
+                if sort_by in ("updated_at", "title"):
+                    # With a compatible index, the row value must become a
+                    # range condition rather than a residual filter.
+                    cursor_plan = _plan_of(driver_captured, sort_column)
                     if dialect == "postgresql":
                         index_conds, rows_filtered = _index_conds_and_filtered(cursor_plan)
-                        assert any(sort_by in c and "id" in c for c in index_conds), (
+                        assert any(sort_column in c and "id" in c for c in index_conds), (
                             where,
                             cursor_plan,
                         )
                         assert all(r == 0 for r in rows_filtered), (where, cursor_plan)
+                    elif dialect == "mysql":
+                        index = {
+                            "updated_at": "ix_conversations_archived_updated",
+                            "title": "ix_conversations_archived_title",
+                        }[sort_by]
+                        scan = f"Index range scan on conversations using {index} over "
+                        assert scan in cursor_plan, (where, cursor_plan)
+                        # The cursor must bound the range, not filter rows read from its start.
+                        scanned_range = cursor_plan.split(scan, 1)[1].split("\n", 1)[0]
+                        scanned_range = scanned_range.split(", with index condition", 1)[0]
+                        assert sort_column in scanned_range, (where, cursor_plan)
                     else:
                         assert "USING INDEX" in cursor_plan, (where, cursor_plan)
                         assert "SCAN conversations" not in cursor_plan, (where, cursor_plan)
@@ -8959,14 +9267,21 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
                 # Skip the cursor point lookup, which also mentions ``sort_by``:
                 # only the paged listing carries an ORDER BY.
                 listing = next(
-                    (c for c in clauses if sort_by in str(c) and "ORDER BY" in str(c)),
+                    (c for c in clauses if sort_column in str(c) and "ORDER BY" in str(c)),
                     clauses[0],
                 )
                 descending_scan = (order == "desc") if direction == "after" else (order == "asc")
                 comparison = "<" if descending_scan else ">"
-                assert f"(conversations.{sort_by}, {tiebreaker}) {comparison}" in " ".join(
-                    str(listing).split()
-                ), (where, tiebreaker, str(listing))
+                spelled = " ".join(str(listing).split())
+                if dialect == "mysql":
+                    terms = [
+                        f"conversations.{sort_column} {comparison} ",
+                        f"{tiebreaker} {comparison} ",
+                    ]
+                else:
+                    terms = [f"(conversations.{sort_column}, {tiebreaker}) {comparison}"]
+                for term in terms:
+                    assert term in spelled, (where, spelled)
 
                 # Keep the descending created_at/after pages for the walk below.
                 if sort_by == "created_at" and order == "desc" and direction == "after":
@@ -9003,9 +9318,84 @@ def test_seeded_acl_pushdown_cursor_plans_and_deep_pagination(
         f"paged walk lost or reordered rows: {len(walked)} of {len(expected_ids)}"
     )
 
+    # ── 4. Name pages: interleaved sub-agents and both archived states ──
+    from omnigent.db.db_models import title_sort_key
+
+    # Sub-agents reuse the seed titles, so they sit between top-level rows of
+    # the same title unless their keys keep them out of the scanned range.
+    _bulk_seed_conversations_and_grants(
+        conversation_store,
+        "alice@example.com",
+        count=_PLAN_SEED_ROWS,
+        granted_ratio=0.5,
+        tie_size=4,
+        parent_conversation_id=expected_ids[0],
+    )
+    for include_archived in (False, True):
+        for order in ("asc", "desc"):
+            listing: dict[str, Any] = {
+                "accessible_by": "alice@example.com",
+                "has_agent_id": True,
+                "kind": "default",
+                "sort_by": "title",
+                "order": order,
+                "include_archived": include_archived,
+            }
+            full = conversation_store.list_conversations(limit=_PLAN_SEED_ROWS * 2, **listing)
+            assert not full.has_more
+            assert [c.id for c in full.data] == [
+                c.id
+                for c in sorted(
+                    full.data,
+                    key=lambda c: (title_sort_key(c.title), c.id),
+                    reverse=order == "desc",
+                )
+            ]
+            assert {c.archived for c in full.data} == {False, include_archived}
+            full_ids = [c.id for c in full.data]
+            deep = int(len(full_ids) * 0.7)
+            cursor = conversation_store.list_conversations(limit=deep, **listing).last_id
+            assert cursor is not None
+            pages: list[tuple[str, dict[str, str], list[str]]] = [
+                ("first", {}, full_ids[:20]),
+                ("after", {"after": cursor}, full_ids[deep : deep + 20]),
+                ("before", {"before": cursor}, full_ids[:20]),
+            ]
+            for direction, cursor_kwargs, expected_page in pages:
+                where = f"title/{order}/{direction}/include_archived={include_archived}"
+                with _capture_driver_sql(conversation_store) as driver_captured:
+                    page = conversation_store.list_conversations(
+                        limit=20, **cursor_kwargs, **listing
+                    )
+                assert [c.id for c in page.data] == expected_page, where
+                listings = [
+                    (statement, parameters)
+                    for statement, parameters in driver_captured
+                    if "order by conversations.title_sort_key" in statement.lower()
+                ]
+                assert len(listings) == (2 if include_archived else 1), where
+                for statement, parameters in listings:
+                    assert "conversations.title_sort_key < " in statement, (where, statement)
+                    plan = _explain_driver(conversation_store, statement, parameters)
+                    if dialect == "postgresql":
+                        index_conds, rows_filtered = _index_conds_and_filtered(plan)
+                        assert any("title_sort_key" in c for c in index_conds), (where, plan)
+                        assert all(r == 0 for r in rows_filtered), (where, plan)
+                        assert "Sort Key" not in plan, (where, plan)
+                    elif dialect == "mysql":
+                        scan = (
+                            "Index range scan on conversations using "
+                            "ix_conversations_archived_title"
+                        )
+                        assert scan in plan, (where, plan)
+                        assert "Sort:" not in plan, (where, plan)
+                    else:
+                        assert "USING INDEX ix_conversations_archived_title" in plan, (where, plan)
+                        assert "TEMP B-TREE" not in plan, (where, plan)
+
 
 @pytest.mark.parametrize("order", ["desc", "asc"])
-@pytest.mark.parametrize("sort_by", ["created_at", "updated_at"])
+@pytest.mark.parametrize("sort_by", ["created_at", "updated_at", "title"])
 def test_cursor_pages_forward_and_backward_in_both_orders(
     conversation_store: SqlAlchemyConversationStore, db_uri: str, sort_by: str, order: str
 ) -> None:

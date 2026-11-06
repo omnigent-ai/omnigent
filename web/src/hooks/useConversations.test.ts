@@ -264,32 +264,34 @@ describe("useConversations project filter", () => {
   });
 });
 
-describe.each([undefined, "updated_at", "created_at"] as const)(
+describe.each([undefined, "updated_at", "created_at", "title"] as const)(
   "fetchConversationsPage sorting %s",
   (sortBy) => {
-    it.each([undefined, "mine", "shared", "archived"] as const)(
-      "sends explicit visibility for %s",
-      async (visibility) => {
-        fetchMock.mockResolvedValueOnce(
-          mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
-        );
-        const queryClient = new QueryClient();
+    // Visibility is built independently of sorting, so Name checks only the default.
+    it.each(
+      ([undefined, "mine", "shared", "archived"] as const).filter(
+        (visibility) => sortBy !== "title" || visibility === undefined,
+      ),
+    )("sends explicit visibility for %s", async (visibility) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+      );
+      const queryClient = new QueryClient();
 
-        await fetchConversationsPage({
-          searchQuery: "",
-          includeArchived: false,
-          visibility,
-          sortBy,
-          queryClient,
-        });
+      await fetchConversationsPage({
+        searchQuery: "",
+        includeArchived: false,
+        visibility,
+        sortBy,
+        queryClient,
+      });
 
-        const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
-        expect(params.get("visibility")).toBe(visibility ?? "all");
-        expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
-        expect(params.get("order")).toBe("desc");
-        queryClient.clear();
-      },
-    );
+      const params = new URL(String(fetchMock.mock.calls[0][0]), "http://localhost").searchParams;
+      expect(params.get("visibility")).toBe(visibility ?? "all");
+      expect(params.get("sort_by")).toBe(sortBy ?? "updated_at");
+      expect(params.get("order")).toBe(sortBy === "title" ? "asc" : "desc");
+      queryClient.clear();
+    });
   },
 );
 
@@ -1365,6 +1367,14 @@ describe("recently-created keep-alive", () => {
 });
 
 describe("useRenameConversation cache patching", () => {
+  // A Name window continues from an opaque position token, not a row id.
+  const nameKey = ["conversations", "", false, null, "mine", "title"] as const;
+  const nameToken = "title.WyIwb2xkIG5hbWUiLCJjb252X3giXQ";
+  function nameWindow(): ConversationsInfiniteData {
+    const loaded = infinitePage([conversation({ id: "conv_x" })]);
+    return { ...loaded, pages: [{ ...loaded.pages[0], last_id: nameToken }] };
+  }
+
   function seedAndRename() {
     // The PATCH response carries the server-confirmed new title and
     // bumped updated_at.
@@ -1391,6 +1401,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", true],
       infinitePage([conversation({ id: "conv_x" })]),
     );
+    queryClient.setQueryData(nameKey, nameWindow());
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     queryClient.setQueryData(["session", "conv_x"], {
       id: "conv_x",
@@ -1417,12 +1428,8 @@ describe("useRenameConversation cache patching", () => {
     rendered.result.current.mutate({ id: "conv_x", title: "New name" });
     await waitFor(() => expect(rendered.result.current.isSuccess).toBe(true));
 
-    for (const includeArchived of [false, true]) {
-      const data = queryClient.getQueryData<ConversationsInfiniteData>([
-        "conversations",
-        "",
-        includeArchived,
-      ]);
+    for (const key of [["conversations", "", false], ["conversations", "", true], nameKey]) {
+      const data = queryClient.getQueryData<ConversationsInfiniteData>(key);
       const row = data!.pages[0].data.find((c) => c.id === "conv_x")!;
       // Title AND updated_at must both land: the title is what the user
       // sees; updated_at drives the sidebar's client-side sort and the
@@ -1430,6 +1437,9 @@ describe("useRenameConversation cache patching", () => {
       expect(row.title).toBe("New name");
       expect(row.updated_at).toBe(200);
     }
+    expect(queryClient.getQueryData<ConversationsInfiniteData>(nameKey)!.pages[0].last_id).toBe(
+      nameToken,
+    );
     // Unrelated rows must survive the patch untouched.
     const base = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(base!.pages[0].data.find((c) => c.id === "conv_other")!.title).toBe("Old name");
@@ -1537,6 +1547,7 @@ describe("useRenameConversation cache patching", () => {
       ["conversations", "", false],
       infinitePage([conversation({ id: "conv_x" })]),
     );
+    queryClient.setQueryData(nameKey, nameWindow());
     queryClient.setQueryData(["conversation-backfill", "conv_x"], conversation({ id: "conv_x" }));
     const wrapper = ({ children }: { children: ReactNode }) =>
       createElement(QueryClientProvider, { client: queryClient }, children);
@@ -1549,6 +1560,9 @@ describe("useRenameConversation cache patching", () => {
     // cache — the row reverts to what it showed before.
     const data = queryClient.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
     expect(data!.pages[0].data.find((c) => c.id === "conv_x")!.title).toBe("Old name");
+    const name = queryClient.getQueryData<ConversationsInfiniteData>(nameKey)!.pages[0];
+    expect(name.data[0].title).toBe("Old name");
+    expect(name.last_id).toBe(nameToken);
     const backfill = queryClient.getQueryData<Conversation>(["conversation-backfill", "conv_x"]);
     expect(backfill!.title).toBe("Old name");
   });
@@ -2773,9 +2787,13 @@ describe("useProjectSessions", () => {
     ["created_at", false, ["project-sessions", "Sprint 42", "created_at", false]],
     ["updated_at", true, ["project-sessions", "Sprint 42", "updated_at", true]],
     ["created_at", true, ["project-sessions", "Sprint 42", "created_at", true]],
+    ["title", false, ["project-sessions", "Sprint 42", "title", false]],
+    ["title", true, ["project-sessions", "Sprint 42", "title", true]],
   ] as const)(
     "fetches project sessions by %s (archived: %s)",
     async (sortBy, archived, expectedKey) => {
+      // Name pages continue from an opaque token, sent back unchanged.
+      const cursor = sortBy === "title" ? "title.WyIwYSIsImNvbnZfYSJd" : "conv_a";
       fetchMock.mockResolvedValueOnce(
         mockResponse({
           data: [
@@ -2789,8 +2807,8 @@ describe("useProjectSessions", () => {
             },
           ],
           first_id: "conv_a",
-          last_id: "conv_a",
-          has_more: false,
+          last_id: cursor,
+          has_more: true,
         }),
       );
       const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -2804,7 +2822,7 @@ describe("useProjectSessions", () => {
       const url = fetchMock.mock.calls[0][0] as string;
       expect(url).toContain("/v1/sessions?");
       expect(url).toContain("project=Sprint+42");
-      expect(url).toContain("order=desc");
+      expect(url).toContain(sortBy === "title" ? "order=asc" : "order=desc");
       expect(url).toContain(`sort_by=${sortBy}`);
       expect(url).toContain("limit=20");
       expect(url).toContain(`visibility=${archived ? "all" : "mine"}`);
@@ -2813,6 +2831,11 @@ describe("useProjectSessions", () => {
       );
       expect(queryClient.getQueryData(expectedKey)).toBeDefined();
       expect(result.current.data?.pages[0]?.data[0]?.id).toBe("conv_a");
+
+      fetchMock.mockResolvedValueOnce(mockResponse(infinitePage([]).pages[0]));
+      await act(() => result.current.fetchNextPage());
+      const next = new URL(fetchMock.mock.calls[1][0] as string, "http://localhost");
+      expect(next.searchParams.get("after")).toBe(cursor);
     },
   );
 
@@ -3294,9 +3317,11 @@ describe("useMoveToProject", () => {
     [undefined, false],
     ["updated_at", false],
     ["created_at", false],
+    ["title", false],
     [undefined, true],
     ["updated_at", true],
     ["created_at", true],
+    ["title", true],
   ] as const)(
     "moves a folder-only row into each matching target cache (window sort: %s, archived: %s)",
     async (windowSort, archived) => {
@@ -3325,8 +3350,8 @@ describe("useMoveToProject", () => {
       const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       queryClient.setQueryData(["projects"], [{ id: "p_sprint", name: "Sprint 42" }]);
       const row = conversation({ id: "conv_deep", project_id: "p_old", archived });
-      for (const sortBy of ["updated_at", "created_at"]) {
-        const sortKey = sortBy === "created_at" ? [sortBy] : [];
+      for (const sortBy of ["updated_at", "created_at", "title"]) {
+        const sortKey = sortBy !== "updated_at" ? [sortBy] : [];
         queryClient.setQueryData(
           ["conversations", "", archived, null, archived ? "archived" : "mine", ...sortKey],
           infinitePage(sortBy === windowSort ? [row] : []),
@@ -3349,8 +3374,8 @@ describe("useMoveToProject", () => {
       result.current.mutate({ id: "conv_deep", project: "Sprint 42" });
 
       await waitFor(() => {
-        for (const sortBy of ["updated_at", "created_at"]) {
-          const sortKey = sortBy === "created_at" ? [sortBy] : [];
+        for (const sortBy of ["updated_at", "created_at", "title"]) {
+          const sortKey = sortBy !== "updated_at" ? [sortBy] : [];
           const target = queryClient.getQueryData<ConversationsInfiniteData>([
             "project-sessions",
             "Sprint 42",

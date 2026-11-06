@@ -2,7 +2,8 @@ import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/use
 import type { ConversationsInfiniteData } from "./sessionListCache";
 
 /** The cursor row's sort key as of the fetch that returned it. */
-export type ScopeBoundary = Pick<Conversation, "id" | "updated_at" | "created_at">;
+export type ScopeBoundary = Pick<Conversation, "id" | "updated_at" | "created_at"> &
+  Partial<Pick<Conversation, "title">>;
 
 // `boundary` is the next page's cursor as it sorted when fetched. Pushed updates
 // move rows in place, so the live cursor row can sort higher than the point the
@@ -100,15 +101,74 @@ export function dedupeSessionRows(rows: Conversation[]): Conversation[] {
   return [...byId.values()];
 }
 
+/** Code points the server keeps of its stored ``sort_by=title`` key. */
+const TITLE_SORT_KEY_MAX_CHARS = 512;
+
+/**
+ * The server's ``sort_by=title`` key: ASCII case folded, untitled last. The
+ * server folds only ASCII on every database, so this must not use toLowerCase.
+ */
+export function titleSortKey(title: string | null | undefined): string {
+  if (!title) return "1";
+  const key = `0${title.replace(/[A-Z]/g, (letter) => letter.toLowerCase())}`;
+  return key.length > TITLE_SORT_KEY_MAX_CHARS
+    ? Array.from(key).slice(0, TITLE_SORT_KEY_MAX_CHARS).join("")
+    : key;
+}
+
+/** Orders like the server's binary collations: by code point, not UTF-16 unit. */
+export function compareCodePoints(a: string, b: string): number {
+  const length = Math.min(a.length, b.length);
+  for (let index = 0; index < length; index++) {
+    if (a.charCodeAt(index) !== b.charCodeAt(index)) {
+      return (a.codePointAt(index) ?? 0) - (b.codePointAt(index) ?? 0);
+    }
+  }
+  return a.length - b.length;
+}
+
 export function compareSessionRows(
   a: ScopeBoundary,
   b: ScopeBoundary,
   sortBy: SessionSortBy = "updated_at",
 ): number {
+  if (sortBy === "title") {
+    return (
+      compareCodePoints(titleSortKey(a.title), titleSortKey(b.title)) ||
+      compareCodePoints(a.id, b.id)
+    );
+  }
   return b[sortBy] - a[sortBy] || b.id.localeCompare(a.id);
 }
 
-/** Only the merged prefix above both unfinished scopes' tails is complete. */
+const TITLE_CURSOR_PREFIX = "title.";
+
+/**
+ * A row that sorts where a page's cursor continues. A ``sort_by=title`` token
+ * is ``"title."`` plus base64url JSON of ``[title_sort_key, id]``.
+ */
+function scopeTail(rows: Conversation[], cursor: string | null | undefined) {
+  if (!cursor?.startsWith(TITLE_CURSOR_PREFIX)) return scopeBoundaryRow(rows, cursor);
+  try {
+    const base64 = cursor.slice(TITLE_CURSOR_PREFIX.length).replace(/-/g, "+").replace(/_/g, "/");
+    const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+    const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    // Destructuring would also split a string, so accept only a [key, id] pair.
+    if (!Array.isArray(decoded) || decoded.length !== 2) return rows.at(-1);
+    const [key, id] = decoded as unknown[];
+    const base = rows.find((row) => row.id === id) ?? rows.at(-1);
+    if (typeof key !== "string" || typeof id !== "string") return base;
+    // The key is already folded, so titleSortKey(title) reproduces the token's position.
+    return { ...base, id, title: key.slice(1) } as Conversation;
+  } catch {
+    return rows.at(-1);
+  }
+}
+
+/**
+ * Only the merged prefix above both unfinished scopes' tails is complete.
+ * Under Name, `watermark` is a position: only its `id` and folded `title` are meaningful.
+ */
 export function mergeScopeRows(
   mine: Conversation[],
   shared: Conversation[],
@@ -122,12 +182,14 @@ export function mergeScopeRows(
 ): { rows: Conversation[]; watermark: ScopeBoundary | undefined } {
   const compare = (a: ScopeBoundary, b: ScopeBoundary) => compareSessionRows(a, b, sortBy);
   // Prefer the cursor as fetched: a pushed bump can lift the live cursor row,
-  // and a watermark taken from it would hide every row below.
+  // and a watermark taken from it would hide every row below. A Name token is
+  // already the fetched position.
   const tailOf = (
     rows: Conversation[],
     cursor?: string | null,
     boundary?: ScopeBoundary,
-  ): ScopeBoundary | undefined => boundary ?? scopeBoundaryRow(rows, cursor);
+  ): ScopeBoundary | undefined =>
+    sortBy === "title" ? scopeTail(rows, cursor) : (boundary ?? scopeBoundaryRow(rows, cursor));
   const mineTail = tailOf(mine, mineCursor, mineBoundary);
   const sharedTail = tailOf(shared, sharedCursor, sharedBoundary);
   const tails = [mineHasMore ? mineTail : undefined, sharedHasMore ? sharedTail : undefined]

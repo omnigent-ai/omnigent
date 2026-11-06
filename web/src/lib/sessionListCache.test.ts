@@ -6,6 +6,7 @@ import {
   type SessionListWireItem,
   collectConversationIds,
   filtersFromConversationQueryKey,
+  filtersFromProjectQueryKey,
   parseProjectSessionsQueryKey,
   insertNewRowsIntoPages,
   mergeItemsIntoPages,
@@ -249,14 +250,16 @@ describe("mergeItemsIntoPages", () => {
         DEFAULT_FILTERS,
       ).needsRefetch,
     ).toBe(true);
-    // In a created_at-ordered list an updated_at bump can't move the cursor.
-    expect(
-      mergeItemsIntoPages(
-        before,
-        new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
-        { ...DEFAULT_FILTERS, sortBy: "created_at" },
-      ).needsRefetch,
-    ).toBe(false);
+    // In a created_at- or title-ordered list an updated_at bump can't move the cursor.
+    for (const sortBy of ["created_at", "title"] as const) {
+      expect(
+        mergeItemsIntoPages(
+          before,
+          new Map<string, SessionListWireItem>([["b", { id: "b", updated_at: 9 }]]),
+          { ...DEFAULT_FILTERS, sortBy },
+        ).needsRefetch,
+      ).toBe(false);
+    }
     // With no further page there is no cursor to protect.
     const complete = { ...before, pages: [{ ...before.pages[0], has_more: false }] };
     expect(
@@ -391,18 +394,21 @@ describe("filtersFromConversationQueryKey", () => {
     });
   });
 
-  it("accepts creation-order caches for live updates and optimistic mutations", () => {
-    expect(
-      filtersFromConversationQueryKey(["conversations", "", false, null, "mine", "created_at"]),
-    ).toEqual({
-      searchQuery: "",
-      includeArchived: false,
-      project: undefined,
-      visibility: "mine",
-      // The sort order decides which field can move the pagination cursor.
-      sortBy: "created_at",
-    });
-  });
+  it.each(["created_at", "title"])(
+    "accepts %s-order caches for live updates and optimistic mutations",
+    (sortBy) => {
+      expect(
+        filtersFromConversationQueryKey(["conversations", "", false, null, "mine", sortBy]),
+      ).toEqual({
+        searchQuery: "",
+        includeArchived: false,
+        project: undefined,
+        visibility: "mine",
+        // The sort order decides which field can move the pagination cursor.
+        sortBy,
+      });
+    },
+  );
 
   it("rejects non-canonical conversation query keys", () => {
     expect(() => filtersFromConversationQueryKey(["conversations", ""])).toThrow(
@@ -487,13 +493,19 @@ describe("collectConversationIds", () => {
 });
 
 describe("parseProjectSessionsQueryKey", () => {
-  it.each(["updated_at", "created_at"])(
+  it.each(["updated_at", "created_at", "title"])(
     "keeps sort and archive scope separate for %s",
     (sortBy) => {
       for (const archived of [false, true]) {
-        expect(
-          parseProjectSessionsQueryKey(["project-sessions", "archived", sortBy, archived]),
-        ).toEqual({ project: "archived", sortBy, archived });
+        const key = ["project-sessions", "archived", sortBy, archived];
+        expect(parseProjectSessionsQueryKey(key)).toEqual({
+          project: "archived",
+          sortBy,
+          archived,
+        });
+        expect(filtersFromProjectQueryKey(key).sortBy).toBe(
+          sortBy === "updated_at" ? undefined : sortBy,
+        );
       }
     },
   );
@@ -508,11 +520,12 @@ describe("project-folder cache membership", () => {
   it.each([
     ["project-sessions", "proj", "updated_at", true],
     ["project-sessions", "proj", "created_at", true],
+    ["project-sessions", "proj", "title", true],
   ])("retains a renamed archive in %j and evicts it from live folders", (...archivedKey) => {
     const qc = new QueryClient();
     const row = conv("a", { archived: true });
     qc.setQueryData(archivedKey, data([row]));
-    const liveKey = ["project-sessions", "proj", "updated_at", false];
+    const liveKey = ["project-sessions", "proj", archivedKey[2], false];
     qc.setQueryData(liveKey, data([row]));
 
     overlayTitleIntoCaches(qc, "a", "Renamed");

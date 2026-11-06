@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
 import {
+  compareSessionRows,
   dedupeSessionRows,
   mergeScopeRows,
   refreshScopeWindow,
   appendScopePage,
   sessionRowsPage,
+  titleSortKey,
 } from "./sidebarData";
+import { titleToken } from "@/test/sidebarMockHelpers";
 
 const row = (id: string, updated_at: number): Conversation => ({
   id,
@@ -196,28 +199,162 @@ describe("scope refresh", () => {
   });
 });
 
-it("uses creation time for scope boundaries, appended pages, and capped refreshes", () => {
-  const newest = { ...row("new", 10), created_at: 30 };
-  const middle = { ...row("middle", 20), created_at: 20 };
-  const oldest = { ...row("old", 30), created_at: 10 };
-  expect(
-    mergeScopeRows([newest, oldest], [middle], true, true, "old", "middle", "created_at").rows.map(
-      (r) => r.id,
-    ),
-  ).toEqual(["new", "middle"]);
+it.each(["created_at", "title"] as const)(
+  "uses %s for scope boundaries, appended pages, and capped refreshes",
+  (sortBy) => {
+    // Newest-created first and A to Z list these alike, and opposite to Updated.
+    const newest = { ...row("new", 10), created_at: 30, title: "Apple" };
+    const middle = { ...row("middle", 20), created_at: 20, title: "banana" };
+    const oldest = { ...row("old", 30), created_at: 10, title: "Cherry" };
+    const cursor = (session: Conversation) =>
+      sortBy === "title" ? titleToken(session) : session.id;
+    const page = (rows: Conversation[], hasMore = false) => ({
+      ...sessionRowsPage(rows, hasMore),
+      last_id: cursor(rows[rows.length - 1]),
+    });
+    expect(
+      mergeScopeRows(
+        [newest, oldest],
+        [middle],
+        true,
+        true,
+        cursor(oldest),
+        cursor(middle),
+        sortBy,
+      ).rows.map((r) => r.id),
+    ).toEqual(["new", "middle"]);
+    const current = {
+      pages: [page([newest, middle], true)],
+      pageParams: [undefined],
+      windowSize: 2,
+    };
+    const appended = appendScopePage(current, page([oldest]), 1, sortBy);
+    expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+    const refreshed = refreshScopeWindow(
+      appended,
+      page([newest, { ...middle, updated_at: 99 }], true),
+      2,
+      sortBy,
+    );
+    expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+    expect(refreshed.pages[0].last_id).toBe(cursor(oldest));
+  },
+);
+
+it("bounds a Name merge at each token's position after a capped refresh", () => {
+  const titled = (id: string, title: string) => ({ ...row(id, 0), title });
+  const cached = [titled("b0", "B000"), titled("b1", "B001"), titled("b2", "B002")];
   const current = {
-    pages: [sessionRowsPage([newest, middle], true)],
+    pages: [{ ...sessionRowsPage(cached, false), last_id: titleToken(cached[2]) }],
     pageParams: [undefined],
-    windowSize: 2,
+    windowSize: 4,
   };
-  const appended = appendScopePage(current, sessionRowsPage([oldest]), 1, "created_at");
-  expect(appended.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
+  // Another client adds A000-A002; the capped refresh fetches only two of them.
+  const prefix = [titled("a0", "A000"), titled("a1", "A001")];
   const refreshed = refreshScopeWindow(
-    appended,
-    sessionRowsPage([newest, { ...middle, updated_at: 99 }], true),
+    current,
+    { ...sessionRowsPage(prefix, true), last_id: titleToken(prefix[1]) },
     2,
-    "created_at",
+    "title",
   );
-  expect(refreshed.pages[0].data.map((r) => r.id)).toEqual(["new", "middle", "old"]);
-  expect(refreshed.pages[0].last_id).toBe("old");
+  const mine = refreshed.pages[0];
+  expect(mine.data.map((r) => r.id)).toEqual(["a0", "a1", "b0", "b1", "b2"]);
+  expect(mine.last_id).toBe(titleToken(prefix[1]));
+  // The sidebar also passes the fetched boundary; Name bounds at the token instead.
+  const mergeIds = (mineRows: Conversation[], shared: Conversation[], sharedCursor?: string) =>
+    mergeScopeRows(
+      mineRows,
+      shared,
+      true,
+      Boolean(sharedCursor),
+      mine.last_id,
+      sharedCursor,
+      "title",
+      refreshed.boundary,
+    ).rows.map((r) => r.id);
+  expect(mergeIds(mine.data, [])).toEqual(["a0", "a1"]);
+  // A shared tail before Mine's sets the boundary instead.
+  const shared = [titled("s0", "A0005")];
+  expect(mergeIds(mine.data, shared, titleToken(shared[0]))).toEqual(["a0", "s0"]);
+  // A boundary row renamed since the fetch leaves the token's position in place.
+  const renamed = mine.data.map((r) => (r.id === "a1" ? { ...r, title: "Zulu" } : r));
+  expect(mergeIds(renamed, [])).toEqual(["a0"]);
+  // Mine's token still bounds the merge when none of its rows are loaded.
+  expect(mergeIds([], [...shared, titled("s1", "B000")])).toEqual(["s0"]);
+  // A non-ASCII key decodes from the token's UTF-8 bytes.
+  const accented = [titled("u0", "Ä"), titled("u1", "Ö"), titled("u2", "Ü")];
+  const merged = mergeScopeRows(accented, [], true, false, titleToken(accented[1]), null, "title");
+  expect(merged.rows.map((r) => r.id)).toEqual(["u0", "u1"]);
+});
+
+it("decodes server-issued Name tokens and ignores malformed ones", () => {
+  const titled = (id: string, title: string) => ({ ...row(id, 0), title });
+  const rows = [titled("a", "Apple"), titled("e", "Éclair \u{1F600}"), titled("o", "Øresund")];
+  // Copied from the server's _encode_title_cursor for rows[1].
+  const serverToken = "title.WyIww4ljbGFpciDwn5iAIiwiZSJd";
+  expect(titleToken(rows[1])).toBe(serverToken);
+  const shared = [titled("u", "Übung")];
+  const mergedIds = (cursor: string) =>
+    mergeScopeRows(rows, shared, true, false, cursor, null, "title").rows.map((r) => r.id);
+  expect(mergedIds(serverToken)).toEqual(["a", "e"]);
+  // Bad base64, non-JSON, a string or three-member payload, and non-string members bound at
+  // Mine's last row, like an unknown id.
+  for (const malformed of [
+    "title.!!",
+    "title.bm90IGpzb24",
+    "title.ImFiIg",
+    "title.WyIwYSIsIngiLCJ5Il0",
+    "title.WzEsMl0",
+  ]) {
+    expect(mergedIds(malformed)).toEqual(["a", "e", "o"]);
+  }
+});
+
+it("keys names like the server: folded case, untitled last", () => {
+  expect(["beta", null, "Alpha", "ab", "a-c", ""].map(titleSortKey).sort()).toEqual([
+    "0a-c",
+    "0ab",
+    "0alpha",
+    "0beta",
+    "1",
+    "1",
+  ]);
+});
+
+it("truncates long name keys to the server's 512 code points", () => {
+  expect(titleSortKey(`A${"b".repeat(600)}`)).toBe(`0a${"b".repeat(510)}`);
+  // Astral characters count once, as in the server's stored key.
+  const emoji = titleSortKey("\u{1F600}".repeat(600));
+  expect(Array.from(emoji)).toHaveLength(512);
+  expect(emoji).toBe(`0${"\u{1F600}".repeat(511)}`);
+});
+
+it("orders names like every server dialect: ASCII-only folding, code points, id ties", () => {
+  const titled = (id: string, title: string) => ({ ...row(id, 0), title });
+  const rows = [
+    titled("b2", "\u{1F600} smile"),
+    titled("b1", "\uFF21 wide"),
+    titled("a8", "\u00E9clair"),
+    titled("a9", "\u00C9clair"),
+    titled("a7", "zeta"),
+    titled("a6", "Zeta"),
+    titled("a2", "y "),
+    titled("a3", "y"),
+    titled("c1", ""),
+    titled("a1", ""),
+  ];
+  // Trailing spaces count, accented capitals stay unfolded, and the emoji
+  // sorts after U+FF21 by code point.
+  expect(rows.sort((x, y) => compareSessionRows(x, y, "title")).map((r) => r.id)).toEqual([
+    "a3",
+    "a2",
+    "a6",
+    "a7",
+    "a9",
+    "a8",
+    "b1",
+    "b2",
+    "a1",
+    "c1",
+  ]);
 });

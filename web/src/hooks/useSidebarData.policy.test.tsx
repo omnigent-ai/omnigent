@@ -17,6 +17,7 @@ import {
   PINNED_LABEL_KEY,
 } from "@/lib/sessionListCache";
 import { sessionRowsPage, type ScopeCacheData } from "@/lib/sidebarData";
+import { titleToken } from "@/test/sidebarMockHelpers";
 import type { Session } from "@/lib/types";
 import type * as IdentityModule from "@/lib/identity";
 import {
@@ -56,6 +57,7 @@ let config: SidebarConfig;
 let view: SessionFilter;
 let mounted: boolean;
 let groupingUi = false;
+let titleSort = true;
 function View() {
   useSidebarView(view);
   return null;
@@ -64,7 +66,11 @@ function wrapper({ children }: { children: ReactNode }) {
   return (
     <QueryClientProvider client={client}>
       <CapabilitiesProvider
-        info={{ ...FALLBACK_SERVER_INFO, features: { sidebar_grouping_ui: groupingUi } }}
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          features: { sidebar_grouping_ui: groupingUi },
+          session_title_sort: titleSort,
+        }}
       >
         <SidebarDataProvider config={config}>
           {mounted && <View />}
@@ -85,6 +91,7 @@ const response = (rows: Conversation[], more = false) => ({
 });
 beforeEach(() => {
   groupingUi = false;
+  titleSort = true;
   localStorage.clear();
   identity.viewerId = null;
   identity.resolution = Promise.resolve(null);
@@ -109,7 +116,9 @@ beforeEach(() => {
       shared,
     );
     if (pinned) next.labels[PINNED_LABEL_KEY] = "1";
-    return response([next], !pinned && !p.has("after"));
+    const page = sessionRowsPage([next], !pinned && !p.has("after"));
+    if (p.get("sort_by") === "title") page.last_id = titleToken(next);
+    return { ok: true, json: async () => page };
   });
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -489,49 +498,103 @@ it.each([true, false])(
   },
 );
 
-it("gates Created ordering and separates its pagination from Updated caches", async () => {
-  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
+it.each([
+  ["created", "created_at", "desc"],
+  ["name", "title", "asc"],
+] as const)(
+  "gates %s ordering and separates its pagination from Updated caches",
+  async (ordering, sortBy, order) => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering }));
+    view = "all";
+    const { result, rerender } = renderHook(useSidebarData, { wrapper });
+    await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+    expect(
+      [...listCalls("mine"), ...listCalls("shared")].every(
+        ([url]) => params(url).get("sort_by") === "updated_at",
+      ),
+    ).toBe(true);
+    groupingUi = true;
+    fetchMock.mockClear();
+    rerender();
+    await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+    expect(result.current.sortBy).toBe(sortBy);
+    expect(listCalls("mine")).toHaveLength(1);
+    expect(listCalls("shared")).toHaveLength(1);
+    await act(async () => {
+      await result.current.all.fetchNextPage();
+    });
+    await act(async () => {
+      await result.current.all.refetch?.();
+    });
+    expect(
+      [...listCalls("mine"), ...listCalls("shared")].every(
+        ([url]) => params(url).get("sort_by") === sortBy && params(url).get("order") === order,
+      ),
+    ).toBe(true);
+    // Each next page sends the previous page's cursor back unchanged, a token under Name.
+    const continuations = listCalls("mine").flatMap(([url]) => params(url).getAll("after"));
+    expect(new Set(continuations)).toEqual(
+      new Set([sortBy === "title" ? titleToken(row("mine")) : "mine"]),
+    );
+    expect(client.getQueryData(["conversations", "", false, null, "mine", sortBy])).toBeDefined();
+    expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
+    await act(async () => {
+      result.current.updateView({ ordering: "updated" });
+    });
+    expect(result.current.sortBy).toBe("updated_at");
+    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
+  },
+);
+
+it("keeps a stored Name ordering but lists by Updated until the server can sort by title", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+  groupingUi = true;
+  titleSort = false;
   view = "all";
   const { result, rerender } = renderHook(useSidebarData, { wrapper });
   await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
-  expect(
-    [...listCalls("mine"), ...listCalls("shared")].every(
-      ([url]) => params(url).get("sort_by") === "updated_at",
-    ),
-  ).toBe(true);
-  groupingUi = true;
+  expect(result.current.sortBy).toBe("updated_at");
+  expect(result.current.view.ordering).toBe("updated");
+  const listed = () => [...listCalls("mine"), ...listCalls("shared")];
+  expect(listed().every(([url]) => params(url).get("sort_by") === "updated_at")).toBe(true);
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("name");
+  titleSort = true;
   fetchMock.mockClear();
   rerender();
   await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
-  expect(result.current.sortBy).toBe("created_at");
+  expect(result.current.sortBy).toBe("title");
   expect(listCalls("mine")).toHaveLength(1);
-  expect(listCalls("shared")).toHaveLength(1);
-  await act(async () => {
-    await result.current.all.fetchNextPage();
-  });
-  await act(async () => {
-    await result.current.all.refetch?.();
-  });
-  expect(
-    [...listCalls("mine"), ...listCalls("shared")].every(
-      ([url]) => params(url).get("sort_by") === "created_at",
-    ),
-  ).toBe(true);
-  expect(listCalls("mine").some(([url]) => params(url).has("after"))).toBe(true);
-  expect(
-    client.getQueryData(["conversations", "", false, null, "mine", "created_at"]),
-  ).toBeDefined();
-  expect(client.getQueryData(["conversations", "", false, null, "mine"])).toBeDefined();
-  await act(async () => {
-    result.current.updateView({ ordering: "updated" });
-  });
-  expect(result.current.sortBy).toBe("updated_at");
-  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
+  expect(listed().every(([url]) => params(url).get("sort_by") === "title")).toBe(true);
 });
 
-it.each([false, true])(
-  "clears destination sort snapshots while folders, pins and Archived reload (archived folder: %s)",
-  async (archivedFolder) => {
+it("keeps the lists when Updated is picked while a stored Name ordering lists by Updated", async () => {
+  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "name" }));
+  groupingUi = true;
+  titleSort = false;
+  view = "all";
+  const { result } = renderHook(useSidebarData, { wrapper });
+  await waitFor(() => expect(result.current.shared.isSuccess).toBe(true));
+  fetchMock.mockClear();
+  await act(async () => {
+    result.current.updateView({ ordering: "updated" });
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+  expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).ordering).toBe("updated");
+  expect(result.current.mine.data).toBeDefined();
+  expect(result.current.shared.data).toBeDefined();
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["created", false, "created_at"],
+  ["created", true, "created_at"],
+  ["name", false, "title"],
+  ["name", true, "title"],
+] as const)(
+  "clears destination %s snapshots while folders, pins and Archived reload (archived folder: %s)",
+  async (ordering, archivedFolder, sortBy) => {
     groupingUi = true;
     view = "all";
     client.setQueryDefaults(["project-sessions"], { staleTime: 30_000 });
@@ -568,7 +631,7 @@ it.each([false, true])(
       result.current.pinned.data?.conversations[0]?.updated_at,
     ];
     await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
-    act(() => result.current.updateView({ ordering: "created" }));
+    act(() => result.current.updateView({ ordering }));
     await waitFor(() => expect(timestamps()).toEqual([100, 100, 100, 100, 100]));
     updatedAt = 200;
     await act(async () => {
@@ -612,11 +675,10 @@ it.each([false, true])(
       true,
     );
     expect(
-      client.getQueryState(["conversations", "", false, null, "mine", "created_at"])?.isInvalidated,
+      client.getQueryState(["conversations", "", false, null, "mine", sortBy])?.isInvalidated,
     ).toBe(true);
     expect(
-      client.getQueryState(["project-sessions", "folder", "created_at", archivedFolder])
-        ?.isInvalidated,
+      client.getQueryState(["project-sessions", "folder", sortBy, archivedFolder])?.isInvalidated,
     ).toBe(true);
 
     updatedAt = 300;
@@ -624,7 +686,7 @@ it.each([false, true])(
       release = resolve;
     });
     fetchMock.mockClear();
-    act(() => result.current.updateView({ ordering: "created" }));
+    act(() => result.current.updateView({ ordering }));
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
     expect(timestamps()).toEqual([undefined, undefined, undefined, undefined, undefined]);
     await act(async () => {
@@ -633,7 +695,7 @@ it.each([false, true])(
     await waitFor(() => expect(timestamps()).toEqual([300, 300, 300, 300, 300]));
     expect(fetchMock).toHaveBeenCalledTimes(5);
     fetchMock.mockClear();
-    act(() => result.current.updateView({ ordering: "created", grouping: "status" }));
+    act(() => result.current.updateView({ ordering, grouping: "status" }));
     expect(fetchMock).not.toHaveBeenCalled();
   },
 );

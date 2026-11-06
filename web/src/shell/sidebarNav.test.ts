@@ -805,6 +805,26 @@ it("orders equal-updated_at rows by id whether or not the order is frozen", () =
   expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
 });
 
+it("sorts Name A to Z case-insensitively with untitled last", () => {
+  const at = new Date(2026, 0, 1);
+  const rows = [
+    conversation("u", null, at),
+    conversation("b", "bravo", at),
+    conversation("a2", "Alpha", at),
+    conversation("a1", "alpha", at),
+    conversation("c", "Charlie", at),
+  ];
+  const ids = (list: Conversation[]) =>
+    sortConversations(list, null, null, "title").map((row) => row.id);
+  // Equal case-folded titles fall back to id ascending, matching the server.
+  expect(ids(rows)).toEqual(["a1", "a2", "b", "c", "u"]);
+  // Updated grouping reads the hover freeze, so Name still captures update times.
+  const frozen = new Map<string, number>();
+  sortConversations(rows, { id: "b", updatedAt: 999 }, frozen, "title");
+  expect(frozen.get("b")).toBe(999);
+  expect(frozen.size).toBe(rows.length);
+});
+
 describe("Custom order", () => {
   // Whole-second server timestamps, as the API returns them.
   const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({

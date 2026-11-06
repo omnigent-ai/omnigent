@@ -270,6 +270,8 @@ class ServerInfoResponse(BaseModel):
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
+    # GET /v1/sessions accepts ``sort_by=title``; older servers reject it.
+    session_title_sort: bool = True
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
@@ -3648,6 +3650,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "session_title_sort": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,

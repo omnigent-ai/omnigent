@@ -183,7 +183,12 @@ import { useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  isSingleUserMode,
+  sandboxOptionLabel,
+  sessionTitleSortSupported,
+} from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
 import { showToast } from "@/components/ui/toast";
@@ -234,8 +239,9 @@ import {
 } from "@/lib/sessionFilterPreferences";
 import {
   SIDEBAR_GROUPINGS,
+  SIDEBAR_ORDERINGS,
   SIDEBAR_SHOW_FIELDS,
-  sidebarBaseOrdering,
+  customOrderBase,
   type SidebarGrouping,
   type SidebarOrdering,
   type SidebarShowField,
@@ -2017,9 +2023,10 @@ function ConversationList({
       onExitSelectionMode();
     }
     // Custom restores its saved positions, or starts from the order on screen.
+    // Leaving Name, it lists Updated's window and saves positions on the first move.
     const custom =
-      patch.ordering === "custom" && !view.custom
-        ? startCustomOrder(sidebarBaseOrdering(view), orderingRows(), activeOverride, frozenKeys)
+      patch.ordering === "custom" && !view.custom && view.ordering !== "name"
+        ? startCustomOrder(customOrderBase(view), orderingRows(), activeOverride, frozenKeys)
         : undefined;
     saveView(custom ? { ...patch, custom } : patch);
   });
@@ -2178,11 +2185,12 @@ function ConversationList({
     const rows = orderingRows();
     const order =
       (view.ordering === "custom" && view.custom) ||
-      startCustomOrder(sidebarBaseOrdering(view), rows, activeOverride, frozenKeys);
+      startCustomOrder(customOrderBase(view), rows, activeOverride, frozenKeys);
     const custom = moveCustomOrder(order, rows, fromId, toId, activeOverride, frozenKeys);
     if (custom) saveView({ ordering: "custom", custom });
   });
-  const reorderable = groupingUi && !selectionMode;
+  // Name has no positions to save, so it offers no drag or Move up/down.
+  const reorderable = groupingUi && !selectionMode && view.ordering !== "name";
 
   // Build sections: Pinned and Archived are peeled off; the rest splits into
   // the viewer's own sessions (Chats) and ones shared with them. Archived
@@ -2941,6 +2949,11 @@ function ConversationList({
       onChange={onActiveTabChange}
       multiUser={multiUser}
       view={groupingUi ? view : null}
+      orderings={
+        sessionTitleSortSupported(serverInfo)
+          ? SIDEBAR_ORDERINGS
+          : SIDEBAR_ORDERINGS.filter((ordering) => ordering !== "name")
+      }
       onViewChange={updateView}
     />
   );
@@ -3667,6 +3680,7 @@ const GROUPING_LABELS: Record<SidebarGrouping, string> = {
 const ORDERING_LABELS: Record<SidebarOrdering, string> = {
   updated: "Updated",
   created: "Created",
+  name: "Name (A to Z)",
   custom: "Custom",
 };
 const SHOW_LABELS: Record<SidebarShowField, string> = {
@@ -3709,6 +3723,7 @@ function SessionFilterMenu({
   onChange,
   multiUser,
   view,
+  orderings,
   onViewChange,
 }: {
   value: SidebarTab;
@@ -3716,6 +3731,8 @@ function SessionFilterMenu({
   multiUser: boolean;
   /** Null while the sidebar_grouping_ui release flag is off: only Display is offered. */
   view: SidebarViewPreferences | null;
+  /** Orderings the server can list by; older servers can't sort by name. */
+  orderings: readonly SidebarOrdering[];
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
@@ -3808,14 +3825,14 @@ function SessionFilterMenu({
               value={view.ordering}
               onValueChange={(next) => onViewChange({ ordering: next as SidebarOrdering })}
             >
-              {Object.entries(ORDERING_LABELS).map(([ordering, label]) => (
+              {orderings.map((ordering) => (
                 <DropdownMenuRadioItem
                   className="mobile-touch-target"
                   key={ordering}
                   value={ordering}
                   data-testid={`session-ordering-${ordering}`}
                 >
-                  {label}
+                  {ORDERING_LABELS[ordering]}
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>

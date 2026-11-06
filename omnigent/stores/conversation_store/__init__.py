@@ -947,11 +947,11 @@ class ConversationStore(ABC):
         ``"asc"`` = oldest-first).
 
         :param limit: Maximum number of conversations to return.
-        :param after: Cursor conversation ID; return conversations
-            appearing after this one in sort order,
-            e.g. ``"conv_abc123"``.
-        :param before: Cursor conversation ID; return conversations
-            appearing before this one in sort order.
+        :param after: Cursor; return conversations appearing after it
+            in sort order. A conversation ID, e.g. ``"conv_abc123"``,
+            or a page's ``last_id``.
+        :param before: Cursor; return conversations appearing before
+            it in sort order. A conversation ID or a page's ``first_id``.
         :param kind: Filter to conversations of this kind. Exact
             match. ``"default"`` returns only user-initiated.
             ``"sub_agent"`` returns only sub-agent conversations.
@@ -1003,10 +1003,13 @@ class ConversationStore(ABC):
             filter is disabled. Powers the ``GET /v1/sessions``
             list endpoint.
         :param order: Sort direction, ``"desc"`` or ``"asc"``.
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``, or ``"id"`` for index order, which bounds the
-            rows a ``root_conversation_id`` read examines. A store without
-            an ``id`` order may fall back to ``"created_at"``.
+        :param sort_by: Sort key: ``"created_at"``, ``"updated_at"``,
+            or ``"title"`` (ignores ASCII letter case, untitled last
+            when ascending). Without a kind filter, ascending title
+            order lists sub-agents after every top-level conversation.
+            ``"id"`` reads in index order, which bounds the rows a
+            ``root_conversation_id`` read examines. A store without an
+            ``id`` order may fall back to ``"created_at"``.
         :param search_query: Case-insensitive substring filter on
             the conversation title OR conversation item content
             (``search_text``). ``None`` or empty string disables
@@ -1058,14 +1061,20 @@ class ConversationStore(ABC):
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
         :returns: A :class:`PagedList` of :class:`Conversation`
-            objects.
+            objects. With ``sort_by="title"``, ``first_id`` and
+            ``last_id`` are opaque tokens carrying the boundary rows'
+            sort positions, so renaming a boundary row between page
+            fetches does not move the cursor.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``
             conversation no longer exists (e.g. deleted between two page
             fetches) — its sort position is unknowable, and an empty page
             would be indistinguishable from a completed enumeration. Also
             raised when ``accessible_by``/``owned_by`` is set and that user
             has no grant on the cursor conversation, so a cursor can't
-            reveal where an ungranted session sorts.
+            reveal where an ungranted session sorts. Title tokens carry
+            their position and never go stale.
+        :raises omnigent.errors.OmnigentError: ``INVALID_INPUT`` for a
+            malformed title token or one used with another sort.
         """
         ...
 

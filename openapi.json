@@ -6324,6 +6324,11 @@
             "title": "Session Search Scope",
             "type": "boolean"
           },
+          "session_title_sort": {
+            "default": true,
+            "title": "Session Title Sort",
+            "type": "boolean"
+          },
           "sharing_mode": {
             "enum": [
               "on",
@@ -14456,7 +14461,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return sessions after this session ID in sort order, e.g. `\"conv_abc123\"`.",
+            "description": "Cursor \u2014 return sessions after this session ID in sort order, e.g. `\"conv_abc123\"`, or after a page's `last_id`. With `sort_by=title`, `first_id` and `last_id` are opaque tokens: pass them back unchanged. A malformed token returns 400 `invalid_input`.",
             "in": "query",
             "name": "after",
             "required": false,
@@ -14473,7 +14478,7 @@
             }
           },
           {
-            "description": "Cursor \u2014 return sessions before this session ID.",
+            "description": "Cursor \u2014 return sessions before this session ID, or before a page's `first_id`.",
             "in": "query",
             "name": "before",
             "required": false,
@@ -14536,13 +14541,13 @@
             }
           },
           {
-            "description": "Column to sort on, `\"created_at\"` or `\"updated_at\"`.",
+            "description": "Sort key, `\"created_at\"`, `\"updated_at\"`, or `\"title\"`. `\"title\"` ignores ASCII letter case and lists untitled sessions last with `order=asc` (A to Z). With `kind=any`, `order=asc` lists sub-agent sessions after every top-level session.",
             "in": "query",
             "name": "sort_by",
             "required": false,
             "schema": {
               "default": "created_at",
-              "pattern": "^(created_at|updated_at)$",
+              "pattern": "^(created_at|updated_at|title)$",
               "title": "Sort By",
               "type": "string"
             }

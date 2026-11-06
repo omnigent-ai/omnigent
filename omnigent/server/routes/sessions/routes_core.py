@@ -1945,7 +1945,7 @@ def register_core_routes(
         agent_id: str | None = Query(default=None),
         agent_name: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
+        sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|title)$"),
         search_query: str | None = Query(default=None),
         search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
@@ -1964,9 +1964,13 @@ def register_core_routes(
         :param limit: Maximum number of sessions to return
             (1-1000, default 20).
         :param after: Cursor — return sessions after this
-            session ID in sort order, e.g. ``"conv_abc123"``.
+            session ID in sort order, e.g. ``"conv_abc123"``, or
+            after a page's ``last_id``. With ``sort_by=title``,
+            ``first_id`` and ``last_id`` are opaque tokens: pass
+            them back unchanged. A malformed token returns 400
+            ``invalid_input``.
         :param before: Cursor — return sessions before this
-            session ID.
+            session ID, or before a page's ``first_id``.
         :param agent_id: When set, only return sessions bound
             to this agent, e.g. ``"ag_abc123"``. ``None``
             returns sessions across all agents.
@@ -1976,8 +1980,11 @@ def register_core_routes(
             have distinct bundles. ``None`` disables the filter.
         :param order: Sort direction, ``"desc"`` (newest-first)
             or ``"asc"`` (oldest-first).
-        :param sort_by: Column to sort on, ``"created_at"`` or
-            ``"updated_at"``.
+        :param sort_by: Sort key, ``"created_at"``, ``"updated_at"``,
+            or ``"title"``. ``"title"`` ignores ASCII letter case and
+            lists untitled sessions last with ``order=asc`` (A to Z).
+            With ``kind=any``, ``order=asc`` lists sub-agent sessions
+            after every top-level session.
         :param search_query: Case-insensitive substring filter on
             the session title or conversation content. ``None``
             or empty string disables the filter. A session

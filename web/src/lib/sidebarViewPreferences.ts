@@ -3,7 +3,9 @@
 const STORAGE_KEY = "omnigent:sidebar-view";
 
 export type SidebarGrouping = "default" | "status" | "harness" | "created" | "updated";
-export type SidebarOrdering = "updated" | "created" | "custom";
+export type SidebarOrdering = "updated" | "created" | "name" | "custom";
+/** An ordering the server sorts by itself. */
+export type SidebarBaseOrdering = Exclude<SidebarOrdering, "custom">;
 export type SidebarShowField = "harness" | "updated" | "environment" | "repo" | "branch";
 
 /** Saved positions on top of the automatic order Custom started from. */
@@ -30,7 +32,12 @@ export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = [
   "created",
   "updated",
 ];
-export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = ["updated", "created", "custom"];
+export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = [
+  "updated",
+  "created",
+  "name",
+  "custom",
+];
 export const SIDEBAR_SHOW_FIELDS: readonly SidebarShowField[] = [
   "harness",
   "updated",
@@ -67,9 +74,11 @@ export function readSidebarViewPreferences(): SidebarViewPreferences {
   const show = Array.isArray(stored.show) ? stored.show : [];
   const custom = parseCustomOrder(stored.custom);
   const ordering = pick(SIDEBAR_ORDERINGS, stored.ordering, DEFAULT_SIDEBAR_VIEW.ordering);
+  // Custom with no positions yet saves them on its first move; malformed ones fall back.
+  const malformedCustom = stored.custom !== undefined && !custom;
   return {
     grouping: pick(SIDEBAR_GROUPINGS, stored.grouping, DEFAULT_SIDEBAR_VIEW.grouping),
-    ordering: ordering === "custom" && !custom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
+    ordering: ordering === "custom" && malformedCustom ? DEFAULT_SIDEBAR_VIEW.ordering : ordering,
     // Keep the menu's field order so equal selections compare equal.
     show: SIDEBAR_SHOW_FIELDS.filter((field) => show.includes(field)),
     ...(custom && { custom }),
@@ -89,8 +98,14 @@ function parseCustomOrder(value: unknown): SidebarCustomOrder | undefined {
 }
 
 /** The server sort behind the selected ordering; Custom sorts its unsaved rows by its base. */
-export function sidebarBaseOrdering(view: SidebarViewPreferences): "updated" | "created" {
+export function sidebarBaseOrdering(view: SidebarViewPreferences): SidebarBaseOrdering {
   return view.ordering === "custom" ? (view.custom?.base ?? "updated") : view.ordering;
+}
+
+/** The base a new Custom order keeps. Name can't be reordered, so Custom starts from Updated. */
+export function customOrderBase(view: SidebarViewPreferences): SidebarCustomOrder["base"] {
+  const base = sidebarBaseOrdering(view);
+  return base === "name" ? "updated" : base;
 }
 
 /** Persist the view options. Swallows quota/access errors. */

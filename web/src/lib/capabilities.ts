@@ -234,6 +234,11 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when ``GET /v1/sessions`` accepts ``sort_by=title``. Older servers
+   * reject it, so the sidebar hides Name ordering there. Fails to ``false``.
+   */
+  session_title_sort?: boolean;
+  /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
    * Session control there. Fails to ``false``.
@@ -421,6 +426,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
   session_search_scope: false,
+  session_title_sort: false,
   scheduled_task_session_modes: false,
   scheduled_task_subhour: false,
   scheduled_task_sandbox_workspaces: false,
@@ -462,6 +468,11 @@ function parseFeatures(raw: unknown, harnessInstallEnabled: boolean): FeatureVal
 /** Return whether a known release feature is enabled; missing/loading is off. */
 export function isFeatureEnabled(info: ServerInfo | "loading", feature: FeatureKey): boolean {
   return info !== "loading" && info.features?.[feature] === true;
+}
+
+/** Whether `GET /v1/sessions` accepts `sort_by=title`; missing/loading is off. */
+export function sessionTitleSortSupported(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.session_title_sort === true;
 }
 
 export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
@@ -582,6 +593,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           session_search_scope: data.session_search_scope === true,
+          session_title_sort: data.session_title_sort === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,
           automation_trigger_poll_minutes:

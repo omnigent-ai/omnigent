@@ -3,7 +3,8 @@ import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
-import type { SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
+import { compareSessionRows } from "@/lib/sidebarData";
+import type { SidebarBaseOrdering, SidebarCustomOrder } from "@/lib/sidebarViewPreferences";
 
 export const PINNED_CONVERSATION_IDS_STORAGE_KEY = "omnigent:pinned-conversation-ids";
 
@@ -223,9 +224,8 @@ export function customSortOrder(order: SidebarCustomOrder): CustomSortOrder {
   return { since: order.since, positions: new Map(order.ids.map((id, index) => [id, index])) };
 }
 
-// Newest first; equal timestamps fall back to id, so arrival order never shows.
-// Freeze update timestamps for the active chat and hovered list; creation
-// timestamps stay immutable, including when the selected order changes.
+// Newest first, ties by id. Update times freeze for the active chat and hovered
+// list; creation times never move. Name sorts by title A to Z.
 export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
@@ -239,6 +239,8 @@ export function sortConversations(
     frozenKeys?.set(c.id, updatedAt);
     return sortBy === "created_at" ? c.created_at : updatedAt;
   };
+  // Name ignores update times, but Updated grouping still reads their freeze.
+  if (sortBy === "title") conversations.forEach(effective);
   // Custom: saved rows by position, later-created sessions above, history (ties too) below.
   const rank = (c: Conversation): number =>
     custom ? (custom.positions.get(c.id) ?? (c.created_at > custom.since ? -1 : Infinity)) : 0;
@@ -246,13 +248,20 @@ export function sortConversations(
     const aRank = rank(a);
     const bRank = rank(b);
     if (aRank !== bRank) return aRank - bRank;
+    if (sortBy === "title") return compareSessionRows(a, b, sortBy);
     const byTime = aRank === -1 ? b.created_at - a.created_at : effective(b) - effective(a);
     return byTime || b.id.localeCompare(a.id);
   });
 }
 
-export function sidebarSortBy(base: SidebarCustomOrder["base"]): SessionSortBy {
-  return base === "created" ? "created_at" : "updated_at";
+const SESSION_SORT_BY: Record<SidebarBaseOrdering, SessionSortBy> = {
+  updated: "updated_at",
+  created: "created_at",
+  name: "title",
+};
+
+export function sidebarSortBy(base: SidebarBaseOrdering): SessionSortBy {
+  return SESSION_SORT_BY[base];
 }
 
 /** Start Custom from the automatic order on screen: every loaded row keeps its slot. */
