@@ -11655,7 +11655,11 @@ async def _create_session_from_existing_agent(
         )
         if source_project is not None:
             project_id = created_by_project_id
-    creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+    creation_metadata(
+        parent_session_id=body.parent_session_id,
+        host_type=body.host_type,
+        created_by_session_id=created_by_session_id,
+    )
     assert body.agent_id is not None
 
     _reject_reserved_cost_control_label_seed(body.labels)
@@ -12341,6 +12345,7 @@ async def _create_session_from_existing_agent(
         conv.id,
         conv.runner_id,
         parent_session_id=body.parent_session_id,
+        created_by_session_id=created_by_session_id,
         agent_id=conv.agent_id,
         harness=selected_harness,
     )

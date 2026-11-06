@@ -16,6 +16,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from tests.debug_log_helpers import capture_debug_rows
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
 from tests.server.integration.test_managed_startup_inputs import (
     startup_permissions as startup_permissions,
@@ -825,23 +826,28 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     try:
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_create",
-                arguments=json.dumps(
-                    {
-                        "agent_id": source["agent_id"],
-                        "placement": "managed",
-                        "message": "First task",
-                    }
-                ),
-                server_client=auth_client,
-                conversation_id=source["id"],
+        with capture_debug_rows("server") as rows:
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps(
+                        {
+                            "agent_id": source["agent_id"],
+                            "placement": "managed",
+                            "message": "First task",
+                        }
+                    ),
+                    server_client=auth_client,
+                    conversation_id=source["id"],
+                )
             )
-        )
         assert "error" not in result, result
         await asyncio.wait_for(launched.wait(), timeout=2)
         session_id = result["conversation_id"]
+        created = next(row for row in rows if row["event_name"] == "session_created")
+        assert created["session_id"] == session_id
+        assert created["attributes"]["created_by_session_id"] == source["id"]
+        assert "parent_session_id" not in created["attributes"]
         assert captured["provider"] is None
         assert captured["sandbox_config"].for_provider(None).provider == provider
         assert captured["owner"] == "alice"
