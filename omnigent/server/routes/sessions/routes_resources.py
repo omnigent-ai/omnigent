@@ -2898,20 +2898,33 @@ def register_resources_routes(
         pr_url: str | None = None,
         head_sha: str | None = None,
         base_sha: str | None = None,
+        commit_sha: str | None = None,
     ) -> Any:
         """
-        Return the whole PR as one unified diff patch.
+        Return the whole PR as one unified diff patch, or one commit's patch.
 
         ``gh pr diff`` covering every changed file, gzipped on the way out
-        (patches are large). The web view parses it client-side into per-file
-        diffs. Falls back to the host tunnel when the runner is offline.
+        (patches are large). With ``commit_sha``, returns that commit's patch
+        instead. The web view parses it client-side into per-file diffs. Falls
+        back to the host tunnel when the runner is offline.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
+        :param commit_sha: A full commit id of the selected PR; replaces the whole-PR patch.
         :returns: JSON with the ``patch`` text.
         """
         conv = await _authorize_browse_read(session_id, request)
         params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if commit_sha is not None:
+            params["commit_sha"] = commit_sha
+            return await _fs_get_with_host_fallback(
+                session_id,
+                conv,
+                op="github_commit_diff",
+                host_params=params,
+                runner_params=params,
+                runner_path=f"/v1/sessions/{session_id}/resources/github/diff",
+            )
         if head_sha:
             params["head_sha"] = head_sha
         if base_sha:
@@ -3633,6 +3646,37 @@ def register_resources_routes(
             host_params=params,
             runner_params=params or None,
             runner_path=f"/v1/sessions/{session_id}/resources/github/changes",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/commits",
+        response_model=None,
+    )
+    async def list_session_github_commits(
+        request: Request,
+        session_id: str,
+        pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the PR's commits, oldest first, at the displayed head.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param head_sha: The full head commit id the panel shows; rejected when the PR moved.
+        :returns: ``list`` of ``session.github.commit`` objects with ``has_more``.
+        """
+        conv = await _authorize_browse_read(session_id, request)
+        params = await _github_params(session_id, {"pr_url": pr_url} if pr_url else {})
+        if head_sha:
+            params["head_sha"] = head_sha
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_commits",
+            host_params=params,
+            runner_params=params or None,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/commits",
         )
 
     @router.post("/sessions/{session_id}/resources/github/prs", response_model=None)

@@ -1458,6 +1458,23 @@ def register_resource_routes(
             default_pr_url=default_pr_url,
         )
 
+    @app.get("/v1/sessions/{session_id}/resources/github/commits")
+    async def read_github_commits(
+        session_id: str,
+        pr_url: str | None = None,
+        server_tracked: bool = False,
+        default_pr_url: str | None = None,
+        head_sha: str | None = None,
+    ) -> JSONResponse:
+        return await _github_call(
+            session_id,
+            "pr_commits",
+            head_sha=head_sha,
+            pr_url=pr_url,
+            server_tracked=server_tracked,
+            default_pr_url=default_pr_url,
+        )
+
     @app.get("/v1/sessions/{session_id}/resources/github/diff")
     async def read_github_pr_diff(
         session_id: str,
@@ -1466,7 +1483,17 @@ def register_resource_routes(
         default_pr_url: str | None = None,
         head_sha: str | None = None,
         base_sha: str | None = None,
+        commit_sha: str | None = None,
     ) -> JSONResponse:
+        if commit_sha is not None:
+            return await _github_call(
+                session_id,
+                "pr_commit_diff",
+                commit_sha=commit_sha,
+                pr_url=pr_url,
+                server_tracked=server_tracked,
+                default_pr_url=default_pr_url,
+            )
         return await _github_call(
             session_id,
             "pr_diff",

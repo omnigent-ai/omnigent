@@ -74,9 +74,11 @@ from omnigent.git_providers import host_of
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
+    COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
     PR_ATTACHMENT_OBJECT,
     PR_DETAILS_OBJECT,
+    PR_DIFF_OBJECT,
     PR_LABELS_OBJECT,
     PR_MERGE_OBJECT,
     PR_REVIEWERS_OBJECT,
@@ -1558,13 +1560,103 @@ def _pr_patch_at_revision(
 
 
 def _check_pr_revision(
-    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str | None = None
 ) -> dict[str, Any]:
-    """Return the PR's REST payload, raising when its head or base moved."""
+    """Return the PR's REST payload, raising when its head, or its base if given, moved."""
     pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
-    if _api_string(pr, "head", "sha") != head_sha or _api_string(pr, "base", "sha") != base_sha:
+    moved_head = _api_string(pr, "head", "sha") != head_sha
+    moved_base = base_sha is not None and _api_string(pr, "base", "sha") != base_sha
+    if moved_head or moved_base:
         raise ValueError("The pull request changed; refresh before viewing its conversations.")
     return pr
+
+
+# GitHub lists at most this many commits for one pull request.
+_MAX_PR_COMMITS = 250
+
+
+def _commit_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Shape one REST commit as ``session.github.commit``: title is the message's first line."""
+    commit = entry.get("commit") if isinstance(entry.get("commit"), dict) else {}
+    author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    message = commit.get("message") if isinstance(commit.get("message"), str) else ""
+    return {
+        "object": COMMIT_OBJECT,
+        "sha": entry["sha"],
+        "title": message.strip().split("\n", 1)[0].strip(),
+        "author": author.get("name"),
+        "date": author.get("date"),
+    }
+
+
+def _pr_commit_entries(root: str, reference: PullRequestRef) -> list[dict[str, Any]]:
+    """Fetch every commit page GitHub returns for the PR, oldest first."""
+    rc, out, _ = _gh(
+        [
+            "api",
+            *_host_args(root, reference),
+            "--paginate",
+            "--slurp",
+            f"repos/{reference.repository}/pulls/{reference.number}/commits?per_page=100",
+        ],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not load the PR's commits. Refresh to retry.")
+    try:
+        pages = json.loads(out)
+    except ValueError:
+        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.") from None
+    if not isinstance(pages, list):
+        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.")
+    entries = [entry for page in pages for entry in (page if isinstance(page, list) else [page])]
+    return [
+        _commit_payload(entry)
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("sha"), str)
+    ]
+
+
+def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+    """List the PR's commits at ``head_sha``, capped at 250; ``has_more`` reports the rest.
+
+    The PR's head is checked before and after the listing, so the list describes the
+    revision the panel shows.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        pr = _check_pr_revision(root, reference, head_sha=head_sha)
+        commits = _pr_commit_entries(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha)
+    shown = commits[:_MAX_PR_COMMITS]
+    total = pr.get("commits")
+    return {
+        "object": "list",
+        "data": shown,
+        "has_more": isinstance(total, int) and total > len(shown),
+    }
+
+
+def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
+    """Return one commit's patch, read as GitHub's diff media type for that commit.
+
+    The caller has checked ``commit_sha`` is a full object id, so the patch is the
+    commit the user selected, not a branch that may have moved.
+    """
+    rc, out, _ = _gh(
+        [
+            "api",
+            *_host_args(root, reference),
+            "-H",
+            "Accept: application/vnd.github.diff",
+            f"repos/{reference.repository}/commits/{commit_sha}",
+        ],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not load the commit's diff. Refresh or open it on GitHub.")
+    return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:

@@ -545,6 +545,99 @@ async def test_changes_route_pins_revision_and_reports_truncation(
     assert partial.json()["detail"] == "Expected full head and base commit SHAs"
 
 
+@pytest.mark.parametrize("bad_sha", ["", "abc", "A" * 40, "a" * 39, "a" * 41])
+def test_commit_ids_must_be_full_lowercase_shas(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, bad_sha: str
+) -> None:
+    def forbidden_gh(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("A malformed commit id must not reach gh")
+
+    monkeypatch.setattr(github, "_gh", forbidden_gh)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commits(tracked, session_id="session", pr_url=B, head_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commit_diff(tracked, session_id="session", pr_url=B, commit_sha=bad_sha)
+
+
+async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, commit = "a" * 40, "c" * 40
+    pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+    listing = [
+        [
+            {
+                "sha": commit,
+                "commit": {
+                    "message": "Fix the thing\n\nDetails",
+                    "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
+                },
+            }
+        ]
+    ]
+    gh_args: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        gh_args.append(args)
+        if args[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps(pr), ""
+        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
+            return 0, json.dumps(listing), ""
+        assert args[-1] == f"repos/example/two/commits/{commit}"
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        commits = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": head},
+        )
+        unpinned = await client.get(
+            "/v1/sessions/session/resources/github/commits", params={"pr_url": B}
+        )
+        moved = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": "d" * 40},
+        )
+        patch = await client.get(
+            "/v1/sessions/session/resources/github/diff",
+            params={"pr_url": B, "commit_sha": commit},
+        )
+        malformed = await client.get(
+            "/v1/sessions/session/resources/github/diff",
+            params={"pr_url": B, "commit_sha": "abc"},
+        )
+
+    assert commits.status_code == 200, commits.text
+    assert commits.json() == {
+        "object": "list",
+        "has_more": False,
+        "data": [
+            {
+                "object": "session.github.commit",
+                "sha": commit,
+                "title": "Fix the thing",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            }
+        ],
+    }
+    assert unpinned.status_code == 400
+    assert unpinned.json()["detail"] == "Expected head_sha to be a full commit SHA"
+    assert moved.status_code == 400
+    assert "pull request changed" in moved.json()["detail"]
+    assert patch.status_code == 200, patch.text
+    assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert "Accept: application/vnd.github.diff" in gh_args[-1]
+    assert malformed.status_code == 400
+
+
 @pytest.fixture
 def context_api(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[int, str, str]]:
     responses = {

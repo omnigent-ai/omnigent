@@ -3873,6 +3873,26 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
 
 
 @pytest.mark.asyncio
+async def test_github_commit_diff_forwards_the_commit_to_the_runner(
+    client: httpx.AsyncClient,
+) -> None:
+    """GET /resources/github/diff?commit_sha=... proxies that one commit's patch."""
+    payload = {"object": "session.github.pr_diff", "patch": "commit patch\n"}
+    fake_runner = _FakeRunnerClient(payload=payload)
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    commit = "c" * 40
+
+    resp = await client.get(
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+        params={"commit_sha": commit},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == payload
+    assert {"commit_sha": commit} in fake_runner.get_params
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("previous_path", "status"),
     [
@@ -10557,6 +10577,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
     [
         ("", "github_info"),
         ("/changes", "github_changes"),
+        ("/commits", "github_commits"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
@@ -10585,6 +10606,8 @@ async def test_selected_pr_reaches_offline_host(
     params = {"pr_url": url}
     if resource.startswith("/review-threads"):
         params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
+    if resource == "/commits":
+        params["head_sha"] = "a" * 40
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
