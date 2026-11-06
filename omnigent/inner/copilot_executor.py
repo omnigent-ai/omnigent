@@ -57,14 +57,25 @@ Requirements:
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
+import shutil
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 
+from omnigent.inner.native_attachments import (
+    attachment_cache_dir,
+    framework_notices,
+    materialize_attachment,
+    parse_data_uri,
+    unresolved_attachment_marker,
+)
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.util.reasoning_effort import COPILOT_EFFORTS, validate_effort
@@ -86,6 +97,9 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
 )
+
+if TYPE_CHECKING:
+    from copilot.session import Attachment, BlobAttachment
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +127,11 @@ _AMBIENT_HOST = os.environ.get(COPILOT_HOST_ENV_VAR) or None
 # pass a generous finite bound: a wedged turn surfaces a timeout error instead
 # of hanging forever. The runner enforces its own per-turn timeout on top.
 _SEND_TIMEOUT_S = 3600.0
+
+_ATTACHMENT_BLOCK_TYPES = ("input_image", "input_file")
+
+# Prompt for a message that carries attachments but no text.
+_ATTACHMENT_ONLY_PROMPT = "(The user sent attachments without a message.)"
 
 
 def _resolve_model(model: str | None) -> str | None:
@@ -207,10 +226,98 @@ def _extract_text(msg: Message) -> str:
 
 def _latest_user_text(messages: list[Message]) -> str:
     """Return the text of the latest user message (multimodal parts joined)."""
+    latest = _latest_user_message(messages)
+    return _extract_text(latest) if latest is not None else ""
+
+
+def _latest_user_message(messages: list[Message]) -> Message | None:
+    """Return the latest user message, or ``None`` when there is none."""
     for msg in reversed(messages):
         if msg.get("role") == "user":
-            return _extract_text(msg)
-    return ""
+            return msg
+    return None
+
+
+def _attachment_blocks(msg: Message) -> list[dict[str, Any]]:  # type: ignore[explicit-any]
+    """Return the message's ``input_image`` / ``input_file`` content blocks."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [
+        part
+        for part in content
+        if isinstance(part, dict) and part.get("type") in _ATTACHMENT_BLOCK_TYPES
+    ]
+
+
+def _history_text(msg: Message) -> str:
+    """Message text for the first-turn history, noting attachments not re-sent."""
+    notes: list[str] = []
+    for block in _attachment_blocks(msg):
+        kind = "image" if block.get("type") == "input_image" else "file"
+        name = block.get("filename") or block.get("file_id") or "attachment"
+        notes.append(f"[earlier {kind} attachment {name} not re-sent]")
+    return " ".join(part for part in [_extract_text(msg), *notes] if part)
+
+
+def _copilot_attachments(
+    msg: Message | None, cache_key: Path
+) -> tuple[list[Attachment], list[str]]:
+    """Convert a user message's attachment blocks into SDK attachments.
+
+    Images travel inline as ``blob`` attachments. Other files are written to
+    the session's private attachment cache (outside the working directory)
+    and passed by path as ``file`` attachments.
+
+    :param msg: The latest user message, or ``None``.
+    :param cache_key: Path identifying the session's attachment cache.
+    :returns: ``(attachments, markers)`` where *markers* are visible lines
+        for attachments that could not be delivered.
+    """
+    attachments: list[Attachment] = []
+    markers: list[str] = []
+    if msg is None:
+        return attachments, markers
+    for block in _attachment_blocks(msg):
+        is_image = block.get("type") == "input_image"
+        data_uri = block.get("image_url" if is_image else "file_data")
+        if (
+            not isinstance(data_uri, str)
+            or not data_uri.startswith("data:")
+            or not data_uri.partition(",")[0].endswith(";base64")
+        ):
+            markers.append(unresolved_attachment_marker(block))
+            continue
+        attachment: Attachment | None = None
+        try:
+            parsed = parse_data_uri(data_uri)
+            # Validate files too: the shared materializer tolerates non-base64
+            # characters, which would otherwise deliver corrupt or empty bytes.
+            base64.b64decode(parsed.base64_payload, validate=True)
+            if not parsed.mime_type or (is_image and not parsed.mime_type.startswith("image/")):
+                markers.append(unresolved_attachment_marker(block))
+                continue
+            if is_image:
+                blob: BlobAttachment = {
+                    "type": "blob",
+                    "data": parsed.base64_payload,
+                    "mimeType": parsed.mime_type,
+                }
+                filename = block.get("filename")
+                if isinstance(filename, str) and filename:
+                    blob["displayName"] = filename
+                attachment = blob
+            else:
+                path = materialize_attachment(block, cache_key)
+                if path is not None:
+                    attachment = {"type": "file", "path": str(path), "displayName": path.name}
+        except (ValueError, binascii.Error, OSError):
+            logger.warning("Could not deliver copilot attachment", exc_info=True)
+        if attachment is None:
+            markers.append(unresolved_attachment_marker(block))
+        else:
+            attachments.append(attachment)
+    return attachments, markers
 
 
 def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> str:
@@ -226,10 +333,12 @@ def _build_copilot_prompt(messages: list[Message], *, is_first_turn: bool) -> st
     :returns: The prompt string (empty when there is nothing to send).
     """
     if is_first_turn and len(messages) > 1:
+        latest = _latest_user_message(messages)
         lines = ["Conversation so far:"]
         for msg in messages:
             role = str(msg.get("role") or "user").replace("_", " ")
-            lines.append(f"{role}: {_extract_text(msg)}")
+            text = _extract_text(msg) if msg is latest else _history_text(msg)
+            lines.append(f"{role}: {text}")
         lines.append("")
         lines.append(
             "Respond to the latest user message, using the conversation above as context."
@@ -280,7 +389,13 @@ class _CopilotSession(Protocol):
     def on(self, callback: Callable[[object], None]) -> Callable[[], None]:
         pass
 
-    async def send_and_wait(self, prompt: str, *, timeout: float) -> object:
+    async def send_and_wait(
+        self,
+        prompt: str,
+        *,
+        attachments: list[Attachment] | None = None,
+        timeout: float,
+    ) -> object:
         pass
 
     async def abort(self) -> object:
@@ -298,6 +413,10 @@ class _CopilotSessionState:
     reasoning_effort: str | None = None
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
+    # A unique virtual bridge path isolates this SDK session's shared cache.
+    attachment_cache_key: Path = field(
+        default_factory=lambda: Path.cwd() / ".copilot-sdk-attachments" / uuid.uuid4().hex
+    )
     # call_id -> tool name, populated on TOOL_EXECUTION_START so the matching
     # TOOL_EXECUTION_COMPLETE (which carries only the id) can name its tool.
     call_names: dict[str, str] = field(default_factory=dict)
@@ -622,6 +741,13 @@ class CopilotExecutor(Executor):
             return
 
         prompt = _build_copilot_prompt(messages, is_first_turn=is_first_turn)
+        latest = _latest_user_message(messages)
+        if not prompt and latest is not None and _attachment_blocks(latest):
+            prompt = _ATTACHMENT_ONLY_PROMPT
+        if latest is not None:
+            notices = framework_notices(latest.get("content"))
+            if notices:
+                prompt = "\n".join([prompt, *notices]).strip()
         if not prompt:
             yield TurnComplete(response=None)
             return
@@ -645,6 +771,10 @@ class CopilotExecutor(Executor):
                 yield ExecutorError(message=f"LLM call denied by policy: {reason}")
                 return
 
+        attachments, markers = _copilot_attachments(latest, state.attachment_cache_key)
+        if markers:
+            prompt = "\n".join([prompt, *markers]).strip()
+
         state.has_sent_prompt = True
         session = state.session
         assert session is not None
@@ -659,7 +789,7 @@ class CopilotExecutor(Executor):
 
         unsubscribe = session.on(_on_event)
         send_task: asyncio.Task[Any] = asyncio.ensure_future(  # type: ignore[explicit-any]
-            session.send_and_wait(prompt, timeout=_SEND_TIMEOUT_S)
+            session.send_and_wait(prompt, attachments=attachments or None, timeout=_SEND_TIMEOUT_S)
         )
 
         response_text = ""
@@ -832,6 +962,12 @@ class CopilotExecutor(Executor):
         if state.client is not None:
             await _safe_stop(state.client)
             state.client = None
+        try:
+            shutil.rmtree(attachment_cache_dir(state.attachment_cache_key))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.warning("Could not remove copilot attachment cache", exc_info=True)
         state.call_names.clear()
 
     async def close_session(self, session_key: str) -> None:

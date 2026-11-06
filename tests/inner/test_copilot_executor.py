@@ -13,11 +13,14 @@ gated e2e test.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import sys
 import types
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -48,6 +51,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.inner.native_attachments import framework_notice_block, resize_notice
 from omnigent.onboarding import copilot_auth
 from omnigent.runtime.harnesses._executor_adapter import _bridge_one_dispatch
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result
@@ -92,8 +96,15 @@ class _FakeSession:
         self._state["unsub_calls"] = self._state.get("unsub_calls", 0)
         return _Unsub(self, handler)
 
-    async def send_and_wait(self, prompt: str, *, timeout: float = 60.0) -> Any:
+    async def send_and_wait(
+        self,
+        prompt: str,
+        *,
+        attachments: list[dict[str, str]] | None = None,
+        timeout: float = 60.0,
+    ) -> Any:
         self._state["sent"].append(prompt)
+        self._state["sent_attachments"].append(attachments)
         await asyncio.sleep(0)
         if self._send_exc is not None and self._state.get("send_exc_remaining", 0) > 0:
             self._state["send_exc_remaining"] -= 1
@@ -151,6 +162,7 @@ def _install_fake_copilot(
         "client_kwargs": [],
         "create_kwargs": [],
         "sent": [],
+        "sent_attachments": [],
         "started": 0,
         "client_closed": 0,
         "session_closed": 0,
@@ -273,6 +285,9 @@ def test_build_prompt_first_turn_history_and_latest() -> None:
     # Single message: just the latest user text.
     assert _build_copilot_prompt([_user("hi")], is_first_turn=True) == "hi"
     assert _build_copilot_prompt([_user("again")], is_first_turn=False) == "again"
+    assert "user:  spaced \n" in _build_copilot_prompt(
+        [_user(" spaced "), _user("latest")], is_first_turn=True
+    )
 
 
 def test_coerce_args() -> None:
@@ -1426,3 +1441,318 @@ async def test_run_turn_usage_accumulates_cache_read_write_through_events(
         "total_tokens": 16,
     }
     await ex.close()
+
+
+# ---------------------------------------------------------------------------
+# Attachments: forwarded to the SDK, never silently dropped
+# ---------------------------------------------------------------------------
+
+_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAEAAH2FzhVAAAAAElFTkSuQmCC"
+)
+_TEXT_B64 = base64.b64encode(b"DIAGNOSTIC_MARKER").decode("ascii")
+
+
+def _attachment_message(*blocks: dict[str, Any], text: str | None = None) -> Message:
+    content: list[dict[str, Any]] = [{"type": "input_text", "text": text}] if text else []
+    return {"role": "user", "content": [*content, *blocks], "session_id": "conv1"}
+
+
+@pytest.fixture
+def _isolated_data_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    return tmp_path / "data"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["Read the attached file.", None])
+@pytest.mark.parametrize("filename", ["diagnostic.txt", "../../diagnostic.txt"])
+async def test_file_attachment_forwarded_by_path(
+    monkeypatch: pytest.MonkeyPatch, _isolated_data_dir: Path, text: str | None, filename: str
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    block = {
+        "type": "input_file",
+        "filename": filename,
+        "file_data": f"data:text/plain;base64,{_TEXT_B64}",
+    }
+    msg = _attachment_message(block, text=text)
+    events = [e async for e in ex.run_turn([msg], [], "SYS")]
+
+    assert len(state["sent"]) == 1 and state["sent"][0]
+    if text is not None:
+        assert state["sent"] == [text]
+    assert any(isinstance(event, TurnComplete) and event.response == "ok" for event in events)
+    (attachments,) = state["sent_attachments"]
+    assert attachments is not None and len(attachments) == 1
+    attachment = attachments[0]
+    assert attachment["type"] == "file"
+    assert attachment["displayName"] == "diagnostic.txt"
+    path = Path(attachment["path"])
+    assert path.read_bytes() == b"DIAGNOSTIC_MARKER"
+    assert path.stat().st_mode & 0o077 == 0
+    assert path.parent.stat().st_mode & 0o077 == 0
+    assert path.is_relative_to(_isolated_data_dir)
+    await ex.close()
+    assert not path.parent.exists()
+
+
+@pytest.mark.asyncio
+async def test_image_attachment_forwarded_as_blob(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    block = {
+        "type": "input_image",
+        "filename": "diagram.png",
+        "image_url": f"data:image/png;base64,{_PNG_B64}",
+    }
+    _ = [
+        e async for e in ex.run_turn([_attachment_message(block, text="What is this?")], [], "SYS")
+    ]
+
+    assert state["sent"] == ["What is this?"]
+    assert state["sent_attachments"] == [
+        [{"type": "blob", "data": _PNG_B64, "mimeType": "image/png", "displayName": "diagram.png"}]
+    ]
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_turn_is_sent(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="seen")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    block = {"type": "input_image", "image_url": f"data:image/png;base64,{_PNG_B64}"}
+    events = [e async for e in ex.run_turn([_attachment_message(block)], [], "SYS")]
+
+    completes = [e for e in events if isinstance(e, TurnComplete)]
+    assert completes and completes[0].response == "seen"
+    assert len(state["sent"]) == 1 and state["sent"][0]
+    assert state["sent_attachments"][0][0]["type"] == "blob"
+    await ex.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"type": "input_file", "filename": "lost.txt", "file_id": "file_123"},
+        {"type": "input_image", "filename": "bad.png", "image_url": "data:image/png;base64,@@@"},
+        {"type": "input_file", "filename": "bad.txt", "file_data": "data:text/plain;base64,@@@"},
+        {"type": "input_image", "filename": "lost.png", "file_id": "file_456"},
+        {"type": "input_image", "filename": "remote.png", "image_url": "https://example.test/x"},
+        {"type": "input_image", "filename": "bad.png", "image_url": "data:image/png;base64"},
+        {"type": "input_image", "filename": "bad.png", "image_url": "data:image/png,abcd"},
+        {"type": "input_image", "filename": "bad.png", "image_url": "data:;base64,YQ=="},
+        {"type": "input_image", "filename": "bad.png", "image_url": "data:text/plain;base64,YQ=="},
+        {"type": "input_file", "filename": "bad.txt", "file_data": "data:text/plain;base64,YQ="},
+        {
+            "type": "input_file",
+            "filename": "bad\u0000.txt",
+            "file_data": f"data:text/plain;base64,{_TEXT_B64}",
+        },
+    ],
+)
+async def test_undeliverable_attachment_gets_visible_marker(
+    monkeypatch: pytest.MonkeyPatch, _isolated_data_dir: Path, block: dict[str, Any]
+) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [e async for e in ex.run_turn([_attachment_message(block, text="Look")], [], "SYS")]
+
+    assert state["sent"] == [f"Look\n[Attachment {block['filename']} could not be loaded]"]
+    assert state["sent_attachments"] == [None]
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_text_only_turn_sends_no_attachments(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = _install_fake_copilot(monkeypatch, [[_ev("ASSISTANT_MESSAGE", content="ok")]])
+    ex = CopilotExecutor(github_token="gho_x")
+    _ = [e async for e in ex.run_turn([_user("hi")], [], "SYS")]
+    assert state["sent"] == ["hi"]
+    assert state["sent_attachments"] == [None]
+    await ex.close()
+
+
+def test_first_turn_history_notes_earlier_attachments_only() -> None:
+    earlier = _attachment_message(
+        {"type": "input_file", "filename": "old.txt", "file_data": "data:text/plain;base64,"},
+        text="before",
+    )
+    latest = _attachment_message(
+        {"type": "input_image", "filename": "new.png", "image_url": "data:image/png;base64,"},
+        text="now",
+    )
+    prompt = _build_copilot_prompt(
+        [earlier, {"role": "assistant", "content": "noted"}, latest], is_first_turn=True
+    )
+    assert "user: before [earlier file attachment old.txt not re-sent]" in prompt
+    assert "user: now\n" in prompt
+    assert "new.png" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_attachment_cache_is_private_to_sdk_session(
+    monkeypatch: pytest.MonkeyPatch, _isolated_data_dir: Path
+) -> None:
+    state = _install_fake_copilot(monkeypatch)
+    block = {
+        "type": "input_file",
+        "filename": "same.txt",
+        "file_data": f"data:text/plain;base64,{_TEXT_B64}",
+    }
+    msg = _attachment_message(block, text="Read")
+    first = CopilotExecutor(github_token="gho_x")
+    second = CopilotExecutor(github_token="gho_x")
+    _ = [event async for event in first.run_turn([msg], [], "SYS")]
+    first_path = Path(state["sent_attachments"][-1][0]["path"])
+    _ = [event async for event in first.run_turn([msg], [], "SYS")]
+    assert state["sent_attachments"][-1][0]["path"] == str(first_path)
+    _ = [event async for event in second.run_turn([msg], [], "SYS")]
+    second_path = Path(state["sent_attachments"][-1][0]["path"])
+    assert first_path.parent != second_path.parent
+    assert len(state["create_kwargs"]) == 2
+    await first.close_session("conv1")
+    assert not first_path.exists()
+    assert second_path.read_bytes() == b"DIAGNOSTIC_MARKER"
+    _ = [event async for event in second.run_turn([msg], [], "CHANGED")]
+    third_path = Path(state["sent_attachments"][-1][0]["path"])
+    assert not second_path.exists()
+    assert third_path != second_path
+    assert third_path.read_bytes() == b"DIAGNOSTIC_MARKER"
+    await second.close()
+    assert not third_path.parent.exists()
+
+
+@pytest.mark.asyncio
+async def test_attachment_history_and_resize_notice_survive_session_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+    earlier = _attachment_message({"type": "input_file", "filename": "old.txt", "file_id": "old"})
+    image = {"type": "input_image", "image_url": f"data:image/png;base64,{_PNG_B64}"}
+    dimensions = {"width": 6000, "height": 4000}
+    latest = _attachment_message(image, framework_notice_block(dimensions), text="Look")
+    messages = [earlier, {"role": "assistant", "content": "noted"}, latest]
+    _ = [event async for event in ex.run_turn(messages, [], "SYS")]
+    assert "Conversation so far:" in state["sent"][0]
+    assert "[earlier file attachment old.txt not re-sent]" in state["sent"][0]
+    assert resize_notice(dimensions) in state["sent"][0]
+    assert state["sent_attachments"] == [
+        [{"type": "blob", "data": _PNG_B64, "mimeType": "image/png"}]
+    ]
+    _ = [event async for event in ex.run_turn([*messages, _user("Thanks")], [], "SYS")]
+    assert state["sent"][-1] == "Thanks"
+    assert state["sent_attachments"][-1] is None
+    assert len(state["create_kwargs"]) == 1
+    await ex.close()
+
+
+@pytest.mark.asyncio
+async def test_attachment_only_turn_respects_request_policy(
+    monkeypatch: pytest.MonkeyPatch, _isolated_data_dir: Path
+) -> None:
+    state = _install_fake_copilot(monkeypatch)
+    ex = CopilotExecutor(github_token="gho_x")
+    requests: list[dict[str, Any]] = []
+
+    async def deny(phase: str, ctx: dict[str, Any]) -> Any:
+        assert phase == "PHASE_LLM_REQUEST"
+        requests.append(ctx)
+        return _verdict("POLICY_ACTION_DENY", "blocked attachment")
+
+    ex._policy_evaluator = deny
+    msg = _attachment_message(
+        {
+            "type": "input_file",
+            "filename": "private.txt",
+            "file_data": f"data:text/plain;base64,{_TEXT_B64}",
+        }
+    )
+    events = [event async for event in ex.run_turn([msg], [], "SYS")]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert "blocked attachment" in events[0].message
+    assert requests == [
+        {
+            "model": "auto",
+            "messages_count": 1,
+            "tools_count": 0,
+            "system_prompt_preview": "SYS",
+            "last_user_message": "",
+        }
+    ]
+    assert state["sent"] == []
+    assert not _isolated_data_dir.exists()
+    await ex.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attachments_only", [False, True])
+async def test_attachment_delivery_through_real_sdk_send(
+    monkeypatch: pytest.MonkeyPatch, _isolated_data_dir: Path, attachments_only: bool
+) -> None:
+    sdk = pytest.importorskip("copilot.session")
+    import copilot
+
+    sent: list[dict[str, Any]] = []
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, str]:
+        if method == "session.send":
+            sent.append(params)
+            for event_type, data in [
+                ("assistant.message", {"messageId": "reply", "content": "seen"}),
+                ("session.idle", {}),
+            ]:
+                session._dispatch_event(
+                    sdk.session_event_from_dict(
+                        {
+                            "id": "00000000-0000-4000-8000-000000000001",
+                            "timestamp": "2026-10-28T00:00:00Z",
+                            "type": event_type,
+                            "data": data,
+                        }
+                    )
+                )
+            return {"messageId": "request"}
+        assert method == "session.destroy"
+        return {}
+
+    session = sdk.CopilotSession("sdk-test", types.SimpleNamespace(request=request))
+    client = types.SimpleNamespace(
+        start=AsyncMock(), stop=AsyncMock(), create_session=AsyncMock(return_value=session)
+    )
+    monkeypatch.setattr(copilot, "CopilotClient", lambda **kwargs: client)
+    ex = CopilotExecutor(github_token="fixture-token")
+    msg = _attachment_message(
+        {
+            "type": "input_image",
+            "filename": "image.png",
+            "image_url": f"data:image/png;base64,{_PNG_B64}",
+        },
+        {
+            "type": "input_file",
+            "filename": "diagnostic.txt",
+            "file_data": f"data:text/plain;base64,{_TEXT_B64}",
+        },
+        text=None if attachments_only else "Read both attachments.",
+    )
+    events = [event async for event in ex.run_turn([msg], [], "SYS")]
+    assert any(isinstance(event, TurnComplete) and event.response == "seen" for event in events)
+    (params,) = sent
+    assert params["prompt"]
+    if not attachments_only:
+        assert params["prompt"] == "Read both attachments."
+    image, file = params["attachments"]
+    assert image == {
+        "type": "blob",
+        "data": _PNG_B64,
+        "mimeType": "image/png",
+        "displayName": "image.png",
+    }
+    assert file["type"] == "file" and file["displayName"] == "diagnostic.txt"
+    path = Path(file["path"])
+    assert path.read_bytes() == b"DIAGNOSTIC_MARKER"
+    await ex.close()
+    assert not path.exists()
