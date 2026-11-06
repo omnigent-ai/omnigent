@@ -646,6 +646,32 @@ async def test_attach_terminal_await_launch_waits_for_waking_runner(
     assert len(attempts) == 3
 
 
+async def test_attach_terminal_await_launch_gives_up_on_a_runner_that_never_connects(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the launch wait, an unavailable runner still closes 1013 for a re-dial."""
+    monkeypatch.setattr("omnigent.server.routes.terminal_attach._RUNNER_WS_RETRY_S", 0.01)
+    monkeypatch.setattr("omnigent.entities.session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S", 0.1)
+    attempts: list[str] = []
+
+    def offline_factory(runner_path: str) -> object:
+        attempts.append(runner_path)
+        raise RunnerUnavailableWSError("runner is offline")
+
+    set_runner_ws_factory(offline_factory)
+
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    assert exc_info.value.code == 1013
+    assert len(attempts) > 1
+
+
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
     """
     When a runner WS factory is set, the server proxies frames

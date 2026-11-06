@@ -240,6 +240,28 @@ describe("control-mode terminal", () => {
     expect(terminalSessionMock.instances[1].url).not.toContain("await_launch");
   });
 
+  it("re-dials when the refusal arrives after the create already succeeded", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-retry2", "attach");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-retry2" />);
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    // The create's response lands first, then the early attach's 4404.
+    act(() => setTerminalLaunching("terminal_zsh_u-retry2", null));
+    act(() =>
+      terminalSessionMock.instances[0].onState({ kind: "closed", code: 4404, reason: "not found" }),
+    );
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(2));
+    expect(terminalSessionMock.instances[1].url).not.toContain("await_launch");
+    // The re-dial is a plain attach: a second refusal stays closed.
+    act(() =>
+      terminalSessionMock.instances[1].onState({ kind: "closed", code: 4404, reason: "not found" }),
+    );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(2);
+  });
+
   it("keeps a 4404 outside a launch closed, and a live attach untouched when its launch ends", async () => {
     vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-gone1" />);
@@ -247,6 +269,9 @@ describe("control-mode terminal", () => {
     act(() =>
       terminalSessionMock.instances[0].onState({ kind: "closed", code: 4404, reason: "not found" }),
     );
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(1);
+    expect(screen.queryByText("Starting shell…")).toBeNull();
     cleanup();
     terminalSessionMock.instances = [];
 

@@ -283,6 +283,9 @@ export function TerminalView({
   // Consecutive re-dial attempts in the current outage. A ref, not
   // state: it only feeds the scheduling effect, never the render.
   const reconnectAttemptsRef = useRef(0);
+  // Whether the current attach was dialed while its shell's create was in
+  // flight (``await_launch``); such an attach gets one re-dial on 4404.
+  const dialedDuringLaunchRef = useRef(false);
   // Epoch ms when the current connection opened, or null while down.
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
@@ -600,12 +603,14 @@ export function TerminalView({
           const h = getSessionHost(sessionId);
           return h && (!isDatabricksWorkspace() || !isHostKeyless(h)) ? h : undefined;
         })();
+        const awaitLaunch = isTerminalLaunching(terminalId);
+        dialedDuringLaunchRef.current = awaitLaunch;
         const relayUrl = buildAttachUrl(
           sessionId,
           terminalId,
           readOnly,
           computedHostId,
-          isTerminalLaunching(terminalId),
+          awaitLaunch,
         );
         const directUrl = directAttachUrl ? withAttachParams(directAttachUrl, readOnly) : undefined;
         // Never keep the user waiting on the direct path: this resolves
@@ -677,19 +682,17 @@ export function TerminalView({
 
   // An early attach can be refused (4404) before its own create registers the
   // terminal: an older runner ignores ``await_launch``, or the launch outlasted
-  // the server's wait. Re-dial once that create succeeds; a 4404 outside a
-  // launch stays a deliberate close.
-  const previousLaunchModeRef = useRef(launchMode);
+  // the server's wait. The refusal and the create's response arrive in either
+  // order, so re-dial once both have happened. The re-dial is a plain attach,
+  // so a 4404 outside a launch stays a deliberate close.
   useEffect(() => {
-    const previous = previousLaunchModeRef.current;
-    previousLaunchModeRef.current = launchMode;
-    if (previous !== "attach" || launchMode !== null) return;
-    const current = stateRef.current;
-    if (current.kind !== "closed" || current.code !== WS_CLOSE_TERMINAL_NOT_FOUND) return;
+    if (!dialedDuringLaunchRef.current || launchMode !== null) return;
+    if (state.kind !== "closed" || state.code !== WS_CLOSE_TERMINAL_NOT_FOUND) return;
+    dialedDuringLaunchRef.current = false;
     reconnectAttemptsRef.current = 0;
     disposeActiveSession();
     setConnectAttempt((attempt) => attempt + 1);
-  }, [launchMode, disposeActiveSession]);
+  }, [launchMode, state, disposeActiveSession]);
   const refusedDuringLaunch =
     launchMode === "attach" &&
     state.kind === "closed" &&
