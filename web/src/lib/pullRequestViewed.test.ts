@@ -256,16 +256,22 @@ describe("useViewedFiles", () => {
     const newer = renderHook(() => useViewedFiles(PR, "head2", newerHashes));
     act(() => newer.result.current.setMany(["a.ts"], true));
 
+    // The older tab is already mounted when another tab writes b.ts, without a storage event here.
     const older = renderHook(() => useViewedFiles(PR, "head1", hashes));
+    localStorage.setItem(KEY, stored({ ...readMarksFromStorage(), "b.ts": [hashes.get("b.ts")!] }));
     act(() => older.result.current.setMany(["a.ts"], true));
 
     expect(newer.result.current.viewed).toEqual(new Set(["a.ts"]));
     expect(newer.result.current.changed.size).toBe(0);
-    expect(older.result.current.viewed).toEqual(new Set(["a.ts"]));
+    expect(older.result.current.viewed).toEqual(new Set(["a.ts", "b.ts"]));
+    expect(readMarksFromStorage()).toEqual({
+      "a.ts": [newerHashes.get("a.ts"), hashes.get("a.ts")],
+      "b.ts": [hashes.get("b.ts")],
+    });
   });
 
-  it("keeps the three newest hashes of a file and drops the oldest", () => {
-    const aAt = (line: string) => hashesOf(`${PATCH_A.replace("+new", `+${line}`)}`);
+  it("keeps the three newest hashes of a file, and unmarking clears all of them", () => {
+    const aAt = (line: string) => hashesOf(PATCH_A.replace("+new", `+${line}`));
     const { result, rerender } = renderHook(
       ({ head, patchHashes }) => useViewedFiles(PR, head, patchHashes),
       { initialProps: { head: "h1", patchHashes: aAt("one") } },
@@ -281,45 +287,101 @@ describe("useViewedFiles", () => {
     }
     expect(JSON.parse(localStorage.getItem(KEY)!).marks["a.ts"]).toHaveLength(3);
 
-    // The first head's hash was dropped, so its content now reads as changed.
+    // Each retained version still reads as viewed. The dropped first version reads as changed.
+    for (const [head, line] of [
+      ["h2", "two"],
+      ["h3", "three"],
+      ["h4", "four"],
+    ] as const) {
+      rerender({ head, patchHashes: aAt(line) });
+      expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+    }
     rerender({ head: "h1", patchHashes: aAt("one") });
     expect(result.current.viewed.size).toBe(0);
     expect(result.current.changed).toEqual(new Set(["a.ts"]));
+
+    // Unmarking a retained version forgets every version, so none reads as changed afterwards.
+    rerender({ head: "h3", patchHashes: aAt("three") });
+    act(() => result.current.setMany(["a.ts"], false));
+    expect(readMarksFromStorage()).toEqual({});
+    for (const [head, line] of [
+      ["h1", "one"],
+      ["h2", "two"],
+      ["h4", "four"],
+    ] as const) {
+      rerender({ head, patchHashes: aAt(line) });
+      expect(result.current.changed.size).toBe(0);
+    }
   });
 
-  it("matches unverified stand-ins only on the head they were made for", () => {
+  it("stays silent for history recorded only without comparable hunks", () => {
     const { result, rerender } = renderHook(
       ({ head, patchHashes }) => useViewedFiles(PR, head, patchHashes),
       { initialProps: { head: "head1", patchHashes: new Map<string, string>() } },
     );
     act(() => result.current.setMany(["a.ts"], true));
-    expect(JSON.parse(localStorage.getItem(KEY)!).marks).toEqual({
-      "a.ts": [unverifiedPatchHash("head1")],
-    });
+    expect(readMarksFromStorage()).toEqual({ "a.ts": [unverifiedPatchHash("head1")] });
 
     // Missing from the patch on the new head: silently not viewed, with no changed flag.
     rerender({ head: "head2", patchHashes: new Map() });
     expect(result.current.viewed.size).toBe(0);
     expect(result.current.changed.size).toBe(0);
 
-    // Once the file has hunks again, its verified hash differs from the stand-in, so it reads as changed.
+    // Comparable hunks appear, but the only history is a stand-in: still silent.
     rerender({ head: "head2", patchHashes: new Map(hashes) });
-    expect(result.current.changed).toEqual(new Set(["a.ts"]));
+    expect(result.current.viewed.size).toBe(0);
+    expect(result.current.changed.size).toBe(0);
+
     rerender({ head: "head1", patchHashes: new Map() });
     expect(result.current.viewed).toEqual(new Set(["a.ts"]));
   });
 
+  it("reports a change when the file's history includes a comparable hash", () => {
+    const { result, rerender } = renderHook(
+      ({ head, patchHashes }) => useViewedFiles(PR, head, patchHashes),
+      { initialProps: { head: "head1", patchHashes: new Map<string, string>() } },
+    );
+    act(() => result.current.setMany(["a.ts"], true));
+
+    // Marked again once its hunks are comparable on head2: the history mixes both kinds.
+    rerender({ head: "head2", patchHashes: new Map(hashes) });
+    act(() => result.current.setMany(["a.ts"], true));
+    expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+
+    rerender({
+      head: "head3",
+      patchHashes: new Map(hashesOf(PATCH_A.replace("+new", "+newer") + PATCH_B)),
+    });
+    expect(result.current.viewed.size).toBe(0);
+    expect(result.current.changed).toEqual(new Set(["a.ts"]));
+  });
+
   it("keeps marks in memory when storage fails and reports them unsaved until a write succeeds", () => {
     const writes = failStorageWrites();
-    const first = renderHook(() => useViewedFiles(PR, "head1", hashes));
+    const first = renderHook(({ pr }) => useViewedFiles(pr, "head1", hashes), {
+      initialProps: { pr: PR },
+    });
     act(() => first.result.current.setMany(["a.ts"], true));
+    expect(first.result.current.persisted).toBe(false);
+    expect(first.result.current.viewed).toEqual(new Set(["a.ts"]));
+
+    // Another pull request has its own key, so it is not unsaved; coming back shows the marks again.
+    first.rerender({ pr: { ...PR, number: 8 } });
+    expect(first.result.current.persisted).toBe(true);
+    expect(first.result.current.viewed.size).toBe(0);
+    first.rerender({ pr: PR });
     expect(first.result.current.persisted).toBe(false);
     expect(first.result.current.viewed).toEqual(new Set(["a.ts"]));
     first.unmount();
 
+    // A denied read still shows the marks held in memory.
+    const reads = vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new DOMException("denied", "SecurityError");
+    });
     const remounted = renderHook(() => useViewedFiles(PR, "head1", hashes));
-    expect(remounted.result.current.persisted).toBe(false);
     expect(remounted.result.current.viewed).toEqual(new Set(["a.ts"]));
+    expect(remounted.result.current.persisted).toBe(false);
+    reads.mockRestore();
 
     writes.mockRestore();
     act(() => remounted.result.current.setMany(["b.ts"], true));
@@ -336,10 +398,16 @@ describe("useViewedFiles", () => {
     storageEvent(KEY);
     expect(result.current.viewed).toEqual(new Set(["a.ts"]));
 
-    failStorageWrites();
+    // Unsaved local marks are replaced, not merged, when another tab writes this key.
+    const writes = failStorageWrites();
     act(() => result.current.setMany(["b.ts"], true));
     expect(result.current.viewed).toEqual(new Set(["a.ts", "b.ts"]));
-    vi.restoreAllMocks();
+    expect(result.current.persisted).toBe(false);
+    writes.mockRestore();
+    localStorage.setItem(KEY, stored({ "a.ts": [hashes.get("a.ts")!] }));
+    storageEvent(KEY);
+    expect(result.current.viewed).toEqual(new Set(["a.ts"]));
+    expect(result.current.persisted).toBe(true);
 
     localStorage.clear();
     storageEvent(null);
@@ -365,6 +433,10 @@ describe("useViewedFiles", () => {
     ["a non-array hash list", JSON.stringify({ v: 2, marks: { "a.ts": "a1" }, updatedAt: 1 })],
     ["a non-string hash", JSON.stringify({ v: 2, marks: { "a.ts": [1] }, updatedAt: 1 })],
     ["a missing timestamp", JSON.stringify({ v: 2, marks: { "a.ts": ["a1"] } })],
+    [
+      "a non-numeric timestamp",
+      JSON.stringify({ v: 2, marks: { "a.ts": ["a1"] }, updatedAt: "1" }),
+    ],
   ])("reads %s as no marks", (_label, value) => {
     const staleHashes = new Map([["a.ts", "a1"]]);
     localStorage.setItem(KEY, value);
@@ -387,6 +459,7 @@ describe("storage retention", () => {
       JSON.stringify({ v: 1, paths: ["a.ts"], updatedAt: 1 }),
     );
     localStorage.setItem("omnigent:unrelated", "keep");
+    localStorage.setItem(`${KEY_PREFIX}corrupt`, "{");
     vi.setSystemTime(191 * DAY_MS);
     writeViewed(KEY, { "a.ts": ["h"] });
 

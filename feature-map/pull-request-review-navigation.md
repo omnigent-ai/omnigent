@@ -163,14 +163,16 @@ Component coverage for these helpers and views lives in
   tab still open on an older head adds its own hash without disturbing the newer
   head's mark. A file keeps its three newest hashes. A file that changes back to a
   version beyond those three shows as changed.
-- **Unmarking on a head can leave a changed badge.** Unmarking removes only the current
-  hash. If the file was viewed at an older hash, it reads **Changed since viewed**
-  until you mark it again.
+- **Unmarking forgets every head.** Unmarking a file clears all of its marks, including
+  the hashes an older head's tab recorded. The file then reads as unviewed on every
+  head, with no **Changed since viewed** badge.
 - **Unverified marks drop silently.** A file the fetched diff leaves out, a file with
   no text hunks, and a file whose hunks were cut short can't be compared. Its mark
   matches only on the head it was made for, and a mismatch shows no badge and no
-  notice. Files whose names git quotes (non-ASCII or special characters) have no parsed
-  diff in the Changes tab, so they always behave this way.
+  notice. A mark recorded only that way stays silent even after the file's hunks
+  become comparable; the badge needs at least one comparable mark. Files whose names
+  git quotes (non-ASCII or special characters) have no parsed diff in the Changes
+  tab, so they always behave this way.
 - **Filter and Hide viewed are not kept across reloads.** Hide viewed starts off.
 - **Thread navigation can clear a filter.** Previous and Next unresolved
   conversation reveal a conversation on a file the path filter or Hide viewed hides,

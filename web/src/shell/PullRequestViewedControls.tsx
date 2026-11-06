@@ -18,7 +18,6 @@ export function PullRequestViewedToggle({
   changed: boolean;
   onToggle: () => void;
 }) {
-  // The badge stacks under the checkbox, so the column is as wide as the badge.
   return (
     <div className="flex shrink-0 flex-col items-end gap-0.5">
       <label className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">

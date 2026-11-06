@@ -227,7 +227,10 @@ export function writeViewed(key: string, marks: ViewedMarks): { persisted: boole
   return { persisted };
 }
 
-/** Viewed when the current hash was marked; changed when it was marked only at other hashes. */
+/**
+ * Viewed when the current hash was marked. Changed when the current hunks can be compared and the
+ * file was marked at a comparable hash that differs from them. Unverified history alone is silent.
+ */
 function classify(
   marks: ViewedMarks,
   fingerprintOf: (path: string) => string,
@@ -237,7 +240,7 @@ function classify(
   for (const [path, hashes] of Object.entries(marks)) {
     const current = fingerprintOf(path);
     if (hashes.includes(current)) viewed.add(path);
-    else if (hashes.length > 0 && isVerified(current)) changed.add(path);
+    else if (isVerified(current) && hashes.some(isVerified)) changed.add(path);
   }
   return { viewed, changed };
 }
@@ -314,13 +317,15 @@ export function useViewedFiles(
       for (const path of paths) {
         const hash = fingerprintOf(path);
         const hashes = after.get(path) ?? [];
-        if (hashes.includes(hash) === viewed) continue;
-        modified = true;
-        // Only the current head's hash moves, so marks recorded at other heads stay as they are.
-        const remaining = hashes.filter((stored) => stored !== hash);
-        const next = viewed ? [...remaining, hash].slice(-MAX_HASHES_PER_PATH) : remaining;
-        if (next.length > 0) after.set(path, next);
-        else after.delete(path);
+        if (viewed) {
+          if (hashes.includes(hash)) continue;
+          modified = true;
+          after.set(path, [...hashes, hash].slice(-MAX_HASHES_PER_PATH));
+        } else if (hashes.includes(hash)) {
+          // Unmarking forgets every hash, so an older head's hash can't bring the badge back.
+          modified = true;
+          after.delete(path);
+        }
       }
       if (modified) writeViewed(storageKey, Object.fromEntries(after));
     },
