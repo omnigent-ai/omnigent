@@ -3180,6 +3180,7 @@ def register_events_routes(
             # Side chats share the source's runner and have no host. A categorical
             # source relaunch refusal consumes the message with its actionable
             # reason, like the host-bound relaunch below.
+            source_wait_started = time.monotonic()
             try:
                 runner_client, conv = await _recover_side_chat_runner_via_source(
                     conv,
@@ -3191,6 +3192,19 @@ def register_events_routes(
                     raise_host_refusal=True,
                 )
             except OmnigentError as exc:
+                if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                    offline_host_id = await _session_offline_host_id(
+                        conv, request.app.state, conversation_store
+                    )
+                    if offline_host_id is not None:
+                        _refuse_offline_host_send(
+                            headers=request.headers,
+                            session_id=session_id,
+                            runner_id=conv.runner_id,
+                            host_id=offline_host_id,
+                            waited_s=time.monotonic() - source_wait_started,
+                        )
+                    raise
                 if exc.code not in (
                     ErrorCode.HARNESS_NOT_CONFIGURED,
                     ErrorCode.WORKSPACE_MISSING,

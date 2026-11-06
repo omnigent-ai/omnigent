@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import Conversation
@@ -521,6 +522,80 @@ async def test_side_chat_recovery_redirects_when_source_host_is_on_another_repli
     ensure.assert_not_awaited()
     saved = store.get_conversation(side.id)
     assert saved is not None and saved.runner_id == "runner-exited"
+
+
+@pytest.mark.parametrize("source_state", ["no-launch", "replacement", "exited"])
+async def test_side_chat_unavailable_send_uses_source_host(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    source_state: str,
+) -> None:
+    """No launch leaves input unconsumed; acknowledged launches and exits still fail."""
+    store = SqlAlchemyConversationStore(db_uri)
+    agent = await create_test_agent(client)
+    source = store.create_conversation(
+        agent_id=agent["id"],
+        runner_id="runner-shared",
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    store.set_host_id(source.id, _HOST_ID, workspace="/workspace")
+    side = store.fork_conversation(
+        source.id,
+        extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source.id},
+    )
+    store.set_runner_id(side.id, "runner-shared")
+    if source_state == "exited":
+        app.state.runner_exit_reports.record(
+            "runner-shared", "runner process exited with code 1", owner=None
+        )
+
+    async def _launch(*_args: object):
+        store.replace_runner_id(source.id, "runner-replacement")
+        return SimpleNamespace(
+            runner_id="runner-replacement", error=None, error_code=None, acknowledged=True
+        )
+
+    launch = AsyncMock(side_effect=_launch)
+    monkeypatch.setattr(orchestration, "_launch_runner_on_host", launch)
+    monkeypatch.setattr(sessions, "_get_runner_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(sessions, "_wait_for_runner_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        orchestration, "_wait_for_host_bound_runner_client", AsyncMock(return_value=None)
+    )
+    monkeypatch.setattr(app.state.runner_router, "host_is_on_another_replica", lambda _host: False)
+    # A saved source binding can outlive its host's registration.
+    monkeypatch.setattr(
+        app.state, "host_store", SimpleNamespace(get_host=lambda _host: None), raising=False
+    )
+    if source_state == "replacement":
+        monkeypatch.setattr(
+            app.state.host_registry, "get", lambda _host: SimpleNamespace(owner=None)
+        )
+
+    response = await client.post(
+        f"/v1/sessions/{side.id}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+    items = store.list_items(side.id).data
+    assert launch.await_count == (1 if source_state == "replacement" else 0)
+    assert store.list_items(source.id).data == []
+    assert store.list_pending_inputs(side.id) == []
+    if source_state != "no-launch":
+        assert response.status_code == 202, response.text
+        assert [item.data.code for item in items if item.type == "error"] == [
+            "runner_failed_to_start"
+        ]
+    else:
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "runner_unavailable"
+        assert "not responding" in response.json()["error"]["message"]
+        assert items == []
+        assert (await client.get(f"/v1/sessions/{side.id}")).json()["status"] != "failed"
 
 
 @pytest.mark.parametrize(

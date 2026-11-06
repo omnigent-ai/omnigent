@@ -5131,7 +5131,8 @@ async def ensure_runner_connected(
     :param runner_router: The ``RunnerRouter``, or ``None`` for in-process.
     :param raise_host_refusal: Raise typed, non-persisting errors when the
         host rejects launch because the harness is unavailable or the
-        workspace is gone. Resource callers keep the legacy ``False``
+        workspace is gone, or no host could take the launch and no runner
+        exit is known. Resource callers keep the legacy ``False``
         behavior; retry recovery opts in because it has no message to persist.
     :returns: ``(runner_client, conv)`` — the client is ``None`` when no
         runner is reachable and none is wakeable; ``conv`` is re-read after
@@ -5182,6 +5183,7 @@ async def ensure_runner_connected(
     if runner_client is None and conv.host_id is not None:
         host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
         relaunched_runner_id: str | None = None
+        launch_unavailable = False
         if host_conn is not None:
             # A session whose runner is merely booting already has a runner_id
             # before its tunnel registers. Mirror post_event's connect grace:
@@ -5268,6 +5270,8 @@ async def ensure_runner_connected(
                 runner_router,
                 conversation=conv,
             )
+        else:
+            launch_unavailable = True
 
         if runner_client is None:
             if (
@@ -5296,6 +5300,14 @@ async def ensure_runner_connected(
                     runner_exit_reports=getattr(app_state, "runner_exit_reports", None),
                 )
             conv = await _reread()
+        if runner_client is None and launch_unavailable and raise_host_refusal:
+            reports = getattr(app_state, "runner_exit_reports", None)
+            if conv.runner_id is None or reports is None or not reports.get(conv.runner_id):
+                raise OmnigentError(
+                    "The host for this session is not responding. "
+                    "Wait for it to reconnect and send the message again.",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
 
     return runner_client, conv
 

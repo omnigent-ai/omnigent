@@ -2266,6 +2266,7 @@ def create_app(
     # and WSTunnelTransport to the same session registry.
     app.state.tunnel_registry = tunnel_registry
     app.state.runner_router = runner_router
+    app.state.runner_exit_reports = runner_exit_reports
     app.state.runner_session_initializer = runner_session_initializer
     app.state.background_title_coordinator = background_title_coordinator
     app.state.host_registry = host_registry
