@@ -1,6 +1,8 @@
 import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
+import userEvent from "@testing-library/user-event";
 import type { Bubble } from "@/lib/renderItems";
 import { Conversation, ConversationContent } from "@/components/ai-elements/conversation";
 import { useChatStore } from "@/store/chatStore";
@@ -288,6 +290,91 @@ it("keeps every action row hover-only when the final message is from the user", 
 
   for (const button of screen.getAllByRole("button", { name: "Copy" })) {
     expect(actionFooter(button)).toHaveClass("md:opacity-0");
+  }
+});
+
+it("toggles mobile message actions on tap and shows the latest assistant's actions by default", async () => {
+  const user = userEvent.setup();
+  const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+  const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+    ...mediaQuery,
+    media: query,
+    matches: query === "(max-width: 767.98px)",
+  }));
+  try {
+    const olderReply = {
+      ...assistantBubble,
+      items: [
+        { kind: "text" as const, itemId: "assistant-1", text: "[Details](#details)", final: true },
+      ],
+    };
+    const latestReply = { ...assistantBubble, responseId: "response-2", stableId: "response-2" };
+    const followUp = { ...bubble, itemId: "user-2" };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = render(messageList([bubble, olderReply, latestReply, followUp], true, false), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    const footers = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
+
+    expect(footers[0]).toHaveClass("invisible", "opacity-0");
+    expect(footers[1]).toHaveClass("invisible", "opacity-0");
+    expect(footers[2]).toHaveClass("opacity-100");
+    expect(footers[2]).not.toHaveClass("invisible");
+    expect(footers[3]).toHaveClass("invisible", "opacity-0");
+
+    const olderMessage = view.container.querySelector<HTMLElement>(
+      '[data-message-id="response-1"]',
+    )!;
+    fireEvent.click(within(olderMessage).getByRole("link", { name: "Details" }));
+    expect(footers[1]).toHaveClass("invisible");
+    const reveal = within(olderMessage).getByRole("button", { name: "Show message actions" });
+    expect(document.getElementById(reveal.getAttribute("aria-controls")!)).toBe(footers[1]);
+    reveal.focus();
+    await user.keyboard("{Enter}");
+    expect(reveal).toHaveAttribute("aria-expanded", "true");
+    expect(footers[1]).not.toHaveClass("invisible");
+    await user.click(within(olderMessage).getByRole("button", { name: "Copy" }));
+    expect(footers[1]).not.toHaveClass("invisible");
+    reveal.focus();
+    await user.keyboard(" ");
+    expect(reveal).toHaveAttribute("aria-expanded", "false");
+    expect(footers[1]).toHaveClass("invisible");
+
+    fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
+    fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
+    expect(footers[0]).not.toHaveClass("invisible");
+    expect(footers[1]).not.toHaveClass("invisible");
+    expect(footers[3]).toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="user-1"]')!);
+    fireEvent.click(view.container.querySelector('[data-message-id="response-1"]')!);
+    expect(footers[0]).toHaveClass("invisible");
+    expect(footers[1]).toHaveClass("invisible");
+
+    view.rerender(
+      messageList(
+        [
+          bubble,
+          olderReply,
+          latestReply,
+          followUp,
+          { ...assistantBubble, responseId: "response-3", stableId: "response-3" },
+        ],
+        false,
+        true,
+      ),
+    );
+    const updatedFooters = screen.getAllByRole("button", { name: "Copy" }).map(actionFooter);
+    expect(updatedFooters[2]).toHaveClass("invisible");
+    expect(updatedFooters[4]).toHaveClass("opacity-100");
+    expect(updatedFooters[4]).not.toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
+    expect(updatedFooters[4]).toHaveClass("invisible");
+    fireEvent.click(view.container.querySelector('[data-message-id="response-3"]')!);
+    expect(updatedFooters[4]).not.toHaveClass("invisible");
+  } finally {
+    matchMedia.mockRestore();
   }
 });
 

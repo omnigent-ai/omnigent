@@ -409,8 +409,13 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
 
-**Mobile** (either composer on a phone-sized viewport): the same controls with
-collapsed labels.
+**Mobile** (either composer on a phone-sized viewport): host and harness/model
+controls live in the top-right glass group. The composer starts as one row with
+Add, hint text, microphone, and Send; focusing the textarea expands it into a
+stacked layout with permission controls. Add alone does not expand it. On the
+landing page, choose the working directory below the headline; in a session,
+find the current directory in the session-actions menu. Running background
+tasks remain accessible from the session header.
 
 **Side chat** (from an existing session you own): choose **+ → Start a new side
 chat** in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on

@@ -6291,6 +6291,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_bundle_model_override": {
+            "default": true,
+            "title": "Session Bundle Model Override",
+            "type": "boolean"
+          },
           "session_claude_sdk_clear": {
             "default": false,
             "title": "Session Claude Sdk Clear",

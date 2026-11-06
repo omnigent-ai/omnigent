@@ -42,8 +42,8 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume. Only the session's owner can start side chats. A side
-  chat started on one device is available from **Browse side chats** on the
-  owner's other devices. Opening and closing tabs stays local.
+  chat started on one device appears as an existing side-chat tab on the
+  owner's other devices. Selection and closing tabs stay local.
 - `side-chat-settings`: choose a supported model or effort in the side-chat composer;
   selections apply to that chat's next turn independently of its parent, in the
   desktop panel and mobile drawer. Generic side chats allow selection before or
@@ -246,7 +246,9 @@ Failed sends restore text and supported attachments unless the cell has a newer 
 Quoted replies recover as serialized text.
 
 **Import:** open Settings → Import sessions, or choose **Import your recent
-sessions** on the empty landing. Choose a machine, harness, and recent count
+sessions** on the empty landing. The X beside the landing button dismisses the
+suggestion and keeps it hidden after reload in this browser; Settings → Import
+sessions remains available. Choose a machine, harness, and recent count
 or session ID. After starting, go Back to the session list; its heading shows
 progress and links back to Settings. Imported sessions appear in the normal list,
 except Codex threads archived in Codex, which land in Archived, so the list can
@@ -287,7 +289,21 @@ actions (mark as read or unread, archive, unarchive, delete).
 pin, fork, export, rename, mark as unread, add to project, archive or
 unarchive, and delete. Clicking the title also renames, and the title's folder
 tag also moves the session into a project. Sub-agent sessions hide owner-only
-actions.
+actions. On phones, the sidebar toggle has a circular glass surface; host,
+harness/model, background tasks, and session actions share the top-right glass
+group. Buttons are 44px tall with 20px icons. These surfaces use the shared
+React Bits glass treatment with a transparent fill, diffused backdrop, subtle
+rim, and soft shadow. Menus and the sidebar use the more strongly blurred menu
+variant. Browsers without backdrop filtering receive a solid theme surface.
+The header controls sit 16px from the top and sides.
+The mobile header omits the session title and fading backdrop,
+retaining a Back link for child sessions.
+
+**Desktop Session menu:** in the desktop app, Session → Pin (⌥⌘P), Archive
+(⇧⌘A) and Fork Session… (⌥⌘F) act on the open session (Ctrl+Alt+P,
+Ctrl+Shift+A and Ctrl+Alt+F on Windows/Linux). They are enabled only while the
+session's header menu offers the action, and the open session's sidebar row
+shows the same chords on its pin button and in its row menu.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
@@ -487,10 +503,11 @@ an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
-On another device, choose **Browse side chats** in the Workspace toolbar or
-mobile drawer, then select a chat to open it. The picker fetches 20 at a time;
-**Next 20** loads another page. Existing local tabs keep their order. Side chats
-created before server discovery was added remain local to their original browser.
+On another device, open the same parent: saved side chats appear in the existing
+Workspace tab strip or mobile Side chats drawer. Discovery fetches up to 20 chats
+without changing the active panel or tab. Tabs closed on this device stay closed
+after reload; other devices keep their tabs. Side chats created before server
+discovery was added remain local to their original browser.
 In the Electron desktop app, Cmd/Ctrl+W also closes the selected side-chat tab
 in a visible workspace rail. With no closable visible tab it returns to the
 new-session page; Cmd/Ctrl+Shift+W closes the window. Grid workspaces are
@@ -899,7 +916,7 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`side-chat-lifecycle`, another device:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_follows_the_user_to_another_device`
   starts a side chat in the desktop rail, opens it from a phone-sized browser
-  context with its own storage using **Browse side chats**, sends a follow-up,
+  context with its own storage using the automatically restored tab, sends a follow-up,
   closes it there, and checks that only the phone tab stays closed after reload.
 - **`side-chat-lifecycle`, direct chat-only URL (browser contract):**
   `tests/browser_ui/chat/test_side_chat_resume.py::test_runnerless_side_chat_sends_from_its_direct_url`
@@ -978,7 +995,9 @@ plain `uv run pytest`, which starts a private server for the test.
   exact-ID imports through a real host when a transcript exceeds the tunnel's
   message cap; the batch summary links to all three sessions in the sidebar.
   Component coverage checks compact large batches, failure expansion, retry
-  after navigation, and collapsed headings.
+  after navigation, and collapsed headings. `web/src/shell/NewChatDialog.test.tsx`
+  covers the landing import link and dismissal, including persistence after
+  remount and unavailable storage.
 
 - **`resume-imported` (own environment):**
   `tests/e2e_ui/sessions/test_imported_session_resume.py::test_imported_session_resumes_onto_chosen_local_host`
@@ -1094,7 +1113,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
 
-For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
 siblings stay open. If stopping the side chat fails, its tab, draft and queued
 messages must remain. Narrow the desktop window below 768 pixels and repeat:

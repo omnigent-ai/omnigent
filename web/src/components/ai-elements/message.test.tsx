@@ -1,7 +1,19 @@
 import userEvent from "@testing-library/user-event";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
+import { useApproveHotkey } from "@/hooks/useApproveHotkey";
+import type { AnyBlock } from "@/lib/blocks";
 import { setEmbedRoot } from "@/lib/host";
+import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
 import { Reasoning, ReasoningContent } from "./reasoning";
 import {
@@ -397,6 +409,51 @@ describe("a streaming Mermaid fence", () => {
   });
 });
 
+it("leaves Escape to the fullscreen diagram while a question waits", async () => {
+  vi.stubGlobal("IntersectionObserver", VisibleIntersectionObserver);
+  const originalGetBBox = Object.getOwnPropertyDescriptor(SVGElement.prototype, "getBBox");
+  Object.defineProperty(SVGElement.prototype, "getBBox", {
+    configurable: true,
+    value: () => ({ x: 0, y: 0, width: 100, height: 40 }),
+  });
+  const onReject = vi.fn();
+  try {
+    render(
+      <>
+        <MessageResponse>{"```mermaid\nflowchart LR\n  Alpha --> Beta\n```"}</MessageResponse>
+        <AskUserQuestionForm
+          elicitationId="elic_pick"
+          questions={[
+            { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+          ]}
+          onSubmit={vi.fn()}
+          onReject={onReject}
+          keyboardActive
+        />
+      </>,
+    );
+    await waitFor(() => expect(document.querySelector('svg[id^="mermaid-"]')).not.toBeNull(), {
+      timeout: 10_000,
+    });
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    expect(screen.getByTitle("Exit fullscreen")).toBeInTheDocument();
+    // Focus stays on the page, outside the overlay.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+
+    // Also when focus was tabbed back into the question behind the overlay.
+    fireEvent.click(screen.getByTitle("View fullscreen"));
+    const custom = screen.getByTestId("ask-user-question-custom-input");
+    custom.focus();
+    fireEvent.keyDown(custom, { key: "Escape" });
+    expect(screen.queryByTitle("Exit fullscreen")).toBeNull();
+    expect(onReject).not.toHaveBeenCalled();
+  } finally {
+    if (originalGetBBox) Object.defineProperty(SVGElement.prototype, "getBBox", originalGetBBox);
+    else delete (SVGElement.prototype as { getBBox?: unknown }).getBBox;
+  }
+}, 15_000);
+
 it("preserves ordinary code fences in reasoning", () => {
   const { container } = render(
     <Reasoning open>
@@ -434,6 +491,26 @@ describe("MessageResponse table fullscreen", () => {
     expect(screen.getByRole("dialog", { name: "View fullscreen" })).toBeInTheDocument();
     fireEvent.keyDown(document, { key: "Escape" });
     expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+  });
+
+  it("closes the fullscreen table with Escape without declining a pending approval", async () => {
+    const { submitApproval } = useChatStore.getState();
+    const submit = vi.fn();
+    useChatStore.setState({
+      blocks: [{ type: "elicitation", elicitationId: "elic_1", status: "pending" }] as AnyBlock[],
+      submitApproval: submit,
+    });
+    try {
+      renderHook(() => useApproveHotkey());
+      render(<MessageResponse>{tableMarkdown}</MessageResponse>);
+      // Opening fullscreen leaves focus on the page, outside the overlay.
+      fireEvent.click(await screen.findByRole("button", { name: "View fullscreen" }));
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      expect(screen.queryByRole("dialog", { name: "View fullscreen" })).toBeNull();
+      expect(submit).not.toHaveBeenCalled();
+    } finally {
+      useChatStore.setState({ blocks: [], submitApproval });
+    }
   });
 });
 

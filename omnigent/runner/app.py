@@ -5283,6 +5283,26 @@ def create_runner_app(
             from omnigent.runner.slow_io import run_slow_io
             from omnigent.runner.tool_dispatch import _maybe_signal_changed_files
 
+            async def _read_text(path: str) -> str | None:
+                environment = resource_registry.resolve_environment(
+                    _captured_session_id, "default", relay_spec
+                )
+                result = await environment.read(path, max_bytes=1_048_576, regular_only=True)
+                content = result.get("content")
+                return content if not result.get("error") and isinstance(content, str) else None
+
+            async def _read_edited_text(path: str) -> str | None:
+                try:
+                    return await _read_text(path)
+                except Exception:
+                    _logger.debug(
+                        "could not read %r after a native edit",
+                        path,
+                        exc_info=True,
+                        extra={"session_id": _captured_session_id},
+                    )
+                    return None
+
             try:
                 changes = native_file_changes(payload)
                 if not changes:
@@ -5294,20 +5314,11 @@ def create_runner_app(
                     for change in changes:
                         try:
                             if registry.needs_snapshot(change.path):
-                                current = None
-                                if change.patch is not None:
-                                    environment = resource_registry.resolve_environment(
-                                        _captured_session_id, "default", relay_spec
-                                    )
-                                    result = await environment.read(
-                                        change.move_path or change.path,
-                                        max_bytes=1_048_576,
-                                        regular_only=True,
-                                    )
-                                    if not result.get("error") and isinstance(
-                                        result.get("content"), str
-                                    ):
-                                        current = result["content"]
+                                current = (
+                                    await _read_text(change.move_path or change.path)
+                                    if change.patch is not None
+                                    else None
+                                )
                                 original = await run_slow_io(
                                     resolve_native_original, change, current
                                 )
@@ -5323,7 +5334,12 @@ def create_runner_app(
                                 exc_info=True,
                                 extra={"session_id": _captured_session_id},
                             )
-                        registry.record_change(change.path, change.operation, _captured_session_id)
+                        await registry.record_tracked_change(
+                            change.path,
+                            change.operation,
+                            _captured_session_id,
+                            functools.partial(_read_edited_text, change.path),
+                        )
                 _maybe_signal_changed_files(
                     _captured_session_id,
                     _publish_event,

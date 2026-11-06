@@ -675,8 +675,8 @@ def test_side_chat_follows_the_user_to_another_device(
         phone.get_by_role("button", name="Conversation actions").click()
         phone.get_by_role("menuitem", name="Side chats").click()
         drawer = phone.get_by_test_id("side-chats-panel-drawer")
-        drawer.get_by_role("button", name="Browse side chats").click()
-        phone.get_by_role("menuitem").filter(has_text="Side chat").click()
+        drawer.get_by_role("tab", name="Side chat 1", exact=True).click()
+        expect(phone.get_by_role("button", name="Browse side chats")).to_have_count(0)
         expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible()
         # The parent history the fork copied stays hidden here too.
         expect(drawer.locator(_ASSISTANT).filter(has_text=parent_reply)).to_have_count(0)
@@ -699,7 +699,7 @@ def test_side_chat_follows_the_user_to_another_device(
         phone.get_by_role("button", name="Conversation actions").click()
         phone.get_by_role("menuitem", name="Side chats").click()
         expect(drawer).to_be_visible()
-        expect(drawer.get_by_role("button", name="Browse side chats")).to_be_visible()
+        expect(drawer.get_by_role("button", name="Browse side chats")).to_have_count(0)
         expect(drawer.get_by_role("tab", name="Side chat 1", exact=True)).to_have_count(0)
 
     page.reload()
