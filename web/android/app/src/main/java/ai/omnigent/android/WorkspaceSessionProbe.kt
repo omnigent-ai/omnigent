@@ -36,17 +36,21 @@ internal class WorkspaceSessionProbe(
         pageUri: URI,
         dbauthValue: String,
     ): WorkspaceSessionCheck {
-        val identityUri =
-            URI(pageUri.scheme, pageUri.authority, "$WORKSPACE_UI_PATH/v1/me", null, null)
+        // Any failure is "no verdict": an exception here would kill the app on resume.
         val request =
-            SessionHttpRequest(
-                uri = identityUri,
-                headers = mapOf("Cookie" to "DBAUTH=$dbauthValue", "Accept" to "application/json"),
-            )
+            try {
+                SessionHttpRequest(
+                    uri = identityUri(pageUri),
+                    headers =
+                        mapOf("Cookie" to "DBAUTH=$dbauthValue", "Accept" to "application/json"),
+                )
+            } catch (_: Exception) {
+                return WorkspaceSessionCheck.Unknown
+            }
         val response =
             try {
                 transport.execute(request)
-            } catch (_: DatabricksSessionException) {
+            } catch (_: Exception) {
                 return WorkspaceSessionCheck.Unknown
             }
         return when {
@@ -59,6 +63,9 @@ internal class WorkspaceSessionProbe(
         }
     }
 
+    private fun identityUri(pageUri: URI): URI =
+        URI(pageUri.scheme, pageUri.authority, "$WORKSPACE_UI_PATH/v1/me", null, null)
+
     private fun redirectsToSignIn(
         requested: URI,
         response: SessionHttpResponse,
@@ -69,8 +76,8 @@ internal class WorkspaceSessionProbe(
                 ?.value
                 ?.singleOrNull()
                 ?: return false
-        val target = runCatching { requested.resolve(location) }.getOrNull() ?: return false
-        return DatabricksWebSession.isLoginPath(target.path)
+        val path = runCatching { requested.resolve(location) }.getOrNull()?.path ?: return false
+        return DatabricksWebSession.isLoginPath(path)
     }
 
     private companion object {

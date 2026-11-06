@@ -76,6 +76,23 @@ class WorkspaceSessionProbeTest {
         assertEquals(WorkspaceSessionCheck.Unknown, probe.check(page, "value"))
     }
 
+    @Test
+    fun `any unexpected transport failure keeps the session`() {
+        val probe = WorkspaceSessionProbe { throw IllegalStateException("bad stream") }
+
+        assertEquals(WorkspaceSessionCheck.Unknown, probe.check(page, "value"))
+    }
+
+    @Test
+    fun `opaque redirect target without a path is not a rejection`() {
+        val transport = RecordingTransport(302, mapOf("Location" to listOf("mailto:someone")))
+
+        assertEquals(
+            WorkspaceSessionCheck.Unknown,
+            WorkspaceSessionProbe(transport).check(page, "value"),
+        )
+    }
+
     private class RecordingTransport(
         private val status: Int,
         private val headers: Map<String, List<String>> = emptyMap(),
