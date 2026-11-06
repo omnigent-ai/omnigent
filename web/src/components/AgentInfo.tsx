@@ -35,7 +35,7 @@ import {
   type PolicyRegistryEntry,
 } from "@/hooks/usePolicies";
 import { usePermissions, useSessionOwner } from "@/hooks/usePermissions";
-import { isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
+import { isEditorLevel, isOwnerLevel, isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import { getCurrentUserId } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -59,6 +59,10 @@ import { copyText } from "@/lib/clipboard";
 import { useChatStore } from "@/store/chatStore";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useSessionHostVersion } from "@/hooks/RunnerHealthProvider";
+import { useSession } from "@/hooks/useSession";
+import { useUpdateSessionLabels } from "@/hooks/useSessionLabels";
+import { LabelEditor } from "@/components/LabelEditor";
+import { userLabelEntries } from "@/lib/sessionLabels";
 
 const MCP_SERVERS_UPDATED_TOAST = (
   <span className="text-ui">MCP servers updated. Restart the session to apply changes.</span>
@@ -1204,6 +1208,35 @@ function McpServersSection({
 }
 
 // ---------------------------------------------------------------------------
+// Session labels section
+// ---------------------------------------------------------------------------
+
+/**
+ * The session's user labels, editable by anyone with edit access. Hidden for
+ * a read-only viewer when there are none to show.
+ */
+function SessionLabelsSection({ sessionId, editable }: { sessionId: string; editable: boolean }) {
+  const { session } = useSession(sessionId);
+  const updateLabels = useUpdateSessionLabels(sessionId);
+  const labels = session?.labels;
+  if (!editable && userLabelEntries(labels).length === 0) return null;
+
+  return (
+    <div className="flex flex-col gap-1.5 py-3" data-testid="agent-info-labels">
+      <SectionLabel>Labels</SectionLabel>
+      <LabelEditor
+        labels={labels}
+        readOnly={!editable}
+        disabled={!session}
+        onSet={(key, value) => updateLabels.mutateAsync({ [key]: value })}
+        onRemove={(key) => updateLabels.mutateAsync({ [key]: null })}
+        testIdPrefix="agent-info-labels-editor"
+      />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Session policies section (user-editable only)
 // ---------------------------------------------------------------------------
 
@@ -1471,6 +1504,9 @@ export function AgentInfoContent({
             )}
           </div>
         )}
+      {sessionId && (
+        <SessionLabelsSection sessionId={sessionId} editable={isEditorLevel(permissionLevel)} />
+      )}
       <McpServersSection
         sessionId={sessionId}
         servers={servers}
