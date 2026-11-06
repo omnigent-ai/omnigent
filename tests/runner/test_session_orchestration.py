@@ -74,6 +74,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     session_id = "1234567890123456" if numeric_id else uuid4().hex
     register = Mock()
     monkeypatch.setattr(subagent_work, "register_child_session", register)
+    register_work = Mock()
+    monkeypatch.setattr(subagent_work, "register_subagent_work", register_work)
     requests = []
 
     def handler(request):
@@ -96,6 +98,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
             return httpx.Response(200, json=info)
         if request.url.path.endswith("/events"):
             return httpx.Response(202, json={"queued": True})
+        if request.method == "GET":
+            return httpx.Response(200, json={"id": session_id, "parent_session_id": "manager"})
         return httpx.Response(201, json={"id": session_id, "agent_id": "worker"})
 
     async with httpx.AsyncClient(
@@ -139,18 +143,25 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     assert "error" not in result, result
     requests = [request for request in requests if request.url.path != "/v1/info"]
     assert result["conversation_id"] == session_id
-    assert len(requests) == (2 if placement == "same_host" else 1)
     body = json.loads(requests[0].content)
     assert not {"project_id", "workspace", "git"} & body.keys()
     if placement == "child":
-        assert requests[0].url.path == "/v1/sessions"
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("POST", "/v1/sessions"),
+            ("GET", "/v1/sessions/manager"),
+            ("GET", f"/v1/sessions/{session_id}"),
+            ("PATCH", f"/v1/sessions/{session_id}"),
+            ("POST", f"/v1/sessions/{session_id}/events"),
+        ]
         assert body["parent_session_id"] == "manager"
-        register.assert_called_once()
+        assert register.call_args.kwargs["parent_session_id"] == "manager"
+        assert register_work.call_args.kwargs["parent_session_id"] == "manager"
     else:
         assert requests[0].url.path == "/v1/sessions/orchestrated"
         assert "parent_session_id" not in body
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
         assert result["agent_id"] == "worker"
+        assert len(requests) == (2 if placement == "same_host" else 1)
         assert result["title"] == "Worker task"
         assert result["project_id"] is None
         assert result["project_name"] is None
@@ -165,7 +176,8 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert body["initial_input"]["data"]["content"][0]["text"] == "Start"
         assert "initial_items" not in body
     elif placement == "child":
-        assert body["initial_items"][0]["data"]["content"][0]["text"] == "Start"
+        assert "initial_items" not in body
+        assert json.loads(requests[-1].content)["data"]["content"][0]["text"] == "Start"
     else:
         assert "initial_items" not in body
         assert requests[1].url.path == f"/v1/sessions/{session_id}/events"
