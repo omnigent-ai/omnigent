@@ -1362,6 +1362,7 @@ def materialize_codex_provider_config(
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
     from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    from omnigent.onboarding.ucode_setup import refresh_ucode_auth_config
 
     gateway_providers = {
         name: provider
@@ -1437,6 +1438,12 @@ def materialize_codex_provider_config(
         effective = resolved if isinstance(resolved, Mapping) else provider_config
         base_url = effective.get("base_url")
         if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            auth = provider_config.get("auth")
+            if isinstance(auth, (tomlkit.items.Table, tomlkit.items.InlineTable)):
+                original_auth = auth.unwrap()
+                repaired_auth = refresh_ucode_auth_config(original_auth)
+                if repaired_auth is not original_auth:
+                    provider_config["auth"] = repaired_auth
             headers = provider_config.get("http_headers")
             effective_headers = effective.get("http_headers")
             attributed = with_gateway_attribution(

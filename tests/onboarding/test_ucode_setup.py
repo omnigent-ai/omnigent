@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 import types
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -16,8 +18,94 @@ from omnigent.onboarding.ucode_setup import (
     configure_ucode_for_workspace,
     find_ucode_command,
     model_gateway_workspace_urls,
+    refresh_ucode_auth_command,
+    refresh_ucode_auth_config,
     ucode_workspace_exists,
 )
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "existing",
+        "outside-archive",
+        "custom-command",
+        "relative-original",
+        "unsupported-argument",
+        "no-replacement",
+        "relative-replacement",
+        "unrelated-ug",
+        "cached-replacement",
+    ],
+)
+def test_refresh_ucode_auth_preserves_unrecoverable_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    original = tmp_path / "cache/archive-v0/removed/bin/ug"
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    installed = tools / "ug"
+    installed.write_text("#!/bin/sh\n# from ucode.cli import main\n")
+    installed.chmod(0o755)
+    arguments = ["auth-token", "--profile", "fixture"]
+    if case == "existing":
+        original.parent.mkdir(parents=True)
+        original.write_text("original helper")
+    elif case == "outside-archive":
+        original = tmp_path / "custom/bin/ug"
+    elif case == "custom-command":
+        arguments[0] = "configure"
+    elif case == "relative-original":
+        original = Path("cache/archive-v0/removed/bin/ug")
+    elif case == "unsupported-argument":
+        arguments += ["--custom-option", "value"]
+    elif case == "no-replacement":
+        installed.unlink()
+    elif case == "relative-replacement":
+        (tools / "uvx").write_bytes(installed.read_bytes())
+        (tools / "uvx").chmod(0o755)
+        monkeypatch.chdir(tmp_path)
+        tools = Path("tools")
+    elif case == "unrelated-ug":
+        installed.write_text("#!/bin/sh\necho unrelated-ugrep\n")
+    elif case == "cached-replacement":
+        cached = tmp_path / "cache/archive-v0/other/bin/ug"
+        cached.parent.mkdir(parents=True)
+        installed.rename(cached)
+        installed.symlink_to(cached)
+    monkeypatch.setenv("PATH", str(tools))
+    command = shlex.join([str(original), *arguments])
+    assert refresh_ucode_auth_command(command) == command
+    for auth in (
+        {"command": str(original), "args": arguments, "timeout_ms": 15000},
+        {"command": "/bin/sh", "args": ["-c", command], "refresh_interval_ms": 60000},
+    ):
+        assert refresh_ucode_auth_config(auth) is auth
+
+
+@pytest.mark.parametrize("suffix", [" | cat", " --profile $PROFILE", " --profile 'unfinished"])
+def test_refresh_ucode_auth_preserves_shell_expressions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suffix: str
+) -> None:
+    def unexpected_lookup() -> list[str]:
+        raise AssertionError("nonliteral command must not trigger helper discovery")
+
+    monkeypatch.setattr("omnigent.onboarding.ucode_setup.find_ucode_command", unexpected_lookup)
+    command = str(tmp_path / "archive-v0/removed/bin/ucode") + " auth-token" + suffix
+    assert refresh_ucode_auth_command(command) == command
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {},
+        {"command": 1, "args": []},
+        {"command": "ug", "args": "auth-token"},
+        {"command": "ug", "args": [None]},
+    ],
+)
+def test_refresh_ucode_auth_keeps_malformed_structured_values(auth: dict[str, object]) -> None:
+    assert refresh_ucode_auth_config(auth) is auth
 
 
 def test_find_ucode_command_prefers_uvx_pinned_commit() -> None:

@@ -4513,6 +4513,87 @@ def test_materialize_codex_provider_config_applies_default_retry_policy(
     assert provider["stream_idle_timeout_ms"] == 120_000
 
 
+@pytest.mark.parametrize("representation", ["direct", "shell"])
+@pytest.mark.parametrize("gateway", [True, False])
+def test_materialize_recovers_only_generated_gateway_auth_helpers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, representation: str, gateway: bool
+) -> None:
+    """Copied provider auth can recover without rewriting the user's source config."""
+    import shlex
+    import subprocess
+    import tomllib
+
+    from omnigent.inner.codex_executor import (
+        _populate_codex_home_config,
+        materialize_codex_provider_config,
+    )
+
+    missing = tmp_path / "cache/archive-v0/evicted/bin/ucode"
+    installed = tmp_path / "tools/ucode"
+    installed.parent.mkdir()
+    installed.write_text(f"#!{sys.executable}\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+    installed.chmod(0o755)
+    monkeypatch.setenv("PATH", str(installed.parent))
+    args = [
+        "auth-token",
+        "--profile",
+        "selected #$[account]",
+        "--host",
+        "https://fixture.cloud.databricks.com",
+    ]
+    auth = {
+        "command": str(missing),
+        "args": args,
+        "timeout_ms": 20000,
+        "refresh_interval_ms": 60000,
+    }
+    if representation == "shell":
+        auth.update(command="sh", args=["-c", shlex.join([str(missing), *args])])
+    base_url = (
+        "https://fixture.cloud.databricks.com/ai-gateway/codex/v1"
+        if gateway
+        else "https://example.test/v1"
+    )
+    source = tmp_path / "source"
+    source.mkdir()
+    original = (
+        'model_provider="selected"\nmodel="explicit-model"\n'
+        '[model_providers.selected]\nname="Selected"\n'
+        f"base_url={json.dumps(base_url)}\n"
+        "[model_providers.selected.auth]\n"
+        + "\n".join(f"{key}={json.dumps(value)}" for key, value in auth.items())
+        + "\n"
+    )
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    _populate_codex_home_config(private, source)
+    materialize_codex_provider_config(private, [])
+    config = tomllib.loads((private / "config.toml").read_text())
+    emitted = config["model_providers"]["selected"]["auth"]
+    assert config["model"] == "explicit-model"
+    assert config["model_provider"] == "selected"
+    assert config["model_providers"]["selected"]["base_url"] == base_url
+    assert emitted["timeout_ms"] == auth["timeout_ms"]
+    assert emitted["refresh_interval_ms"] == auth["refresh_interval_ms"]
+    assert (source / "config.toml").read_text() == original
+    if not gateway:
+        assert emitted == auth
+        return
+    if representation == "direct":
+        assert emitted["command"] == str(installed)
+        assert emitted["args"] == args
+        invocation = [emitted["command"], *emitted["args"]]
+    else:
+        assert emitted["args"] == ["-c", shlex.join([str(installed), *args])]
+        invocation = ["/bin/sh", *emitted["args"]]
+    other = tmp_path / "other-workspace"
+    other.mkdir()
+    result = subprocess.run(invocation, cwd=other, capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == args
+
+
 def test_materialize_codex_provider_config_applies_custom_retry_policy(tmp_path: Path) -> None:
     """Agent-specific retry values override Codex provider defaults."""
     import tomllib
