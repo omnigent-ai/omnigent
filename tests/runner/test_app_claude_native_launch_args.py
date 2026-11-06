@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -1777,22 +1778,133 @@ def test_claude_terminal_env_unsets_tmux_for_bash_tool_commands(
     assert result.stdout.strip() == "unset unset"
 
 
-@pytest.mark.parametrize("source", ["ambient", "provider"])
-def test_claude_terminal_env_keeps_a_user_claude_env_file(
-    monkeypatch: pytest.MonkeyPatch, source: str
+_TOOL_ENV_SHELL_COMMANDS = [("bash",), ("bash", "--posix"), ("sh",)]
+if shutil.which("zsh"):
+    _TOOL_ENV_SHELL_COMMANDS.append(("zsh",))
+
+
+@pytest.mark.parametrize("source", ["ambient", "provider", "provider_overrides_ambient"])
+@pytest.mark.parametrize("shell", _TOOL_ENV_SHELL_COMMANDS)
+def test_claude_terminal_env_composes_user_env_with_tmux_isolation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, source: str, shell: tuple[str, ...]
 ) -> None:
-    """A user's own CLAUDE_ENV_FILE is left in place instead of the tmux scrub."""
-    user_file = "/home/user/claude-env.sh"
+    """Custom tool setup still runs, without inheriting Claude's private tmux."""
+    user_file = tmp_path / "user's tool env.sh"
+    user_file.write_text(
+        'export TEST_TOOL_SETTING="custom setup"\n'
+        'export TEST_SETUP_TMUX="${TMUX-unset} ${TMUX_PANE-unset}"\n'
+        'export TEST_ENV_FILE="$CLAUDE_ENV_FILE"\n'
+        'export TEST_SETUP_RUNS="${TEST_SETUP_RUNS}x"\n',
+        encoding="utf-8",
+    )
     config = None
+    monkeypatch.delenv("OMNIGENT_CLAUDE_USER_ENV_FILE", raising=False)
     if source == "ambient":
-        monkeypatch.setenv("CLAUDE_ENV_FILE", user_file)
+        monkeypatch.setenv("CLAUDE_ENV_FILE", str(user_file))
     else:
         monkeypatch.delenv("CLAUDE_ENV_FILE", raising=False)
-        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": user_file})
+        config = ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": str(user_file)})
+        if source == "provider_overrides_ambient":
+            monkeypatch.setenv("CLAUDE_ENV_FILE", str(tmp_path / "unused.sh"))
 
     terminal_env = build_native_claude_terminal_env(config)
+    # Rebuilding an existing launch must not wrap the wrapper recursively.
+    rebuilt = build_native_claude_terminal_env(ClaudeNativeUcodeConfig(env=terminal_env))
+    result = subprocess.run(
+        [
+            *shell,
+            "-c",
+            '. "$CLAUDE_ENV_FILE"; '
+            'printf "%s\\n" "$TEST_TOOL_SETTING" "$TEST_SETUP_TMUX" '
+            '"$TEST_ENV_FILE" "$TEST_SETUP_RUNS" "${TMUX-unset} ${TMUX_PANE-unset}" '
+            '"$CLAUDE_ENV_FILE"',
+        ],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+            "CLAUDE_ENV_FILE": str(user_file),
+            **rebuilt,
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
 
-    assert terminal_env.get("CLAUDE_ENV_FILE", user_file) == user_file
+    assert result.stdout.splitlines() == [
+        "custom setup",
+        "unset unset",
+        str(user_file),
+        "x",
+        "unset unset",
+        str(user_file),
+    ]
+
+
+@pytest.mark.parametrize("shell", _TOOL_ENV_SHELL_COMMANDS)
+@pytest.mark.parametrize("file_state", ["missing", "unreadable", "directory"])
+def test_claude_terminal_env_unusable_user_setup_preserves_tool_commands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, shell: tuple[str, ...], file_state: str
+) -> None:
+    user_file = tmp_path / "user's tool env.sh"
+    if file_state == "unreadable":
+        user_file.write_text("exit 23\n", encoding="utf-8")
+        user_file.chmod(0)
+    elif file_state == "directory":
+        user_file.mkdir()
+    monkeypatch.delenv("OMNIGENT_CLAUDE_USER_ENV_FILE", raising=False)
+    terminal_env = build_native_claude_terminal_env(
+        ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": str(user_file)})
+    )
+    result = subprocess.run(
+        [
+            *shell,
+            "-eu",
+            "-c",
+            '. "$CLAUDE_ENV_FILE"; echo "tool ${TMUX-unset} ${TMUX_PANE-unset}"',
+        ],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TERMINAL_EMULATOR": "",
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "TMUX_PANE": "%0",
+            **terminal_env,
+        },
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "tool unset unset"
+    assert result.stderr == ""
+
+
+def test_claude_terminal_env_empty_override_disables_inherited_user_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit empty provider setting must not revive a parent's setup file."""
+    monkeypatch.setenv("CLAUDE_ENV_FILE", "/unused/parent.sh")
+    monkeypatch.setenv("OMNIGENT_CLAUDE_USER_ENV_FILE", "/unused/older-parent.sh")
+    terminal_env = build_native_claude_terminal_env(
+        ClaudeNativeUcodeConfig(env={"CLAUDE_ENV_FILE": ""})
+    )
+    assert terminal_env["OMNIGENT_CLAUDE_USER_ENV_FILE"] == ""
+    result = subprocess.run(
+        ["bash", "-eu", "-c", '. "$CLAUDE_ENV_FILE"; echo "${TMUX-unset}"'],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "TMUX": "/tmp/omnigent-terminal-ab12/tmux.sock,4242,0",
+            "OMNIGENT_CLAUDE_USER_ENV_FILE": "/unused/older-parent.sh",
+            **terminal_env,
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=5,
+    )
+    assert result.stdout.strip() == "unset"
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize("source", ["ambient", "provider"])
