@@ -50,10 +50,27 @@ request"):
   not the live `refs/pull/<n>/merge` ref (which re-points to the newest push), so
   a run only ever builds one specific, inspectable commit.
 - **Fork deploys need per-run approval.** The secret-bearing `deploy` job runs in
-  the `ui-preview-fork` Environment for fork PRs, so each new commit waits for a
-  human reviewer before it can deploy. Same-repo PRs (maintainers + the
-  resolve-agent bot, which outside contributors can't push to) are trusted and
-  skip the gate.
+  the `ui-preview-fork` Environment for fork PRs whose authors are not owners,
+  members, or collaborators, so each new commit waits for a human reviewer before
+  it can deploy. Trusted-author forks and same-repo PRs skip the gate.
+
+## Reviewer-directed updates
+
+On same-repo Resolve PRs, `OTTO_ADDRESS_REVIEWERS` delegates bot changes through
+`/address`. If `ui-preview` is already present, those pushes automatically rebuild
+and redeploy the preview without per-push approval. Requiring current-head
+maintainer approval for merging does not gate preview deployment. Configure the
+reviewer list and apply the preview label with this delegation in mind.
+
+The build has no deployment secrets; the deploy job receives Databricks OAuth
+credentials. That separation does not establish the deployed app's runtime
+permissions. Preview code runs with its Databricks App identity, and existing
+deployments retain that identity and its grants. Before enabling previews for
+reviewer-directed changes, check the app's actual workspace/resource grants and
+runtime configuration; ephemeral SQLite storage and the absence of a bundled
+runner do not restrict the app identity's access. These live permissions cannot
+be verified from the repository configuration alone. Remove `ui-preview` to
+disable future automatic preview updates if this delegation is not appropriate.
 
 ## What it is
 

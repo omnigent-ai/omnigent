@@ -1,3 +1,7 @@
+import sys
+
+import maintainer_approval
+import pytest
 from maintainer_approval import (
     approval_decision,
     latest_decisive_reviews,
@@ -89,20 +93,43 @@ def test_trusted_automation_author_passes_without_review():
     assert "trusted automation" in decision.reason
 
 
-def test_address_requires_current_maintainer_approval_even_for_trusted_author():
-    for reviews in ([], [review("APPROVED", "old")], [review("DISMISSED", "new")]):
-        assert not decide(
-            author="omni-resolve-agent[bot]",
-            reviews=reviews,
-            commits=[commit("old"), commit("new")],
-            require_current_head=True,
-        ).approved
-    assert decide(
+@pytest.mark.parametrize("activation", ["explicit", "removed-label"])
+@pytest.mark.parametrize(
+    "reviews, expected",
+    [
+        pytest.param([], False, id="missing"),
+        pytest.param([review("APPROVED", "old")], False, id="stale"),
+        pytest.param([review("DISMISSED", "old")], False, id="auto-dismissed"),
+        pytest.param([review("APPROVED", "new")], True, id="current"),
+    ],
+)
+def test_address_requires_current_maintainer_approval_even_for_trusted_author(
+    activation, reviews, expected
+):
+    timeline = [dismissal_event()]
+    if activation == "removed-label":
+        timeline += [
+            {"event": "labeled", "label": {"name": "otto-address"}},
+            {
+                "event": "unlabeled",
+                "label": {"name": "otto-address"},
+                "actor": {"login": "triager"},
+            },
+        ]
+    decision = decide(
         author="omni-resolve-agent[bot]",
-        reviews=[review("APPROVED", "new")],
-        commits=[commit("new")],
-        require_current_head=True,
-    ).approved
+        reviews=reviews,
+        commits=[commit("old"), commit("new")],
+        timeline=timeline,
+        require_current_head=activation == "explicit",
+    )
+    assert decision.approved is expected, decision.reason
+    if expected:
+        assert "Current head approved" in decision.reason
+    elif reviews:
+        assert "otto-address PRs require current-head maintainer approval" in decision.reason
+    else:
+        assert "awaiting approval from a maintainer" in decision.reason
 
 
 def test_address_contributor_cannot_supply_merge_approval():
@@ -127,13 +154,17 @@ def test_approval_survives_trusted_same_repo_successor_commits():
 
 
 def test_auto_dismissed_approval_survives_the_trusted_push_that_dismissed_it():
-    decision = decide(
-        reviews=[review("DISMISSED", "old")],
-        commits=[commit("old"), commit("new")],
-        timeline=[dismissal_event()],
-    )
+    arguments = {
+        "reviews": [review("DISMISSED", "old")],
+        "commits": [commit("old"), commit("new")],
+        "timeline": [dismissal_event()],
+    }
+    decision = decide(**arguments)
     assert decision.approved
     assert "only trusted automation pushed and committed" in decision.reason
+    address_decision = decide(**arguments, require_current_head=True)
+    assert not address_decision.approved
+    assert "otto-address PRs require current-head maintainer approval" in address_decision.reason
 
 
 def test_fork_head_requires_a_fresh_approval():
@@ -272,23 +303,42 @@ def test_maintainer_authored_pr_still_passes():
     assert decision.approved
 
 
-def test_removed_address_label_still_requires_current_head_approval():
-    timeline = [
-        {"event": "labeled", "label": {"name": "otto-address"}},
-        {"event": "unlabeled", "label": {"name": "otto-address"}, "actor": {"login": "triager"}},
-    ]
-    for reviews, expected in (
-        ([], False),
-        ([review("APPROVED", "old")], False),
-        ([review("DISMISSED", "new")], False),
-        ([review("APPROVED", "new")], True),
-    ):
-        assert (
-            decide(
-                author="omni-resolve-agent[bot]",
-                reviews=reviews,
-                commits=[commit("old"), commit("new")],
-                timeline=timeline,
-            ).approved
-            is expected
-        )
+@pytest.mark.parametrize(
+    "labels, reviews, expected",
+    [
+        pytest.param([], [], 0, id="ordinary-bot-exemption"),
+        pytest.param([{"name": "otto-address"}], [], 1, id="label-blocks-exemption"),
+        pytest.param(
+            [{"name": "otto-address"}], [review("APPROVED", "new")], 0, id="label-current-approval"
+        ),
+    ],
+)
+def test_main_current_address_label_requires_approval(monkeypatch, labels, reviews, expected):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "maintainer_approval.py",
+            "--repository",
+            REPOSITORY,
+            "--pr-number",
+            "1",
+            "--trusted-author",
+            "omni-resolve-agent[bot]",
+        ],
+    )
+    pull = {
+        "user": {"login": "omni-resolve-agent[bot]"},
+        "head": {"sha": "new", "repo": {"full_name": REPOSITORY}},
+        "labels": labels,
+    }
+    responses = {f"repos/{REPOSITORY}/pulls/1": pull}
+    pages = {
+        f"repos/{REPOSITORY}/pulls/1/reviews": reviews,
+        f"repos/{REPOSITORY}/pulls/1/commits": [commit("new")],
+        f"repos/{REPOSITORY}/issues/1/timeline": [],
+    }
+    monkeypatch.setattr(maintainer_approval, "gh_json", lambda arguments: responses[arguments[1]])
+    monkeypatch.setattr(maintainer_approval, "paginated", pages.__getitem__)
+    monkeypatch.setattr(maintainer_approval, "maintainers", lambda _repository: MAINTAINERS)
+    assert maintainer_approval.main() == expected

@@ -476,6 +476,11 @@ access. Configure it in `omnigent-ai/omnigent` under **Settings → Secrets and
 variables → Actions → Variables**, using comma- or newline-separated GitHub
 usernames. An unset or empty variable permits only maintainers.
 
+On PRs already labeled `ui-preview`, bot pushes also automatically redeploy the
+preview. Review the [preview delegation and runtime permissions](.github/ui-preview/README.md#reviewer-directed-updates)
+when configuring contributors; the merge approval requirement does not gate
+preview deployment.
+
 Otto collects outstanding feedback from all listed reviewers and maintainers,
 including conversation comments, submitted reviews, and unresolved inline
 comments. It pushes applicable fixes to the existing branch, runs checks, and
