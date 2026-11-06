@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import tracemalloc
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -1050,6 +1051,61 @@ def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
     assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0]}
 
 
+def test_spawn_scan_memory_does_not_grow_with_tool_output(tmp_path: Path) -> None:
+    """Large tool-result histories should cost one record of working memory."""
+    transcript_path = tmp_path / "session.jsonl"
+    tool_result = json.dumps(
+        {"message": {"content": [{"type": "tool_result", "content": "x" * 16_384}]}}
+    )
+    with transcript_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_record("toolu_first", "spawn", sidechain=False)) + "\n")
+        for _ in range(256):
+            handle.write(tool_result + "\n")
+        handle.write(json.dumps(_spawn_record("toolu_last", "spawn", sidechain=False)) + "\n")
+
+    tracemalloc.start()
+    try:
+        tool_use_ids = forwarder._tool_use_ids_in_transcript(
+            transcript_path, include_sidechains=False
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert tool_use_ids == {"toolu_first", "toolu_last"}
+    assert peak < 512 * 1024, f"spawn scan retained transcript-sized buffers: {peak} bytes"
+
+
+@pytest.mark.parametrize("include_sidechains", [False, True])
+def test_spawn_scan_recovers_a_partial_utf8_tail(tmp_path: Path, include_sidechains: bool) -> None:
+    """Malformed rows and a split UTF-8 tail must not hide later complete spawns."""
+    transcript_path = tmp_path / "session.jsonl"
+    tail = json.dumps(
+        _spawn_record("toolu_tail", "résumé", sidechain=False), ensure_ascii=False
+    ).encode("utf-8")
+    split_at = tail.index("é".encode()) + 1
+    transcript_path.write_bytes(
+        json.dumps(_spawn_record("toolu_root", "spawn", sidechain=False)).encode()
+        + b'\ninvalid json\n[]\n{"message":{"content":"text"}}\n'
+        + json.dumps(_spawn_record("toolu_child", "spawn", sidechain=True)).encode()
+        + b"\n"
+        + tail[:split_at]
+    )
+    expected = {"toolu_root", "toolu_child"} if include_sidechains else {"toolu_root"}
+    assert (
+        forwarder._spawn_tool_use_ids_cached(
+            transcript_path, include_sidechains=include_sidechains
+        )
+        == expected
+    )
+
+    with transcript_path.open("ab") as handle:
+        handle.write(tail[split_at:] + b"\n")
+    assert forwarder._spawn_tool_use_ids_cached(
+        transcript_path, include_sidechains=include_sidechains
+    ) == expected | {"toolu_tail"}
+
+
 def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1066,16 +1122,16 @@ def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
         tool_use_id="toolu_child",
     )
     subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
-    real_read_text = Path.read_text
+    real_open = Path.open
     failures_left = [1]
 
-    def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+    def flaky_open(self: Path, *args: Any, **kwargs: Any) -> Any:
         if self == transcript_path and failures_left[0]:
             failures_left[0] -= 1
             raise OSError(errno.EIO, "transient read failure")
-        return real_read_text(self, *args, **kwargs)
+        return real_open(self, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    monkeypatch.setattr(Path, "open", flaky_open)
 
     assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {}
     assert transcript_path not in forwarder._SPAWN_TOOL_USE_ID_CACHE
