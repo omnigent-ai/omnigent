@@ -2930,6 +2930,75 @@ def _manage_kimi_harness() -> None:
             status = None
 
 
+def _manage_commandcode_harness() -> None:
+    """Run the level-2 loop for Command Code: install the CLI and drive sign-in.
+
+    Command Code authenticates against its own backend via ``cmd login`` (which
+    writes ``~/.commandcode/auth.json``) or a ``COMMAND_CODE_API_KEY`` env var.
+    ``cmd status --json`` reports ``authenticated``, so the sign-in state is
+    read structurally rather than inferred from an exit code. This drill-in
+    offers ``cmd login`` and ``cmd logout``.
+
+    Like the other CLI-backed harnesses, a missing CLI gates the drill-in —
+    there is nothing to configure for a harness you can't run.
+
+    :returns: None. Side effects: may run ``cmd login`` / ``cmd logout`` in the
+        foreground.
+    """
+    from omnigent.onboarding.harness_install import (
+        COMMANDCODE_KEY,
+        harness_cli_installed,
+        harness_cli_logged_in,
+        harness_install_spec,
+        harness_login,
+        harness_logout,
+    )
+    from omnigent.onboarding.interactive import console, select
+
+    if not harness_cli_installed(COMMANDCODE_KEY):
+        spec = harness_install_spec(COMMANDCODE_KEY)
+        hint = (spec.install_hint if spec else None) or "npm i -g command-code@latest"
+        console.print(
+            "  Command Code's CLI isn't installed. Install it with:\n"
+            f"    [bold]{hint}[/bold]\n"
+            "  then re-open this menu to sign in."
+        )
+        return
+
+    signed_in_status = "✓ Command Code is signed in"
+    status: str | None = (
+        signed_in_status if harness_cli_logged_in(COMMANDCODE_KEY) else None
+    )
+    while True:
+        rows: list[_HarnessMenuRow] = [
+            _HarnessMenuRow("Sign in (cmd login)", action="login"),
+            _HarnessMenuRow("Sign out (cmd logout)", action="logout"),
+            _HarnessMenuRow("← Back", action="back"),
+        ]
+        idx = select(
+            "Command Code — authentication is managed by the Command Code CLI",
+            [r.label for r in rows],
+            clear_on_exit=True,
+            status=status,
+        )
+        if idx < 0:  # Esc / q
+            return
+        action = rows[idx].action
+        if action == "back":
+            return
+        if action == "login":
+            console.print("  [dim]Signing in to Command Code (its login will open)…[/dim]")
+            harness_login(COMMANDCODE_KEY)
+            status = (
+                signed_in_status
+                if harness_cli_logged_in(COMMANDCODE_KEY)
+                else "cmd login flow finished — re-open this menu to re-check the status"
+            )
+        elif action == "logout":
+            harness_logout(COMMANDCODE_KEY)
+            status = "Signed out of Command Code"
+
+
 def _prompt_install_copilot() -> str | None:
     """Offer to install the missing ``copilot`` extra; return a status line.
 
@@ -3734,6 +3803,7 @@ def _run_configure_harnesses_interactive() -> None:
     from omnigent.onboarding.extra_install import extra_install_display
     from omnigent.onboarding.goose_auth import goose_config_summary
     from omnigent.onboarding.harness_install import (
+        COMMANDCODE_KEY,
         COPILOT_KEY,
         CURSOR_KEY,
         DEVIN_KEY,
@@ -3811,6 +3881,11 @@ def _run_configure_harnesses_interactive() -> None:
     # / ``kimi provider add`` → ~/.kimi-code/config.toml), so it dispatches to its
     # own drill-in rather than ``_manage_harness_providers``.
     _KIMI = "\x00kimi"
+    # Sentinel marking the Command Code row — like Kimi/Kiro it is not a provider
+    # family. Auth lives entirely in the Command Code CLI (``cmd login`` /
+    # ``COMMAND_CODE_API_KEY`` → ``~/.commandcode/auth.json``), so it dispatches
+    # to its own drill-in rather than ``_manage_harness_providers``.
+    _COMMANDCODE = "\x00commandcode"
     # Sentinels for the generic-ACP rows. Each configured agent gets its own row
     # (``_ACP_AGENT_PREFIX + slug`` → per-agent remove drill-in); import/add rows
     # jump straight into those flows. Not a provider family — each ACP agent owns
@@ -4265,6 +4340,39 @@ def _run_configure_harnesses_interactive() -> None:
                 )
             )
 
+        # Command Code — native CLI, own auth via `cmd login` (→
+        # ~/.commandcode/auth.json) or COMMAND_CODE_API_KEY. Its status command
+        # (`cmd status --json`) reports `authenticated`, so readiness separates
+        # "signed in" (green) from "installed but not configured" (yellow). Ships
+        # on npm as `command-code`, so a missing CLI uses its install_hint.
+        if harness_cli_installed(COMMANDCODE_KEY):
+            if harness_cli_logged_in(COMMANDCODE_KEY):
+                rows.append((_COMMANDCODE, "Command Code", "Signed in", "ready", ""))
+            else:
+                rows.append(
+                    (
+                        _COMMANDCODE,
+                        "Command Code",
+                        "Not configured",
+                        "warn",
+                        "Sign in with `cmd login`, or set COMMAND_CODE_API_KEY.",
+                    )
+                )
+        else:
+            commandcode_spec = harness_install_spec(COMMANDCODE_KEY)
+            commandcode_hint = (
+                commandcode_spec.install_hint if commandcode_spec else None
+            ) or "npm i -g command-code@latest"
+            rows.append(
+                (
+                    _COMMANDCODE,
+                    "Command Code",
+                    _cli_absence_label(COMMANDCODE_KEY),
+                    "missing",
+                    _install_hint(commandcode_hint),
+                )
+            )
+
         # Custom ACP agents — the generic `acp` harness driving any user-configured
         # ACP-agent command. Each configured agent gets its own overview row
         # (select → per-agent remove drill-in) so it sits alongside the built-in
@@ -4391,5 +4499,7 @@ def _run_configure_harnesses_interactive() -> None:
             _manage_kiro_harness()
         elif selected_target == _KIMI:
             _manage_kimi_harness()
+        elif selected_target == _COMMANDCODE:
+            _manage_commandcode_harness()
         else:  # Quit row (or, defensively, a non-family row)
             return

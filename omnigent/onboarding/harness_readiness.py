@@ -47,6 +47,7 @@ from omnigent.harness_availability import (
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
 from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready
 from omnigent.onboarding.harness_install import (
+    COMMANDCODE_KEY,
     COPILOT_KEY,
     CURSOR_KEY,
     DEVIN_KEY,
@@ -169,6 +170,16 @@ _HERMES_NATIVE_HARNESSES: frozenset[str] = frozenset({"hermes-native", "native-h
 # inside the executor.
 _DEVIN_NATIVE_HARNESSES: frozenset[str] = frozenset({"devin-native", "native-devin"})
 
+# Native Command Code harnesses boot the resident ``cmd`` TUI (``omni
+# commandcode``). Command Code owns its own auth (``cmd login`` /
+# ``COMMAND_CODE_API_KEY``), so there is no Omnigent-managed key to gate on and
+# readiness is binary presence — like the other native CLI harnesses. Without
+# these entries they'd fail open like an unknown harness, letting a binary-less
+# launch die inside the executor.
+_COMMANDCODE_NATIVE_HARNESSES: frozenset[str] = frozenset(
+    {"commandcode-native", "native-commandcode"}
+)
+
 # CLI-wrapping qwen harnesses. ``qwen`` / ``qwen-code`` (the ACP harness) and
 # ``qwen-native`` / ``native-qwen`` (the native TUI via ``omni qwen``) all resolve
 # to the same ``qwen`` binary (canonicalize_harness folds ``qwen-code`` → ``qwen``
@@ -209,6 +220,8 @@ def _install_key(canonical: str) -> str:
     """
     if canonical == KIMI_SURFACE or canonical in _KIMI_NATIVE_HARNESSES:
         return KIMI_KEY
+    if canonical in _COMMANDCODE_NATIVE_HARNESSES:
+        return COMMANDCODE_KEY
     if canonical in _OPENCODE_HARNESSES:
         return OPENCODE_KEY
     if canonical in _QWEN_HARNESSES:
@@ -264,6 +277,8 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
         return _installer_only_availability(HERMES_KEY)
     if canonical in _DEVIN_NATIVE_HARNESSES:
         return _installer_only_availability(DEVIN_KEY)
+    if canonical in _COMMANDCODE_NATIVE_HARNESSES:
+        return _installer_only_availability(COMMANDCODE_KEY)
     if canonical == CURSOR_KEY:
         # Cursor runs in-process via ``cursor-sdk`` and authenticates with a
         # ``CURSOR_API_KEY`` (a ``cursor-agent login`` does not apply). So,
@@ -1079,6 +1094,7 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.update(_KIMI_NATIVE_HARNESSES)
     spellings.update(_HERMES_NATIVE_HARNESSES)
     spellings.update(_DEVIN_NATIVE_HARNESSES)
+    spellings.update(_COMMANDCODE_NATIVE_HARNESSES)
     spellings.update(_QWEN_HARNESSES)
     spellings.add(CURSOR_KEY)
     spellings.add(KIMI_SURFACE)

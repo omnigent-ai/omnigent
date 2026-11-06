@@ -82,6 +82,11 @@ KIMI_KEY = "kimi"
 # installer, not an npm package managed by ``omni setup``.
 KIRO_KEY = "kiro"
 
+# Command Code authenticates against its own backend (``cmd login`` or
+# ``COMMAND_CODE_API_KEY``) and ships on npm as ``command-code`` (binary ``cmd``,
+# ``cmdc`` on Windows).
+COMMANDCODE_KEY = "commandcode"
+
 # Minimum CLI versions for native harnesses where the runtime has a known
 # feature floor. These are intentionally conservative: the runtime may
 # gracefully degrade on older CLIs, but setup enforces the floor so a user
@@ -349,6 +354,21 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
         auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
     ),
+    # Command Code ships on npm as ``command-code``; the binary is ``cmd``
+    # (``cmdc`` on Windows). Auth is its own backend (``cmd login`` /
+    # ``COMMAND_CODE_API_KEY``), so Omnigent stores no credential.
+    COMMANDCODE_KEY: HarnessInstallSpec(
+        "Command Code",
+        "cmd",
+        package="command-code",
+        login_args=("login",),
+        logout_args=("logout",),
+        status_args=("status", "--json"),
+        # ``cmd status --json`` emits ``{"authenticated": true, ...}``.
+        login_status_key="authenticated",
+        install_hint="npm i -g command-code@latest",
+        auth_hint="run `cmd login` (or set COMMAND_CODE_API_KEY)",
+    ),
 }
 
 
@@ -420,6 +440,11 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Native Command Code TUI (``commandcode-native``, via ``omni commandcode``)
+    # wraps the ``cmd`` CLI; ``native-commandcode`` gates on the same binary.
+    COMMANDCODE_KEY: COMMANDCODE_KEY,
+    "commandcode-native": COMMANDCODE_KEY,
+    "native-commandcode": COMMANDCODE_KEY,
 }
 
 
