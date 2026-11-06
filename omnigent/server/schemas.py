@@ -3135,6 +3135,11 @@ class SessionListItem(BaseModel):
         ``omnigent claude`` sessions. ``None`` for regular
         AP-only conversations. Lets the sidebar / picker render
         a runtime badge without a follow-up GET.
+    :param shared_with_others: Whether the requesting user owns this
+        session and has granted access to another user (the public link
+        alone doesn't count). ``None`` when the requester isn't the owner
+        or permissions are disabled, so the grant list never leaks to
+        non-owners.
     :param pending_elicitations_count: Number of approval prompts
         currently waiting on this session. Powers the sidebar's
         "needs attention" badge so a user with several sessions
@@ -3224,6 +3229,7 @@ class SessionListItem(BaseModel):
     permission_level: int | None = None
     owner: str | None = None
     external_session_id: str | None = None
+    shared_with_others: bool | None = None
     pending_elicitations_count: int = 0
     background_work_running: bool = False
     blocked_on: str | None = None
