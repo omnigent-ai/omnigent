@@ -1,6 +1,13 @@
 import { PanelLeftOpenIcon, PanelRightOpenIcon, SearchIcon, SettingsIcon } from "lucide-react";
 
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  ARIA_MOD_KEY,
+  COMMAND_PALETTE_KEYS,
+  settingsAriaShortcut,
+  settingsShortcutKeys,
+  sidebarToggleAriaShortcut,
+  sidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -8,10 +15,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "./MobileHeaderButton";
-
-const SIDEBAR_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "["] as const;
-const SEARCH_KEYS = [MOD_KEY, "K"] as const;
-const SETTINGS_KEYS = [MOD_KEY, ALT_KEY, ","] as const;
 
 /**
  * Search / Settings / sidebar-toggle cluster from the sidebar's header row.
@@ -74,7 +77,7 @@ export function SidebarHeaderActions({
             variant="ghost"
             size="icon-xs"
             aria-label={expanded ? "Close sidebar" : "Open sidebar"}
-            aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+[`}
+            aria-keyshortcuts={sidebarToggleAriaShortcut()}
             onClick={onToggle}
             onPointerEnter={onTogglePointerEnter}
             onPointerDown={onTogglePointerDown}
@@ -95,7 +98,7 @@ export function SidebarHeaderActions({
             )}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="bottom" shortcut={SIDEBAR_TOGGLE_KEYS}>
+        <TooltipContent side="bottom" shortcut={sidebarToggleShortcutKeys()}>
           <span>{expanded ? "Collapse sidebar" : "Open sidebar"}</span>
         </TooltipContent>
       </Tooltip>
@@ -145,7 +148,7 @@ export function SidebarSearchButton({
       </TooltipTrigger>
       {/* Bottom placement keeps the tooltip clear of the macOS Electron
       shell's traffic lights at the window's top edge. */}
-      <TooltipContent side="bottom" shortcut={SEARCH_KEYS}>
+      <TooltipContent side="bottom" shortcut={COMMAND_PALETTE_KEYS}>
         <span>Search</span>
       </TooltipContent>
     </Tooltip>
@@ -179,7 +182,7 @@ export function SidebarSettingsButton({
           variant="ghost"
           size="icon-xs"
           aria-label="Settings"
-          aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+,`}
+          aria-keyshortcuts={settingsAriaShortcut()}
           className={cn(SIDEBAR_FLOAT_BUTTON, "rounded-[8px] bg-transparent", className)}
         >
           <Link to="/settings" onClick={onSettingsClick} data-testid={testId}>
@@ -188,7 +191,7 @@ export function SidebarSettingsButton({
           </Link>
         </Button>
       </TooltipTrigger>
-      <TooltipContent side="bottom" shortcut={SETTINGS_KEYS}>
+      <TooltipContent side="bottom" shortcut={settingsShortcutKeys()}>
         <span>Settings</span>
       </TooltipContent>
     </Tooltip>

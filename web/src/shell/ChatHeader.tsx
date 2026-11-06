@@ -21,7 +21,10 @@ import {
   XIcon,
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  rightSidebarToggleAriaShortcut,
+  rightSidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
@@ -53,8 +56,6 @@ import { SidebarOpenButton } from "./SidebarOpenButton";
 import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
 import { SessionMenuHeader } from "./SessionMenuHeader";
-
-const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -830,7 +831,7 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
-                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+]`}
+                aria-keyshortcuts={rightSidebarToggleAriaShortcut()}
                 onClick={onToggleRightPanel}
                 componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
@@ -842,7 +843,7 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent shortcut={RIGHT_PANEL_KEYS}>
+            <TooltipContent shortcut={rightSidebarToggleShortcutKeys()}>
               <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>

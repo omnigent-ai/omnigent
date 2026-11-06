@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { WorkingIndicatorRow } from "@/components/chat/chatBubbleParts";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import {
   TerminalFirstContextProvider,
@@ -167,6 +168,55 @@ describe("RunnerStartingIndicator", () => {
     render(<RunnerStartingIndicator variant="row" />);
     expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
     expect(screen.queryByTestId("runner-starting-indicator")).not.toBeInTheDocument();
+  });
+});
+
+describe("WorkingIndicatorRow", () => {
+  const closings: { onfinish: (() => void) | null; cancel: () => void }[] = [];
+
+  beforeEach(() => {
+    useChatStore.setState({ backgroundTaskCount: 0, blockedOn: null, sessionStatus: "running" });
+    // jsdom has no Web Animations; record each close so the test can finish it.
+    Element.prototype.animate = vi.fn(() => {
+      const closing = { onfinish: null, cancel: vi.fn() };
+      closings.push(closing);
+      return closing as unknown as Animation;
+    });
+  });
+
+  afterEach(() => {
+    delete (Element.prototype as { animate?: unknown }).animate;
+    closings.length = 0;
+    vi.unstubAllGlobals();
+    cleanup();
+  });
+
+  it("keeps the row while it eases closed after the turn ends", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(closings).toHaveLength(1);
+
+    act(() => closings[0]!.onfinish?.());
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+  });
+
+  it("stays when the next turn starts while it closes", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    rerender(<WorkingIndicatorRow show />);
+
+    expect(closings[0]!.cancel).toHaveBeenCalled();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
+  it("goes at once under reduced motion", () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("reduce") }));
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(closings).toHaveLength(0);
   });
 });
 
