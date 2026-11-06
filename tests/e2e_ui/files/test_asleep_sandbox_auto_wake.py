@@ -1,13 +1,14 @@
-"""E2E: opening the Files view on an asleep sandbox wakes it without a message.
+"""E2E: opening an asleep sandbox's session, or its Files view, wakes it without a message.
 
 A session whose managed sandbox idle-stopped reads ``host_asleep``, and the
-Files panel has no workspace to list. Opening the panel must ask the server to
-resume the sandbox with a ``wake_session`` event, show that it is starting,
-and list the files once the sandbox reads online, without the user sending a
-chat message. ``force_host_asleep`` patches the browser's view into
-``host_asleep`` and workspace reads answer the runner-offline 503 until a wake
-request succeeds; the seeded runner stays really connected, so the file list
-and ``wake_session`` then come from the real server.
+Files panel has no workspace to list. Opening the session, and opening the
+Files panel on it, must ask the server to resume the sandbox with a
+``wake_session`` event, show that it is starting, and list the files once the
+sandbox reads online, without the user sending a chat message.
+``force_host_asleep`` patches the browser's view into ``host_asleep`` and
+workspace reads answer the runner-offline 503 until a wake request succeeds;
+the seeded runner stays really connected, so the file list and
+``wake_session`` then come from the real server.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from urllib.parse import urlparse
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Request, Response, Route, expect
+from playwright.sync_api import Locator, Page, Request, Response, Route, expect
 
 from tests.e2e_ui.conftest import _recording_requested, open_right_rail
 from tests.e2e_ui.sessions._host_asleep import (
@@ -120,7 +121,7 @@ def _open_asleep_session(
     page: Page = request.getfixturevalue("page")
     force_host_asleep(page, session_id, host_online=recorder.host_online)
     _fail_workspace_reads_while_asleep(page, recorder)
-    # The rail defaults open, so the panel can request the wake as the page loads.
+    # Opening the session requests the wake about a second after the page loads.
     held = hold_wake_requests(page, session_id, event_type="wake_session")
     page.on("request", recorder.on_request)
     page.on("response", recorder.on_response)
@@ -128,27 +129,63 @@ def _open_asleep_session(
     return page, recorder, held
 
 
-def test_opening_files_wakes_asleep_sandbox(
-    request: pytest.FixtureRequest,
-    asleep_session_file: tuple[str, str],
-) -> None:
-    """Opening the Workspace rail on Files starts the sandbox and lists its files."""
-    base_url, session_id = asleep_session_file
-    page, recorder, held = _open_asleep_session(request, base_url, session_id)
-    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    _hold_for_viewer(request, page)
-
-    open_right_rail(page)
-    wake = next_held_wake(page, held, timeout_ms=30_000)
-    rail = page.get_by_role("complementary", name="Workspace")
-    # The wake is held, so the sandbox can't read online before this check.
-    expect(rail.get_by_text("Starting sandbox…")).to_be_visible()
-    wake.continue_()
-
+def _expect_file_listed(rail: Locator) -> None:
     expect(rail.get_by_role("button", name=re.compile(re.escape(_FILE_PATH))).first).to_be_visible(
         timeout=30_000
     )
     expect(rail.get_by_text("Starting sandbox…")).to_have_count(0)
+
+
+def test_opening_asleep_session_wakes_sandbox(
+    request: pytest.FixtureRequest,
+    asleep_session_file: tuple[str, str],
+) -> None:
+    """Opening the session starts its sandbox; Files shows it starting, then lists files."""
+    base_url, session_id = asleep_session_file
+    page, recorder, held = _open_asleep_session(request, base_url, session_id)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+    wake = next_held_wake(page, held, timeout_ms=30_000)
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    # The wake is held, so the sandbox can't read online before this check.
+    expect(rail.get_by_text("Starting sandbox…")).to_be_visible()
+    _hold_for_viewer(request, page)
+    wake.continue_()
+
+    _expect_file_listed(rail)
     # The wake is the only session event: no chat message was sent.
     assert recorder.events == [_WAKE_SESSION]
+    _hold_for_viewer(request, page)
+
+
+def test_opening_files_wakes_sandbox_after_a_failed_wake(
+    request: pytest.FixtureRequest,
+    asleep_session_file: tuple[str, str],
+) -> None:
+    """A failed wake leaves today's offline hint; reopening the Files rail wakes it again."""
+    base_url, session_id = asleep_session_file
+    page, recorder, held = _open_asleep_session(request, base_url, session_id)
+    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
+    next_held_wake(page, held, timeout_ms=30_000).fulfill(
+        status=500,
+        content_type="application/json",
+        body=json.dumps({"error": {"code": "internal", "message": "Sandbox resume failed."}}),
+    )
+
+    open_right_rail(page)
+    rail = page.get_by_role("complementary", name="Workspace")
+    expect(rail.get_by_text("Sandbox is offline")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_text("Send a message in the chat to start it again.")).to_be_visible()
+    expect(rail.get_by_role("button", name=re.compile("Start sandbox|Try again"))).to_have_count(0)
+    _hold_for_viewer(request, page)
+
+    page.get_by_role("button", name="Collapse right panel").first.click()
+    open_right_rail(page)
+    wake = next_held_wake(page, held, timeout_ms=30_000)
+    expect(rail.get_by_text("Starting sandbox…")).to_be_visible()
+    wake.continue_()
+
+    _expect_file_listed(rail)
+    assert recorder.events == [_WAKE_SESSION, _WAKE_SESSION]
     _hold_for_viewer(request, page)

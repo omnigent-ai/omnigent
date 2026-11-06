@@ -1,14 +1,5 @@
 import { CloudOffIcon, PauseCircleIcon } from "lucide-react";
-import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import type { SandboxWakePhase } from "@/hooks/useSandboxAutoWake";
-
-/** A panel's own wake of the asleep sandbox, for users who may restart it. */
-export interface SandboxWakeHintState {
-  phase: SandboxWakePhase;
-  error: string | null;
-  onWake: () => void;
-}
 
 /**
  * Shown in a workspace panel when the session's runner is bound but not
@@ -21,16 +12,16 @@ export interface SandboxWakeHintState {
  * `sandboxOffline`: the session's managed sandbox itself is down (stopped
  * while idle, for example), not just its runner. "The agent is asleep"
  * misreads that, so name the sandbox; a message starts it again.
- * Optional `wake` supplies progress, failure, and retry controls.
+ * `waking`: a wake of that sandbox is in flight, so say it is starting.
  */
 export function RunnerAsleepHint({
   sandboxOffline = false,
-  wake,
+  waking = false,
 }: {
   sandboxOffline?: boolean;
-  wake?: SandboxWakeHintState;
+  waking?: boolean;
 }) {
-  if (sandboxOffline && wake?.phase === "waking") {
+  if (sandboxOffline && waking) {
     return (
       <div
         role="status"
@@ -51,20 +42,11 @@ export function RunnerAsleepHint({
         <Icon className="size-3.5 shrink-0" />
         {sandboxOffline ? "Sandbox is offline" : "Agent is asleep"}
       </span>
-      {sandboxOffline && wake ? (
-        <>
-          {wake.error && <span role="alert">{wake.error}</span>}
-          <Button type="button" variant="outline" size="sm" className="mt-1" onClick={wake.onWake}>
-            {wake.phase === "failed" ? "Try again" : "Start sandbox"}
-          </Button>
-        </>
-      ) : (
-        <span>
-          {sandboxOffline
-            ? "Send a message in the chat to start it again."
-            : "Send a message in the chat to reconnect."}
-        </span>
-      )}
+      <span>
+        {sandboxOffline
+          ? "Send a message in the chat to start it again."
+          : "Send a message in the chat to reconnect."}
+      </span>
     </div>
   );
 }

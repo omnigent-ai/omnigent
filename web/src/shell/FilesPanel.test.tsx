@@ -515,6 +515,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     vi.mocked(useSession).mockReturnValue({
       session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
     } as unknown as ReturnType<typeof useSession>);
+    useAsleepMock.mockReturnValue(true);
   });
 
   afterEach(() => {
@@ -523,20 +524,44 @@ describe("FilesPanel on an asleep sandbox", () => {
     } as unknown as ReturnType<typeof useSession>);
   });
 
-  it.each([true, false])(
-    "starts the sandbox when opened instead of showing an empty workspace (flatView=%s)",
-    (flatView) => {
-      useAsleepMock.mockReturnValue(true);
-      renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
+  const asleepPanel = {
+    conversationId: "conv_asleep",
+    files: [] as WorkspaceFile[],
+    listsLoaded: false,
+  };
 
+  it.each([true, false])(
+    "starts the sandbox when the panel is opened (flatView=%s)",
+    async (flatView) => {
+      const { rerender } = renderPanel({ ...asleepPanel, flatView, active: false });
+      expect(wakeSessionMock).not.toHaveBeenCalled();
+
+      await act(async () => rerender(panelAt("conv_asleep", { flatView, active: true })));
       expect(wakeSessionMock).toHaveBeenCalledTimes(1);
       expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
       expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
-      expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
       expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
       expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
     },
   );
+
+  it.each([
+    ["is already open when the page loads", () => renderPanel(asleepPanel)],
+    [
+      "stays open while the user switches sessions",
+      () => {
+        const view = renderPanel({ ...asleepPanel, conversationId: "conv_other" });
+        view.rerender(panelAt("conv_asleep"));
+        return view;
+      },
+    ],
+  ])("leaves the sandbox for navigation when the panel %s", async (_label, renderCase) => {
+    renderCase();
+    await act(async () => {});
+    expect(wakeSessionMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
+    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
+  });
 
   it("starts the sandbox when the mobile Files drawer opens", async () => {
     useAsleepMock.mockReturnValue(true);
@@ -580,91 +605,17 @@ describe("FilesPanel on an asleep sandbox", () => {
   });
 
   it.each([
-    [
-      "the session to load",
-      () =>
-        vi
-          .mocked(useSession)
-          .mockReturnValue({ session: undefined } as unknown as ReturnType<typeof useSession>),
-    ],
-    [
-      "the capability probe",
-      () => {
-        serverInfo = "loading";
-      },
-    ],
-  ])("waits for %s, then wakes the open panel once", async (_label, startLoading) => {
-    startLoading();
-    useAsleepMock.mockReturnValue(true);
-    const { rerender } = renderPanel({
-      conversationId: "conv_asleep",
-      files: [],
-      listsLoaded: false,
-    });
+    ["a read-only viewer", LEVEL_EDIT - 1],
+    ["an unknown access level", null],
+  ])("doesn't start the sandbox for %s", async (_label, permissionLevel) => {
+    vi.mocked(useSession).mockReturnValue({
+      session: { hostId: "host_test", permissionLevel },
+    } as unknown as ReturnType<typeof useSession>);
+    const { rerender } = renderPanel({ ...asleepPanel, active: false });
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
+
     expect(wakeSessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
-
-    vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
-    } as unknown as ReturnType<typeof useSession>);
-    serverInfo = WAKE_CAPABLE_INFO;
-    await act(async () => rerender(panelAt("conv_asleep")));
-    await act(async () => rerender(panelAt("conv_asleep")));
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
-  });
-
-  it("does not wake the sandbox from a hidden panel, but offers to start it", async () => {
-    useAsleepMock.mockReturnValue(true);
-    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false, active: false });
-
-    expect(wakeSessionMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
-    });
-    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
-  });
-
-  it("keeps starting the sandbox past a cached tab, loads the files once it is back, and only offers to start it once it sleeps again", async () => {
-    useAsleepMock.mockReturnValue(true);
-    const { rerender } = renderPanel({
-      conversationId: "conv_asleep",
-      files: [],
-      listsLoaded: false,
-    });
-    await act(async () => {});
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    useChangedFilesMock.mockReturnValue(changedFilesResult());
-    rerender(panelAt("conv_asleep", { flatView: true }));
-    expect(screen.getByText("No workspace changes yet")).toBeInTheDocument();
-
-    rerender(panelAt("conv_asleep"));
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-
-    useAsleepMock.mockReturnValue(false);
-    useRunnerOnlineMock.mockReturnValue(true);
-    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
-    rerender(panelAt("conv_asleep"));
-    expect(screen.getByText("README.md")).toBeInTheDocument();
-    expect(screen.queryByText("Starting sandbox…")).not.toBeInTheDocument();
-
-    useAsleepMock.mockReturnValue(true);
-    useRunnerOnlineMock.mockReturnValue(false);
-    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
-    await act(async () => rerender(panelAt("conv_asleep")));
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Start sandbox" }));
-    });
-    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
-    expect(wakeSessionMock).toHaveBeenLastCalledWith("conv_asleep");
   });
 
   it.each<[string, ServerInfo, number]>([
@@ -679,52 +630,47 @@ describe("FilesPanel on an asleep sandbox", () => {
     wakeSessionMock.mockRejectedValueOnce(
       new ApiError("Unknown event type: 'wake_session'", 400, "invalid_input"),
     );
-    useAsleepMock.mockReturnValue(true);
-    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
-    await act(async () => {});
+    const { rerender } = renderPanel({ ...asleepPanel, active: false });
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
 
     expect(wakeSessionMock).toHaveBeenCalledTimes(wakes);
     expect(retrySessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
   });
 
-  it.each([
-    ["a read-only viewer", LEVEL_EDIT - 1],
-    ["an unknown access level", null],
-  ])("keeps the send-a-message hint for %s", (_label, permissionLevel) => {
-    vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test", permissionLevel },
-    } as unknown as ReturnType<typeof useSession>);
-    useAsleepMock.mockReturnValue(true);
-    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+  it("goes back to the offline hint when the wake fails, with no new controls", async () => {
+    wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
+    const { rerender } = renderPanel({ ...asleepPanel, active: false });
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
 
-    expect(wakeSessionMock).not.toHaveBeenCalled();
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Start sandbox" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /start sandbox|try again/i }),
+    ).not.toBeInTheDocument();
   });
 
-  it("shows why the wake failed and tries again on request", async () => {
-    wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
-    useAsleepMock.mockReturnValue(true);
-    renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
-    await act(async () => {});
-
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(
-      screen.getByText("Couldn't start the sandbox: Sandbox resume timed out"),
-    ).toBeInTheDocument();
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-    });
-    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
+  it("loads the files once the sandbox is back, and doesn't wake it again when it sleeps", async () => {
+    const { rerender } = renderPanel({ ...asleepPanel, active: false });
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+
+    useAsleepMock.mockReturnValue(false);
+    useRunnerOnlineMock.mockReturnValue(true);
+    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
+    rerender(panelAt("conv_asleep", { active: true }));
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.queryByText("Starting sandbox…")).not.toBeInTheDocument();
+
+    useAsleepMock.mockReturnValue(true);
+    useRunnerOnlineMock.mockReturnValue(false);
+    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
+    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps showing a list cached before the sandbox went offline", () => {
-    useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [file("README.md")] });
 
     expect(screen.getByText("README.md")).toBeInTheDocument();

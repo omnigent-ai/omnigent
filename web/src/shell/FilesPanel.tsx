@@ -15,9 +15,8 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
-import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
+import { isOwnerLevel } from "@/lib/permissionsApi";
+import { useSandboxWake, useSandboxWakeWhenOpened } from "@/hooks/useSandboxAutoWake";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -514,22 +513,12 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
-  // Opening the panel on an asleep sandbox starts it, as Reconnect host does,
-  // so its files load without a chat message. Restarting needs known edit
-  // access and a server that can wake without resuming an interrupted turn.
-  const serverInfo = useServerInfo();
-  const canWake =
-    session?.permissionLevel != null &&
-    isEditorLevel(session.permissionLevel) &&
-    serverInfo !== "loading" &&
-    serverInfo.session_event_types?.includes("wake_session") === true;
-  const sandboxWake = useSandboxAutoWake({
-    conversationId,
-    asleep: sandboxAsleep,
-    needsSandbox: !dataReady,
-    awake: runnerOnline === true,
-    active,
-    canWake,
+  // Opening the panel (not arriving at a session with it already open) starts
+  // an asleep sandbox so its files load without a chat message. The
+  // full-screen drawer (`onClose`) mounts only when the user opens it.
+  const sandboxWake = useSandboxWake(conversationId);
+  useSandboxWakeWhenOpened(active, conversationId, sandboxWake.wakeIfAsleep, {
+    mountIsOpen: onClose !== undefined,
   });
 
   return (
@@ -721,20 +710,7 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && (
-          <RunnerAsleepHint
-            sandboxOffline
-            wake={
-              canWake && sandboxWake.phase !== "unsupported"
-                ? {
-                    phase: sandboxWake.phase,
-                    error: sandboxWake.error,
-                    onWake: () => void sandboxWake.wake(),
-                  }
-                : undefined
-            }
-          />
-        )}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWake.waking} />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}
