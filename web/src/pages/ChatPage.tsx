@@ -804,6 +804,11 @@ export function ChatPage() {
     isOwner: isOwnerLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null),
     importSource,
   });
+  const routesToResumePicker = opensResumePicker({
+    unboundFork: isUnboundFork,
+    resumableUnbound: canResumeOnLocalHost,
+    sandboxLaunching,
+  });
 
   // Author labels show only once a session is shared. A non-owner viewer
   // already implies a share; the owner needs the grant list (manage-only,
@@ -1001,7 +1006,7 @@ export function ChatPage() {
       // the bind. Pin the prompt to THIS session so it replays here, never
       // into a session the user may switch to first; carry any attachments
       // so the replay sends the same payload.
-      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+      if (urlConvId && runnerOnline === false && routesToResumePicker) {
         setPendingResumePrompt({ sessionId: urlConvId, text, files: files ?? [], replyDraft });
         setResumeDirDialogOpen(true);
         return;
@@ -1057,8 +1062,7 @@ export function ChatPage() {
       agentId,
       urlConvId,
       runnerOnline,
-      isUnboundFork,
-      canResumeOnLocalHost,
+      routesToResumePicker,
       isUnreachable,
       sendReconnectsArca,
       reconnect,
@@ -1071,7 +1075,7 @@ export function ChatPage() {
       if (!agentId) return;
       // Slash commands aren't replayed (an edge), but still route an unbound
       // coding clone to the directory picker so it isn't a dead end.
-      if (urlConvId && runnerOnline === false && (isUnboundFork || canResumeOnLocalHost)) {
+      if (urlConvId && runnerOnline === false && routesToResumePicker) {
         setResumeDirDialogOpen(true);
         return;
       }
@@ -1085,16 +1089,7 @@ export function ChatPage() {
         },
       });
     },
-    [
-      agentId,
-      urlConvId,
-      runnerOnline,
-      isUnboundFork,
-      canResumeOnLocalHost,
-      isUnreachable,
-      reconnect,
-      navigate,
-    ],
+    [agentId, urlConvId, runnerOnline, routesToResumePicker, isUnreachable, reconnect, navigate],
   );
 
   const onStop = useCallback(() => {
@@ -1190,9 +1185,9 @@ export function ChatPage() {
 
   const onShowReconnectHelp = useCallback(() => {
     // Unbound sessions need a directory; a bound local host can reconnect directly.
-    if (isUnboundFork || canResumeOnLocalHost) setResumeDirDialogOpen(true);
+    if (routesToResumePicker) setResumeDirDialogOpen(true);
     else void reconnect();
-  }, [isUnboundFork, canResumeOnLocalHost, reconnect]);
+  }, [routesToResumePicker, reconnect]);
 
   const newSessionProjectId =
     activeConv?.project_id !== undefined ? activeConv.project_id : activeSession?.projectId;
@@ -4853,6 +4848,32 @@ export function unboundSessionResumableInApp(params: {
 }): boolean {
   if (!params.unbound || !params.isOwner) return false;
   return params.importSource == null || HOST_PORTABLE_IMPORT_SOURCES.has(params.importSource);
+}
+
+/**
+ * Whether a send (or the reconnect help) in an offline session opens the
+ * in-app resume picker (`ResumeWithDirectoryDialog`) instead of going to the
+ * server.
+ *
+ * A managed-sandbox session, including a clone forked onto a new sandbox, has
+ * no host or workspace until its sandbox registers, so it reads as unbound.
+ * The server binds it and holds a message sent meanwhile for the launch, so
+ * the picker would offer a bind the server is already doing, and for a clone
+ * it says the source's host is offline (host pickers hide sandbox hosts). A
+ * failed launch opens the picker as before.
+ *
+ * @param unboundFork - See `isUnboundCodingFork`.
+ * @param resumableUnbound - See `unboundSessionResumableInApp`.
+ * @param sandboxLaunching - A managed-sandbox launch is in flight (its
+ *   `sandboxStatus` is set and not `failed`).
+ */
+export function opensResumePicker(params: {
+  unboundFork: boolean;
+  resumableUnbound: boolean;
+  sandboxLaunching: boolean;
+}): boolean {
+  if (params.sandboxLaunching) return false;
+  return params.unboundFork || params.resumableUnbound;
 }
 
 export function shouldShowCodexPlanModeControl(

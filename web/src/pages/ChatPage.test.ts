@@ -30,6 +30,7 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
+  opensResumePicker,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -1992,6 +1993,27 @@ describe("unboundSessionResumableInApp", () => {
     for (const src of ["kimi", "kiro", "qwen"]) {
       expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
     }
+  });
+});
+
+describe("opensResumePicker", () => {
+  it("opens for an unbound fork or a resumable host-less session", () => {
+    const idle = { unboundFork: false, resumableUnbound: false, sandboxLaunching: false };
+    expect(opensResumePicker({ ...idle, unboundFork: true })).toBe(true);
+    expect(opensResumePicker({ ...idle, resumableUnbound: true })).toBe(true);
+    expect(opensResumePicker(idle)).toBe(false);
+  });
+
+  it("stays closed while a managed-sandbox launch places the session", () => {
+    // OMNI-10516: a clone forked onto a new sandbox is unbound until the
+    // sandbox registers. Its first send opened "Resume this session" with "The
+    // original session's host is offline" for the ~15 s the launch took.
+    expect(
+      opensResumePicker({ unboundFork: true, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
+    expect(
+      opensResumePicker({ unboundFork: false, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
   });
 });
 
