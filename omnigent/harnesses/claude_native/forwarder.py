@@ -2603,40 +2603,38 @@ def _tool_use_ids_in_transcript(
     :returns: Tool-use ids owned by this transcript, or ``None`` when the file
         could not be read so the caller retries on the next poll.
     """
+    tool_use_ids: set[str] = set()
     try:
-        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
-        # while Claude is writing; the mangled tail line fails JSON parse below
-        # and is skipped, and the completed record is read on the next poll.
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        # Stream records so a large tool result does not copy the whole transcript.
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("isSidechain") is True and not include_sidechains:
+                    continue
+                message = record.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use":
+                        continue
+                    # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
+                    # Restricting to it keeps an unrelated tool-use id collision from
+                    # making a legitimate spawn look ambiguous.
+                    if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
+                        continue
+                    tool_use_id = block.get("id")
+                    if isinstance(tool_use_id, str) and tool_use_id:
+                        tool_use_ids.add(tool_use_id)
     except OSError:
         return None
-    tool_use_ids: set[str] = set()
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        if record.get("isSidechain") is True and not include_sidechains:
-            continue
-        message = record.get("message")
-        if not isinstance(message, dict):
-            continue
-        content = message.get("content")
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict) or block.get("type") != "tool_use":
-                continue
-            # Only the sub-agent spawn tool mints the ids in ``.meta.json``.
-            # Restricting to it keeps an unrelated tool-use id collision from
-            # making a legitimate spawn look ambiguous.
-            if block.get("name") not in _SUBAGENT_SPAWN_TOOL_NAMES:
-                continue
-            tool_use_id = block.get("id")
-            if isinstance(tool_use_id, str) and tool_use_id:
-                tool_use_ids.add(tool_use_id)
     return tool_use_ids
 
 
@@ -4570,7 +4568,7 @@ async def _forward_available_status_events(
                                         extra={"session_id": session_id},
                                     )
                                     return durable
-                        except Exception:
+                        except Exception:  # noqa: BLE001 - preserve the cursor for retry
                             # Non-HTTP failure (e.g. reading Claude session
                             # messages). Hold the cursor and retry next poll.
                             _logger.warning(
@@ -5144,7 +5142,7 @@ async def _handle_compact_summary_item(
             extra={"session_id": session_id},
         )
         return False
-    except Exception:
+    except Exception:  # noqa: BLE001 - preserve the cursor for retry
         # Non-HTTP failure (e.g. reading Claude session messages). Retry.
         _logger.warning(
             "Unexpected error persisting compaction boundary (transcript path) for %s; seq=%s",
