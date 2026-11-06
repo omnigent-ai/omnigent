@@ -552,3 +552,26 @@ def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
     managed_host_keepalive.record_pong("r1", None)
     gate.tick()
     assert gate.submitted == ["r1", "r1"]
+
+
+@pytest.mark.parametrize(("configured", "expected"), [(1500.0, 1500.0), (None, 0.0)])
+def test_provider_grace_reaches_the_runner_cache(
+    monkeypatch: pytest.MonkeyPatch, configured: float | None, expected: float
+) -> None:
+    # agent_sandbox configs carry keep_warm_after_work_s; others (or duck-typed
+    # configs without the field) get no grace beyond their platform window.
+    launcher = _Launcher()
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
+    )
+    config = SimpleNamespace(launcher_factory=lambda: launcher)
+    if configured is not None:
+        config.keep_warm_after_work_s = configured
+    monkeypatch.setattr(
+        managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=lambda _p: config)
+    )
+    monkeypatch.setattr(managed_host_keepalive, "_runner_warm_grace_s", {})
+    managed_host_keepalive._keep_alive_for_runner("r1")
+    assert managed_host_keepalive._runner_warm_grace_s == {"r1": expected}

@@ -1657,15 +1657,16 @@ def create_runner_app(
 
     # Monotonic time of the newest published session event. Every turn publishes
     # through _publish_event, so this records work even when it starts and ends
-    # between two reads of has_active_work. Status edges are left out: they report
-    # state rather than do work, and a tunnel reconnect republishes every session's
-    # status (resync_session_statuses), which must not look like new work.
+    # between two reads of has_active_work. ``session.*`` events are left out: they
+    # are resource and UI notifications (status edges, plain-shell terminal output,
+    # resource changes), not agent work, and a tunnel reconnect republishes every
+    # session's status (resync_session_statuses), which must not look like new work.
     _last_event_published_at: list[float | None] = [None]
     app.state.last_event_published_at = lambda: _last_event_published_at[0]
 
     def _publish_event(session_id: str, event: Mapping[str, object]) -> None:
         event_body = cast(_JsonObject, event)
-        if event_body.get("type") != "session.status":
+        if not str(event_body.get("type", "")).startswith("session."):
             _last_event_published_at[0] = time.monotonic()
         queue = _session_event_queues.get(session_id)
         if queue is None:

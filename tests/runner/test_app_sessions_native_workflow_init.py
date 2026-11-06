@@ -2675,10 +2675,13 @@ async def test_turn_finished_between_busy_checks_still_reports_busy_once() -> No
     assert busy.check() is True, "the finished turn's events must count as work"
     assert busy.check() is False, "no further work, so the next check is idle"
 
-    # A tunnel reconnect republishes every session's status edge; that is not work.
-    publish = app.state.session_resource_registry._session_status_publisher
-    publish("5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c", "idle", None)
+    # Notifications are not agent work: a tunnel reconnect republishes every status
+    # edge, and a plain shell's output publishes terminal activity.
+    registry = app.state.session_resource_registry
+    registry._session_status_publisher("5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c", "idle", None)
     assert busy.check() is False, "a republished status edge must not count as work"
+    registry._terminal_activity_publisher("5b0f3a9d2c7e4f1a8b6d0c9e3f2a1b4c", "terminal_bash_main")
+    assert busy.check() is False, "plain-shell terminal output must not count as work"
 
 
 @pytest.mark.asyncio
