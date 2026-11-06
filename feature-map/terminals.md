@@ -11,7 +11,10 @@ reattach when the session moves to another host.
 
 - `agent-terminal-view`: the Chat/Terminal switcher shows the harness terminal
   and returns to chat with the terminal's content kept. States: starting up
-  (no Resume action), stopped (Resume offered), connected.
+  (no Resume action), automatically restarting on an online host, stopped
+  (Resume offered after recovery fails or when the host is offline), connected.
+  Automatic recovery runs once when opening Terminal. Leaving it open does not
+  revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
@@ -59,10 +62,16 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
-- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
-  is inert while the host is offline, the session is stranded, or a shell is
-  still being created, and it yields to a focused terminal or editor.
+- Press Control+` (on every platform) to open a shell of the remembered default
+  type, also from a focused terminal. The chord is inert while the host is
+  offline, the session is stranded, or a shell is still being created.
+- In the desktop app, Control+` or File → New Terminal does the same, also
+  while an embedded browser tab has focus. The menu item is disabled whenever
+  the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
+  In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
+  workspace tab, using the same terminal confirmation. A read-only viewer's
+  terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -85,6 +94,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
+  `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
+  through the desktop switch, keyboard shortcut, mobile menu and grid switch,
+  plus failed attempts followed by manual Resume, including a cached closed
+  terminal that stays mounted during recovery. It uses the built SPA with
+  mocked host, retry and terminal transports; run with
+  `--browser-ui-skip-build --reruns 0 --video=on`.
   Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm
   surfaces against mocked terminal WebSockets, independent input, per-cell
   switches and keeping connections across view changes. Run without a server
@@ -103,6 +118,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
+  A program's terminal queries get exactly one reply:
+  `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
@@ -113,9 +130,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `web/src/shell/TerminalSplitControls.test.tsx` and
   `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
-  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
-  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
-  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  twice and expect Terminal view, then Chat view; press Control+` and
+  expect a new shell tab to open and take focus. With `splittable_terminal_view_ui`,
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
@@ -160,6 +176,13 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   injects the blocked event; it does not run a vendor CLI. For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+
+For the desktop Close shortcut, open a shell tab in an ordinary session,
+focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
+only that tab should close. Cancel the prompt to keep the tab and session.
+Repeat as a read-only viewer: the shortcut should leave the terminal open.
+Cmd/Ctrl+Shift+W should close the window. Native accelerator delivery requires
+an Electron run; component tests cover the selection and confirmation paths.
 
 ## Gotchas
 

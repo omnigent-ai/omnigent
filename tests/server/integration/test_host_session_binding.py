@@ -51,6 +51,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.server.helpers import (
     FakeSandboxLauncher,
     HostStartInvocation,
@@ -562,6 +563,61 @@ async def test_managed_session_create_end_to_end(
     assert env.host_store.list_hosts(RESERVED_USER_LOCAL) == []
     # The tunnels list holds the fake hosts open through the delete;
     # release them only now.
+    del tunnels
+
+
+async def test_deleting_one_session_keeps_a_shared_sandbox_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Several sessions can be bound to one sandbox host (a runner launch on
+    the host binds its session there). Deleting one keeps the sandbox for
+    the others; deleting the last tears it down.
+    """
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2
+    )
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="shared-host-agent")
+    resp = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "managed"}
+    )
+    assert resp.status_code == 201, resp.text
+    first = await _wait_for_managed_binding(env, resp.json()["id"])
+    tunnels = [await future for future in host_futures]
+    assert first.host_id is not None
+
+    resp = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+    assert resp.status_code == 201, resp.text
+    second_id = resp.json()["id"]
+    env.conv_store.set_host_id(second_id, first.host_id, "/root/workspace")
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{first.id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert fake.terminated == []
+    assert env.host_store.get_host(first.host_id) is not None
+
+    delete_resp = await env.client.delete(f"/v1/sessions/{second_id}")
+    assert delete_resp.status_code == 200, delete_resp.text
+    assert set(fake.terminated) == {"sb-fake-1"}
+    assert env.host_store.get_host(first.host_id) is None
     del tunnels
 
 
@@ -2156,7 +2212,10 @@ async def test_delete_managed_session_forwards_capture_logs(
     )
     teardowns: list[bool] = []
 
-    async def record_teardown(*args: object, capture_logs: bool = False) -> None:
+    async def record_teardown(
+        *args: object, keep_if_bound: bool = False, capture_logs: bool = False
+    ) -> None:
+        assert keep_if_bound
         teardowns.append(capture_logs)
 
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", record_teardown)
@@ -2241,9 +2300,7 @@ async def test_runner_exited_logs_one_event_per_bound_session(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_crashed")
-    async with asyncio.timeout(5.0):
-        while len(_runner_exited_events(caplog)) < 2:
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: len(_runner_exited_events(caplog)) >= 2)
 
     events = _runner_exited_events(caplog)
     assert sorted(getattr(r, "session_id", None) for r in events) == sorted([parent.id, child.id])
@@ -2263,9 +2320,7 @@ async def test_runner_exited_without_bound_sessions_logs_sessionless_event(
 
     caplog.set_level("WARNING", logger="omnigent.server.routes.host_tunnel")
     _comm = await _report_runner_exited(app, "runner_orphan")
-    async with asyncio.timeout(5.0):
-        while not _runner_exited_events(caplog):
-            await asyncio.sleep(0.01)
+    await poll_until_async(lambda: _runner_exited_events(caplog))
     # Let any (incorrect) extra rows from the same frame land before counting.
     await asyncio.sleep(0.05)
 
@@ -2301,9 +2356,7 @@ async def test_runner_exited_lookup_failure_logs_event_and_keeps_tunnel(
     def _callback_failures() -> list[logging.LogRecord]:
         return [r for r in caplog.records if "on_runner_exited callback failed" in r.getMessage()]
 
-    async with asyncio.timeout(5.0):
-        while not _callback_failures():
-            await asyncio.sleep(0.01)
+    await poll_until_async(_callback_failures)
 
     events = _runner_exited_events(caplog)
     assert len(events) == 1
@@ -2470,7 +2523,7 @@ async def test_runner_exited_after_connect_fails_mid_turn_session(
 
     error = _persisted_task_error(conv_store, conv.id)
     assert error is not None
-    assert error["code"] == "runner_failed_to_start"
+    assert error["code"] == "runner_process_crash"
     decision = _disconnect_decisions(caplog, conv.id)[0]
     attributes = getattr(decision, "attributes", {})
     assert attributes["decision"] == "failed_mid_turn"

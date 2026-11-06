@@ -28,12 +28,13 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
+| `codex_plan_at_launch` | On | Server | 0.22.0 | Allows the new-session composer to start Codex in Plan mode. Missing or disabled support disables this launch option; connected hosts must also advertise support. |
 | `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
 | `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires a transactional store; a multi-replica deployment also supplies host ownership, and coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
-| `custom_agents_settings_ui` | Off | Web | 0.18.0 | Exposes Custom agents settings when the server also advertises `agent_install`. |
+| `custom_agents_settings_ui` | On | Web | 0.24.0 | Exposes Custom agents settings when the server also advertises `agent_install`. Append `-custom_agents_settings_ui` to restore the previous Settings layout, with Harnesses under General. |
 | `sidebar_grouping_ui` | Off | Web | 0.19.0 | Adds Grouping, Ordering and Show options to the sidebar filter menu, moves that menu to the Projects header, splits Shared sessions into their own section, lets a Status or Updated grouping replace the Projects, Shared and Sessions sections, and expands the session tooltip with Repo, PR and Created by. |
 | `claude_osc_status` | On | Runner | 0.20.0 | Uses Claude OSC 7501 reports for working status, with legacy file/pane fallback. Set on the host/runner; applies to newly launched Claude-native terminals after restart. Not exposed in `/v1/info`. |
 

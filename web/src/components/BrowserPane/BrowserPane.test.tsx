@@ -1,12 +1,41 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import type * as NativeBridge from "@/lib/nativeBridge";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { BrowserPane } from "./BrowserPane";
+
+const getSessionSlim = vi.fn();
+vi.mock("@/lib/sessionsApi", () => ({
+  getSessionSlim: (...args: unknown[]) => getSessionSlim(...args),
+}));
+
+// Desktop menu commands (Reload, Focus Address Bar); off unless a test turns them on.
+const desktop = vi.hoisted(() => ({
+  enabled: false,
+  send: (_event: { command: string; browserViewId: string | null }) => {},
+}));
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
 // unsupported-shell (returns null) path is covered by reading the early return.
-vi.mock("@/lib/nativeBridge", () => ({
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
   isElectronShell: () => true,
   supportsBrowser: () => true,
+  supportsDesktopCommands: () => desktop.enabled,
+  onDesktopCommand: (callback: typeof desktop.send) => {
+    desktop.send = callback;
+    return () => {};
+  },
+  setDesktopCommandState: () => {},
   // DialogContent sizes itself for the iOS keyboard and asks for the shell.
   isIOSShell: () => false,
   // Delegate to the per-test bridge stub so a test can assert the call.
@@ -57,6 +86,11 @@ function installBridge(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  getSessionSlim.mockReset().mockImplementation(async (id: string) => ({
+    id,
+    hostId: null,
+    parentSessionId: null,
+  }));
   // jsdom has no ResizeObserver; the measuring-container effect (viewActive path)
   // constructs one. Stub it so mounting the container doesn't throw.
   (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
@@ -69,6 +103,8 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  resetDesktopCommandsForTests();
+  desktop.enabled = false;
   vi.clearAllMocks();
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = undefined;
 });
@@ -216,6 +252,28 @@ describe("BrowserPane cold-start (no view yet)", () => {
   });
 });
 
+describe("BrowserPane focus requests", () => {
+  it("focuses the address bar once for a tab just opened", () => {
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_f" focus="address" onFocused={onFocused} />);
+    expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveFocus();
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses the page of a tab returned to once its view is attached", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://example.com/" }),
+    });
+    const onFocused = vi.fn();
+    render(<BrowserPane conversationId="conv_g" focus="page" onFocused={onFocused} />);
+    expect(onFocused).not.toHaveBeenCalled();
+    await waitFor(() =>
+      expect(bridge.browserSetActive).toHaveBeenCalledWith("conv_g", { focus: true }),
+    );
+    expect(onFocused).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("BrowserPane retained-view lifecycle", () => {
   it("does not reattach a view closed while the pane is hidden", async () => {
     let fireClosed: ((p: { conversationId: string; reason: string | null }) => void) | undefined;
@@ -323,7 +381,12 @@ describe("BrowserPane design-mode toggle", () => {
 });
 
 describe("BrowserPane toolbar navigation + URL bar", () => {
-  it("opens a manually typed localhost preview through the user navigation path", async () => {
+  it("sends the owning session host and protocol for a manually typed localhost preview", async () => {
+    getSessionSlim.mockResolvedValue({
+      id: "conv_preview",
+      hostId: "local-host",
+      parentSessionId: null,
+    });
     const bridge = installBridge();
     render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
     const bar = screen.getByRole("textbox", { name: "Address bar" });
@@ -335,9 +398,10 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         "browser-tab:conv_preview:two",
         "http://localhost:5273/preview",
         undefined,
-        { force: true },
+        { force: true, sourceHostId: "local-host", sessionHostProtocol: 1 },
       ),
     );
+    expect(getSessionSlim).toHaveBeenCalledWith("conv_preview");
     expect(bar).toHaveValue("http://localhost:5273/preview");
   });
 
@@ -374,6 +438,125 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: /reload/i })).not.toBeDisabled());
     return { bridge, fireUrl: () => fireUrl, fireNav: () => fireNav };
   }
+
+  it("resolves the current host on address-bar navigation after the session moves", async () => {
+    getSessionSlim
+      .mockResolvedValueOnce({ id: "conv_preview", hostId: "local-host", parentSessionId: null })
+      .mockResolvedValue({ id: "conv_preview", hostId: "remote-host", parentSessionId: null });
+    const bridge = installBridge();
+    render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+    const bar = screen.getByRole("textbox", { name: "Address bar" });
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/before" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+    fireEvent.change(bar, { target: { value: "http://127.0.0.1:5173/after" } });
+    fireEvent.keyDown(bar, { key: "Enter" });
+    await waitFor(() =>
+      expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+        "browser-tab:conv_preview:two",
+        "http://127.0.0.1:5173/after",
+        undefined,
+        { force: true, sourceHostId: "remote-host", sessionHostProtocol: 1 },
+      ),
+    );
+    expect(getSessionSlim).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["host lookup", "navigation result"])(
+    "keeps the latest URL submission while the earlier %s is pending",
+    async (pendingStage) => {
+      let resolveFirstHost!: (host: unknown) => void;
+      const firstHost = new Promise((resolve) => {
+        resolveFirstHost = resolve;
+      });
+      let resolveFirstNavigation!: (result: { ok: boolean; error?: string }) => void;
+      const firstNavigation = new Promise<{ ok: boolean; error?: string }>((resolve) => {
+        resolveFirstNavigation = resolve;
+      });
+      getSessionSlim
+        .mockReturnValueOnce(
+          pendingStage === "host lookup"
+            ? firstHost
+            : Promise.resolve({ id: "conv_preview", hostId: "local-host" }),
+        )
+        .mockResolvedValue({ id: "conv_preview", hostId: "remote-host" });
+      const bridge = installBridge({
+        browserOpenOrNavigate: vi
+          .fn()
+          .mockImplementationOnce(() =>
+            pendingStage === "navigation result" ? firstNavigation : Promise.resolve({ ok: true }),
+          )
+          .mockResolvedValue({ ok: true }),
+      });
+      render(<BrowserPane conversationId="browser-tab:conv_preview:two" agentBrowser={false} />);
+      const bar = screen.getByRole("textbox", { name: "Address bar" });
+      fireEvent.change(bar, { target: { value: "https://first.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      if (pendingStage === "navigation result") {
+        await waitFor(() => expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(1));
+      }
+      fireEvent.change(bar, { target: { value: "https://latest.example" } });
+      fireEvent.keyDown(bar, { key: "Enter" });
+      await waitFor(() => expect(bar).toHaveValue("https://latest.example"));
+      if (pendingStage === "host lookup") {
+        expect(bridge.browserOpenOrNavigate).not.toHaveBeenCalled();
+        await act(async () => {
+          resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        });
+      }
+      await waitFor(() =>
+        expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+          "browser-tab:conv_preview:two",
+          "https://latest.example",
+          undefined,
+          {
+            force: true,
+            sourceHostId: pendingStage === "host lookup" ? "local-host" : "remote-host",
+            sessionHostProtocol: 1,
+          },
+        ),
+      );
+      expect(getSessionSlim).toHaveBeenCalledTimes(pendingStage === "host lookup" ? 1 : 2);
+      await act(async () => {
+        resolveFirstHost({ id: "conv_preview", hostId: "local-host" });
+        resolveFirstNavigation({ ok: false, error: "stale failure" });
+      });
+      expect(bridge.browserOpenOrNavigate).toHaveBeenCalledTimes(
+        pendingStage === "host lookup" ? 1 : 2,
+      );
+      expect(bar).toHaveValue("https://latest.example");
+      expect(screen.queryByText("stale failure")).not.toBeInTheDocument();
+    },
+  );
+
+  it("reloads the page for desktop Reload from its toolbar, and passes it on elsewhere", async () => {
+    desktop.enabled = true;
+    const appReload = vi.fn();
+    renderHook(() => useDesktopCommand("reload", appReload));
+    const { bridge } = await renderActive("conv_cmd_r");
+    const bar = screen.getByRole("textbox", { name: /address bar/i });
+    expect(bar).toHaveAttribute("title", "Address bar (Ctrl+L)");
+    expect(screen.getByRole("button", { name: /reload/i })).toHaveAttribute(
+      "title",
+      "Reload (Ctrl+R)",
+    );
+
+    act(() => bar.focus());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(bridge.browserReload).toHaveBeenCalledWith("conv_cmd_r");
+    expect(appReload).not.toHaveBeenCalled();
+
+    act(() => bar.blur());
+    act(() => desktop.send({ command: "reload", browserViewId: null }));
+    expect(appReload).toHaveBeenCalledTimes(1);
+  });
+
+  it("focuses and selects the address for desktop Focus Address Bar", async () => {
+    desktop.enabled = true;
+    await renderActive("conv_cmd_l");
+    act(() => desktop.send({ command: "focus-address-bar", browserViewId: null }));
+    expect(document.activeElement).toBe(screen.getByRole("textbox", { name: /address bar/i }));
+  });
 
   it("reload button calls the reload IPC once a view is active", async () => {
     const { bridge } = await renderActive("conv_reload");

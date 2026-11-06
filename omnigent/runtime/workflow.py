@@ -1429,10 +1429,10 @@ def _build_claude_sdk_spawn_env(
     if retry_payload is not None:
         env["HARNESS_CLAUDE_SDK_RETRY_POLICY"] = retry_payload
     # Permission mode: controls whether Claude asks for approval before
-    # calling native tools. When set to anything other than the default
-    # ``"bypassPermissions"``, the SDK's ``can_use_tool`` callback is
-    # active and approval requests surface via Omnigent elicitation. Read from
-    # Omitted when not set — harness falls back to ``"bypassPermissions"``.
+    # calling native tools. Unless it is ``"bypassPermissions"``, the SDK's
+    # ``can_use_tool`` callback is active and approval requests surface via
+    # Omnigent elicitation. Omitted when not set — the harness falls back to
+    # ``"auto"``.
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
@@ -1468,6 +1468,32 @@ def _apply_harness_path_override(
     path = config_harness_path_override(harness, load_config())
     if path is not None:
         env[_harness_path_env_var(canonicalize_harness(harness) or harness)] = path
+
+
+def _apply_codex_provider_env(
+    env: dict[str, str],
+    spec: AgentSpec,
+    provider: ProviderEntry | None,
+) -> None:
+    """Set the ``HARNESS_CODEX_*`` routing a Codex launch on *provider* uses.
+
+    :param env: The spawn-env dict being built (mutated in place).
+    :param spec: The agent spec.
+    :param provider: The launch's resolved provider, or ``None`` when none resolved.
+    """
+    if provider is not None:
+        if provider.kind == DATABRICKS_KIND:
+            _configure_brokered_codex_with_ucode(env, spec, provider)
+        else:
+            configure_agent_harness_with_provider(env, provider, harness_type="codex")
+    elif codex_config_provider_dismissed(load_config()):
+        # No credential resolved. If the user Removed codex's custom
+        # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
+        # provider so the dismissal holds at run time — the executor's bridged
+        # config.toml would otherwise still route this launch through that removed
+        # default model_provider. (Gateway mode never reaches here: it resolves a
+        # provider above, and the executor rejects a double pin.)
+        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
 
 
 def _build_codex_spawn_env(
@@ -1514,19 +1540,7 @@ def _build_codex_spawn_env(
     # :func:`_resolve_provider_for_build`. Otherwise the existing path is
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
-    if provider is not None:
-        if provider.kind == DATABRICKS_KIND:
-            _configure_brokered_codex_with_ucode(env, spec, provider)
-        else:
-            configure_agent_harness_with_provider(env, provider, harness_type="codex")
-    elif codex_config_provider_dismissed(load_config()):
-        # No credential resolved. If the user Removed codex's custom
-        # ~/.codex/config.toml provider (dismissed), pin the built-in ``openai``
-        # provider so the dismissal holds at run time — the executor's bridged
-        # config.toml would otherwise still route this launch through that removed
-        # default model_provider. (Gateway mode never reaches here: it resolves a
-        # provider above, and the executor rejects a double pin.)
-        env["HARNESS_CODEX_MODEL_PROVIDER"] = "openai"
+    _apply_codex_provider_env(env, spec, provider)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.

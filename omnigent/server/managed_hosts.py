@@ -184,7 +184,8 @@ import re
 import secrets
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from dataclasses import field as dataclass_field
 from functools import partial
@@ -262,22 +263,15 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
 _ONLINE_POLL_INTERVAL_S = 1.0
 
-# Launch-token lifetime for the YAML modal path: Modal's 24h sandbox
-# cap plus an hour of slack, so a live sandbox can always
-# re-authenticate its tunnel across reconnects, while a token leaked
-# from a long-dead sandbox cannot. Scoped to the token, not the host:
-# the host row is durable, and a relaunch mints a fresh token + expiry.
-# Deployments injecting their own launcher choose their own TTL on
-# ManagedSandboxConfig.
+# Provider defaults; sandbox.token_ttl_s can override these windows.
+# Authenticated hosts renew halfway through their TTL.
+# Tokens expire after the last renewal; resume/relaunch rotates the token.
+
+# Modal's 24h sandbox cap plus an hour of slack.
 MODAL_MANAGED_TOKEN_TTL_S = 25 * 3600
 
-# Launch-token lifetime for the YAML daytona path. Daytona sandboxes
-# have no platform lifetime cap (idle auto-stop is disabled at
-# provision), so the bound is policy, not platform: 7 days keeps a
-# long-lived sandbox re-authenticating across tunnel reconnects while
-# still expiring tokens of sandboxes nobody deleted. A relaunch (or a
-# session past 7 days going through the dead-host relaunch path) mints
-# a fresh token.
+# Daytona has no platform lifetime cap. Seven days bounds disconnected
+# credentials while authenticated heartbeats keep active sandboxes usable.
 DAYTONA_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 
 # The blaxel launch-token TTL is NOT a constant: Blaxel reaps a sandbox at its
@@ -362,7 +356,8 @@ MANAGED_SANDBOX_LABEL_NAMESPACE = "omnigent.sandbox."
 # silently truncated at the 256-char label-value cap, losing repos on relaunch.
 # Per-session state: a fork never inherits them (the store drops the whole
 # ``<base>.`` family, and the fork's own launch re-stamps whatever it resolves),
-# while an in-place agent switch keeps them — the sandbox is unchanged.
+# while an in-place agent switch or a continuation in the same sandbox (claude-sdk
+# ``/clear``) keeps them — the sandbox is unchanged.
 MANAGED_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 
 # Server-owned routing id from a managed create's or fork's ``host_id``:
@@ -579,11 +574,14 @@ class ManagedLaunch:
     :param bound: Set once the session row records its new host. From
         then on the host's replica can finish the launch and deliver
         saved inputs, so a scheduled fire can hand off at this point.
+    :param host_online_failure_hint: Recovery guidance from the active provider,
+        read off the event loop if a scheduled registration wait times out.
     """
 
     settled: asyncio.Event
     error: str | None = None
     bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    host_online_failure_hint: Callable[[], str | None] | None = None
 
 
 class ManagedLaunchTracker:
@@ -679,10 +677,10 @@ class ManagedSandboxConfig:
         (launchers may cache provider handles internally). May raise
         ``HTTPException`` to report an unusable backend — the YAML
         path uses this for providers without managed support.
-    :param token_ttl_s: Launch-token lifetime in seconds, e.g.
-        ``90000`` (25h) for Modal. Must comfortably exceed the
-        provider's maximum sandbox lifetime so a live sandbox can
-        always re-authenticate its tunnel across reconnects.
+    :param token_ttl_s: Launch-token validity window in seconds, e.g.
+        ``90000`` (25h) for Modal. Authenticated hosts renew halfway through
+        this window, allowing long-lived sandboxes to reconnect after an
+        outage. Tokens expire after the last renewal plus this window.
     :param managed_launch_supported: Whether ``launcher_factory`` can
         actually serve a managed launch. The YAML path sets this from
         :data:`PROVIDERS_WITH_MANAGED_LAUNCH` — staged providers
@@ -722,6 +720,8 @@ class ManagedSandboxConfig:
         Supplies choices without selecting a default or provisioning a host.
         Raise :class:`NoReachableModels` when no model can serve the harness;
         the picker then blocks launch instead of offering Default.
+    :param manages_profiles: Static opt-in copied from plugin metadata. Embedding
+        deployments set it explicitly for launchers that require profile selection.
     """
 
     server_url: str
@@ -735,6 +735,9 @@ class ManagedSandboxConfig:
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
+    # Request-scoped reference; teardown must not depend on launch authorization.
+    profile_selection: dict[str, Any] | None = None
+    manages_profiles: bool = False
 
 
 class NoReachableModels(Exception):
@@ -1332,6 +1335,24 @@ def _apply_keep_warm(
     return merged
 
 
+def deployment_with_sandbox_profile(
+    deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
+) -> ManagedSandboxDeployment:
+    """Pass a saved provider reference to fresh launcher instances."""
+    if snapshot is None:
+        return deployment
+    entry = deployment.for_provider(snapshot["provider"])
+    if entry is None:
+        raise HTTPException(status_code=400, detail="The sandbox profile provider is unavailable")
+    return replace(
+        deployment,
+        configs=tuple(
+            replace(config, profile_selection=snapshot) if config is entry else config
+            for config in deployment.configs
+        ),
+    )
+
+
 def deployment_with_inference_snapshot(
     deployment: ManagedSandboxDeployment, snapshot: dict[str, Any] | None
 ) -> ManagedSandboxDeployment:
@@ -1454,7 +1475,8 @@ def parse_sandbox_config(raw: object) -> ManagedSandboxDeployment | None:
 
     Takes either a scalar ``provider:`` (one provider) or a ``providers:``
     list (several, offered side by side), never both. ``server_url`` /
-    ``host_config`` stay top-level and apply to every entry::
+    ``host_config`` stay top-level and apply to every entry. ``token_ttl_s``
+    overrides provider defaults and can also be set per entry::
 
         sandbox:
           server_url: https://omnigent.example.com
@@ -1656,6 +1678,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     validate_inference_credentials({}, model_discovery)
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
+    manages_profiles = False
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
             _parse_modal_image(raw), _parse_modal_secrets(raw)
@@ -1923,11 +1946,27 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         _parse_registry_config(provider, section)
         launcher_factory = _registry_launcher_factory(provider, section)
         token_ttl_s = _registry_token_ttl_s(provider)
+        from omnigent.onboarding.sandboxes import registry as sandbox_registry
+
+        metadata = sandbox_registry.get_provider_metadata(provider)
+        manages_profiles = metadata is not None and metadata.manages_profiles
     else:
         launcher_factory = _unsupported_launcher_factory(provider)
         # Never consulted (the factory rejects before any token is
         # minted); the conservative modal TTL keeps the field total.
         token_ttl_s = MODAL_MANAGED_TOKEN_TTL_S
+    configured_token_ttl_s = raw.get("token_ttl_s")
+    if configured_token_ttl_s is not None:
+        if (
+            not isinstance(configured_token_ttl_s, int)
+            or isinstance(configured_token_ttl_s, bool)
+            or not 300 <= configured_token_ttl_s <= 365 * 24 * 3600
+        ):
+            raise ValueError(
+                "server config 'sandbox.token_ttl_s' must be an integer from "
+                "300 to 31536000 seconds (5 minutes to 365 days), or null for the provider default"
+            )
+        token_ttl_s = configured_token_ttl_s
     return ManagedSandboxConfig(
         server_url=server_url.strip().rstrip("/"),
         launcher_factory=launcher_factory,
@@ -1939,6 +1978,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         host_config=host_config,
         model_discovery=model_discovery,
         git_clone=git_clone,
+        manages_profiles=manages_profiles,
     )
 
 
@@ -3776,6 +3816,42 @@ class SandboxStageObserver(Protocol):
         """
 
 
+async def _select_launch_profile(
+    launcher: SandboxHostLauncher,
+    entry: ManagedSandboxConfig,
+    owner: str,
+    *,
+    sandbox_id: str | None = None,
+) -> None:
+    from omnigent.server.provider_sandbox_profiles import select_provider_profile
+
+    snapshot = entry.profile_selection
+    if snapshot is not None:
+        if snapshot.get("user_id") != owner:
+            raise HTTPException(
+                status_code=403, detail="Sandbox profile execution identity mismatch"
+            )
+        await asyncio.to_thread(select_provider_profile, launcher, snapshot, sandbox_id=sandbox_id)
+    elif getattr(launcher, "manages_profiles", False):
+        raise HTTPException(status_code=422, detail="Choose a sandbox profile for this provider")
+
+
+@contextmanager
+def _provider_recovery_hint(
+    launch_state: ManagedLaunch | None, launcher: SandboxHostLauncher, sandbox_id: str
+) -> Iterator[None]:
+    """Keep provider guidance available only while its host is registering."""
+    if launch_state is not None:
+        launch_state.host_online_failure_hint = partial(
+            launcher.host_online_failure_hint, sandbox_id
+        )
+    try:
+        yield
+    finally:
+        if launch_state is not None:
+            launch_state.host_online_failure_hint = None
+
+
 async def launch_managed_host(
     *,
     config: ManagedSandboxDeployment,
@@ -3786,6 +3862,7 @@ async def launch_managed_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     host_id: str | None = None,
+    launch_state: ManagedLaunch | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3831,6 +3908,8 @@ async def launch_managed_host(
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
         host route by it (see :func:`host_slice_key_enabled`).
+    :param launch_state: In-flight state for callers with an independent
+        registration deadline. Retains provider recovery guidance while launching.
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3839,6 +3918,7 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = build_owner_launcher(entry, config, owner)
+    await _select_launch_profile(launcher, entry, owner)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
@@ -3855,20 +3935,21 @@ async def launch_managed_host(
             status_code=502,
             detail=f"managed sandbox launch failed: {exc.message}",
         ) from exc
-    workspace = await _register_and_start_host(
-        launcher=launcher,
-        config=entry,
-        host_store=host_store,
-        host_id=host_id,
-        host_name=host_name,
-        owner=owner,
-        sandbox_id=sandbox_id,
-        repos=repos,
-        agent_name=agent_name,
-        on_stage=on_stage,
-        slice_key_enabled=slice_key_enabled,
-        owner_credentials=config.owner_credentials,
-    )
+    with _provider_recovery_hint(launch_state, launcher, sandbox_id):
+        workspace = await _register_and_start_host(
+            launcher=launcher,
+            config=entry,
+            host_store=host_store,
+            host_id=host_id,
+            host_name=host_name,
+            owner=owner,
+            sandbox_id=sandbox_id,
+            repos=repos,
+            agent_name=agent_name,
+            on_stage=on_stage,
+            slice_key_enabled=slice_key_enabled,
+            owner_credentials=config.owner_credentials,
+        )
     return ManagedHostLaunch(host_id=host_id, workspace=workspace)
 
 
@@ -3881,6 +3962,7 @@ async def relaunch_managed_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     slice_key_enabled: bool = False,
+    launch_state: ManagedLaunch | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
@@ -3915,6 +3997,7 @@ async def relaunch_managed_host(
         ``None`` disables progress reporting.
     :param slice_key_enabled: Whether the host routes by its own id, as at its
         first launch (see :func:`host_slice_key_enabled`).
+    :param launch_state: In-flight state retaining provider guidance during registration.
     :returns: The (unchanged) host id + fresh in-sandbox workspace.
     :raises HTTPException: 400 when the host's recorded provider no
         longer matches the configured launcher; 502 when
@@ -3932,6 +4015,7 @@ async def relaunch_managed_host(
     # Stay on the host's provider so the new generation is armed with ITS
     # token TTL, not the deployment default's.
     entry = config.recorded(host.sandbox_provider)
+    await _select_launch_profile(launcher, entry, host.user_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     # The old generation is normally already dead (that is why we are
     # here), but terminate defensively so a transient tunnel outage
@@ -3955,20 +4039,21 @@ async def relaunch_managed_host(
             detail=f"managed sandbox relaunch failed: {exc.message}",
         ) from exc
     try:
-        workspace = await _register_and_start_host(
-            launcher=launcher,
-            config=entry,
-            host_store=host_store,
-            host_id=host.host_id,
-            host_name=host.name,
-            owner=host.user_id,
-            sandbox_id=sandbox_id,
-            repos=repos,
-            agent_name=agent_name,
-            on_stage=on_stage,
-            keep_host_on_failure=True,
-            slice_key_enabled=slice_key_enabled,
-        )
+        with _provider_recovery_hint(launch_state, launcher, sandbox_id):
+            workspace = await _register_and_start_host(
+                launcher=launcher,
+                config=entry,
+                host_store=host_store,
+                host_id=host.host_id,
+                host_name=host.name,
+                owner=host.user_id,
+                sandbox_id=sandbox_id,
+                repos=repos,
+                agent_name=agent_name,
+                on_stage=on_stage,
+                keep_host_on_failure=True,
+                slice_key_enabled=slice_key_enabled,
+            )
     except ValueError as exc:
         raise HTTPException(
             status_code=409,
@@ -4434,6 +4519,7 @@ async def resume_managed_host(
         # providers retain their filesystem and do not need workspace prep.
         workspace_repos = repos if launcher.provider == "agent_sandbox" else ()
         entry = config.recorded(host.sandbox_provider)
+        await _select_launch_profile(launcher, entry, host.user_id, sandbox_id=host.sandbox_id)
         workspace_repos = _apply_git_clone_options(launcher, workspace_repos, entry.git_clone)
         sandbox_id = host.sandbox_id
         _logger.info(
@@ -4513,6 +4599,7 @@ async def terminate_managed_host(
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
     *,
+    keep_if_bound: bool = False,
     capture_logs: bool = False,
 ) -> None:
     """
@@ -4530,10 +4617,14 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param keep_if_bound: Keep a host other sessions are still bound to.
+        Explicit host teardown keeps the unconditional default.
     :param capture_logs: Log the in-sandbox host and runner log tails before
         terminating, e.g. after a client saw the session's turn fail.
     """
-    tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
+    tombstone = await asyncio.to_thread(
+        host_store.delete_host, host.host_id, keep_if_bound=keep_if_bound
+    )
     if tombstone is None:
         return
     launcher = _launcher_for_teardown(tombstone, config)
@@ -4556,6 +4647,34 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def release_session_managed_host(
+    host_id: str,
+    host_store: HostStore,
+    config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
+) -> None:
+    """
+    Tear down a gone session's managed sandbox unless another session uses it.
+
+    For a session row that was just deleted: a host with no sandbox provider
+    (e.g. a laptop) is never touched, and a managed host another session is
+    still bound to (e.g. a ``/clear`` continuation) is kept.
+
+    :param host_id: The deleted session's host.
+    :param host_store: Store holding the host row.
+    :param config: The deployment's sandbox config, or ``None`` (the row is
+        still deleted and its token revoked).
+    :param capture_logs: Log the sandbox's log tails before terminating.
+    """
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is None:
+        return
+    await terminate_managed_host(
+        host, host_store, config, keep_if_bound=True, capture_logs=capture_logs
+    )
 
 
 async def _log_sandbox_logs_best_effort(

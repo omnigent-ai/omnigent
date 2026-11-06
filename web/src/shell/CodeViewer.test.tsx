@@ -7,6 +7,8 @@ import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
+import { BRIDGE_MSG } from "./htmlCommentBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
@@ -116,28 +118,35 @@ const MINIMAL_NB = JSON.stringify({
   cells: [{ cell_type: "markdown", metadata: {}, source: ["# Notebook Title\n"] }],
 });
 
+interface ViewerOptions {
+  conversationId?: string;
+  viewMode?: "editor" | "preview" | "source" | "diff";
+  truncated?: boolean;
+  markdownSourceFallback?: boolean;
+  mediaActive?: boolean;
+  position?: { line: number; endLine?: number };
+  onRequestEditMode?: () => void;
+}
+
 function renderViewer(
   content: string,
   panelOpen = true,
   path = "notes.md",
-  opts: {
-    viewMode?: "editor" | "preview" | "source" | "diff";
-    truncated?: boolean;
-    markdownSourceFallback?: boolean;
-    mediaActive?: boolean;
-    position?: { line: number; endLine?: number };
-    onRequestEditMode?: () => void;
-  } = {},
+  opts: ViewerOptions = {},
 ) {
   // Markdown source view still renders via the Shiki DOM, where the
   // select-all/copy override under test lives. Non-markdown files now render in
   // Monaco, which handles select-all + copy natively, so this suite defaults to
   // a .md path to exercise the remaining Shiki path.
-  return render(
+  return render(viewerElement(content, panelOpen, path, opts));
+}
+
+function viewerElement(content: string, panelOpen: boolean, path: string, opts: ViewerOptions) {
+  return (
     <CodeViewer
       markdownSourceFallback={opts.markdownSourceFallback ?? false}
       position={opts.position}
-      conversationId="conv_1"
+      conversationId={opts.conversationId ?? "conv_1"}
       path={path}
       fileQuery={makeFileQuery(content, opts.truncated)}
       comments={[]}
@@ -150,7 +159,7 @@ function renderViewer(
       searchInputRef={noopRef}
       viewMode={opts.viewMode ?? "source"}
       onRequestEditMode={opts.onRequestEditMode}
-    />,
+    />
   );
 }
 
@@ -832,6 +841,38 @@ describe("CodeViewer HTML preview sandbox", () => {
     // #777: every link opens in a new tab via the injected base tag.
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
+
+  // Each case starts from its own path: the scroll cache is module-level and outlives a test.
+  it.each([
+    ["another file", "a.html", "b.html", "conv_1"],
+    ["the same path in another conversation", "shared.html", "shared.html", "conv_2"],
+  ])(
+    "opens %s at 100% zoom and without the first preview's scroll offset",
+    async (_, path, nextPath, nextConversationId) => {
+      const html = "<html><head></head><body><p>report</p></body></html>";
+      const opened = (filePath: string, conversationId: string) =>
+        viewerElement(html, true, filePath, { viewMode: "preview", conversationId });
+      const { rerender } = render(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toBeNull();
+      const { port, send } = await connectHtmlPreviewBridge(
+        screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+      );
+      send({ type: BRIDGE_MSG.scroll, top: 760 });
+      // Port messages arrive in order, so the zoom also shows the offset was handled.
+      send({ type: BRIDGE_MSG.zoom, action: "in" });
+      const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+      await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+
+      // The content stays loaded, as it does for a cached file.
+      rerender(opened(nextPath, nextConversationId));
+      expect(zoomBox().style.transform).toBe("");
+      expect(requestedScrollRestore()).toBeNull();
+      port.close();
+
+      rerender(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+    },
+  );
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {

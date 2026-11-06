@@ -22,20 +22,28 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
     flags = resolve_feature_flags(environ)
 
     assert flags.enabled_features == frozenset(
-        {Feature.CLAUDE_OSC_STATUS, Feature.SESSION_ORCHESTRATION}
+        {
+            Feature.CLAUDE_OSC_STATUS,
+            Feature.CODEX_PLAN_AT_LAUNCH,
+            Feature.CUSTOM_AGENTS_SETTINGS_UI,
+            Feature.SESSION_ORCHESTRATION,
+        }
     )
     assert flags.frontend_dict() == {
+        "sandbox_profiles": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": False,
+        "custom_agents_settings_ui": True,
         "sidebar_grouping_ui": False,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
+        "session_orchestration": True,
+        "codex_plan_at_launch": True,
     }
 
 
@@ -46,6 +54,8 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
         "claude_osc_status",
+        "codex_plan_at_launch",
+        "custom_agents_settings_ui",
         "harness_install",
         "session_orchestration",
         "usage_page",
@@ -60,13 +70,17 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "-{feature},{feature}",
     ],
 )
-@pytest.mark.parametrize("feature", ["claude_osc_status", "session_orchestration"])
+@pytest.mark.parametrize(
+    "feature", ["claude_osc_status", "custom_agents_settings_ui", "session_orchestration"]
+)
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
     features = override.format(feature=feature)
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
         "claude_osc_status",
+        "codex_plan_at_launch",
+        "custom_agents_settings_ui",
         "session_orchestration",
         "usage_page",
     } - {feature}
@@ -75,7 +89,12 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
 def test_default_off_features_can_also_be_explicitly_disabled() -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: "usage_page,-usage_page"})
 
-    assert flags.enabled_names() == ("claude_osc_status", "session_orchestration")
+    assert flags.enabled_names() == (
+        "claude_osc_status",
+        "codex_plan_at_launch",
+        "custom_agents_settings_ui",
+        "session_orchestration",
+    )
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:
@@ -94,7 +113,13 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
 
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
-    assert flags.enabled_names() == ("canvas", "claude_osc_status", "session_orchestration")
+    assert flags.enabled_names() == (
+        "canvas",
+        "claude_osc_status",
+        "codex_plan_at_launch",
+        "custom_agents_settings_ui",
+        "session_orchestration",
+    )
 
 
 def test_arca_shutdown_warnings_are_frontend_visible() -> None:
@@ -104,13 +129,19 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
-@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.SESSION_ORCHESTRATION])
+@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS])
 def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 
     assert flags.enabled(feature)
     assert feature.value in flags.enabled_names()
     assert feature.value not in flags.frontend_dict()
+
+
+def test_session_orchestration_is_frontend_visible_so_trigger_templates_can_gate_on_it() -> None:
+    assert resolve_feature_flags({}).frontend_dict()["session_orchestration"] is True
+    disabled = resolve_feature_flags({FEATURES_ENV_VAR: "-session_orchestration"})
+    assert disabled.frontend_dict()["session_orchestration"] is False
 
 
 @pytest.mark.parametrize("name", ["usage-pgae", "-usage-pgae", "-", "--claude_osc_status"])

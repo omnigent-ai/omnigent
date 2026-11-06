@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -494,8 +495,24 @@ async def test_terminal_only_native_work_idle_accounting(
             )
 
 
+_API_ERROR_CAUSE = "The request exceeded the model's context window."
+# Longer than the published message's 1,024-character clip, so the raw envelope cannot
+# stand in for the cause it carries.
+_LONG_API_ERROR_ENVELOPE = "API Error: 500 " + json.dumps(
+    {"error": {"type": "api_error", "message": _API_ERROR_CAUSE}, "details": "x" * 1200}
+)
+_PANE_FAILURE_DETAILS = {
+    "pane_detail": "API Error: 499 Authorization: Bearer synthetic-secret-token",
+    "pane_envelope": _LONG_API_ERROR_ENVELOPE,
+    # Claude's own refusal of a turn whose context is full; no StopFailure hook follows.
+    "pane_overflow": "Prompt is too long",
+}
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_source", ["forwarder", "pane"])
+@pytest.mark.parametrize(
+    "status_source", ["forwarder", "pane", "pane_detail", "pane_envelope", "pane_overflow"]
+)
 async def test_native_failed_status_releases_idle_pin(status_source: str) -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
@@ -507,22 +524,52 @@ async def test_native_failed_status_releases_idle_pin(status_source: str) -> Non
         assert created.status_code == 201, created.text
         await _post_status(client, conv_id, "running")
         assert app.state.has_active_work() is True
-        if status_source == "pane":
+        if status_source.startswith("pane"):
             from omnigent.runner.app import _session_event_queues_ref
 
             queue = _session_event_queues_ref[conv_id]
             while not queue.empty():
                 queue.get_nowait()
-            publish = app.state.session_resource_registry._session_status_publisher
-            assert publish is not None
-            publish(conv_id, "failed", None)
+            if status_source in _PANE_FAILURE_DETAILS:
+                publish_failure = app.state.session_resource_registry._session_failure_publisher
+                assert publish_failure is not None
+                publish_failure(conv_id, _PANE_FAILURE_DETAILS[status_source])
+            else:
+                publish = app.state.session_resource_registry._session_status_publisher
+                assert publish is not None
+                publish(conv_id, "failed", None)
             events = []
             while not queue.empty():
                 events.append(queue.get_nowait())
             failures = [event for event in events if event and event.get("status") == "failed"]
             assert len(failures) == 1
-            assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
-            assert "Open the terminal" in failures[0]["error"]["message"]
+            if status_source == "pane_detail":
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"].startswith("API Error: 499")
+                assert "synthetic-secret-token" not in str(failures)
+                context = failures[0]["failure_context"]
+                assert context["http_status"] == 499
+                assert context["failure_source"] == "claude_program_status"
+                assert context["detail_source"] == "program_status_error"
+                assert "native_hook_event" not in context
+            elif status_source == "pane_envelope":
+                assert len(_LONG_API_ERROR_ENVELOPE) > 1024
+                assert failures[0]["error"]["code"] == "native_turn_error"
+                assert failures[0]["error"]["message"] == _API_ERROR_CAUSE
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == _API_ERROR_CAUSE
+                assert context["http_status"] == 500
+                assert context["failure_source"] == "claude_program_status"
+            elif status_source == "pane_overflow":
+                assert failures[0]["error"]["code"] == "context_length_exceeded"
+                assert failures[0]["error"]["message"].startswith("Context limit reached")
+                assert "/compact" in failures[0]["error"]["message"]
+                context = failures[0]["failure_context"]
+                assert context["native_error_message"] == "Prompt is too long"
+                assert context["failure_source"] == "claude_program_status"
+            else:
+                assert failures[0]["error"]["code"] == "native_failure_detail_unavailable"
+                assert "Open the terminal" in failures[0]["error"]["message"]
         else:
             await _post_status(client, conv_id, "failed")
         assert app.state.has_active_work() is False
@@ -621,3 +668,87 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
             await asyncio.sleep(0.01)
         app.state.native_pane_status[conv_id] = "running"
         assert app.state.has_active_work() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+)
+async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    evidence: str,
+) -> None:
+    """A pane that reads idle but shows live work keeps the idle watchdog open.
+
+    The pane watcher publishes ``idle`` once the pane goes quiet, which a
+    permission prompt does too. The pane reaper spares such a pane for the
+    prompt marker or recent output and input; the watchdog must do the same.
+
+    :param tmp_path: Pytest temp dir for the approval-wait marker root.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
+        leaves the pane idle.
+    :returns: None.
+    """
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.runner.native import NativeLaunchContext
+    from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+    from omnigent.terminals import TerminalRegistry
+    from tests.runner.conftest import _runner_client, _spec_resolver_returning
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = "conv_idle_edge_live_pane"
+    terminals = TerminalRegistry()
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
+    monkeypatch.setattr(instance, "close", AsyncMock())
+    monkeypatch.setattr(
+        instance, "screen_changed_within", Mock(return_value=evidence == "pane_output")
+    )
+    monkeypatch.setattr(
+        instance, "client_interaction_within", Mock(return_value=evidence == "pane_input")
+    )
+    approval_root = tmp_path / "approval-waits"
+    approval_root.mkdir()
+    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", approval_root)
+    if evidence == "permission_prompt":
+        bridge.touch_approval_wait_marker(bridge.approval_wait_marker_path(conv_id))
+    spec = AgentSpec(
+        spec_version=1,
+        name="claude-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-native"}),
+    )
+
+    async def launch(ctx: NativeLaunchContext):
+        terminals._by_conversation.setdefault(conv_id, {})[("claude", "main")] = instance
+        return await ctx.resource_registry.observe_required_terminal(
+            conv_id,
+            "claude",
+            "main",
+            instance,
+            resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        )
+
+    monkeypatch.setattr("omnigent.runner.native._launch_claude", launch)
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, json={"id": conv_id, "agent_id": "ag"})
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as server_client:
+        app = create_runner_app(
+            spec_resolver=await _spec_resolver_returning(spec),
+            server_client=server_client,
+            terminal_registry=terminals,
+        )
+        async with _runner_client(app) as client:
+            ensured = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "ensure_native_terminal": True},
+            )
+            assert ensured.status_code == 200, ensured.text
+            publish = app.state.session_resource_registry._session_status_publisher
+            publish(conv_id, "running", None)
+            publish(conv_id, "idle", None)
+            assert app.state.native_pane_status[conv_id] == "idle"
+            assert app.state.has_active_work() is (evidence != "no_evidence")

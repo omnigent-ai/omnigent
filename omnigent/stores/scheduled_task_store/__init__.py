@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import builtins
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
@@ -20,6 +21,18 @@ _UNSET: Any = object()
 # How :meth:`ScheduledTaskStore.adopt_session` resolved: the task now continues
 # the session, another session got there first, or the task changed under the run.
 AdoptOutcome = Literal["adopted", "taken", "stale"]
+
+
+@dataclass(frozen=True)
+class AutomationFailure:
+    """Latest sessionless failure, without prompts or raw error details."""
+
+    task_id: str
+    task_name: str
+    run_id: str
+    scheduled_at: int
+    finished_at: int | None
+    error_code: str | None
 
 
 class ScheduledTaskStore(ABC):
@@ -59,10 +72,12 @@ class ScheduledTaskStore(ABC):
         session_mode: str = "new",
         session_id: str | None = None,
         workspace: str | None = None,
+        base_branch: str | None = None,
         host_id: str | None = None,
         project_id: str | None = None,
         execution_target: str = "connected_host",
         state: str = "active",
+        delegation_ref: str | None = None,
     ) -> ScheduledTask:
         """
         Insert a new scheduled task.
@@ -94,6 +109,8 @@ class ScheduledTaskStore(ABC):
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
             Defaults to ``"active"``. Persistent dispatch sets ``completed``
             once a schedule has no remaining occurrences.
+        :param delegation_ref: Names the authorization grant a deployment uses to
+            act as the owner when the task fires; never a credential.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """
@@ -118,6 +135,23 @@ class ScheduledTaskStore(ABC):
         :returns: List of :class:`ScheduledTask` instances.
         """
         ...
+
+    def list_inbox_failures(
+        self,
+        *,
+        owner_user_id: str | None,
+        generation: str | None = None,
+        check_generation: bool = False,
+        after: tuple[int, str] | None = None,
+        limit: int = 50,
+    ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
+        """Page owned tasks and return their latest failures without a session.
+
+        The cursor advances over examined tasks, including healthy/deleted tasks,
+        so an empty page can still have a continuation. Legacy stores return empty.
+        """
+        del owner_user_id, generation, check_generation, after, limit
+        return [], None
 
     @abstractmethod
     def list_active(self) -> builtins.list[ScheduledTask]:
@@ -159,21 +193,23 @@ class ScheduledTaskStore(ABC):
         session_mode: str | None = None,
         session_id: str | None = _UNSET,
         workspace: str | None = _UNSET,
+        base_branch: str | None = _UNSET,
         host_id: str | None = _UNSET,
         project_id: str | None = _UNSET,
         execution_target: str | None = None,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
+        expected_schedule: ScheduledTask | None = None,
     ) -> ScheduledTask | None:
         """
         Update mutable fields of a task.
 
         Most parameters use ``None`` to mean "leave unchanged". For the per-task
         overrides (``model_override``, ``reasoning_effort``,
-        ``permission_mode``), ``host_id``, ``project_id``, ``max_cost_usd``, ``session_id``, and
-        ``last_run_conversation_id``, the sentinel default means "not provided /
-        leave unchanged"; passing ``None`` explicitly sets the column to NULL —
+        ``permission_mode``), ``base_branch``, ``host_id``, ``project_id``, ``max_cost_usd``,
+        ``session_id``, and ``last_run_conversation_id``, the sentinel default means
+        "not provided / leave unchanged"; passing ``None`` explicitly sets the column to NULL —
         so resetting an override to the agent default actually clears it (e.g.
         turning a set ``bypassPermissions`` back off), and clearing a host
         binding or nulling out a deleted last-run conversation.
@@ -185,6 +221,10 @@ class ScheduledTaskStore(ABC):
         switches the harness its future firings run. The fire path reads
         ``agent_id`` fresh on every firing and each firing owns its own
         conversation, so past runs keep the agent they actually ran.
+
+        ``expected_schedule`` guards the recurrence, session mode and execution
+        target read before validation. A mismatch raises a conflict before any
+        changes are saved; callers must reload and revalidate before retrying.
 
         Returns ``None`` if the task does not exist.
 
@@ -217,6 +257,23 @@ class ScheduledTaskStore(ABC):
             that has none: the session cannot move, so every later run routes
             to that host.
         :returns: How the adoption resolved.
+        """
+        ...
+
+    @abstractmethod
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """
+        Forget the session a ``"continue"`` task continues, if it is still *session_id*.
+
+        Used when that session was deleted, so the next firing starts a new one
+        and records it with :meth:`adopt_session`. Does not touch ``updated_at``:
+        this is housekeeping, and a firing compares that field with its own read
+        of the task before it records the session it created.
+
+        :param scheduled_task_id: Opaque task identifier.
+        :param session_id: The session the caller found missing.
+        :returns: ``True`` if the task held *session_id* and no longer does;
+            ``False`` if the task is gone or already holds another session.
         """
         ...
 

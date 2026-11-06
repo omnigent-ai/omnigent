@@ -29,6 +29,12 @@ from fastapi.responses import JSONResponse, Response
 from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import native_terminal_name
+from omnigent.harnesses.codex_native.timeouts import (
+    APP_SERVER_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
+)
+from omnigent.harnesses.codex_native.timeouts import (
+    SETTINGS_BRIDGE_READY_TIMEOUT_SECONDS as _CODEX_SETTINGS_READY_TIMEOUT_S,
+)
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.runner.app_support import (
     _client_safe_error_detail,
@@ -41,7 +47,8 @@ from omnigent.runner.native import (
     _claude_native_bridge_id_for_session,
     _codex_native_model_from_spec,
     _CodexNativeModelOptionsNotReady,
-    _resolve_opencode_compact_model,
+    _opencode_model_options_from_catalog,
+    _opencode_model_ref,
 )
 from omnigent.runner.resource_registry import CODEX_NATIVE_TERMINAL_ROLE, SessionResourceRegistry
 from omnigent.spec.types import AgentSpec
@@ -202,9 +209,6 @@ _CODEX_PERMISSION_CONFIRM_BUDGET_S = 4.0
 # (Read Only appears only with a read-only permission profile), so the digit is
 # read from the live popup when possible rather than hardcoded.
 _CODEX_PERMISSION_MENU_BUDGET_S = 5.0
-# Runtime recovery and bridge publication precede any settings RPC. Keep this
-# below the server's Codex settings forward budget, including confirmation.
-_CODEX_SETTINGS_READY_TIMEOUT_S = 15.0
 _CODEX_SETTINGS_READY_POLL_S = 0.1
 _CODEX_SETTINGS_CLOSE_TIMEOUT_S = 1.0
 # Older servers read any reply as a confirmed result, so outlast their
@@ -272,7 +276,12 @@ class _HandleCodexNativePlanModeChangeFn(Protocol):
 
 class _HandleCodexNativeSettingsUpdateFn(Protocol):
     async def __call__(
-        self, conv_id: str, settings: _JsonObject, *, legacy_server: bool = False
+        self,
+        conv_id: str,
+        settings: _JsonObject,
+        *,
+        legacy_server: bool = False,
+        allow_cold_start: bool = False,
     ) -> Response: ...
 
 
@@ -302,6 +311,7 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_claude_sdk_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
@@ -355,6 +365,7 @@ def build_native_controls(
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
+    _release_session_harness: Callable[[str], Coroutine[Any, Any, None]],
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
     _resolve_session_claude_launch_config: Callable[
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
@@ -384,6 +395,7 @@ def build_native_controls(
         settings: _JsonObject,
         *,
         legacy_server: bool = False,
+        allow_cold_start: bool = False,
     ) -> Response:
         if not settings:
             return Response(status_code=204)
@@ -393,7 +405,7 @@ def build_native_controls(
         # The lock also covers the public mirror so the server sees efforts in apply order.
         async with lock:
             response, resolved = await _apply_codex_native_settings_update(
-                conv_id, settings, legacy_server=legacy_server
+                conv_id, settings, legacy_server=legacy_server, allow_cold_start=allow_cold_start
             )
             if "effort" in settings and (
                 response.status_code == 504 or (legacy_server and response.status_code == 503)
@@ -421,15 +433,13 @@ def build_native_controls(
                 _logger.warning("Could not mirror pending Codex %s in %s", key, bridge_dir)
         return pending
 
-    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
-        """Recover a reaped pane and wait for startup to publish its owned bridge."""
+    async def _wait_for_codex_bridge_for_settings(
+        conv_id: str,
+    ) -> CodexNativeBridgeState | None:
+        """Wait for a created terminal to publish its owned bridge."""
         from omnigent.harnesses.codex_native.bridge import read_bridge_state
 
         terminal_registry = resource_registry.terminal_registry
-        if terminal_registry is not None:
-            await _ensure_native_terminal_for_turn(conv_id, "codex-native")
-            if terminal_registry.get(conv_id, "codex", "main") is None:
-                return None
         state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id, action="settings update", missing_state_log_level=logging.DEBUG
         )
@@ -443,6 +453,35 @@ def build_native_controls(
                 return state if state.session_id == conv_id else None
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
         return None
+
+    async def _ready_codex_bridge_for_settings(conv_id: str) -> CodexNativeBridgeState | None:
+        """Bound cold terminal creation separately from its thread-discovery wait."""
+        from omnigent.entities.session_resources import terminal_resource_id
+
+        terminal_registry = resource_registry.terminal_registry
+        if terminal_registry is not None:
+            # A picker change is client activity. Serialize with reaping before
+            # ensuring so an in-flight reap finishes before we recover its pane.
+            lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
+            async with asyncio.timeout(_CODEX_SETTINGS_READY_TIMEOUT_S), lock:
+                terminal = terminal_registry.get(conv_id, "codex", "main")
+                if terminal is not None and (
+                    resource_registry.terminal_resource_role(
+                        conv_id, terminal_resource_id("codex", "main")
+                    )
+                    == CODEX_NATIVE_TERMINAL_ROLE
+                ):
+                    terminal.note_client_interaction()
+            await asyncio.wait_for(
+                _ensure_native_terminal_for_turn(conv_id, "codex-native"),
+                timeout=_CODEX_SETTINGS_LAUNCH_TIMEOUT_S,
+            )
+            if terminal_registry.get(conv_id, "codex", "main") is None:
+                return None
+        return await asyncio.wait_for(
+            _wait_for_codex_bridge_for_settings(conv_id),
+            timeout=_CODEX_SETTINGS_READY_TIMEOUT_S,
+        )
 
     async def _close_unreachable_owned_codex(
         conv_id: str,
@@ -492,6 +531,7 @@ def build_native_controls(
         settings: _JsonObject,
         *,
         legacy_server: bool,
+        allow_cold_start: bool = False,
         ready_deadline: float | None = None,
         retry_unreachable: bool = True,
     ) -> tuple[Response, _JsonObject]:
@@ -512,7 +552,17 @@ def build_native_controls(
         from omnigent.util.reasoning_effort import effort_for_model_switch
 
         if ready_deadline is None:
-            ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+            # Only an explicit capability promises enough forward time for cold startup.
+            # Older rollback-aware servers still have a 40-second total budget.
+            ready_deadline = (
+                asyncio.get_running_loop().time()
+                + _CODEX_SETTINGS_READY_TIMEOUT_S
+                + (
+                    _CODEX_SETTINGS_LAUNCH_TIMEOUT_S
+                    if allow_cold_start and not legacy_server
+                    else 0
+                )
+            )
         backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         process_before_ready = getattr(backend_before_ready, "proc", None)
         try:
@@ -673,7 +723,7 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
-        except Exception as exc:  # surface app-server settings failures.
+        except Exception as exc:
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
                 conv_id,
@@ -802,30 +852,8 @@ def build_native_controls(
                     "detail": "Codex-native plan-mode update requires a current model.",
                 },
             )
-        from omnigent.harnesses.codex_native.bridge import (
-            DeveloperInstructionsReadState,
-            read_codex_config_developer_instructions_state_from_home,
-        )
-
-        _di_read = read_codex_config_developer_instructions_state_from_home(Path(state.codex_home))
-        if _di_read.state is DeveloperInstructionsReadState.UNREADABLE:
-            _logger.warning(
-                "Codex-native plan-mode update skipped for %s: developer_instructions "
-                "config unreadable — refusing to guess and risk wiping live state.",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            return JSONResponse(
-                status_code=503,
-                content={
-                    "error": "codex_native_settings_update_failed",
-                    "detail": (
-                        "Codex-native plan-mode update requires reading the current "
-                        "developer_instructions config; it could not be read."
-                    ),
-                },
-            )
-        developer_instructions = _di_read.value
+        # A non-null developer_instructions here replaces the mode's built-in
+        # prompt; the agent's instructions already ride the additive config key.
         return await _handle_codex_native_settings_update(
             conv_id,
             {
@@ -834,7 +862,7 @@ def build_native_controls(
                     "settings": {
                         "model": model,
                         "reasoning_effort": effort,
-                        "developer_instructions": developer_instructions,
+                        "developer_instructions": None,
                     },
                 },
             },
@@ -869,6 +897,22 @@ def build_native_controls(
                 content={
                     "error": "codex_native_approval_mode_failed",
                     "detail": "Codex terminal is not running; reconnect first.",
+                },
+            )
+        state = await _codex_native_bridge_state_for_session(
+            conv_id, action="approval mode change", missing_state_log_level=logging.DEBUG
+        )
+        if state is not None and state.active_turn_id is not None:
+            # Codex disables /permissions while a turn runs, and the Escape that
+            # opens it would interrupt that turn and drop the message it carries.
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "codex_native_approval_mode_busy",
+                    "detail": (
+                        "Codex is working on a turn. Change the approval mode after "
+                        "it finishes, or stop the turn first."
+                    ),
                 },
             )
         try:
@@ -998,7 +1042,7 @@ def build_native_controls(
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
-        except Exception:  # write-back is best-effort
+        except Exception:
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
@@ -1048,14 +1092,17 @@ def build_native_controls(
             bridge_dir_for_session_id,
             enqueue_model_change,
         )
+        from omnigent.util.reasoning_effort import to_pi_thinking_level
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        effort = _session_reasoning_effort.get(conv_id)
         try:
             await asyncio.to_thread(
                 enqueue_model_change,
                 bridge_dir_for_session_id(conv_id),
                 model.strip(),
+                thinking_level=to_pi_thinking_level(effort) if effort else None,
             )
         except OSError as exc:
             _logger.warning(
@@ -1318,7 +1365,7 @@ def build_native_controls(
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
                 )
-            except Exception:  # best-effort; the report reconciles
+            except Exception:
                 _logger.debug(
                     "late model-dialog watch errored for session=%s",
                     conv_id,
@@ -1344,6 +1391,7 @@ def build_native_controls(
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
             inject_slash_command,
+            model_switch_acknowledged,
             read_claude_status_model,
             read_model_env,
             read_model_picker_values,
@@ -1363,6 +1411,7 @@ def build_native_controls(
             alias_pins,
             canonical_claude_id,
             claude_model_command_arg,
+            normalized_model_id,
             picker_command_values,
         )
 
@@ -1490,6 +1539,9 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        # Claude Code's statusLine names a 1M model without its ``[1m]`` marker,
+        # so once the marker reached the pane, the unmarked name confirms it.
+        unmarked_expected: set[str] = set()
         if not bound_model:
             # A repeated alias pick keeps the same model; its launch pin proves
             # the exact generation even when the options cache is cold.
@@ -1498,15 +1550,26 @@ def build_native_controls(
                 for value in (selected_model, resolved_model or "", model_arg)
             )
             pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
+            # A translation that dropped the marker leaves the pane on the plain
+            # model, which must not confirm a 1M pick.
+            marker_sent = any(
+                value.lower().endswith("[1m]") for value in (model_arg, pinned or "")
+            )
             if pinned:
                 if long_context_requested and not pinned.lower().endswith("[1m]"):
                     pinned += "[1m]"
                 expected.add(pinned)
             if long_context_requested:
                 expected = {value for value in expected if value.lower().endswith("[1m]")}
+            if marker_sent:
+                unmarked_expected = {normalized_model_id(value) for value in expected}
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
+        elif model_arg.lower().endswith("[1m]"):
+            # A bound 1M pick is typed with its marker too, and the statusLine
+            # names the model without it; the unmarked name confirms the pick.
+            unmarked_expected = {normalized_model_id(value) for value in expected}
 
         def _switched(current: str | None) -> bool:
             comparable = current if bound_model or not current else canonical_claude_id(current)
@@ -1515,6 +1578,10 @@ def build_native_controls(
                 and (
                     current in expected
                     or comparable in expected
+                    or (
+                        not current.lower().endswith("[1m]")
+                        and normalized_model_id(current) in unmarked_expected
+                    )
                     or (baseline and current != baseline)
                 )
             )
@@ -1556,6 +1623,18 @@ def build_native_controls(
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
+                return Response(status_code=204)
+            if await asyncio.to_thread(model_switch_acknowledged, bridge_dir, command=command):
+                # Claude Code acknowledged the command on the pane while the
+                # statusLine snapshot still reads otherwise; the forwarder's
+                # report settles the row on what the pane actually runs.
+                _logger.info(
+                    "claude-native model change for session=%s confirmed by Claude Code's "
+                    "acknowledgement; statusLine still reports %r",
+                    conv_id,
+                    current,
+                    extra={"session_id": conv_id},
+                )
                 return Response(status_code=204)
             if baseline is None and current is None:
                 # No statusLine snapshot on either side of the injection: a
@@ -1897,22 +1976,7 @@ def build_native_controls(
             )
         client = server.client()
         try:
-            session = await client.get_session(state.opencode_session_id)
-            messages = await client.list_messages(state.opencode_session_id)
-            provider_id, model_id = _resolve_opencode_compact_model(
-                session, messages, state.model_override
-            )
-            if not provider_id or not model_id:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "opencode_native_compact_failed",
-                        "detail": "Could not resolve a compaction model; try switching the model.",
-                    },
-                )
-            await client.summarize(
-                state.opencode_session_id, provider_id=provider_id, model_id=model_id
-            )
+            await client.compact(state.opencode_session_id)
         except (httpx.HTTPError, OpenCodeClientError, RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
@@ -1926,49 +1990,34 @@ def build_native_controls(
         return Response(status_code=200)
 
     async def _opencode_native_model_options(conv_id: str) -> list[_JsonObject]:
-        from omnigent.harnesses.opencode_native.app_server import (
-            filtered_server_env,
-            list_opencode_cli_model_options,
-        )
+        from omnigent.harnesses.opencode_native import app_server as opencode_app_server
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
             read_bridge_state,
         )
-        from omnigent.harnesses.opencode_native.client import OpenCodeClient
 
-        bridge_dir = bridge_dir_for_bridge_id(conv_id)
-        state = read_bridge_state(bridge_dir)
+        state = read_bridge_state(bridge_dir_for_bridge_id(conv_id))
         if state is None or not state.server_base_url:
             raise _CodexNativeModelOptionsNotReady("OpenCode-native app-server is not ready yet.")
-
-        cli_env = filtered_server_env(
-            bridge_dir=bridge_dir,
-            auth_secret=state.auth_secret or "",
-        )
-        try:
-            return await asyncio.to_thread(list_opencode_cli_model_options, env=cli_env)
-        except Exception as exc:  # noqa: BLE001 - fall back to the server catalog.
-            _logger.debug(
-                "OpenCode CLI model list failed for %s: %r",
-                conv_id,
-                exc,
-                extra={"session_id": conv_id},
-            )
-
-        client = OpenCodeClient(
+        client = opencode_app_server.client_for_state(
             base_url=state.server_base_url,
-            headers=state.auth_headers(),
+            auth_secret=state.auth_secret,
+            directory=state.workspace,
         )
         try:
-            return await client.list_models()
+            models = await client.list_models()
         finally:
             await client.aclose()
+        return _opencode_model_options_from_catalog(models)
 
     async def _handle_opencode_native_model_change(conv_id: str, model: str | None) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
             bridge_dir_for_bridge_id,
+            read_bridge_state,
+            update_last_applied_model,
             update_model_override,
         )
+        from omnigent.harnesses.opencode_native.client import OpenCodeClientError
         from omnigent.inference_config import (
             binding_for_harness,
             load_runtime_inference_config,
@@ -1979,9 +2028,34 @@ def build_native_controls(
         if binding_for_harness(inference_config, "opencode-native") is not None:
             selected = resolve_bound_model(inference_config, "opencode-native", model)
             model = f"omnigent/{selected}" if selected is not None else None
-        updated = await asyncio.to_thread(
-            update_model_override, bridge_dir_for_bridge_id(conv_id), model
+        bridge_dir = bridge_dir_for_bridge_id(conv_id)
+        updated = await asyncio.to_thread(update_model_override, bridge_dir, model)
+        model_ref = _opencode_model_ref(model)
+        server = _AUTO_OPENCODE_SERVERS.get(conv_id)
+        state = (
+            await asyncio.to_thread(read_bridge_state, bridge_dir) if server is not None else None
         )
+        if model_ref is not None and server is not None and state is not None:
+            # The TUI and the next turn pick the model up from the session.
+            client = server.client()
+            try:
+                await client.set_model(
+                    state.opencode_session_id,
+                    provider_id=model_ref["providerID"],
+                    model_id=model_ref["id"],
+                    variant=model_ref.get("variant"),
+                )
+            except (httpx.HTTPError, OpenCodeClientError):
+                _logger.warning(
+                    "OpenCode set_model failed for %s; the next prompt retries it",
+                    conv_id,
+                    exc_info=True,
+                    extra={"session_id": conv_id},
+                )
+            else:
+                await asyncio.to_thread(update_last_applied_model, bridge_dir, model)
+            finally:
+                await client.aclose()
         return Response(status_code=200 if updated else 204)
 
     async def _handle_opencode_native_clear(conv_id: str) -> Response:
@@ -2009,6 +2083,7 @@ def build_native_controls(
                     agent_spec=spec,
                     server_client=server_client,
                     ensure_comment_relay=_ensure_comment_relay_started,
+                    fresh=True,
                 )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(
@@ -2332,6 +2407,71 @@ def build_native_controls(
                 _ingest_now_serving[conv_id] = _seq + 1
                 _cond.notify_all()
 
+    def _retire_ingest_ticket(conv_id: str, seq: int, cond: asyncio.Condition) -> None:
+        """Advance the ingest gate past an abandoned ticket once its turn comes."""
+
+        async def retire() -> None:
+            async with cond:
+                while _ingest_now_serving.get(conv_id, 0) < seq:
+                    if _ingest_cond.get(conv_id) is not cond:
+                        return  # The session's gate was torn down meanwhile.
+                    await cond.wait()
+                if _ingest_now_serving.get(conv_id, 0) == seq:
+                    _ingest_now_serving[conv_id] = seq + 1
+                    cond.notify_all()
+
+        task = asyncio.create_task(retire(), name=f"retire-ingest-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _handle_claude_sdk_clear(conv_id: str) -> Response:
+        """Drop a claude-sdk session's live client and history before ``/clear``.
+
+        Called only for a ``clear`` marked ``continue_in_new_session``: the
+        server then continues the work in a fresh session, so this one ends
+        here; a later message rebuilds its client from the transcript.
+        Refused with 409 while a turn runs or messages wait for one, through
+        the same ingest gate the message path uses.
+        """
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.setdefault(conv_id, asyncio.Condition())
+        try:
+            async with _cond:
+                while _ingest_now_serving.get(conv_id, 0) != _seq:
+                    if _ingest_cond.get(conv_id) is not _cond:
+                        # The session was deleted while this waited: its gate
+                        # is gone, so answer without recreating it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "claude_sdk_clear_session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
+                    await _cond.wait()
+        except asyncio.CancelledError:
+            # Give up the place in line without jumping the input ahead of it,
+            # or later input for the session would wait on it forever.
+            _retire_ingest_ticket(conv_id, _seq, _cond)
+            raise
+        try:
+            if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "claude_sdk_clear_busy",
+                        "detail": "A turn is running; stop it before /clear.",
+                    },
+                )
+            _session_histories.pop(conv_id, None)
+            await _release_session_harness(conv_id)
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -2478,6 +2618,7 @@ def build_native_controls(
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
         handle_claude_native_model_change=_handle_claude_native_model_change,
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
+        handle_claude_sdk_clear=_handle_claude_sdk_clear,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
         handle_codex_native_clear=_handle_codex_native_clear,
