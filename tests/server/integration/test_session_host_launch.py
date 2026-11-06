@@ -2430,12 +2430,14 @@ async def test_native_message_relaunch_runner_never_connects_keeps_runner_failed
     assert (event.attributes["outcome"], event.attributes["attempts"]) == ("never_connected", 0)
 
 
+@pytest.mark.parametrize("session_kind", ["source", "side_chat", "sub_agent"])
 async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_while_connected(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    session_kind: str,
 ) -> None:
     """A launch the connected host never answered refuses the send instead of failing the turn.
 
@@ -2447,18 +2449,43 @@ async def test_native_message_relaunch_unanswered_launch_is_not_host_offline_whi
     from omnigent.server.routes.sessions import routes_events
 
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
     monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
     monkeypatch.setattr(sessions_helpers, "_HOST_LAUNCH_RESULT_TIMEOUT_S", 0.2)
     caplog.set_level(logging.INFO, logger="omnigent.server.routes.sessions")
 
     comm = await _connect_host(app)
     session_id = await _native_host_session(client, app, db_uri, comm)
-    responder = asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=False))
+    if session_kind != "source":
+        store = SqlAlchemyConversationStore(db_uri)
+        source = store.get_conversation(session_id)
+        assert source is not None
+        derived = store.create_conversation(
+            agent_id=source.agent_id,
+            runner_id=source.runner_id,
+            kind="sub_agent" if session_kind == "sub_agent" else "default",
+            parent_conversation_id=source.id if session_kind == "sub_agent" else None,
+            labels={
+                **source.labels,
+                **(
+                    {"omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id}
+                    if session_kind == "side_chat"
+                    else {}
+                ),
+            },
+        )
+        session_id = derived.id
+    responder = (
+        asyncio.create_task(_swallow_relaunch_launch_frame(comm, then_disconnect=False))
+        if session_kind != "sub_agent"
+        else None
+    )
     try:
         response = await _post_hello(client, session_id)
     finally:
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            _ = await responder
+        if responder is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                _ = await responder
 
     assert response.status_code == 503, response.text
     assert response.json()["error"]["code"] == "runner_unavailable"

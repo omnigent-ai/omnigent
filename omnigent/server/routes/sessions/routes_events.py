@@ -3511,16 +3511,15 @@ def register_events_routes(
                 )
                 host_offline = offline_host_id is not None
                 if (
-                    conv.host_id is not None
-                    and conv.kind != "sub_agent"
-                    and not exit_cause
+                    not exit_cause
                     and not host_offline
                     and not relaunched_launch_acknowledged
                     and not relaunched_launch_refused
+                    and await asyncio.to_thread(routing_host_id, runner_owner, conversation_store)
+                    is not None
                 ):
-                    # A connected host that never took the launch shows no runner failed
-                    # to start. Refuse the send so the client keeps the message, as for a
-                    # dropped tunnel, instead of consuming it into a failed turn.
+                    # The routing host also owns side chats and sub-agents. Without
+                    # a launch verdict, keep their inputs with the caller to retry.
                     raise OmnigentError(
                         "The host for this session is not responding. "
                         "Wait for it to reconnect and send the message again.",
