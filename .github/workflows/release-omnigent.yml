@@ -176,7 +176,7 @@ jobs:
       - name: Publish to TestPyPI
         # Tag pushes + explicit test-pypi dispatches; PR runs never publish.
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.destination == 'test-pypi')
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           repository-url: https://test.pypi.org/legacy/
           # Let a re-run skip already-landed files after a partial publish;
@@ -187,5 +187,5 @@ jobs:
         # Real PyPI only via deliberate dispatch with destination=pypi,
         # behind the protected `pypi` environment.
         if: github.event_name == 'workflow_dispatch' && inputs.destination == 'pypi'
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         # default repository-url is pypi.org
