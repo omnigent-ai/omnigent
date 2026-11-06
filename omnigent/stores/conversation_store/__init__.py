@@ -534,6 +534,7 @@ class ConversationStore(ABC):
         runner_id: str,
         deadline: float,
         connected: bool = False,
+        tighten_deadline: bool = False,
     ) -> StartupRunnerWait | None:
         """Retain one queued input's first runner/deadline; refuse settled or canceled inputs."""
         raise NotImplementedError

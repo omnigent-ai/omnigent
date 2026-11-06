@@ -1638,24 +1638,43 @@ def test_runner_status_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_token_abc"
 
 
-def test_runner_status_result_frame_round_trip() -> None:
+@pytest.mark.parametrize("launch_age_s", [None, 0.0, 17.5])
+def test_runner_status_result_frame_round_trip(launch_age_s: float | None) -> None:
     """
     Verify HostRunnerStatusResultFrame survives encode → decode for each
     verdict.
 
-    ``status`` is the entire signal the dispatch gate acts on — a lossy
-    round-trip would make the server wait when it should relaunch, or
-    vice versa.
+    Liveness remains usable without optional launch-age metadata from older hosts.
     """
     for status in ("alive", "dead", "unknown"):
         original = HostRunnerStatusResultFrame(
             request_id="req_rs_1",
             status=status,
+            launch_age_s=launch_age_s,
         )
         decoded = decode_host_frame(encode_host_frame(original))
         assert isinstance(decoded, HostRunnerStatusResultFrame)
         assert decoded.request_id == "req_rs_1"
         assert decoded.status == status
+        assert decoded.launch_age_s == launch_age_s
+
+
+@pytest.mark.parametrize(
+    "age", [True, -1, float("nan"), float("inf"), -float("inf"), "0", [], {}, 10**500]
+)
+def test_invalid_runner_launch_age_keeps_legacy_liveness(age: object) -> None:
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.runner_status_result",
+                "request_id": "query",
+                "status": "alive",
+                "launch_age_s": age,
+            }
+        )
+    )
+    assert isinstance(frame, HostRunnerStatusResultFrame)
+    assert frame.status == "alive" and frame.launch_age_s is None
 
 
 def test_decode_unknown_kind_raises() -> None:

@@ -5900,6 +5900,8 @@ async def _query_host_runner_status(
     host_conn: HostConnection,
     host_registry: HostRegistry,
     runner_id: str,
+    *,
+    on_launch_age: Callable[[float], None] | None = None,
 ) -> str | None:
     """
     Ask the host for this runner's liveness or bounded pending-sign-in state.
@@ -5913,17 +5915,24 @@ async def _query_host_runner_status(
     :param host_conn: Live host connection to query.
     :param host_registry: Registry used to enqueue the outbound frame.
     :param runner_id: Runner to ask about, e.g. ``"runner_abc123..."``.
+    :param on_launch_age: Optional observer for valid age on an alive process.
     :returns: ``"alive"``, ``"sign_in_pending"``, ``"dead"``, or ``"unknown"``; or
         ``None`` when the host didn't reply in time, the connection
         dropped, or the host is too old to support the query. ``None``
         means "no authoritative answer" — the caller falls back to the
         plain connect grace, preserving the prior blind-wait behavior.
     """
-    from omnigent.host.frames import HostRunnerStatusFrame, encode_host_frame
+    from omnigent.host.frames import (
+        HostRunnerStatusFrame,
+        encode_host_frame,
+        parse_runner_launch_age,
+    )
     from omnigent.server.routes import sessions as _facade
 
     request_id = secrets.token_hex(8)
-    future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+    future: asyncio.Future[dict[str, str | float | None]] = (
+        asyncio.get_running_loop().create_future()
+    )
     host_conn.pending_runner_status[request_id] = future
     frame = encode_host_frame(HostRunnerStatusFrame(request_id=request_id, runner_id=runner_id))
     try:
@@ -5951,7 +5960,11 @@ async def _query_host_runner_status(
         return None
     finally:
         host_conn.pending_runner_status.pop(request_id, None)
-    return result.get("status")
+    status = result.get("status")
+    age = parse_runner_launch_age(result.get("launch_age_s"))
+    if status == "alive" and age is not None and on_launch_age is not None:
+        on_launch_age(age)
+    return status if isinstance(status, str) else None
 
 
 async def _wait_for_runner_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
@@ -7937,9 +7950,18 @@ def _stable_id_reuse_is_exact_retry(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
         )
-    persisted_payload = persisted.data.model_dump(mode="json", by_alias=True)
-    request_payload = item.data.model_dump(mode="json", by_alias=True)
-    return persisted.type == item.type and persisted_payload == request_payload
+    # Runner retention is delivery lifecycle state, not the caller's payload.
+    payloads = []
+    for data in (persisted.data, item.data):
+        payload = data.model_dump(mode="json", by_alias=True, exclude={"startup_options"})
+        if isinstance(data, (MessageData, SlashCommandData)) and data.startup_options is not None:
+            options = data.startup_options.model_dump(
+                mode="json", by_alias=True, exclude={"runner_wait"}, exclude_defaults=True
+            )
+            if options:
+                payload["startup_options"] = options
+        payloads.append(payload)
+    return persisted.type == item.type and payloads[0] == payloads[1]
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:

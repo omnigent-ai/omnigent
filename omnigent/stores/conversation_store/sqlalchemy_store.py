@@ -2443,6 +2443,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         runner_id: str,
         deadline: float,
         connected: bool = False,
+        tighten_deadline: bool = False,
     ) -> StartupRunnerWait | None:
         requested = StartupRunnerWait(runner_id=runner_id, deadline=deadline)
         workspace_id = current_workspace_id()
@@ -2457,6 +2458,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                 return None
             options = data.startup_options or StartupInputOptions()
             retained = options.runner_wait or requested
+            if (
+                tighten_deadline
+                and retained.runner_id == runner_id
+                and not retained.connected
+                and deadline < retained.deadline
+            ):
+                retained = retained.model_copy(update={"deadline": deadline})
             if connected and options.runner_wait is None:
                 return None
             if connected and retained.runner_id == runner_id and retained.deadline == deadline:

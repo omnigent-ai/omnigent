@@ -44,6 +44,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -51,6 +52,7 @@ from tests.server.integration.test_managed_launch_failure_teardown import (
 from tests.server.integration.test_managed_launch_failure_teardown import (
     teardown_env as teardown_env,
 )
+from tests.server.integration.test_session_host_launch import _NoopRunnerWS, _runner_hello
 from tests.server.integration.test_sessions_native_kickoff_duplicate import (
     _simulate_transcript_forwarder_echo,
 )
@@ -883,6 +885,157 @@ def _stub_launch(
     stub = AsyncMock(side_effect=launch)
     monkeypatch.setattr("omnigent.server.routes.sessions._launch_runner_on_host", stub)
     return stub
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "connected",
+        "worker_restart",
+        "stop",
+        "expired",
+        "old_input",
+        "host_reconnected",
+        "host_reconnected_expired",
+    ],
+)
+async def test_saved_input_retains_the_slow_starting_runner(
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Accepted input and its live runner survive the ordinary connect grace."""
+    from omnigent.server.routes import sessions as facade
+    from omnigent.server.routes._sessions import orchestration
+
+    env = startup_env
+    session_id = await _create(
+        env,
+        name=(
+            CODEX_NATIVE_CODING_AGENT.agent_name
+            if outcome in {"expired", "host_reconnected_expired"}
+            else "startup-probe"
+        ),
+    )
+    saved = _bind(env, session_id)
+    if outcome == "old_input":
+        saved = saved.model_copy(update={"created_at": saved.created_at - 7200})
+    conv = env.conv_store.get_conversation(session_id)
+    runner_id = uuid4().hex
+    env.conv_store.set_runner_id(session_id, runner_id)
+    _connect_host(env, conv.host_id)
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    connected = False
+
+    async def resolve(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
+        return runner if connected else None
+
+    grace = 0.03
+    monkeypatch.setattr(facade, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", grace)
+    monkeypatch.setattr(facade, "_get_runner_client", resolve)
+    expires = outcome in {"expired", "host_reconnected_expired"}
+    launch_started = orchestration.time.monotonic() - (599.7 if expires else 0)
+    queried_connections: list[Any] = []
+
+    async def status(connection: Any, *_args: Any, on_launch_age: Any = None) -> str:
+        queried_connections.append(connection)
+        if on_launch_age is not None:
+            on_launch_age(orchestration.time.monotonic() - launch_started)
+        return "alive"
+
+    monkeypatch.setattr(orchestration, "_query_host_runner_status", status)
+    monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0.01)
+    launch = _stub_launch(env, monkeypatch)
+    ordinary_finished = asyncio.Event()
+    extended = asyncio.Event()
+    waits: list[float] = []
+    original_wait = orchestration._wait_for_runner_client
+
+    async def wait(*args: Any, timeout_s: float, **kwargs: Any) -> Any:
+        waits.append(timeout_s)
+        if timeout_s > grace:
+            extended.set()
+        try:
+            return await original_wait(*args, timeout_s=timeout_s, **kwargs)
+        finally:
+            if timeout_s == grace:
+                ordinary_finished.set()
+
+    monkeypatch.setattr(orchestration, "_wait_for_runner_client", wait)
+    startup = env.app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_args: None)
+    delivery = asyncio.create_task(startup._deliver(env.app, session_id, saved))
+    restarted: ManagedStartupInputs | None = None
+    try:
+        await asyncio.wait_for(ordinary_finished.wait(), budget(5))
+        await poll_until_async(lambda: extended.is_set() or delivery.done(), timeout_s=budget(5))
+        assert extended.is_set(), "the saved input failed while its original runner was alive"
+        assert not delivery.done()
+        assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+        assert launch.await_count == 0
+        [retained_input] = env.conv_store.list_pending_inputs(session_id)
+        assert retained_input.data.startup_options.runner_wait is not None
+        retry = await env.client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={**_INPUT, "data": {**_INPUT["data"], "stable_id": saved.id}},
+        )
+        assert retry.status_code == 202, retry.text
+        assert [item.id for item in env.conv_store.list_pending_inputs(session_id)] == [saved.id]
+        assert launch.await_count == 0
+
+        if outcome.startswith("host_reconnected"):
+            replacement = _connect_host(env, conv.host_id)
+            await poll_until_async(
+                lambda: (
+                    any(connection is replacement for connection in queried_connections)
+                    or delivery.done()
+                ),
+                timeout_s=budget(5),
+            )
+            assert launch.await_count == 0, "a same-host reconnect replaced the admitted runner"
+            assert any(connection is replacement for connection in queried_connections)
+            assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+        if outcome == "worker_restart":
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+            ordinary_finished.clear()
+            extended.clear()
+            previous_wait_count = len(waits)
+            restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+            restarted.dispatch = startup.dispatch
+            delivery = asyncio.create_task(restarted._deliver(env.app, session_id, saved))
+            await asyncio.wait_for(extended.wait(), budget(5))
+            assert waits[previous_wait_count] > grace, "restart reused ordinary grace"
+            assert waits[-1] < waits[1], "restarting the worker renewed the startup deadline"
+            assert launch.await_count == 0
+        elif outcome == "stop":
+            await startup.cancel(session_id)
+            assert delivery.cancelled()
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            assert env.conv_store.list_items(session_id).data == []
+            return
+        elif expires:
+            await asyncio.wait_for(delivery, budget(5))
+            await startup._deliver(env.app, session_id, saved)
+            [pending] = env.conv_store.list_pending_inputs(session_id)
+            assert pending.id == saved.id and pending.status == "failed"
+            assert launch.await_count == 0
+            [error] = env.conv_store.list_items(session_id).data
+            assert error.data.code == "startup_input_failed"
+            assert not forwarded
+            return
+
+        connected = True
+        env.app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), _runner_hello())
+        await asyncio.wait_for(delivery, budget(5))
+        assert len([event for event in forwarded if event.get("type") == "message"]) == 1
+        assert launch.await_count == 0
+        assert env.conv_store.get_conversation(session_id).runner_id == runner_id
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+        if restarted is not None:
+            await restarted.shutdown()
+        await runner.aclose()
 
 
 async def test_host_replica_starts_the_runner_its_launch_skipped(

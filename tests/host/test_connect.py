@@ -1019,6 +1019,7 @@ async def test_handle_launch_spawns_subprocess(
             stderr=subprocess.DEVNULL,
         )
 
+    launch_requested = time.monotonic()
     with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
         result = await host._handle_launch(frame)
 
@@ -1029,6 +1030,8 @@ async def test_handle_launch_spawns_subprocess(
     )
     assert result.request_id == "req_001"
     expected_runner_id = token_bound_runner_id("test_token_abc")
+    handle = host._runners[expected_runner_id]
+    assert launch_requested <= handle.launch_started_monotonic <= time.monotonic()
     # runner_id should be derived from the binding token.
     assert result.runner_id == expected_runner_id, (
         "runner_id should be token_bound_runner_id(binding_token)"
@@ -4007,7 +4010,11 @@ async def test_hello_does_not_wait_for_forkserver_control(
     host = _make_host_process()
     manager = ZygoteManager()
     proc = ZygoteRunnerProc(os.getpid(), manager)
-    host._runners["runner_alive"] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")
+    handle = _RunnerHandle(
+        proc=proc, log_path=tmp_path / "runner.log", launch_started_monotonic=time.monotonic()
+    )
+    host._runners["runner_alive"] = handle
+    launch_started = handle.launch_started_monotonic
     control_locked = threading.Event()
     release_control = threading.Event()
     hello_sent = threading.Event()
@@ -4030,6 +4037,8 @@ async def test_hello_does_not_wait_for_forkserver_control(
         hello = decode_host_frame(tunnel.sent[0])
         assert isinstance(hello, HostHelloFrame)
         assert hello.runners == ["runner_alive"]
+        assert host._runners["runner_alive"] is handle
+        assert handle.launch_started_monotonic == launch_started
     finally:
         release_control.set()
         await asyncio.to_thread(holder.join, 5.0)
@@ -4117,7 +4126,23 @@ async def test_stop_trigger_waits_for_termination_after_cancellation(
     assert maintenance_reasons == ["runner_stopped"]
 
 
-async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "age_authority",
+    [
+        "owned",
+        "old_handle",
+        "missing_identity",
+        "pid_reused",
+        "replaced",
+        "stopped",
+        "already_connected",
+        "unreadable_marker",
+        "connected_during_identity",
+    ],
+)
+async def test_handle_runner_status_alive_for_running_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, age_authority: str
+) -> None:
     """
     Verify ``_handle_runner_status`` reports ``alive`` for a tracked
     runner whose process is still running.
@@ -4126,21 +4151,61 @@ async def test_handle_runner_status_alive_for_running_process(tmp_path: Path) ->
     for this runner's tunnel rather than relaunch a healthy process.
     """
     host = _make_host_process()
+    from omnigent.host import connect
+
     proc = subprocess.Popen(
         ["sleep", "60"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
     try:
+        identity = connect._proc.process_create_time(proc.pid)
+        assert identity is not None
+        marker = tmp_path / "runner.connected"
+        if age_authority == "already_connected":
+            marker.touch()
+        if age_authority == "unreadable_marker":
+            original_exists = Path.exists
+
+            def exists(path: Path) -> bool:
+                if path == marker:
+                    raise PermissionError("marker is unreadable")
+                return original_exists(path)
+
+            monkeypatch.setattr(Path, "exists", exists)
+            monkeypatch.setattr(connect, "runner_sign_in_is_pending", lambda *_: False)
         host._runners["runner_live"] = _RunnerHandle(
-            proc=proc, log_path=tmp_path / "runner-live.log"
+            proc=proc,
+            log_path=tmp_path / "runner-live.log",
+            create_time=identity if age_authority != "old_handle" else None,
+            launch_started_monotonic=10.0,
+            connect_marker=marker,
         )
+        monkeypatch.setattr(connect, "time", SimpleNamespace(monotonic=lambda: 30.0))
+
+        def process_identity(_pid: int) -> float | None:
+            if age_authority == "missing_identity":
+                return None
+            if age_authority == "pid_reused":
+                return identity + 1
+            if age_authority == "replaced":
+                host._runners.pop("runner_live")
+            if age_authority == "stopped":
+                host._runners["runner_live"].stop_requested = True
+            if age_authority == "connected_during_identity":
+                marker.touch()
+            return identity
+
+        monkeypatch.setattr(connect._proc, "process_create_time", process_identity)
         result = await host._handle_runner_status(
             HostRunnerStatusFrame(request_id="req_rs", runner_id="runner_live")
         )
         assert isinstance(result, HostRunnerStatusResultFrame)
         assert result.request_id == "req_rs"
-        assert result.status == "alive"
+        assert result.status == (
+            "unknown" if age_authority in {"pid_reused", "replaced", "stopped"} else "alive"
+        )
+        assert result.launch_age_s == (20.0 if age_authority == "owned" else None)
     finally:
         proc.terminate()
         proc.wait()

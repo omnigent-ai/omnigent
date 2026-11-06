@@ -113,6 +113,7 @@ class StartupInputContext:
         expected_status: str = "in_progress",
         check_deadline: bool = True,
         expected_runner_wait: StartupRunnerWait | None = None,
+        expected_host_id: str | None = None,
     ) -> bool:
         """Refuse a retired input or a changed runner before waiting or submitting."""
         current, item = await asyncio.gather(
@@ -136,6 +137,11 @@ class StartupInputContext:
         if expected_runner_wait is not None and retained != expected_runner_wait:
             return False
         self.runner_wait = retained
+        if expected_host_id is not None and current.host_id != expected_host_id:
+            raise OmnigentError(
+                "The host changed while this saved message was waiting; send it again.",
+                code=ErrorCode.WRONG_REPLICA,
+            )
         if self.runner_wait is not None:
             if current.runner_id != self.runner_wait.runner_id:
                 raise OmnigentError(
@@ -155,15 +161,23 @@ class StartupInputContext:
         return True
 
     async def retain_runner(
-        self, store: ConversationStore, session_id: str, runner_id: str
+        self,
+        store: ConversationStore,
+        session_id: str,
+        runner_id: str,
+        *,
+        deadline: float | None = None,
     ) -> float:
-        """Retain the first live launch without renewing its persisted deadline."""
+        """Retain or narrow the original live launch without extending its deadline."""
         retained = await asyncio.to_thread(
             store.claim_pending_input_runner,
             session_id,
             self.input_id,
             runner_id=runner_id,
-            deadline=time.time() + STARTUP_RUNNER_CONNECT_TIMEOUT_S,
+            deadline=deadline
+            if deadline is not None
+            else time.time() + STARTUP_RUNNER_CONNECT_TIMEOUT_S,
+            tighten_deadline=deadline is not None,
         )
         if retained is None or not await self.validate_pending(store, session_id):
             raise asyncio.CancelledError
