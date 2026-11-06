@@ -3377,6 +3377,75 @@ def _build_session_create_body(
     return body
 
 
+def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
+    """
+    Check the project a ``sys_session_create`` call names, before any request.
+
+    :param args: Parsed tool arguments; a null ``project_id`` or ``project_name`` is absent.
+    :param placement: The requested placement, e.g. ``"same_host"``.
+    :returns: A JSON error, or ``None`` when the arguments are usable.
+    """
+    project_id = args.get("project_id")
+    project_name = args.get("project_name")
+    if project_id is None and project_name is None:
+        return None
+    if project_id is not None and project_name is not None:
+        return json.dumps({"error": "Set project_id or project_name, not both"})
+    if placement == "child":
+        return json.dumps(
+            {"error": "project_id and project_name require placement='same_host' or 'managed'"}
+        )
+    named = project_id if project_id is not None else project_name
+    if not isinstance(named, str) or not named.strip():
+        return json.dumps({"error": "project_id and project_name must be nonempty strings"})
+    if project_id is not None:
+        try:
+            _route_identifier(project_id, "Project")
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+    return None
+
+
+async def _add_named_project(
+    body: _JsonObject, args: _JsonObject, server_client: httpx.AsyncClient
+) -> str | None:
+    """
+    Add the project a checked ``sys_session_create`` call names to its create body.
+
+    Explicit ``workspace`` and ``git`` nulls keep the project's defaults off the
+    session, so only the filing applies.
+
+    :param body: The orchestrated create body to update.
+    :param args: Arguments that passed :func:`_project_argument_error`.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: A JSON error when the project can't be used, else ``None``.
+    """
+    project_id = args.get("project_id")
+    project_name = args.get("project_name")
+    if project_id is None and project_name is None:
+        return None
+    if project_id is not None:
+        try:
+            resp = await server_client.get(
+                f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
+            )
+        except httpx.HTTPError as exc:
+            return json.dumps({"error": f"Could not check project {project_id}: {exc}"})
+        if resp.status_code == 404:
+            return json.dumps({"error": "project_not_found", "project_id": project_id})
+        if resp.status_code >= 400:
+            return json.dumps(
+                {"error": f"Could not check project {project_id}: HTTP {resp.status_code}"}
+            )
+    else:
+        try:
+            project_id = await _project_id_for_name(server_client, str(project_name))
+        except (httpx.HTTPError, ValueError) as exc:
+            return json.dumps({"error": f"Could not resolve project_name: {exc}"})
+    body.update({"project_id": project_id, "workspace": None, "git": None})
+    return None
+
+
 def _finalize_created_session(
     data: _JsonObject,
     *,
@@ -3512,6 +3581,9 @@ async def _execute_session_create(
         return json.dumps({"error": "placement must be child, same_host or managed"})
     if placement != "child" and has_config_path:
         return json.dumps({"error": "Independent sessions require agent_id"})
+    project_error = _project_argument_error(args, placement)
+    if project_error is not None:
+        return project_error
     message = args.get("message")
     profile_fields = ("sandbox_provider", "sandbox_profile_id", "sandbox_profile_revision")
     selection = {key: args[key] for key in profile_fields if args.get(key) is not None}
@@ -3589,11 +3661,17 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
+            project_error = await _add_named_project(body, args, server_client)
+            if project_error is not None:
+                return project_error
             create_requested = True
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
             )
         else:
+            project_error = await _add_named_project(body, args, server_client)
+            if project_error is not None:
+                return project_error
             create_requested = True
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
@@ -3645,6 +3723,7 @@ async def _execute_session_create(
             "status": data.get("status") or "created",
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
+            "project_id": data.get("project_id"),
         }
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
@@ -5432,6 +5511,7 @@ async def _session_get_info_via_rest(
             "model": snap.get("model_override") or snap.get("llm_model"),
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
+            "project_id": snap.get("project_id"),
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —

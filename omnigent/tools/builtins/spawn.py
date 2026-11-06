@@ -940,6 +940,8 @@ class SysSessionCreateTool(Tool):
             "These placements require orchestration enabled "
             "and a sending session that is private or shared read-only, including its "
             "side-chat source chain. "
+            "project_id or project_name files an independent session in that project; "
+            "the project's agent, workspace and git defaults don't apply. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
@@ -1021,6 +1023,23 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Optional human-readable label for the "
                                 "new session, e.g. 'auth refactor'."
+                            ),
+                        },
+                        "project_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional existing project id to file an independent "
+                                "session (same_host or managed) in. Do not set "
+                                "project_name with it."
+                            ),
+                        },
+                        "project_name": {
+                            "type": "string",
+                            "description": (
+                                "Optional project to file an independent session "
+                                "(same_host or managed) in, by name: your existing "
+                                "project with this name, or a new one if you have "
+                                "none. Do not set project_id with it."
                             ),
                         },
                         "message": {
