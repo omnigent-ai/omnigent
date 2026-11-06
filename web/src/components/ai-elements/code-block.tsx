@@ -160,17 +160,32 @@ const highlighterCache = new Map<
   Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>
 >();
 
-// Token cache
+// Token objects expand the source considerably; retain only a small recent window.
+const MAX_CACHED_CODE_CHARACTERS = 256 * 1024;
+const MAX_CACHED_CODE_BLOCKS = 128;
 const tokensCache = new Map<string, TokenizedCode>();
+let cachedCodeCharacters = 0;
+const pendingHighlights = new Set<string>();
+
+function cacheTokens(key: string, tokenized: TokenizedCode): void {
+  if (key.length > MAX_CACHED_CODE_CHARACTERS) return;
+  tokensCache.set(key, tokenized);
+  cachedCodeCharacters += key.length;
+  while (
+    tokensCache.size > MAX_CACHED_CODE_BLOCKS ||
+    cachedCodeCharacters > MAX_CACHED_CODE_CHARACTERS
+  ) {
+    const oldestKey = tokensCache.keys().next().value;
+    if (oldestKey === undefined) break;
+    tokensCache.delete(oldestKey);
+    cachedCodeCharacters -= oldestKey.length;
+  }
+}
 
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
-const getTokensCacheKey = (code: string, language: CodeLanguage) => {
-  const start = code.slice(0, 100);
-  const end = code.length > 100 ? code.slice(-100) : "";
-  return `${language}:${code.length}:${start}:${end}`;
-};
+const getTokensCacheKey = (code: string, language: CodeLanguage) => `${language}:${code}`;
 
 const getHighlighter = (
   language: CodeLanguage,
@@ -182,12 +197,17 @@ const getHighlighter = (
 
   // Import Shiki's engine lazily so its core (incl. the WASM regex engine)
   // stays out of the main bundle and only loads when a code block renders.
-  const highlighterPromise = import("shiki").then(({ createHighlighter }) =>
-    createHighlighter({
-      langs: [language],
-      themes: ["github-light", "github-dark"],
-    }),
-  );
+  const highlighterPromise = import("shiki")
+    .then(({ createHighlighter }) =>
+      createHighlighter({
+        langs: [language],
+        themes: ["github-light", "github-dark"],
+      }),
+    )
+    .catch((error: unknown) => {
+      highlighterCache.delete(language);
+      throw error;
+    });
 
   highlighterCache.set(language, highlighterPromise);
   return highlighterPromise;
@@ -221,6 +241,8 @@ export const highlightCode = (
   // Return cached result if available
   const cached = tokensCache.get(tokensCacheKey);
   if (cached) {
+    tokensCache.delete(tokensCacheKey);
+    tokensCache.set(tokensCacheKey, cached);
     return cached;
   }
 
@@ -231,6 +253,10 @@ export const highlightCode = (
     }
     subscribers.get(tokensCacheKey)?.add(callback);
   }
+
+  // Rendering and its effect can request the same block before Shiki is ready.
+  if (pendingHighlights.has(tokensCacheKey)) return null;
+  pendingHighlights.add(tokensCacheKey);
 
   // Start highlighting in background - fire-and-forget async pattern
   getHighlighter(language)
@@ -255,21 +281,22 @@ export const highlightCode = (
         tokens: result.tokens,
       };
 
-      // Cache the result
-      tokensCache.set(tokensCacheKey, tokenized);
+      cacheTokens(tokensCacheKey, tokenized);
+      pendingHighlights.delete(tokensCacheKey);
 
-      // Notify all subscribers
+      // Detach listeners before notifying so a callback can request another pass.
       const subs = subscribers.get(tokensCacheKey);
+      subscribers.delete(tokensCacheKey);
       if (subs) {
         for (const sub of subs) {
           sub(tokenized);
         }
-        subscribers.delete(tokensCacheKey);
       }
     })
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then), eslint-plugin-promise(prefer-await-to-callbacks)
     .catch((error) => {
       console.error("Failed to highlight code:", error);
+      pendingHighlights.delete(tokensCacheKey);
       subscribers.delete(tokensCacheKey);
     });
 
