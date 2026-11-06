@@ -9028,8 +9028,12 @@ async def test_turnless_setup_failure_settles_by_stable_id_without_a_second_card
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refusal", ["exception", "not_accepted"])
 @pytest.mark.parametrize("with_attachment", [False, True])
+@pytest.mark.parametrize("later_state", [None, "in_progress", "running", "completed", "unknown"])
 async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
-    monkeypatch: pytest.MonkeyPatch, refusal: str, with_attachment: bool
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+    with_attachment: bool,
+    later_state: str | None,
 ) -> None:
     """A re-send that cannot start records the failure the re-send replaced."""
     from types import SimpleNamespace
@@ -9044,6 +9048,7 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
     session_id = "64a784c3aa907d1774f44313546947c6"
     # Earlier relay tests leave this session's live status failed.
     orchestration_module._session_status_cache.pop(session_id, None)
+    orchestration_module._session_last_response_cache.pop(session_id, None)
     stable_id = "9c" * 16
     content = [{"type": "input_text", "text": "run the tests"}]
     if with_attachment:
@@ -9062,6 +9067,45 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
         attempts.append(args[0])
         assert args[1].data == {"role": "user", "content": content, "stable_id": stable_id}
         assert args[2:] == ("owner@example.test", False)
+        if later_state == "unknown":
+            orchestration_module._session_last_response_cache.pop(session_id, None)
+            orchestration_module._session_active_response_cache.pop(session_id, None)
+        elif later_state is not None:
+            frames = [
+                _sse_frame({"type": "response.in_progress", "response": {"id": "resp_later"}}),
+            ]
+            if later_state != "in_progress":
+                frames.append(
+                    _sse_frame(
+                        {
+                            "type": "session.status",
+                            "status": "running",
+                            "response_id": "resp_later",
+                        }
+                    )
+                )
+            if later_state == "completed":
+                frames.extend(
+                    [
+                        _sse_frame(
+                            {"type": "response.completed", "response": {"id": "resp_later"}}
+                        ),
+                        _sse_frame(
+                            {
+                                "type": "session.status",
+                                "status": "idle",
+                                "response_id": "resp_later",
+                            }
+                        ),
+                    ]
+                )
+            frames.append("data: [DONE]\n\n")
+            await _relay_runner_stream(
+                session_id,
+                _ScriptedStreamingRunnerClient(frames),
+                store,
+                runner_id="native-runner",
+            )  # type: ignore[arg-type]
         if refusal == "exception":
             raise RuntimeError("runner unavailable")
         return SimpleNamespace(accepted=False)
@@ -9078,9 +9122,30 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
     }
     store = _ConversationStore()
     store._conversations[session_id].runner_id = "native-runner"
+    label_writes: list[dict[str, str]] = []
+    original_set_labels = store.set_labels
+
+    def record_labels(target: str, updates: dict[str, str]) -> None:
+        label_writes.append(dict(updates))
+        original_set_labels(target, updates)
+
+    monkeypatch.setattr(store, "set_labels", record_labels)
     client = _ScriptedStreamingRunnerClient(
         [
             _sse_frame({"type": "response.in_progress", "response": {"id": "resp_untyped"}}),
+            *(
+                [
+                    _sse_frame(
+                        {
+                            "type": "session.status",
+                            "status": "running",
+                            "response_id": "resp_untyped",
+                        }
+                    )
+                ]
+                if later_state is not None
+                else []
+            ),
             _sse_frame(
                 {
                     "type": "response.failed",
@@ -9110,15 +9175,29 @@ async def test_failed_resend_of_an_untyped_message_reports_the_original_failure(
         persisted = orchestration_module._last_task_error_from_labels(
             store._conversations[session_id].labels
         )
-        assert persisted is not None
-        assert persisted["code"] == error["code"]
-        assert persisted["message"] == error["message"]
+        assert persisted is None
+        assert not any(error["code"] in updates.values() for updates in label_writes)
+        error_events = [
+            event
+            for event in published
+            if event.get("type") == "response.output_item.done"
+            and event.get("item", {}).get("type") == "error"
+        ]
+        assert len(error_events) == 1
+        assert error_events[0]["item"]["response_id"] == "resp_untyped"
+        assert session_stream._sse_safe_attributes(error_events[0])["item_code"] == error["code"]
         failed = [
             event
             for event in published
             if event.get("type") == "session.status" and event.get("status") == "failed"
         ]
-        assert [event["error"]["code"] for event in failed] == [error["code"]]
+        assert [event["error"]["code"] for event in failed] == (
+            [error["code"]] if later_state is None else []
+        )
+        if later_state is not None:
+            assert orchestration_module._session_status_cache.get(session_id) == (
+                "idle" if later_state == "completed" else "running"
+            )
         assert pending_inputs.snapshot_for(session_id) == []
     finally:
         orchestration_module._resent_native_inputs.clear()

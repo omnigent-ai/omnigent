@@ -250,6 +250,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_last_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -5203,6 +5204,7 @@ def _publish_status(
     if status in ("running", "waiting"):
         if response_id is not None:
             _session_active_response_cache[session_id] = response_id
+            _session_last_response_cache[session_id] = response_id
     else:
         _session_active_response_cache.pop(session_id, None)
     # Keep the background-shell tally sticky alongside the status (see the
@@ -8754,6 +8756,8 @@ async def _relay_persist_error_once(
     conversation_store: ConversationStore | None,
     session_id: str,
     item: NewConversationItem,
+    *,
+    publish_item: bool = False,
 ) -> Literal["persisted", "duplicate", "skipped", "failed"]:
     """
     Persist a runner error item unless the same error already exists.
@@ -8768,6 +8772,7 @@ async def _relay_persist_error_once(
     :param session_id: Session/conversation identifier, e.g.
         ``"conv_abc123"``.
     :param item: The candidate ``type="error"`` item.
+    :param publish_item: Emit a newly persisted item when no original failure frame is forwarded.
     :returns: ``"persisted"`` if this call appended the item,
         ``"duplicate"`` if a matching recent error already exists,
         ``"skipped"`` if no store or non-error item was provided, or
@@ -8818,6 +8823,8 @@ async def _relay_persist_error_once(
                 response_id=persisted_items[0].response_id,
             ),
         )
+        if publish_item and not persisted_items[0].deduplicated:
+            _publish_external_conversation_item(session_id, persisted_items[0])
         return "persisted"
     except Exception:  # noqa: BLE001
         _logger.exception(

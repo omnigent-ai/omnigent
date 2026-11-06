@@ -248,6 +248,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _session_background_task_count_cache,
     _session_background_tasks_cache,
     _session_blocked_on_cache,
+    _session_last_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -3948,7 +3949,11 @@ async def _claim_native_input_resend(
     try:
         drained = (
             pending_inputs.resolve_delivery_attempt(
-                session_id, pending_id, attempt, stable_id=raw_stable_id
+                session_id,
+                pending_id,
+                attempt,
+                stable_id=raw_stable_id,
+                allow_restored=False,
             )
             if refusal is None
             else None
@@ -3992,6 +3997,7 @@ async def _resend_native_input(
     cannot start, that route's own failure stands.
     """
     resender = _native_input_resender
+    owner_response_id = response_id
     retention: asyncio.Task[None] | None = None
     log_input_event(
         _logger,
@@ -4099,6 +4105,7 @@ async def _resend_native_input(
                     NewConversationItem(
                         type="error", response_id=generate_task_id(), data=unconfirmed
                     ),
+                    publish_item=True,
                 )
                 == "persisted"
             ):
@@ -4115,7 +4122,9 @@ async def _resend_native_input(
         )
         error_item = _error_item_from_sse(dict(failed_event), response_id=response_id)
         if error_item is not None:
-            await _relay_persist_error_once(conversation_store, session_id, error_item)
+            await _relay_persist_error_once(
+                conversation_store, session_id, error_item, publish_item=True
+            )
         raw_response = failed_event.get("response")
         raw_error = (
             raw_response.get("error") if isinstance(raw_response, dict) else None
@@ -4123,11 +4132,11 @@ async def _resend_native_input(
         status_error = (
             ErrorDetail.model_validate(raw_error) if isinstance(raw_error, dict) else None
         )
-        await _persist_session_status_error_labels(
-            session_id,
-            status_error,
-            conversation_store,
-        )
+        if (
+            owner_response_id is None
+            or _session_last_response_cache.get(session_id) != owner_response_id
+        ):
+            return
         _publish_status(
             session_id,
             "failed",
@@ -4229,11 +4238,12 @@ async def _retain_unsent_native_input(
                 NewConversationItem(
                     type="error", response_id=response_id or generate_task_id(), data=notice
                 ),
+                publish_item=True,
             )
             == "persisted"
         ):
             _publish_error_event(session_id, notice)
-    else:
+    elif response_id is not None and _session_last_response_cache.get(session_id) == response_id:
         _publish_status(session_id, "idle", response_id=response_id)
 
 
@@ -10420,6 +10430,7 @@ async def _relay_runner_stream_once(
                             current_response_id = _rid
                             # Keep the turn identity across transport retries until final status.
                             _session_active_response_cache[session_id] = _rid
+                            _session_last_response_cache[session_id] = _rid
                         _model = resp_obj.get("model")
                         failure_agent_name = _model if isinstance(_model, str) and _model else None
                         if isinstance(_model, str) and _model:
