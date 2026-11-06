@@ -22,6 +22,7 @@ from omnigent.runner import create_runner_app
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
+from omnigent.runner.session_history import build_session_history
 from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.polling import poll_until_async
@@ -1526,8 +1527,8 @@ async def test_cancelled_turn_publishes_idle_so_client_unsticks() -> None:
 class _FakeServerClient:
     """Fake server_client that returns paginated history items.
 
-    Items must have an ``"id"`` field. Supports ``after`` cursor
-    and ``limit`` params, returns ``has_more`` when more pages
+    Items must have an ``"id"`` field. Supports ``after`` cursor,
+    ``order`` and ``limit`` params, returns ``has_more`` when more pages
     exist. Tracks GET calls for assertion.
     """
 
@@ -1559,16 +1560,17 @@ class _FakeServerClient:
 
         after = params.get("after")
         limit = int(params.get("limit", "100"))
+        items = self._items[::-1] if params.get("order") == "desc" else self._items
 
         # Find start index based on after cursor.
         start = 0
         if after:
-            for i, item in enumerate(self._items):
+            for i, item in enumerate(items):
                 if item.get("id") == after:
                     start = i + 1
                     break
-        page = self._items[start : start + limit]
-        has_more = (start + limit) < len(self._items)
+        page = items[start : start + limit]
+        has_more = (start + limit) < len(items)
 
         class _Resp:
             status_code = 200
@@ -1577,6 +1579,81 @@ class _FakeServerClient:
                 return {"data": page, "has_more": has_more}
 
         return _Resp()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("item_count", "compaction_indices", "drop_item_id", "expected_requests"),
+    [
+        (0, [], None, 1),
+        (250, [], None, 3),
+        (250, [40, 150], None, 1),
+        (250, [40, 149], None, 2),
+        (250, [40, 150], "item_150", 3),
+        (250, [40, 150], "item_249", 1),
+        (250, [249], None, 1),
+    ],
+    ids=[
+        "empty",
+        "uncompacted",
+        "page-end",
+        "next-page",
+        "dropped-compaction",
+        "dropped-newest",
+        "compacted-newest",
+    ],
+)
+async def test_history_load_stops_at_latest_compaction(
+    item_count: int,
+    compaction_indices: list[int],
+    drop_item_id: str | None,
+    expected_requests: int,
+) -> None:
+    items = [
+        {"id": f"item_{index}", "type": "compaction", "summary": f"summary {index}"}
+        if index in compaction_indices
+        else {
+            "id": f"item_{index}",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": f"message {index}"}],
+        }
+        for index in range(item_count)
+    ]
+    server_client = _FakeServerClient(items)
+    last_server_item_id: dict[str, str] = {}
+
+    async def persist_cancellation_items(*_args: Any) -> None:
+        raise AssertionError("Loading history must not persist cancellation items")
+
+    session_history = build_session_history(
+        _background_tasks=set(),
+        _last_server_item_id=last_server_item_id,
+        _persist_cancellation_items=persist_cancellation_items,
+        _session_histories={},
+        _session_spec_cache={},
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    loaded = await session_history.load_history_as_input("history", drop_item_id=drop_item_id)
+
+    compaction_index = max(
+        (index for index in compaction_indices if f"item_{index}" != drop_item_id),
+        default=-1,
+    )
+    message_texts = [
+        f"message {index}"
+        for index in range(compaction_index + 1, item_count)
+        if f"item_{index}" != drop_item_id
+    ]
+    if compaction_index >= 0:
+        assert loaded[0]["role"] == "user"
+        assert "summary" in loaded[0]["content"][0]["text"]
+        message_texts.insert(0, f"summary {compaction_index}")
+        loaded = loaded[1:]
+    assert [item["content"][0]["text"] for item in loaded] == message_texts
+    assert len(server_client.get_calls) == expected_requests
+    assert all(call["order"] == "desc" for call in server_client.get_calls)
+    assert last_server_item_id == ({"history": f"item_{item_count - 1}"} if item_count else {})
 
 
 def _build_recovery_app(
@@ -2052,7 +2129,7 @@ async def test_history_load_paginates_beyond_100_items() -> None:
     # The server_client should have been called multiple times
     # (pagination). 2 pages for 150 items at limit=100.
     # get_calls[0] has no after cursor (first page).
-    # get_calls[1] has after=item_99 (second page).
+    # get_calls[1] has after=item_50 (second descending page).
     assert len(server_client.get_calls) >= 2, (
         f"Expected at least 2 GET calls (pagination), "
         f"got {len(server_client.get_calls)}. "

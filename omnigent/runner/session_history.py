@@ -102,7 +102,7 @@ def build_session_history(
         while True:
             params: dict[str, str] = {
                 "limit": "100",
-                "order": "asc",
+                "order": "desc",
             }
             if after_cursor is not None:
                 params["after"] = after_cursor
@@ -132,16 +132,24 @@ def build_session_history(
             page_items = page.get("data", [])
             if not page_items:
                 break
-            all_items.extend(page_items)
-            last_id = page_items[-1].get("id")
-            if last_id:
-                _last_server_item_id[session_id] = last_id
-            if not page.get("has_more", False):
+            if after_cursor is None:
+                newest_id = page_items[0].get("id")
+                if newest_id:
+                    _last_server_item_id[session_id] = newest_id
+            found_compaction = False
+            for item in page_items:
+                if drop_item_id is not None and item.get("id") == drop_item_id:
+                    continue
+                all_items.append(item)
+                if item.get("type") == "compaction":
+                    found_compaction = True
+                    break
+            # Earlier items are replaced by the newest compaction's context.
+            if found_compaction or not page.get("has_more", False):
                 break
-            after_cursor = last_id
+            after_cursor = page_items[-1].get("id")
 
-        if drop_item_id is not None:
-            all_items = [it for it in all_items if it.get("id") != drop_item_id]
+        all_items.reverse()
 
         converted = _convert_raw_items_to_input(all_items)
         # Items are persisted pre-resolution, so reloaded history can still
