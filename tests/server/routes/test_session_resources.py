@@ -1784,8 +1784,12 @@ async def test_create_terminal_surfaces_runner_error_without_crashing(
     fake_runner = _FakeRunnerClient(responses={path: (runner_status, runner_payload)})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
-    resp = await client.post(path, json={"terminal": "bash", "session_key": "s1"})
+    with capture_debug_rows("server") as rows:
+        resp = await client.post(path, json={"terminal": "bash", "session_key": "s1"})
 
+    # A failed launch still records its timing, with the runner's status.
+    (finished,) = [row for row in rows if row["event_name"] == "terminal_create_finished"]
+    assert int(cast(dict[str, str], finished["attributes"])["status_code"]) >= 400
     # http_status is derived from the surfaced code; 503 here proves the
     # runner's ``runner_unavailable`` propagated (a 500 would mean it was
     # masked by the old TypeError path or a generic internal error).

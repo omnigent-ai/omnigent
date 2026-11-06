@@ -3924,3 +3924,31 @@ async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monke
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def test_process_age_ms_measures_from_process_creation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The age is wall time since the process was created, in milliseconds."""
+
+    class _Process:
+        def create_time(self) -> float:
+            return 1_000.0
+
+    monkeypatch.setattr("psutil.Process", _Process)
+    monkeypatch.setattr(serve_module.time, "time", lambda: 1_002.5)
+
+    assert serve_module._process_age_ms() == 2_500
+
+
+def test_process_age_ms_is_none_when_the_process_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A psutil failure leaves the age unknown instead of failing the connect row."""
+    import psutil
+
+    class _Process:
+        def create_time(self) -> float:
+            raise psutil.AccessDenied()
+
+    monkeypatch.setattr("psutil.Process", _Process)
+
+    assert serve_module._process_age_ms() is None

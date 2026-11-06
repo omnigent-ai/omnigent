@@ -245,7 +245,7 @@ def create_terminal_attach_router(
                         await _shuttle_ws_frames(
                             websocket,
                             runner_ws,
-                            on_first_runner_frame=lambda: _log_attach_first_output(
+                            on_first_output=lambda: _log_attach_first_output(
                                 session_id, terminal_id, attach_started_at
                             ),
                         )
@@ -444,7 +444,7 @@ class _RunnerWSClosed(Exception):
 async def _shuttle_ws_frames(
     browser_ws: WebSocket,
     runner_ws: object,
-    on_first_runner_frame: Callable[[], None] | None = None,
+    on_first_output: Callable[[], None] | None = None,
 ) -> None:
     """
     Forward frames between *browser_ws* (FastAPI) and *runner_ws*
@@ -464,7 +464,7 @@ async def _shuttle_ws_frames(
 
     :param browser_ws: The browser-facing FastAPI WebSocket.
     :param runner_ws: The runner-facing websockets client.
-    :param on_first_runner_frame: Called once, after the first runner frame
+    :param on_first_output: Called once, after the first terminal output
         reaches the browser.
     """
     from websockets.exceptions import ConnectionClosed
@@ -488,17 +488,20 @@ async def _shuttle_ws_frames(
             return
 
     async def _runner_to_browser() -> None:
-        first_frame_callback = on_first_runner_frame
+        first_output_callback = on_first_output
         try:
             while True:
                 msg = await runner_ws.recv()  # type: ignore[attr-defined]
                 if isinstance(msg, bytes | bytearray | memoryview):
-                    await browser_ws.send_bytes(bytes(msg))
+                    data = bytes(msg)
+                    await browser_ws.send_bytes(data)
+                    # Binary frames carry pane output; text frames are control
+                    # JSON (e.g. tmux replies sent before any output).
+                    if data and first_output_callback is not None:
+                        first_output_callback()
+                        first_output_callback = None
                 else:
                     await browser_ws.send_text(msg)
-                if first_frame_callback is not None:
-                    first_frame_callback()
-                    first_frame_callback = None
         except ConnectionClosed as cc:
             # Surface the runner-side close code so the browser
             # mirrors it (4404 for missing terminal, etc.). Use
