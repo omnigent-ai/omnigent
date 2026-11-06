@@ -3019,10 +3019,15 @@ describe("Right workspace card visibility", () => {
     renderShell("/c/conv_hotkey");
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
+    // The rail is still sliding in from past the window edge, so focus must not scroll.
+    expect(focus.mock.contexts.at(-1)).toBe(filesTab);
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    focus.mockRestore();
     // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
