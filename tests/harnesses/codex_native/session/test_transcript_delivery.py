@@ -623,6 +623,8 @@ def _run_steered_turn(
     late_steer_reply: bool = False,
     live_follow_up_steer: bool = False,
     during_read: Callable[[], Awaitable[None]] | None = None,
+    live_next_prompt: bool = True,
+    late_live_steer_id: str | None = None,
 ) -> list[str]:
     """
     Run one turn that a web send steers, returning posts and forwarder reads in order.
@@ -636,6 +638,8 @@ def _run_steered_turn(
     :param late_steer_reply: Whether the turn ends before the steer's reply arrives.
     :param live_follow_up_steer: Whether a second web steer, seen live, follows the first.
     :param during_read: Awaited while each transcript read is in flight.
+    :param live_next_prompt: Whether the following turn's live ``userMessage`` arrives.
+    :param late_live_steer_id: Item id of a live steer copy arriving after the replies.
     :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
@@ -699,13 +703,17 @@ def _run_steered_turn(
                 agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
                 await deliver(_turn_item_event("item/started", agent_item))
                 await deliver(_agent_message_event("turn_123", f"msg_{index}", f"reply {index}"))
+            if late_live_steer_id is not None:
+                late_copy = {**steer, "id": late_live_steer_id}
+                await deliver(_turn_item_event("item/completed", late_copy))
             fake_client.error = turn_end_read_error
             await deliver(turn_end)
             fake_client.error = None
             if not next_turn_replies:
                 return
             await deliver(_started_event("turn_456"))
-            await deliver(_turn_item_event("item/completed", next_prompt, "turn_456"))
+            if live_next_prompt:
+                await deliver(_turn_item_event("item/completed", next_prompt, "turn_456"))
             for index in range(1, next_turn_replies + 1):
                 agent_item = {"type": "agentMessage", "id": f"next_{index}"}
                 await deliver(_turn_item_event("item/started", agent_item, "turn_456"))
@@ -763,6 +771,22 @@ def test_forwarder_mirrors_accepted_steer_whose_live_message_was_missed(
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
+def test_forwarder_skips_late_live_copy_of_recovered_steer(tmp_path: Path) -> None:
+    """A live copy of a recovered steer arriving later under another item id is not reposted."""
+    transcript = _run_steered_turn(
+        tmp_path, live_steer_copy=False, replies_after_steer=2, late_live_steer_id="item_late"
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        "assistant: reply 1",
+        _TRANSCRIPT_READ,
+        _RECOVERED_STEER,
+        "assistant: reply 2",
+        "status: idle",
+    ]
+
+
 def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Path) -> None:
     """A steer Codex consumed is mirrored at turn end even before its RPC reply arrives."""
     transcript = _run_steered_turn(
@@ -788,6 +812,39 @@ def test_forwarder_mirrors_missed_steer_ahead_of_later_steer(tmp_path: Path) -> 
         _TRANSCRIPT_READ,
         _RECOVERED_STEER,
         "user: and the changelog",
+        "status: idle",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_drops_missed_steer_when_read_before_later_steer_fails(tmp_path: Path) -> None:
+    """
+    A missed steer is dropped, not mirrored late, once a later steer is mirrored ahead of it.
+
+    A server ignoring the delivery a late copy names would settle it against another input.
+    """
+    reads_started = 0
+
+    async def fail_first_read() -> None:
+        nonlocal reads_started
+        reads_started += 1
+        if reads_started == 1:
+            raise ConnectionError("app-server closed")
+
+    transcript = _run_steered_turn(
+        tmp_path,
+        live_steer_copy=False,
+        replies_after_steer=2,
+        live_follow_up_steer=True,
+        during_read=fail_first_read,
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        _TRANSCRIPT_READ,
+        "user: and the changelog",
+        "assistant: reply 1",
+        "assistant: reply 2",
         "status: idle",
     ]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
@@ -916,6 +973,31 @@ def test_forwarder_retries_steer_whose_turn_end_read_failed(
         "assistant: next 2",
         "assistant: next 3",
         "assistant: next 4",
+        "status: idle",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
+
+
+def test_forwarder_drops_unread_steer_once_next_turn_message_is_mirrored(tmp_path: Path) -> None:
+    """An ended turn's unread steer is dropped once the next turn's prompt is mirrored first."""
+    transcript = _run_steered_turn(
+        tmp_path,
+        live_steer_copy=False,
+        replies_after_steer=0,
+        turn_end_read_error=ConnectionError("app-server closed"),
+        next_turn_replies=2,
+        live_next_prompt=False,
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        _TRANSCRIPT_READ,
+        "status: idle",
+        "status: running",
+        "codex: thread/resume",
+        "user: run the tests",
+        "assistant: next 1",
+        "assistant: next 2",
         "status: idle",
     ]
     assert read_sent_steers(tmp_path, thread_id="thread_123") == []
