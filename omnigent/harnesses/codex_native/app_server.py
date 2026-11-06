@@ -25,10 +25,12 @@ import tomlkit
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from omnigent.models import model_catalog
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
+from omnigent.models.model_override import is_databricks_model_id
+from omnigent.onboarding.codex_auth_readiness import effective_codex_model_provider
 from omnigent.telemetry.surface import CLIENT_SURFACE_ENV_VAR
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -246,6 +248,59 @@ class CodexModelProviderMissingError(OmnigentError, RuntimeError):
             code=ErrorCode.HARNESS_NOT_CONFIGURED,
         )
         self.provider = provider
+
+
+class CodexAccountModelIncompatibleError(OmnigentError, ValueError):
+    """A gateway-only model was explicitly selected for a ChatGPT account."""
+
+    def __init__(self, model: str) -> None:
+        super().__init__(
+            f"Model {model!r} requires the Databricks gateway and cannot run with this "
+            "Codex ChatGPT login. Choose a ChatGPT-supported model, or configure the "
+            f"Databricks provider with `{cli_invocation()} setup` on the host.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+
+
+async def validate_codex_account_model(
+    client: CodexAppServerClient,
+    model: str | None = None,
+    *,
+    cwd: Path | None = None,
+) -> None:
+    """Refuse only a confirmed ChatGPT/built-in OpenAI/gateway-model mismatch."""
+    if model is not None and not is_databricks_model_id(model):
+        return
+    try:
+        response = await asyncio.wait_for(
+            client.request(
+                "config/read", {"includeLayers": False, **({"cwd": str(cwd)} if cwd else {})}
+            ),
+            timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+        result = response.get("result")
+        config = result.get("config") if isinstance(result, dict) else None
+        if not isinstance(config, dict) or effective_codex_model_provider(config) != "openai":
+            return
+        selected = model if model is not None else config.get("model")
+        if not isinstance(selected, str) or not is_databricks_model_id(selected):
+            return
+        response = await asyncio.wait_for(
+            client.request("account/read", {"refreshToken": False}),
+            timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+    except (AttributeError, OSError, RuntimeError, ValueError, WebSocketException) as exc:
+        _logger.debug("Codex account/model admission unavailable: %s", type(exc).__name__)
+        return
+    result = response.get("result")
+    account = result.get("account") if isinstance(result, dict) else None
+    if (
+        isinstance(result, dict)
+        and isinstance(account, dict)
+        and account.get("type") == "chatgpt"
+        and result.get("requiresOpenaiAuth") is True
+    ):
+        raise CodexAccountModelIncompatibleError(selected)
 
 
 def _missing_model_provider(stderr_lines: Sequence[str]) -> str | None:
@@ -2640,6 +2695,16 @@ class CodexNativeAppServer:
                     model_migration_target,
                 )
         effective_model = self.pinned_model or read_codex_home_config_model(self.codex_home)
+        check_account_model = isinstance(effective_model, str) and is_databricks_model_id(
+            effective_model
+        )
+        for override in self.config_overrides:
+            try:
+                override_model = tomlkit.parse(override).get("model")
+            except tomlkit.exceptions.TOMLKitError:
+                continue
+            if isinstance(override_model, str) and is_databricks_model_id(override_model):
+                check_account_model = True
         requested_effort = self.pinned_effort or read_codex_home_config_effort(self.codex_home)
         effective_effort = clamp_codex_effort_for_model(requested_effort, effective_model, catalog)
         if effective_effort and (self.pinned_effort or effective_effort != requested_effort):
@@ -2752,6 +2817,8 @@ class CodexNativeAppServer:
                 except CodexAppServerSilentStartTimeout as second:
                     raise RuntimeError(str(second)) from second
             try:
+                if check_account_model:
+                    await validate_codex_account_model(startup_client, cwd=self.cwd)
                 # Standalone CLI launches may have no shared catalog snapshot.
                 # Correct their copied defaults before a TUI creates its thread.
                 if (

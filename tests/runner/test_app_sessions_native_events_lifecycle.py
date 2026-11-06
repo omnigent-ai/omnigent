@@ -5983,3 +5983,67 @@ async def test_events_stop_session_during_delivery_cancels_the_turn(
     assert "failed" not in statuses, events
     assert "idle" in statuses
     assert session_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
+async def test_codex_account_model_pick_refuses_before_native_settings_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.codex_native import app_server as codex_app
+
+    model = "system.ai.synthetic-account-model"
+    conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    home = codex_native_bridge.codex_home_for_bridge_dir(bridge_dir)
+    home.mkdir(parents=True)
+    config = home / "config.toml"
+    original = 'model = "synthetic-supported-account-model"\n'
+    config.write_text(original)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_codex",
+            codex_home=str(home),
+            active_turn_id=None,
+        ),
+    )
+    fake = _RecordingCodexAppServerClient("ws://127.0.0.1:43210", "omnigent-codex-native-runner")
+
+    async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake.requests.append((method, params))
+        if method == "config/read":
+            return {
+                "result": {
+                    "config": {
+                        "model_provider": "openai",
+                        "model": "synthetic-supported-account-model",
+                    }
+                }
+            }
+        if method == "account/read":
+            assert params == {"refreshToken": False}
+            return {"result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}}
+        raise AssertionError(f"unexpected mutation: {method}")
+
+    fake.request = request
+    monkeypatch.setattr(codex_app, "client_for_transport", lambda *_args, **_kwargs: fake)
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native", model="synthetic-supported-account-model")
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert response.status_code == 201, response.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events", json={"type": "model_change", "model": model}
+        )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"] == "harness_not_configured"
+    assert model in response.json()["detail"]
+    assert config.read_text() == original
+    assert [method for method, _params in fake.requests] == ["config/read", "account/read"]

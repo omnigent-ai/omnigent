@@ -20,6 +20,7 @@ from omnigent.debug_logging import debug_event
 from omnigent.errors import OmnigentError
 from omnigent.harnesses.codex_native import side_chat
 from omnigent.harnesses.codex_native.app_server import (
+    CodexAccountModelIncompatibleError,
     CodexAppServerClient,
     CodexAppServerResponseError,
     CodexMessage,
@@ -29,6 +30,7 @@ from omnigent.harnesses.codex_native.app_server import (
     is_server_draining_error,
     is_stale_active_turn_error,
     resolve_codex_effort_for_model,
+    validate_codex_account_model,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
@@ -496,6 +498,19 @@ async def _native_delivery_request_once(
     return response
 
 
+async def _validate_codex_message_model(client: CodexAppServerClient, model: object) -> None:
+    """Keep a proven account/model refusal ahead of input consumption."""
+    if not isinstance(model, str):
+        return
+    try:
+        await validate_codex_account_model(client, model)
+    except CodexAccountModelIncompatibleError as exc:
+        raise _CodexNativeInputUndelivered(
+            CodexStartupFailure(message=exc.message, code=exc.code),
+            preserve_session=True,
+        ) from exc
+
+
 async def _start_codex_turn(
     client: CodexAppServerClient,
     *,
@@ -513,6 +528,7 @@ async def _start_codex_turn(
         or unmirrored.get("model")
         or await asyncio.to_thread(read_codex_config_model, bridge_dir)
     )
+    await _validate_codex_message_model(client, model)
     effort = (
         settings_overrides.get("effort")
         or unmirrored.get("effort")
@@ -585,6 +601,9 @@ async def _steer_codex_turn(
 ) -> None:
     """Steer one bridge-recorded active Codex turn."""
     assert state.active_turn_id is not None
+    await _validate_codex_message_model(
+        client, await asyncio.to_thread(read_codex_config_model, bridge_dir)
+    )
     response = await _native_delivery_request(
         client,
         "turn/steer",

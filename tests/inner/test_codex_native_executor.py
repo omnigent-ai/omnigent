@@ -4398,3 +4398,47 @@ def test_interrupt_reraises_unrelated_rejections(
     assert state is not None and state.active_turn_id == "turn_active", (
         f"an unexplained rejection must not clear the recorded turn; bridge={state!r}"
     )
+
+
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_confirmed_account_model_refusal_preserves_the_single_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, active_turn_id: str | None
+) -> None:
+    model = "system.ai.synthetic-account-model"
+
+    class AccountClient(_FakeCodexNativeClient):
+        requests = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            if method == "config/read":
+                return {"result": {"config": {"model_provider": "openai", "model": model}}}
+            if method == "account/read":
+                assert params == {"refreshToken": False}
+                return {"result": {"account": {"type": "chatgpt"}, "requiresOpenaiAuth": True}}
+            raise AssertionError(f"unexpected mutation: {method}")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", AccountClient
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    config = home / "config.toml"
+    original = f'model = "{model}"\n'
+    config.write_text(original)
+    before = read_bridge_state(tmp_path)
+    [failure] = _collect_turn_events(
+        CodexNativeExecutor(bridge_dir=tmp_path), "keep this exact single message"
+    )
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == "harness_not_configured"
+    assert failure.undelivered is True
+    assert failure.preserve_session is True
+    assert model in failure.message
+    assert config.read_text() == original
+    assert read_bridge_state(tmp_path) == before
+    assert [method for method, _params in AccountClient.requests] == [
+        "config/read",
+        "account/read",
+    ]
