@@ -16,7 +16,15 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
+import { useDesktopCommand } from "@/lib/desktopCommands";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
@@ -26,7 +34,7 @@ import { useSessionAgent } from "@/hooks/useAgents";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
-import { useCloseTabShortcut } from "@/hooks/useCloseTabShortcut";
+import { useHistoryNavigation } from "@/hooks/useHistoryNavigation";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
@@ -41,6 +49,8 @@ import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/fil
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
+  closeDesktopWindow,
+  confirmDesktopQuit,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
@@ -110,6 +120,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
+import { useCanStartSideChat } from "@/hooks/usePermissions";
 import { supportsSideChat } from "@/lib/sideChat";
 import { subagentTabId } from "@/lib/subagentTabs";
 import {
@@ -120,6 +131,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { MobileHeaderControlsProvider } from "./MobileHeaderControlsSlot";
 import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
@@ -153,6 +165,8 @@ import { CommandPalette } from "./CommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 import { Toaster } from "@/components/ui/sonner";
 import { CloseShellDialog } from "./CloseShellDialog";
+import { CloseWindowDialog } from "./CloseWindowDialog";
+import { QuitDialog } from "./QuitDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
 import { InlineTerminalsSection } from "./InlineTerminalsSection";
@@ -229,7 +243,9 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
 export function AppShell() {
   return (
     <GridSessionsProvider>
-      <AppShellImpl />
+      <MobileHeaderControlsProvider>
+        <AppShellImpl />
+      </MobileHeaderControlsProvider>
     </GridSessionsProvider>
   );
 }
@@ -284,6 +300,7 @@ function AppShellImpl() {
     gridId: string;
   }>();
   const location = useLocation();
+  const navigateTo = useNavigate();
   const rebasePath = useRebasePath();
   const serverInfo = useServerInfo();
   const canvasMode =
@@ -572,7 +589,8 @@ function AppShellImpl() {
     rightPanelMotionTimerRef.current = window.setTimeout(() => {
       rightPanelMotionTimerRef.current = null;
       setRightPanelVisibilityAnimating(false);
-    }, 350);
+      // Just past the rail's 200 ms transition in index.css.
+    }, 250);
   }, []);
   useEffect(
     () => () => {
@@ -1482,7 +1500,7 @@ function AppShellImpl() {
     };
   }, []);
   const guardFileNavigation = useCallback(
-    (path: string, options: OpenFileOptions | undefined, commit: () => void) => {
+    (path: string | null, options: OpenFileOptions | undefined, commit: () => void) => {
       const guards = [...fileNavigationGuardsRef.current];
       const navigate = (index: number) => {
         const guard = guards[index];
@@ -1606,12 +1624,9 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     terminalFirst,
   ]);
+  // One press toggles: a rail on screen closes, a closed or covered one opens
+  // with focus on its tabs.
   const toggleRightPanelFromHotkey = useCallback(() => {
-    if (rightPanelOpen && workspaceTabListRef.current?.contains(document.activeElement)) {
-      focusWorkspaceTabsOnOpenRef.current = false;
-      toggleRightPanel();
-      return;
-    }
     const hiddenByCompetingPanel =
       (!terminalFirst && panelOpen) || executionLogsOpen || filesPanelOpen;
     if (hiddenByCompetingPanel) {
@@ -1620,11 +1635,7 @@ function AppShellImpl() {
       revealRightPanel();
       return;
     }
-    if (rightPanelOpen) {
-      focusWorkspaceTabs();
-      return;
-    }
-    focusWorkspaceTabsOnOpenRef.current = !!conversationId && hasRailContent;
+    focusWorkspaceTabsOnOpenRef.current = !rightPanelOpen && !!conversationId && hasRailContent;
     toggleRightPanel();
   }, [
     rightPanelOpen,
@@ -1636,11 +1647,10 @@ function AppShellImpl() {
     hasRailContent,
     restoreSelectedFileUrl,
     revealRightPanel,
-    focusWorkspaceTabs,
     toggleRightPanel,
   ]);
 
-  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // The hotkey (⌘B, or ⌘⌥[ in a browser) and command-palette toggle for the left sidebar. A peeking
   // sidebar counts as open, so toggling collapses it; either way peek is
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
@@ -1771,9 +1781,9 @@ function AppShellImpl() {
     setRightPanelMaximized((prev) => !prev);
   }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, setSidebarOpen]);
 
-  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
-  // here where both panels' open-state lives. A grid route replaces this rail
-  // with the grid's own workspace, which binds ⌘⌥] itself.
+  // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
+  // right sidebars. Bound here where both panels' open-state lives. A grid route
+  // replaces this rail with the grid's own workspace, which binds its own toggle.
   const gridRoute =
     gridId !== undefined && isFeatureEnabled(serverInfo, "grid_sessions_display_ui");
   useSidebarToggleHotkeys({
@@ -1819,6 +1829,7 @@ function AppShellImpl() {
   );
   useNewSessionHotkey();
   useSettingsHotkey();
+  useHistoryNavigation();
 
   // Mobile back button: close the open file and return to the files/changes
   // list. On mobile the tab strip is hidden, so a "back" should fully drop the
@@ -1991,7 +2002,11 @@ function AppShellImpl() {
     // Phones hide the rail, so the side chat opens in its drawer instead.
     if (isMobileViewport()) openSideChatsPanel();
   }, [sideChatToOpen, conversationId, openSideChatsPanel, setRightPanelOpenAnimated]);
-  const showSideChats = supportsSideChat(useChatStore((s) => s.sessionHarness));
+  const canStartSideChat = useCanStartSideChat(serverConversationId, permissionLevel);
+  const showSideChats = supportsSideChat(
+    useChatStore((s) => s.sessionHarness),
+    canStartSideChat,
+  );
   // With the panel setting on, sub-agent links open a rail tab beside this chat,
   // revealing the rail if another panel covers it. Ancestors still navigate.
   const parentSessionId = activeSession?.parentSessionId;
@@ -2026,9 +2041,9 @@ function AppShellImpl() {
       revealRightPanel,
     ],
   );
-  // Sub-agent tabs opened on desktop must stay reachable from a phone's
-  // drawer even when this harness can't start side chats.
-  const [hasSubagentTabs, setHasSubagentTabs] = useState(false);
+  // Side-chat and sub-agent tabs opened elsewhere must stay reachable from a
+  // phone's drawer even where this viewer or harness can't start side chats.
+  const [hasSideChatTabs, setHasSideChatTabs] = useState(false);
 
   function openTerminalsPanel(key: string) {
     setSelectedFilePath(null); // close file viewer
@@ -2046,12 +2061,13 @@ function AppShellImpl() {
   // the selected file keeps the rail's single content slot unambiguous — a
   // shell tab and a file tab can't both be "active".
   const openTerminalTab = useCallback(
-    (key: string) => {
+    (key: string, { focus = true }: { focus?: boolean } = {}) => {
       // The tab already exists (tabs derive 1:1 from the terminal list); this
       // just focuses it and reveals the rail. The selection is sticky (never
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
-      autoFocusTerminalKeyRef.current = key;
+      // `focus: false` shows the shell but leaves keyboard focus where it is.
+      autoFocusTerminalKeyRef.current = focus ? key : null;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -2066,8 +2082,9 @@ function AppShellImpl() {
     [clearFileViewerUrl, conversationId, setRightPanelOpenAnimated],
   );
 
-  // ⌘⌥T (Ctrl+Alt+T) opens a new shell — the keyboard path for the tab-strip
-  // "+" menu, launching the remembered default type via the same create +
+  // ⌃` and ⌘⌥T (Ctrl+Alt+T) open a new shell, as does the desktop menu's New
+  // Terminal — the keyboard path for the tab-strip "+" menu, launching the
+  // remembered default type via the same create +
   // focus path the menu uses (mark-start snapshot, then focus the tab). Gated
   // on the session declaring shell access and being reachable: an offline
   // session can't be reconnected from the browser, so the chord is inert there,
@@ -2096,7 +2113,33 @@ function AppShellImpl() {
     clearShellCreatePending,
     openTerminalTab,
   ]);
-  useNewShellHotkey(launchDefaultShell, shellLaunchable);
+  // A new shell replaces the file on screen, so its viewer confirms unsaved edits first.
+  const launchShellFromShortcut = useCallback(
+    () => guardFileNavigation(null, undefined, launchDefaultShell),
+    [guardFileNavigation, launchDefaultShell],
+  );
+  useNewShellHotkey(launchShellFromShortcut, shellLaunchable);
+  useDesktopCommand("new-terminal", shellLaunchable ? launchShellFromShortcut : null);
+
+  // Desktop Close (⌘W / Ctrl+W), once the workspace rail has passed on it:
+  // leave the open session or page for the new-session page; from the
+  // new-session page itself, confirm, then close the window.
+  const atNewSessionPage =
+    location.pathname.replace(/\/$/, "") === rebasePath("/").replace(/\/$/, "");
+  const [closeWindowPrompt, setCloseWindowPrompt] = useState<{ quits: boolean } | null>(null);
+  useDesktopCommand("close", (event) => {
+    if (atNewSessionPage) setCloseWindowPrompt({ quits: event.closingQuits });
+    // An open file with unsaved edits asks before the session (and its viewer) goes away.
+    else guardFileNavigation(null, undefined, () => navigateTo("/"));
+  });
+  // Desktop Quit (⌘Q / Ctrl+Q) asks here first, over any page; a second ⌘Q
+  // leaves the open prompt to answer.
+  const [quitPrompt, setQuitPrompt] = useState<{ detail: string | null } | null>(null);
+  useDesktopCommand("quit", (event) =>
+    setQuitPrompt((current) => current ?? { detail: event.quitDetail }),
+  );
+  // Desktop Reload (⌘R) reloads the app unless a browser tab's toolbar took it.
+  useDesktopCommand("reload", () => window.location.reload());
 
   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
   // — a new non-agent terminal key that wasn't present when the create started.
@@ -2318,6 +2361,7 @@ function AppShellImpl() {
     () => ({
       openFile: openFileViewer,
       registerNavigationGuard,
+      guardFileNavigation,
       openGithubTab,
       openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
@@ -2329,6 +2373,7 @@ function AppShellImpl() {
     [
       openFileViewer,
       registerNavigationGuard,
+      guardFileNavigation,
       openGithubTab,
       showFilesPanel,
       openFolderInFiles,
@@ -2537,13 +2582,6 @@ function AppShellImpl() {
     focusWorkspaceTabsOnOpenRef.current = false;
     focusWorkspaceTabs();
   }, [workspacePanelVisible, focusWorkspaceTabs]);
-  // Desktop Close Tab closes the rail's selected tab only while the rail is on
-  // screen; otherwise it leaves the session (or closes the window off one).
-  const closeSelectedRailTabRef = useRef<(() => boolean) | null>(null);
-  useCloseTabShortcut(
-    () => workspacePanelVisible && (closeSelectedRailTabRef.current?.() ?? false),
-    conversationId !== undefined,
-  );
 
   return (
     <FileViewerContext.Provider value={fileViewerContextValue}>
@@ -2688,6 +2726,7 @@ function AppShellImpl() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    workingDirectory={activeSession?.workspace ?? activeConv?.workspace}
                     createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
@@ -2723,7 +2762,7 @@ function AppShellImpl() {
                       githubPanelOpen,
                       contentSearchPanelOpen,
                       sideChatsPanelOpen,
-                      showSideChats: showSideChats || hasSubagentTabs,
+                      showSideChats: showSideChats || hasSideChatTabs,
                       hideTerminalsTab,
                       // Mobile: reachable when a shell exists OR the agent
                       // declares shell access (so the drawer's "+ New shell" row
@@ -2799,12 +2838,12 @@ function AppShellImpl() {
                     onRightRailTabChange={handleRightRailTabChange}
                     openPanels={openPanels}
                     onClosePanel={closeWorkspacePanel}
-                    closeSelectedTabRef={closeSelectedRailTabRef}
                     showFilesPanel={showFilesPanel}
                     showGithubTab={railTabsAvailable.github}
                     showContentSearch={railTabsAvailable["content-search"]}
                     showBrowserTab={railTabsAvailable.browser}
                     onReveal={revealRightPanel}
+                    onHide={rightPanelOpen ? toggleRightPanel : undefined}
                     changedCount={changedCount}
                     subagentsWorking={subagentsWorking}
                     agentCount={agentCount}
@@ -2839,7 +2878,7 @@ function AppShellImpl() {
                     onShellCreateFailed={clearShellCreatePending}
                     mobileSideChatsOpen={sideChatsPanelOpen}
                     onMobileSideChatsOpenChange={setSideChatsPanelOpen}
-                    onHasSubagentTabsChange={setHasSubagentTabs}
+                    onHasSideChatTabsChange={setHasSideChatTabs}
                     subagentPanelOpener={openSubagentInPanel}
                   />
                 )}
@@ -2994,6 +3033,22 @@ function AppShellImpl() {
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}
           />
+          <CloseWindowDialog
+            prompt={closeWindowPrompt}
+            onConfirm={() => {
+              setCloseWindowPrompt(null);
+              void closeDesktopWindow();
+            }}
+            onCancel={() => setCloseWindowPrompt(null)}
+          />
+          <QuitDialog
+            prompt={quitPrompt}
+            onConfirm={(dontAskAgain) => {
+              setQuitPrompt(null);
+              void confirmDesktopQuit(dontAskAgain);
+            }}
+            onCancel={() => setQuitPrompt(null)}
+          />
           {/* Agent tools & policies — the mobile counterpart of the desktop
         AgentInfoButton popover, opened from the header's three-dot menu. */}
           {hasAgentInfo && (
@@ -3037,6 +3092,7 @@ function AppShellImpl() {
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}
             onToggleRightSidebar={toggleRightPanel}
+            rightSidebarShortcutEnabled={!gridRoute}
           />
           <RecentSessionsSwitcher
             conversations={allConversations}

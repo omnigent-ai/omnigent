@@ -509,6 +509,14 @@ Fields:
     redraw a bubble the person stopped. Empty for non-native sessions,
     which already carry the message in `items`.
 
+  failed_inputs (array, default `[]`)
+    Saved startup inputs (see `initial_input` below) that were never
+    delivered, e.g. because the managed sandbox host did not come online.
+    Same `{pending_id, content, created_by?}` shape as `pending_inputs`, in
+    submission order. File blocks keep their `file_id`, so attachments stay
+    downloadable from this session. Clients show these as undelivered
+    messages; a `retry_session` that redelivers them removes them.
+
   todos (array, default `[]`)
     Current native Plan/TODO list reported by a harness.
     Each item: `{content: string, status: "pending"|"in_progress"|"completed",
@@ -548,7 +556,11 @@ Request parts:
 
   metadata (JSON string, required)
     Session metadata. Shape matches `SessionCreateMetadata`:
-    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `{title?: string | null, labels?: object, reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra" | null, model_override?: string | null, workspace?: string | null, terminal_launch_args?: string[] | null}`.
+    `model_override` and `reasoning_effort` are session-level and win over
+    the uploaded bundle's `executor.model` / `executor.reasoning_effort`, as on
+    the JSON create. Servers that accept `model_override` here report
+    `session_bundle_model_override` in `GET /v1/info`; older ones reject it.
     `terminal_launch_args` carries pass-through CLI args for a native
     terminal wrapper, e.g. `["--permission-mode", "bypassPermissions"]`
     (same field as the JSON create path below). Unknown fields fail with 400.
@@ -1030,7 +1042,22 @@ Request body matches `SessionEventInput`:
                                   in place); the harness then moves the
                                   terminal onto a fresh session that live
                                   viewers follow via `session.superseded`.
-                                  Other harnesses get a 400. Payload: `{}`.
+                                  For claude-sdk (servers reporting
+                                  `session_claude_sdk_clear` in
+                                  `/v1/info`), the server checks the
+                                  caller owns the top-level session, asks
+                                  the runner to drop its live SDK client
+                                  with `continue_in_new_session: true`
+                                  (an older runner's 204 is accepted), and
+                                  continues the work in an empty session
+                                  on the same host, workspace and runner,
+                                  returning its id as `session_id`. A
+                                  running or starting turn is a 400; a
+                                  clear already moving the session is a
+                                  409, as is a message sent meanwhile. A
+                                  runner leaves an unmarked claude-sdk
+                                  clear unsupported (204). Other harnesses
+                                  get a 400. Payload: `{}`.
       - "stop_session"          — terminate the live session without
                                   deleting the conversation (owner-only;
                                   requires LEVEL_OWNER). Forwarded

@@ -59,6 +59,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   startupPending: true,
   returnedStartupInputs: true,
   replacedStartupInputs: true,
+  failedInputs: true,
   mcpStartup: true,
   mcpStartupLaunch: true,
   btwSidechat: true,
@@ -70,6 +71,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
   failedSendTakenBy: true,
   restoredSendDraft: true,
   sendLatchedAt: true,
+  sendLatchSeenRunning: true,
   historyGeneration: true,
   awaitingSideChatFor: true,
 };
@@ -133,6 +135,7 @@ export function createInitialConversationState(): ConversationState {
     startupPending: false,
     returnedStartupInputs: [],
     replacedStartupInputs: [],
+    failedInputs: [],
     mcpStartup: null,
     mcpStartupLaunch: { pending: false, dismissed: false },
     btwSidechat: null,
@@ -144,6 +147,7 @@ export function createInitialConversationState(): ConversationState {
     failedSendTakenBy: "session",
     restoredSendDraft: null,
     sendLatchedAt: null,
+    sendLatchSeenRunning: null,
     historyGeneration: 0,
     awaitingSideChatFor: null,
   };

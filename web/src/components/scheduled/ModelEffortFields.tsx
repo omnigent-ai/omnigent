@@ -1,13 +1,10 @@
+import { ScheduleSelect as Select } from "./ScheduleSelect";
 // Harness-specific automation controls; Default leaves the agent configuration unchanged.
 
+import { cn } from "@/lib/utils";
+import { pickerTriggerClass } from "./pickerStyles";
 import { Label } from "@/components/scheduled/Label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EFFORT_SELECT_NONE, MODEL_SELECT_DEFAULT } from "@/components/HarnessConfigControls";
 import type { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 
@@ -60,8 +57,11 @@ export function ModelEffortFields({
   return (
     <div className="flex flex-col gap-3 sm:gap-4">
       {settings.supportsModel && (
-        <div className="grid gap-3 sm:grid-cols-2 sm:gap-6" data-testid="task-model-effort-row">
-          <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-model-control">
+        <div className="flex flex-col gap-3" data-testid="task-model-effort-row">
+          <div
+            className="flex w-full min-w-0 items-center justify-between gap-4"
+            data-testid="task-model-control"
+          >
             <Label htmlFor="task-model">Model</Label>
             <Select
               disabled={disabled}
@@ -71,13 +71,20 @@ export function ModelEffortFields({
               onValueChange={(v) => onModelChange(v === MODEL_SELECT_DEFAULT ? "" : v)}
               onOpenChange={onSelectOpenChange}
             >
-              <SelectTrigger id="task-model" data-testid="task-model-trigger" className="w-full">
+              <SelectTrigger
+                id="task-model"
+                data-testid="task-model-trigger"
+                className={cn(
+                  "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                  pickerTriggerClass,
+                )}
+              >
                 <SelectValue />
               </SelectTrigger>
               <SelectContent
                 position="popper"
-                align="start"
-                className="w-(--radix-select-trigger-width)"
+                align="end"
+                className="w-[min(20rem,calc(100vw-2rem))]"
               >
                 <SelectItem value={MODEL_SELECT_DEFAULT}>Default</SelectItem>
                 {modelOptions.map((m) => (
@@ -90,7 +97,10 @@ export function ModelEffortFields({
           </div>
 
           {effortOptions.length > 0 && (
-            <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-effort-control">
+            <div
+              className="flex w-full min-w-0 items-center justify-between gap-4"
+              data-testid="task-effort-control"
+            >
               <Label htmlFor="task-effort">Effort</Label>
               <Select
                 disabled={disabled}
@@ -103,14 +113,17 @@ export function ModelEffortFields({
                 <SelectTrigger
                   id="task-effort"
                   data-testid="task-effort-trigger"
-                  className="w-full"
+                  className={cn(
+                    "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                    pickerTriggerClass,
+                  )}
                 >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent
                   position="popper"
-                  align="start"
-                  className="w-(--radix-select-trigger-width)"
+                  align="end"
+                  className="w-[min(20rem,calc(100vw-2rem))]"
                 >
                   <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
                   {effortOptions.map((e) => (
@@ -129,8 +142,11 @@ export function ModelEffortFields({
       )}
 
       {permissionOptions.length > 0 && (
-        <div className="flex w-full min-w-0 flex-col gap-1.5" data-testid="task-permission-control">
-          <Label htmlFor="task-permission">Permission mode</Label>
+        <div
+          className="flex w-full min-w-0 items-center justify-between gap-4"
+          data-testid="task-permission-control"
+        >
+          <Label htmlFor="task-permission">Permissions</Label>
           <Select
             disabled={disabled}
             value={
@@ -147,14 +163,17 @@ export function ModelEffortFields({
             <SelectTrigger
               id="task-permission"
               data-testid="task-permission-trigger"
-              className="w-full"
+              className={cn(
+                "w-auto max-w-[65%] border-0 shadow-none text-muted-foreground",
+                pickerTriggerClass,
+              )}
             >
               <SelectValue />
             </SelectTrigger>
             <SelectContent
               position="popper"
-              align="start"
-              className="w-(--radix-select-trigger-width)"
+              align="end"
+              className="w-[min(20rem,calc(100vw-2rem))]"
             >
               <SelectItem value={PERMISSION_SELECT_DEFAULT}>Default</SelectItem>
               {permissionOptions.map((m) => (

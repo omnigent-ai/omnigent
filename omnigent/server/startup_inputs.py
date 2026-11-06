@@ -7,7 +7,7 @@ import contextlib
 import logging
 import re
 import weakref
-from collections.abc import Callable, Collection, Coroutine
+from collections.abc import Awaitable, Callable, Collection, Coroutine
 from dataclasses import dataclass
 from typing import Any
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -218,35 +218,42 @@ class ManagedStartupInputs:
                 )
         return saved[0]
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(
+        self, session_id: str, reason: str | Callable[[], Awaitable[str]]
+    ) -> str:
         """
         Mark a failed create launch on the session, for replicas without its tracker.
 
         No sandbox is left to deliver the saved inputs, so they are failed and
-        the transcript says why.
+        the transcript says why. A deferred reason is resolved only after queued
+        inputs are failed, so diagnostic I/O cannot race their delivery. Returns
+        the resolved reason for callers recording the same failure elsewhere.
         """
-        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is None:
-            return
-        with contextlib.suppress(ConversationNotFoundError):
-            await asyncio.to_thread(
-                self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
-            )
         undelivered = False
-        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
-            if item.status == "in_progress":
-                undelivered |= await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    item.id,
-                    expected="in_progress",
-                    status="failed",
+        if await asyncio.to_thread(self.conversations.get_conversation, session_id) is not None:
+            with contextlib.suppress(ConversationNotFoundError):
+                await asyncio.to_thread(
+                    self.conversations.set_labels, session_id, {STARTUP_LABEL: "failed"}
                 )
+            for item in await asyncio.to_thread(
+                self.conversations.list_pending_inputs, session_id
+            ):
+                if item.status == "in_progress":
+                    undelivered |= await asyncio.to_thread(
+                        self.conversations.transition_pending_input,
+                        session_id,
+                        item.id,
+                        expected="in_progress",
+                        status="failed",
+                    )
+        reason = await reason() if callable(reason) else reason
         if undelivered:
             await self._report_failure(
                 session_id,
                 "launch_failed",
                 f"The message could not be delivered: {reason[:1000]}",
             )
+        return reason
 
     async def accepts(self, conv: Conversation, app: Any) -> bool:
         """Whether a new message must wait behind the session's startup."""
@@ -259,10 +266,7 @@ class ManagedStartupInputs:
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and launch.error is not None:
             return False
-        if any(
-            item.status in ("in_progress", "incomplete")
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-        ):
+        if await self.has_undelivered(conv.id):
             return True
         if state != "pending":
             return False
@@ -279,15 +283,32 @@ class ManagedStartupInputs:
         )
         return host is not None and host_is_live(host)
 
-    async def pending_snapshot(self, session_id: str) -> list[dict[str, Any]]:
+    async def has_undelivered(self, session_id: str) -> bool:
+        """Whether a saved input is still to be delivered (or confirmed) here."""
+        return any(
+            item.status in ("in_progress", "incomplete")
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        )
+
+    async def snapshot(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """
+        Render the session's saved inputs for its snapshot.
+
+        :param session_id: Session/conversation identifier.
+        :returns: ``(queued, failed)``, each a list of
+            ``{"pending_id", "content", "created_by"?}`` in submission order.
+            ``failed`` holds inputs no launch or delivery could hand over, so
+            clients can show them as undelivered instead of dropping them.
+        """
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
         if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
-            return []
-        return [
-            _snapshot_entry(session_id, item)
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
-            if item.status != "failed"
-        ]
+            return [], []
+        queued: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id):
+            entry = _snapshot_entry(session_id, item)
+            (failed if item.status == "failed" else queued).append(entry)
+        return queued, failed
 
     async def failed_page(
         self, conv: Conversation, viewer_id: str | None, *, after: str | None, limit: int
@@ -545,6 +566,8 @@ class ManagedStartupInputs:
             )
             raise
         except Exception as exc:
+            if await self._waits_out_session_move(session_id, exc):
+                return
             log_delivery(
                 "scheduled_run_stage_failed",
                 session_id=session_id,
@@ -582,6 +605,23 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
+        """Whether *exc* refused delivery only while ``/clear`` moves the session.
+
+        The input stays queued; the host worker delivers it once the move
+        ends, as after any other transient wait.
+        """
+        from omnigent.server.routes._sessions.orchestration import _session_is_moving
+
+        if not (
+            isinstance(exc, OmnigentError)
+            and exc.code == ErrorCode.CONFLICT
+            and _session_is_moving(session_id)
+        ):
+            return False
+        _logger.info("Saved message for session %s waits for /clear to finish", session_id)
+        return True
 
     async def retry(self, session_id: str) -> bool:
         changed = False
