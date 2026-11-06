@@ -1831,23 +1831,44 @@ async def test_next_turn_gets_its_own_hidden_input_box_delay(
     assert session.published[-1] == ("running", "terminal prompt")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("final_status", ["idle", "failed"])
-@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
-async def test_turn_end_during_input_box_probe_is_not_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_status: str, alerting: bool
+# Status changes that can land between an inference and its delivery, with the edge each leaves.
+_INTERVENING_STATUS_EDGES: dict[str, tuple[str, str | None]] = {
+    "idle": ("idle", None),
+    "failed": ("failed", None),
+    "dialog-open": ("running", "dialog open"),
+    "new-turn": ("running", None),
+}
+
+
+def _change_session_status(
+    registry: SessionResourceRegistry, session_id: str, intervening: str
 ) -> None:
-    """A turn that ends while the pane is probed keeps its final status."""
+    if intervening == "dialog-open":
+        registry._claim_status_edge(session_id, "running", "dialog open", explicit_activity=True)
+    elif intervening == "new-turn":
+        registry.note_external_session_status(session_id, "idle")
+        registry.note_external_session_status(session_id, "running")
+    else:
+        registry.note_external_session_status(session_id, intervening)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("intervening", list(_INTERVENING_STATUS_EDGES))
+@pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
+async def test_status_change_during_input_box_probe_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intervening: str, alerting: bool
+) -> None:
+    """A status change that lands while the pane is probed is kept."""
     session_id = "conv_hidden_probe_race"
     armed = {"value": False}
 
-    def end_turn_mid_probe() -> None:
+    def change_status_mid_probe() -> None:
         if armed["value"]:
             armed["value"] = False
-            session.registry.note_external_session_status(session_id, final_status)
+            _change_session_status(session.registry, session_id, intervening)
 
     session = await _hidden_input_box_session(
-        tmp_path, monkeypatch, session_id, during_probe=end_turn_mid_probe
+        tmp_path, monkeypatch, session_id, during_probe=change_status_mid_probe
     )
     session.write_claude_status("busy")
     await session.tick_at(100.0, _CLAUDE_NOTICE_PANE)
@@ -1859,16 +1880,17 @@ async def test_turn_end_during_input_box_probe_is_not_overwritten(
     armed["value"] = True
     await session.tick_at(117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE)
     assert session.published[published_before:] == []
-    assert session.registry._published_status_edge(session_id) == (final_status, None)
+    expected_edge = _INTERVENING_STATUS_EDGES[intervening]
+    assert session.registry._published_status_edge(session_id) == expected_edge
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("final_status", ["idle", "failed"])
+@pytest.mark.parametrize("intervening", list(_INTERVENING_STATUS_EDGES))
 @pytest.mark.parametrize("alerting", [False, True], ids=["raise", "clear"])
-async def test_turn_end_before_queued_alert_delivery_is_not_overwritten(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, final_status: str, alerting: bool
+async def test_status_change_before_queued_alert_delivery_is_not_overwritten(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, intervening: str, alerting: bool
 ) -> None:
-    """A queued alert change is dropped when the turn ends before it is delivered."""
+    """A queued alert change is dropped when the status changes before it is delivered."""
     session_id = "conv_hidden_delivery_race"
     session = await _hidden_input_box_session(tmp_path, monkeypatch, session_id)
     session.write_claude_status("busy")
@@ -1881,10 +1903,11 @@ async def test_turn_end_before_queued_alert_delivery_is_not_overwritten(
     await session.tick_at(
         117.0, _CLAUDE_WORKING_PANE if alerting else _CLAUDE_NOTICE_PANE, drain=False
     )
-    session.registry.note_external_session_status(session_id, final_status)
+    _change_session_status(session.registry, session_id, intervening)
     await asyncio.sleep(0)
     assert session.published[published_before:] == []
-    assert session.registry._published_status_edge(session_id) == (final_status, None)
+    expected_edge = _INTERVENING_STATUS_EDGES[intervening]
+    assert session.registry._published_status_edge(session_id) == expected_edge
 
 
 @pytest.mark.asyncio
