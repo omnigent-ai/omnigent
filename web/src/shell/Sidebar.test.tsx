@@ -2124,6 +2124,8 @@ describe("Sidebar sections", () => {
       ]);
       seedPins([]);
       refresh();
+      expect(screen.queryByText("conv_sibling")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
       expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
       expect(screen.getByText("conv_sibling").closest("li")).toHaveAttribute(
         "data-sibling-session",

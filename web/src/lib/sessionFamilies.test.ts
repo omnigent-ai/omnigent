@@ -23,5 +23,19 @@ describe("session families", () => {
     // Removal reaches the list before the server's replacement metadata.
     expect(orderSessionFamilies([c, standalone, b]).map((row) => row.id)).toEqual(["b", "c", "x"]);
     expect(b.family?.representative_id).toBe("a");
+    const collapsed = new Set(["family"]);
+    expect(orderSessionFamilies([standalone, c, a, b], collapsed).map((row) => row.id)).toEqual([
+      "x",
+      "a",
+    ]);
+    expect(orderSessionFamilies([c, standalone, b], collapsed).map((row) => row.id)).toEqual([
+      "b",
+      "x",
+    ]);
+    const pinned = { ...c, labels: { "omnigent.pinned": "1" } };
+    expect(orderSessionFamilies([b, pinned, a], collapsed).map((row) => row.id)).toEqual([
+      "a",
+      "c",
+    ]);
   });
 });

@@ -6,7 +6,7 @@ export function isIndividuallyPinnedSibling(row: Conversation): boolean {
 }
 
 /** Display groups retain a surviving representative while deletion metadata refreshes. */
-export function sessionFamilyGroups(rows: Conversation[]): Map<string, Conversation[]> {
+export function sessionFamilyGroups(rows: readonly Conversation[]): Map<string, Conversation[]> {
   const families = new Map<string, Conversation[]>();
   for (const row of rows) {
     if (!row.family || isIndividuallyPinnedSibling(row)) continue;
@@ -28,8 +28,11 @@ export function sessionFamilyGroups(rows: Conversation[]): Map<string, Conversat
   return families;
 }
 
-/** Retain each family's sorted position, but put its representative before its peers. */
-export function orderSessionFamilies(rows: Conversation[]): Conversation[] {
+/** Retain each family's position, with its representative before any visible peers. */
+export function orderSessionFamilies(
+  rows: readonly Conversation[],
+  collapsedFamilies?: ReadonlySet<string>,
+): Conversation[] {
   const families = sessionFamilyGroups(rows);
   const emitted = new Set<string>();
   const result: Conversation[] = [];
@@ -37,8 +40,9 @@ export function orderSessionFamilies(rows: Conversation[]): Conversation[] {
     if (emitted.has(row.id)) continue;
     const members =
       row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)! : [row];
+    const collapsed = row.family && collapsedFamilies?.has(row.family.id);
     for (const member of members) {
-      if (!emitted.has(member.id)) result.push(member);
+      if (!emitted.has(member.id) && (!collapsed || member === members[0])) result.push(member);
       emitted.add(member.id);
     }
   }

@@ -1547,6 +1547,8 @@ function ProjectFolder({
   expanded,
   active,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   pinnedConversationIds,
   sessionShortcutSlots,
   activeOverride,
@@ -1594,6 +1596,8 @@ function ProjectFolder({
   /** Whether the new-session composer is currently scoped to this project. */
   active: boolean;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   pinnedConversationIds: string[];
   /** Jump slot per numbered row (the first ten the sidebar lists). */
   sessionShortcutSlots: ReadonlyMap<string, number>;
@@ -1828,6 +1832,8 @@ function ProjectFolder({
         // Projects default collapsed: shown only when explicitly expanded.
         collapsed={!expanded}
         onToggleCollapsed={onToggleCollapsed}
+        collapsedFamilies={collapsedFamilies}
+        onToggleFamily={onToggleFamily}
         onRowClick={onRowClick}
         onTogglePinned={onTogglePinned}
         selectionMode={selectionMode}
@@ -2025,6 +2031,15 @@ function ConversationList({
   getVisibleIdsRef,
 }: ConversationListProps) {
   const grids = useGridSessions();
+  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
+  const toggleFamily = useCallback((familyId: string) => {
+    setCollapsedFamilies((previous) => {
+      const next = new Set(previous);
+      if (next.has(familyId)) next.delete(familyId);
+      else next.add(familyId);
+      return next;
+    });
+  }, []);
   // Row-invariant values resolved once here and shared with rows via context
   // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
@@ -2818,12 +2833,16 @@ function ConversationList({
   // session hotkeys. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list;
+      effectiveCollapsedSections.includes(title)
+        ? []
+        : orderSessionFamilies(list, collapsedFamilies);
     // A project's chats are navigable only while the "Projects" group and that
     // folder are both expanded (folders start collapsed), down to its "Show more".
     const projectsCollapsed = effectiveCollapsedSections.includes("Projects");
     const projectVisible = (group: (typeof sections.projectGroups)[number]) =>
-      !projectsCollapsed && expandedProjects.includes(group.name) ? folderVisibleRows(group) : [];
+      !projectsCollapsed && expandedProjects.includes(group.name)
+        ? orderSessionFamilies(folderVisibleRows(group), collapsedFamilies)
+        : [];
     // `sections` is already scoped to the active tab, so the same Pinned /
     // Projects / Sessions walk covers every tab (Projects is empty on Shared).
     return [
@@ -2834,7 +2853,14 @@ function ConversationList({
         ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
         : visible("Chats", sections.sessions)),
     ].map((c) => c.id);
-  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, folderVisibleRows]);
+  }, [
+    sections,
+    sessionGroups,
+    effectiveCollapsedSections,
+    expandedProjects,
+    folderVisibleRows,
+    collapsedFamilies,
+  ]);
   // Shift-select range ids in render order, built at click time from the
   // selectable scope. Folders contribute the rows they list above "Show more"
   // (their own reports), so a target outside the global window still resolves.
@@ -2842,12 +2868,16 @@ function ConversationList({
     const projectIds = () => {
       if (effectiveCollapsedSections.includes("Projects")) return [];
       return sections.projectGroups.flatMap((g) =>
-        expandedProjects.includes(g.name) ? folderVisibleRows(g).map((c) => c.id) : [],
+        expandedProjects.includes(g.name)
+          ? orderSessionFamilies(folderVisibleRows(g), collapsedFamilies).map((c) => c.id)
+          : [],
       );
     };
     if (selectionScope === "projects") return projectIds();
     const visibleIds = (title: string, list: readonly Conversation[]) =>
-      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
+      effectiveCollapsedSections.includes(title)
+        ? []
+        : orderSessionFamilies(list, collapsedFamilies).map((c) => c.id);
     return [
       ...(unifiedSelection ? projectIds() : []),
       ...visibleIds("Shared", sections.shared),
@@ -2924,6 +2954,8 @@ function ConversationList({
   // List header controls and row props, shared by the Shared, single "Sessions"
   // and grouped sections; the controls sit on the first of the viewer's lists.
   const sessionRowProps = {
+    collapsedFamilies,
+    onToggleFamily: toggleFamily,
     activeConversationId: displayedActiveId,
     pinnedConversationIds,
     sessionShortcutSlots,
@@ -3150,6 +3182,8 @@ function ConversationList({
                       <PinOrderContext.Provider value={pinOrder}>
                         <ConversationSection
                           title="Pinned"
+                          collapsedFamilies={collapsedFamilies}
+                          onToggleFamily={toggleFamily}
                           conversations={sections.pinned}
                           activeConversationId={displayedActiveId}
                           pinnedConversationIds={pinnedConversationIds}
@@ -3266,6 +3300,8 @@ function ConversationList({
                             expanded={expandedProjects.includes(group.name)}
                             active={newSessionProjectName === group.name}
                             onToggleCollapsed={() => toggleProjectExpanded(group.name)}
+                            collapsedFamilies={collapsedFamilies}
+                            onToggleFamily={toggleFamily}
                             pinnedConversationIds={pinnedConversationIds}
                             sessionShortcutSlots={sessionShortcutSlots}
                             activeOverride={activeOverride}
@@ -4099,6 +4135,8 @@ function ConversationSection({
   pinnedConversationIds,
   collapsed,
   onToggleCollapsed,
+  collapsedFamilies,
+  onToggleFamily,
   onRowClick,
   onTogglePinned,
   selectionMode,
@@ -4136,6 +4174,8 @@ function ConversationSection({
   /** Whether this section is currently collapsed. */
   collapsed: boolean;
   onToggleCollapsed: () => void;
+  collapsedFamilies: ReadonlySet<string>;
+  onToggleFamily: (familyId: string) => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
@@ -4167,7 +4207,6 @@ function ConversationSection({
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
-  const [collapsedFamilies, setCollapsedFamilies] = useState<Set<string>>(() => new Set());
   const families = sessionFamilyGroups(conversations);
   const familyRepresentative = (row: Conversation) =>
     row.family && !isIndividuallyPinnedSibling(row) ? families.get(row.family.id)?.[0] : undefined;
@@ -4175,9 +4214,7 @@ function ConversationSection({
     const representative = familyRepresentative(row);
     return representative !== undefined && representative.id !== row.id;
   };
-  const visibleFamilyRows = conversations.filter(
-    (row) => !isNestedFamilyRow(row) || !collapsedFamilies.has(row.family!.id),
-  );
+  const visibleFamilyRows = orderSessionFamilies(conversations, collapsedFamilies);
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
@@ -4303,15 +4340,7 @@ function ConversationSection({
                       ? !collapsedFamilies.has(conv.family.id)
                       : undefined
                   }
-                  onToggleFamily={() =>
-                    setCollapsedFamilies((previous) => {
-                      const next = new Set(previous);
-                      const id = conv.family!.id;
-                      if (next.has(id)) next.delete(id);
-                      else next.add(id);
-                      return next;
-                    })
-                  }
+                  onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={conv.id === activeConversationId}
                   inActiveGrid={gridMembers.has(conv.id)}
                   gridSelected={conv.id === grids?.selectedSessionId}
