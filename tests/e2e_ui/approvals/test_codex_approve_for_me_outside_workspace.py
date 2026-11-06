@@ -12,7 +12,7 @@ Journey (all user-observable):
 1. create a codex-native session in "Approve for me" whose workspace is
    folder A;
 2. ask Codex to create a file in folder B, outside A;
-3. the turn completes and the file exists, with no approval card.
+3. the turn completes with no approval card.
 
 With ``LLM_API_KEY`` set (CI / local dev) the real gateway model drives the
 journey; it escalates the command itself. Without the key, the in-process

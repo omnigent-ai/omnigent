@@ -6983,6 +6983,8 @@ describe("NewChatLandingScreen", () => {
 
   it.each([
     ["default", "Default"],
+    ["ask-for-approval", "Ask for approval"],
+    ["approve-for-me", "Approve for me"],
     ["full-access", "Full Access"],
     ["read-only", "Read Only"],
     ["bypass", "Bypass approvals & sandbox"],

@@ -1955,6 +1955,19 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(arg.permissionMode).toBe("auto");
   });
 
+  it("starts on Auto again after the user picks Default and cancels", async () => {
+    const onOpenChange = vi.fn();
+    const view = renderDialog(onOpenChange);
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(await screen.findByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+  });
+
   it("omits permission on create when the user picks Default", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });

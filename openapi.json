@@ -6252,6 +6252,11 @@
             "title": "Sandbox Providers",
             "type": "array"
           },
+          "scheduled_task_codex_reviewer_modes": {
+            "default": true,
+            "title": "Scheduled Task Codex Reviewer Modes",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
