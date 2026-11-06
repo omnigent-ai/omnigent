@@ -44,10 +44,8 @@ export function useSideChats(conversationId: string) {
   // Changes a failed storage write couldn't save. Each update replays them on
   // fresh storage, so they survive without undoing other windows' changes.
   const unsaved = useRef<{ conversationId: string; changes: TabsChange[] } | null>(null);
-  // WorkspacePanel isn't remounted when the user navigates to another
-  // conversation (conversationId is a prop, not a key), so reload this
-  // conversation's own tabs on change — during render, so the previous
-  // conversation's side-chat tabs never reach the new one's first frame.
+  // WorkspacePanel isn't keyed by conversationId, so reload tabs during render
+  // on a switch; the previous session's tabs never reach the new first frame.
   const [stateConversationId, setStateConversationId] = useState(conversationId);
   if (stateConversationId !== conversationId) {
     setStateConversationId(conversationId);

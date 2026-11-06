@@ -527,9 +527,9 @@ function AppShellImpl() {
   // The one shell key the user just opened by an explicit gesture (clicking a
   // tab / creating a "+"→Shell). Its rail xterm may grab keyboard focus when it
   // connects; a shell merely *restored* on a session switch may not — switching
-  // sessions keeps focus in the chat composer. Cleared once consumed and on
-  // every session switch.
-  const autoFocusTerminalKeyRef = useRef<string | null>(null);
+  // sessions keeps focus in the chat composer. Scoped to its session, since a
+  // switch restores the next session's shell before the effect clears this.
+  const autoFocusTerminalRef = useRef<{ conversationId: string; key: string } | null>(null);
   // Whether the workspace rail is maximized (covers the full content region,
   // hiding the chat column). Session-transient — a fresh visit starts docked.
   const [rightPanelMaximized, setRightPanelMaximized] = useState(false);
@@ -1196,12 +1196,8 @@ function AppShellImpl() {
     [conversationId, setSearchParams, terminalFirst],
   );
 
-  // Restore the per-session workspace state when switching conversations (and
-  // on mount): rail open-state, selected tab, and the open file tabs. Done
-  // during render so the incoming session's first frame shows its own state.
-  // The Chat/TUI toggle is restored from sessionStorage; with no per-tab choice,
-  // terminal-first sessions use the Appearance default. The Files scope and the
-  // active file also honor URL search params so shared links open to the right view.
+  // Restore saved and URL workspace state during render (on mount and on every
+  // switch) so the session's first frame is correct.
   const [restoredWorkspace, setRestoredWorkspace] = useState<{
     conversationId: string | undefined;
     canvasMode: boolean;
@@ -1327,11 +1323,8 @@ function AppShellImpl() {
           : restoredPanels,
       );
 
-      // Restore the rail open-state for this session. A deep link / reload that
-      // carries a workspace signal — a file to open (?file=) or a comment to
-      // surface (?comment=) — reveals the rail even when this session was last
-      // left closed; otherwise the linked file/comment would render into a
-      // collapsed, invisible panel.
+      // ?file= / ?comment= deep links reveal the rail even if this session left
+      // it closed, so the linked target isn't rendered into a collapsed panel.
       setRightPanelOpen(restoredRailOpen(conversationId, canvasMode, searchParams));
     }
   }
@@ -1342,7 +1335,7 @@ function AppShellImpl() {
   // would otherwise auto-focus an unrelated shell in the new session.
   useEffect(() => {
     pendingShellCreateRef.current = null;
-    autoFocusTerminalKeyRef.current = null;
+    autoFocusTerminalRef.current = null;
     stateConvRef.current = conversationId ?? null;
     cancelRightPanelVisibilityMotion();
     if (restoredWorkspace?.exitedMaximized) restoreSidebarAfterMaximize();
@@ -1426,11 +1419,8 @@ function AppShellImpl() {
     setSubagentsPanelOpen(isMobileViewport());
   }, [conversationId, agentsPanelRequested, setRightPanelOpenImmediately, selectRightRailTab]);
 
-  // Persist the per-session rail tab + open file tabs whenever they change.
-  // Keyed on the state (not conversationId) and targeted at the conversation
-  // the current state belongs to (stateConvRef, set by the restore effect) so
-  // a conversation switch can't write the outgoing session's state into the
-  // incoming one.
+  // Persist the per-session rail tab + open file tabs whenever they change, to
+  // the session the state belongs to (stateConvRef, set after each restore).
   useEffect(() => {
     const id = stateConvRef.current;
     if (!id) return;
@@ -2088,7 +2078,7 @@ function AppShellImpl() {
       // pruned off the list), so a fresh create that's still landing stays
       // selected and its xterm surfaces the instant the terminal appears.
       // `focus: false` shows the shell but leaves keyboard focus where it is.
-      autoFocusTerminalKeyRef.current = focus ? key : null;
+      autoFocusTerminalRef.current = focus && conversationId ? { conversationId, key } : null;
       setSelectedTerminalKey(key);
       setSelectedFilePath(null);
       setFileViewerCommentsOpen(false);
@@ -2882,8 +2872,9 @@ function AppShellImpl() {
                     openTerminals={openTerminals}
                     selectedTerminalKey={selectedTerminalKey}
                     autoFocusSelectedTerminal={
-                      autoFocusTerminalKeyRef.current !== null &&
-                      autoFocusTerminalKeyRef.current === selectedTerminalKey
+                      autoFocusTerminalRef.current !== null &&
+                      autoFocusTerminalRef.current.conversationId === conversationId &&
+                      autoFocusTerminalRef.current.key === selectedTerminalKey
                     }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}

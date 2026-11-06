@@ -242,8 +242,16 @@ vi.mock("./SubagentsPanel", () => ({
 // The real WorkspacePanel mounts a rail xterm for an open shell tab; stub the
 // low-level view to a marker echoing the attached terminal id.
 vi.mock("@/components/blocks/TerminalView", () => ({
-  TerminalView: ({ terminalId }: { terminalId: string }) => (
-    <div data-testid="terminal-view-stub">{terminalId}</div>
+  TerminalView: ({
+    terminalId,
+    focusOnConnect,
+  }: {
+    terminalId: string;
+    focusOnConnect?: boolean;
+  }) => (
+    <div data-testid="terminal-view-stub" data-focus-on-connect={String(focusOnConnect)}>
+      {terminalId}
+    </div>
   ),
 }));
 vi.mock("./FilesPanelDrawer", () => ({
@@ -3730,6 +3738,49 @@ describe("Right workspace card visibility", () => {
     );
     fireEvent.click(screen.getByTestId("nav-session"));
     expect(frames).toEqual(["conv_from:terminal", "conv_to:chat"]);
+  });
+
+  it("does not carry the outgoing session's shell focus intent to a restored shell", async () => {
+    writeSessionWorkspaceState("conv_from", { open: true, openFiles: ["a.ts"] });
+    writeSessionWorkspaceState("conv_to", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_main",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null, home: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([
+      { id: "conv_from", permission_level: 4 },
+      { id: "conv_to", permission_level: 4 },
+    ]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [{ id: "terminal_main", name: "main", session: "u-1", running: true }],
+      isLoading: false,
+      error: null,
+    });
+    const frames: string[] = [];
+    const shellFocus = () =>
+      document
+        .querySelector('[data-testid="terminal-view-stub"]')
+        ?.getAttribute("data-focus-on-connect") ?? "none";
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      sessionShellTree(
+        qc,
+        "/c/conv_from",
+        <RailFirstFrameProbe frames={frames} to="/c/conv_to" snapshot={shellFocus} />,
+      ),
+    );
+    // Focus the shell in the outgoing session, then move its slot to a file.
+    fireEvent.click(screen.getByTitle("main · u-1"));
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveAttribute(
+      "data-focus-on-connect",
+      "true",
+    );
+    fireEvent.click(screen.getByTitle("a.ts"));
+    fireEvent.click(screen.getByTestId("nav-session"));
+    expect(frames).toEqual(["conv_from:none", "conv_to:false"]);
   });
 
   it("uses the default when navigating from Agents to a child in another tree", () => {
