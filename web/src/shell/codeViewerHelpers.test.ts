@@ -1006,4 +1006,8 @@ describe("large Markdown routing", () => {
   ])("uses UTF-8 bytes for case %#", (lang, content, expected) => {
     expect(isMarkdownTooLargeForRichView(lang, content)).toBe(expected);
   });
+
+  it("opens an 800 KB document as source", () => {
+    expect(isMarkdownTooLargeForRichView("markdown", "a".repeat(800_000))).toBe(true);
+  });
 });

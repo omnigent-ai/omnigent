@@ -17,7 +17,7 @@ and the recording protocol for comparing revisions.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
 - `live-refresh`: an open file shows saves from other sessions and processes
   in place, keeping the caret; unsaved edits raise a conflict instead.
-- `large-files`: files above 1 MiB open as editable source; truncated files
+- `large-files`: files above 256 KiB open as editable source; truncated files
   remain read-only, with full-file download available.
 
 ## How to get to it (user POV)
@@ -115,7 +115,8 @@ Results carry `readiness_probe: terminal-marker`; older results without this
 field include assertion overhead and must be remeasured for comparisons.
 The load runs use real time and no slow-motion or simulated clock.
 Report repeated samples for performance decisions; a single video is illustrative.
-This does not cover every Markdown shape or establish a safe 1 MiB limit.
+The 256 KiB fixture sits just below the source-view limit. These runs do not
+cover every Markdown shape or establish that limit for every machine.
 
 ### Complementary correctness journeys
 
@@ -225,7 +226,7 @@ instead of treating one comparison clip as complete feature verification.
   Refresh those tabs to load the source-map behavior; this display difference
   does not overwrite the comment's saved offsets.
 - The automatic source fallback uses UTF-8 bytes, not JavaScript string length.
-  It applies above 1 MiB regardless of the saved view preference. The choice
+  It applies above 256 KiB regardless of the saved view preference. The choice
   stays fixed for that file visit so an autosave cannot replace an editor with
   newer unsaved edits. Reopen another file and return, or reload, to reassess.
   This is an initial-load guard, not a live cap on edits or external updates.

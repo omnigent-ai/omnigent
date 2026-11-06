@@ -51,9 +51,12 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
-export const MAX_RICH_MARKDOWN_BYTES = 1024 * 1024;
+export const MAX_RICH_MARKDOWN_BYTES = 256 * 1024;
 
-/** Use source for large Markdown to bound the initial rich-rendering work. */
+/**
+ * Use source for large Markdown: the rich editor renders the whole document on
+ * load and lays all of it out again on every resize.
+ */
 export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
   return (
     lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
