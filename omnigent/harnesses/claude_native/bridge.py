@@ -4632,10 +4632,12 @@ def _paste_and_submit(
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
     )
-    if not draft_seen and _composer_box(pane) is None:
-        # The composer frame is not mounted (a resumed TUI still replaying its
-        # transcript). An Enter now would submit nothing yet report success, so
-        # wait for the composer, clear what the first paste left, and paste once more.
+    box = _composer_box(pane)
+    if not draft_seen and (
+        box is None or (box.framed and "".join(box.rows).strip() == _CLAUDE_PROMPT_GLYPH)
+    ):
+        # A resuming TUI can drop the paste, then remount an empty composer
+        # before the draft wait ends. Recover once before sending any Enter.
         delivery_diagnostics.set_stage("waiting_for_composer")
         _wait_for_claude_prompt_ready(
             socket_path,
