@@ -28,6 +28,7 @@ from omnigent.terminals.pane_reaper import (
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
+    resolve_sub_agent_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -182,6 +183,27 @@ def test_resolve_invalid_falls_back(
     assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
 
 
+@pytest.mark.parametrize(
+    ("env", "session_timeout_s", "expected"),
+    [
+        (None, 86400.0, _DEFAULT_IDLE_TIMEOUT_S),
+        (None, 600.0, 600.0),
+        (None, 0.0, 0.0),
+        ("120", 86400.0, 120.0),
+        ("7200", 7200.0, 7200.0),
+        ("0", 0.0, 0.0),
+    ],
+)
+def test_resolve_sub_agent_window_caps_session_window_at_native_default(
+    monkeypatch: pytest.MonkeyPatch, env: str | None, session_timeout_s: float, expected: float
+) -> None:
+    if env is None:
+        monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_IDLE_TIMEOUT_ENV, env)
+    assert resolve_sub_agent_pane_idle_timeout_s(session_timeout_s) == expected
+
+
 # ── Loop smoke (start/shutdown + disable) ───────────────────────────────────
 
 
@@ -202,7 +224,7 @@ async def test_loop_reaps_idle_pane() -> None:
 
 async def test_loop_disabled_when_timeout_non_positive() -> None:
     f = _Fakes()
-    f.panes = [_pane("conv_a")]
+    f.panes = [_pane("conv_a"), _pane("conv_child")._replace(sub_agent=True)]
     r = _make(f, timeout=0.0, interval=0.01)  # 0 disables
     await r.start()
     try:
@@ -210,6 +232,7 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     finally:
         await r.shutdown()
     assert f.reaped == []
+    assert f.busy_calls == 0
 
 
 def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:
