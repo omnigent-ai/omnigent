@@ -184,6 +184,7 @@ import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
+  parseSystemMessage,
   taskNotificationMarkerContent,
   withoutAttachedMarkers,
 } from "@/lib/systemMessage";
@@ -399,6 +400,7 @@ export function beginLocalConversation(
     initialDraft: { text, files: files ?? [] },
     createdAtS: Math.floor(Date.now() / 1000),
     ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+    sentWhileIdle: true,
   };
 
   // Seed the model/agent identity so the optimistic composer shows the selected
@@ -630,6 +632,8 @@ export interface PendingUserMessage {
    * it. Unset on snapshot-replayed entries.
    */
   sentMidTurn?: boolean;
+  /** Sent with no turn in flight; a reply preview streamed before its ack renders below it. */
+  sentWhileIdle?: boolean;
 }
 
 /**
@@ -2760,6 +2764,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : pinnedId === null
           ? get().status === "streaming"
           : setterForState(pinnedId)?.status === "streaming";
+    // A reply already streaming, or owed to an earlier send or committed input, is not this send's.
+    const sentWhileIdle =
+      !alreadyStreaming &&
+      !sentMidTurn &&
+      !targetState?.blocks.some(isLiveProvisionalBlock) &&
+      !targetState?.pendingUserMessages.length &&
+      !committedInputAwaitsReply(targetState?.blocks ?? []);
     if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
@@ -2818,6 +2829,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
+                ...(sentWhileIdle ? { sentWhileIdle } : {}),
               },
             ],
         // A new turn does NOT supersede the background-shell tally: shells
@@ -6965,6 +6977,65 @@ function makeLiveTextBlock(
   };
 }
 
+const TURN_NEUTRAL_BLOCK_TYPES: ReadonlySet<AnyBlock["type"]> = new Set([
+  "response_start",
+  "response_end",
+  "routing_decision",
+  "compaction_loading",
+  "file",
+]);
+
+/** Whether committed input owns the turn after it; an interrupt record closes its turn. */
+function opensTurn(content: MessageContentBlock[]): boolean {
+  return parseSystemMessage(messageContentText(content))?.kind !== "interrupted";
+}
+
+/** Whether the newest committed input, other than a promoted local send, is still without a reply. */
+function committedInputAwaitsReply(blocks: AnyBlock[]): boolean {
+  for (let at = blocks.length - 1; at >= 0; at -= 1) {
+    const block = blocks[at]!;
+    if (block.type === "user_message") {
+      return block.stableKey === undefined && opensTurn(block.content);
+    }
+    if (!TURN_NEUTRAL_BLOCK_TYPES.has(block.type)) return false;
+  }
+  return false;
+}
+
+/** Input committed ahead of an idle send owns the next turn, including any reply that send already claimed. */
+function withTurnOwnedBy(
+  blocks: AnyBlock[],
+  pending: PendingUserMessage[],
+  input: AnyBlock[],
+): Partial<ChatState> {
+  const claims = new Set(pending.filter((p) => p.sentWhileIdle).map((p) => p.tempId));
+  if (claims.size === 0) return {};
+  const unclaimed = pending.map((p) => (p.sentWhileIdle ? { ...p, sentWhileIdle: false } : p));
+  const isClaimed = (block: AnyBlock) =>
+    block.type === "text_done" &&
+    block.answersPendingSend !== undefined &&
+    claims.has(block.answersPendingSend);
+  const replyAt = blocks.findIndex(isClaimed);
+  if (replyAt === -1) return { pendingUserMessages: unclaimed };
+  const inputAt = blocks.findIndex((block) => input.includes(block));
+  const ordered =
+    inputAt < replyAt
+      ? blocks
+      : [
+          ...blocks.slice(0, replyAt),
+          ...input,
+          ...blocks.slice(replyAt).filter((block) => !input.includes(block)),
+        ];
+  return {
+    pendingUserMessages: unclaimed,
+    blocks: ordered.map((block) =>
+      block.type === "text_done" && isClaimed(block)
+        ? { ...block, answersPendingSend: undefined }
+        : block,
+    ),
+  };
+}
+
 /**
  * Fold one streamed chunk into its in-flight preview block in `blocks`.
  *
@@ -6995,9 +7066,16 @@ function applyLiveDelta(set: Setter, messageId: string, delta: string, index?: n
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
+      // Deltas outrun the transcript, so the send that started this turn may
+      // still be pending; the preview must render below it.
+      const startingSend = s.pendingUserMessages.find((p) => p.sentWhileIdle && !p.initialDraft);
+      const preview = makeLiveTextBlock(itemId, delta, responseId, index);
       return {
         ...startupPatch,
-        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId, index)],
+        blocks: [
+          ...s.blocks,
+          startingSend ? { ...preview, answersPendingSend: startingSend.tempId } : preview,
+        ],
       };
     }
     const existing = s.blocks[at]!;
@@ -7627,10 +7705,14 @@ export async function pumpStreamEvents(
         // fall through and append as a normal block.
       }
 
+      let repliesToPendingSend: string | undefined;
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
-          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
+          const preview = get().blocks[provIdx]!;
+          ignoreLivePreview(preview, ignoredMessages);
+          // A reply that settles before its send's ack keeps its place below that send.
+          if (preview.type === "text_done") repliesToPendingSend = preview.answersPendingSend;
           // The done item has no message id. Native messages are sequential,
           // so remove the oldest preview and let the committed item follow
           // the normal reducer path.
@@ -7708,8 +7790,12 @@ export async function pumpStreamEvents(
       // tool_call boundaries + create_session first-activity, from live blocks.
       // Only fresh (non-deduped) blocks reach here, so each is observed once;
       // history hydration takes the `reduceSync` path and never runs this loop.
-      onLiveBlock(id, block);
-      buffer.push(block);
+      const fresh =
+        repliesToPendingSend !== undefined && block.type === "text_done"
+          ? { ...block, answersPendingSend: repliesToPendingSend }
+          : block;
+      onLiveBlock(id, fresh);
+      buffer.push(fresh);
       if (!paintedFirstContent) {
         // First content of the response — paint it immediately so the
         // user sees the first token without waiting a frame.
@@ -8203,6 +8289,17 @@ function committedUserBlock(
     content,
     stableKey,
   };
+}
+
+/** Append a promoted send, above any reply preview that streamed in before its ack. */
+function withPromotedSend(blocks: AnyBlock[], userBlock: UserMessageBlock): AnyBlock[] {
+  const tempId = userBlock.stableKey;
+  const replyAt =
+    tempId === undefined
+      ? -1
+      : blocks.findIndex((b) => b.type === "text_done" && b.answersPendingSend === tempId);
+  if (replyAt === -1) return [...blocks, userBlock];
+  return [...blocks.slice(0, replyAt), userBlock, ...blocks.slice(replyAt)];
 }
 
 interface RefetchRunnerBackedSessionStateOptions {
@@ -9119,7 +9216,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // and arrives with clearedPendingId unset; dropping the head would
           // steal a real queued message's bubble. Hold the head back for a marker.
           if (unmatchedEnvelope || (eventContent !== null && isSystemUserContent(eventContent))) {
-            return {};
+            return eventContent !== null && opensTurn(eventContent)
+              ? withTurnOwnedBy(
+                  s.blocks,
+                  s.pendingUserMessages,
+                  s.blocks.filter((block) => block.ctx.itemId === event.itemId),
+                )
+              : {};
           }
           if (s.pendingUserMessages.length === 0 || s.pendingUserMessages[0]?.initialDraft)
             return {};
@@ -9143,8 +9246,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               ],
               // stableKey = the optimistic bubble's temp id → the
               // promoted bubble keeps the same React key (no remount).
-              blocks: [
-                ...s.blocks,
+              blocks: withPromotedSend(
+                s.blocks,
                 committedUserBlock(
                   event.itemId,
                   content,
@@ -9152,7 +9255,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                   event.createdBy ?? matched.author,
                   matched.createdAtS,
                 ),
-              ],
+              ),
             };
           }
         }
@@ -9179,8 +9282,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             pendingUserMessages: s.pendingUserMessages.slice(1),
             // stableKey = the popped optimistic bubble's temp id so the
             // promoted bubble keeps the same React key (no remount/flink).
-            blocks: [
-              ...s.blocks,
+            blocks: withPromotedSend(
+              s.blocks,
               committedUserBlock(
                 event.itemId,
                 content,
@@ -9188,18 +9291,20 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.createdBy ?? head.author,
                 head.createdAtS,
               ),
-            ],
+            ),
           };
         }
 
         // 3. Nothing pending (or a marker that owns no bubble) — render the
         //    event payload fresh.
         if (eventContent === null) return {};
+        const input = committedUserBlock(event.itemId, eventContent, undefined, event.createdBy);
+        const blocks = [...s.blocks, input];
         return {
-          blocks: [
-            ...s.blocks,
-            committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
-          ],
+          blocks,
+          ...(settledShell || !opensTurn(eventContent)
+            ? {}
+            : withTurnOwnedBy(blocks, s.pendingUserMessages, [input])),
         };
       });
       return;

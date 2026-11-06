@@ -4209,6 +4209,20 @@ describe("buildBubbles — continued turns (sub-agent await)", () => {
     expect(assistantAt(assistants, 0).continued).toBeFalsy();
   });
 
+  it("does not mark a turn continued by a reply to a still-pending send", () => {
+    const earlyReply: AnyBlock = {
+      type: "text_done",
+      ctx: ctx({ itemId: "live:m_next", responseId: "live:m_next" }),
+      fullText: "Next answer.",
+      hasCodeBlocks: false,
+      answersPendingSend: "pend_1",
+    };
+    const bubbles = buildBubbles([...narrationThenTools("resp_1"), earlyReply], null);
+    const assistants = bubbles.filter((b) => b.kind === "assistant");
+    expect(assistants).toHaveLength(2);
+    expect(assistantAt(assistants, 0).continued).toBeFalsy();
+  });
+
   it("leaves a lone trailing turn unmarked", () => {
     const bubbles = buildBubbles(narrationThenTools("resp_1"), null);
     const assistants = bubbles.filter((b) => b.kind === "assistant");
