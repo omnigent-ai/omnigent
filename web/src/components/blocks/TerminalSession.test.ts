@@ -66,6 +66,13 @@ describe("openTerminalLink", () => {
     expect(pushSpy).toHaveBeenCalledWith(null, "", "/c/conv_next");
   });
 
+  it("keeps the router's history index on the entry it pushes", () => {
+    window.history.replaceState({ usr: null, key: "start", idx: 3 }, "", "/c/conv_a");
+    openTerminalLink(new MouseEvent("click"), `${window.location.origin}/c/conv_b`);
+    expect(window.history.state).toEqual({ usr: null, key: expect.any(String), idx: 4 });
+    expect(window.location.pathname).toBe("/c/conv_b");
+  });
+
   it("does not reopen the current same-origin session link", () => {
     window.history.replaceState(null, "", "/c/conv_current");
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);

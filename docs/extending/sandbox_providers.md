@@ -230,6 +230,9 @@ sandbox:
     sweep_interval_s: 86400           # optional; defaults to 1 day
 ```
 
+Disabling `reaper.enabled` stops age-based offline cleanup. Retries of teardown
+already requested by session or host deletion continue running.
+
 The server resolves the provider through the registry and calls
 `prepare()` → `provision()` → `start_host()` → wait for online registration.
 Each managed sandbox authenticates back with a server-minted per-launch token.

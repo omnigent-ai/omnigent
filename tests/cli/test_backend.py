@@ -13,12 +13,14 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import re
 import subprocess
 import sys
 import textwrap
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -3869,7 +3871,14 @@ def test_databricks_preflight_rejected_credential_recovers_via_sdk_refresh(
         lambda server: "https://example.databricks.com",
     )
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda server: None)
-    fresh_auth = SimpleNamespace(current_token=lambda: "fresh-token", profile_name=None)
+    from omnigent.inner.databricks_executor import _databrickscfg_fingerprint
+
+    # Resolved from the config file as it is now, like _resolve_databricks_auth stamps it.
+    fresh_auth = SimpleNamespace(
+        current_token=lambda: "fresh-token",
+        profile_name=None,
+        resolved_config_file=_databrickscfg_fingerprint(),
+    )
     monkeypatch.setattr(
         cli,
         "_databricks_workspace_auth_info",
@@ -4430,6 +4439,243 @@ def test_mixed_case_server_gets_the_same_workspace_key_and_pin() -> None:
     assert cli._build_host_daemon_env(server_url=server)[PINNED_DATABRICKS_ORG_ENV_VAR].endswith(
         "?o=111"
     )
+
+
+@pytest.mark.parametrize("bound_org", [None, "111", "222", "legacy"])
+@pytest.mark.parametrize("background", [False, True])
+def test_reuse_checks_the_recorded_workspace_binding(monkeypatch, bound_org, background):
+    from omnigent.cli_auth import databricks_org_pin
+
+    _select_workspace(monkeypatch, "111")
+    record = cli._HostDaemonRecord(
+        pid=12345,
+        target=_ACCOUNT_SERVER,
+        mode="server",
+        server_url=_ACCOUNT_SERVER,
+        log_path="/tmp/synthetic-host.log" if background else None,
+        started_at=1,
+        org_pin=None if bound_org == "legacy" else databricks_org_pin(_ACCOUNT_SERVER, bound_org),
+    )
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: record)
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda existing: True)
+    monkeypatch.setattr(cli, "_daemon_host_identity_changed", lambda existing: False)
+    stopped = []
+    monkeypatch.setattr(
+        cli, "_terminate_host_unit", lambda existing, **kwargs: stopped.append(existing)
+    )
+    if bound_org not in {"111", "legacy"}:
+        with pytest.raises(click.ClickException, match="left running"):
+            cli._reuse_existing_daemon_record(_ACCOUNT_SERVER)
+    else:
+        decision = cli._reuse_existing_daemon_record(_ACCOUNT_SERVER)
+        assert decision.reuse
+    assert stopped == []
+
+
+@pytest.mark.parametrize("workspace_id", [None, "111", "222"])
+def test_legacy_binding_uses_recorded_workspace_without_stopping_host(monkeypatch, workspace_id):
+    _select_workspace(monkeypatch, "111")
+    record = cli._HostDaemonRecord(
+        pid=12345,
+        target=_ACCOUNT_SERVER,
+        mode="server",
+        server_url=_ACCOUNT_SERVER,
+        log_path="/tmp/synthetic-host.log",
+        started_at=1,
+        workspace_id=workspace_id,
+    )
+    monkeypatch.setattr(cli, "_terminate_host_unit", lambda *args, **kwargs: pytest.fail("stop"))
+    if workspace_id == "222":
+        with pytest.raises(click.ClickException, match="left running"):
+            cli._require_compatible_daemon(record, _ACCOUNT_SERVER)
+    else:
+        cli._require_compatible_daemon(record, _ACCOUNT_SERVER)
+
+
+@pytest.mark.parametrize("bound_org", [None, "111", "222"])
+@pytest.mark.parametrize("identity_changed", [False, True])
+def test_warm_reuse_does_not_restart_a_running_host(monkeypatch, bound_org, identity_changed):
+    from omnigent.cli_auth import databricks_org_pin
+
+    _select_workspace(monkeypatch, "111")
+    record = cli._HostDaemonRecord(
+        pid=12345,
+        target=_ACCOUNT_SERVER,
+        mode="server",
+        server_url=_ACCOUNT_SERVER,
+        log_path="/tmp/synthetic-host.log",
+        started_at=1,
+        org_pin=databricks_org_pin(_ACCOUNT_SERVER, bound_org),
+    )
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: record)
+    monkeypatch.setattr(cli, "_daemon_owner_is_live", lambda existing: True)
+    monkeypatch.setattr(cli, "_daemon_host_identity_changed", lambda existing: identity_changed)
+    monkeypatch.setattr(cli, "_terminate_host_unit", lambda *args, **kwargs: pytest.fail("stop"))
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", lambda **kwargs: pytest.fail("spawn"))
+    assert cli._reuse_host_daemon_if_compatible(_ACCOUNT_SERVER) == (
+        bound_org == "111" and not identity_changed
+    )
+
+
+def test_warm_reuse_never_starts_a_missing_host(monkeypatch):
+    _select_workspace(monkeypatch, "111")
+    monkeypatch.setattr(cli, "_find_daemon_record", lambda target: None)
+    monkeypatch.setattr(cli, "_same_workspace_daemon", lambda server: None)
+    monkeypatch.setattr(cli, "_spawn_host_daemon_process", lambda **kwargs: pytest.fail("spawn"))
+    assert not cli._reuse_host_daemon_if_compatible(_ACCOUNT_SERVER)
+
+
+def test_unknown_workspace_probe_failure_prevents_host_start(monkeypatch, tmp_path):
+    import httpx
+
+    from omnigent import chat, cli_auth, debug_logging
+
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    monkeypatch.setattr(debug_logging, "publish_origin_identity", lambda server: None)
+    monkeypatch.setattr(chat, "_remote_headers", lambda **kwargs: {})
+
+    def unavailable(*args, **kwargs):
+        raise httpx.ConnectError("synthetic unavailable workspace")
+
+    monkeypatch.setattr(httpx, "get", unavailable)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", lambda server: pytest.fail("spawn"))
+    with pytest.raises(click.ClickException, match="Could not verify the workspace"):
+        cli._ensure_backend(_ACCOUNT_SERVER)
+
+
+@pytest.mark.parametrize("selector_source", ["discovered", "headerless", "stored", "explicit"])
+def test_workspace_startup_orders_discovery_and_preserves_host_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, selector_source: str
+) -> None:
+    import httpx
+
+    from omnigent import chat, cli_auth, debug_logging
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.delenv(cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR, raising=False)
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    monkeypatch.setattr(debug_logging, "publish_origin_identity", lambda server: None)
+    monkeypatch.setattr(chat, "_remote_headers", lambda **kwargs: {})
+    cli_auth.store_databricks_auth(
+        _ACCOUNT_SERVER,
+        "https://acct.example.com",
+        org_id="111" if selector_source == "stored" else None,
+    )
+    server = f"{_ACCOUNT_SERVER}?o=111" if selector_source == "explicit" else _ACCOUNT_SERVER
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    host_started = threading.Event()
+    host_env: dict[str, str] = {}
+
+    def probe(url: str, **kwargs: object) -> httpx.Response:
+        assert url == f"{_ACCOUNT_SERVER}/v1/me"
+        probe_started.set()
+        assert release_probe.wait(10)
+        headers = {} if selector_source == "headerless" else {"x-databricks-org-id": "111"}
+        return httpx.Response(200, headers=headers)
+
+    def start_host(server_url: str) -> bool:
+        if selector_source in {"stored", "explicit"}:
+            assert probe_started.wait(10)
+        # Another CLI writes after discovery (or during parallel authentication),
+        # before this launch snapshots the host's environment.
+        cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+        host_env.update(cli._build_host_daemon_env(server_url=server_url))
+        host_started.set()
+        return False
+
+    monkeypatch.setattr(httpx, "get", probe)
+    monkeypatch.setattr(cli, "_ensure_host_daemon", start_host)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        launch = pool.submit(cli._ensure_backend, server)
+        try:
+            assert probe_started.wait(10)
+            if selector_source in {"stored", "explicit"}:
+                assert host_started.wait(10), (
+                    "known workspace startup should overlap authentication"
+                )
+            else:
+                assert not host_started.wait(0.2), "host started before workspace discovery"
+        finally:
+            release_probe.set()
+        assert launch.result(timeout=10) == _ACCOUNT_SERVER
+
+    selected_org = None if selector_source == "headerless" else "111"
+    pin = host_env[cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR]
+    assert pin == cli_auth.databricks_org_pin(_ACCOUNT_SERVER, selected_org)
+    cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+    assert cli_auth.load_databricks_org_id(_ACCOUNT_SERVER) == selected_org
+    monkeypatch.setenv(cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR, pin)
+    assert cli_auth.load_databricks_org_id(_ACCOUNT_SERVER) == selected_org
+
+
+@pytest.mark.parametrize("auth_path", ["cached", "refresh", "browser"])
+@pytest.mark.parametrize("verified_org", [None, "111"])
+def test_discovery_pins_verified_result_despite_concurrent_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, auth_path: str, verified_org: str | None
+) -> None:
+    import httpx
+
+    from omnigent import cli_auth
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(cli_auth, "_token_file_path", lambda: tmp_path / "auth_tokens.json")
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **kwargs: {})
+    monkeypatch.setattr(cli.sys.stdin, "isatty", lambda: True)
+    response = httpx.Response(
+        200, headers={"x-databricks-org-id": verified_org} if verified_org else {}, json={}
+    )
+    monkeypatch.setattr(
+        httpx,
+        "get",
+        lambda *args, **kwargs: response if auth_path == "cached" else httpx.Response(401),
+    )
+    monkeypatch.setattr(
+        cli, "_databricks_workspace_login_target", lambda *args: "https://acct.example.com"
+    )
+    auth = cli._DatabricksWorkspaceAuthInfo(token="synthetic-token", profile_name=None)
+    monkeypatch.setattr(
+        cli,
+        "_databricks_workspace_auth_info",
+        lambda *args: auth if auth_path == "refresh" else None,
+    )
+    monkeypatch.setattr(cli, "_login_and_mint_workspace_auth_info", lambda *args: auth)
+    monkeypatch.setattr(cli, "_workspace_hosted_profile_org_id", lambda *args: None)
+    monkeypatch.setattr(cli, "_databricks_default_workspace_id", lambda *args: None)
+    monkeypatch.setattr(cli, "_databricks_host_needs_org_selector", lambda *args: False)
+    monkeypatch.setattr(cli, "_verify_databricks_server_token", lambda *args: response)
+
+    persist = cli._persist_databricks_org_id
+    store = cli_auth.store_databricks_auth
+
+    def persist_then_other_login(*args, **kwargs):
+        persist(*args, **kwargs)
+        cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+
+    def store_then_other_login(*args, **kwargs):
+        store(*args, **kwargs)
+        cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+
+    monkeypatch.setattr(cli, "_persist_databricks_org_id", persist_then_other_login)
+    monkeypatch.setattr(cli_auth, "store_databricks_auth", store_then_other_login)
+    host_env: dict[str, str] = {}
+
+    def start_host(server_url):
+        cli_auth.store_databricks_org_id(_ACCOUNT_SERVER, "222")
+        host_env.update(cli._build_host_daemon_env(server_url=server_url))
+        return False
+
+    monkeypatch.setattr(cli, "_ensure_host_daemon", start_host)
+    assert cli._ensure_backend(_ACCOUNT_SERVER) == _ACCOUNT_SERVER
+    assert (
+        json.loads((tmp_path / "auth_tokens.json").read_text())[_ACCOUNT_SERVER]["org_id"] == "222"
+    )
+    expected = cli_auth.databricks_org_pin(_ACCOUNT_SERVER, verified_org)
+    assert os.environ[cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR] == expected
+    assert host_env[cli_auth.PINNED_DATABRICKS_ORG_ENV_VAR] == expected
+    assert cli_auth.load_databricks_org_id(_ACCOUNT_SERVER) == verified_org
+    headers = cli_auth.databricks_request_headers(_ACCOUNT_SERVER, bearer_token="synthetic-token")
+    assert headers.get(cli_auth.DATABRICKS_ORG_ID_HEADER) == verified_org
 
 
 def test_daemon_owned_sessions_adds_sub_agents_of_owned_sessions() -> None:

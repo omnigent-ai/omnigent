@@ -23,7 +23,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +34,10 @@ from omnigent.db.utils import generate_agent_id
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.server.bundles import bundle_location
+from omnigent.server.routes._host_worktree import (
+    WORKTREE_ROOT_LABEL_KEY,
+    worktree_root_fingerprint,
+)
 from omnigent.server.scheduled import fire as fire_mod
 from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
 from omnigent.server.scheduled.schedule import continued_sandbox_host_id
@@ -61,6 +65,7 @@ class _FakeConversation:
     runner_last_seen: int | None = None
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
+    terminal_launch_args: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -88,36 +93,57 @@ class FakeAgentStore:
 
 
 class _FakeExecutor:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
         # Mirrors AgentSpec.executor: a canonical harness in ``config['harness']``
         # (falls back to ``type``). The permission-mode injection reads this to
         # confirm a claude-native agent before adding ``--permission-mode``.
         self.type = harness
-        self.config = {"harness": harness}
+        self.config: dict[str, Any] = {"harness": harness}
+        if permission_mode is not None:
+            self.config["permission_mode"] = permission_mode
         self.reasoning_effort = reasoning_effort
 
 
 class _FakeSpec:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.executor = _FakeExecutor(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.executor = _FakeExecutor(harness, reasoning_effort, permission_mode)
 
 
 class _FakeLoadedAgent:
-    def __init__(self, harness: str, reasoning_effort: str | None = None) -> None:
-        self.spec = _FakeSpec(harness, reasoning_effort)
+    def __init__(
+        self,
+        harness: str,
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
+    ) -> None:
+        self.spec = _FakeSpec(harness, reasoning_effort, permission_mode)
 
 
 class FakeAgentCache:
     """Resolves an agent id to a spec with a fixed harness (for launch gating)."""
 
     def __init__(
-        self, harness: str = "claude-native", reasoning_effort: str | None = None
+        self,
+        harness: str = "claude-native",
+        reasoning_effort: str | None = None,
+        permission_mode: str | None = None,
     ) -> None:
         self._harness = harness
         self._reasoning_effort = reasoning_effort
+        self._permission_mode = permission_mode
 
     def load(self, agent_id: str, bundle_location: str, **_: Any) -> _FakeLoadedAgent:
-        return _FakeLoadedAgent(self._harness, self._reasoning_effort)
+        return _FakeLoadedAgent(self._harness, self._reasoning_effort, self._permission_mode)
 
 
 class FakeScheduledTaskStore:
@@ -139,6 +165,7 @@ class FakeScheduledTaskStore:
         # Fail adopt_session, after committing the session when ``adopt_commits``.
         self.adopt_error: Exception | None = None
         self.adopt_commits = False
+        self.released: list[tuple[str, str]] = []
 
     def get(self, scheduled_task_id: str) -> ScheduledTask | None:
         self.get_workspace_ids.append(current_workspace_id())
@@ -196,6 +223,14 @@ class FakeScheduledTaskStore:
             raise self.adopt_error
         return self.adopt_outcome
 
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        key = next((k for k, t in self._rows.items() if t.id == scheduled_task_id), None)
+        if key is None or self._rows[key].session_id != session_id:
+            return False
+        self._rows[key] = replace(self._rows[key], session_id=None)
+        self.released.append((scheduled_task_id, session_id))
+        return True
+
     def get_running_run_by_conversation(self, conversation_id: str) -> Any:
         if conversation_id in self.running_runs:
             seeded = self.running_runs[conversation_id]
@@ -240,8 +275,10 @@ class FakeStartupInputs:
             {"session_id": session_id, "event": event, "user_id": user_id, "headers": headers}
         )
 
-    async def record_launch_failure(self, session_id: str, reason: str) -> None:
+    async def record_launch_failure(self, session_id: str, reason: Any) -> str:
+        reason = await reason() if callable(reason) else reason
         self.launch_failures.append((session_id, reason))
+        return reason
 
 
 class SequencedScheduledTaskStore(FakeScheduledTaskStore):
@@ -283,6 +320,7 @@ class FakeConversationStore:
             workspace=kwargs.get("workspace"),
             host_id=kwargs.get("host_id"),
             git_branch=kwargs.get("git_branch"),
+            labels=dict(kwargs.get("labels", {})),
         )
         self.created.append(kwargs)
         return conv
@@ -293,6 +331,9 @@ class FakeConversationStore:
 
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
+
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
@@ -605,17 +646,29 @@ async def test_delete_between_on_fire_and_run_fire_is_noop() -> None:
 
 
 @pytest.mark.asyncio
-async def test_active_creates_session_grant_and_run() -> None:
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+@pytest.mark.parametrize("trigger", [False, True])
+async def test_active_creates_session_grant_and_run(session_mode: str, trigger: bool) -> None:
     perm = FakePermissionStore()
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    task = _task(
+        prompt="This automation watches Jira and starts one Omnigent session"
+        if trigger
+        else "Do the work.",
+        session_mode=session_mode,
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append((conv, task))
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(
+            store,
+            permission_store=perm,
+            conversation_store=conv_store,
+        ),
         launch_dispatch=_launch,
     )
     await on_fire(0, "task_1")
@@ -624,6 +677,9 @@ async def test_active_creates_session_grant_and_run() -> None:
     # A conversation was created bound to the task's agent.
     assert len(conv_store.created) == 1
     assert conv_store.created[0]["agent_id"] == "ag_1"
+    assert conv_store.created[0]["title"] == (
+        "[automation job] nightly" if trigger and session_mode == "continue" else "nightly"
+    )
     # NULL owner resolved to "local" and granted LEVEL_OWNER.
     assert perm.ensured == [RESERVED_USER_LOCAL]
     assert perm.grants and perm.grants[0][0] == RESERVED_USER_LOCAL
@@ -907,6 +963,32 @@ def _claude_agent_deps(
             ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
             False,
         ),
+        (
+            "codex-native",
+            "ask-for-approval",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="user"',
+            ],
+            False,
+        ),
+        (
+            "codex-native",
+            "approve-for-me",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
+            False,
+        ),
         ("codex-native", "default", None, False),
         ("codex-native", "bypass", None, True),
         ("cursor-native", "auto-review", ["--auto-review"], False),
@@ -938,7 +1020,6 @@ async def test_permission_mode_launch_options(
     [
         ("claude-native", "acceptEdits", ["--permission-mode", "acceptEdits"], False),
         ("codex-native", "default", None, False),
-        ("codex-native", "bypass", None, True),
     ],
 )
 async def test_permission_mode_becomes_terminal_launch_args(
@@ -993,7 +1074,7 @@ async def test_unset_permission_mode_sends_no_launch_args() -> None:
 async def test_incompatible_permission_mode_fails_without_session() -> None:
     """A saved mode for another harness must not silently fall back to defaults."""
     conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="bypassPermissions")})
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode="acceptEdits")})
 
     launch = AsyncMock()
 
@@ -1009,7 +1090,7 @@ async def test_incompatible_permission_mode_fails_without_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "permission_mode_unsupported"
-    assert "'bypassPermissions' is not supported by 'codex-native'" in store.runs[0]["error"]
+    assert "'acceptEdits' is not supported by 'codex-native'" in store.runs[0]["error"]
     assert "Edit the automation" in store.runs[0]["error"]
     assert store.runs[0]["conversation_id"] is None
 
@@ -1461,7 +1542,7 @@ async def test_create_failure_records_failed_without_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_grant_failure_records_failed_with_session() -> None:
+async def test_grant_failure_records_failed_without_a_deleted_session() -> None:
     store = FakeScheduledTaskStore(rows={"task_1": _task()})
     perm = FakePermissionStore(fail_grant=True)
 
@@ -1475,7 +1556,7 @@ async def test_grant_failure_records_failed_with_session() -> None:
     assert len(store.runs) == 1
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_grant_failed"
-    assert store.runs[0]["conversation_id"] == "conv_1"
+    assert store.runs[0]["conversation_id"] is None
 
 
 @pytest.mark.asyncio
@@ -2571,10 +2652,27 @@ async def _fire_once(deps: FireDeps) -> list[Any]:
 
 
 @pytest.mark.asyncio
-async def test_continue_sends_the_prompt_into_the_session() -> None:
-    conv_store = _ExistingConversationStore(_continued_session())
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_continue_sends_the_prompt_into_the_session(worktree: bool) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+
+    session = _continued_session()
+    if worktree:
+        session.workspace = "/repo-worktrees/previous"
+        session.git_branch = "previous"
+        session.labels = {
+            fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(session.workspace),
+            fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint("/repo"),
+        }
+    conv_store = _ExistingConversationStore(session)
     perm = FakePermissionStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _continuing_task(base_branch="HEAD" if worktree else None)}
+    )
 
     launched = await _fire_once(_deps(store, conversation_store=conv_store, permission_store=perm))
 
@@ -2652,18 +2750,48 @@ async def test_a_first_run_whose_session_record_fails_never_runs_unbound(committ
 
 
 @pytest.mark.asyncio
-async def test_a_first_run_skips_when_another_run_already_started_the_session() -> None:
-    """The run that records its session second deletes it before anything ran in it."""
-    conv_store = FakeConversationStore()
-    store = FakeScheduledTaskStore(rows={"task_1": _task(session_mode="continue")})
+@pytest.mark.parametrize(
+    "change,error_code",
+    [
+        ("none", None),
+        ("reset", "session_record_failed"),
+        ("deleted", "session_record_failed"),
+        ("new_mode", "session_record_failed"),
+        ("read_failed", "session_record_failed"),
+        ("incompatible", "continued_session_incompatible"),
+    ],
+)
+async def test_a_first_run_reuses_the_winning_session_if_still_available(
+    monkeypatch: pytest.MonkeyPatch, change: str, error_code: str | None
+) -> None:
+    conv_store = _ExistingConversationStore(
+        _continued_session(workspace="/different" if change == "incompatible" else "/repo")
+    )
+    task = _task(session_mode="continue")
+    store = FakeScheduledTaskStore(rows={"task_1": task})
     store.adopt_outcome = "taken"
+    adopt = store.adopt_session
+
+    def record_winner(*args: Any, **kwargs: Any) -> str:
+        outcome = adopt(*args, **kwargs)
+        store._rows[task.id] = replace(
+            task,
+            session_id=None if change == "reset" else "conv_prev",
+            session_mode="new" if change == "new_mode" else "continue",
+            state="deleted" if change == "deleted" else task.state,
+        )
+        if change == "read_failed":
+            monkeypatch.setattr(store, "get", Mock(side_effect=RuntimeError("read failed")))
+        return outcome
+
+    monkeypatch.setattr(store, "adopt_session", record_winner)
 
     launched = await _fire_once(_deps(store, conversation_store=conv_store))
 
-    assert launched == []
+    assert [conv.id for conv in launched] == ([] if error_code else ["conv_prev"])
     assert conv_store.deleted == ["conv_1"]
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
-        ("skipped", "continued_session_busy")
+        ("failed" if error_code else "succeeded", error_code)
     ]
 
 
@@ -2696,11 +2824,38 @@ async def test_a_first_run_that_cannot_create_its_session_records_none() -> None
 
 
 @pytest.mark.asyncio
-async def test_a_first_run_whose_owner_grant_fails_records_no_session() -> None:
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_a_first_run_whose_owner_grant_fails_records_no_session(
+    monkeypatch: pytest.MonkeyPatch, worktree: bool
+) -> None:
     """A session is recorded only once its owner can use it, so the next run starts another."""
-    store = FakeScheduledTaskStore(rows={"task_1": _task(session_mode="continue")})
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
 
-    await _fire_once(_deps(store, permission_store=FakePermissionStore(fail_grant=True)))
+    store = FakeScheduledTaskStore(
+        rows={"task_1": _task(session_mode="continue", base_branch="HEAD" if worktree else None)}
+    )
+    conv_store = FakeConversationStore()
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(return_value=_host_worktree.CreatedWorktree("/repo-worktrees/new", "new")),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    await _fire_once(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_registry=FakeHostRegistry({"host_1"}),
+            permission_store=FakePermissionStore(fail_grant=True),
+        )
+    )
+    assert conv_store.deleted == ["conv_1"]
+    assert remove.await_count == int(worktree)
+    if worktree:
+        assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/new"
+        assert remove.call_args.kwargs["delete_branch"] is True
 
     assert store.adopted == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [
@@ -2722,7 +2877,6 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
 @pytest.mark.parametrize(
     ("existing", "task_overrides", "error_code"),
     [
-        (None, {}, "continued_session_missing"),
         (_continued_session(archived=True), {}, "continued_session_archived"),
         (
             _continued_session(parent_conversation_id="conv_root"),
@@ -2730,6 +2884,83 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             "continued_session_incompatible",
         ),
         (_continued_session(agent_id="ag_other"), {}, "continued_session_incompatible"),
+        (_continued_session(), {"base_branch": "HEAD"}, "continued_session_incompatible"),
+        # Under the "new sessions only" contract a reused session keeps its own
+        # mode, so one switched to bypass must not take unattended prompts.
+        (
+            _continued_session(
+                labels={"omnigent.claude_native.permission_mode": "bypassPermissions"}
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
+        # Codex's full bypass, as spec-derived launch args emit it, with no label.
+        (
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
+        (
+            _continued_session(
+                git_branch="main",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/other"
+                    ),
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                host_id="host_2",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task_1",
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
+        (
+            _continued_session(
+                git_branch="worktree-test",
+                workspace="/repo-worktrees/test",
+                labels={
+                    fire_mod.SCHEDULED_TASK_ORIGIN_LABEL_KEY: "another_task",
+                    fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY: worktree_root_fingerprint(
+                        "/repo"
+                    ),
+                    WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/test"),
+                },
+            ),
+            {"base_branch": "HEAD"},
+            "continued_session_incompatible",
+        ),
         (_continued_session(host_id="host_2"), {}, "continued_session_incompatible"),
         (_continued_session(workspace="/elsewhere"), {}, "continued_session_incompatible"),
         (
@@ -2765,6 +2996,46 @@ async def test_continue_never_replaces_an_unusable_session(
     assert conv_store.created == []
     assert [(run["status"], run["error_code"]) for run in store.runs] == [("failed", error_code)]
     assert "start a new session" in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+async def test_continue_starts_a_new_session_when_the_old_one_was_deleted() -> None:
+    """The owner deleted the session between runs: the task starts and keeps a fresh one."""
+    conv_store = _ExistingConversationStore()  # conv_prev is gone
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.released == [("task_1", "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == "task_1"
+    assert new_session_id != "conv_prev"
+    assert [conv.id for conv in launched] == [new_session_id]
+    assert [run["status"] for run in store.runs] == ["running"]
+    assert store.runs[0].get("error_code") is None
+
+
+@pytest.mark.asyncio
+async def test_continue_follows_a_replacement_another_run_recorded_first() -> None:
+    """Two runs find the session gone; the loser continues the winner's new session."""
+    conv_store = _ExistingConversationStore(_continued_session(id="conv_new"))
+    store = FakeScheduledTaskStore(rows={"task_1": _continuing_task()})
+
+    def release_after_a_competing_run(task_id: str, session_id: str) -> bool:
+        # The competing run released conv_prev and recorded conv_new before this one.
+        store._rows["task_1"] = replace(store._rows["task_1"], session_id="conv_new")
+        return False
+
+    store.release_session = release_after_a_competing_run  # type: ignore[method-assign]
+
+    launched = await _fire_once(_deps(store, conversation_store=conv_store))
+
+    assert store.adopted == []
+    assert conv_store.created == []
+    assert [conv.id for conv in launched] == ["conv_new"]
+    assert [(run["status"], run["conversation_id"]) for run in store.runs] == [
+        ("succeeded", "conv_new")
+    ]
 
 
 _SANDBOX_TASK_ID = "5a1d0c9e8b7f4a3d2c1b0a9f8e7d6c5b"
@@ -2878,6 +3149,52 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
     assert call.kwargs["host_id"] == own
     assert call.kwargs["relaunch_host"] is (existing if host_exists else None)
     # A relaunch keeps routing the sandbox by the task's host id.
+    assert conv_store.created[0]["labels"][REQUESTED_HOST_ID_LABEL_KEY] == own
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
+async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_own_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the session gone, no earlier workspace is known, so the sandbox host the task
+    left behind is relaunched under the task's own host id."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    task = _sandbox_continue_task(session_id="conv_prev", last_run_conversation_id="conv_prev")
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
+
+    async def launch(**kwargs: Any) -> None:
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    managed_launch = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    conv_store = _ExistingConversationStore()  # conv_prev was deleted
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({own: existing}),
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=FakeStartupInputs(),
+        )
+    )
+
+    await on_fire(0, "task_1")
+    await _drain()
+    await _drain_managed_launches()
+
+    assert store.released == [(task.id, "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == task.id
+    assert new_session_id != "conv_prev"
+    [call] = managed_launch.await_args_list
+    assert call.kwargs["host_id"] == own
+    assert call.kwargs["relaunch_host"] is existing
     assert conv_store.created[0]["labels"][REQUESTED_HOST_ID_LABEL_KEY] == own
     assert [run["status"] for run in store.runs] == ["running"]
 
@@ -3267,3 +3584,341 @@ async def test_continue_dispatch_failure_records_a_failed_run() -> None:
     assert [(run["status"], run["error_code"], run["conversation_id"]) for run in store.runs] == [
         ("failed", "launch_failed", "conv_prev")
     ]
+
+
+@pytest.mark.parametrize(
+    ("enabled", "source_length"), [(False, 5), (True, 5), (True, 256), (True, 257)]
+)
+async def test_random_worktree_is_created_per_new_session(
+    monkeypatch: pytest.MonkeyPatch, db_uri: str, enabled: bool, source_length: int
+) -> None:
+    from omnigent.server.routes import _host_worktree
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    source = "/" + "r" * (source_length - 1)
+    task = _task(
+        base_branch="HEAD" if enabled else None,
+        workspace=source,
+        agent_id=generate_agent_id(),
+        host_id="a" * 32,
+    )
+    deps = _deps(FakeScheduledTaskStore(), host_registry=FakeHostRegistry({"a" * 32}))
+    create = AsyncMock(
+        side_effect=[
+            _host_worktree.CreatedWorktree(
+                f"/repo-worktrees/run-{i}", f"run-{i}", f"/repo-worktrees/run-{i}/src"
+            )
+            for i in range(2)
+        ]
+    )
+    monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create)
+    for i in range(2):
+        conv = await fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task))
+        saved = deps.conversation_store.created[-1]
+        assert saved["workspace"] == (f"/repo-worktrees/run-{i}/src" if enabled else source)
+        assert saved["git_branch"] == (f"run-{i}" if enabled else None)
+        if enabled:
+            assert saved["labels"][
+                _host_worktree.WORKTREE_ROOT_LABEL_KEY
+            ] == _host_worktree.worktree_root_fingerprint(f"/repo-worktrees/run-{i}")
+            # The next firing accepts the relocated directory and bypasses creation.
+            persisted = SqlAlchemyConversationStore(db_uri)
+            stored = persisted.create_conversation(**saved)
+            conv = persisted.get_conversation(stored.id)
+            assert conv is not None
+            assert conv.labels[
+                fire_mod.SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY
+            ] == worktree_root_fingerprint(source)
+            continuing = replace(task, session_mode="continue", session_id=conv.id)
+            assert (
+                await fire_mod.continued_session_problem(
+                    continuing, conv, host_store=None, permission_store=None
+                )
+                is None
+            )
+    assert create.await_count == (2 if enabled else 0)
+    if enabled:
+        calls = [call.kwargs for call in create.await_args_list]
+        assert calls[0]["branch_name"] != calls[1]["branch_name"]
+        assert all(call["repo_path"] == source and call["base_branch"] == "HEAD" for call in calls)
+    assert task.workspace == source
+
+
+@pytest.mark.parametrize("failure", ["create", "update", "labels", "reasoning", "presentation"])
+async def test_random_worktree_rolls_back_when_session_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
+
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        host_registry=FakeHostRegistry({"host_1"}),
+        conversation_store=FakeConversationStore(fail_create=failure == "create"),
+    )
+    if failure in ("update", "labels"):
+        method = "update_conversation" if failure == "update" else "set_labels"
+        monkeypatch.setattr(
+            deps.conversation_store, method, Mock(side_effect=RuntimeError("create failed"))
+        )
+    if failure in ("reasoning", "presentation"):
+        method = "_spec_reasoning_effort" if failure == "reasoning" else "_presentation_labels"
+        monkeypatch.setattr(fire_mod, method, AsyncMock(side_effect=RuntimeError("create failed")))
+    elif failure == "labels":
+        monkeypatch.setattr(
+            fire_mod, "_presentation_labels", AsyncMock(return_value={"presentation": "terminal"})
+        )
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(return_value=_host_worktree.CreatedWorktree("/repo-worktrees/new", "new")),
+    )
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    with pytest.raises(RuntimeError, match="create failed"):
+        await fire_mod._create_session(
+            deps,
+            _task(base_branch="HEAD", model_override="custom" if failure == "update" else None),
+            labels=fire_mod._session_labels(_task()),
+        )
+    assert deps.conversation_store.deleted == ([] if failure == "create" else ["conv_1"])
+    assert remove.await_count == 1
+    assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/new"
+    assert remove.call_args.kwargs["delete_branch"] is True
+
+
+async def test_unused_session_discards_its_random_worktree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes._host_worktree import (
+        WORKTREE_ROOT_LABEL_KEY,
+        worktree_root_fingerprint,
+    )
+    from omnigent.server.routes._sessions import helpers
+
+    conv = _continued_session(
+        workspace="/repo-worktrees/unused/src",
+        git_branch="unused",
+        labels={WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint("/repo-worktrees/unused")},
+    )
+    deps = _deps(FakeScheduledTaskStore())
+    remove = AsyncMock()
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    await fire_mod._discard_session(deps, conv)
+    assert remove.await_count == 1
+    assert remove.call_args.kwargs["worktree_path"] == "/repo-worktrees/unused"
+    assert remove.call_args.kwargs["branch"] == "unused"
+    assert deps.conversation_store.deleted == [conv.id]
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+async def test_random_worktree_failure_preserves_host_error(
+    monkeypatch: pytest.MonkeyPatch, unavailable: bool
+) -> None:
+    from omnigent.server.routes import _host_worktree
+
+    error_type = (
+        _host_worktree.WorktreeHostUnavailableError
+        if unavailable
+        else _host_worktree.WorktreeProxyError
+    )
+    monkeypatch.setattr(
+        _host_worktree,
+        "create_worktree_on_host",
+        AsyncMock(side_effect=error_type("repository unavailable")),
+    )
+    store = FakeScheduledTaskStore(rows={"task_1": _task(base_branch="HEAD")})
+    deps = _deps(store, host_registry=FakeHostRegistry({"host_1"}))
+    assert await _fire_once(deps) == []
+    assert deps.conversation_store.created == []
+    assert store.runs[0]["error"] == "repository unavailable"
+    assert store.runs[0]["error_code"] == (
+        "host_offline" if unavailable else "worktree_create_failed"
+    )
+
+
+@pytest.mark.parametrize("stage", ["worktree", "project", "insert", "presentation"])
+async def test_cancelled_session_creation_waits_for_writes_before_cleanup(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    import threading
+
+    from omnigent.server.routes import _host_worktree
+    from omnigent.server.routes._sessions import helpers
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    thread_release = threading.Event()
+    removing = asyncio.Event()
+    removed = asyncio.Event()
+    finish_cleanup = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    conversations = FakeConversationStore()
+    insert = conversations.create_conversation
+
+    async def create_worktree(**kwargs: Any) -> _host_worktree.CreatedWorktree:
+        if stage == "worktree":
+            entered.set()
+            await release.wait()
+        return _host_worktree.CreatedWorktree("/repo-worktrees/new", "new")
+
+    def create_conversation(**kwargs: Any) -> _FakeConversation:
+        if stage == "insert":
+            loop.call_soon_threadsafe(entered.set)
+            assert thread_release.wait(5)
+        return insert(**kwargs)
+
+    async def project(*args: Any) -> None:
+        if stage == "project":
+            entered.set()
+            await release.wait()
+
+    async def presentation(*args: Any) -> dict[str, str]:
+        if stage == "presentation":
+            entered.set()
+            await release.wait()
+        return {}
+
+    async def remove(**kwargs: Any) -> None:
+        assert kwargs["worktree_path"] == "/repo-worktrees/new"
+        assert kwargs["delete_branch"] is True
+        removing.set()
+        await finish_cleanup.wait()
+        removed.set()
+
+    monkeypatch.setattr(_host_worktree, "create_worktree_on_host", create_worktree)
+    monkeypatch.setattr(conversations, "create_conversation", create_conversation)
+    monkeypatch.setattr(fire_mod, "_fire_project_id", project)
+    monkeypatch.setattr(fire_mod, "_presentation_labels", presentation)
+    monkeypatch.setattr(helpers, "_remove_session_worktree_best_effort", remove)
+    deps = _deps(
+        FakeScheduledTaskStore(),
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({"host_1"}),
+    )
+    task = _task(base_branch="HEAD")
+    pending = asyncio.create_task(
+        fire_mod._create_session(deps, task, labels=fire_mod._session_labels(task))
+    )
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        pending.cancel()
+        release.set()
+        thread_release.set()
+        await asyncio.wait_for(removing.wait(), 5)
+        # A second cancellation must not interrupt the compensating host operation.
+        pending.cancel()
+        finish_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, 5)
+        assert removed.is_set()
+        assert conversations.deleted == ["conv_1"]
+    finally:
+        release.set()
+        thread_release.set()
+        finish_cleanup.set()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "mode"),
+    [
+        ("claude-native", "bypassPermissions"),
+        ("claude-native", "dontAsk"),
+        ("codex-native", "bypass"),
+        ("codex-native", "full-access"),
+        ("cursor-native", "yolo"),
+        ("antigravity-native", "skip"),
+        ("devin-native", "dangerous"),
+    ],
+)
+async def test_saved_unattended_disallowed_mode_fails_without_session(
+    harness: str, mode: str
+) -> None:
+    """A task saved before the restriction fails at fire instead of running unattended."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task(permission_mode=mode)})
+    launch = AsyncMock()
+
+    on_fire = build_on_fire(
+        _claude_agent_deps(store, conv_store, harness=harness), launch_dispatch=launch
+    )
+    await on_fire(0, "task_1")
+    await _drain()
+
+    launch.assert_not_awaited()
+    assert conv_store.created == []
+    assert store.runs[0]["status"] == "failed"
+    assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+    assert repr(mode) in store.runs[0]["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("spec_mode", "fires"), [(None, True), ("bypassPermissions", False)])
+async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fires: bool) -> None:
+    """A Claude SDK spec with no mode runs in auto; one set to bypassPermissions cannot fire."""
+    conv_store = FakeConversationStore()
+    store = FakeScheduledTaskStore(rows={"task_1": _task()})
+    launch = AsyncMock()
+    deps = _deps(
+        store,
+        conversation_store=conv_store,
+        agent_store=FakeAgentStore({"ag_1": _FakeAgent("ag_1", bundle_location="ag_1/hash")}),
+        agent_cache=FakeAgentCache(harness="claude-sdk", permission_mode=spec_mode),
+    )
+
+    on_fire = build_on_fire(deps, launch_dispatch=launch)
+    await on_fire(0, "task_1")
+    await _drain()
+
+    if fires:
+        assert len(conv_store.created) == 1
+    else:
+        launch.assert_not_awaited()
+        assert conv_store.created == []
+        assert store.runs[0]["error_code"] == "permission_mode_not_allowed"
+        assert "the agent's default" in store.runs[0]["error"]
+
+
+@pytest.mark.parametrize(
+    ("labels", "launch_args", "expected"),
+    [
+        ({}, None, None),
+        ({"omnigent.claude_native.permission_mode": "auto"}, None, None),
+        (
+            {"omnigent.claude_native.permission_mode": "bypassPermissions"},
+            None,
+            "bypassPermissions",
+        ),
+        ({"omnigent.claude_native.permission_mode": "dontAsk"}, None, "dontAsk"),
+        # The live label wins over the flags the session was launched with.
+        (
+            {"omnigent.claude_native.permission_mode": "auto"},
+            ["--permission-mode", "bypassPermissions"],
+            None,
+        ),
+        ({}, ["--permission-mode", "bypassPermissions"], "--permission-mode bypassPermissions"),
+        ({}, ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
+        ({}, ["--yolo"], "--yolo"),
+        (
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (
+            {},
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            "--ask-for-approval never",
+        ),
+        ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
+        ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
+    ],
+)
+def test_session_unattended_disallowed_mode(
+    labels: dict[str, str], launch_args: list[str] | None, expected: str | None
+) -> None:
+    conv = SimpleNamespace(labels=labels, terminal_launch_args=launch_args)
+
+    assert fire_mod.session_unattended_disallowed_mode(conv) == expected
