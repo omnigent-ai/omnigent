@@ -437,6 +437,26 @@ function emptyChangesText(commitView: boolean, commitUnavailable: boolean): stri
   return "No changes vs base.";
 }
 
+const PR_PARSE_ERROR = "Couldn’t read the PR diff. Refresh or open the PR on its provider.";
+const COMMIT_PARSE_ERROR = "Couldn’t read this commit’s diff. Refresh or open it on its provider.";
+
+/** A unified patch split into per-file diffs keyed by path, or `parseError` when it can't be parsed. */
+function parsePatchByPath(
+  patch: string | undefined,
+  parseError: string,
+): { filesByPath: Map<string, FileDiffMetadata>; parseError: string | undefined } {
+  const filesByPath = new Map<string, FileDiffMetadata>();
+  if (!patch) return { filesByPath, parseError: undefined };
+  try {
+    for (const parsed of parsePatchFiles(patch)) {
+      for (const file of parsed.files) filesByPath.set(file.name, file);
+    }
+  } catch {
+    return { filesByPath, parseError };
+  }
+  return { filesByPath, parseError: undefined };
+}
+
 /**
  * The Changes tab content. Mounted beside the other tabs' content (it renders its
  * own TabsContent) so collapse and scroll-spy state survive tab switches.
@@ -534,25 +554,12 @@ export function PullRequestChangesTab({
   const pinnedHead = changes.data?.head_sha ?? null;
   const renderedHead = pinnedHead && prDiff.data?.head_sha === pinnedHead ? pinnedHead : null;
   // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = prDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [prDiff.data]);
-  // Hashed from this parse, before the expand-context loader edits these files.
-  const patchHashes = useMemo(() => patchFileHashes(filesByPath), [filesByPath]);
+  const prParse = useMemo(
+    () => parsePatchByPath(prDiff.data?.patch, PR_PARSE_ERROR),
+    [prDiff.data],
+  );
+  // Viewed marks always hash the whole-PR patch, before the expand-context loader edits these files.
+  const patchHashes = useMemo(() => patchFileHashes(prParse.filesByPath), [prParse]);
   const viewedFiles = useViewedFiles(identity, renderedHead, patchHashes);
 
   const themeType = useResolvedThemeMode();
@@ -569,26 +576,11 @@ export function PullRequestChangesTab({
     });
   }, []);
 
-  // Parse the shown patch (the whole PR, or one commit) into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = shownDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: commitView
-            ? "Couldn’t read this commit’s diff. Refresh or open it on its provider."
-            : "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [shownDiff.data, commitView]);
+  // The shown patch: the whole PR's parse in Changes, or one commit's.
+  const { filesByPath, parseError } = useMemo(
+    () => (commitView ? parsePatchByPath(shownDiff.data?.patch, COMMIT_PARSE_ERROR) : prParse),
+    [commitView, shownDiff.data, prParse],
+  );
   // A commit's list is the files its patch changes; the PR's list is the provider's.
   const commitFiles = useMemo(
     () => (commitView ? changedFilesFromPatch(filesByPath) : []),

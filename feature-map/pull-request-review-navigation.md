@@ -2,8 +2,8 @@
 
 Move through a pull request's Changes tab: filter the changed files by path, find
 text in the fetched patch, copy and open files at the reviewed revision, and mark
-files viewed with progress and hide-viewed controls. Viewed marks are kept in this
-browser only. A file stays viewed on a new head while its diff hunks are unchanged,
+files viewed with progress and hide-viewed controls, and browse the pull request's
+commits one at a time. Viewed marks are kept in this browser only. A file stays viewed on a new head while its diff hunks are unchanged,
 and a changed file is flagged.
 
 ## Sub-features
@@ -40,6 +40,13 @@ and a changed file is flagged.
   changed, until **Dismiss** or until every changed file is marked. A file that can't
   be compared (binary, pure rename, missing from the fetched diff, or cut short) loses
   its mark without a badge or notice.
+- `commits`: A **Changes | Commits** switch starts the toolbar on GitHub pull requests
+  whose list is pinned to a head. The commit list runs oldest first with title, short
+  sha, author and date; **Search commits** matches sha, title or author, ignoring case.
+  More than 250 commits shows `History limited to 250 commits`. Selecting a commit
+  shows its patch with the same file list, diff and find bar, plus **Back to commits**,
+  **Previous commit** and **Next commit**. A commit view has no viewed controls, review
+  conversations or drafts, or context expansion, and **Open in** uses the commit's sha.
 
 ## How to get to it (user POV)
 
@@ -115,8 +122,22 @@ new head where only `main.py` changes. `README.md` keeps its mark, `main.py` sho
   show **Changed since viewed**, and the notice should show. Files the commit leaves
   alone keep their marks.
 
+### commits
+
+`tests/e2e_ui/github/test_github_tab.py::test_changes_commits_view_lists_and_opens_a_commit`
+covers `rail`. It checks the viewed controls in Changes, switches to Commits, searches
+the list, opens a commit and checks that only its file is listed and the viewed
+controls are gone, steps with **Next commit**, and returns with **Back to commits**.
+
+- `composer-desktop`, `composer-mobile` and `canvas`: Open Changes on a GitHub pull
+  request with several commits and choose **Commits**. Search by an author's name and
+  confirm the list narrows. Open a commit: only its files should be listed, with no
+  **Viewed** checkbox or **Hide viewed**. Use **Next commit**, then **Back to commits**,
+  then **Changes**, and confirm your viewed marks are unchanged.
+
 Component coverage for these helpers and views lives in
 `web/src/shell/PullRequestChangesTab.test.tsx`,
+`web/src/shell/PullRequestCommitsList.test.tsx`,
 `web/src/shell/PullRequestFileSection.test.tsx`,
 `web/src/shell/pullRequestReview.test.ts`,
 `web/src/shell/useChangesViewState.test.ts` and
@@ -185,5 +206,11 @@ Component coverage for these helpers and views lives in
   list and drops keyboard focus. Marks made in another tab on the same head show as
   checked but do not collapse the file until the Changes view remounts (for example
   after a reload) or the head changes.
+- **Commits need GitHub and a current server.** GitLab and Azure DevOps show Changes
+  only. If the Omnigent server predates the commit view, the switch disappears for that
+  pull request and the toast `Commits need an updated Omnigent server.` appears.
+- **The commit list follows the list's head.** A newer push does not reload it until
+  the Changes list reloads. A commit's patch is fixed by its sha. GitHub truncates the
+  diff of a commit that touches more than 300 files, with no warning shown.
 - **Canvas requires its release feature.** Check it is enabled before using the
   `canvas` entry.
