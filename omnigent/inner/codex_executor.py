@@ -697,7 +697,10 @@ async def _codex_config_check_error(
     except OSError:
         return None
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        async with asyncio.timeout(timeout):
+            assert proc.stderr is not None
+            error_line = await _first_error_line(proc.stderr)
+            await proc.wait()
     except BaseException as exc:
         with suppress(ProcessLookupError):
             proc.kill()
@@ -708,13 +711,53 @@ async def _codex_config_check_error(
             # Timeouts and pipe errors only cost the supplementary detail.
             return None
         raise
-    if proc.returncode == 0:
-        return None
-    for line in stderr.decode("utf-8", errors="replace").splitlines():
-        text = line.strip()
+    return None if proc.returncode == 0 else error_line
+
+
+async def _first_error_line(stream: asyncio.StreamReader) -> str | None:
+    """
+    Drain *stream*, keeping only its first ``Error:`` line.
+
+    Reads in chunks and holds at most one partial line, so a check that
+    floods stderr cannot grow the runner's memory.
+
+    :param stream: The check's stderr.
+    :returns: The first line starting with ``Error:``, truncated to
+        ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters, or ``None``.
+    """
+    found: str | None = None
+    partial = b""
+    while chunk := await stream.read(_STREAM_READ_CHUNK_SIZE):
+        if found is not None:
+            continue
+        *lines, partial = (partial + chunk).split(b"\n")
+        for raw in lines:
+            text = raw.decode("utf-8", errors="replace").strip()
+            if text.startswith("Error:"):
+                found = text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+                break
+        # Only a line's start can decide whether it is an error line.
+        partial = partial[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+    if found is None and partial:
+        text = partial.decode("utf-8", errors="replace").strip()
         if text.startswith("Error:"):
-            return text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
-    return None
+            found = text[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
+    return found
+
+
+def _startup_exit_stderr_tail(stderr_lines: Sequence[str]) -> list[str]:
+    """
+    Select the stderr lines that explain a startup exit.
+
+    Codex prefixes its fatal message with ``Error:``; when such lines exist,
+    only they are kept, so routine warnings do not bury the cause.
+
+    :param stderr_lines: The worker's recent stderr lines, oldest first.
+    :returns: At most the last five selected lines, each truncated to
+        ``_STARTUP_EXIT_STDERR_LINE_LIMIT`` characters.
+    """
+    error_lines = [line for line in stderr_lines if line.startswith("Error:")]
+    return [line[:_STARTUP_EXIT_STDERR_LINE_LIMIT] for line in (error_lines or stderr_lines)[-5:]]
 
 
 async def _codex_cli_version(codex_path: str) -> tuple[int, int, int] | None:
@@ -3093,6 +3136,7 @@ class _CodexAppServerSession:
         self._closing = False
         self._transport_error = None
         self._startup_exit_explained = None
+        self._recent_stderr = []
         self._native_progress_observed = False
         self._reader_started_turn = None
         self._reader_completed_turn = None
@@ -4722,13 +4766,7 @@ class _CodexAppServerSession:
                 await asyncio.wait_for(proc.wait(), timeout=max(0.0, deadline - loop.time()))
         if proc is not None and proc.returncode is not None:
             parts.append(f"exited with code {proc.returncode} during startup")
-        # Codex prefixes its fatal message with ``Error:``; keep only those
-        # when present so routine warnings do not bury the cause.
-        error_lines = [line for line in self._recent_stderr if line.startswith("Error:")]
-        stderr_tail = [
-            line[:_STARTUP_EXIT_STDERR_LINE_LIMIT]
-            for line in (error_lines or self._recent_stderr)[-5:]
-        ]
+        stderr_tail = _startup_exit_stderr_tail(self._recent_stderr)
         if stderr_tail:
             parts.append(f"stderr: {' | '.join(stderr_tail)}")
         if self._startup_config_check is not None:

@@ -619,8 +619,17 @@ async def test_cancelled_native_close_kills_and_reaps_sigterm_ignoring_child(
         await session.close()
 
 
-@pytest.mark.parametrize("explaining", [False, True])
-@pytest.mark.parametrize("activity, malformed", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "activity, malformed, explaining",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        # Malformed input never reaches the startup-exit explanation.
+        (False, False, True),
+        (True, False, True),
+    ],
+)
 async def test_stdin_failure_after_reader_eof_preserves_typed_replay_safety(
     activity: bool,
     malformed: bool,
@@ -658,7 +667,7 @@ async def test_stdin_failure_after_reader_eof_preserves_typed_replay_safety(
     if malformed:
         stream.feed_data(b"[]\n")
     stream.feed_eof()
-    if explaining and not malformed:
+    if explaining:
         # The send fails while the reader is still explaining the EOF it saw.
         reader = asyncio.create_task(session._reader_loop())
         while session._startup_exit_explained is None:
@@ -676,7 +685,7 @@ async def test_stdin_failure_after_reader_eof_preserves_typed_replay_safety(
         await request
     assert caught.value is session._transport_error
     assert caught.value.replay_safe is (not activity and not malformed)
-    if explaining and not malformed:
+    if explaining:
         assert str(caught.value) == "Codex app-server closed stdout; explained"
     assert not session._pending_requests
 
@@ -778,3 +787,69 @@ async def test_interrupted_send_settles_pending_response_without_future_warnings
         assert not warnings
     finally:
         loop.set_exception_handler(previous_handler)
+
+
+async def test_restarted_session_explains_only_its_own_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "src-codex-home"))
+
+    async def no_provider_probe(
+        _home: object, overrides: list[str], **_kwargs: object
+    ) -> list[str]:
+        # Its own app-server probe would consume the script's first launch.
+        return overrides
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.prepare_codex_provider_config",
+        no_provider_probe,
+    )
+    launches = tmp_path / "launches"
+    script = tmp_path / "codex"
+    script.write_text(
+        f"""#!{sys.executable}
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("codex-cli 0.0.0-scripted")
+    raise SystemExit(0)
+if sys.argv[1:3] == ["debug", "models"]:
+    raise SystemExit(0)
+with open({str(launches)!r}, "a") as handle:
+    handle.write("x")
+with open({str(launches)!r}) as handle:
+    launch = len(handle.read())
+if launch == 1:
+    sys.stderr.write("Error: first launch failed\\n")
+    sys.stderr.flush()
+    request = json.loads(sys.stdin.readline())
+    reply = {{"id": request["id"], "error": {{"code": -1, "message": "initialize rejected"}}}}
+    sys.stdout.write(json.dumps(reply) + "\\n")
+    sys.stdout.flush()
+    sys.stdin.read()
+    raise SystemExit(0)
+sys.stderr.write("second launch output\\n")
+raise SystemExit(1)
+""",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    session = _CodexAppServerSession(
+        codex_path=str(script),
+        cwd=str(tmp_path),
+        env={"PATH": os.environ.get("PATH", "")},
+        tool_executor=None,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="initialize rejected"):
+            await asyncio.wait_for(session.start(), timeout=30)
+        with pytest.raises(HarnessTransportClosedError) as caught:
+            await asyncio.wait_for(session.start(), timeout=30)
+    finally:
+        await session.close()
+
+    assert str(caught.value) == (
+        "Codex app-server closed stdout; exited with code 1 during startup; "
+        "stderr: second launch output"
+    )

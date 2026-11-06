@@ -17,7 +17,9 @@ from omnigent.inner.codex_executor import (
     CodexExecutor,
     _codex_config_check_error,
     _startup_config_check,
+    _startup_exit_stderr_tail,
 )
+from tests.inner.test_codex_transport_closed import _session
 
 _PROVIDER = "example-provider"
 _APP_SERVER_ERROR = f"Error: Model provider `{_PROVIDER}` not found"
@@ -33,6 +35,8 @@ def _write_scripted_codex(tmp_path: Path, *, mode: str) -> Path:
     ``mode="config_ok"``: as above, but ``debug models`` succeeds.
     ``mode="check_hangs"``: ``debug models`` writes its pid to ``check.pid``
     and sleeps.
+    ``mode="check_floods"``: ``debug models`` writes 8 MB of noise, then the
+    config error, and exits 1.
     ``mode="mid_session"``: ``app-server`` answers ``initialize`` and
     ``thread/start``, then exits on ``turn/start`` without replying.
     """
@@ -63,7 +67,10 @@ def _write_scripted_codex(tmp_path: Path, *, mode: str) -> Path:
                     with open({str(tmp_path / "check.pid")!r}, "w") as handle:
                         handle.write(str(os.getpid()))
                     time.sleep(60)
-                if mode == "config_error":
+                if mode == "check_floods":
+                    for _ in range(8 * 1024):
+                        sys.stderr.write("n" * 1023 + "\\n")
+                if mode in ("config_error", "check_floods"):
                     sys.stderr.write({_CONFIG_ERROR!r} + "\\n")
                     raise SystemExit(1)
                 print(json.dumps({{"models": [{{"slug": "scripted-model"}}]}}))
@@ -160,36 +167,6 @@ async def test_startup_exit_reports_exit_code_stderr_and_config_error(
 
 
 @pytest.mark.timeout(120)
-async def test_startup_exit_omits_a_passing_config_check(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    error = await _run_turn(tmp_path, monkeypatch, mode="config_ok")
-
-    assert str(error) == (
-        f"Codex app-server closed stdout; exited with code 1 during startup; "
-        f"stderr: {_APP_SERVER_ERROR}"
-    )
-
-
-@pytest.mark.timeout(120)
-async def test_failed_config_check_keeps_the_startup_detail_and_replay_safety(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    async def failing_check(*_args: object, **_kwargs: object) -> str | None:
-        raise OSError("diagnostic pipe failed")
-
-    monkeypatch.setattr(codex_executor, "_codex_config_check_error", failing_check)
-
-    error = await _run_turn(tmp_path, monkeypatch, mode="config_error")
-
-    assert str(error) == (
-        f"Codex app-server closed stdout; exited with code 1 during startup; "
-        f"stderr: {_APP_SERVER_ERROR}"
-    )
-    assert error.replay_safe is True
-
-
-@pytest.mark.timeout(120)
 async def test_exit_after_startup_keeps_the_plain_transport_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -260,3 +237,76 @@ async def test_cancelled_config_check_kills_the_check_and_propagates(tmp_path: P
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not _pid_alive(pid)
+
+
+def _check(tmp_path: Path, mode: str):
+    check = _startup_config_check(
+        sandboxed=False,
+        signer_backed=False,
+        codex_path=str(_write_scripted_codex(tmp_path, mode=mode)),
+        config_overrides=[],
+        env={"PATH": os.environ.get("PATH", "")},
+        cwd=str(tmp_path),
+    )
+    assert check is not None
+    return check
+
+
+@pytest.mark.timeout(60)
+async def test_passing_config_check_reports_no_error(tmp_path: Path) -> None:
+    assert await _codex_config_check_error(_check(tmp_path, "config_ok")) is None
+
+
+@pytest.mark.timeout(60)
+async def test_config_check_finds_the_error_after_flooded_stderr(tmp_path: Path) -> None:
+    assert await _codex_config_check_error(_check(tmp_path, "check_floods")) == _CONFIG_ERROR
+
+
+async def test_failed_config_check_keeps_the_stderr_and_replay_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def failing_check(*_args: object, **_kwargs: object) -> str | None:
+        raise OSError("diagnostic pipe failed")
+
+    monkeypatch.setattr(codex_executor, "_codex_config_check_error", failing_check)
+    session, stream = _session()
+    session._explain_startup_exit = True
+    session._startup_config_check = _startup_config_check(
+        sandboxed=False,
+        signer_backed=False,
+        codex_path="/opt/example/codex",
+        config_overrides=[],
+        env={},
+        cwd="/tmp",
+    )
+    session._recent_stderr = [_APP_SERVER_ERROR]
+    stream.feed_eof()
+
+    await session._reader_loop()
+
+    error = session._transport_error
+    assert error is not None
+    assert str(error) == f"Codex app-server closed stdout; stderr: {_APP_SERVER_ERROR}"
+    assert error.replay_safe is True
+
+
+@pytest.mark.parametrize(
+    "lines, expected",
+    [
+        pytest.param([], [], id="empty"),
+        pytest.param(["warning a", "warning b"], ["warning a", "warning b"], id="no-error-lines"),
+        pytest.param(
+            ["warning a", "Error: first", "warning b", "Error: second"],
+            ["Error: first", "Error: second"],
+            id="error-lines-only",
+        ),
+        pytest.param(
+            [f"line {i}" for i in range(8)],
+            [f"line {i}" for i in range(3, 8)],
+            id="last-five",
+        ),
+        pytest.param(["Error: " + "x" * 600], ["Error: " + "x" * 493], id="truncated"),
+    ],
+)
+def test_startup_exit_stderr_tail(lines: list[str], expected: list[str]) -> None:
+    assert _startup_exit_stderr_tail(lines) == expected
