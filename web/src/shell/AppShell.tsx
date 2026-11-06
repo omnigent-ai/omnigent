@@ -236,6 +236,29 @@ const CHAT_VIEW_STORAGE_VALUE = "__chat__";
  * :param agentKey: The session's agent-terminal key (or the no-target sentinel).
  * :returns: The terminal key the view should open on.
  */
+/**
+ * The rail open-state a session restores to: its saved choice, else the Appearance
+ * default. A deep link to a file, a comment or the Agents tab reveals the rail
+ * without rewriting the saved choice.
+ */
+function restoredRailOpen(
+  conversationId: string,
+  canvasMode: boolean,
+  searchParams: URLSearchParams,
+): boolean {
+  const file = searchParams.get("file");
+  const comment = searchParams.get("comment");
+  const hasWorkspaceUrlSignal =
+    searchParams.get("panel") === "agents" ||
+    (file !== null && file !== "") ||
+    (comment !== null && comment !== "");
+  return (
+    (readSessionWorkspaceState(conversationId).open ??
+      (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
+    hasWorkspaceUrlSignal
+  );
+}
+
 function resolveTerminalViewKey(stored: string | null, agentKey: string): string {
   return stored !== null && stored !== CHAT_VIEW_STORAGE_VALUE ? stored : agentKey;
 }
@@ -562,6 +585,16 @@ function AppShellImpl() {
   const rightPanelOpenRef = useRef(rightPanelOpen);
   rightPanelOpenRef.current = rightPanelOpen;
   const [rightPanelVisibilityAnimating, setRightPanelVisibilityAnimating] = useState(false);
+  // Take the incoming session's rail open-state during render, so its first frame
+  // doesn't show the outgoing session's rail. The restore effect applies the rest.
+  const [railOpenConversationId, setRailOpenConversationId] = useState(conversationId);
+  if (railOpenConversationId !== conversationId) {
+    setRailOpenConversationId(conversationId);
+    setRightPanelOpen(
+      conversationId ? restoredRailOpen(conversationId, canvasMode, searchParams) : false,
+    );
+    setRightPanelVisibilityAnimating(false);
+  }
   const rightPanelMotionTimerRef = useRef<number | null>(null);
   const cancelRightPanelVisibilityMotion = useCallback(() => {
     if (rightPanelMotionTimerRef.current !== null) {
@@ -1305,15 +1338,8 @@ function AppShellImpl() {
     // carries a workspace signal — a file to open (?file=) or a comment to
     // surface (?comment=) — reveals the rail even when this session was last
     // left closed; otherwise the linked file/comment would render into a
-    // collapsed, invisible panel. This is transient: it doesn't rewrite the
-    // session's saved open-state.
-    const commentParam = searchParams.get("comment");
-    const hasWorkspaceUrlSignal =
-      showAgents || urlFile !== null || (commentParam !== null && commentParam !== "");
-    setRightPanelOpenImmediately(
-      (persisted.open ?? (canvasMode ? false : readDefaultWorkspacePanelOpen())) ||
-        hasWorkspaceUrlSignal,
-    );
+    // collapsed, invisible panel.
+    setRightPanelOpenImmediately(restoredRailOpen(conversationId, canvasMode, searchParams));
 
     stateConvRef.current = conversationId;
   }, [conversationId, canvasMode]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -1606,7 +1632,8 @@ function AppShellImpl() {
       '[role="tab"][aria-selected="true"], [role="button"][aria-current="true"]',
     );
     const visibleSelectedTab = (selectedTab?.checkVisibility?.() ?? true) ? selectedTab : null;
-    (visibleSelectedTab ?? tabList)?.focus();
+    // The rail is still sliding in from past the window edge; scrolling to it would shift the page.
+    (visibleSelectedTab ?? tabList)?.focus({ preventScroll: true });
   }, []);
   const revealRightPanel = useCallback(() => {
     if (!conversationId) return;

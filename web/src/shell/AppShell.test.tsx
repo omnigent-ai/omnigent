@@ -25,6 +25,7 @@ import {
   Routes,
   useLocation,
   useNavigate,
+  useParams,
   useSearchParams,
 } from "react-router-dom";
 import { setEmbedRoot } from "@/lib/host";
@@ -459,6 +460,16 @@ function PathDisplay() {
  * test can exercise the conversation-switch effect (AppShell stays mounted,
  * only the :conversationId route param changes) without a full remount.
  */
+/** Records the rail's state in the first commit of each session, before paint. */
+function RailFirstFrameProbe({ frames, to }: { frames: string[]; to: string }) {
+  const { conversationId } = useParams();
+  useLayoutEffect(() => {
+    const rail = document.querySelector('aside[aria-label="Workspace"]');
+    frames.push(`${conversationId}:${rail?.getAttribute("data-state") ?? "none"}`);
+  }, [conversationId, frames]);
+  return <SessionNavButton to={to} />;
+}
+
 function SessionNavButton({ to }: { to: string }) {
   const navigate = useNavigate();
   return (
@@ -3008,10 +3019,15 @@ describe("Right workspace card visibility", () => {
     renderShell("/c/conv_hotkey");
     expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
 
+    const focus = vi.spyOn(HTMLElement.prototype, "focus");
     fireEvent.keyDown(document, { code: "BracketRight", ctrlKey: true, altKey: true });
 
     const filesTab = await screen.findByRole("tab", { name: "Files" });
     await waitFor(() => expect(filesTab).toHaveFocus());
+    // The rail is still sliding in from past the window edge, so focus must not scroll.
+    expect(focus.mock.contexts.at(-1)).toBe(filesTab);
+    expect(focus).toHaveBeenLastCalledWith({ preventScroll: true });
+    focus.mockRestore();
     // Alt+2 here (⌃2 on macOS) shows the second fixed tab, wherever focus is.
     screen.getByRole("button", { name: "Collapse right panel" }).focus();
     fireEvent.keyDown(document.activeElement!, { code: "Digit2", key: "2", altKey: true });
@@ -3616,6 +3632,32 @@ describe("Right workspace card visibility", () => {
       vi.unstubAllGlobals();
     }
   });
+
+  it.each([
+    ["open", "closed"],
+    ["closed", "open"],
+  ] as const)(
+    "shows the incoming session's rail state in its first frame (%s to %s)",
+    (from, to) => {
+      writeSessionWorkspaceState("conv_from", { open: from === "open" });
+      writeSessionWorkspaceState("conv_to", { open: to === "open" });
+      mockConversations([
+        { id: "conv_from", permission_level: null },
+        { id: "conv_to", permission_level: null },
+      ]);
+      const frames: string[] = [];
+      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      render(
+        sessionShellTree(
+          qc,
+          "/c/conv_from",
+          <RailFirstFrameProbe frames={frames} to="/c/conv_to" />,
+        ),
+      );
+      fireEvent.click(screen.getByTestId("nav-session"));
+      expect(frames).toEqual([`conv_from:${from}`, `conv_to:${to}`]);
+    },
+  );
 
   it("uses the default when navigating from Agents to a child in another tree", () => {
     localStorage.setItem("omnigent:default-workspace-tab", "changes");

@@ -94,7 +94,7 @@ import {
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
@@ -442,12 +442,10 @@ function FileTabsStrip({
   onCloseFile: (path: string) => void;
 }) {
   // Scroll the active tab into view when it changes (e.g. a newly opened file
-  // appended past the visible edge). `inline: "nearest"` scrolls whichever
-  // ancestor is the scroller — the outer strip (<500px) or the file-tabs
-  // region (≥500px) — without us hard-coding which one.
+  // appended past the visible edge).
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeFilePath]);
   // Render nothing (not an empty flex row) when there are no files — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -559,7 +557,7 @@ function TerminalTabsStrip({
 }) {
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeTabRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeTabRef.current);
   }, [activeTerminalKey]);
   // Render nothing (not an empty flex row) when there are no shells — an empty
   // wrapper would still consume a slot in the parent's gap-0.5 and leave a
@@ -993,7 +991,7 @@ function WorkspacePanelImpl({
   };
   const activeBrowserRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeBrowserRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
   const browserSelected =
     rightRailTab === "browser" &&
@@ -1112,7 +1110,7 @@ function WorkspacePanelImpl({
   const clearSideChatToOpen = useChatStore((s) => s.clearSideChatToOpen);
   const activeSideChatRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    activeSideChatRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activeSideChatRef.current);
   }, [sideChats.selected, rightRailTab]);
   // Pending tabs awaiting a real child id, in submit order. Only Codex uses this
   // queue — its child arrives asynchronously via session_created with no id to
@@ -1418,7 +1416,7 @@ function WorkspacePanelImpl({
   const railShown = !pending && open && !isMobile && (maximized || width > 0);
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
-    activePanelRef.current?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
   const showOpenTabs =
     !pending &&
