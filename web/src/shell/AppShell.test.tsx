@@ -15,7 +15,7 @@ import type * as UseConversationsModule from "@/hooks/useConversations";
 import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
 
-import { useCallback, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useState } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -30,7 +30,8 @@ import {
 import { setEmbedRoot } from "@/lib/host";
 import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
-import { useFileViewer } from "./FileViewerContext";
+import { FileViewerContext, useFileViewer } from "./FileViewerContext";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -76,6 +77,7 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
   useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
 }));
 
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
@@ -272,7 +274,7 @@ vi.mock("./TerminalsPanel", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
-import { useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
+import { useCreateTerminal, useTerminals, useDeleteTerminal } from "@/hooks/useTerminals";
 
 const useConvMock = vi.mocked(useConversations);
 const useTerminalsMock = vi.mocked(useTerminals);
@@ -413,6 +415,21 @@ function LocationDisplay() {
  * what AppShell keys the /settings sidebar pin off, so the tests need a real
  * router transition rather than a re-render.
  */
+/** A file viewer holding unsaved edits: file navigation waits until "allow leaving". */
+function DirtyFileViewerProbe() {
+  const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  const [allowLeaving, setAllowLeaving] = useState<(() => void) | null>(null);
+  useLayoutEffect(
+    () => registerNavigationGuard?.((_path, _options, navigate) => setAllowLeaving(() => navigate)),
+    [registerNavigationGuard],
+  );
+  return allowLeaving ? (
+    <button type="button" onClick={allowLeaving}>
+      allow leaving
+    </button>
+  ) : null;
+}
+
 function NavProbe() {
   const navigate = useNavigate();
   return (
@@ -530,7 +547,7 @@ function sessionShellTree(
 function renderShell(
   path: string,
   info?: ServerInfo,
-  options: { rerenderable?: boolean; sessionNavTo?: string } = {},
+  options: { rerenderable?: boolean; sessionNavTo?: string; dirtyFileViewer?: boolean } = {},
 ) {
   const qc = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -556,6 +573,7 @@ function renderShell(
             <ForkDialogProbe />
             <NavProbe />
             {options.sessionNavTo && <SessionNavButton to={options.sessionNavTo} />}
+            {options.dirtyFileViewer && <DirtyFileViewerProbe />}
             <LocationDisplay />
           </>
         }
@@ -2206,31 +2224,31 @@ describe("Sidebar across the md breakpoint", () => {
 
   it("leaves the session without closing a selected file in a responsive-hidden rail", () => {
     const resize = mockViewportWidth(1280);
-    let requestCloseTab: (() => void) | undefined;
-    const closeWindow = vi.fn();
+    let sendCommand: (event: {
+      command: string;
+      browserViewId: string | null;
+      closingQuits: boolean;
+    }) => void = () => {};
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
-      setCloseTabSupported: vi.fn(),
-      onCloseTabRequest: (callback: () => void) => {
-        requestCloseTab = callback;
-        return () => {
-          requestCloseTab = undefined;
-        };
+      onDesktopCommand: (callback: typeof sendCommand) => {
+        sendCommand = callback;
+        return () => {};
       },
-      closeWindow,
+      setDesktopCommandState: () => {},
     });
     onTestFinished(() => {
       vi.unstubAllGlobals();
+      resetDesktopCommandsForTests();
     });
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc?file=README.md");
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
 
     resize(740);
-    act(() => requestCloseTab?.());
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
     expect(screen.getByText("home", { exact: true })).toBeInTheDocument();
     expect(readSessionWorkspaceState("conv_abc").openFiles).toContain("README.md");
-    expect(closeWindow).not.toHaveBeenCalled();
   });
 
   it("closes an open sidebar when the window narrows and reopens it on widening", () => {
@@ -5954,5 +5972,57 @@ describe("new-session browser shortcut", () => {
     fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
     expect(screen.getByText("New session route")).toBeInTheDocument();
     setEmbedRoot(null);
+  });
+});
+
+describe("AppShell desktop Close", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits: boolean;
+  }) => void;
+  let sendCommand: CommandListener = () => {};
+
+  beforeEach(() => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: (callback: CommandListener) => {
+        sendCommand = callback;
+        return () => {};
+      },
+      setDesktopCommandState: () => {},
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.unstubAllGlobals();
+    resetDesktopCommandsForTests();
+  });
+
+  it("opens New Terminal over an open file only once its viewer allows it", () => {
+    const createShell = vi.fn();
+    vi.mocked(useCreateTerminal).mockReturnValue({
+      mutate: createShell,
+      isPending: false,
+    } as unknown as ReturnType<typeof useCreateTerminal>);
+    useSessionAgentMock.mockReturnValue({
+      data: { id: "ag_x", name: "polly", terminals: ["zsh"] },
+    } as ReturnType<typeof useSessionAgent>);
+    mockConversations([{ id: "conv_shell", permission_level: null }]);
+    renderShell("/c/conv_shell", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "new-terminal", browserViewId: null, closingQuits: false }));
+    expect(createShell).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(createShell).toHaveBeenCalledWith("zsh", expect.anything());
+  });
+
+  it("leaves the session once an open file's viewer allows dropping its unsaved edits", () => {
+    mockConversations([{ id: "conv_close", permission_level: null }]);
+    renderShell("/c/conv_close", undefined, { dirtyFileViewer: true });
+    act(() => sendCommand({ command: "close", browserViewId: null, closingQuits: false }));
+    expect(screen.queryByText("home")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "allow leaving" }));
+    expect(screen.getByText("home")).toBeInTheDocument();
   });
 });

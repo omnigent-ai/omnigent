@@ -26,6 +26,8 @@ export type SessionUpdatesFrame =
   | { type: "snapshot"; items: SessionListWireItem[] }
   | { type: "changed"; items: SessionListWireItem[] }
   | { type: "removed"; ids: string[] }
+  // A watched session was newly shared with the viewer; its row may be unchanged.
+  | { type: "access_changed"; ids: string[] }
   | { type: "hosts_changed" }
   | { type: "projects_changed" }
   | { type: "heartbeat" };

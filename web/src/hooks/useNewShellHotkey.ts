@@ -1,16 +1,17 @@
-// ⌘⌥T (Ctrl+Alt+T on Win/Linux) opens a new shell in the workspace rail,
-// launching the remembered default type — the keyboard path for the tab-strip
-// "+" menu, whose row launches on click (mouse-only otherwise). Sibling to the
-// other app-shell hotkeys (⌘K palette, ⌘⌥[ / ⌘⌥] sidebars); like them it's
-// bound ONCE at the app shell, where the shell-launch wiring lives.
+// ⌃` (Ctrl+` on Win/Linux) and ⌘⌥T (Ctrl+Alt+T on Win/Linux) open a new shell
+// in the workspace rail, launching the remembered default type — the keyboard
+// path for the tab-strip "+" menu, whose row launches on click (mouse-only
+// otherwise). Sibling to the other app-shell hotkeys (⌘K palette, ⌘⌥[ / ⌘⌥]
+// sidebars); like them it's bound ONCE at the app shell, where the shell-launch
+// wiring lives.
 //
-// Why ⌘⌥T: it joins the app's ⌘⌥ family (sidebar toggles, voice) with no
-// browser/OS clash — unlike ⌘` (macOS window cycling) or ⌘⇧T (browser reopen-
-// tab). "T" for terminal.
+// ⌃` is the terminal chord most editors use; it is literal Control on every
+// platform, so it never meets macOS window cycling (⌘`). ⌘⌥T joins the app's
+// ⌘⌥ family with no browser clash (unlike ⌘⇧T, reopen tab). "T" for terminal.
 
 import { useEffect, useRef } from "react";
 
-/** Editor/terminal surfaces that own their own keystrokes; the chord defers. */
+/** Editor/terminal surfaces that own their own keystrokes; ⌘⌥T defers. */
 const TEXT_ENTRY_SURFACE = ".monaco-editor, .xterm";
 
 function isMacPlatform(): boolean {
@@ -34,12 +35,18 @@ export function isNewShellHotkey(e: globalThis.KeyboardEvent, isMac = isMacPlatf
   return e.code === "KeyT";
 }
 
+/** True for ⌃` — Control plus the key left of 1, with no other modifier. */
+export function isTerminalHotkey(e: globalThis.KeyboardEvent): boolean {
+  return e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey && e.code === "Backquote";
+}
+
 /**
- * Bind ⌘/Ctrl+Alt+T to open a new shell. Bind ONCE at the app shell.
+ * Bind ⌃` and ⌘/Ctrl+Alt+T to open a new shell. Bind ONCE at the app shell.
  *
- * The chord defers to a focused Monaco editor or xterm terminal — those
+ * ⌘/Ctrl+Alt+T defers to a focused Monaco editor or xterm terminal — those
  * surfaces own their keystrokes, and stealing the chord mid-edit would surprise
- * the user. It fires only when ``enabled`` (the caller gates on the session
+ * the user. ⌃` is no editing key in either, so it also works from a focused
+ * shell. It fires only when ``enabled`` (the caller gates on the session
  * declaring shell access and being reachable).
  *
  * @param onLaunch Open the default shell (no-op if the caller can't right now).
@@ -60,10 +67,13 @@ export function useNewShellHotkey(
     if (!enabled) return;
     const handler = (e: globalThis.KeyboardEvent): void => {
       // Ignore auto-repeat: holding the chord would spawn a shell per tick.
-      if (e.repeat || !isNewShellHotkey(e, isMac)) return;
-      // Leave the chord to a focused editor/terminal that consumes keystrokes.
-      const el = document.activeElement;
-      if (el instanceof Element && el.closest(TEXT_ENTRY_SURFACE) !== null) return;
+      if (e.repeat) return;
+      if (!isTerminalHotkey(e)) {
+        if (!isNewShellHotkey(e, isMac)) return;
+        // Leave the chord to a focused editor/terminal that consumes keystrokes.
+        const el = document.activeElement;
+        if (el instanceof Element && el.closest(TEXT_ENTRY_SURFACE) !== null) return;
+      }
       e.preventDefault();
       e.stopPropagation();
       latest.current();
