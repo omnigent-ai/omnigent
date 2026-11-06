@@ -257,10 +257,7 @@ class ManagedStartupInputs:
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and launch.error is not None:
             return False
-        if any(
-            item.status in ("in_progress", "incomplete")
-            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, conv.id)
-        ):
+        if await self.has_undelivered(conv.id):
             return True
         if state != "pending":
             return False
@@ -276,6 +273,13 @@ class ManagedStartupInputs:
             else None
         )
         return host is not None and host_is_live(host)
+
+    async def has_undelivered(self, session_id: str) -> bool:
+        """Whether a saved input is still to be delivered (or confirmed) here."""
+        return any(
+            item.status in ("in_progress", "incomplete")
+            for item in await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        )
 
     async def snapshot(self, session_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """
@@ -512,6 +516,8 @@ class ManagedStartupInputs:
             )
             raise
         except Exception as exc:
+            if await self._waits_out_session_move(session_id, exc):
+                return
             log_delivery(
                 "scheduled_run_stage_failed",
                 session_id=session_id,
@@ -549,6 +555,23 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
+        """Whether *exc* refused delivery only while ``/clear`` moves the session.
+
+        The input stays queued; the host worker delivers it once the move
+        ends, as after any other transient wait.
+        """
+        from omnigent.server.routes._sessions.orchestration import _session_is_moving
+
+        if not (
+            isinstance(exc, OmnigentError)
+            and exc.code == ErrorCode.CONFLICT
+            and _session_is_moving(session_id)
+        ):
+            return False
+        _logger.info("Saved message for session %s waits for /clear to finish", session_id)
+        return True
 
     async def retry(self, session_id: str) -> bool:
         changed = False
