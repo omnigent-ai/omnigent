@@ -10,14 +10,13 @@ browser only and reset when the pull request gets a new head.
 - `path-filter`: **Filter changed files** narrows the file list, tree, counts and
   Expand/Collapse all by path or previous path. Empty state reads
   `No changed files match "<query>"` with **Clear filter**. Escape clears it. Each
-  file keeps its collapse state. When the file list is hidden (always on narrow
-  screens), a toolbar button opens the filter above the list.
+  file keeps its collapse state. When the file list is hidden (hidden by default on
+  narrow screens), a toolbar button opens the filter above the list.
 - `find`: **Find in changes** bar over the fetched patch. Toggles for match case and
   regular expression. Status reads `k of N`, with `+` after N at the 10,000-match
   cap, `No results`, or `Invalid`. Opening the bar seeds the first match at or below
-  the top of the viewport. Enter and
-  Shift+Enter step through matches and wrap at the ends. Matches on file paths scroll
-  to the file header. Escape or **Close find** closes the bar and keeps the query.
+  the top of the viewport. Enter and Shift+Enter step through matches and wrap at the
+  ends. Matches on file paths scroll to the file header. Escape or **Close find** closes the bar and keeps the query.
   Shows `+M in hidden files` with **Show** when matches sit in files the filters hide.
 - `copy-path`: Copies the repo-relative current path. Renamed files also get **Copy
   previous path**. Success and failure show a toast.
@@ -73,8 +72,9 @@ checks Escape, copies a path through the icon (desktop) or the overflow menu
 (mobile), and checks that **Open in GitHub** links to the fork at the pinned head.
 
 - `composer-desktop` and `canvas`: Open Changes. Type `readme` in **Filter changed
-  files** and confirm only `README.md` remains. Click **Copy path** on another file
-  and paste it; the path should be repo-relative. Open that file's overflow menu and
+  files** and confirm only `README.md` remains. Clear the filter (**Clear filter** or
+  Escape) so the other file is listed again. Click **Copy path** on it and paste it;
+  the path should be repo-relative. Open that file's overflow menu and
   confirm **Open in <provider>** links to the head repository at the list's head.
 
 ### find
@@ -134,7 +134,7 @@ Component coverage for these helpers and views lives in
 - **Highlights need the browser's CSS highlight API.** Without it, the match's row
   still centres but is not painted. Highlight painting was checked only in Chromium.
 - **Find's reveal ends with a collapse.** Collapsing a file that find opened keeps it
-  closed until you step to another match.
+  closed until you explicitly navigate to a match again, even the same one.
 - **Open uses the list's revision, not the newest head.** A commit pushed while you
   read does not change the link until the list reloads. The link goes to the file
   without a line anchor.
@@ -157,6 +157,7 @@ Component coverage for these helpers and views lives in
   conversations on hidden files stay hidden with their files.
 - **Known rough edges.** Marking a file while Hide viewed is on removes it from the
   list and drops keyboard focus. Marks made in another tab on the same head show as
-  checked but do not collapse the file until the head changes.
+  checked but do not collapse the file until the Changes view remounts (for example
+  after a reload) or the head changes.
 - **Canvas requires its release feature.** Check it is enabled before using the
   `canvas` entry.
