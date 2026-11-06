@@ -44,8 +44,14 @@ if startup in {"dead", "dead-no-status"}:
     raise SystemExit(1)
 print("Starting Claude Code...", flush=True)
 time.sleep(1.0)
-draft = "\n".join(f"OLD {index}" for index in range(8)) if startup.startswith("stale-") else ""
-box = _InputBox("bash" if startup == "stale-shell-frame" else "prompt", draft)
+draft = (
+    "\n".join(f"OLD {index}" for index in range(8))
+    if startup.startswith("stale-") or startup == "late-shell" else ""
+)
+if startup.startswith("quoted-"):
+    draft = "draft\n──────\n❯ quoted prompt\n──────\nHIDDEN ONE\nHIDDEN TWO\nHIDDEN THREE"
+box = _InputBox("bash" if startup in {"stale-shell-frame", "late-shell"} else "prompt", draft)
+received_bytes = 0
 
 
 def render(*_args):
@@ -53,7 +59,18 @@ def render(*_args):
     if startup.startswith("stale-"):
         screen = "─" * 30 + "\n❯ previous message\n" + screen
         screen = "\n".join(screen.splitlines()[:os.get_terminal_size().lines])
+    if startup.startswith("quoted-"):
+        if startup == "quoted-wrapped-frame":
+            screen = "first part of a long title\nlast part ─\n" + screen.split("\n", 1)[1]
+        screen = "\n".join(screen.splitlines()[:6 if startup == "quoted-wrapped-frame" else 5])
+    delivered.with_suffix(".state").write_text(
+        json.dumps({"draft": box.draft, "received_bytes": received_bytes})
+    )
     sys.stdout.write("\x1b[H\x1b[2J" + screen.replace("\n", "\r\n"))
+    prompt_row = screen.splitlines().index(box.pane().splitlines()[1])
+    cursor_row = prompt_row + box.draft[:box.cursor].count("\n")
+    cursor_column = len(box.draft[:box.cursor].rsplit("\n", 1)[-1]) + 2
+    sys.stdout.write(f"\x1b[{cursor_row + 1};{cursor_column + 1}H")
     sys.stdout.flush()
 
 
@@ -61,7 +78,9 @@ signal.signal(signal.SIGWINCH, render)
 render()
 pending = b""
 while True:
-    pending += os.read(sys.stdin.fileno(), 65536)
+    incoming = os.read(sys.stdin.fileno(), 65536)
+    received_bytes += len(incoming)
+    pending += incoming
     while pending:
         if pending.startswith(b"\x1b[200~"):
             if b"\x1b[201~" not in pending:
@@ -83,6 +102,8 @@ while True:
             if token == "\r":
                 box.key("Enter")
                 delivered.write_text(json.dumps(box.submitted))
+            elif token in {"\x7f", "\b"}:
+                box.key("BSpace")
             elif token == "\x15" or token.startswith("\x1b["):
                 box.key("C-u" if token == "\x15" else token)
             elif token.isprintable():
@@ -103,6 +124,9 @@ while True:
         "exit-after-ready",
         "stale-frame",
         "stale-shell-frame",
+        "late-shell",
+        "quoted-frame",
+        "quoted-wrapped-frame",
     ],
 )
 @pytest.mark.timeout(20)
@@ -139,10 +163,13 @@ def test_first_message_survives_slow_terminal_startup(
         *,
         timeout_s: float,
         bridge_dir: Path | None = None,
+        **kwargs,
     ) -> None:
         started_at.append(time.monotonic())
         gate_started.touch()
-        original_wait(socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir)
+        original_wait(
+            socket_path, tmux_target, timeout_s=timeout_s, bridge_dir=bridge_dir, **kwargs
+        )
         if startup == "exit-after-ready":
             subprocess.run(
                 ["tmux", "-S", socket_path, "kill-server"],
@@ -178,7 +205,11 @@ def test_first_message_survives_slow_terminal_startup(
                     "-x",
                     "120",
                     "-y",
-                    "6" if startup.startswith("stale-") else "24",
+                    "6"
+                    if startup.startswith("stale-")
+                    else "7"
+                    if startup.startswith("quoted-")
+                    else "24",
                     command,
                 ],
                 check=True,
@@ -199,14 +230,39 @@ def test_first_message_survives_slow_terminal_startup(
                     time.sleep(0.05)
             bridge_dir = tmp_path / "bridge"
             bridge.write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="main")
-            if startup == "slow":
+            if startup.startswith("quoted-"):
+                gate_started.touch()
+                deadline = time.monotonic() + 5
+                state_path = delivered.with_suffix(".state")
+                while not state_path.exists():
+                    assert time.monotonic() < deadline, "Scripted composer did not render."
+                    time.sleep(0.05)
+                before = json.loads(state_path.read_text())
+                assert "HIDDEN THREE" in before["draft"]
+                for slash in (False, True):
+                    with pytest.raises(bridge.ClaudeComposerNotCleared):
+                        if slash:
+                            bridge.inject_slash_command(
+                                bridge_dir, command="/effort high", timeout_s=1
+                            )
+                        else:
+                            bridge.inject_user_message(
+                                bridge_dir, content="ONLY_NEW_INPUT", timeout_s=1
+                            )
+                    assert json.loads(state_path.read_text()) == before
+                    assert not delivered.exists()
+                geometry = subprocess.check_output(
+                    [*tmux, "display-message", "-p", "-t", "main", "#{window_height}"], text=True
+                ).strip()
+                assert geometry == "7"
+            elif startup == "slow":
                 bridge.inject_user_message(
                     bridge_dir, content="FIRST_PROMPT_DELIVERED", timeout_s=0.3
                 )
                 assert time.monotonic() - started_at[0] >= 1.0
                 assert json.loads(delivered.read_text()) == [["prompt", "FIRST_PROMPT_DELIVERED"]]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
-            elif startup.startswith("stale-"):
+            elif startup.startswith("stale-") or startup == "late-shell":
                 bridge.inject_user_message(bridge_dir, content="ONLY_NEW_INPUT", timeout_s=2.0)
                 assert json.loads(delivered.read_text()) == [["prompt", "ONLY_NEW_INPUT"]]
                 bridge.inject_slash_command(bridge_dir, command="/effort high", timeout_s=2.0)
@@ -221,7 +277,7 @@ def test_first_message_survives_slow_terminal_startup(
                     text=True,
                     timeout=5,
                 )
-                assert geometry.stdout.strip() == "6"
+                assert geometry.stdout.strip() == ("24" if startup == "late-shell" else "6")
             elif startup == "exit-after-ready":
                 caplog.set_level(logging.WARNING)
                 with pytest.raises(RuntimeError, match="tmux command failed"):
@@ -290,6 +346,7 @@ termios.tcflush(fd, termios.TCIFLUSH)
 
 def render(draft=""):
     sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80 + "\r\n")
+    sys.stdout.write(f"\x1b[2;{3 + len(draft)}H")
     sys.stdout.flush()
 
 render()
@@ -313,6 +370,8 @@ while True:
             lines.append(draft)
             draft = ""
             delivered.write_text(json.dumps(lines))
+        elif ch in {"\x7f", "\b"}:
+            draft = draft[:-1]
         elif ch >= " ":
             draft += ch
     render(draft)

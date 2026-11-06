@@ -1946,18 +1946,22 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    pane = "❯ "
+    pane = "──────\n❯ \n──────\n"
     enters = 0
     prompt_pending = False
+    cursor_offset = 0
     killed: list[Path] = []
 
-    def run_tmux(socket_path: str, *args: str) -> None:
-        nonlocal pane, enters, prompt_pending
+    def run_tmux(socket_path: str, *args: str) -> SimpleNamespace | None:
+        nonlocal pane, enters, prompt_pending, cursor_offset
         del socket_path
+        if args[0] == "display-message":
+            return SimpleNamespace(stdout=f"{2 + cursor_offset} 1", returncode=0)
         if args[-1] == "Space":
+            cursor_offset = 1
             pane = "──────\n❯ \n──────\n"
-        elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+        elif args[-1] == "BSpace":
+            cursor_offset = 0
         elif args[0] == "paste-buffer":
             pane = "❯ review this function"
             prompt_pending = not submitted
@@ -1967,6 +1971,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
             prompt_pending = refusal == "pending_prompt"
             if refusal == "capture_lost":
                 pane = ""
+        return None
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -1984,12 +1989,17 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     monkeypatch.setattr(claude_bridge, "_restore_occupied_input", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", lambda *_a, **_k: None)
     monkeypatch.setattr(claude_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_a, **_k: SimpleNamespace(stdout=f"{2 + cursor_offset} 1", returncode=0),
+    )
     monkeypatch.setattr(claude_bridge, "_capture_pane", lambda *_a: pane)
     monkeypatch.setattr(claude_bridge, "_has_approval_wait", lambda _bridge: prompt_pending)
     monkeypatch.setattr(claude_bridge, "_PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.0)
     monkeypatch.setattr(claude_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.01)
+    monkeypatch.setattr(claude_native_executor, "_MESSAGE_HOLD_S", 0.0)
     monkeypatch.setattr(
         claude_native_executor,
         "kill_session",

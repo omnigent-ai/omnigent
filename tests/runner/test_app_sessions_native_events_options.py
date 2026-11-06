@@ -2865,6 +2865,7 @@ class _SlowSwitchTui:
         draft_after_s: float | None,
         dialog_after_s: float | None,
     ) -> None:
+        self.cursor_offset = 0
         self.sent: list[tuple[float, str]] = []
         self._clock = clock
         self._draft_after_s = draft_after_s
@@ -2878,7 +2879,13 @@ class _SlowSwitchTui:
         claude_native_bridge._check_injection_cancelled()
         now = self._clock.monotonic()
         self.sent.append((now, args[-1]))
-        if "-l" in args:
+        if args[-1] == "Space":
+            self.cursor_offset += 1
+        elif args[-1].startswith(claude_native_bridge._COMPOSER_KILL_TO_LINE_END):
+            self.cursor_offset = 1
+        elif args[-1] == "BSpace":
+            self.cursor_offset = max(0, self.cursor_offset - 1)
+        elif "-l" in args:
             self._pasted_at = now
         elif args[-1] == "Enter" and self._submitted_at is None:
             self._submitted_at = now
@@ -2936,6 +2943,9 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     monkeypatch.setattr(claude_native_bridge, "time", clock)
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", tui.run_tmux)
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", tui.capture_pane)
+    monkeypatch.setattr(
+        claude_native_bridge, "_composer_cursor_offset", lambda *_: tui.cursor_offset
+    )
     real_inject = claude_native_bridge.inject_slash_command
 
     def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
@@ -2959,7 +2969,13 @@ async def test_events_model_change_sends_no_key_past_its_budget(
     assert resp.json()["error"] == "claude_native_model_failed"
     keys = [key for _, key in tui.sent]
     clear_composer = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
-    assert keys[:4] == ["Space", clear_composer, "/model claude-opus-4-7", "Enter"], keys
+    assert keys[:5] == [
+        "Space",
+        clear_composer + " ",
+        "BSpace",
+        "/model claude-opus-4-7",
+        "Enter",
+    ], keys
     late = [
         (round(at - started_at, 2), key) for at, key in tui.sent if at >= started_at + budget_s
     ]
@@ -3773,7 +3789,7 @@ async def test_events_compact_on_claude_sdk_session_dispatches_compact_turn() ->
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3843,7 +3859,7 @@ async def test_events_compact_on_claude_sdk_buffers_behind_active_turn() -> None
     hc = _ScriptedHarnessClient([])
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         """Return the claude-sdk spec for any agent_id."""
@@ -3915,7 +3931,7 @@ async def test_events_clear_on_claude_sdk_releases_the_idle_client(
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_histories_ref
 
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
     finish_turn = asyncio.Event()
     if busy == "ingesting":
@@ -4027,7 +4043,7 @@ async def test_cancelled_claude_sdk_clear_does_not_block_later_input(
         return build(**kwargs)
 
     monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "f5b4cad6e7f38d9e1f2a3b4c53647566"
     ingest_held, release_ingest = asyncio.Event(), asyncio.Event()
     resolve_content = runner_app._resolve_forwarded_message_content
@@ -4131,7 +4147,7 @@ async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
         return build(**kwargs)
 
     monkeypatch.setattr(runner_app, "build_native_controls", keep_gate)
-    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "b7c6dce8f9a05b1c2d3e4f5a67584930"
     async with _runner_client(app) as client:
         created = await client.post(
@@ -4173,7 +4189,7 @@ async def test_queued_claude_sdk_clear_ends_when_its_session_is_deleted_first(
 @pytest.mark.asyncio
 async def test_deleting_a_session_the_runner_never_set_up_is_harmless() -> None:
     """The server's rollback of an unconfirmed continuation can repeat its delete."""
-    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, _pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     async with _runner_client(app) as client:
         responses = [
             await client.delete("/v1/sessions/a6b5cbd7e8f49a0b1c2d3e4f56473829") for _ in range(2)
@@ -4192,7 +4208,7 @@ async def test_events_legacy_clear_on_claude_sdk_stays_unsupported() -> None:
     """
     from omnigent.runner.app import _session_histories_ref
 
-    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk"))
+    app, pm = await _build_app_for_spec(_harness_spec("claude-sdk", executor_model="mock-claude"))
     sid = "e4a3c9d5f6b27c8d0e1f2a3b42536455"
     async with _runner_client(app) as client:
         create_resp = await client.post(
@@ -4255,7 +4271,7 @@ def _build_claude_sdk_compact_app(
     hc = _ScriptedHarnessClient(sse_frames)
     pm = _FakeProcessManager(hc)
 
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -4442,7 +4458,7 @@ async def test_events_compact_on_claude_sdk_clears_flag_on_pre_stream_failure() 
 
     hc = _ScriptedHarnessClient([])
     pm = _FailingProcessManager(hc)
-    sdk_spec = _harness_spec("claude-sdk")
+    sdk_spec = _harness_spec("claude-sdk", executor_model="mock-claude")
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
