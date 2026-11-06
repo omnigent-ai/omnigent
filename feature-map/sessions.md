@@ -19,7 +19,7 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
-- `custom-order`: behind `sidebar_grouping_ui`, drop one of your sessions onto
+- `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
   above them; a drop on another project's row still files the session there.
@@ -197,8 +197,9 @@ the header menu), and each place is a separate entry point.
   All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
-  the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
-  a flat Display filter and the tooltip keeps its plain layout.
+  the `sidebar_grouping_ui` release flag, on by default; with
+  `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
+  Display filter and the tooltip keeps its plain layout.
 - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
   drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
   a third of its width, or after a quick flick, closes it; a shorter drag springs
@@ -286,7 +287,7 @@ use Settings → Appearance → Sidebar.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
-**Custom order:** with `sidebar_grouping_ui` on, drag one of your sessions onto
+**Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
 Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
@@ -350,7 +351,7 @@ choice only when the server supports cleanup.
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
 
-**Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
+**Sidebar filter menu:** with `sidebar_grouping_ui` on (the default), the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
 Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
@@ -1116,7 +1117,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
-  (enable the flag by patching `GET /v1/info`). Unit tests in
+  (the flag-off case disables it by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 - **`project-show-more`:** no browser test drives it. Component tests in
