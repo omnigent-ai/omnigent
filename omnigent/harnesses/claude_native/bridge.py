@@ -115,6 +115,7 @@ from omnigent.inner.terminal_lifecycle import (
     TERMINAL_LAUNCH_ID_ENV,
     TERMINAL_LAUNCH_SESSION_ID_ENV,
 )
+from omnigent.llms.errors import is_prompt_too_long
 from omnigent.native import native_bridge_common, policy_allow_cache
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
@@ -11111,7 +11112,7 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     :returns: The text to show, e.g. the context-overflow guidance.
     """
     stripped = text.strip()
-    if _CONTEXT_OVERFLOW_RE.match(stripped):
+    if _CONTEXT_OVERFLOW_RE.match(stripped) or is_prompt_too_long(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_login_guidance()}"
@@ -11134,7 +11135,8 @@ def program_status_turn_error(text: str) -> tuple[str, str]:
         "Context limit reached — ...")``; other errors keep
         ``"native_turn_error"``.
     """
-    if _CONTEXT_OVERFLOW_RE.match(text.strip()):
+    stripped = text.strip()
+    if _CONTEXT_OVERFLOW_RE.match(stripped) or is_prompt_too_long(stripped):
         return "context_length_exceeded", _CONTEXT_OVERFLOW_REPLACEMENT
     return "native_turn_error", _display_text(text, is_api_error=True)
 

@@ -9478,6 +9478,18 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
             "context_length_exceeded",
             "Context limit reached",
         ),
+        # Anthropic API rejection wrapped in HTTP status + JSON envelope.
+        (
+            '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}',
+            "context_length_exceeded",
+            "Context limit reached",
+        ),
+        (
+            'API Error: 400 {"error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 1028000 tokens > 1000000 maximum"}}',
+            "context_length_exceeded",
+            "Context limit reached",
+        ),
         ("Login expired · Please run /login", "native_turn_error", "Login expired"),
         ("API Error: 500 upstream failed", "native_turn_error", "API Error: 500 upstream failed"),
     ],
