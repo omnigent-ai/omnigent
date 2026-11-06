@@ -20,6 +20,8 @@ _logger = logging.getLogger(__name__)
 # How long an error report may stand before its turn is failed without the
 # StopFailure hook. Process startup and forwarding can delay its detailed error.
 ERROR_HOOK_GRACE_S = 10.0
+# OSC states that keep the session running; every other state reads as idle.
+_RUNNING_STATES = frozenset({"working", "blocked"})
 
 
 def _reports_failed_turn(report: ProgramStatus) -> bool:
@@ -111,6 +113,15 @@ class ClaudeProgramStatusPoller:
             return self._holding_background_agents
         return self._fallback.holding_background_agents
 
+    def reports_idle(self) -> bool:
+        """Whether the current report maps Claude to idle, so pane polling may back off."""
+        if self._retired:
+            return False
+        report = self._reader.status
+        if report is None:
+            return self._fallback.reports_idle
+        return report.state not in _RUNNING_STATES
+
     def tick(self) -> None:
         """Publish changed reports; never interpret silence as completion."""
         if self._retired:
@@ -152,7 +163,7 @@ class ClaudeProgramStatusPoller:
                 # The StopFailure hook owns the failed edge and carries the API
                 # error text; an error report here would fail the turn first, bare.
                 if not is_error:
-                    working = report.state in {"working", "blocked"}
+                    working = report.state in _RUNNING_STATES
                     status = "waiting" if holding else "running" if working else "idle"
                     publish = self._on_status if changed else self._on_replay
                     publish(status, blocked_reason(report))
