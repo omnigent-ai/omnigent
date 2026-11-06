@@ -416,6 +416,8 @@ _QUEUED_MESSAGE_HINT = "Press up to edit queued messages"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# A shorter end-of-draft marker could match unrelated words left in the box.
+_MIN_TAIL_NEEDLE_CHARS = 8
 # Mode footer Claude Code renders below its input box, keyed by
 # ``--permission-mode`` value. There is no non-interactive mode command, so
 # a live switch cycles with shift+tab and reads this footer to know where it
@@ -4622,13 +4624,14 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message.",
             nothing_typed=True,
         )
+    tail_needle = _submit_tail_needle(text) if needle else ""
     delivery_diagnostics.set_stage("pasting")
     # Clear stale text first, or the paste lands inside the person's draft and
     # Enter submits both together.
     _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-        bridge_dir, socket_path, tmux_target, text=text, needle=needle
+        bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
     )
     box = _composer_box(pane)
     # A TUI that submits the paste itself leaves an empty box and a new transcript line.
@@ -4652,7 +4655,7 @@ def _paste_and_submit(
         )
         _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
         draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
-            bridge_dir, socket_path, tmux_target, text=text, needle=needle
+            bridge_dir, socket_path, tmux_target, text=text, needle=needle, tail_needle=tail_needle
         )
     delivery_diagnostics.record_draft(
         pane=pane,
@@ -4697,6 +4700,7 @@ def _paste_and_submit(
             socket_path,
             tmux_target,
             needle=needle,
+            tail_needle=tail_needle,
             what="submitted message",
             bridge_dir=bridge_dir,
             submit_boundary=submit_boundary,
@@ -4723,6 +4727,7 @@ def _paste_and_await_draft(
     *,
     text: str,
     needle: str,
+    tail_needle: str = "",
 ) -> tuple[bool, str, int, int, float]:
     """
     Paste *text* into the composer, then poll until its draft shows or the paste budget ends.
@@ -4732,6 +4737,7 @@ def _paste_and_await_draft(
     :param tmux_target: tmux pane target string.
     :param text: Exact text to paste.
     :param needle: Draft marker from :func:`_submit_needle`.
+    :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :returns: ``(draft_seen, last_pane, polls, empty_captures, wait_started)``.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
@@ -4781,7 +4787,7 @@ def _paste_and_await_draft(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle):
+        if _draft_in_input_box(pane, needle, tail_needle=tail_needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -4794,6 +4800,7 @@ def _verify_submit_accepted(
     *,
     needle: str,
     what: str,
+    tail_needle: str = "",
     bridge_dir: Path | None = None,
     submit_boundary: SubmitBoundary | None = None,
     submitted_text: str | None = None,
@@ -4815,6 +4822,7 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
+    :param tail_needle: End-of-draft marker from :func:`_submit_tail_needle`.
     :param bridge_dir: Bridge whose pending questions protect submit retries.
     :param submit_boundary: Native transcript boundary captured before Enter.
     :param submitted_text: Full submitted text; a marker alone cannot identify a refusal.
@@ -4844,7 +4852,7 @@ def _verify_submit_accepted(
             and _fresh_matching_hook_block(bridge_dir, submit_boundary, submitted_text)
         ):
             delivery_diagnostics.record_verification(
-                draft_still_present=_draft_in_input_box(pane, needle),
+                draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
                 pane=pane,
                 needle=needle,
                 prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4861,7 +4869,7 @@ def _verify_submit_accepted(
         # neither that the draft cleared nor that another Enter is safe.
         if not pane.strip():
             continue
-        if not _draft_in_input_box(pane, needle):
+        if not _draft_in_input_box(pane, needle, tail_needle=tail_needle):
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -4896,7 +4904,7 @@ def _verify_submit_accepted(
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=_draft_in_input_box(pane, needle),
+        draft_still_present=_draft_in_input_box(pane, needle, tail_needle=tail_needle),
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -7191,7 +7199,34 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
+def _submit_tail_needle(content: str) -> str:
+    r"""
+    Derive a marker for the end of *content*, where a scrolled draft stays in view.
+
+    Claude Code keeps the cursor row of a draft taller than its input box on
+    screen, so the first line :func:`_submit_needle` reads can scroll away
+    while the last one stays visible.
+
+    :param content: Raw user text, e.g. ``"step 1\n…\nstep 9 then run the tests"``.
+    :returns: The last :data:`_DRAFT_NEEDLE_MAX_CHARS` characters of the last
+        non-empty line after its final control character, e.g.
+        ``"step 9 then run the tests"``; empty when that marker is too short
+        to tell the draft from other text in the box.
+    """
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    for line in reversed(normalized.split("\n")):
+        for idx in range(len(line) - 1, -1, -1):
+            if ord(line[idx]) < 0x20:
+                line = line[idx + 1 :]
+                break
+        line = line.strip()
+        if line:
+            tail = line[-_DRAFT_NEEDLE_MAX_CHARS:].strip()
+            return tail if len(_comparable_draft_text(tail)) >= _MIN_TAIL_NEEDLE_CHARS else ""
+    return ""
+
+
+def _draft_in_input_box(pane: str, needle: str, *, tail_needle: str = "") -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
@@ -7208,16 +7243,24 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     Whitespace is ignored, so a needle wrapped across rows still matches,
     and so are Unicode control and format characters (e.g. U+FEFF), which
     Claude Code keeps in the draft but does not render.
+    A shell-mode box (``!`` glyph) is read too: Claude Code turns a draft's
+    leading ``!`` into that glyph, so the needle is matched without it.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
         ``"fix the bug"``. Empty means the draft can't be identified;
         only the paste placeholder is then considered.
+    :param tail_needle: Marker from :func:`_submit_tail_needle`, matched as
+        well: a draft taller than the box scrolls its first line out of view.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
     rows = _composer_rows(pane)
+    first_row = rows[0].strip() if rows else ""
     if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
         tail = "\n".join([rows[0].split(_CLAUDE_PROMPT_GLYPH, 1)[1], *rows[1:]])
+    elif first_row.startswith(_SHELL_MODE_GLYPH):
+        tail = "\n".join([first_row[len(_SHELL_MODE_GLYPH) :], *rows[1:]])
+        needle = needle.removeprefix(_SHELL_MODE_GLYPH)
     else:
         glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
         if not glyph_lines:
@@ -7226,9 +7269,11 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
     # The hint is not a draft, but a short needle such as "to" or "a" matches its words.
-    tail = tail.replace(_QUEUED_MESSAGE_HINT, "")
-    target = _comparable_draft_text(needle)
-    return bool(target) and target in _comparable_draft_text(tail)
+    tail = _comparable_draft_text(tail.replace(_QUEUED_MESSAGE_HINT, ""))
+    return any(
+        target and target in tail
+        for target in (_comparable_draft_text(needle), _comparable_draft_text(tail_needle))
+    )
 
 
 def _comparable_draft_text(text: str) -> str:

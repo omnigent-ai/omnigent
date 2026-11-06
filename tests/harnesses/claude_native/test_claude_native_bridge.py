@@ -10479,6 +10479,45 @@ def test_queued_message_hint_is_not_a_draft_for_submit_verification(needle: str)
     assert claude_native_bridge._draft_in_input_box(pane, needle) is False
 
 
+def test_a_draft_scrolled_past_its_first_line_is_seen_by_its_end() -> None:
+    """
+    A draft taller than the box keeps only its end in view, which the tail marker finds.
+
+    The first-line marker alone missed it, so long messages were submitted blind
+    and a swallowed Enter left them unsent in the box.
+    """
+    content = (
+        "Please review the change. " + "Check each caller carefully. " * 20 + "Then run tests."
+    )
+    rule = "─" * 60
+    pane = "\n".join(
+        [rule, "❯ each caller carefully. Check each caller", "  carefully. Then run tests.", rule]
+    )
+    needle = claude_native_bridge._submit_needle(content)
+    tail_needle = claude_native_bridge._submit_tail_needle(content)
+
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is False
+    assert claude_native_bridge._draft_in_input_box(pane, needle, tail_needle=tail_needle) is True
+    empty_box = "\n".join([rule, "❯ ", rule])
+    assert not claude_native_bridge._draft_in_input_box(empty_box, needle, tail_needle=tail_needle)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ("first line\nlast line of the draft", "last line of the draft"),
+        ("x" * 30 + " and the final words here", "and the final words here"),
+        ("long first line here\nok", ""),
+        ("before\tafter the tab char", "after the tab char"),
+        ("   \n  ", ""),
+    ],
+    ids=["last-line", "truncated", "too-short", "after-control-char", "blank"],
+)
+def test_submit_tail_needle(content: str, expected: str) -> None:
+    """The tail marker is the end of the last line, or empty when too short to be specific."""
+    assert claude_native_bridge._submit_tail_needle(content) == expected
+
+
 def test_typed_draft_is_still_seen_beside_the_queued_message_hint() -> None:
     """A real draft in the box is still detected when the same words appear in it."""
     rule = "─" * 40
