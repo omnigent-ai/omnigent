@@ -39,3 +39,19 @@ it.each([true, false])(
     expect(client.getQueryState(["identity-is-admin"])?.dataUpdatedAt).toBeGreaterThan(0);
   },
 );
+
+it("shows cached admin access on the first render", async () => {
+  vi.mocked(getCurrentIsAdmin).mockReturnValue(true);
+  vi.mocked(resolveIdentity).mockResolvedValue("admin");
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const { result } = renderHook(() => useIsAdmin(), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+
+  expect(result.current).toBe(true);
+  await act(async () => {});
+  expect(result.current).toBe(true);
+  client.clear();
+});
