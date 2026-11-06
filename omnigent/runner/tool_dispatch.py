@@ -3381,28 +3381,25 @@ def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
     """
     Check the project a ``sys_session_create`` call names, before any request.
 
-    :param args: Parsed tool arguments; a null ``project_id`` or ``project_name`` is absent.
+    :param args: Parsed tool arguments; a null ``project_name`` or ``project_id`` is absent.
     :param placement: The requested placement, e.g. ``"same_host"``.
     :returns: A JSON error, or ``None`` when the arguments are usable.
     """
-    project_id = args.get("project_id")
-    project_name = args.get("project_name")
-    if project_id is None and project_name is None:
-        return None
-    if project_id is not None and project_name is not None:
-        return json.dumps({"error": "Set project_id or project_name, not both"})
-    if placement == "child":
+    # The scheduled-task tools take project_id, so refuse it here instead of ignoring it.
+    if args.get("project_id") is not None:
         return json.dumps(
-            {"error": "project_id and project_name require placement='same_host' or 'managed'"}
+            {
+                "error": "sys_session_create takes project_name, the project's name as "
+                "shown in the UI, not project_id"
+            }
         )
-    named = project_id if project_id is not None else project_name
-    if not isinstance(named, str) or not named.strip():
-        return json.dumps({"error": "project_id and project_name must be nonempty strings"})
-    if project_id is not None:
-        try:
-            _route_identifier(project_id, "Project")
-        except ValueError as exc:
-            return json.dumps({"error": str(exc)})
+    project_name = args.get("project_name")
+    if project_name is None:
+        return None
+    if placement == "child":
+        return json.dumps({"error": "project_name requires placement='same_host' or 'managed'"})
+    if not isinstance(project_name, str) or not project_name.strip():
+        return json.dumps({"error": "project_name must be a nonempty string"})
     return None
 
 
@@ -3418,37 +3415,17 @@ async def _add_named_project(
     :param body: The orchestrated create body to update.
     :param args: Arguments that passed :func:`_project_argument_error`.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: A JSON error when the project can't be used, else ``None``.
+    :returns: A JSON error when the project name can't be resolved, else ``None``.
     """
-    project_id = args.get("project_id")
     project_name = args.get("project_name")
-    if project_id is None and project_name is None:
+    if project_name is None:
         return None
-    if project_id is not None:
-        try:
-            resp = await server_client.get(
-                f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
-            )
-        except httpx.HTTPError as exc:
-            return json.dumps(
-                {"error": f"Could not check project {project_id}: {type(exc).__name__}: {exc}"}
-            )
-        if resp.status_code == 404:
-            return json.dumps({"error": "project_not_found", "project_id": project_id})
-        if resp.status_code >= 400:
-            return json.dumps(
-                {
-                    "error": f"Could not check project {project_id}: HTTP {resp.status_code}",
-                    "detail": resp.text[:200],
-                }
-            )
-    else:
-        try:
-            project_id = await _project_id_for_name(server_client, str(project_name))
-        except (httpx.HTTPError, ValueError) as exc:
-            return json.dumps(
-                {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
-            )
+    try:
+        project_id = await _project_id_for_name(server_client, str(project_name))
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps(
+            {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
+        )
     body.update({"project_id": project_id, "workspace": None, "git": None})
     return None
 
@@ -3729,6 +3706,9 @@ async def _execute_session_create(
             "agent_id": data.get("agent_id") or agent_id,
             "title": data.get("title") or args.get("title"),
             "project_id": data.get("project_id"),
+            "project_name": await _project_name_or_none(
+                _optional_string(data.get("project_id")), server_client
+            ),
         }
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
@@ -5424,6 +5404,25 @@ async def _host_harnesses_or_none(
     return readiness if isinstance(readiness, dict) else None
 
 
+async def _project_name_or_none(
+    project_id: str | None,
+    server_client: httpx.AsyncClient,
+) -> str | None:
+    """Return the name of the caller's project ``project_id``, best-effort."""
+    if not project_id:
+        return None
+    try:
+        resp = await server_client.get(
+            f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
+        )
+        if resp.status_code != 200:
+            return None
+        name = resp.json().get("name")
+    except Exception:  # noqa: BLE001
+        return None
+    return name if isinstance(name, str) else None
+
+
 async def _session_get_info_via_rest(
     args: _JsonObject,
     conversation_id: str,
@@ -5443,7 +5442,9 @@ async def _session_get_info_via_rest(
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
-    best-effort via ``GET /v1/hosts/{id}``. The full transcript is
+    best-effort via ``GET /v1/hosts/{id}``, and the project name via
+    ``GET /v1/projects/{id}`` (``None`` when the lookup fails or the project
+    isn't the caller's). The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``
@@ -5481,9 +5482,10 @@ async def _session_get_info_via_rest(
     snap_agent_name = _optional_string(snap.get("agent_name"))
     snap_runner_id = _optional_string(snap.get("runner_id"))
     snap_host_id = _optional_string(snap.get("host_id"))
-    runner_online, configured_harnesses = await asyncio.gather(
+    runner_online, configured_harnesses, project_name = await asyncio.gather(
         _runner_online_or_none(snap_runner_id, server_client),
         _host_harnesses_or_none(snap_host_id, server_client),
+        _project_name_or_none(_optional_string(snap.get("project_id")), server_client),
     )
     return json.dumps(
         {
@@ -5517,6 +5519,7 @@ async def _session_get_info_via_rest(
             "workspace": snap.get("workspace"),
             "git_branch": snap.get("git_branch"),
             "project_id": snap.get("project_id"),
+            "project_name": project_name,
             # The outstanding approval prompts themselves (original
             # elicitation-request event dicts), plus a count for quick
             # status checks. Surfacing the prompts — not just a tally —

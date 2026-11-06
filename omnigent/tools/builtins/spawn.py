@@ -706,7 +706,7 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, project_id, "
+            "parent session, workspace, project_id, project_name, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
@@ -901,7 +901,7 @@ class SysSessionCreateTool(Tool):
     an optional ``title`` labels the session.
 
     Returns a handle ``{conversation_id, agent_id, title, status}``, plus
-    ``project_id`` for an independent session. The session runs
+    ``project_id`` and ``project_name`` for an independent session. The session runs
     asynchronously — use ``sys_session_get_history`` /
     ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
     further child work and ``sys_session_message`` for independent sessions.
@@ -941,14 +941,14 @@ class SysSessionCreateTool(Tool):
             "These placements require orchestration enabled "
             "and a sending session that is private or shared read-only, including its "
             "side-chat source chain. "
-            "project_id or project_name files an independent session in that project; "
-            "the project's agent, workspace and git defaults don't apply. "
+            "project_name files an independent session in your project with that name, "
+            "or in a new one; the project's agent, workspace and git defaults don't apply. "
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}, plus project_id "
-            "for an independent session; the "
+            "and project_name for an independent session; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send for children or sys_session_message for independent sessions."
@@ -1027,21 +1027,13 @@ class SysSessionCreateTool(Tool):
                                 "new session, e.g. 'auth refactor'."
                             ),
                         },
-                        "project_id": {
-                            "type": "string",
-                            "description": (
-                                "Optional existing project id to file an independent "
-                                "session (same_host or managed) in. Do not set "
-                                "project_name with it."
-                            ),
-                        },
                         "project_name": {
                             "type": "string",
                             "description": (
-                                "Optional project to file an independent session "
-                                "(same_host or managed) in, by name: your existing "
-                                "project with this name, or a new one if you have "
-                                "none. Do not set project_id with it."
+                                "Optional project, by the name shown in the UI (not "
+                                "the project id), to file an independent session "
+                                "(same_host or managed) in: your existing project "
+                                "with this name, or a new one if you have none."
                             ),
                         },
                         "message": {

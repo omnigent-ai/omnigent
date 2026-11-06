@@ -197,9 +197,8 @@ async def test_a_project_named_in_the_request_wins_over_the_source_project(
     )
 
 
-@pytest.mark.parametrize("by", ["id", "name"])
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
-    auth_client, auth_app, db_uri, monkeypatch, by
+    auth_client, auth_app, db_uri, monkeypatch
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -210,10 +209,9 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         "Elsewhere",
         {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
     )
-    tool_args = {"project_id": named} if by == "id" else {"project_name": "Elsewhere"}
 
     worker_id = await _start_worker(
-        auth_client, auth_app, db_uri, monkeypatch, source, tool_args=tool_args
+        auth_client, auth_app, db_uri, monkeypatch, source, tool_args={"project_name": "Elsewhere"}
     )
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
@@ -230,35 +228,41 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
         )
     )
     assert info["project_id"] == named
+    assert info["project_name"] == "Elsewhere"
 
 
-async def test_the_tool_refuses_another_users_project(auth_client, auth_app, db_uri, monkeypatch):
+async def test_a_name_only_another_user_has_gets_a_new_project(
+    auth_client, auth_app, db_uri, monkeypatch
+):
     auth_client.headers["X-Forwarded-Email"] = "bob"
     await _create_session_as(auth_client, "", "bob")
     bobs_project = await _project(auth_client, "Bob's work")
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
-    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
-    store = SqlAlchemyConversationStore(db_uri)
-    before = {conversation.id for conversation in store.list_conversations().data}
 
-    result = json.loads(
+    worker_id = await _start_worker(
+        auth_client,
+        auth_app,
+        db_uri,
+        monkeypatch,
+        source,
+        tool_args={"project_name": "Bob's work"},
+    )
+
+    store = SqlAlchemyConversationStore(db_uri)
+    worker = store.get_conversation(worker_id)
+    assert worker.project_id not in (None, bobs_project)
+    assert [c.id for c in store.list_conversations().data if c.project_id == bobs_project] == []
+    info = json.loads(
         await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {
-                    "agent_id": source["agent_id"],
-                    "placement": "managed",
-                    "project_id": bobs_project,
-                }
-            ),
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": worker_id}),
             server_client=auth_client,
             conversation_id=source["id"],
         )
     )
-
-    assert result == {"error": "project_not_found", "project_id": bobs_project}
-    assert {conversation.id for conversation in store.list_conversations().data} == before
+    # The project read is owner-scoped, so a name here means the project is Alice's.
+    assert info["project_name"] == "Bob's work"
 
 
 async def test_same_host_worker_in_a_named_project_starts_no_worktree(
@@ -293,7 +297,11 @@ async def test_same_host_worker_in_a_named_project_starts_no_worktree(
         await execute_tool(
             tool_name="sys_session_create",
             arguments=json.dumps(
-                {"agent_id": source["agent_id"], "placement": "same_host", "project_id": named}
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": "same_host",
+                    "project_name": "Elsewhere",
+                }
             ),
             server_client=auth_client,
             conversation_id=source["id"],

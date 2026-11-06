@@ -27,7 +27,7 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   Managed creation uses the server's configured default sandbox provider. An
   independent session is filed in its creator's project, if that project still
   exists; the project's agent and workspace defaults don't apply to it. A
-  `project_id` or `project_name` argument files it in that project instead, also
+  `project_name` argument files it in that project instead, also
   without the project's defaults.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,

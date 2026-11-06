@@ -9207,8 +9207,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     """
     ``sys_session_get_info`` projects ``GET /v1/sessions/{id}`` metadata
     and folds in live runner connectivity from ``GET
-    /v1/runners/{id}/status`` and host harness readiness from ``GET
-    /v1/hosts/{id}``.
+    /v1/runners/{id}/status``, host harness readiness from ``GET
+    /v1/hosts/{id}`` and the project name from ``GET /v1/projects/{id}``.
 
     Proves the full runner-dispatch path: read the session snapshot,
     derive the effective model (a per-session ``model_override`` wins
@@ -9255,6 +9255,8 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                 200,
                 json={"configured_harnesses": {"codex-native": True, "cursor-native": False}},
             )
+        if request.method == "GET" and request.url.path == "/v1/projects/proj_1":
+            return httpx.Response(200, json={"id": "proj_1", "name": "Auth work"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
@@ -9286,6 +9288,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
     }
     assert info["parent_session_id"] == "conv_parent"
     assert info["project_id"] == "proj_1"
+    assert info["project_name"] == "Auth work"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.
