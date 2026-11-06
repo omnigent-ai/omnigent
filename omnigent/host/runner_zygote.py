@@ -84,6 +84,7 @@ class ZygoteRunnerProc:
             manager._generation if zygote_generation is None else zygote_generation
         )
         self.returncode: int | None = None
+        self._poll_lock = threading.Lock()
         try:
             self._process: psutil.Process | None = psutil.Process(pid)
         except psutil.NoSuchProcess:
@@ -95,12 +96,14 @@ class ZygoteRunnerProc:
         Caches the first observed exit code in :attr:`returncode`, matching
         ``subprocess.Popen.poll`` semantics the daemon relies on.
         """
-        if self.returncode is not None:
+        # Publish a consumed exit status before another poll can replace it.
+        with self._poll_lock:
+            if self.returncode is not None:
+                return self.returncode
+            code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
+            if code is not None:
+                self.returncode = code
             return self.returncode
-        code = self._manager.poll(self.pid, zygote_generation=self._zygote_generation)
-        if code is not None:
-            self.returncode = code
-        return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
         """Block until the runner exits or *timeout* elapses.
@@ -161,8 +164,7 @@ class ZygoteRunnerProc:
 class ZygoteManager:
     """Owns the daemon's connection to the runner zygote forkserver.
 
-    Thread-safe: ``fork_runner`` is typically driven from ``asyncio.to_thread``
-    while ``poll`` runs on the event-loop thread, so every control exchange is
+    Thread-safe: all fork and poll control exchanges are synchronous and
     serialized under one lock.
 
     :param python_executable: Interpreter to launch the zygote with; defaults
@@ -288,6 +290,9 @@ class ZygoteManager:
                 stderr=log_fh,
                 # Avoid pinning the daemon's potentially transient cwd.
                 cwd="/",
+                # Own session, inherited by every fork: a hangup of the daemon's
+                # terminal must not reach runners or harnesses mid-turn.
+                **_proc.spawn_kwargs(),
             )
 
     def fork_runner(self, env: dict[str, str], log_path: str, workspace: str) -> ZygoteRunnerProc:
