@@ -399,6 +399,7 @@ def test_failed_install_suggests_package_mirror(
     assert r.returncode != 0
     assert "continued" not in r.stdout
     assert "Failed to fetch: https://pypi.org/simple/omnigent/" in r.stderr
+    assert "Omnigent could not be installed. Check the error above." in r.stderr
     assert "s3cr3t-token" not in r.stdout + r.stderr
     if rerun is None:
         assert "pypi.example.com" not in r.stderr
