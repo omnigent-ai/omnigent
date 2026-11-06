@@ -49,7 +49,10 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitSnapshot,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
+    CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY,
+)
 from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
@@ -488,6 +491,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
         "cancel_launch",
         "use_envelope",
         "provider_profile",
+        "bypass_label",
     ),
     [
         pytest.param(
@@ -497,6 +501,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
             cancel_launch,
             use_envelope,
             None,
+            False,
             id=f"{version}-{'cancel' if cancel_launch else 'launch'}-"
             f"{'envelope' if use_envelope else 'legacy'}",
         )
@@ -510,8 +515,16 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credentia
     ]
     + [
         pytest.param(
-            (0, 154, 0), [], True, False, True, "configured-workspace", id="configured-provider"
-        )
+            (0, 154, 0),
+            [],
+            True,
+            False,
+            True,
+            "configured-workspace",
+            False,
+            id="configured-provider",
+        ),
+        pytest.param((0, 154, 0), [], True, False, True, None, True, id="bypass-label"),
     ],
 )
 @pytest.mark.parametrize("rotated", [False, True], ids=["session-dir", "label-dir"])
@@ -525,6 +538,7 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     use_envelope: bool,
     rotated: bool,
     provider_profile: str | None,
+    bypass_label: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
@@ -571,6 +585,8 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     session_labels: dict[str, str] = (
         {codex_native_bridge.CODEX_NATIVE_BRIDGE_ID_LABEL_KEY: bridge_id} if rotated else {}
     )
+    if bypass_label:
+        session_labels[CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
     plan_mode = provider_profile is not None
     plan_rejected = plan_mode and rotated
     if plan_mode:
@@ -986,11 +1002,16 @@ async def test_auto_create_codex_terminal_uses_persisted_resume_launch_config(
     from omnigent.harnesses.codex_native.app_server import _format_codex_version
 
     assert launch_events[0].attributes["codex_cli_version"] == _format_codex_version(version)
+    # The resumed TUI carries no bypass flag, so the preload must apply the label's bypass.
     assert preload_calls == [
         (
             app_server.listen_url,
             thread_id,
-            ["--config", "approval_policy=on-request"],
+            [
+                *(["--dangerously-bypass-approvals-and-sandbox"] if bypass_label else []),
+                "--config",
+                "approval_policy=on-request",
+            ],
             "omnigent_databricks" if provider_profile else None,
         )
     ]
