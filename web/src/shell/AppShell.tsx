@@ -589,7 +589,8 @@ function AppShellImpl() {
     rightPanelMotionTimerRef.current = window.setTimeout(() => {
       rightPanelMotionTimerRef.current = null;
       setRightPanelVisibilityAnimating(false);
-    }, 350);
+      // Just past the rail's 200 ms transition in index.css.
+    }, 250);
   }, []);
   useEffect(
     () => () => {
@@ -1623,12 +1624,9 @@ function AppShellImpl() {
     setRightPanelOpenAnimated,
     terminalFirst,
   ]);
+  // One press toggles: a rail on screen closes, a closed or covered one opens
+  // with focus on its tabs.
   const toggleRightPanelFromHotkey = useCallback(() => {
-    if (rightPanelOpen && workspaceTabListRef.current?.contains(document.activeElement)) {
-      focusWorkspaceTabsOnOpenRef.current = false;
-      toggleRightPanel();
-      return;
-    }
     const hiddenByCompetingPanel =
       (!terminalFirst && panelOpen) || executionLogsOpen || filesPanelOpen;
     if (hiddenByCompetingPanel) {
@@ -1637,11 +1635,7 @@ function AppShellImpl() {
       revealRightPanel();
       return;
     }
-    if (rightPanelOpen) {
-      focusWorkspaceTabs();
-      return;
-    }
-    focusWorkspaceTabsOnOpenRef.current = !!conversationId && hasRailContent;
+    focusWorkspaceTabsOnOpenRef.current = !rightPanelOpen && !!conversationId && hasRailContent;
     toggleRightPanel();
   }, [
     rightPanelOpen,
@@ -1653,11 +1647,10 @@ function AppShellImpl() {
     hasRailContent,
     restoreSelectedFileUrl,
     revealRightPanel,
-    focusWorkspaceTabs,
     toggleRightPanel,
   ]);
 
-  // The hotkey (⌘⌥[) and command-palette toggle for the left sidebar. A peeking
+  // The hotkey (⌘B, or ⌘⌥[ in a browser) and command-palette toggle for the left sidebar. A peeking
   // sidebar counts as open, so toggling collapses it; either way peek is
   // cleared so we never leave `sidebarOpen` and `sidebarPeek` both true (a
   // floating-card layout the rest of the shell treats as a pushing panel).
@@ -1788,9 +1781,9 @@ function AppShellImpl() {
     setRightPanelMaximized((prev) => !prev);
   }, [rightPanelMaximized, sidebarOpen, restoreSidebarAfterMaximize, setSidebarOpen]);
 
-  // ⌘⌥[ / ⌘⌥] (Ctrl+Alt on Win/Linux) toggle the left and right sidebars. Bound
-  // here where both panels' open-state lives. A grid route replaces this rail
-  // with the grid's own workspace, which binds ⌘⌥] itself.
+  // ⌘B / ⇧⌘B in the desktop app (⌘⌥[ / ⌘⌥] in a browser) toggle the left and
+  // right sidebars. Bound here where both panels' open-state lives. A grid route
+  // replaces this rail with the grid's own workspace, which binds its own toggle.
   const gridRoute =
     gridId !== undefined && isFeatureEnabled(serverInfo, "grid_sessions_display_ui");
   useSidebarToggleHotkeys({
