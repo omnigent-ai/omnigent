@@ -656,8 +656,12 @@ async def _reconcile_shell_command(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     timeout_seconds: float,
-) -> None:
-    """Probe core turn state after earlier shell operations, without adding input."""
+) -> bool:
+    """
+    Probe core turn state after earlier shell operations, without adding input.
+
+    :returns: ``False`` when the app-server connection is gone and cannot answer.
+    """
     expected_turn_id = f"omnigent-shell-fence-{uuid.uuid4().hex}"
     try:
         # Shell and steer requests share Codex's per-thread FIFO. Unlike the
@@ -669,18 +673,25 @@ async def _reconcile_shell_command(
             )
     except CodexAppServerResponseError as error:
         if error.code != -32600:
-            return
+            return True
         if error.message == "no active turn to steer":
             reconcile_shell_command_state(bridge_dir, state, None)
-            return
+            return True
         prefix = f"expected active turn id `{expected_turn_id}` but found `"
         message = error.message or ""
         if message.startswith(prefix) and message.endswith("`"):
             active_turn_id = message[len(prefix) : -1]
             if active_turn_id and "`" not in active_turn_id:
                 reconcile_shell_command_state(bridge_dir, state, active_turn_id)
-    except (TimeoutError, OSError, RuntimeError, WebSocketException):
+        return True
+    except TimeoutError:
+        # A probe queued behind the shell times out until the shell settles.
         _logger.debug("Codex shell reconciliation remains unresolved", exc_info=True)
+    except (OSError, RuntimeError, WebSocketException):
+        # A lost connection never answers again; waiting would hold the input forever.
+        _logger.debug("Codex shell reconciliation lost the app-server", exc_info=True)
+        return False
+    return True
 
 
 async def _wait_for_shell_completion(
@@ -720,9 +731,13 @@ async def _wait_for_shell_completion(
             if not require_idle:
                 return current
             raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
-        await _reconcile_shell_command(
+        connected = await _reconcile_shell_command(
             client, bridge_dir, current, min(_SHELL_RECONCILIATION_RPC_SECONDS, remaining)
         )
+        if not connected:
+            if not require_idle:
+                return current
+            raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
         remaining = deadline - asyncio.get_running_loop().time()
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 

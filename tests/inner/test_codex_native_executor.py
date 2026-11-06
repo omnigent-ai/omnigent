@@ -1656,6 +1656,30 @@ async def test_shell_completion_waits_past_legacy_deadline(
     assert settled.pending_shell_command_id is None
 
 
+@pytest.mark.asyncio
+async def test_shell_wait_fails_undelivered_once_the_app_server_connection_is_gone(
+    tmp_path: Path,
+) -> None:
+    """A lost probe connection cannot confirm the shell, so the input is not held forever."""
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(initial, active_shell_turn_id="turn_shell")
+    write_bridge_state(tmp_path, pending)
+
+    class _DisconnectedClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            raise RuntimeError("Codex app-server client is not connected")
+
+    with pytest.raises(codex_native_executor._CodexNativeInputUndelivered):
+        await asyncio.wait_for(
+            codex_native_executor._wait_for_shell_completion(
+                _DisconnectedClient(), tmp_path, pending
+            ),
+            timeout=5,
+        )
+
+
 @pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
 def test_shell_wait_and_cancellation_do_not_consume_followup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool
