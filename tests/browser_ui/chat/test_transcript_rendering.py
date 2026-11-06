@@ -66,6 +66,41 @@ _CLIPPED_MERMAID_LABELS = """svg => [...svg.querySelectorAll('foreignObject')].f
     ));
     return clipped ? [label.textContent.trim()] : [];
 })"""
+_STREAMED_MERMAID_LINES = [
+    "flowchart TD\n",
+    "  A[Start] --> B[Read the config]\n",
+    "  B --> C{Is it valid?}\n",
+    "  C -->|yes| D[Run the job]\n",
+    "  C -->|no| E[Report the error]\n",
+]
+# Per painted frame: whether the diagram's source and the diagram show, and the shown one's height.
+_SAMPLE_DIAGRAM_FRAMES = """() => {
+    window.__diagramFrames = [];
+    const shown = (element) => !!element && element.checkVisibility({ visibilityProperty: true });
+    const record = () => {
+        const log = document.querySelector('[role="log"]');
+        const source = [...log.querySelectorAll('[data-streamdown="code-block"]')]
+            .find((block) => block.textContent.includes("flowchart TD"));
+        const diagram = log.querySelector('[data-streamdown="mermaid-block"]');
+        const visible = shown(diagram) ? diagram : shown(source) ? source : null;
+        window.__diagramFrames.push({
+            source: shown(source),
+            diagram: shown(diagram),
+            drawn: shown(log.querySelector('svg[id^="mermaid-"]')),
+            height: visible ? Math.round(visible.getBoundingClientRect().height) : null,
+        });
+    };
+    // Read layout after the app's resize observers have run, as the frame paints.
+    const sample = () => {
+        const observer = new ResizeObserver(() => {
+            observer.disconnect();
+            record();
+        });
+        observer.observe(document.body);
+        requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+}"""
 _POINTER_CONTEXTS = [
     pytest.param(
         True,
@@ -394,6 +429,57 @@ def test_mermaid_recovery_uses_the_real_browser_renderer(
         )
         expect(escaped).to_contain_text("one semicolon escaped as #59; (first on line 3)")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
+
+
+def test_streaming_mermaid_shows_its_source_until_the_diagram_draws(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A Mermaid fence streams as code, and its diagram replaces the code once, already drawn.
+
+    Drawing each partial source moved the text around it on every update, and an
+    empty box and a spinner showed before each first drawing.
+    """
+    chat = chat_session_contract
+    response_id = "streamed-diagram"
+    user = message_item("streamed-diagram-user", "user", "Draw the flow.", response_id=response_id)
+    chat.set_items([user])
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": "Here is the flow:\n\n"}})
+    expect(page.locator('[role="log"] p', has_text="Here is the flow")).to_be_visible(
+        timeout=10_000
+    )
+    page.evaluate(_SAMPLE_DIAGRAM_FRAMES)
+    for delta in ["```mermaid\n", *_STREAMED_MERMAID_LINES, "```\n\nThat's the flow.\n"]:
+        chat.emit({"event": "response.output_text.delta", "data": {"delta": delta}})
+        page.wait_for_timeout(300)
+    expect(page.locator('[role="log"] svg[id^="mermaid-"]')).to_be_visible(timeout=10_000)
+    page.wait_for_timeout(300)
+
+    frames = page.evaluate("() => window.__diagramFrames")
+    early = [frame["height"] for frame in frames if frame["diagram"] and not frame["drawn"]]
+    assert not early, f"the diagram's box showed before it drew: {early}"
+    shown = [frame for frame in frames if frame["source"] or frame["drawn"]]
+    assert shown, "neither the source nor the diagram showed"
+    after_first = frames[frames.index(shown[0]) :]
+    assert all(frame["source"] or frame["drawn"] for frame in after_first), (
+        "a frame showed neither the source nor the diagram"
+    )
+    kinds = [frame["diagram"] for frame in shown]
+    assert kinds == sorted(kinds), "the source showed again after the diagram"
+    source = [frame["height"] for frame in shown if not frame["diagram"]]
+    diagram = [frame["height"] for frame in shown if frame["diagram"]]
+    grew = len(set(source)) > 1 and source == sorted(source)
+    assert grew, f"the source didn't grow as it streamed: {source}"
+    assert max(diagram) - min(diagram) <= 1, f"the diagram changed size once shown: {diagram}"
 
 
 @pytest.mark.parametrize("activation", ["click", "keyboard"])

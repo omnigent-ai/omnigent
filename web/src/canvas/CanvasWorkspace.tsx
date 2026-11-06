@@ -146,6 +146,9 @@ export function CanvasWorkspace({
         ref={container}
         className="canvas-workspace relative flex min-h-0 min-w-0 flex-1"
         data-testid="canvas-workspace"
+        // A focused conversation restores the board on Escape, so page-wide Escape
+        // shortcuts leave it alone.
+        data-escape-owner={focused ? "" : undefined}
       >
         <section
           aria-label="Canvas pane"
