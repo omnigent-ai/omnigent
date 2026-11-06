@@ -470,8 +470,11 @@ if it is already enabled.
 
 On an open, ready-for-review PR authored by `omni-resolve-agent`, submit your
 review comments and then post `/address` as a new PR conversation comment.
-Maintainers and people listed in [`.github/OTTO_REVIEWERS`](.github/OTTO_REVIEWERS)
-can use this command without granting contributors repository Write access.
+Maintainers and people listed in the `OTTO_ADDRESS_REVIEWERS` Actions repository
+variable can use this command without granting contributors repository Write
+access. Configure it in `omnigent-ai/omnigent` under **Settings → Secrets and
+variables → Actions → Variables**, using comma- or newline-separated GitHub
+usernames. An unset or empty variable permits only maintainers.
 
 Otto collects outstanding feedback from all listed reviewers and maintainers,
 including conversation comments, submitted reviews, and unresolved inline

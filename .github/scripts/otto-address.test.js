@@ -2,10 +2,11 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const authorize = require("./otto-address.js");
 
-async function run({ comment = {}, pull = {}, files = {}, apiFailure = false } = {}) {
+async function run({ comment = {}, pull = {}, files = {}, apiFailure = false, reviewers = "Reader,second-reader\nthird-reader" } = {}) {
   const outputs = {};
   const calls = [];
   await authorize({
+    reviewers,
     context: {
       repo: { owner: "omnigent-ai", repo: "omnigent" },
       payload: { issue: { number: 7, pull_request: {} }, comment: { id: 42 } },
@@ -26,9 +27,8 @@ async function run({ comment = {}, pull = {}, files = {}, apiFailure = false } =
       repos: { getContent: async ({ path, ref }) => {
         calls.push({ path, ref });
         if (apiFailure) throw new Error("API unavailable");
-        return { data: { content: Buffer.from(files[path] ?? (
-          path === ".github/MAINTAINER" ? "maintainer\n" : "# Feedback only\nReader\n"
-        )).toString("base64") } };
+        assert.equal(path, ".github/MAINTAINER");
+        return { data: { content: Buffer.from(files[path] ?? "maintainer\n").toString("base64") } };
       } },
     } },
   });
@@ -38,14 +38,24 @@ async function run({ comment = {}, pull = {}, files = {}, apiFailure = false } =
 test("allows an explicitly listed reader without consulting repository Write permissions", async () => {
   const { outputs, calls } = await run();
   assert.equal(outputs.authorized, "true");
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 1);
   assert.ok(calls.every(call => call.ref === "main"));
 });
 
 test("maintainers do not need a duplicate allowlist entry", async () => {
-  const { outputs } = await run({ comment: { user: { login: "maintainer", type: "User" } } });
+  const { outputs } = await run({ reviewers: "", comment: { user: { login: "maintainer", type: "User" } } });
   assert.equal(outputs.authorized, "true");
 });
+
+test("an unset variable does not authorize contributors", async () => {
+  assert.deepEqual((await run({ reviewers: "" })).outputs, {});
+});
+
+for (const login of ["second-reader", "third-reader"]) {
+  test(`accepts comma- and newline-separated usernames: ${login}`, async () => {
+    assert.equal((await run({ comment: { user: { login, type: "User" } } })).outputs.authorized, "true");
+  });
+}
 
 for (const comment of [
   { body: "/address anything" }, { body: "quoted /address" },

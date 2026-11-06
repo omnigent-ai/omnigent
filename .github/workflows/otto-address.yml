@@ -30,9 +30,13 @@ jobs:
       - name: Authorize command
         id: authorize
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          OTTO_ADDRESS_REVIEWERS: ${{ vars.OTTO_ADDRESS_REVIEWERS }}
         with:
           script: |
-            await require('./.github/scripts/otto-address.js')({ github, context, core });
+            await require('./.github/scripts/otto-address.js')({
+              github, context, core, reviewers: process.env.OTTO_ADDRESS_REVIEWERS,
+            });
       - name: Mint private workflow dispatch token
         if: steps.authorize.outputs.authorized == 'true'
         id: dispatch-token
