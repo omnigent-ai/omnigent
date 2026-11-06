@@ -1,4 +1,4 @@
-import { type CSSProperties, useState } from "react";
+import { type CSSProperties, useEffect, useState } from "react";
 import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -19,6 +19,11 @@ import { useCreateHostDirectory } from "@/hooks/useHostFilesystem";
 import type { ProjectConfig } from "@/lib/projectsApi";
 import { joinPath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+
+interface WorkspaceSelection {
+  hostId: string;
+  path: string;
+}
 
 function friendlyDirectoryError(error: unknown): string {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
@@ -89,14 +94,27 @@ export function NewProjectButton({
   const [name, setName] = useState("");
   const [icon, setIcon] = useState<string | undefined>(undefined);
   const [emojiOpen, setEmojiOpen] = useState(false);
-  const [workspace, setWorkspace] = useState("");
+  const [dialogHostId, setDialogHostId] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceSelection | null>(null);
+  const [createdWorkspace, setCreatedWorkspace] = useState<
+    | (WorkspaceSelection & {
+        projectName: string;
+      })
+    | null
+  >(null);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   const [createWorkspaceFolder, setCreateWorkspaceFolder] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const createProject = useCreateProject();
   const createDirectory = useCreateHostDirectory();
   const isPending = createProject.isPending || createDirectory.isPending;
-  const folderCreationDisabled = isPending || (!hostsLoading && hostId === null);
+  const folderCreationDisabled = isPending || (!hostsLoading && dialogHostId === null);
+
+  useEffect(() => {
+    if (open && dialogHostId === null && hostId !== null) {
+      setDialogHostId(hostId);
+    }
+  }, [dialogHostId, hostId, open]);
 
   const submit = async () => {
     const trimmed = name.trim();
@@ -105,26 +123,32 @@ export function NewProjectButton({
 
     let selectedWorkspace = workspace;
     if (createWorkspaceFolder) {
-      if (hostId === null) {
+      if (dialogHostId === null) {
         setSubmitError("Connect a host before creating a working directory.");
         return;
       }
-      try {
-        selectedWorkspace = await createDirectory.mutateAsync({
-          hostId,
-          path: joinPath("~", trimmed),
-        });
-      } catch (error) {
-        setSubmitError(friendlyDirectoryError(error));
-        return;
+      if (createdWorkspace?.hostId === dialogHostId && createdWorkspace.projectName === trimmed) {
+        selectedWorkspace = createdWorkspace;
+      } else {
+        try {
+          const path = await createDirectory.mutateAsync({
+            hostId: dialogHostId,
+            path: joinPath("~", trimmed),
+          });
+          selectedWorkspace = { hostId: dialogHostId, path };
+          setCreatedWorkspace({ ...selectedWorkspace, projectName: trimmed });
+        } catch (error) {
+          setSubmitError(friendlyDirectoryError(error));
+          return;
+        }
       }
     }
 
     const config: ProjectConfig = {};
     if (icon) config.icon = icon;
-    if (selectedWorkspace && hostId !== null) {
-      config.host_id = hostId;
-      config.workspace = selectedWorkspace;
+    if (selectedWorkspace) {
+      config.host_id = selectedWorkspace.hostId;
+      config.workspace = selectedWorkspace.path;
     }
     createProject.mutate(
       { name: trimmed, config: Object.keys(config).length > 0 ? config : undefined },
@@ -133,7 +157,9 @@ export function NewProjectButton({
           setOpen(false);
           setName("");
           setIcon(undefined);
-          setWorkspace("");
+          setDialogHostId(null);
+          setWorkspace(null);
+          setCreatedWorkspace(null);
           setWorkspacePickerOpen(false);
           setCreateWorkspaceFolder(false);
           setSubmitError(null);
@@ -158,7 +184,9 @@ export function NewProjectButton({
               e.stopPropagation();
               setName("");
               setIcon(undefined);
-              setWorkspace("");
+              setDialogHostId(hostId);
+              setWorkspace(null);
+              setCreatedWorkspace(null);
               setWorkspacePickerOpen(false);
               setCreateWorkspaceFolder(false);
               setSubmitError(null);
@@ -299,10 +327,10 @@ export function NewProjectButton({
                 aria-label={`Working directory: ${
                   createWorkspaceFolder
                     ? joinPath("~", name.trim() || "Project name")
-                    : workspace || "Not selected"
+                    : workspace?.path || "Not selected"
                 }`}
                 onClick={() => setWorkspacePickerOpen(true)}
-                disabled={createWorkspaceFolder || hostId === null || isPending}
+                disabled={createWorkspaceFolder || dialogHostId === null || isPending}
                 className="flex h-10 w-full items-center justify-between gap-3 rounded-lg border border-input bg-transparent px-3 text-ui outline-none transition-colors hover:bg-muted/50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <span className="flex min-w-0 items-center gap-2">
@@ -310,7 +338,7 @@ export function NewProjectButton({
                   <span className="truncate">
                     {createWorkspaceFolder
                       ? joinPath("~", name.trim() || "Project name")
-                      : workspace || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
+                      : workspace?.path || (hostsLoading ? "Loading hosts…" : "Choose a folder…")}
                   </span>
                 </span>
                 <span className="shrink-0 text-muted-foreground text-sm">Browse</span>
@@ -318,9 +346,13 @@ export function NewProjectButton({
               <WorkspacePickerDialog
                 open={workspacePickerOpen}
                 onOpenChange={setWorkspacePickerOpen}
-                hostId={hostId}
-                initialPath={workspace || undefined}
-                onConfirm={setWorkspace}
+                hostId={dialogHostId}
+                initialPath={workspace?.path}
+                onConfirm={(path) => {
+                  if (dialogHostId !== null) {
+                    setWorkspace({ hostId: dialogHostId, path });
+                  }
+                }}
                 description="Choose a default working directory for sessions in this project."
               />
             </CollapsibleContent>

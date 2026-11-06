@@ -25,13 +25,6 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   }),
 }));
 
-vi.mock("@/hooks/useHosts", () => ({
-  useHosts: () => ({
-    data: [{ host_id: "host_1", name: "Laptop", owner: "me", status: "online" }],
-    isLoading: false,
-  }),
-}));
-
 vi.mock("@/components/ProjectIconPicker", () => ({
   EmojiPicker: () => null,
 }));
@@ -51,13 +44,20 @@ vi.mock("./WorkspacePickerDialog", () => ({
     ) : null,
 }));
 
-function renderButton() {
-  render(
+function projectButton(hostId: string | null) {
+  return (
     <TooltipProvider>
-      <NewProjectButton onCreated={vi.fn()} hostId="host_1" hostsLoading={false} />
-    </TooltipProvider>,
+      <NewProjectButton onCreated={vi.fn()} hostId={hostId} hostsLoading={false} />
+    </TooltipProvider>
   );
+}
+
+function renderButton() {
+  const view = render(projectButton("host_1"));
   fireEvent.click(screen.getByRole("button", { name: "New project" }));
+  return {
+    rerenderHost: (hostId: string | null) => view.rerender(projectButton(hostId)),
+  };
 }
 
 beforeEach(() => {
@@ -74,12 +74,14 @@ beforeEach(() => {
 
 describe("NewProjectButton", () => {
   it("stores a selected working directory in the new project config", async () => {
-    renderButton();
+    const { rerenderHost } = renderButton();
 
     expect(screen.queryByTestId("new-project-workspace")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
     fireEvent.click(screen.getByRole("button", { name: "Working directory: Not selected" }));
     fireEvent.click(screen.getByRole("button", { name: "Select test folder" }));
+    rerenderHost("host_2");
+    rerenderHost(null);
     fireEvent.change(screen.getByPlaceholderText("Project name…"), {
       target: { value: "Garden" },
     });
@@ -136,6 +138,36 @@ describe("NewProjectButton", () => {
       },
       expect.any(Object),
     );
+  });
+
+  it("reuses a created folder when project creation is retried", async () => {
+    let projectAttempts = 0;
+    mocks.createProject.mockImplementation(
+      (input: { name: string }, options?: { onSuccess?: (project: { name: string }) => void }) => {
+        projectAttempts += 1;
+        if (projectAttempts === 2) {
+          options?.onSuccess?.({ name: input.name });
+        }
+      },
+    );
+    renderButton();
+
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+      target: { value: "Garden" },
+    });
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Create a folder using the project name",
+      }),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+    await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+    await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(2));
+    expect(mocks.createDirectory).toHaveBeenCalledTimes(1);
   });
 
   it("turns a duplicate folder error into a short actionable message", async () => {
