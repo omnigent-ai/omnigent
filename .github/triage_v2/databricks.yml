@@ -56,6 +56,9 @@ variables:
   allow_github_writes:
     description: Hard gate for GitHub mutations. Keep false until rollout approval.
     default: "false"
+  schedule_timezone:
+    description: Timezone for the daily 06:00 refresh.
+    default: UTC
   schedule_pause_status:
     description: Keep PAUSED until App authentication is verified manually.
     default: PAUSED

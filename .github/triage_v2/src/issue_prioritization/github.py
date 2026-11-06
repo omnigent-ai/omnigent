@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from collections.abc import Callable
+from dataclasses import replace
+from email.utils import parsedate_to_datetime
 from typing import Protocol
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -43,7 +47,9 @@ class GitHubLabels(Protocol):
         labels_remove: tuple[str, ...],
     ) -> None: ...
 
-    def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
+    def sync_issue_comment(
+        self, issue_number: int, body: str, state: BotState | None = None
+    ) -> tuple[int, str, bool]: ...
 
 
 class PriorityLabelHistory(Protocol):
@@ -56,12 +62,22 @@ class GitHubClient:
         token: str,
         repo: str,
         transport: Callable[[str, str, object | None], object] | None = None,
+        *,
+        max_attempts: int | None = None,
     ) -> None:
         self.token = token.strip()
         if not self.token:
             raise ValueError("GitHub token must not be empty")
         self.repo = repo
         self.transport = transport or self._request
+        self.max_attempts = (
+            int(os.environ.get("TRIAGE_GITHUB_MAX_ATTEMPTS", "4"))
+            if max_attempts is None
+            else max_attempts
+        )
+        if self.max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        self._events: dict[int, tuple[dict[str, object], ...]] = {}
 
     def sync_missing_labels(self, manifest: LabelManifest) -> None:
         existing = self._repo_labels()
@@ -282,68 +298,73 @@ class GitHubClient:
             )
 
     def upsert_issue_comment(self, issue_number: int, body: str) -> int:
-        page = 1
-        while True:
-            value = self.transport(
-                "GET",
-                f"/issues/{issue_number}/comments?per_page=100&page={page}",
-                None,
-            )
-            if not isinstance(value, list):
-                raise ValueError("GitHub issue comments response must be an array")
-            for comment in value:
-                if not isinstance(comment, dict) or not is_triage_comment(
-                    str(comment.get("body", ""))
-                ):
-                    continue
-                comment_id = int(comment["id"])
-                existing_body = str(comment.get("body", ""))
-                body = preserve_needs_info_deadline(body, existing_body)
-                if existing_body != body:
-                    self.transport("PATCH", f"/issues/comments/{comment_id}", {"body": body})
-                return comment_id
-            if len(value) < 100:
-                break
-            page += 1
+        return self.sync_issue_comment(issue_number, body)[0]
+
+    def sync_issue_comment(
+        self, issue_number: int, body: str, state: BotState | None = None
+    ) -> tuple[int, str, bool]:
+        if state and state.comment_id and state.comment_body is not None:
+            body = preserve_needs_info_deadline(body, state.comment_body)
+            if body == state.comment_body:
+                return state.comment_id, body, False
+            try:
+                self.transport("PATCH", f"/issues/comments/{state.comment_id}", {"body": body})
+                return state.comment_id, body, True
+            except GitHubNotFound:
+                pass  # Rediscover or recreate a deleted cached comment.
+        for comment in self.issue_comments(issue_number):
+            existing_body = str(comment.get("body", ""))
+            if not is_triage_comment(existing_body):
+                continue
+            comment_id = int(comment["id"])
+            body = preserve_needs_info_deadline(body, existing_body)
+            changed = existing_body != body
+            if changed:
+                self.transport("PATCH", f"/issues/comments/{comment_id}", {"body": body})
+            return comment_id, body, changed
         created = self.transport("POST", f"/issues/{issue_number}/comments", {"body": body})
         if not isinstance(created, dict) or not created.get("id"):
             raise ValueError("GitHub issue comment response must include an id")
-        return int(created["id"])
+        return int(created["id"]), body, True
+
+    def _issue_events(self, issue_number: int) -> tuple[dict[str, object], ...]:
+        if issue_number in self._events:
+            return self._events[issue_number]
+        events = []
+        page = 1
+        while True:
+            value = self.transport(
+                "GET", f"/issues/{issue_number}/events?per_page=100&page={page}", None
+            )
+            if not isinstance(value, list):
+                raise ValueError("GitHub issue events response must be an array")
+            events.extend(event for event in value if isinstance(event, dict))
+            if len(value) < 100:
+                self._events[issue_number] = tuple(events)
+                return self._events[issue_number]
+            page += 1
 
     def priority_label_actor(self, issue_number: int, priority: str) -> str | None:
         actor = None
         latest_event_id = -1
-        page = 1
-        while True:
-            value = self.transport(
-                "GET",
-                f"/issues/{issue_number}/events?per_page=100&page={page}",
-                None,
-            )
-            if not isinstance(value, list):
-                raise ValueError("GitHub issue events response must be an array")
-            for event in value:
-                if not isinstance(event, dict):
-                    continue
-                label = event.get("label")
-                if not isinstance(label, dict) or label.get("name") != priority:
-                    continue
-                event_id = int(event.get("id") or 0)
-                if event_id < latest_event_id:
-                    continue
-                latest_event_id = event_id
-                if event.get("event") == "unlabeled":
-                    actor = None
-                elif event.get("event") == "labeled":
-                    event_actor = event.get("actor")
-                    actor = (
-                        str(event_actor["login"])
-                        if isinstance(event_actor, dict) and event_actor.get("login")
-                        else None
-                    )
-            if len(value) < 100:
-                return actor
-            page += 1
+        for event in self._issue_events(issue_number):
+            label = event.get("label")
+            if not isinstance(label, dict) or label.get("name") != priority:
+                continue
+            event_id = int(event.get("id") or 0)
+            if event_id < latest_event_id:
+                continue
+            latest_event_id = event_id
+            if event.get("event") == "unlabeled":
+                actor = None
+            elif event.get("event") == "labeled":
+                event_actor = event.get("actor")
+                actor = (
+                    str(event_actor["login"])
+                    if isinstance(event_actor, dict) and event_actor.get("login")
+                    else None
+                )
+        return actor
 
     def _repo_labels(self) -> set[str]:
         labels: set[str] = set()
@@ -379,16 +400,50 @@ class GitHubClient:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
         )
-        try:
-            with urlopen(request, timeout=30) as response:
-                content = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode(errors="replace")
-            message = f"GitHub API {method} {path} failed: {exc.code} {detail}"
-            if exc.code == 404:
-                raise GitHubNotFound(message) from exc
-            raise RuntimeError(message) from exc
-        return json.loads(content) if content else None
+        for attempt in range(self.max_attempts):
+            delay = min(2**attempt, 60)
+            try:
+                with urlopen(request, timeout=30) as response:
+                    content = response.read()
+                return json.loads(content) if content else None
+            except HTTPError as exc:
+                detail = exc.read().decode(errors="replace")
+                message = f"GitHub API {method} {path} failed: {exc.code} {detail}"
+                if exc.code == 404:
+                    raise GitHubNotFound(message) from exc
+                limited = exc.code == 403 and (
+                    "secondary rate limit" in detail.lower()
+                    or "abuse" in detail.lower()
+                    or exc.headers.get("Retry-After") is not None
+                    or exc.headers.get("x-ratelimit-remaining") == "0"
+                )
+                if not (exc.code == 429 or limited or 500 <= exc.code < 600):
+                    raise RuntimeError(message) from exc
+                if attempt + 1 == self.max_attempts:
+                    raise RuntimeError(message) from exc
+                if exc.code == 429 or limited:
+                    delay = max(delay, 60)
+                retry_after = exc.headers.get("Retry-After")
+                reset = exc.headers.get("x-ratelimit-reset")
+                if retry_after:
+                    try:
+                        delay = max(0, float(retry_after))
+                    except ValueError:
+                        delay = max(0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+                if reset:
+                    delay = max(delay, float(reset) - time.time())
+            except (TimeoutError, URLError) as exc:
+                if attempt + 1 == self.max_attempts:
+                    raise RuntimeError(f"GitHub API {method} {path} failed: {exc}") from exc
+            time.sleep(delay)
+            # A lost response may follow a successful comment creation.
+            if method == "POST" and path.startswith("/issues/") and path.endswith("/comments"):
+                issue_number = int(path.split("/")[2])
+                if isinstance(payload, dict):
+                    for comment in self.issue_comments(issue_number):
+                        if comment.get("body") == payload.get("body") and comment.get("id"):
+                            return comment
+        raise AssertionError("unreachable")
 
 
 class GitHubLegacyPriorityOwnership:
@@ -425,12 +480,18 @@ class GitHubMutationSink:
         self.client.sync_missing_labels(self.manifest)
         ranked = {item.issue.number: item for item in run.ranked}
         states = self.states.load()
-        updated = []
+        updated: dict[int, BotState] = {}
         applied = []
         skipped: list[int] = []
+        mutated = 0
+        unchanged = 0
+        seen: set[int] = set()
         try:
             for proposed in run.mutations:
                 issue_number = proposed.target.issue_number
+                if issue_number in seen:
+                    continue
+                seen.add(issue_number)
                 try:
                     current_labels = self.client.issue_labels(issue_number)
                     state = self.planner.resolve_state(
@@ -446,24 +507,38 @@ class GitHubMutationSink:
                         self.client.apply_labels(issue_number, plan.labels_add, plan.labels_remove)
                     applied.append(plan)
                     previous = states.get(issue_number)
-                    if plan.next_state != previous and (
-                        previous is not None or plan.next_state.has_ownership
+                    next_state = plan.next_state
+                    # Retain label ownership even if the comment update fails.
+                    if next_state != previous and (
+                        previous is not None or next_state.has_ownership
                     ):
-                        updated.append(plan.next_state)
-                    states[issue_number] = plan.next_state
+                        updated[issue_number] = next_state
+                    changed = bool(plan.labels_add or plan.labels_remove)
                     labels_after = _labels_after(current_labels, plan)
                     if item := ranked.get(issue_number):
-                        self.client.upsert_issue_comment(
+                        comment_id, body, comment_changed = self.client.sync_issue_comment(
                             issue_number,
                             build_triage_comment(item, plan, labels_after, run.scored_at),
+                            state,
                         )
+                        next_state = replace(next_state, comment_id=comment_id, comment_body=body)
+                        changed = changed or comment_changed
+                        if next_state != previous:
+                            updated[issue_number] = next_state
+                    states[issue_number] = next_state
+                    mutated += int(changed)
+                    unchanged += int(not changed)
                 except GitHubNotFound:
                     # The bronze snapshot lags GitHub: an issue deleted or
                     # transferred since ingestion 404s on this live re-check.
                     # Skip it rather than abort the whole apply.
                     skipped.append(issue_number)
         finally:
-            self.states.upsert(updated)
+            self.states.upsert(list(updated.values()))
+        print(
+            f"GitHub apply: mutated={mutated}, skipped_unchanged={unchanged}, "
+            f"skipped_missing={len(skipped)}"
+        )
         if skipped:
             print(
                 f"Skipped {len(skipped)} issue(s) gone from GitHub (deleted/transferred): {skipped}"

@@ -276,10 +276,10 @@ def test_event_fetches_related_issues_for_intake_and_edits(
             labels.update(labels_add)
             labels.difference_update(labels_remove)
 
-        def upsert_issue_comment(self, number, body):
+        def sync_issue_comment(self, number, body, state=None):
             assert "Automated triage" in body
             writes.append("triage_comment")
-            return 1
+            return 1, body, True
 
         def assign_issue(self, *args):
             pytest.fail("Edit runs must not assign an issue")
@@ -339,6 +339,7 @@ def test_event_fetches_related_issues_for_intake_and_edits(
             raise HTTPError(request.full_url, corpus_status, "Unavailable", {}, None)
 
         monkeypatch.setattr(github, "urlopen", fail_request)
+        monkeypatch.setattr(github.time, "sleep", lambda _: None)
         with pytest.raises(RuntimeError) as raised:
             event.main()
         assert isinstance(raised.value.__cause__, HTTPError)

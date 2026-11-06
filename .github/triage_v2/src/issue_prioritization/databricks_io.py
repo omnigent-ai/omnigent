@@ -35,7 +35,8 @@ reported_type STRING, type_label_mismatch BOOLEAN, evidence_kind STRING,
 information_status STRING, missing_information ARRAY<STRING>,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
-_BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, components ARRAY<STRING>"""
+_BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, components ARRAY<STRING>,
+comment_id BIGINT, comment_body STRING"""
 
 
 class SparkIssueSource:
@@ -253,6 +254,8 @@ class SparkBotStateRepository:
                 issue_number=int(row.issue_number),
                 priority=str(row.priority) if row.priority else None,
                 components=tuple(row.components or ()),
+                comment_id=getattr(row, "comment_id", None),
+                comment_body=getattr(row, "comment_body", None),
             )
             for row in self.spark.table(self.table).collect()
         }
@@ -263,6 +266,8 @@ class SparkBotStateRepository:
                 "issue_number": state.issue_number,
                 "priority": state.priority,
                 "components": list(state.components),
+                "comment_id": state.comment_id,
+                "comment_body": state.comment_body,
             }
             for state in states
         ]
@@ -272,7 +277,15 @@ class SparkBotStateRepository:
             frame = self.spark.createDataFrame(rows, schema=_BOT_STATE_SCHEMA)
             frame.write.format("delta").mode("overwrite").saveAsTable(self.table)
             return
-        frame = self.spark.createDataFrame(rows, schema=self.spark.table(self.table).schema)
+        columns = self.spark.table(self.table).columns
+        additions = [
+            f"{name} {kind}"
+            for name, kind in (("comment_id", "BIGINT"), ("comment_body", "STRING"))
+            if name not in columns
+        ]
+        if additions:
+            self.spark.sql(f"ALTER TABLE {self.table} ADD COLUMNS ({', '.join(additions)})")
+        frame = self.spark.createDataFrame(rows, schema=_BOT_STATE_SCHEMA)
         view = "issue_priority_bot_state_updates"
         frame.createOrReplaceTempView(view)
         self.spark.sql(

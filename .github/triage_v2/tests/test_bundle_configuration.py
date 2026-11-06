@@ -6,7 +6,7 @@ ROOT = Path(__file__).parents[1]
 WORKFLOWS = ROOT.parent / "workflows"
 
 
-def test_trigger_waits_for_bronze_table_updates_and_is_safe_by_default() -> None:
+def test_daily_schedule_is_safe_by_default_and_preserves_prod_overrides() -> None:
     bundle = (ROOT / "databricks.yml").read_text()
     job = (ROOT / "resources/issue_prioritization.job.yml").read_text()
 
@@ -15,7 +15,17 @@ def test_trigger_waits_for_bronze_table_updates_and_is_safe_by_default() -> None
     assert "scheduled_mode:\n" in bundle
     assert "default: dry_run" in bundle
     assert "pause_status: ${var.schedule_pause_status}" in job
-    assert "table_update:" in job
+    assert "table_update:" not in job
+    assert "      trigger:" not in job
+    assert "      schedule:" in job
+    assert 'quartz_cron_expression: "0 0 6 * * ?"' in job
+    assert "timezone_id: ${var.schedule_timezone}" in job
+    assert "  schedule_timezone:" in bundle
+    assert "default: UTC" in bundle
+    assert "max_concurrent_runs: 1" in job
+    prod = bundle.split("  prod:", 1)[1]
+    assert "schedule_pause_status: UNPAUSED" in prod
+    assert "scheduled_mode: apply" in prod
     assert "${var.catalog}.${var.schema}.${var.source_table}" in job
     assert "default: ${var.scheduled_mode}" in job
 

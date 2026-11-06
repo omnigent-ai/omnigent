@@ -52,9 +52,9 @@ class FakeClient:
     def apply_labels(self, issue_number, labels_add, labels_remove):
         self.applied.append((issue_number, labels_add, labels_remove))
 
-    def upsert_issue_comment(self, issue_number, body):
+    def sync_issue_comment(self, issue_number, body, state=None):
         self.comments.append((issue_number, body))
-        return 42
+        return 42, body, True
 
 
 def _manifest() -> LabelManifest:
@@ -272,7 +272,7 @@ def test_request_maps_404_to_not_found_and_keeps_other_errors_generic(monkeypatc
 
         return _open
 
-    client = GitHubClient("token", "org/repo")
+    client = GitHubClient("token", "org/repo", max_attempts=1)
 
     monkeypatch.setattr(github_module, "urlopen", raise_http(404))
     with pytest.raises(GitHubNotFound):
@@ -514,3 +514,199 @@ def test_client_creates_and_updates_one_marker_comment(author_type: str) -> None
     assert [method for method, _, _ in calls].count("POST") == 1
     assert [method for method, _, _ in calls].count("PATCH") == 1
     assert comments == [{"id": 42, "body": second, "user": {"type": author_type}}]
+
+
+@pytest.mark.parametrize("needs_info", [False, True])
+def test_apply_unchanged_rerun_has_no_writes_or_comment_reads(needs_info, capsys):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    from issue_prioritization.domain import InformationStatus
+
+    calls = []
+    labels = {"Bug", "P1-high", "comp:db"}
+    if needs_info:
+        labels.add("needs-info")
+    comments = []
+
+    def transport(method, path, payload):
+        calls.append((method, path))
+        if path.startswith("/labels?"):
+            return [{"name": label.name} for label in _manifest().labels]
+        if method == "GET" and path == "/issues/1":
+            return {"labels": [{"name": label} for label in labels]}
+        if method == "GET" and "/comments?" in path:
+            return comments
+        if method == "POST" and path == "/issues/1/comments":
+            comments.append({"id": 42, "body": payload["body"]})
+            return comments[-1]
+        raise AssertionError((method, path))
+
+    states = FakeStates({1: BotState(1, "P1-high", ("comp:db",))})
+    planner = MutationPlanner(_manifest(), states)
+    issue = Issue(
+        1,
+        "Session fails",
+        "https://github.com/org/repo/issues/1",
+        IssueType.BUG,
+        Impact.HIGH,
+        information_status=(
+            InformationStatus.NEEDS_INFO if needs_info else InformationStatus.SUFFICIENT
+        ),
+    )
+    item = RankedIssue(1, 1, issue, ScoreResult(Decimal(60), Priority.P1, ()))
+    proposed = planner.plan_one(
+        MutationTarget(1, "P1-high", ("comp:db",)), tuple(labels), states.values[1]
+    )
+    run = PipelineRun("run", PipelineMode.APPLY, datetime.now(UTC), (item,), 0, (proposed,))
+    sink = GitHubMutationSink(
+        GitHubClient("token", "org/repo", transport), _manifest(), planner, states
+    )
+    sink.apply(run)
+    assert states.updated[-1].comment_id == 42
+    assert len(comments) == 1
+    calls.clear()
+
+    sink.apply(replace(run, scored_at=run.scored_at + timedelta(days=1)))
+
+    assert calls == [("GET", "/labels?per_page=100&page=1"), ("GET", "/issues/1")]
+    assert "mutated=0, skipped_unchanged=1" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_cached_comment_updates_directly_and_recovers_from_deleted_id(deleted):
+    calls = []
+    first = "<!-- omnigent-issue-prioritization-v2 {} -->\nFirst"
+    second = "<!-- omnigent-issue-prioritization-v2 {} -->\nSecond"
+
+    def transport(method, path, payload):
+        calls.append((method, path))
+        if path == "/issues/comments/42":
+            if deleted:
+                raise GitHubNotFound("deleted")
+            return {"id": 42}
+        if method == "GET":
+            return []
+        return {"id": 43}
+
+    client = GitHubClient("token", "org/repo", transport)
+    assert client.sync_issue_comment(7, second, BotState(7, None, (), 42, first)) == (
+        43 if deleted else 42,
+        second,
+        True,
+    )
+    expected = [("PATCH", "/issues/comments/42")]
+    if deleted:
+        expected.extend(
+            [
+                ("GET", "/issues/7/comments?per_page=100&page=1"),
+                ("POST", "/issues/7/comments"),
+            ]
+        )
+    assert calls == expected
+
+
+def test_events_are_memoized_per_issue_across_planning_and_apply():
+    calls = []
+
+    def transport(method, path, payload):
+        calls.append(path)
+        return [
+            {"id": 1, "event": "labeled", "label": {"name": "P2-medium"}, "actor": {"login": "bot"}}
+        ]
+
+    client = GitHubClient("token", "org/repo", transport)
+    ownership = GitHubLegacyPriorityOwnership(client, {"bot"})
+    planner = MutationPlanner(_manifest(), FakeStates({}), ownership)
+    assert planner.resolve_state(1, ("P2-medium",), None) == BotState(1, "P2-medium", ())
+    assert planner.resolve_state(1, ("P2-medium",), None) == BotState(1, "P2-medium", ())
+    assert client.priority_label_actor(1, "P1-high") is None
+    assert calls == ["/issues/1/events?per_page=100&page=1"]
+
+
+@pytest.mark.parametrize(
+    "code,headers,detail,delay",
+    [
+        (429, {"Retry-After": "7"}, "rate limit", 7),
+        (403, {"Retry-After": "3"}, "secondary rate limit", 3),
+        (403, {"x-ratelimit-remaining": "0", "x-ratelimit-reset": "1100"}, "limit", 100),
+        (403, {}, "You have exceeded a secondary rate limit", 60),
+        (503, {}, "unavailable", 1),
+    ],
+)
+def test_request_retries_transient_http_errors(monkeypatch, code, headers, detail, delay):
+    import io
+
+    from issue_prioritization import github
+
+    calls = []
+    sleeps = []
+
+    def open_request(request, timeout):
+        calls.append(request)
+        if len(calls) == 1:
+            raise HTTPError(request.full_url, code, "failure", headers, io.BytesIO(detail.encode()))
+        return io.BytesIO(b'{"number": 1}')
+
+    monkeypatch.setattr(github, "urlopen", open_request)
+    monkeypatch.setattr(github.time, "sleep", sleeps.append)
+    monkeypatch.setattr(github.time, "time", lambda: 1000)
+    assert GitHubClient("token", "org/repo").issue_data(1) == {"number": 1}
+    assert len(calls) == 2
+    assert sleeps == [delay]
+
+
+def test_request_timeout_backoff_and_configurable_attempt_limit(monkeypatch):
+    from issue_prioritization import github
+
+    calls = []
+    sleeps = []
+
+    def open_request(request, timeout):
+        calls.append(request)
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(github, "urlopen", open_request)
+    monkeypatch.setattr(github.time, "sleep", sleeps.append)
+    monkeypatch.setenv("TRIAGE_GITHUB_MAX_ATTEMPTS", "3")
+    with pytest.raises(RuntimeError, match="timed out"):
+        GitHubClient("token", "org/repo").issue_data(1)
+    assert len(calls) == 3
+    assert sleeps == [1, 2]
+
+
+def test_request_does_not_retry_permission_denied(monkeypatch):
+    import io
+
+    from issue_prioritization import github
+
+    def open_request(request, timeout):
+        raise HTTPError(request.full_url, 403, "Forbidden", {}, io.BytesIO(b"denied"))
+
+    monkeypatch.setattr(github, "urlopen", open_request)
+    monkeypatch.setattr(github.time, "sleep", lambda _: pytest.fail("Unexpected retry"))
+    with pytest.raises(RuntimeError, match="403 denied"):
+        GitHubClient("token", "org/repo").issue_data(1)
+
+
+def test_request_reconciles_comment_creation_after_a_lost_response(monkeypatch):
+    import io
+    import json
+
+    from issue_prioritization import github
+
+    methods = []
+
+    def open_request(request, timeout):
+        methods.append(request.method)
+        if request.method == "POST":
+            raise TimeoutError("response lost after creation")
+        return io.BytesIO(json.dumps([{"id": 42, "body": "triage body"}]).encode())
+
+    monkeypatch.setattr(github, "urlopen", open_request)
+    monkeypatch.setattr(github.time, "sleep", lambda _: None)
+    result = GitHubClient("token", "org/repo")._request(
+        "POST", "/issues/1/comments", {"body": "triage body"}
+    )
+    assert result["id"] == 42
+    assert methods == ["POST", "GET"]

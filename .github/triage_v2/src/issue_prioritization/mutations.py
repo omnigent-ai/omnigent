@@ -13,6 +13,8 @@ class BotState:
     issue_number: int
     priority: str | None
     components: tuple[str, ...]
+    comment_id: int | None = None
+    comment_body: str | None = None
 
     @property
     def has_ownership(self) -> bool:
@@ -158,6 +160,8 @@ class MutationPlanner:
             issue_number=target.issue_number,
             priority=target.priority if priority_written else state_priority(state),
             components=tuple(sorted(bot_components)),
+            comment_id=state.comment_id if state else None,
+            comment_body=state.comment_body if state else None,
         )
         return MutationPlan(
             target=target,

@@ -211,3 +211,12 @@ def test_duplicate_is_exempt_and_drops_stale_needs_info() -> None:
 
     assert "needs-info" in plan.labels_remove
     assert "needs_info_duplicate_exempt" in plan.blocked
+
+
+def test_replanning_preserves_comment_cache_and_persisted_adoption():
+    state = BotState(1, "P2-medium", (), 42, "cached body")
+    planner = MutationPlanner(_manifest(), FakeStates())
+    assert planner.resolve_state(1, ("P2-medium",), state) is state
+    plan = planner.plan_one(_target(), ("P2-medium",), state)
+    assert plan.next_state.comment_id == 42
+    assert plan.next_state.comment_body == "cached body"

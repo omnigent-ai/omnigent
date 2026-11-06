@@ -219,3 +219,27 @@ def test_bot_state_schema_handles_empty_ownership() -> None:
     repository.upsert([BotState(1, None, ())])
 
     assert "components ARRAY<STRING>" in spark.schemas[0]
+
+
+def test_bot_state_migrates_old_table_and_round_trips_comment_cache():
+    spark = FakeSpark()
+    old_row = SimpleNamespace(issue_number=1, priority="P2-medium", components=[])
+    frame = SimpleNamespace(
+        columns=["issue_number", "priority", "components"], collect=lambda: [old_row]
+    )
+    spark.catalog.tableExists = lambda _: True
+    spark.table = lambda _: frame
+    repository = SparkBotStateRepository(spark, "main.team.bot_state")
+    assert repository.load() == {1: BotState(1, "P2-medium", ())}
+
+    state = BotState(1, "P2-medium", (), 42, "cached body")
+    repository.upsert([state])
+
+    assert spark.statements[0] == (
+        "ALTER TABLE main.team.bot_state ADD COLUMNS (comment_id BIGINT, comment_body STRING)"
+    )
+    assert spark.rows[0][0]["comment_id"] == 42
+    assert spark.rows[0][0]["comment_body"] == "cached body"
+    assert "MERGE INTO main.team.bot_state" in spark.statements[1]
+    frame.collect = lambda: [SimpleNamespace(**spark.rows[0][0])]
+    assert repository.load() == {1: state}

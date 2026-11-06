@@ -447,3 +447,50 @@ def test_pipeline_does_not_publish_scores_when_artifacts_fail() -> None:
         pipeline.run("run-artifact-failure")
 
     assert scores.runs == []
+
+
+def test_apply_persists_legacy_adoption_before_sink_failure():
+    from issue_prioritization.pipeline import PipelineMode
+
+    class States(FakeStates):
+        def __init__(self):
+            self.values = {}
+
+        def load(self):
+            return dict(self.values)
+
+        def upsert(self, states):
+            self.values.update({state.issue_number: state for state in states})
+
+    class Legacy(FakeLegacyPriorities):
+        calls = 0
+
+        def is_bot_owned(self, issue_number, priority):
+            self.calls += 1
+            return True
+
+    class FailingSink:
+        def apply(self, run):
+            assert states.values[1].priority == "P2-medium"
+            raise RuntimeError("apply failed")
+
+    issue = _bronze(1)
+    classification = Classification(
+        1, IssueType.BUG, Impact.HIGH, (), (), "reason", issue.content().content_hash
+    )
+    states = States()
+    legacy = Legacy()
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=FakeClassifier(classification),
+        classifications=FakeClassifications({1: classification}),
+        scores=CaptureSink(),
+        artifacts=CaptureSink(),
+        engine=ScoreEngine(ScoringConfig.default(), AreaCatalog({}, {})),
+        mutation_planner=MutationPlanner(LabelManifest(labels=()), states, legacy),
+        mutation_sink=FailingSink(),
+    )
+    for run_id in ("first", "second"):
+        with pytest.raises(RuntimeError, match="apply failed"):
+            pipeline.run(run_id, mode=PipelineMode.APPLY, adopt_legacy_bot_priorities=True)
+    assert legacy.calls == 1

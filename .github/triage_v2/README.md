@@ -133,7 +133,7 @@ trapped behind the classifier switch.
 
 The `prod` target is the live job: it applies labels, runs as a service
 principal, and lets a workspace group manage it. The target pins the live
-behavior (App authentication, apply mode, writes on, unpaused trigger). The
+behavior (App authentication, apply mode, writes on, unpaused schedule). The
 workspace-specific values are kept with the deploying team, outside this
 repository, in a git-ignored overrides file:
 
@@ -162,9 +162,10 @@ which every run recreates.
 
 ## Databricks dry-run
 
-The bundle defines a paused trigger on updates to `github_issues_bronze`. It
-waits five minutes after an update and runs at most once per hour. Manual runs
-default to `mode=dry_run`:
+The bundle defines a daily schedule at 06:00 UTC (`0 0 6 * * ?`). Set the
+`schedule_timezone` bundle variable to change its timezone. The base configuration
+is paused; prod retains its `UNPAUSED` override. `max_concurrent_runs: 1` prevents
+overlapping refreshes. Manual runs default to `mode=dry_run`:
 
 ```bash
 databricks bundle validate --strict --target dev --profile <profile>
@@ -229,7 +230,7 @@ dashboard.
 
 ## GitHub apply gate
 
-The table-update trigger is paused. GitHub writes additionally require
+The base daily schedule is paused. GitHub writes additionally require
 `mode=apply`, the deploy variable `allow_github_writes=true`, and a configured
 secret scope. The job re-reads every issue's live labels before writing and
 preserves maintainer priority overrides. Removing a bot-owned priority is also a
@@ -253,7 +254,7 @@ The existing `github-token` secret remains a temporary fallback. Secret values
 are stripped before use, so a trailing newline from stdin does not become part
 of the HTTP authorization header.
 
-Deploy with App authentication while the trigger remains paused, then run a
+Deploy with App authentication while the schedule remains paused, then run a
 read-only ownership check. Confirm the run log does not contain the PAT fallback
 warning:
 
@@ -267,7 +268,7 @@ databricks bundle run issue_prioritization --target dev --profile <profile> \
   --params mode=dry_run,regrade=false,adopt_legacy_bot_priorities=true
 ```
 
-After reviewing that run, enable apply-mode table-update runs. Keep legacy
+After reviewing that run, enable apply-mode daily runs. Keep legacy
 adoption enabled until new-issue artifacts are imported into `issue_bot_state`:
 
 ```bash
@@ -313,5 +314,25 @@ importer shares that ownership with `issue_bot_state`.
 ## Tests
 
 ```bash
-uv run --project .github/triage_v2 pytest .github/triage_v2/tests
+PYTHONPATH=. uv run --frozen --project .github/triage_v2 pytest .github/triage_v2/tests
+uv run --frozen --project .github/triage_v2 ruff check .github/triage_v2
+uv run --frozen --project .github/triage_v2 ruff format --check .github/triage_v2
 ```
+
+### GitHub apply performance
+
+Apply rechecks live labels once per issue to preserve human overrides. Bot state
+stores the triage comment ID and last body, including the original needs-info
+deadline. Unchanged comments require no comment reads or writes; changed comments
+use the cached ID, with rediscovery if that ID returns 404. The first run discovers
+existing comments and adds nullable cache columns to existing bot-state tables.
+An unchanged cached comment is trusted; external comment edits or deletions are
+rediscovered when the desired comment changes. Legacy label events are cached per
+issue for the job, and adopted ownership is saved before apply in apply mode.
+
+Mutations run sequentially in ranked order. Each apply prints mutated,
+skipped_unchanged, and skipped_missing issue counts. Requests retry rate limits,
+server errors, and transport timeouts with exponential backoff, honoring
+`Retry-After` and `x-ratelimit-reset`. Rate limits without a server delay wait at
+least 60 seconds. Set `TRIAGE_GITHUB_MAX_ATTEMPTS` in the job environment to change
+the default of four attempts (or use `GitHubClient(max_attempts=...)`).

@@ -3,14 +3,10 @@ resources:
     issue_prioritization:
       name: "[${bundle.target}] Issue prioritization v2"
       max_concurrent_runs: 1
-      trigger:
+      schedule:
+        quartz_cron_expression: "0 0 6 * * ?"
+        timezone_id: ${var.schedule_timezone}
         pause_status: ${var.schedule_pause_status}
-        table_update:
-          table_names:
-            - ${var.catalog}.${var.schema}.${var.source_table}
-          condition: ANY_UPDATED
-          min_time_between_triggers_seconds: 3600
-          wait_after_last_change_seconds: 300
       parameters:
         - name: mode
           default: ${var.scheduled_mode}

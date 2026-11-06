@@ -152,6 +152,14 @@ class IssuePrioritizationPipeline:
                 )
                 is not None
             }
+        if self.mutation_planner and mode == PipelineMode.APPLY:
+            self.mutation_planner.states.upsert(
+                [
+                    state
+                    for number, state in bot_states.items()
+                    if number not in persisted_bot_states
+                ]
+            )
         normalized = []
         for issue in issues:
             if issue.number not in resolved:
