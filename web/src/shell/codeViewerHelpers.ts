@@ -51,6 +51,15 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
+export const MAX_RICH_MARKDOWN_BYTES = 1024 * 1024;
+
+/** Use source for large Markdown to bound the initial rich-rendering work. */
+export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
+  );
+}
+
 // ---------------------------------------------------------------------------
 // File-type helpers
 // ---------------------------------------------------------------------------
@@ -525,7 +534,7 @@ function scriptEnd(html: string, from: number): number {
  * anything still open at end of input swallows the rest, as in the parser. The
  * scan only moves forward because artifact text is processed on the host page.
  */
-function startTagEnd(html: string, tag: "head" | "html"): number {
+export function startTagEnd(html: string, tag: "head" | "html"): number {
   for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
     if (html.startsWith("<!--", i)) {
       // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.

@@ -16,6 +16,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from omnigent.automations_availability import AUTOMATIONS_HEADER
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCode, OmnigentError
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.mcp_selection import MCP_SELECTION_HEADER, MCP_SELECTION_PREFIX, selected_mcp_spec
@@ -36,7 +37,6 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
@@ -265,6 +265,9 @@ def register_agent_routes(
                     if key.startswith(MCP_SELECTION_PREFIX)
                 }
             )
+        automations_available = getattr(request.app.state, "automations_available", None)
+        if automations_available is not None:
+            selection_headers[AUTOMATIONS_HEADER] = "1" if automations_available() else "0"
         return Response(
             content=bundle_bytes,
             media_type="application/gzip",
@@ -354,7 +357,7 @@ def register_agent_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:
             raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)
@@ -398,7 +401,12 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
+        if agent_store.supports_config_edit:
+            updated = await asyncio.to_thread(
+                agent_store.update, agent.id, new_loc, user_id, description=spec.description
+            )
+        else:
+            updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",

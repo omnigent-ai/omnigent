@@ -118,6 +118,24 @@ describe("RunnerStartingIndicator", () => {
     },
   );
 
+  it.each(["hero", "row"] as const)(
+    "%s: still says provisioning while the launch needs the user to act",
+    (variant) => {
+      // SandboxActionBanner says what to do; the indicator's copy doesn't change.
+      useChatStore.setState({
+        sandboxStatus: {
+          stage: "action_required",
+          error: null,
+          provider: "arclet",
+          details: "Refresh your dbcert on your laptop.",
+        },
+      });
+      renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
+      const indicator = screen.getByTestId("runner-starting-indicator");
+      expect(indicator).toHaveTextContent(/provisioning sandbox/i);
+    },
+  );
+
   it("row: sandbox stage still renders during terminal startup", () => {
     useChatStore.setState({ sandboxStatus: { stage: "cloning", error: null } });
     renderWithContext("row", makeCtx({ terminalStartingUp: true }));
@@ -127,19 +145,16 @@ describe("RunnerStartingIndicator", () => {
   });
 
   it.each(["hero", "row"] as const)(
-    "%s: renders nothing for a FAILED sandbox launch",
+    "%s: shows the failure in place of launch progress",
     (variant) => {
-      // Failure belongs to the destructive SandboxFailedIndicator band —
-      // rendering a spinner here would read as "still launching".
       useChatStore.setState({
         sandboxStatus: { stage: "failed", error: "managed sandbox launch failed: boom" },
       });
-      const { container } = renderWithContext(
-        variant,
-        makeCtx({ isTerminalFirst: false, terminalStartingUp: false }),
-      );
+      renderWithContext(variant, makeCtx({ isTerminalFirst: false, terminalStartingUp: false }));
       expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
-      expect(container).toBeEmptyDOMElement();
+      expect(screen.getByTestId("sandbox-failed-indicator")).toHaveTextContent(
+        "Sandbox launch failed",
+      );
     },
   );
 });

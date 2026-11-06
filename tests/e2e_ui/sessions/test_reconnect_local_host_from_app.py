@@ -196,14 +196,14 @@ def test_desktop_reconnect_performs_local_host_reconnect(
     assert page.evaluate("window.__controlHostCalls") == ["start"]
     expect(page.get_by_text("Reconnecting this machine…", exact=True)).to_be_visible()
     expect(page.get_by_test_id("reconnect-session-dialog")).not_to_be_visible()
-    expect(page.get_by_text("Host start requested.", exact=True)).not_to_be_visible()
+    expect(page.get_by_text("This machine is back online.", exact=True)).not_to_be_visible()
 
     host_state["online"] = True
     page.evaluate("window.__finishReconnect({ ok: true })")
     expect(page.get_by_test_id("composer-host-select")).to_have_attribute(
         "aria-label", re.compile(r", online$"), timeout=3_000
     )
-    expect(page.get_by_text("Host start requested.", exact=True)).to_be_visible()
+    expect(page.get_by_text("This machine is back online.", exact=True)).to_be_visible()
     assert page.evaluate("window.__reconnectDialogShown") is False
 
 
@@ -218,7 +218,7 @@ def test_desktop_reconnect_failure_offers_retry(
     dialog = page.get_by_test_id("reconnect-session-dialog")
     expect(dialog).to_be_visible()
     expect(dialog.get_by_role("alert")).to_contain_text("Finish signing in")
-    expect(page.get_by_text("Host start requested.", exact=True)).not_to_be_visible()
+    expect(page.get_by_text("This machine is back online.", exact=True)).not_to_be_visible()
     expect(dialog.get_by_test_id("reconnect-session-command")).to_contain_text("omnigent host")
 
     dialog.get_by_role("button", name="Retry reconnect", exact=True).click()
@@ -230,4 +230,4 @@ def test_desktop_reconnect_failure_offers_retry(
         "aria-label", re.compile(r", online$"), timeout=3_000
     )
     expect(dialog).not_to_be_visible()
-    expect(page.get_by_text("Host start requested.", exact=True)).to_be_visible()
+    expect(page.get_by_text("This machine is back online.", exact=True)).to_be_visible()

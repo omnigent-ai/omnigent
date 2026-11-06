@@ -19,10 +19,10 @@ Centralizing the checks here keeps the two call sites from drifting
 from __future__ import annotations
 
 import functools
-import importlib.util
 import logging
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from fastapi import HTTPException
 
@@ -34,6 +34,9 @@ from omnigent.server.permissions import check_session_access
 from omnigent.stores import ConversationStore
 from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
 _logger = logging.getLogger(__name__)
 
@@ -149,21 +152,26 @@ def resolve_host_owner(
     return host
 
 
-@functools.cache
-def _deployment_is_sharded() -> bool:
-    """Whether this deployment shards host traffic across replicas by host_id.
+# Set by ``create_app(host_sharded=...)``. Process-wide because
+# :func:`host_absent_error` runs deep in route helpers with no request to read
+# ``app.state`` from.
+_host_sharded = False
 
-    Only the Databricks managed deployment runs multiple replicas behind the
-    host_id-sharding router (Dicer); a single-process / OSS server has exactly
-    one replica, so an absent host is simply offline. The server can't see the
-    sharding layer directly (Dicer strips its routing header), so we detect the
-    managed deployment by the presence of the internal lakebox launcher module —
-    the same signal that gates ``databricks_features`` in ``server_info`` and
-    mirrors the client's own ``isDatabricksWorkspace()`` re-address gate. Cached:
-    ``find_spec`` is side-effect-free but the answer is fixed for the process
-    lifetime.
+
+def configure_host_sharding(enabled: bool) -> None:
+    """Record whether this deployment shards host traffic across replicas.
+
+    :param enabled: ``True`` when replicas sit behind a router that keys host
+        and runner tunnels by host_id, so a host absent from this replica's
+        registry may be live on another one.
     """
-    return importlib.util.find_spec("omnigent.onboarding.sandboxes.lakebox") is not None
+    global _host_sharded
+    _host_sharded = enabled
+
+
+def _deployment_is_sharded() -> bool:
+    """Return whether this deployment shards host traffic by host_id."""
+    return _host_sharded
 
 
 def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentError:
@@ -188,8 +196,9 @@ def host_absent_error(host: Host, *, sharded: bool | None = None) -> OmnigentErr
     So ``WRONG_REPLICA`` is emitted only when the deployment is actually sharded.
 
     :param host: The host's persistent record (owner-checked by the caller).
-    :param sharded: Whether this deployment shards by host_id. Defaults to
-        auto-detection (:func:`_deployment_is_sharded`); overridable for tests.
+    :param sharded: Whether this deployment shards by host_id. Defaults to the
+        deployment's setting (:func:`configure_host_sharding`); overridable for
+        tests.
     :returns: The ``OmnigentError`` to raise; the global handler maps its code
         to the HTTP status and the ``{"error": {"code": ...}}`` body the
         client's re-address matches on.
@@ -211,6 +220,7 @@ def resolve_host_launch(
     conversation_store: ConversationStore,
     permission_store: PermissionStore | None,
     conversation: Conversation | None = None,
+    sandbox_profiles: SandboxProfileCatalog | None = None,
 ) -> HostLaunchTarget:
     """
     Resolve and authorize a host runner launch.
@@ -276,5 +286,14 @@ def resolve_host_launch(
         )
         if not allowed:
             raise HTTPException(status_code=404, detail="session not found")
+
+    if sandbox_profiles is not None:
+        sandbox_profiles.require_session_host(
+            session_id,
+            host_id,
+            bind=False,
+            sandbox_provider=host.sandbox_provider,
+            user_id=host.user_id,
+        )
 
     return HostLaunchTarget(host=host, conn=conn, conv=conv)

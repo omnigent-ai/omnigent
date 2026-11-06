@@ -12,18 +12,29 @@
 // client-recomputed instant can't match the server anchor for INTERVAL>1 rules)
 // is not violated. Paused rows are NOT dimmed — the title stays fully legible
 // and the pill is the sole paused signal. A hover-revealed ellipsis (⋯) action
-// menu (Run now / Pause / Resume / Edit / Delete) sits on the right.
+// menu (Run now / Pause / Resume / Edit / Delete) sits on the right; right-clicking
+// the card opens the same actions as a context menu.
 
-import { useMemo, useState } from "react";
+import { useId, useMemo, useState, type ComponentType, type ReactNode } from "react";
 import {
+  CirclePlayIcon,
   MoreHorizontalIcon,
   PauseIcon,
   PencilIcon,
   PlayIcon,
   Trash2Icon,
-  ZapIcon,
+  TriangleAlertIcon,
 } from "lucide-react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useNavigate } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,6 +43,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { describeSchedule, formatNextRunAt } from "@/lib/scheduleText";
+import { isTriggerPrompt } from "./triggerTemplates";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 
@@ -56,8 +68,13 @@ export function ScheduledTaskRow({
   onDelete: (task: ScheduledTask) => void;
   busy: boolean;
 }) {
+  const navigate = useNavigate();
+  const info = useServerInfo();
+  const detailPageEnabled = isFeatureEnabled(info, "automations_v2");
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const [menuOpen, setMenuOpen] = useState(false);
-  const { trackClick } = useOmnigentAnalytics();
+  const failureLabelId = useId();
+  const failed = task.lastRunStatus === "failed";
   const paused = task.state === "paused";
   // Subtitle: the schedule summary, plus the SERVER's next-run time when armed
   // (active tasks only — a paused task has null nextRunAt). We only format the
@@ -66,7 +83,55 @@ export function ScheduledTaskRow({
   const scheduleSummary = useMemo(() => describeSchedule(task.rrule), [task.rrule]);
   const nextRun = useMemo(() => formatNextRunAt(task.nextRunAt, now), [task.nextRunAt, now]);
 
-  return (
+  // Navigate to the task's detail page from the card BODY. The ⋯ menu (trigger
+  // + portalled content) stops propagation so opening / using it never also
+  // navigates. Rendered as a real <button> so keyboard (Enter/Space) and focus
+  // come for free; the ⋯ trigger is a sibling, not a descendant, so there's no
+  // nested-interactive-element (button-in-button) violation.
+  function handleNavigate() {
+    navigate(`/tasks/${task.id}`);
+  }
+
+  const body = (
+    <>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-[15px] font-semibold">{task.name}</span>
+        {failed && (
+          <span
+            id={failureLabelId}
+            role="img"
+            aria-label="Last run failed"
+            title="Last run failed"
+            className="relative z-10 shrink-0 text-status-red"
+            data-testid="task-failed-warning"
+          >
+            <TriangleAlertIcon className="size-4" aria-hidden="true" />
+          </span>
+        )}
+        {paused && (
+          <span
+            data-testid="task-paused-pill"
+            className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+          >
+            Paused
+          </span>
+        )}
+      </span>
+      <span className="truncate text-ui text-muted-foreground/80" data-testid="task-schedule-line">
+        {triggerMode ? "Runs when new items match" : scheduleSummary}
+        {!triggerMode && nextRun && (
+          <>
+            {" · "}
+            <span data-testid="task-next-run">Next run {nextRun}</span>
+          </>
+        )}
+      </span>
+    </>
+  );
+
+  const menuItemProps = { task, paused, triggerMode, onEdit, onPauseToggle, onRunNow, onDelete };
+
+  const card = (
     <div
       data-testid="scheduled-task-row"
       data-state={task.state}
@@ -84,31 +149,22 @@ export function ScheduledTaskRow({
         "group relative flex items-center gap-3 rounded-xl border border-border bg-card py-3 pr-12 pl-4 transition-colors hover:bg-muted/40",
       )}
     >
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-[15px] font-semibold">{task.name}</span>
-          {paused && (
-            <span
-              data-testid="task-paused-pill"
-              className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
-            >
-              Paused
-            </span>
-          )}
-        </span>
-        <span
-          className="truncate text-ui text-muted-foreground/80"
-          data-testid="task-schedule-line"
+      {/* Stretch the body's hit area across the card while keeping the menu
+          trigger above it. */}
+      {detailPageEnabled ? (
+        <button
+          type="button"
+          data-testid="task-row-open"
+          onClick={handleNavigate}
+          aria-label={`Open ${task.name}`}
+          aria-describedby={failed ? failureLabelId : undefined}
+          className="flex min-w-0 flex-1 cursor-pointer flex-col text-left after:absolute after:inset-0 after:content-['']"
         >
-          {scheduleSummary}
-          {nextRun && (
-            <>
-              {" · "}
-              <span data-testid="task-next-run">Next run {nextRun}</span>
-            </>
-          )}
-        </span>
-      </div>
+          {body}
+        </button>
+      ) : (
+        <div className="flex min-w-0 flex-1 flex-col">{body}</div>
+      )}
 
       {/* Hover-revealed ellipsis menu, mirroring the sidebar conversation-row
           action button: absolute-positioned on the right, hidden until the row
@@ -123,8 +179,11 @@ export function ScheduledTaskRow({
             aria-label={`Actions for ${task.name}`}
             data-testid="task-row-menu"
             disabled={busy}
+            // Sit above the body's hit area; don't bubble into card navigation.
+            onClick={(e) => e.stopPropagation()}
+            onPointerDown={(e) => e.stopPropagation()}
             className={cn(
-              "-translate-y-1/2 absolute top-1/2 right-3 transition-opacity",
+              "-translate-y-1/2 absolute top-1/2 right-3 z-10 transition-opacity",
               "md:opacity-0 md:group-hover:opacity-100 md:group-has-[:focus-visible]:opacity-100",
               "md:aria-expanded:opacity-100",
             )}
@@ -132,59 +191,121 @@ export function ScheduledTaskRow({
             <MoreHorizontalIcon className="size-4" />
           </Button>
         </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.run_now", "button");
-              onRunNow(task);
-            }}
-            data-testid="task-run-now"
-          >
-            <ZapIcon className="size-4" />
-            Run now
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.edit", "button");
-              onEdit(task);
-            }}
-            data-testid="task-edit"
-          >
-            <PencilIcon className="size-4" />
-            Edit
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            onSelect={() => {
-              trackClick("tasks.scheduled.pause_resume", "button");
-              onPauseToggle(task);
-            }}
-            data-testid="task-pause-toggle"
-          >
-            {paused ? (
-              <>
-                <PlayIcon className="size-4" />
-                Resume
-              </>
-            ) : (
-              <>
-                <PauseIcon className="size-4" />
-                Pause
-              </>
-            )}
-          </DropdownMenuItem>
-          <DropdownMenuItem
-            variant="destructive"
-            onSelect={() => {
-              trackClick("tasks.scheduled.delete", "button");
-              onDelete(task);
-            }}
-            data-testid="task-delete"
-          >
-            <Trash2Icon className="size-4" />
-            Delete
-          </DropdownMenuItem>
+        {/* The menu content portals to the body, so a click inside it can't
+            bubble to the card; guard anyway for the rare non-portalled path and
+            to keep item selection from triggering navigation. */}
+        <DropdownMenuContent
+          align="end"
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <TaskMenuItems Item={DropdownMenuItem} {...menuItemProps} />
         </DropdownMenuContent>
       </DropdownMenu>
     </div>
+  );
+
+  // Right-clicking the card opens the same actions in place of the browser menu.
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild disabled={busy}>
+        {card}
+      </ContextMenuTrigger>
+      <ContextMenuContent
+        className="min-w-40"
+        onClick={(e) => e.stopPropagation()}
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        <TaskMenuItems Item={ContextMenuItem} {...menuItemProps} />
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
+// Item props shared by the dropdown and context-menu item primitives.
+interface TaskMenuItemProps {
+  children?: ReactNode;
+  variant?: "default" | "destructive";
+  onSelect?: (event: Event) => void;
+  "data-testid"?: string;
+}
+
+// The action list, authored once and rendered under both the ⋯ dropdown and the
+// card's right-click context menu.
+function TaskMenuItems({
+  Item,
+  task,
+  paused,
+  triggerMode,
+  onEdit,
+  onPauseToggle,
+  onRunNow,
+  onDelete,
+}: {
+  Item: ComponentType<TaskMenuItemProps>;
+  task: ScheduledTask;
+  paused: boolean;
+  triggerMode: boolean;
+  onEdit: (task: ScheduledTask) => void;
+  onPauseToggle: (task: ScheduledTask) => void;
+  onRunNow: (task: ScheduledTask) => void;
+  onDelete: (task: ScheduledTask) => void;
+}) {
+  const { trackClick } = useOmnigentAnalytics();
+  return (
+    <>
+      {!triggerMode && (
+        <Item
+          onSelect={() => {
+            trackClick("tasks.scheduled.run_now", "button");
+            onRunNow(task);
+          }}
+          data-testid="task-run-now"
+        >
+          <PlayIcon className="size-4" />
+          Run now
+        </Item>
+      )}
+      <Item
+        onSelect={() => {
+          trackClick("tasks.scheduled.edit", "button");
+          onEdit(task);
+        }}
+        data-testid="task-edit"
+      >
+        <PencilIcon className="size-4" />
+        Edit
+      </Item>
+      <Item
+        onSelect={() => {
+          trackClick("tasks.scheduled.pause_resume", "button");
+          onPauseToggle(task);
+        }}
+        data-testid="task-pause-toggle"
+      >
+        {paused ? (
+          <>
+            <CirclePlayIcon className="size-4" />
+            Resume
+          </>
+        ) : (
+          <>
+            <PauseIcon className="size-4" />
+            Pause
+          </>
+        )}
+      </Item>
+      <Item
+        variant="destructive"
+        onSelect={() => {
+          trackClick("tasks.scheduled.delete", "button");
+          onDelete(task);
+        }}
+        data-testid="task-delete"
+      >
+        <Trash2Icon className="size-4" />
+        Delete
+      </Item>
+    </>
   );
 }

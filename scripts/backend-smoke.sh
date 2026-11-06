@@ -75,6 +75,7 @@ env_vars=(
   "OMNIGENT_CONFIG_HOME=$runtime_config/omnigent"
   "OMNIGENT_DATA_DIR=$runtime_data/omnigent"
   "OMNIGENT_DATABASE_URI=sqlite:///$runtime_db"
+  "OMNIGENT_HARNESS_TMP_PARENT=$runtime_root/h"
   "OMNIGENT_SKIP_WEB_UI=true"
 )
 
@@ -84,7 +85,7 @@ echo "Checkout:    $repo_root"
 echo "Installing uv into a throwaway toolchain venv..."
 python3 -m venv "$toolchain_venv"
 python3 -m venv "$project_venv"
-env "${env_vars[@]}" "$toolchain_venv/bin/python" -m pip install --quiet "uv>=0.11.8"
+env "${env_vars[@]}" "$toolchain_venv/bin/python" -m pip install --quiet "uv>=0.13.4"
 
 echo "Syncing project dependencies (uv sync --frozen)..."
 ( cd "$repo_root" && env "${env_vars[@]}" "$toolchain_venv/bin/uv" sync --frozen )

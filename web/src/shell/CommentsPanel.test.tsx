@@ -6,7 +6,7 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -96,16 +96,16 @@ describe("CommentsPanel copy-comment-link", () => {
     expect(onCopyCommentLink).toHaveBeenCalledWith("c1");
   });
 
-  it("shows a link button for addressed comments after switching to the Addressed tab", () => {
+  it("shows a link button for addressed comments after switching to the Sent tab", () => {
     const addressedComment = makeComment("c2", "addressed");
     const onCopyCommentLink = vi.fn();
     renderPanel([], [addressedComment], onCopyCommentLink);
 
     // The default view is "Open". Addressed comments are hidden until the user
-    // clicks the Addressed tab.
+    // clicks the Sent tab.
     expect(screen.queryByRole("button", { name: "Copy link to comment" })).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /addressed/i }));
+    fireEvent.click(screen.getByRole("button", { name: /sent/i }));
 
     // After switching tabs, the addressed comment is visible and has a link button.
     // Failure: onCopyLink was not passed to CommentCard for addressed comments.
@@ -520,7 +520,7 @@ describe("CommentsPanel active-comment reveal", () => {
     expect(screen.queryByText("Comment c2")).not.toBeInTheDocument();
   });
 
-  it("follows a selected comment into Addressed once without locking the tabs", async () => {
+  it("follows a selected comment into Sent once without locking the tabs", async () => {
     Element.prototype.scrollIntoView = vi.fn();
 
     // Matching ids model one comment changing status; only one tab renders at a time.
@@ -552,9 +552,72 @@ describe("CommentsPanel active-comment reveal", () => {
     const onClickComment = vi.fn();
     render(panelWithSelection([], [addressed], null, onClickComment));
 
-    fireEvent.click(screen.getByRole("button", { name: /^Addressed/ }));
+    fireEvent.click(screen.getByRole("button", { name: /^Sent/ }));
     fireEvent.click(screen.getByText("Comment c2"));
 
     expect(onClickComment).toHaveBeenCalledWith(addressed);
+  });
+});
+
+describe("CommentsPanel Address All", () => {
+  function renderAddressPanel(
+    comments: Comment[],
+    addressCount?: number,
+    addressFileCount?: number,
+    onAddressAll = vi.fn(),
+  ) {
+    return render(
+      <CommentsPanel
+        comments={comments}
+        addressedComments={[]}
+        activeSelection={null}
+        onAddComment={vi.fn()}
+        onAddressAll={onAddressAll}
+        onEditComment={vi.fn()}
+        onDeleteComment={vi.fn()}
+        onClickComment={vi.fn()}
+        canAddress
+        addressCount={addressCount}
+        addressFileCount={addressFileCount}
+        addressPending={false}
+      />,
+    );
+  }
+
+  it.each([
+    ["drafts only in other files", [], 2, "Address All (2)", true],
+    ["this file's and other files' drafts", [makeComment("c1")], 3, "Address All (3)", true],
+    ["this file's drafts by default", [makeComment("c1")], undefined, "Address All1", true],
+    ["no drafts anywhere", [], 0, "Address All", false],
+  ])(
+    "enables and labels the button from the session count with %s",
+    (_label, comments, count, label, enabled) => {
+      const onAddressAll = vi.fn();
+      renderAddressPanel(comments, count, undefined, onAddressAll);
+
+      const button = screen.getByRole("button", { name: /^Address All/i });
+      fireEvent.click(button);
+      expect(button).toHaveProperty("disabled", !enabled);
+      expect(onAddressAll).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(button.textContent).toBe(label);
+    },
+  );
+
+  // Focus opens the tooltip without the hover delay.
+  it.each([
+    ["this file and another", [makeComment("c1")], 3, 2, "Sends 3 draft comments from 2 files"],
+    ["one other file", [], 1, 1, "Sends 1 draft comment from 1 file"],
+  ])("explains the send scope with drafts in %s", (_label, comments, count, fileCount, tooltip) => {
+    renderAddressPanel(comments, count, fileCount);
+
+    act(() => screen.getByRole("button", { name: `Address All (${count})` }).focus());
+    expect(screen.getByRole("tooltip")).toHaveTextContent(tooltip);
+  });
+
+  it("shows no scope tooltip when every draft is in the open file", () => {
+    renderAddressPanel([makeComment("c1"), makeComment("c2")], 2, 1);
+
+    act(() => screen.getByRole("button", { name: /^Address All/ }).focus());
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

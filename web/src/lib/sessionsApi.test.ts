@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   apiErrorFromResponse,
+  parseRetryAfterMs,
   approve,
   bindOnlyOnlineRunner,
   createBundledSession,
@@ -16,6 +17,7 @@ import {
   createSideChat,
   exportSessionTranscript,
   fetchSessionItemsPage,
+  fetchSessionRepositoryBranches,
   forkSession,
   getSession,
   getSessionSlim,
@@ -77,7 +79,62 @@ afterEach(() => {
   localStorage.clear();
 });
 
+describe("fetchSessionRepositoryBranches", () => {
+  it("reads per-repository branch availability and forwards cancellation", async () => {
+    const response = {
+      repositories: [
+        { url: "https://github.com/org/api", branch: "feature/api", pushed: true },
+        { url: "https://github.com/org/web", branch: "wip/web", pushed: false },
+        { url: "https://github.com/org/tools", branch: null, pushed: null },
+      ],
+    };
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(response));
+    const { signal } = new AbortController();
+    expect(await fetchSessionRepositoryBranches("session with space", signal)).toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/session%20with%20space/resources/repository-branches",
+      expect.objectContaining({ signal }),
+    );
+  });
+});
+
+describe("parseRetryAfterMs", () => {
+  it("reads delta-seconds and HTTP dates, and rejects anything else", () => {
+    const now = Date.parse("2026-11-04T00:00:00Z");
+    expect(parseRetryAfterMs("30", now)).toBe(30_000);
+    expect(parseRetryAfterMs(" 0 ", now)).toBe(0);
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:05 GMT", now)).toBe(5_000);
+    // A date already past means "now", not a negative wait.
+    expect(parseRetryAfterMs("Wed, 04 Nov 2026 00:00:00 GMT", now + 1_000)).toBe(0);
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+    expect(parseRetryAfterMs("soon", now)).toBeNull();
+    // Malformed numbers aren't dates, so they mustn't read as "retry now".
+    expect(parseRetryAfterMs("-1", now)).toBeNull();
+    expect(parseRetryAfterMs("1.5", now)).toBeNull();
+    expect(parseRetryAfterMs("2026-11-04", now)).toBeNull();
+    // Looser date forms Date.parse would accept, read as "now" or a far-off wait.
+    expect(parseRetryAfterMs("Mon 1", now)).toBeNull();
+    expect(parseRetryAfterMs("January 1, 2027", now)).toBeNull();
+    expect(parseRetryAfterMs("Wednesday, 04-Nov-26 00:00:05 GMT", now)).toBeNull();
+  });
+});
+
 describe("apiErrorFromResponse", () => {
+  it("records the response's Retry-After for the retry policy", async () => {
+    const throttled = new Response(JSON.stringify({ error: { code: "rate_limited" } }), {
+      status: 429,
+      headers: { "Retry-After": "7" },
+    });
+    expect((await apiErrorFromResponse(throttled)).retryAfterMs).toBe(7_000);
+
+    const plain = new Response("{}", { status: 503 });
+    expect((await apiErrorFromResponse(plain)).retryAfterMs).toBeNull();
+    // Hand-built stand-ins have no headers at all.
+    expect(
+      (await apiErrorFromResponse(mockJsonResponse({}, { ok: false, status: 503 }))).retryAfterMs,
+    ).toBeNull();
+  });
+
   it("reads the AP `error` envelope (message + code)", async () => {
     const err = await apiErrorFromResponse(
       mockJsonResponse(
@@ -153,6 +210,8 @@ describe("createSession", () => {
       contextWindow: undefined,
       labels: undefined,
       projectId: null,
+      sideChatParentId: null,
+      sideChatAllowed: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -166,6 +225,7 @@ describe("createSession", () => {
       reasoningEffort: undefined,
       pendingElicitations: [],
       pendingInputs: [],
+      failedInputs: [],
       permissionLevel: null,
       parentSessionId: null,
       subAgentName: null,
@@ -174,8 +234,10 @@ describe("createSession", () => {
       backgroundTaskCount: undefined,
       todos: [],
       codexModelOptions: [],
+      sideChatSettingsSupported: false,
       terminalPending: false,
       sandboxStatus: null,
+      sandboxProfile: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -313,11 +375,12 @@ describe("createSession", () => {
     expect(session.queuedItems).toEqual(queued);
   });
 
-  it("maps pending_inputs (snake) to pendingInputs (camel) with content", async () => {
+  it("maps pending_inputs and failed_inputs (snake) to camel with content", async () => {
     // The snapshot replays un-consumed native web messages here so the
     // store re-hydrates the optimistic bubble on rebind. Each entry's
     // pending_id becomes the bubble's stable key and the content is
-    // carried through verbatim for rendering.
+    // carried through verbatim for rendering. Undelivered startup
+    // messages share the shape.
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -328,12 +391,26 @@ describe("createSession", () => {
         pending_inputs: [
           { pending_id: "pending_1", content: [{ type: "input_text", text: "queued" }] },
         ],
+        failed_inputs: [
+          {
+            pending_id: "pending_2",
+            content: [{ type: "input_text", text: "lost" }],
+            created_by: "alice@example.com",
+          },
+        ],
       }),
     );
 
     const session = await createSession("agent_xyz");
     expect(session.pendingInputs).toEqual([
       { pendingId: "pending_1", content: [{ type: "input_text", text: "queued" }] },
+    ]);
+    expect(session.failedInputs).toEqual([
+      {
+        pendingId: "pending_2",
+        content: [{ type: "input_text", text: "lost" }],
+        createdBy: "alice@example.com",
+      },
     ]);
   });
 
@@ -377,6 +454,7 @@ describe("createBundledSession", () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         session_id: "conv_bundle",
+        agent_id: "ag_bundle",
       }),
     );
 
@@ -385,7 +463,7 @@ describe("createBundledSession", () => {
       { workspace: "/tmp/project" },
     );
 
-    expect(result.id).toBe("conv_bundle");
+    expect(result).toEqual({ id: "conv_bundle", agentId: "ag_bundle" });
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(new Headers(init.headers).get("X-Omnigent-Background-Session-Titles")).toBe("off");
   });
@@ -434,6 +512,28 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({ title: "My clone" });
   });
 
+  it("sends a managed fork's chosen sandbox host id", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", {
+      sandbox: { workspace: null, hostId: "0123456789abcdef0123456789abcdef" },
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      workspace: null,
+      host_id: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
   it("forwards run-config overrides (model / effort / launch args)", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -477,27 +577,42 @@ describe("forkSession", () => {
     expect(JSON.parse(init.body as string)).toEqual({});
   });
 
-  it("asks for a managed sandbox when a sandbox target is given", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        id: "conv_fork",
-        agent_id: "agent_clone",
-        status: "idle",
-        created_at: 1704067200,
-      }),
-    );
+  it.each([
+    { profile: false, multiRepo: false },
+    { profile: true, multiRepo: false },
+    { profile: true, multiRepo: true },
+  ])(
+    "sends a managed sandbox target with profile=$profile and multiRepo=$multiRepo",
+    async ({ profile, multiRepo }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
 
-    await forkSession("conv_src", {
-      sandbox: { provider: "modal", workspace: "https://github.com/org/repo#main" },
-    });
+      const repositoryFields = multiRepo
+        ? { workspaces: ["https://github.com/org/api#main", "https://github.com/org/web#dev"] }
+        : { workspace: "https://github.com/org/repo#main" };
+      await forkSession("conv_src", {
+        sandbox: {
+          provider: "modal",
+          ...repositoryFields,
+          ...(profile ? { profileId: "large", profileRevision: "revision-1" } : {}),
+        },
+      });
 
-    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(JSON.parse(init.body as string)).toEqual({
-      host_type: "managed",
-      sandbox_provider: "modal",
-      workspace: "https://github.com/org/repo#main",
-    });
-  });
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "modal",
+        ...repositoryFields,
+        ...(profile ? { sandbox_profile_id: "large", sandbox_profile_revision: "revision-1" } : {}),
+      });
+    },
+  );
 
   it("keeps an explicit null workspace, so a sandbox fork can start empty", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -516,6 +631,57 @@ describe("forkSession", () => {
 
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
+  });
+
+  it.each([
+    {
+      workspaces: [
+        "https://github.com/org/api#fix-auth",
+        "https://github.com/org/web#update-login",
+      ],
+    },
+    { workspaces: [] },
+    { workspaces: null },
+  ])(
+    "forwards a sandbox fork's explicit repository selection: $workspaces",
+    async ({ workspaces }) => {
+      fetchMock.mockResolvedValueOnce(
+        mockJsonResponse({
+          id: "conv_fork",
+          agent_id: "agent_clone",
+          status: "idle",
+          created_at: 1704067200,
+        }),
+      );
+
+      await forkSession("conv_src", { sandbox: { provider: "kubernetes", workspaces } });
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "kubernetes",
+        workspaces,
+      });
+    },
+  );
+
+  it("omits both repository fields when inheriting the source's entire selection", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+
+    await forkSession("conv_src", { sandbox: { provider: "kubernetes" } });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "kubernetes",
+    });
   });
 
   it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
@@ -559,6 +725,26 @@ describe("createSideChat", () => {
     created_at: 1704067200,
     labels: { "omnigent.side_chat": "1", "omnigent.side_chat.source_id": source.id },
   };
+
+  it.each(["max", null])(
+    "passes draft effort %s into the fork before binding its runner",
+    async (reasoningEffort) => {
+      fetchMock
+        .mockResolvedValueOnce(mockJsonResponse(source))
+        .mockResolvedValueOnce(mockJsonResponse(fork))
+        .mockResolvedValueOnce(mockJsonResponse({ ...fork, runner_id: source.runner_id }));
+      await createSideChat(source.id, { modelOverride: "gpt-6-sol", reasoningEffort });
+      const [url, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+      expect(url).toBe(`/v1/sessions/${source.id}/fork`);
+      expect(JSON.parse(init.body as string)).toEqual({
+        title: "Side chat",
+        side_chat: true,
+        model_override: "gpt-6-sol",
+        reasoning_effort: reasoningEffort,
+      });
+      expect(fetchMock.mock.calls[2][0]).toBe(`/v1/sessions/${fork.id}`);
+    },
+  );
 
   it.each(["worktree-from-another-machine", "main", null])(
     "relaunches a stopped parent and reuses its runner without requiring saved branch %s",
@@ -970,6 +1156,19 @@ describe("runner binding", () => {
 });
 
 describe("getSession", () => {
+  it.each([undefined, false, true])("reads side-chat settings support (%s)", async (supported) => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "side",
+        agent_id: "agent",
+        status: "idle",
+        created_at: 0,
+        side_chat_settings_supported: supported,
+      }),
+    );
+    expect((await getSession("side")).sideChatSettingsSupported).toBe(supported === true);
+  });
+
   it("GETs the sessions endpoint and parses the response", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -978,6 +1177,8 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        side_chat_parent_id: "conv_parent",
+        side_chat_allowed: false,
       }),
     );
 
@@ -987,6 +1188,8 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.sideChatParentId).toBe("conv_parent");
+    expect(session.sideChatAllowed).toBe(false);
   });
 
   it("url-encodes the session id", async () => {
@@ -1487,6 +1690,14 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {

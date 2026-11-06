@@ -39,12 +39,15 @@ import logging
 import os
 import shlex
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity_env import in_managed_sandbox
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
@@ -69,22 +72,44 @@ def _credential_url(server: str, host_id: str) -> str:
     return f"{server.rstrip('/')}/v1/hosts/{host_id}/credentials/databricks"
 
 
+# Pauses between broker attempts. A transient blip otherwise surfaces as an empty
+# bearer, and the harness fails the turn on the spot.
+_RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0)
+
+
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the broker JSON, or ``None`` on any failure."""
-    try:
-        resp = httpx.get(
-            _credential_url(server, host_id),
-            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
-            timeout=_TIMEOUT_S,
-        )
-    except httpx.HTTPError:
-        return None
-    if resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
-    except ValueError:
-        return None
+    """Fetch the broker JSON; ``None`` on a permanent failure or once retries run out.
+
+    Connection errors, 429 and 5xx are retried; any other non-200 is final. All
+    attempts share one :data:`_TIMEOUT_S` budget, so retrying never outlasts the
+    single attempt the harness's helper timeout was sized for.
+    """
+    deadline = time.monotonic() + _TIMEOUT_S
+    for attempt in range(len(_RETRY_BACKOFF_S) + 1):
+        if attempt:
+            pause = _RETRY_BACKOFF_S[attempt - 1]
+            if time.monotonic() + pause >= deadline:
+                return None
+            time.sleep(pause)
+        try:
+            resp = httpx.get(
+                _credential_url(server, host_id),
+                headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+                timeout=max(deadline - time.monotonic(), 0.1),
+            )
+        except httpx.TransportError:
+            continue
+        except httpx.HTTPError:
+            return None
+        if resp.status_code == 429 or resp.status_code >= 500:
+            continue
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+    return None
 
 
 def fetch_broker_bearer(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
@@ -160,17 +185,25 @@ def _write_sidecar(
         "host_token": host_token,
         "workspace_host": workspace_host,
     }
+    temporary_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Create 0600 atomically so the launch token is never briefly world/group
-        # readable, and fail closed if secure perms can't be guaranteed.
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        # Keep complete coordinates available to helpers until the 0600 replacement
+        # is ready. A failed write must leave the previous sidecar intact.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False
+        ) as handle:
+            temporary_path = Path(handle.name)
             json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
     except OSError:
         return False
+    finally:
+        if temporary_path is not None:
+            with contextlib.suppress(OSError):
+                temporary_path.unlink()
     return True
 
 
@@ -285,7 +318,7 @@ def configure_host_databricks(server_url: str, host_id: str) -> bool:
     :returns: ``True`` when the per-user profile was written; ``False`` otherwise
         (no-op — ambient config, if any, is left untouched).
     """
-    if os.environ.get("IS_SANDBOX") != "1":
+    if not in_managed_sandbox():
         return False
     token = (os.environ.get(HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:

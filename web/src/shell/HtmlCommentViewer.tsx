@@ -27,7 +27,13 @@ import {
   injectCommentBridge,
   parseBridgeMessage,
 } from "./htmlCommentBridge";
+import {
+  formatHtmlPreviewZoom,
+  htmlPreviewZoomStyle,
+  nextHtmlPreviewZoom,
+} from "./htmlPreviewZoom";
 import { TruncatedBanner } from "./TruncatedBanner";
+import { getSavedScrollTop, saveScrollTop } from "./useScrollRestore";
 
 // Force a file asset: a data: URL would be blocked by the embed's script-src CSP.
 const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
@@ -35,9 +41,12 @@ const HTML_COMMENT_BRIDGE_RUNTIME_URL = new URL(
   import.meta.url,
 ).href;
 const BRIDGE_READY_TIMEOUT_MS = 5_000;
+const ZOOM_BADGE_MS = 1_500;
 
 interface HtmlCommentViewerProps {
   conversationId: string;
+  /** Cache key for the preview's scroll offset (null disables persistence). */
+  scrollKey: string | null;
   /** Raw HTML source — rendered in the iframe and searched for comment anchors. */
   content: string;
   truncated: boolean;
@@ -53,6 +62,8 @@ interface FloatingAnchor {
   start_index: number;
   end_index: number;
   anchor_content: string;
+  /** Hidden until the frame re-reports the selection after a zoom reflow. */
+  awaitingReflow: boolean;
 }
 
 function genNonce(): string {
@@ -83,6 +94,7 @@ function activePayload(content: string, sel: ActiveSelection | null) {
 
 export function HtmlCommentViewer({
   conversationId,
+  scrollKey,
   content,
   truncated,
   comments,
@@ -97,8 +109,8 @@ export function HtmlCommentViewer({
   const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
 
   // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
-  // which re-runs the bridge and (via the new nonce) re-establishes
-  // the channel — clearing any stale highlights from the previous content.
+  // re-running the bridge and clearing stale highlights; the frame reopens at the
+  // reader's saved offset for this file.
   const { nonce, srcDoc } = useMemo(() => {
     const n = genNonce();
     return {
@@ -107,15 +119,28 @@ export function HtmlCommentViewer({
         content,
         n,
         loadBridgeExternally ? HTML_COMMENT_BRIDGE_RUNTIME_URL : undefined,
+        scrollKey ? (getSavedScrollTop(scrollKey) ?? 0) : 0,
       ),
     };
-  }, [content, loadBridgeExternally]);
+  }, [content, loadBridgeExternally, scrollKey]);
 
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const portRef = useRef<MessagePort | null>(null);
   const channelRef = useRef<MessageChannel | null>(null);
   const readyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [floating, setFloating] = useState<FloatingAnchor | null>(null);
+  // Preview-only zoom; it survives content reloads, which remount just the frame.
+  const [zoom, setZoom] = useState(1);
+  const zoomRef = useRef(zoom);
+  zoomRef.current = zoom;
+  const [zoomBadgeVisible, setZoomBadgeVisible] = useState(false);
+  const zoomBadgeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(
+    () => () => {
+      if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
+    },
+    [],
+  );
 
   const clearReadyTimer = useCallback(() => {
     if (readyTimerRef.current !== null) clearTimeout(readyTimerRef.current);
@@ -174,6 +199,7 @@ export function HtmlCommentViewer({
       // Selecting a range that already has a comment activates it (which
       // scrolls the panel to its card) rather than offering to add a new one.
       const existing =
+        !msg.reflow &&
         offsets &&
         commentsRef.current.find(
           (c) =>
@@ -194,13 +220,18 @@ export function HtmlCommentViewer({
       const iframe = iframeRef.current;
       if (!iframe) return;
       const rect = iframe.getBoundingClientRect();
-      setFloating({
-        x: rect.left + msg.rect.left,
-        y: rect.top + msg.rect.top - 6,
+      // The frame reports unscaled coordinates; the zoom wrapper scales them.
+      const scale = zoomRef.current;
+      const anchor: FloatingAnchor = {
+        x: rect.left + msg.rect.left * scale,
+        y: rect.top + msg.rect.top * scale - 6,
         start_index: offsets?.start_index ?? 0,
         end_index: offsets?.end_index ?? 0,
         anchor_content: msg.text,
-      });
+        awaitingReflow: false,
+      };
+      // A reflow only moves a button that is still offered, never a dismissed one.
+      setFloating((current) => (msg.reflow && !current ? null : anchor));
     } else if (msg.type === BRIDGE_MSG.commentClick) {
       const c = commentsRef.current.find((x) => x.id === msg.id);
       if (c) {
@@ -215,6 +246,20 @@ export function HtmlCommentViewer({
     } else if (msg.type === BRIDGE_MSG.selectionCleared) {
       onSetActiveSelectionRef.current(null);
       setFloating(null);
+    } else if (msg.type === BRIDGE_MSG.zoom) {
+      const next = nextHtmlPreviewZoom(zoomRef.current, msg.action);
+      if (next !== zoomRef.current) {
+        zoomRef.current = next;
+        setZoom(next);
+        // The frame resizes and re-reports the selection at its new position.
+        setFloating((current) => current && { ...current, awaitingReflow: true });
+      }
+      setZoomBadgeVisible(true);
+      if (zoomBadgeTimerRef.current !== null) clearTimeout(zoomBadgeTimerRef.current);
+      zoomBadgeTimerRef.current = setTimeout(() => setZoomBadgeVisible(false), ZOOM_BADGE_MS);
+    } else if (msg.type === BRIDGE_MSG.scroll) {
+      // A new scrollKey also changes the nonce, so this closure's key is the sender's.
+      if (scrollKey) saveScrollTop(scrollKey, msg.top);
     }
   };
 
@@ -290,8 +335,29 @@ export function HtmlCommentViewer({
   return (
     <div className="flex h-full flex-col">
       {truncated && <TruncatedBanner />}
-      <div className="min-h-0 flex-1">{preview}</div>
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        <div className="h-full w-full" style={htmlPreviewZoomStyle(zoom)}>
+          {preview}
+        </div>
+        <div
+          role="status"
+          data-testid="html-preview-zoom"
+          className={
+            zoomBadgeVisible
+              ? "pointer-events-none absolute right-3 top-3 rounded-md border border-border bg-popover px-2 py-1 text-xs font-medium tabular-nums text-popover-foreground shadow-md"
+              : "sr-only"
+          }
+        >
+          {zoomBadgeVisible && (
+            <>
+              <span className="sr-only">Preview zoom </span>
+              {formatHtmlPreviewZoom(zoom)}
+            </>
+          )}
+        </div>
+      </div>
       {floating &&
+        !floating.awaitingReflow &&
         canEdit &&
         createPortal(
           <button

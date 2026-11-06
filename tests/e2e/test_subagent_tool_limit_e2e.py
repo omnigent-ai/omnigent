@@ -37,7 +37,7 @@ import httpx
 import pytest
 import yaml
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
 from tests.e2e.conftest import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     configure_mock_llm,
@@ -129,7 +129,7 @@ def _register_limit_bundle(
             )
         bundle = buf.getvalue()
 
-    resp = post_session_bundle(
+    resp = post_operator_session(
         client.post, "/v1/sessions", bundle, headers={"Origin": OMNIGENT_INTERNAL_WS_ORIGIN}
     )
     if resp.status_code not in (200, 201, 409):

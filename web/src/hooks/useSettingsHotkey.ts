@@ -1,14 +1,20 @@
 import { useEffect } from "react";
 
 import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
 
-/** True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. */
+/**
+ * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
+ * desktop app, whose Settings menu item owns Cmd/Ctrl+, instead.
+ */
 export function isSettingsHotkey(
   event: globalThis.KeyboardEvent,
   isMac = isMacPlatform(),
+  desktopMenu = supportsDesktopCommands(),
 ): boolean {
   if (
+    desktopMenu ||
     !hasCommandModifier(event, isMac) ||
     !event.altKey ||
     event.shiftKey ||

@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field, replace
 
+import pytest
+
 from omnigent.server.scheduled.scheduler import (
     MISFIRE_GRACE_TIME_S,
     ScheduledTaskScheduler,
@@ -24,10 +26,7 @@ from omnigent.server.scheduled.scheduler import (
 class _FakeTask:
     """The slice of ``ScheduledTask`` the scheduler reads.
 
-    The scheduler only touches ``id``, ``workspace_id``, ``rrule``,
-    ``timezone``, and ``state``, so the tests drive it with this local stand-in
-    rather than the full persisted entity — keeping the scheduler unit tests
-    independent of the entity's field set.
+    Keep scheduler tests independent of unrelated persisted entity fields.
     """
 
     id: str
@@ -35,6 +34,8 @@ class _FakeTask:
     timezone: str
     state: str
     workspace_id: int = 0
+    session_mode: str = "new"
+    execution_target: str = "connected_host"
 
 
 # ── Fakes ────────────────────────────────────────────────────────────────────
@@ -156,11 +157,16 @@ def _make(
 # ── boot load ────────────────────────────────────────────────────────────────
 
 
-async def test_start_arms_one_timer_per_active_task() -> None:
-    scheduler, _clock, seam, _fired = _make([_task("a"), _task("b")])
+@pytest.mark.parametrize(
+    "rule", ["FREQ=HOURLY", "FREQ=MINUTELY;INTERVAL=60", "FREQ=SECONDLY;INTERVAL=3600"]
+)
+async def test_start_arms_one_timer_per_active_task(rule: str) -> None:
+    scheduler, _clock, seam, _fired = _make([_task("a", rule), _task("b", rule)])
     await scheduler.start()
     assert scheduler.job_count == 2
     assert len(seam.live()) == 2
+    assert scheduler.next_run_at("a") is not None
+    assert all(0 < timer.delay <= 3600 for timer in seam.live())
 
 
 async def test_start_is_idempotent() -> None:
@@ -337,6 +343,21 @@ async def test_on_fire_exception_does_not_break_rearm() -> None:
     assert len(seam.live()) == 1  # re-armed despite the error
 
 
+async def test_rearm_work_limit_clears_next_run(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    scheduler, clock, seam, fired = _make([_task("a")])
+    await scheduler.start()
+    clock.advance(seam.live()[0].delay)
+    monkeypatch.setattr("omnigent.server.scheduled.rrule._MAX_SEARCH_STEPS", 0)
+    await seam.fire_latest()
+    assert fired.calls == [(0, "a")]
+    assert scheduler.next_run_at("a") is None
+    assert seam.live() == []
+    assert "task a stopped" in caplog.text
+    assert "work limit" in caplog.text
+
+
 async def test_inactive_fire_does_not_remove_a_replacement_timer() -> None:
     reached, resume = asyncio.Event(), asyncio.Event()
 
@@ -371,3 +392,76 @@ async def _fire_timer(timer) -> None:
 def scheduler_task_of(scheduler: ScheduledTaskScheduler, task_id: str) -> _FakeTask:
     """Reach into the fake store to get the seed task for update tests."""
     return scheduler._store.get(task_id)  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("mutation", ["create", "edit", "resume", "pause", "delete", "stop"])
+async def test_startup_snapshot_preserves_changes_during_load(monkeypatch, mutation):
+    from threading import Event
+
+    original = _task("changed", state="paused" if mutation == "resume" else "active")
+    scheduler, _clock, timers, _fired = _make([original, _task("untouched")])
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = scheduler._store.list_active_all_workspaces
+
+    def snapshot_then_wait():
+        snapshot = load()
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    monkeypatch.setattr(scheduler._store, "list_active_all_workspaces", snapshot_then_wait)
+    startup = asyncio.create_task(scheduler.start())
+    target = "new" if mutation == "create" else "changed"
+    try:
+        await asyncio.wait_for(entered.wait(), 10)
+        if mutation == "create":
+            scheduler.add(_task(target))
+        elif mutation in ("edit", "resume"):
+            scheduler.update(
+                replace(
+                    original, state="active", rrule="FREQ=DAILY;BYHOUR=9", timezone="Asia/Tokyo"
+                )
+            )
+        elif mutation == "pause":
+            scheduler.update(replace(original, state="paused"))
+        elif mutation == "delete":
+            scheduler.remove(target)
+        else:
+            scheduler.stop()
+        expected = scheduler.next_run_at(target)
+    finally:
+        release.set()
+        await startup
+    try:
+        assert scheduler.next_run_at(target) == expected
+        assert (expected is not None) == (mutation in ("create", "edit", "resume"))
+        assert scheduler.is_started == (mutation != "stop")
+        assert (scheduler.next_run_at("untouched") is not None) == (mutation != "stop")
+        assert len(timers.live()) == scheduler.job_count
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+async def test_ten_minute_timer_by_execution(execution_target, session_mode):
+    armed = execution_target == "connected_host" or session_mode == "continue"
+    task = replace(
+        _task("ten_minutes", "FREQ=MINUTELY;INTERVAL=10"),
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
+    scheduler, clock, seam, fired = _make([task])
+    await scheduler.start()
+    try:
+        assert bool(seam.live()) is armed
+        if armed:
+            assert 0 < seam.live()[-1].delay <= 600
+            clock.advance(seam.live()[-1].delay)
+            await seam.fire_latest()
+            assert fired.calls == [(0, task.id)]
+            assert seam.live()[-1].delay == 600
+    finally:
+        scheduler.stop()

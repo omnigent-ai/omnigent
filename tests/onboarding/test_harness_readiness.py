@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import os
+import shlex
 import subprocess
 import threading
 from collections import Counter
@@ -12,9 +15,18 @@ import yaml
 
 import omnigent.onboarding.harness_install as hi
 from omnigent.acp_cli_harnesses import ACP_CLI_HARNESSES
-from omnigent.harness_availability import HARNESS_VERSION_TOO_LOW
+from omnigent.harness_availability import (
+    HARNESS_BINARY_MISSING,
+    HARNESS_NEEDS_AUTH,
+    HARNESS_TMUX_UNAVAILABLE,
+    HARNESS_VERSION_TOO_LOW,
+    HarnessAvailability,
+)
 from omnigent.onboarding.harness_readiness import (
     _READINESS_PROBE_MAX_WORKERS,
+    _binary_availability_reason,
+    _databricks_credential_source,
+    _with_tmux_requirement,
     configured_harness_map,
     harness_is_configured,
 )
@@ -95,7 +107,31 @@ def _isolate_cli_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) ->
     import omnigent._platform as platform
 
     monkeypatch.delenv("OMNIGENT_CODEX_PATH", raising=False)
+    monkeypatch.delenv("OMNIGENT_PI_PATH", raising=False)
+    monkeypatch.delenv("HARNESS_PI_PATH", raising=False)
     monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
+    # Native readiness also requires tmux; pin a supported one ahead of the
+    # host's so these verdicts don't depend on whether the machine has tmux.
+    tmux_dir = tmp_path / "tmux-bin"
+    _write_fake_executable(tmux_dir, "tmux", "tmux 3.6a")
+    monkeypatch.setenv("PATH", f"{tmux_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+def _write_fake_executable(directory: Path, name: str, output: str | None) -> Path:
+    """Write an executable shell script that prints *output* and exits 0.
+
+    :param directory: Directory to create the script in, e.g. a test PATH entry.
+    :param name: Executable name, e.g. ``"tmux"`` or ``"devin"``.
+    :param output: Line printed on every invocation, e.g. ``"tmux 3.2"``;
+        ``None`` prints nothing.
+    :returns: Path of the written script.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    body = f"printf '%s\\n' {shlex.quote(output)}\n" if output is not None else ""
+    script.write_text(f"#!/bin/sh\n{body}exit 0\n")
+    script.chmod(0o755)
+    return script
 
 
 def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -111,12 +147,15 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
     # satisfying version so tests that simply need "binary present" are not
     # tripped up by an unexpected subprocess probe.
     def _stub_run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if argv == ["/usr/bin/tmux", "-V"]:
+            # Native harnesses also need a supported tmux on the same PATH.
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout="tmux 3.6a\n")
         if len(argv) >= 2 and argv[1] == "--version":
-            # OpenCode's declared range is [1.17.7, 1.18.0); Cursor uses calendar
+            # OpenCode's declared range is [2.0.0, 3.0.0); Cursor uses calendar
             # versions and needs a build after 2026-06-01; everything else is
             # fine with a generous semver placeholder.
             if argv[0].endswith("opencode"):
-                version = "1.17.7\n"
+                version = "opencode v2.0.18\n"
             elif argv[0].endswith("cursor-agent") or argv[0].endswith("hermes"):
                 version = "2026.07.01\n"
             else:
@@ -223,6 +262,50 @@ def test_cli_harness_configured_only_when_binary_installed(
     assert harness_is_configured(harness) is False
 
 
+@pytest.mark.parametrize("path_env", ["OMNIGENT_PI_PATH", "HARNESS_PI_PATH"])
+@pytest.mark.parametrize(
+    ("path_version", "selected_version", "expected"),
+    [
+        (None, "0.85.1", True),
+        ("0.84.1", "0.85.1", True),
+        ("0.85.1", "0.84.1", HARNESS_VERSION_TOO_LOW),
+        ("0.85.1", None, HARNESS_BINARY_MISSING),
+        ("0.85.1", "unparseable", HARNESS_VERSION_TOO_LOW),
+    ],
+)
+def test_pi_readiness_uses_selected_executable(
+    monkeypatch: pytest.MonkeyPatch,
+    path_env: str,
+    path_version: str | None,
+    selected_version: str | None,
+    expected: bool | str,
+) -> None:
+    """Readiness, inference-bound launches and setup inspect the selected Pi."""
+    versions = {"/test/path/pi": path_version, "/test/selected/pi": selected_version}
+    monkeypatch.setenv("HARNESS_PI_PATH", "/test/missing/legacy-pi")
+    monkeypatch.setenv(path_env, "/test/selected/pi")
+
+    def resolve_binary(name: str) -> str | None:
+        binary = "/test/path/pi" if name == "pi" else name
+        return binary if versions.get(binary) is not None else None
+
+    monkeypatch.setattr(hi.shutil, "which", resolve_binary)
+
+    def version_probe(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        assert argv == ["/test/selected/pi", "--version"]
+        return subprocess.CompletedProcess(argv, 0, stdout=selected_version or "", stderr="")
+
+    monkeypatch.setattr(hi.subprocess, "run", version_probe)
+    assert _binary_availability_reason("pi") == expected
+    assert hi.harness_cli_version_satisfies("pi") is (expected is True)
+    version, _range = hi.harness_cli_version("pi")
+    assert version == (None if selected_version == "unparseable" else selected_version)
+    for harness in ("pi", "pi-native", "native-pi"):
+        assert harness_is_configured(harness) is (expected is True)
+    for harness in ("pi", "pi-native"):
+        assert (hi.missing_harness_cli(harness) is None) is (expected is True)
+
+
 def test_auth_aware_native_harness_reports_binary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,7 +337,13 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: False
     )
     monkeypatch.setattr(hi, "harness_cli_logged_in", lambda key, **_kw: False)
-    # opencode: no stored/env provider.
+    result = configured_harness_map()
+    assert result["claude-native"] == "needs-auth"
+
+
+def test_opencode_ready_without_provider_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An installed OpenCode is launchable with no credential: its free models need none."""
+    _all_clis_installed(monkeypatch)
     import omnigent.onboarding.opencode_auth as oc
 
     monkeypatch.setattr(
@@ -262,9 +351,7 @@ def test_auth_aware_native_harness_needs_auth_when_installed_not_signed_in(
         "opencode_auth_summary",
         lambda: oc.OpenCodeAuthSummary(installed=True, stored_providers=(), env_providers=()),
     )
-    result = configured_harness_map()
-    assert result["claude-native"] == "needs-auth"
-    assert result["opencode-native"] == "needs-auth"
+    assert configured_harness_map()["opencode-native"] is True
 
 
 def test_opencode_ready_via_bedrock_profile_without_stored_login(
@@ -462,8 +549,7 @@ def test_configured_harness_map_covers_all_spellings(
         "hermes",
         "hermes-native",
         "native-hermes",
-        # Generic ACP harness — config-gated (≥1 agent in the acp: block), no CLI
-        # binary of its own; the acp:<slug> picks are config-derived, not keyed here.
+        # Generic ACP is config-gated; the empty fixture has no slug keys.
         "acp",
         # Builtin ACP CLI harnesses: every catalog row + alias, derived so a new
         # row never needs to touch this list.
@@ -593,15 +679,90 @@ def test_configured_harness_map_all_true_with_clis(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_readiness._family_provider_configured", lambda _h: True
     )
-    # The generic ACP harness is config-gated (≥1 registered agent), not
-    # CLI-gated — satisfy it so it isn't the lone unconfigured entry here.
-    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda config=None: [object()])
+    # Supply a real entry so generic and per-slug ACP readiness are true.
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
+
+    monkeypatch.setattr(
+        "omnigent.onboarding.acp_auth.acp_agents",
+        lambda config=None: [AcpAgentEntry(slug="traex", name="TraeX", command="traex acp serve")],
+    )
     # antigravity (SDK) needs a visible Gemini credential (not the openai
     # family the other SDK harnesses share).
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini-key")
     result = configured_harness_map()
     not_ready = {k: v for k, v in result.items() if v is not True}
     assert not not_ready, f"expected every spelling ready, got {not_ready}"
+
+
+def test_configured_harness_map_enumerates_configured_acp_slugs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Expose every configured ACP slug, including collision suffixes, as launchable."""
+    _no_clis_installed(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {"name": "TraeX", "command": "traex acp serve"},
+                        {"name": "Gemini CLI", "command": "gemini --experimental-acp"},
+                        {"name": "gemini cli", "command": "gemini2 --experimental-acp"},
+                    ]
+                }
+            }
+        )
+    )
+    result = configured_harness_map()
+    assert result["acp"] is True
+    # The picker filters on these exact keys, so they must agree with the launch gate.
+    for slug in ("traex", "gemini-cli", "gemini-cli-2"):
+        assert result[f"acp:{slug}"] is True
+        assert harness_is_configured(f"acp:{slug}") is True
+
+
+def test_configured_harness_map_omits_acp_slugs_for_malformed_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A malformed ACP block yields no slug keys and reads the generic acp as unready."""
+    _no_clis_installed(monkeypatch)
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {"acp": {"agents": [{"name": "X", "command": "y", "omnigent_mcp": "nope"}]}}
+        )
+    )
+    result = configured_harness_map()
+    assert not [key for key in result if key.startswith("acp:")]
+    assert result["acp"] is False
+
+
+def test_malformed_acp_config_does_not_log_secret_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Malformed passthrough entries must not expose their values in readiness logs."""
+    secret = "TOKEN=readiness-secret-sentinel"
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "acp": {
+                    "agents": [
+                        {
+                            "name": "TraeX",
+                            "command": "traex acp serve",
+                            "env_passthrough": [secret],
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    with caplog.at_level(logging.DEBUG, logger="omnigent.onboarding.harness_readiness"):
+        result = configured_harness_map()
+    assert result["acp"] is False
+    assert "acp:traex" not in result
+    assert "ValueError" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_configured_harness_map_probes_codex_readiness_once(
@@ -1006,6 +1167,27 @@ def test_sdk_harness_ready_via_databricks_workspace(
     result = configured_harness_map()
     assert result["claude-sdk"] is True
     assert result["openai-agents"] is True
+
+
+def test_databricks_credential_source_names_the_actual_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detection distinguishes env auth from the profile that actually matched."""
+    monkeypatch.setenv("DATABRICKS_HOST", "https://example.cloud.databricks.com")
+    monkeypatch.setenv("DATABRICKS_TOKEN", "dapi-test-token")
+    assert _databricks_credential_source() == "Databricks environment variables"
+
+    monkeypatch.delenv("DATABRICKS_HOST")
+    monkeypatch.delenv("DATABRICKS_TOKEN")
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "not-the-match")
+    config_file = tmp_path / "databrickscfg-source"
+    config_file.write_text(
+        "[actual-profile]\nhost = https://example.cloud.databricks.com\ntoken = dapi-test-token\n"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(config_file))
+
+    assert _databricks_credential_source() == "Databricks profile actual-profile"
 
 
 def test_databricks_workspace_url_alone_is_not_a_credential(
@@ -1423,3 +1605,116 @@ def test_antigravity_sdk_readiness_keys_off_gemini_credential(
         )
     )
     assert configured_harness_map()["antigravity"] is True
+
+
+def _isolated_cli_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point PATH at one empty directory holding a fake ``devin`` CLI.
+
+    Devin has no version floor or login probe, so its native harness is ready
+    from binary presence alone and only tmux can change its verdict.
+
+    :returns: The PATH directory, for adding or replacing a fake ``tmux``.
+    """
+    bin_dir = tmp_path / "isolated-bin"
+    _write_fake_executable(bin_dir, "devin", "devin 1.0.0")
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    return bin_dir
+
+
+@pytest.mark.parametrize(
+    ("tmux_output", "expected"),
+    [
+        pytest.param(None, HARNESS_TMUX_UNAVAILABLE, id="missing"),
+        pytest.param("tmux 3.2", HARNESS_TMUX_UNAVAILABLE, id="too-old"),
+        pytest.param("tmux next", HARNESS_TMUX_UNAVAILABLE, id="unparseable"),
+        pytest.param("tmux 3.3", True, id="minimum"),
+        pytest.param("tmux 3.6a", True, id="suffixed"),
+    ],
+)
+def test_native_readiness_requires_supported_tmux(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tmux_output: str | None,
+    expected: bool | str,
+) -> None:
+    """A native harness with a usable CLI reports tmux-unavailable until tmux works."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    if tmux_output is not None:
+        _write_fake_executable(bin_dir, "tmux", tmux_output)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == expected
+    assert result["native-devin"] == expected
+    # Non-native harnesses never launch tmux, so their verdicts are unaffected.
+    assert result["claude-sdk"] is True
+    assert result["claude"] is True
+    # A missing vendor CLI keeps precedence so its installer is still offered.
+    assert result["codex-native"] == HARNESS_BINARY_MISSING
+    assert result["codex"] == HARNESS_BINARY_MISSING
+    # The launch gate stays binary-only; the runner's tmux preflight owns that error.
+    assert harness_is_configured("devin-native") is True
+
+
+@pytest.mark.parametrize(
+    "availability",
+    [HARNESS_NEEDS_AUTH, HARNESS_BINARY_MISSING, HARNESS_VERSION_TOO_LOW, False],
+)
+def test_tmux_requirement_keeps_every_state_but_ready(availability: HarnessAvailability) -> None:
+    """Sign-in and CLI problems keep their own state, so the UI still shows what to fix first."""
+    assert _with_tmux_requirement("devin-native", availability, tmux_usable=False) == availability
+    assert (
+        _with_tmux_requirement("devin-native", True, tmux_usable=False) == HARNESS_TMUX_UNAVAILABLE
+    )
+
+
+@pytest.mark.parametrize("broken_tmux", [None, "tmux 3.2"], ids=["missing", "too-old"])
+def test_native_readiness_recovers_when_tmux_is_repaired(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    broken_tmux: str | None,
+) -> None:
+    """A tmux placed in an existing PATH directory is picked up on the next probe."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    if broken_tmux is not None:
+        _write_fake_executable(bin_dir, "tmux", broken_tmux)
+    assert configured_harness_map()["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+
+    _write_fake_executable(bin_dir, "tmux", "tmux 3.4")
+
+    assert configured_harness_map()["devin-native"] is True
+
+
+def test_configured_harness_map_probes_tmux_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Every native spelling shares one ``tmux -V`` run per readiness map."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    calls = tmp_path / "tmux-calls"
+    tmux = bin_dir / "tmux"
+    tmux.write_text(f"#!/bin/sh\necho call >> {shlex.quote(str(calls))}\necho 'tmux 3.2'\n")
+    tmux.chmod(0o755)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+    assert calls.read_text().splitlines() == ["call"]
+
+
+def test_undecodable_tmux_version_reads_as_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Invalid UTF-8 from ``tmux -V`` is an unknown version, not an aborted readiness map."""
+    bin_dir = _isolated_cli_path(monkeypatch, tmp_path)
+    tmux = bin_dir / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+
+    result = configured_harness_map()
+
+    assert result["devin-native"] == HARNESS_TMUX_UNAVAILABLE
+    assert result["claude-sdk"] is True
+    assert result["codex"] == HARNESS_BINARY_MISSING

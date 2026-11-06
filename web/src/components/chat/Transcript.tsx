@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { useVirtualizer } from "@tanstack/react-virtual";
+import { measureElement, useVirtualizer } from "@tanstack/react-virtual";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import {
   Conversation,
@@ -13,8 +13,8 @@ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
 import { cn } from "@/lib/utils";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { hasCommandModifier } from "@/lib/hotkeys";
-import { isSystemUserContent } from "@/lib/systemMessage";
-import { isTerminalCommandInput } from "@/lib/blocks";
+import { isSystemUserContent, parseSystemMessage } from "@/lib/systemMessage";
+import { isTerminalCommandInput, isTextBlock } from "@/lib/blocks";
 import {
   type Bubble,
   type BubbleCache,
@@ -22,18 +22,24 @@ import {
   createBubbleCache,
   liveCandidateAssistantIndex,
 } from "@/lib/renderItems";
-import { useChatStore } from "@/store/chatStore";
+import { sendableQueuedHead, useChatStore } from "@/store/chatStore";
 import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
 import { TurnRail, type Turn } from "@/pages/TurnRail";
-import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { FloatingBannerStack, StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+import { DbcertBanner } from "@/components/DbcertBanner";
 import { ArcaShutdownBanner } from "@/components/ArcaShutdownBanner";
 import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import { useSearchParams } from "@/lib/routing";
 import { MESSAGE_QUERY_PARAM } from "@/lib/messageDeepLink";
+import { onFindOpened } from "@/lib/nativeBridge";
 import { useMessageDeepLink } from "@/hooks/useMessageDeepLink";
 import { useUserMessageNav } from "@/hooks/useUserMessageNav";
 import { ChatPlanAccordion } from "@/shell/ChatPlanAccordion";
-import { RunnerStartingIndicator, McpStartupIndicator } from "@/pages/ChatIndicators";
+import {
+  RunnerStartingIndicator,
+  McpStartupIndicator,
+  SandboxActionBanner,
+} from "@/pages/ChatIndicators";
 import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
 import {
   type ConversationScroller,
@@ -42,21 +48,21 @@ import {
   HistoryAutoLoader,
   HistoryLoadingIndicator,
   JumpToTopButton,
-  KeepBottomOnViewportResize,
+  KeepBottomOnResize,
   LatestTurnSpacer,
   ScrollToBottomOnSend,
-  WorkingIndicator,
+  WorkingIndicatorRow,
   bubbleKey,
-  buildPendingBubbles,
   collectPendingElicitations,
   computeIsWorking,
   extractUserText,
   isSystemBubble,
-  mergePendingBubbles,
+  keyboardActiveQuestionId,
   reorderCommittedRequestElicitations,
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
   stripPendingElicitations,
+  withUncommittedUserBubbles,
 } from "@/components/chat/chatBubbleParts";
 import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
 
@@ -82,6 +88,29 @@ export interface TranscriptProps {
   sandboxLaunching: boolean;
   /** Pub/sub ref for the LatestTurnSpacer's synchronous re-measure handle. */
   spacerMeasureRef: React.RefObject<(() => void) | null>;
+}
+
+function isHiddenSubagentWakeBubble(bubble: Bubble): boolean {
+  if (bubble.kind !== "user") return false;
+  const first = bubble.content[0];
+  if (!first || !isTextBlock(first) || !first.text.startsWith("[System: sub-agent ")) return false;
+  if (!bubble.content.every(isTextBlock)) return false;
+  const parsed = parseSystemMessage(extractUserText(bubble.content));
+  return parsed?.kind === "subagent_wake" && parsed.body === "";
+}
+
+/** Keep model-facing sub-agent wake messages out of the visible row geometry. */
+export function visibleTranscriptBubbles(bubbles: Bubble[]): Bubble[] {
+  let visible: Bubble[] | null = null;
+  for (let index = 0; index < bubbles.length; index += 1) {
+    const bubble = bubbles[index]!;
+    if (isHiddenSubagentWakeBubble(bubble)) {
+      visible ??= bubbles.slice(0, index);
+    } else {
+      visible?.push(bubble);
+    }
+  }
+  return visible ?? bubbles;
 }
 
 export function isNativeFindShortcut(
@@ -123,9 +152,11 @@ function TranscriptImpl({
 }: TranscriptProps) {
   const blocks = useChatStore((s) => s.blocks);
   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+  const failedInputs = useChatStore((s) => s.failedInputs);
   const activeResponse = useChatStore((s) => s.activeResponse);
   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
+  const sandboxFailed = useChatStore((s) => s.sandboxStatus?.stage === "failed");
   const subagentRoutingOverride = useChatStore((s) => s.subagentRoutingOverride);
   const mcpStartupActive = useChatStore((s) => s.mcpStartup !== null);
   const hasTasks = useChatStore((s) => s.todos.length > 0);
@@ -135,6 +166,8 @@ function TranscriptImpl({
   // cache so a streaming append rebuilds only the active bubble, reusing the
   // finalized prefix by reference. Pending user messages (POSTed but not yet
   // acked) render as trailing user bubbles so the input is visible immediately.
+  // Undelivered startup messages replace their pending bubbles, above the
+  // failure notice that explains them.
   const bubbleCacheRef = useRef<BubbleCache>(createBubbleCache());
   const bubbles = useMemo<Bubble[]>(() => {
     const committed = stripGatedSubagentRoutingChips(
@@ -149,23 +182,32 @@ function TranscriptImpl({
       ),
       subagentRoutingOverride,
     );
-    if (pendingUserMessages.length === 0) return committed;
-    return mergePendingBubbles(
+    return withUncommittedUserBubbles(
       committed,
-      buildPendingBubbles(pendingUserMessages, getCurrentAuthorId()),
+      pendingUserMessages,
+      failedInputs,
+      getCurrentAuthorId(),
     );
   }, [
     blocks,
     activeResponse,
     interruptedResponseIds,
     pendingUserMessages,
+    failedInputs,
     subagentRoutingOverride,
     sessionStatus,
   ]);
 
   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+  const keyboardActiveElicitationId = useMemo(
+    () => keyboardActiveQuestionId(pendingElicitations),
+    [pendingElicitations],
+  );
   const streamBubbles = useMemo(
-    () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+    () =>
+      visibleTranscriptBubbles(
+        pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles),
+      ),
     [bubbles, pendingElicitations.length],
   );
   const committedUserIds = useMemo(() => {
@@ -189,6 +231,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blockCount: blocks.length,
       committedUserIds,
       hasCommittedAnchor:
@@ -204,6 +247,7 @@ function TranscriptImpl({
       bubbles,
       streamBubbles,
       pendingElicitations,
+      keyboardActiveElicitationId,
       blocks,
       committedUserIds,
       hasTasks,
@@ -223,7 +267,14 @@ function TranscriptImpl({
       flushSync(() => setNativeFindConversationId(display.conversationId));
     };
     window.addEventListener("keydown", handleFind);
-    return () => window.removeEventListener("keydown", handleFind);
+    // The desktop Edit > Find… menu opens its find bar without a keydown.
+    const unsubscribeFindOpened = onFindOpened(() => {
+      if (display.conversationId) setNativeFindConversationId(display.conversationId);
+    });
+    return () => {
+      window.removeEventListener("keydown", handleFind);
+      unsubscribeFindOpened();
+    };
   }, [display.conversationId]);
   const disableVirtualization = nativeFindConversationId === display.conversationId;
   const [searchParams] = useSearchParams();
@@ -312,7 +363,8 @@ function TranscriptImpl({
     return () => window.removeEventListener("keydown", handler);
   }, [nav]);
 
-  const showWorkingIndicator = shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
+  const showWorkingIndicator =
+    !sandboxFailed && shouldShowWorkingIndicator(display.showsWorking, display.bubbles);
   const arcaWarning = useArcaShutdownBanner();
   const showArcaBanner = arcaWarning.showForHost(hostId);
   const hasPinnedBanner = display.hasTasks || showArcaBanner;
@@ -327,11 +379,12 @@ function TranscriptImpl({
       conversation area without requiring Conversation to forward refs. */}
       <div
         ref={setConversationEl}
-        className="@container/chat relative flex min-h-0 flex-1 overflow-hidden"
+        className="session-chat-transcript @container/chat relative flex min-h-0 flex-1 overflow-hidden"
       >
         <Conversation
           className={cn(
-            hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade",
+            !isMobileViewport &&
+              (hasPinnedBanner ? "chat-scroll-composer-fade" : "chat-scroll-fade"),
             "flex-1",
           )}
         >
@@ -346,14 +399,13 @@ function TranscriptImpl({
           >
             {/* Scroll helpers — must live inside StickToBottom to access context. */}
             <ScrollToBottomOnSend nonce={sendScrollNonce} />
-            <KeepBottomOnViewportResize />
-            <ConversationScrollRefBridge onScroller={setScroller} />
+            <KeepBottomOnResize />
             <HistoryAutoLoader
               scrollElement={scroller?.el ?? null}
               rowCount={display.streamBubbles.length}
             />
             {display.bubbles.length === 0 && !showWorkingIndicator && !display.mcpStartupActive ? (
-              sandboxLaunching ? (
+              sandboxLaunching || sandboxFailed ? (
                 <RunnerStartingIndicator variant="hero" />
               ) : (
                 <ConversationEmptyState>
@@ -396,13 +448,19 @@ function TranscriptImpl({
                     data-testid="bottom-elicitation"
                   >
                     <MessageContent className="w-full">
-                      <ElicitationCard item={item} />
+                      <ElicitationCard
+                        item={item}
+                        keyboardActive={item.elicitationId === display.keyboardActiveElicitationId}
+                      />
                     </MessageContent>
                   </Message>
                 ))}
                 {/* Working… shimmer, lit for the whole busy turn. */}
-                {showWorkingIndicator && <WorkingIndicator />}
-                {/* Managed-sandbox stage cue; only when Working is absent. */}
+                <WorkingIndicatorRow
+                  key={display.conversationId ?? "landing"}
+                  show={showWorkingIndicator}
+                />
+                {/* Managed-sandbox launch status; only when Working is absent. */}
                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
                 {/* MCP-server startup band (codex-native); clears once the
                 round settles (failures stay in host logs, not the chat). */}
@@ -422,7 +480,15 @@ function TranscriptImpl({
               remeasureNonce={spacerMeasureNonce}
             />
           </ConversationContent>
-          <ConversationScrollButton />
+          {/* After the content, so the scroll element's ref is attached when its layout effect runs. */}
+          <ConversationScrollRefBridge onScroller={setScroller} />
+          <ConversationScrollButton
+            className={
+              isMobileViewport
+                ? "bottom-[calc(var(--session-composer-height,0px)+1rem)]"
+                : undefined
+            }
+          />
         </Conversation>
         {/* Constant-height scrollbar. Sibling of Conversation so it escapes the
         chat-scroll-fade mask. */}
@@ -433,8 +499,12 @@ function TranscriptImpl({
           scroller={scroller}
           hasMoreHistory={display.hasMoreHistory}
         />
-        {/* Too-many-tabs warning, a sibling of Conversation. */}
-        <StreamBudgetBanner />
+        {/* Too-many-tabs, dbcert, and sandbox-launch warnings, siblings of Conversation. */}
+        <FloatingBannerStack>
+          <StreamBudgetBanner />
+          <DbcertBanner conversationId={conversationId} hostId={hostId} />
+          <SandboxActionBanner />
+        </FloatingBannerStack>
         {/* Left-edge minimap: one tick per turn. Desktop-only. */}
         {!isMobileViewport && (
           <TurnRail
@@ -476,7 +546,7 @@ export function activeTurnIdAtBubbleIndex(bubbles: Bubble[], midIndex: number): 
  * mount every bubble's markdown/tool subtree at once.
  *
  * The window is one flex child of the content div, sized to the full measured
- * height (`getTotalSize`) with each row absolutely positioned. Keeping the
+ * height (`getTotalSize`), with mounted rows padded to their offsets. Keeping the
  * wrapper at full height preserves `scrollHeight`, so StickToBottom's
  * at-bottom math, the TranscriptScrollbar, and the LatestTurnSpacer all keep
  * measuring the whole transcript even though most rows are unmounted. Rows are
@@ -548,6 +618,8 @@ function rememberTranscriptView(convId: string, snap: TranscriptViewSnapshot): v
 }
 /** Physical "is this scroll element at (or within a hair of) its bottom". */
 const BOTTOM_EPSILON_PX = 8;
+/** Space between virtualized rows, shared by the virtualizer's offsets and the list's layout. */
+const ROW_GAP_PX = 16;
 const RESTORE_CANCEL_EVENTS = ["wheel", "touchstart", "pointerdown", "keydown"] as const;
 function isElAtBottom(el: HTMLElement): boolean {
   return el.scrollHeight - el.clientHeight - el.scrollTop <= BOTTOM_EPSILON_PX;
@@ -583,7 +655,32 @@ export function VirtualBubbleList({
   };
   const ctxRef = useRef(ctx);
   ctxRef.current = ctx;
+  // A commit can transiently shorten the transcript and clamp a following reader to that height.
+  // Re-pin only a reader the commit moved up from the end (the library pins 1px short of it);
+  // a user scroll lands in its own task.
+  const followingScrollTopRef = useRef<number | null>(null);
+  followingScrollTopRef.current =
+    scrollEl &&
+    ctx.state.isAtBottom &&
+    !ctx.state.escapedFromLock &&
+    scrollEl.scrollHeight - scrollEl.clientHeight - scrollEl.scrollTop <= 2
+      ? scrollEl.scrollTop
+      : null;
+  useLayoutEffect(() => {
+    const recorded = followingScrollTopRef.current;
+    const { isAtBottom, escapedFromLock } = ctxRef.current.state;
+    if (!scrollEl || recorded === null || !isAtBottom || escapedFromLock) return;
+    if (scrollEl.scrollTop >= recorded) return;
+    const bottom = scrollEl.scrollHeight - scrollEl.clientHeight;
+    if (bottom - scrollEl.scrollTop > 1) ctxRef.current.state.scrollTop = bottom;
+  });
   const storeConvId = useChatStore((s) => s.conversationId);
+  // A queued follow-up is sent as soon as the turn ends, so the reply's actions would
+  // only show for a frame.
+  const followUpQueued = useChatStore(
+    (s) => sendableQueuedHead(s.queuedMessages, conversationId) !== null,
+  );
+  const actionsPersist = sessionIdle && !followUpQueued;
   const restoringRef = useRef<string | null>(null);
   const latestSnapshotRef = useRef<{
     conversationId: string;
@@ -628,8 +725,8 @@ export function VirtualBubbleList({
       // offset is scroll-invariant and only in-flow content above it moves it,
       // while the hold measures purely inside the list. Neither sees the other's
       // change, so their writes add rather than double-count.
-      // Native scroll anchoring can't — the rows it would anchor to are out of
-      // flow — so it is off for this scroller (data-virtualized-transcript).
+      // Native scroll anchoring would also answer the virtualizer's own row
+      // corrections, so it is off for this scroller (data-virtualized-transcript).
       // Only the observer sees the net change per painted frame; a layout
       // effect can catch the indicator mid unmount-and-remount. At the very
       // top the indicator is meant to be seen, so nothing moves there.
@@ -640,8 +737,8 @@ export function VirtualBubbleList({
       if (observed) {
         const previous = listOffsetRef.current;
         listOffsetRef.current = { el: scrollEl, offset, scrollable };
-        // With virtualization off (native find) the rows are in flow and the
-        // browser's own anchoring handles this; writing too would double it.
+        // With virtualization off (native find) the browser's own anchoring is
+        // on and handles this; writing too would double it.
         if (
           !disableVirtualization &&
           previous?.el === scrollEl &&
@@ -659,7 +756,16 @@ export function VirtualBubbleList({
     };
     measure(false);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure(true));
+    let viewportHeight = scrollEl.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const nextViewportHeight = scrollEl.clientHeight;
+      if (viewportHeight === 0 && nextViewportHeight > 0) {
+        // The browser can restore scrollTop without firing scroll when a hidden view returns.
+        scrollEl.dispatchEvent(new Event("scroll"));
+      }
+      viewportHeight = nextViewportHeight;
+      measure(true);
+    });
     observer.observe(scrollEl); // viewport height changes
     if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
     return () => observer.disconnect();
@@ -720,12 +826,40 @@ export function VirtualBubbleList({
       const key = bubbleKey(bubbles[index]!);
       return rowKeyAliasRef.current.get(key) ?? key;
     },
-    // Replaces the content column's `gap-4` between bubbles, which absolute
-    // positioning would otherwise drop.
-    gap: 16,
+    gap: ROW_GAP_PX,
     overscan: 6,
     scrollMargin,
+    // Unrounded, unlike the library default: in-flow rows sit at their exact
+    // heights, so rounded sizes would drift each row off its virtual offset.
+    measureElement: (element, entry, instance) => {
+      const observed = entry?.borderBoxSize?.[0]?.blockSize;
+      if (observed !== undefined) return observed;
+      // On mount the library falls back to a cached size, else the rounded offsetHeight.
+      const key = instance.options.getItemKey(instance.indexFromElement(element));
+      return instance.itemSizeCache.has(key)
+        ? measureElement(element, entry, instance)
+        : element.getBoundingClientRect().height;
+    },
   });
+
+  // A row mounted mid-scroll is only measured by its ResizeObserver, after the layout
+  // has recorded its shift. Measuring it right after the commit corrects the scroll first.
+  const measureRow = useCallback(
+    (node: HTMLDivElement | null) => {
+      virtualizer.measureElement(node);
+      if (node === null) return;
+      queueMicrotask(() => {
+        const key = node.dataset.bubbleKey;
+        if (!node.isConnected || key === undefined || virtualizer.itemSizeCache.has(key)) return;
+        // The cached offset lags scroll writes until the next scroll event, and the
+        // correction below writes an absolute position built from it.
+        const scroller = virtualizer.scrollElement;
+        if (scroller) virtualizer.scrollOffset = scroller.scrollTop;
+        virtualizer.resizeItem(Number(node.dataset.index), node.getBoundingClientRect().height);
+      });
+    },
+    [virtualizer],
+  );
 
   // An assistant bubble is keyed by its first item, so a history page that
   // continues the top turn renames it. Keep rendering it under the key its row
@@ -922,9 +1056,9 @@ export function VirtualBubbleList({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [bubbles, scrollEl, range, totalSize, virtualizer]);
 
-  // Older-history prepend compensation. Absolute rows are out of normal flow,
-  // so the browser's native scroll anchoring can't hold the read position
-  // across a prepend. Snapshot every mounted row's offset each render; when a
+  // Older-history prepend compensation. Native scroll anchoring is off for
+  // this scroller, so it can't hold the read position across a prepend.
+  // Snapshot every mounted row's offset each render; when a
   // prepend lands, restore scrollTop so the topmost snapshotted row that still
   // exists keeps its pre-prepend viewport position. A bubble the page renamed
   // is skipped when any other row survives, and otherwise held by its bottom
@@ -1018,7 +1152,7 @@ export function VirtualBubbleList({
             isLastAssistant={index === lastAssistantIndex}
             showsWorking={showsWorking && index === lastAssistantIndex}
             actionsPersistent={
-              index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+              index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
             }
           />
         ))}
@@ -1026,9 +1160,22 @@ export function VirtualBubbleList({
     );
   }
 
+  // Rows stay in flow, padded to their virtual offsets: the browser resolves a
+  // drag ending beside or between out-of-flow rows to the start of the list.
+  const virtualItems = virtualizer.getVirtualItems();
+  const firstItem = virtualItems[0];
+  const lastItem = virtualItems.at(-1);
   return (
-    <div ref={wrapperRef} className="relative w-full" style={{ height: `${totalSize}px` }}>
-      {virtualizer.getVirtualItems().map((item) => {
+    <div
+      ref={wrapperRef}
+      className="flex w-full flex-col"
+      style={{
+        rowGap: ROW_GAP_PX,
+        paddingTop: firstItem ? firstItem.start - scrollMargin : 0,
+        paddingBottom: lastItem ? totalSize - (lastItem.end - scrollMargin) : totalSize,
+      }}
+    >
+      {virtualItems.map((item) => {
         const bubble = bubbles[item.index];
         if (!bubble) return null;
         return (
@@ -1036,16 +1183,15 @@ export function VirtualBubbleList({
             key={rowKey(bubble)}
             data-index={item.index}
             data-bubble-key={rowKey(bubble)}
-            ref={virtualizer.measureElement}
-            className="absolute top-0 left-0 w-full"
-            style={{ transform: `translateY(${item.start - scrollMargin}px)` }}
+            ref={measureRow}
+            className="relative"
           >
             <BubbleView
               bubble={bubble}
               isLastAssistant={item.index === lastAssistantIndex}
               showsWorking={showsWorking && item.index === lastAssistantIndex}
               actionsPersistent={
-                item.index === lastMessageIndex && bubble.kind === "assistant" && sessionIdle
+                item.index === lastMessageIndex && bubble.kind === "assistant" && actionsPersist
               }
             />
           </div>

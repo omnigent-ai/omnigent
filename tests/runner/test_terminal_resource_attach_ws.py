@@ -153,6 +153,90 @@ def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> 
     assert exc_info.value.code == 4404
 
 
+def _register_on_first_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: TerminalRegistry,
+    conversation_id: str,
+    instance: TerminalInstance | None,
+) -> list[str]:
+    """Make the launch wait's lookup miss once, registering *instance* as it does.
+
+    The route's own lookup has already missed by then, so the attach is known
+    to take the wait branch. ``None`` never registers anything.
+
+    :returns: Terminal ids the wait looked up, one entry per lookup.
+    """
+    from omnigent.entities import session_resources
+
+    real = session_resources.resolve_terminal_entry_by_resource_id
+    lookups: list[str] = []
+
+    def lookup(session_id: str, terminal_id: str, terminal_registry: object) -> object:
+        lookups.append(terminal_id)
+        if len(lookups) == 1:
+            if instance is not None:
+                _seed_registry(registry, conversation_id, instance)
+            return None
+        return real(session_id, terminal_id, terminal_registry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_resources, "resolve_terminal_entry_by_resource_id", lookup)
+    return lookups
+
+
+def test_runner_resource_attach_await_launch_waits_for_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``?await_launch=true`` attaches once an in-flight launch registers."""
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    calls: list[tuple[str, str, bool]] = []
+    _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
+    lookups = _register_on_first_lookup(
+        monkeypatch, registry, "conv_abc", _make_running_instance("zsh", "u-ab12cd", tmp_path)
+    )
+
+    with pytest.raises(RuntimeError, match="bridge stopped"):
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach"
+            "?await_launch=true"
+        ) as ws:
+            ws.receive_bytes()
+
+    assert len(lookups) == 2
+    assert calls == [(str(tmp_path / "zsh-u-ab12cd.sock"), "main", False)]
+
+
+def test_runner_resource_attach_await_launch_times_out_with_4404(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A launch that never registers still ends in 4404 after the wait."""
+    monkeypatch.setattr(
+        "omnigent.entities.session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S",
+        0.1,
+    )
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    lookups = _register_on_first_lookup(monkeypatch, registry, "conv_abc", None)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_bytes()
+
+    assert exc_info.value.code == 4404
+    # It waited (repeated lookups) rather than refusing at once.
+    assert len(lookups) > 1
+
+
 def test_runner_resource_attach_defunct_terminal_closes_4404(tmp_path: Path) -> None:
     """A registry entry with ``running=False`` closes with 4404.
 
@@ -414,6 +498,7 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         *,
         server_client: object,
         ensure_comment_relay: object = None,
+        agent_spec: object = None,
     ) -> SessionResourceView:
         """
         Stand-in for ``_auto_create_qwen_terminal`` that registers a
@@ -425,6 +510,8 @@ def test_runner_resource_attach_recreates_dead_qwen_terminal(
         :param server_client: Omnigent server client (unused).
         :param ensure_comment_relay: Comment relay hook threaded by the
             recreate path (unused by the stub).
+        :param agent_spec: Session agent spec threaded by the recreate path so
+            the pane inherits its ``os_env`` (unused by the stub).
         :returns: Terminal resource view for the fresh pane.
         """
         auto_create_sessions.append(session_id)
@@ -553,7 +640,7 @@ def test_runner_resource_attach_without_registry_closes_4404() -> None:
 
 
 def _make_direct_app(
-    events: list[tuple[str, str, bool]],
+    events: list[tuple[str, str, bool, bool]],
 ) -> FastAPI:
     """A direct-attach app whose attach handler records its arguments.
 
@@ -567,8 +654,9 @@ def _make_direct_app(
         session_id: str,
         terminal_id: str,
         read_only: bool = False,
+        await_launch: bool = False,
     ) -> None:
-        events.append((session_id, terminal_id, read_only))
+        events.append((session_id, terminal_id, read_only, await_launch))
         await websocket.accept()  # type: ignore[attr-defined]
         await websocket.close()  # type: ignore[attr-defined]
 
@@ -625,7 +713,7 @@ def test_direct_attach_probe_accepts_loopback_dev_origin(origin: str) -> None:
     ],
 )
 def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(path):
@@ -645,7 +733,7 @@ def test_direct_attach_rejects_missing_or_wrong_token(path: str) -> None:
 )
 def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -> None:
     """A DNS-rebinding-style page presents its own origin — refused."""
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with pytest.raises(WebSocketDisconnect) as exc_info:
         with TestClient(app).websocket_connect(
@@ -659,16 +747,16 @@ def test_direct_attach_rejects_foreign_origin_despite_valid_token(origin: str) -
 
 def test_direct_attach_forwards_attach_params_to_handler() -> None:
     """The attach wrapper hands session/terminal/read-only through unchanged."""
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     app = _make_direct_app(events)
     with contextlib.suppress(WebSocketDisconnect):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv1/resources/terminals/terminal_bash_s1/attach"
-            "?token=sekret-token&read_only=true",
+            "?token=sekret-token&read_only=true&await_launch=true",
             headers={"origin": "https://app.example"},
         ):
             pass
-    assert events == [("conv1", "terminal_bash_s1", True)]
+    assert events == [("conv1", "terminal_bash_s1", True, True)]
 
 
 def test_allowed_origin_for_server_strips_path_and_keeps_port() -> None:
@@ -686,7 +774,7 @@ async def test_direct_attach_listener_serves_probe_on_loopback() -> None:
     """The uvicorn listener binds 127.0.0.1:0 and answers the probe route."""
     import websockets
 
-    events: list[tuple[str, str, bool]] = []
+    events: list[tuple[str, str, bool, bool]] = []
     listener = await start_direct_attach_listener(_make_direct_app(events))
     assert listener is not None, "listener failed to start on loopback"
     try:

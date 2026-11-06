@@ -1,4 +1,5 @@
-// Tests for downloadWorkspaceFile's two transports under a configured base path.
+// Tests for downloadWorkspaceFile's two transports under a configured base path,
+// and for workspaceFileMediaUrl's host-resolved direct media URL.
 //
 //   - Standalone browser: a direct anchor click, so the URL must carry the
 //     subpath prefix (withBasePath) or a stripping proxy misses the app.
@@ -12,11 +13,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const isDatabricksWorkspace = vi.fn();
+const resolveMediaUrl = vi.fn();
 const authenticatedFetch = vi.fn();
 const isIOSShell = vi.fn(() => false);
 const isAndroidShell = vi.fn(() => false);
 
-vi.mock("@/lib/host", () => ({ isDatabricksWorkspace: () => isDatabricksWorkspace() }));
+vi.mock("@/lib/host", () => ({
+  isDatabricksWorkspace: () => isDatabricksWorkspace(),
+  resolveMediaUrl: (p: string) => resolveMediaUrl(p),
+}));
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authenticatedFetch(u) }));
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
@@ -29,7 +34,8 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 }));
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
-import { downloadWorkspaceFile } from "./useFileContent";
+import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
+import { downloadWorkspaceFile, workspaceFileMediaUrl } from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -72,5 +78,42 @@ describe("downloadWorkspaceFile base-path handling", () => {
     await downloadWorkspaceFile("sess_abc", "src/main.py");
 
     expect(authenticatedFetch).toHaveBeenCalledWith(RAW_URL);
+  });
+});
+
+describe("workspaceFileMediaUrl", () => {
+  const MEDIA_URL =
+    "/v1/sessions/sess_abc/resources/environments/default/filesystem/demo.mp4?download=true";
+
+  beforeEach(() => {
+    resolveMediaUrl.mockReset();
+    resolveMediaUrl.mockImplementation((p: string) => `https://ws.example${p}`);
+  });
+
+  afterEach(() => {
+    setSessionHost("sess_abc", null);
+    clearHostKeyless("host_1");
+  });
+
+  it("is null when the host has no media resolver, so callers fall back to fetching", () => {
+    resolveMediaUrl.mockReturnValue(null);
+
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBeNull();
+  });
+
+  it("routes the headerless media load to the session host's replica", () => {
+    setSessionHost("sess_abc", "host_1");
+
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(
+      `https://ws.example${MEDIA_URL}&omnigent_slice_key=host_1`,
+    );
+  });
+
+  it("leaves the load unkeyed when the session host is unknown or proven keyless", () => {
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
+
+    setSessionHost("sess_abc", "host_1");
+    markHostKeyless("host_1");
+    expect(workspaceFileMediaUrl("sess_abc", "demo.mp4")).toBe(`https://ws.example${MEDIA_URL}`);
   });
 });

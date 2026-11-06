@@ -133,6 +133,43 @@ def test_prune_retains_entry_reclaimed_during_eligibility_check(
     assert bridge_dir.exists()
 
 
+def test_prune_unmarked_dirs_follow_the_retention_policy(tmp_path: Path) -> None:
+    """Without a marker the retention policy alone decides; bad markers stay put."""
+    root = tmp_path / "bridge-root"
+    accepted = root / "accepted"
+    rejected = root / "rejected"
+    bad = root / "badmarker"
+    for bridge_dir in (accepted, rejected, bad):
+        bridge_dir.mkdir(parents=True)
+    (bad / native_bridge_common.OWNER_PID_FILENAME).write_text("not-an-int", encoding="utf-8")
+    seen: list[str] = []
+
+    def _should_prune(bridge_dir: Path) -> bool:
+        seen.append(bridge_dir.name)
+        return bridge_dir == accepted
+
+    assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_should_prune) == 1
+    assert sorted(seen) == ["accepted", "rejected"]
+    assert not accepted.exists()
+    assert rejected.exists()
+    assert bad.exists()
+
+
+def test_prune_retains_unmarked_entry_adopted_during_eligibility_check(tmp_path: Path) -> None:
+    """A runner writing owner.pid while the retention check runs keeps the dir."""
+    root = tmp_path / "bridge-root"
+    bridge_dir = root / "adopted"
+    bridge_dir.mkdir(parents=True)
+
+    def _adopt(_bridge_dir: Path) -> bool:
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
+        return True
+
+    assert native_bridge_common.prune_orphaned_dirs(root, should_prune=_adopt) == 0
+    assert bridge_dir.exists()
+    assert (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).exists()
+
+
 def test_reap_invokes_prune_for_every_native_agent(monkeypatch: pytest.MonkeyPatch) -> None:
     """The dynamic sweep calls each native agent's module-level prune once."""
     agents = (
@@ -305,3 +342,123 @@ def test_reap_still_errors_on_a_module_that_raises_on_import(
 
     records = [r for r in caplog.records if "broken_native" in r.getMessage()]
     assert [r.levelno for r in records] == [logging.ERROR]
+
+
+_NATIVE_BRIDGE_HARNESSES = pytest.mark.parametrize(
+    ("harness", "dirname"),
+    [
+        ("antigravity_native", "antigravity-native"),
+        ("codex_native", "codex-native"),
+        ("opencode_native", "opencode-native"),
+        ("pi_native", "pi-native"),
+    ],
+)
+
+
+def _run_python(
+    code: str, *, cwd: Path | None, data_dir: str | None, home: Path | None = None
+) -> str:
+    """Run *code* in a fresh interpreter with *cwd* and ``OMNIGENT_DATA_DIR``.
+
+    :param code: Python source passed to ``-c``.
+    :param cwd: Working directory of the child, or ``None`` to inherit it.
+    :param data_dir: ``OMNIGENT_DATA_DIR`` for the child, or ``None`` to unset it.
+    :param home: Home directory for the child, or ``None`` to inherit it.
+    :returns: The child's stripped stdout.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    pythonpath = os.pathsep.join(filter(None, [str(repo_root), os.environ.get("PYTHONPATH")]))
+    env = {**os.environ, "PYTHONPATH": pythonpath}
+    env.pop("OMNIGENT_DATA_DIR", None)
+    if data_dir is not None:
+        env["OMNIGENT_DATA_DIR"] = data_dir
+    if home is not None:
+        env["HOME"] = str(home)
+        env["USERPROFILE"] = str(home)
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return completed.stdout.strip()
+
+
+def _bridge_root_code(harness: str) -> str:
+    """Return child code that prints *harness*'s import-time bridge root."""
+    return f"from omnigent.harnesses.{harness} import bridge; print(bridge._BRIDGE_ROOT)"
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_follows_the_configured_data_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """Two instances with their own data dir never share, or sweep, one bridge root."""
+    root = _run_python(_bridge_root_code(harness), cwd=None, data_dir=str(tmp_path))
+
+    assert Path(root).is_absolute()
+    assert Path(root) == tmp_path / dirname
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_defaults_to_the_home_omnigent_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """With no data dir override, a single instance keeps ``~/.omnigent/<harness>-native``."""
+    home = tmp_path / "home"
+    home.mkdir()
+
+    root = _run_python(_bridge_root_code(harness), cwd=None, data_dir=None, home=home)
+
+    assert Path(root) == home / ".omnigent" / dirname
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_bridge_root_anchors_a_relative_data_dir_in_the_launch_directory(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """A relative data dir becomes absolute against the host's working directory."""
+    launch_dir = tmp_path / "launch"
+    launch_dir.mkdir()
+
+    root = _run_python(_bridge_root_code(harness), cwd=launch_dir, data_dir="state")
+
+    # The child's cwd is the real path, so compare against the resolved launch dir.
+    assert Path(root).is_absolute()
+    assert Path(root) == launch_dir.resolve() / "state" / dirname
+
+
+@_NATIVE_BRIDGE_HARNESSES
+def test_relay_in_another_workspace_accepts_the_runner_bridge_dir(
+    tmp_path: Path, harness: str, dirname: str
+) -> None:
+    """The pinned data dir lets a relay started in the workspace find the runner's bridge."""
+    launch_dir = tmp_path / "launch"
+    workspace = tmp_path / "workspace"
+    launch_dir.mkdir()
+    workspace.mkdir()
+
+    runner_root, pinned_data_dir = _run_python(
+        f"from omnigent.harnesses.{harness} import bridge\n"
+        "from omnigent.native import native_bridge_common\n"
+        "print(bridge._BRIDGE_ROOT)\n"
+        "print(native_bridge_common.native_bridge_data_dir())",
+        cwd=launch_dir,
+        data_dir="state",
+    ).splitlines()
+    assert Path(pinned_data_dir) == launch_dir.resolve() / "state"
+
+    # The relay runs in the session's workspace with only the pinned data dir.
+    relay_root = _run_python(
+        f"from pathlib import Path\n"
+        f"from omnigent.harnesses.{harness} import bridge\n"
+        "from omnigent.harnesses.claude_native import bridge as relay\n"
+        f"relay._trusted_parent_for_bridge_dir(Path({str(Path(runner_root) / 'sess')!r}))\n"
+        "print(bridge._BRIDGE_ROOT)",
+        cwd=workspace,
+        data_dir=pinned_data_dir,
+    )
+
+    assert Path(relay_root) == Path(runner_root) == launch_dir.resolve() / "state" / dirname

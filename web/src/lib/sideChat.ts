@@ -12,13 +12,20 @@
 /** Prefix that opens a side chat. The trailing space keeps `/sidebar` out. */
 export const SIDE_CHAT_COMMAND_PREFIX = "/side ";
 
+export const SIDE_CHAT_SETTINGS_MUTATION = "side-chat-settings";
+
+/** Shared by the picker and every send/queue gate for the same child. */
+export function sideChatSettingsMutationKey(sessionId: string) {
+  return [SIDE_CHAT_SETTINGS_MUTATION, sessionId] as const;
+}
+
 /** A fresh id for a side-chat rail tab whose fork isn't created yet. */
 export function newPendingSideChatId(): string {
   return `pending:${crypto.randomUUID()}`;
 }
 
 /**
- * Whether a harness supports the `/side` panel side chat.
+ * Whether the viewer can start a `/side` panel side chat in this session.
  *
  * The single onboarding point for side chat across the web app: the composer
  * slash command, the `+` trays, the busy-send bypass, and the text-selection
@@ -27,9 +34,14 @@ export function newPendingSideChatId(): string {
  * on for all of them. Codex uses its native ephemeral fork
  * (:func:`usesNativeSideChatFork`); the rest fork server-side and run in the
  * parent's workspace. To withhold side chat from a future harness, gate it here.
+ * Only the owner of the session's root can start side chats (see
+ * `useCanStartSideChat`); the server enforces it too.
  */
-export function supportsSideChat(harness: string | null | undefined): boolean {
-  return typeof harness === "string" && harness.length > 0;
+export function supportsSideChat(
+  harness: string | null | undefined,
+  canStartSideChat: boolean,
+): boolean {
+  return typeof harness === "string" && harness.length > 0 && canStartSideChat;
 }
 
 /**
@@ -55,4 +67,10 @@ export function usesNativeSideChatFork(harness: string | null | undefined): bool
 export function isSideChatCommand(text: string): boolean {
   if (!text.startsWith(SIDE_CHAT_COMMAND_PREFIX)) return false;
   return text.slice(SIDE_CHAT_COMMAND_PREFIX.length).trim().length > 0;
+}
+
+/** Optional model and effort picks for a side chat’s first turn. */
+export interface SideChatModelSettings {
+  modelOverride?: string;
+  reasoningEffort?: string | null;
 }

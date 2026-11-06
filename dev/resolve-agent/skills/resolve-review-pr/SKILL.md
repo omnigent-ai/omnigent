@@ -31,11 +31,16 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    to your handoff `recordings`. This is **not** gated on the repro handoff
    carrying footage — you have the test and the journey, which is all the recorder
    needs, so produce the after-clip whether or not any before-clip was recovered.
-   Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)
+   Burn timed step-by-step captions into each new clip and inspect the render
+   using `dev/caption_recording.py`; the attachment description alone is not
+   an on-screen caption. Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)
    (build the SPA first, record via `OMNIGENT_E2E_RECORD_DIR`, per-surface `web` /
-   `mobile` / `terminal` / `cli` / `desktop` mechanics) — saving to
-   `recordings/<slug>/after-<facet>.<ext>` with a `caption` for what the clip
-   shows. The test result determines the verdict separately; the footage must
+   `mobile` / `terminal` / `cli` / `desktop` mechanics). Save the raw capture to
+   `recordings/<slug>/raw/after-<facet>.<ext>`, render to
+   `recordings/<slug>/after-<facet>.mp4`, and declare only the inspected final
+   path with a `caption` for what the clip shows. If captioning fails, use the
+   shared guide's explicit fallback path instead.
+   The test result determines the verdict separately; the footage must
    show the product journey and its visible outcome, never the test runner. When
    the handoff *does* carry a before clip, carry it
    through **and** produce the after; when it carries none, still produce the

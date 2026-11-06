@@ -51,6 +51,10 @@ _LAUNCHER_WRAPPED_ENV = "OMNIGENT_LAUNCHER_SPAWN_WRAPPED"
 # write root that merely happens to sit under the system tempdir.
 _LAUNCHER_PRIVATE_TMPDIR_ENV = "OMNIGENT_LAUNCHER_SPAWN_PRIVATE_TMPDIR"
 
+# Trusted outer-launcher hint consumed before sandbox environment filtering.
+# Active sandbox helpers and launcher targets strip it; unsandboxed children keep it.
+HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
+
 # Backends that need a spawn-time wrap (parent-side ``bwrap`` /
 # ``sandbox-exec`` invocation) in addition to whatever in-process
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
@@ -125,6 +129,8 @@ class SandboxPolicy:
         environment cannot leak it into the sandbox.
         ``None`` (the default) skips the prune for spawn sites that
         haven't opted in.
+    :param bind_host_proc: Launcher-local bwrap choice. ``None`` means the
+        process constructing the final launcher has not resolved it yet.
     :param egress_relay_port: TCP port the in-namespace relay listens
         on (loopback). Set when ``egress_rules`` is active; the helper
         starts a relay daemon on this port at activation time. C1
@@ -183,6 +189,7 @@ class SandboxPolicy:
     mask_paths: list[Path] | None = None
     env_passthrough: list[str] | None = None
     spawn_env_allowlist: list[str] | None = None
+    bind_host_proc: bool | None = None
     egress_relay_port: int | None = None
     egress_socket_path: str | None = None
     git_ssh_socket_path: str | None = None
@@ -247,6 +254,7 @@ class SandboxPolicy:
                 if self.spawn_env_allowlist is not None
                 else None
             ),
+            "bind_host_proc": self.bind_host_proc,
             "egress_relay_port": self.egress_relay_port,
             "egress_socket_path": self.egress_socket_path,
             "git_ssh_socket_path": self.git_ssh_socket_path,
@@ -290,6 +298,8 @@ class SandboxPolicy:
         overflow = overflow_raw if isinstance(overflow_raw, str) else "warn"
         recursive_raw = data.get("cwd_hidden_scan_recursive", False)
         recursive = recursive_raw if isinstance(recursive_raw, bool) else False
+        bind_host_proc_raw = data.get("bind_host_proc")
+        bind_host_proc = bind_host_proc_raw if isinstance(bind_host_proc_raw, bool) else None
         mask_paths_data = data.get("mask_paths")
         mask_paths: list[Path] | None = None
         if isinstance(mask_paths_data, list):
@@ -349,6 +359,7 @@ class SandboxPolicy:
             mask_paths=mask_paths,
             env_passthrough=env_passthrough,
             spawn_env_allowlist=spawn_env_allowlist,
+            bind_host_proc=bind_host_proc,
             egress_relay_port=egress_relay_port,
             egress_socket_path=egress_socket_path,
             git_ssh_socket_path=git_ssh_socket_path,
@@ -445,6 +456,10 @@ class SandboxBackend(ABC):
         """
         del policy, cwd, chdir, target
         return argv
+
+    def prepare_launcher_policy(self, policy: SandboxPolicy) -> SandboxPolicy:
+        """Resolve host-local policy immediately before launcher construction."""
+        return policy
 
     def post_spawn(self, policy: SandboxPolicy, pid: int) -> ContainmentHandle | None:
         """
@@ -664,10 +679,9 @@ class ReachableRoot:
     """
     One path an environment's file tools are permitted to reach.
 
-    Produced by :func:`reachable_roots`, which is the single source of
-    truth for the grant boundary: the same list drives enforcement (in
-    :func:`omnigent.inner.os_env._assert_within_reach`) and the reach
-    the file-browsing APIs advertise, so the two cannot drift.
+    Produced from runtime policy by :func:`reachable_roots` or from remote
+    declarations by :func:`declared_filesystem_reach`. Both use the same
+    grant assembly for enforcement and file-browsing metadata.
 
     :param path: Resolved absolute path of the grant, e.g.
         ``Path("/Users/corey/data")``.
@@ -737,6 +751,39 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     :param policy: Resolved sandbox policy carrying the declared grants.
     :returns: Grants in precedence order, cwd first. Never empty.
     """
+    return _filesystem_reach_roots(
+        cwd, policy.write_roots, policy.write_files, policy.read_roots or []
+    )
+
+
+def declared_filesystem_reach(cwd: Path, spec: OSEnvSpec) -> tuple[list[ReachableRoot], bool]:
+    """Describe declared file grants without preparing a local sandbox.
+
+    Remote metadata readers need neither sandbox binaries nor runtime mounts.
+    Only an explicitly unconfined spec permits browsing beyond these grants.
+
+    :returns: Declared reachable roots and whether the spec is unconfined.
+    """
+    sandbox = spec.sandbox
+    if sandbox is None:
+        return _filesystem_reach_roots(cwd, [], [], []), False
+    return (
+        _filesystem_reach_roots(
+            cwd,
+            [_resolve_grant_root(cwd, grant.path) for grant in sandbox.write_path_specs],
+            [_resolve_grant_root(cwd, root) for root in sandbox.write_files or []],
+            [_resolve_grant_root(cwd, root) for root in sandbox.read_paths or []],
+        ),
+        sandbox.type == "none",
+    )
+
+
+def _filesystem_reach_roots(
+    cwd: Path,
+    write_roots: Sequence[Path],
+    write_files: Sequence[Path],
+    read_roots: Sequence[Path],
+) -> list[ReachableRoot]:
     # Resolving cwd is what makes the grants comparable to a resolved
     # candidate path. Callers pass a root that is already contained — see
     # `_session_workspace` / `compute_default_env_root`, which vet it against
@@ -744,15 +791,15 @@ def reachable_roots(cwd: Path, policy: SandboxPolicy) -> list[ReachableRoot]:
     roots = [ReachableRoot(path=cwd.resolve(), access="write", origin="cwd", kind="tree")]
     roots += [
         ReachableRoot(path=root, access="write", origin="write_paths", kind="tree")
-        for root in policy.write_roots
+        for root in write_roots
     ]
     roots += [
         ReachableRoot(path=grant, access="write", origin="write_files", kind="file")
-        for grant in policy.write_files
+        for grant in write_files
     ]
     roots += [
         ReachableRoot(path=root, access="read", origin="read_paths", kind="tree")
-        for root in (policy.read_roots or [])
+        for root in read_roots
     ]
     return roots
 
@@ -844,6 +891,7 @@ def _clone_policy_with(
         spawn_env_allowlist=(
             list(policy.spawn_env_allowlist) if policy.spawn_env_allowlist is not None else None
         ),
+        bind_host_proc=policy.bind_host_proc,
         egress_relay_port=policy.egress_relay_port,
         egress_socket_path=policy.egress_socket_path,
         git_ssh_socket_path=policy.git_ssh_socket_path,
@@ -1104,8 +1152,21 @@ def run_launcher(
     # broker dirs before bwrap scans dotfiles and hides their sockets.
     sandbox = _restore_broker_socket_roots(SandboxPolicy.from_jsonable(decoded))
 
-    # Before any wrap / exec so neither the re-exec'd launcher nor the
-    # target can see env vars the spawner didn't deliberately pass.
+    # Older launcher payloads may not have frozen host-local choices. Resolve
+    # them only on the host-side pass; the re-encoded policy carries the result.
+    if (
+        sandbox.active
+        and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
+        and os.environ.get(_LAUNCHER_WRAPPED_ENV) != "1"
+    ):
+        sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
+
+    # Unsandboxed children may launch their own runner and still need the hint.
+    if sandbox.active:
+        os.environ.pop(HOST_SANDBOX_BACKEND_ENV, None)
+
+    # Before any wrap / exec so neither the re-exec'd launcher nor the target
+    # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
 
     # Spawn-time wrap re-exec for backends whose sandbox enforcement
@@ -1120,7 +1181,7 @@ def run_launcher(
     #
     # We re-exec self under ``backend.wrap_launcher_argv``. The
     # wrapped invocation re-enters this function (via the launcher
-    # script's ``__main__``) but the marker env var breaks the loop
+    # script's ``__main__``) but ``_LAUNCHER_WRAPPED_ENV`` breaks the loop
     # and we proceed to the in-process ``activate_sandbox`` +
     # ``subprocess.run`` path. The wrap inherits HTTP_PROXY / CA
     # env vars set by the parent (terminal path) so the relay
@@ -1173,7 +1234,9 @@ def run_launcher(
                 f"raise SystemExit(run_launcher({encoded_sandbox!r}, "
                 f"{target_path!r}, sys.argv[1:]))"
             )
-            launcher_argv = [sys.executable, "-c", inline, *argv]
+            # -P keeps the wrap's cwd (the workspace) off sys.path, as in
+            # the host-side launcher script.
+            launcher_argv = [sys.executable, "-P", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
                     launcher_argv,
@@ -1299,6 +1362,10 @@ def create_exec_launcher(
                     f"Sandbox write grant {root} exposes the host launcher directory. "
                     "Grant a dedicated scratch directory instead of the host temporary root."
                 )
+        if sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            # Path-based spawners may filter the launcher environment. Freeze
+            # host-local choices here, immediately before encoding the policy.
+            sandbox = get_backend(sandbox.backend_type).prepare_launcher_policy(sandbox)
     inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
     interpreter = sys.executable
     if not interpreter:
@@ -1320,8 +1387,10 @@ def create_exec_launcher(
         # breaks whenever it is a wrapper script, sits behind a path
         # too long for the kernel's shebang buffer, or contains spaces —
         # each of which surfaces as an opaque ENOEXEC from the spawner.
+        # Spawners usually run it from the agent workspace. -P keeps that cwd
+        # off sys.path but, unlike -I, still honours the runtime's PYTHONPATH.
         fd, path = tempfile.mkstemp(prefix="omnigent-sandbox-", suffix=".sh", dir=launcher_dir)
-        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -c {shlex.quote(inline)} "$@"\n'
+        script = f'#!/bin/sh\nexec {shlex.quote(interpreter)} -P -c {shlex.quote(inline)} "$@"\n'
 
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(script)

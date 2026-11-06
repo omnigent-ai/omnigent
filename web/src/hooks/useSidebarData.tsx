@@ -1,15 +1,37 @@
-import { replaceEqualDeep } from "@tanstack/react-query";
+import { replaceEqualDeep, useQueryClient } from "@tanstack/react-query";
 import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useLayoutEffect,
   useMemo,
   useState,
   type ReactNode,
 } from "react";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import {
+  DEFAULT_SIDEBAR_VIEW,
+  readSidebarViewPreferences,
+  sidebarBaseOrdering,
+  writeSidebarViewPreferences,
+  type SidebarViewPreferences,
+} from "@/lib/sidebarViewPreferences";
+import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
+import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
-import { dedupeSessionRows, mergeScopeRows, sessionRowsPage } from "@/lib/sidebarData";
+import {
+  dedupeSessionRows,
+  mergeScopeRows,
+  type ScopeCacheData,
+  sessionRowsPage,
+} from "@/lib/sidebarData";
+import {
+  applyLocalElicitationResolutions,
+  observeSessionPendingCounts,
+  useLocalElicitationResolutions,
+} from "@/lib/localElicitationResolutions";
 import {
   sidebarConfig,
   SidebarConfigContext,
@@ -19,10 +41,13 @@ import {
 import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { useIdentityReady, useViewerId } from "./useViewerId";
 import { sumPendingApprovals } from "@/lib/inbox";
+import { useAutomationInbox } from "./useAutomationInbox";
 import { useCommentInbox } from "./useCommentInbox";
 import {
   usePinnedConversations,
+  PINNED_CONVERSATIONS_KEY,
   type Conversation,
+  type SessionSortBy,
   type useConversations,
 } from "./useConversations";
 import { useScopeCache } from "./useScopeCache";
@@ -32,7 +57,67 @@ export type SidebarListQuery = Pick<
   "data" | "error" | "isError" | "isLoading" | "isFetching" | "isFetchingNextPage" | "hasNextPage"
 > & { fetchNextPage: () => unknown; refetch?: () => unknown };
 
+/** Apply `apply` to every page's rows; returns `data` itself when no row changed. */
+function overlayPageRows(
+  data: ScopeCacheData | undefined,
+  apply: (rows: Conversation[]) => Conversation[],
+): ScopeCacheData | undefined {
+  if (!data) return data;
+  let changed = false;
+  const pages = data.pages.map((page) => {
+    const rows = apply(page.data);
+    if (rows === page.data) return page;
+    changed = true;
+    return { ...page, data: rows };
+  });
+  return changed ? { ...data, pages } : data;
+}
+
+/** Pinned-query counterpart of `overlayPageRows`. */
+function overlayPinnedRows<Data extends { conversations: Conversation[] }>(
+  data: Data | undefined,
+  apply: (rows: Conversation[]) => Conversation[],
+): Data | undefined {
+  if (!data) return data;
+  const conversations = apply(data.conversations);
+  return conversations === data.conversations ? data : { ...data, conversations };
+}
+
 function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
+  const client = useQueryClient();
+  const serverInfo = useServerInfo();
+  const [storedView, setView] = useState(readSidebarViewPreferences);
+  const view = isFeatureEnabled(serverInfo, "sidebar_grouping_ui")
+    ? storedView
+    : DEFAULT_SIDEBAR_VIEW;
+  const sortBy: SessionSortBy = sidebarSortBy(sidebarBaseOrdering(view));
+  const customOrder = useMemo(
+    () => (view.ordering === "custom" && view.custom ? customSortOrder(view.custom) : null),
+    [view],
+  );
+  const updateView = useCallback(
+    (patch: Partial<SidebarViewPreferences>) => {
+      const next = { ...storedView, ...patch };
+      writeSidebarViewPreferences(next);
+      if (sidebarBaseOrdering(next) !== sidebarBaseOrdering(storedView)) {
+        const nextSortBy = sidebarSortBy(sidebarBaseOrdering(next));
+        // Clear the destination snapshots before observers switch to the selected order.
+        for (const queryKey of [["conversations", "", false, null], ["project-sessions"]]) {
+          void client.invalidateQueries({ queryKey, refetchType: "none" });
+          void client.resetQueries({
+            queryKey,
+            predicate: ({ queryKey: key }) =>
+              (key[0] === "conversations"
+                ? (key[5] ?? "updated_at")
+                : parseProjectSessionsQueryKey(key).sortBy) === nextSortBy,
+          });
+        }
+        void client.resetQueries({ queryKey: PINNED_CONVERSATIONS_KEY });
+      }
+      setView(next);
+    },
+    [storedView, client],
+  );
   const [selectedView, registerView] = useState<SessionFilter | null>(null);
   const viewNeedsShared = selectedView === "all" || selectedView === "shared";
   const sharedActive = config.sharedAvailable && (viewNeedsShared || config.inboxIncludesShared);
@@ -44,6 +129,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     config.maxRefreshSessions,
     selectedView === "mine" || selectedView === "all" ? selectedView : null,
     config.sessionPageSize,
+    sortBy,
   );
   const shared = useScopeCache(
     "shared",
@@ -52,6 +138,7 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
     config.maxRefreshSessions,
     viewNeedsShared ? selectedView : null,
     config.sessionPageSize,
+    sortBy,
   );
   const pinned = usePinnedConversations(pinsIncludeShared, config.pinCap);
   const [folders, setFolders] = useState<Map<string, Conversation[]>>(() => new Map());
@@ -66,25 +153,73 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       return next;
     });
   }, []);
-  const mineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
-  const sharedRows = useMemo(
+  const rawMineRows = useMemo(() => mine.data?.pages.flatMap((p) => p.data) ?? [], [mine.data]);
+  const rawSharedRows = useMemo(
     () => (sharedActive ? (shared.data?.pages.flatMap((p) => p.data) ?? []) : []),
     [shared.data, sharedActive],
   );
   const pinnedRows = pinned.data?.conversations;
   const viewerId = useViewerId();
-  const loadedRows = useMemo(
+  // Answers the server has not yet reflected are subtracted from the derived rows below.
+  // Observation reads the raw counts, so the server's own count drops release them.
+  const localResolutions = useLocalElicitationResolutions();
+  const applyLocalResolutions = useCallback(
+    (rows: Conversation[]) => applyLocalElicitationResolutions(rows, localResolutions),
+    [localResolutions],
+  );
+  const rawLoadedRows = useMemo(
     () =>
       dedupeSessionRows([
         ...(pinnedRows ?? []),
         ...(sharedActive
           ? [...folders.values()].flat()
           : filterSessionScope([...folders.values()].flat(), "mine", viewerId)),
-        ...mineRows,
-        ...sharedRows,
+        ...rawMineRows,
+        ...rawSharedRows,
       ]).filter((row) => !row.archived),
-    [mineRows, sharedRows, pinnedRows, folders, sharedActive, viewerId],
+    [rawMineRows, rawSharedRows, pinnedRows, folders, sharedActive, viewerId],
   );
+  useEffect(() => {
+    observeSessionPendingCounts(rawLoadedRows);
+  }, [rawLoadedRows]);
+  const loadedRows = useMemo(
+    () => applyLocalResolutions(rawLoadedRows),
+    [applyLocalResolutions, rawLoadedRows],
+  );
+  const mineRows = useMemo(
+    () => applyLocalResolutions(rawMineRows),
+    [applyLocalResolutions, rawMineRows],
+  );
+  const sharedRows = useMemo(
+    () => applyLocalResolutions(rawSharedRows),
+    [applyLocalResolutions, rawSharedRows],
+  );
+  const mineData = useMemo(
+    () => overlayPageRows(mine.data, applyLocalResolutions),
+    [mine.data, applyLocalResolutions],
+  );
+  const sharedData = useMemo(
+    () => overlayPageRows(shared.data, applyLocalResolutions),
+    [shared.data, applyLocalResolutions],
+  );
+  const pinnedData = useMemo(
+    () => overlayPinnedRows(pinned.data, applyLocalResolutions),
+    [pinned.data, applyLocalResolutions],
+  );
+  // A session created in Custom's cutoff second looks like history by its
+  // timestamp, so save it at the top while this tab still knows it is new.
+  useLayoutEffect(() => {
+    const order = view.ordering === "custom" ? view.custom : undefined;
+    if (!order || !customOrder) return;
+    const arrivals = loadedRows.filter(
+      (row) =>
+        row.created_at === order.since &&
+        recentlyCreatedSessions.has(row.id) &&
+        !customOrder.positions.has(row.id),
+    );
+    if (arrivals.length > 0)
+      updateView({ custom: { ...order, ids: [...arrivals.map((row) => row.id), ...order.ids] } });
+  }, [view, customOrder, loadedRows, updateView]);
   const inboxRows = useMemo(
     () =>
       config.inboxIncludesShared
@@ -92,11 +227,23 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         : loadedRows.filter((row) => sessionVisibility(row, viewerId) === "mine"),
     [loadedRows, config.inboxIncludesShared, viewerId],
   );
+  // The server's counts, before answers in flight are subtracted.
+  const serverInboxRows = useMemo(
+    () =>
+      config.inboxIncludesShared
+        ? rawLoadedRows
+        : rawLoadedRows.filter((row) => sessionVisibility(row, viewerId) === "mine"),
+    [rawLoadedRows, config.inboxIncludesShared, viewerId],
+  );
   const comments = useCommentInbox(inboxRows);
-  const inboxCount = sumPendingApprovals(inboxRows) + comments.items.length;
+  const automationInbox = useAutomationInbox(identityReady);
+  const inboxCount =
+    sumPendingApprovals(inboxRows) + comments.items.length + automationInbox.items.length;
   const watchedIds = useMemo(() => loadedRows.map((row) => row.id), [loadedRows]);
   const mineCursor = mine.data?.pages.at(-1)?.last_id;
   const sharedCursor = shared.data?.pages.at(-1)?.last_id;
+  const mineBoundary = mine.data?.boundary;
+  const sharedBoundary = shared.data?.boundary;
   const merged = useMemo(
     () =>
       mergeScopeRows(
@@ -106,6 +253,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         sharedActive && shared.hasNextPage,
         mineCursor,
         sharedCursor,
+        sortBy,
+        mineBoundary,
+        sharedBoundary,
       ),
     [
       mineRows,
@@ -115,6 +265,9 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
       sharedActive,
       mineCursor,
       sharedCursor,
+      sortBy,
+      mineBoundary,
+      sharedBoundary,
     ],
   );
   const hasNextPage = mine.hasNextPage || (sharedActive && shared.hasNextPage);
@@ -153,26 +306,37 @@ function useSidebarSources(config: SidebarConfig, identityReady: boolean) {
         : undefined,
     [mine.data, shared.data, sharedActive, loadedRows],
   );
+  const mineView = { ...mine, data: mineData };
+  const sharedView = { ...shared, data: sharedData };
   return {
     config,
+    view,
+    updateView,
+    sortBy,
+    customOrder,
     identityReady,
     sharedAvailable: config.sharedAvailable,
     sharedActive,
     selectedView,
     registerView,
     pinsIncludeShared,
-    mine,
-    shared,
+    mine: mineView,
+    shared: sharedView,
     all,
-    inbox: config.inboxIncludesShared ? all : mine,
-    pinned,
+    inbox: config.inboxIncludesShared ? all : mineView,
+    pinned: { ...pinned, data: pinnedData },
     loadedRows,
     loadedData,
+    serverLoadedRows: rawLoadedRows,
     inboxRows,
+    serverInboxRows,
     inboxCount,
+    inboxCountIncomplete: automationInbox.hasNextPage,
     comments,
+    automationInbox,
     watchedIds,
     registerFolder,
+    applyLocalResolutions,
     watermark: merged.watermark,
   };
 }
@@ -225,8 +389,8 @@ export function useSidebarData() {
 
 /** Read shared rows without mounting another session-list query. */
 export function useLoadedConversations() {
-  const { loadedData: data, all } = useSidebarData();
-  return { data, isLoading: data === undefined && all.isLoading };
+  const { loadedData: data, serverLoadedRows: serverRows, all } = useSidebarData();
+  return { data, serverRows, isLoading: data === undefined && all.isLoading };
 }
 
 /** Register the mounted sidebar's persisted selection; unmount releases its demand. */

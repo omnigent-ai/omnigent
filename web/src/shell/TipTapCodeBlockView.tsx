@@ -26,6 +26,9 @@ export function TipTapCodeBlockView({ node, editor, getPos }: NodeViewProps) {
   // The editor is read-only for a file the user can't edit; the language
   // picker must not offer to mutate the doc in that case.
   const editable = editor.isEditable;
+  // Hundreds of unopened native pickers otherwise create thousands of option
+  // elements. Keep the selected label, then populate the menu before use.
+  const [optionsReady, setOptionsReady] = useState(false);
 
   // Match a known language case-insensitively so a cased fence (```Mermaid) maps
   // to the canonical option; a truly unknown language (e.g. ```rust) is appended
@@ -70,9 +73,12 @@ export function TipTapCodeBlockView({ node, editor, getPos }: NodeViewProps) {
         className="tiptap-code-block-lang absolute right-2 top-2 z-10 rounded border border-border bg-popover px-1.5 py-0.5 text-xs text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 focus:opacity-100"
         value={selectValue}
         disabled={!editable}
+        onPointerEnter={() => setOptionsReady(true)}
+        onPointerDown={() => setOptionsReady(true)}
+        onFocus={() => setOptionsReady(true)}
         onChange={onLanguageChange}
       >
-        {options.map((l) => (
+        {(optionsReady ? options : options.filter((l) => l.value === selectValue)).map((l) => (
           <option key={l.value} value={l.value}>
             {l.label}
           </option>

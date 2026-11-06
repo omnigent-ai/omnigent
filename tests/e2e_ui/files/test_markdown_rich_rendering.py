@@ -8,28 +8,42 @@ filesystem PUT endpoint (no agent run).
 
 from __future__ import annotations
 
+import contextlib
 import re
+import textwrap
 from collections.abc import Iterator
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests.e2e_ui.conftest import switch_markdown_view_mode
+from tests.e2e_ui.conftest import open_right_rail, switch_markdown_view_mode
 
 # ---------------------------------------------------------------------------
 # Test constants
 # ---------------------------------------------------------------------------
 
 _MARKDOWN_FILE_PATH = "design_rich.md"
+_WRAPPED_PARAGRAPH = textwrap.fill(
+    "This design note describes how the workspace file viewer renders Markdown "
+    "documents in its three modes. The rendered preview reflows every paragraph to "
+    "the full width of the viewer, while the editing surface must keep the text "
+    "selectable so reviewers can anchor comments to exact phrases in the file. Both "
+    "surfaces read the same source bytes, so any difference in how far a line of "
+    "prose extends across the panel comes from the way each surface lays the text "
+    "out rather than from the document itself.",
+    width=80,
+)
 
 # A GitHub-flavored markdown fixture covering the rich-rendering construct
 # matrix: headings, unordered + ordered lists, a fenced code block, a
 # table, a link, inline code/bold, and a blockquote.
-_MARKDOWN_CONTENT = """\
+_MARKDOWN_CONTENT = f"""\
 # Rich Design Document
 
 A short intro paragraph with **bold text**, _italics_, and `inline_code`.
+
+{_WRAPPED_PARAGRAPH}
 
 ## Goals
 
@@ -90,7 +104,12 @@ def seeded_rich_markdown_session(
         timeout=10.0,
     )
     resp.raise_for_status()
-    yield (base_url, session_id, _MARKDOWN_FILE_PATH)
+    try:
+        yield (base_url, session_id, _MARKDOWN_FILE_PATH)
+    finally:
+        # Session deletion leaves workspace files behind.
+        with contextlib.suppress(httpx.HTTPError):
+            httpx.delete(file_url, timeout=10.0).raise_for_status()
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +117,7 @@ def seeded_rich_markdown_session(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.browser_context_args(viewport={"width": 1600, "height": 900})
 def test_markdown_renders_rich_constructs_and_source_toggle(
     page: Page,
     seeded_rich_markdown_session: tuple[str, str, str],
@@ -105,6 +125,7 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
     """Rich markdown constructs render as HTML; source toggle shows raw text."""
     base_url, session_id, _file_path = seeded_rich_markdown_session
     page.goto(f"{base_url}/c/{session_id}?view=explore")
+    open_right_rail(page)
 
     file_button = page.get_by_role(
         "button", name=re.compile(rf"^{re.escape(_MARKDOWN_FILE_PATH)}\b")
@@ -125,8 +146,7 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
         page.get_by_role("button", name=f"Close {_MARKDOWN_FILE_PATH}", exact=True).first
     ).to_be_visible()
 
-    # Markdown opens in the rich-text editor by default, where each construct
-    # renders as its semantic HTML element.
+    # Edit mode renders each construct as its semantic HTML element.
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
     expect(editor.locator("h1")).to_contain_text("Rich Design Document")
@@ -142,6 +162,48 @@ def test_markdown_renders_rich_constructs_and_source_toggle(
     expect(editor.locator("blockquote")).to_contain_text("caution about scope")
     # Parsed, not dumped verbatim: the heading text is "Goals", never "## Goals".
     expect(editor.locator("h2").filter(has_text="Goals")).not_to_contain_text("##")
+
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    for mode, root in (("Preview", ".markdown-preview"), ("Edit", ".ProseMirror")):
+        switch_markdown_view_mode(page, file_viewer, mode)
+        paragraph = file_viewer.locator(f"{root} p").filter(has_text="This design note")
+        expect(paragraph).to_be_visible()
+        layout = paragraph.evaluate("""paragraph => {
+            const range = document.createRange();
+            range.selectNodeContents(paragraph);
+            const box = paragraph.getBoundingClientRect();
+            return {
+                width: box.width,
+                fill: (range.getBoundingClientRect().right - box.left) / box.width,
+            };
+        }""")
+        # Eighty-column source lines cannot fill a paragraph this wide.
+        assert layout["width"] > 900, layout
+        assert layout["fill"] > 0.9, f"{mode} paragraph does not fill the viewer: {layout}"
+
+    # Copy across a reflowed source newline without replacing it with a space.
+    lines = _WRAPPED_PARAGRAPH.splitlines()
+    last_word, first_word = lines[0].rsplit(" ", 1)[1], lines[1].split(" ", 1)[0]
+    editor.locator("h1").click()
+    editor.locator("span.md-soft-break").first.evaluate(
+        """(span, [before, after]) => {
+            window.getSelection().setBaseAndExtent(
+                span.previousSibling, span.previousSibling.textContent.length - before,
+                span.nextSibling, after,
+            );
+            window.__copiedText = null;
+            document.addEventListener("copy", event => {
+                window.__copiedText = event.clipboardData.getData("text/plain");
+            }, {once: true});
+        }""",
+        [len(last_word), len(first_word)],
+    )
+    expect(
+        page.get_by_role("button", name=re.compile("Add comment", re.IGNORECASE))
+    ).to_be_visible()
+    page.keyboard.press("ControlOrMeta+c")
+    page.wait_for_function("() => window.__copiedText !== null")
+    assert page.evaluate("window.__copiedText") == f"{last_word}\n{first_word}"
 
     # Source view: raw markdown becomes visible, no contenteditable editor.
     switch_markdown_view_mode(page, file_viewer, "Source")

@@ -11,14 +11,18 @@ import {
   getConversationIconKind,
   groupConversations,
   getConversationAgentType,
+  customSortOrder,
   migratePinnedConversationIds,
+  moveCustomOrder,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
   sessionsListAcceptsDrop,
+  sortConversations,
+  startCustomOrder,
   STATUS_BUCKETS,
   statusBucket,
-  updatedBucket,
+  dateBucket,
 } from "./sidebarNav";
 
 function conversation(
@@ -693,20 +697,30 @@ describe("statusBucket", () => {
     expect(statusBucket({ ...base, status: "idle" }, false, true)).toBe("Draft");
     expect(statusBucket({ ...base, status: "idle" }, false, false)).toBe("Done");
   });
+  it("puts a turn parked on a terminal prompt in Needs attention", () => {
+    const parked = { ...base, blocked_on: "permission prompt" };
+    expect(statusBucket({ ...parked, status: "running" }, false, false)).toBe("Needs attention");
+    expect(statusBucket({ ...parked, status: "idle" }, false, false)).toBe("Done");
+  });
+  it("keeps an ended turn with a running background shell in Working", () => {
+    const shells = { ...base, background_work_running: true };
+    expect(statusBucket({ ...shells, status: "idle" }, true, true)).toBe("Working");
+    expect(statusBucket({ ...shells, status: "failed" }, false, false)).toBe("Needs attention");
+  });
 });
 
-describe("updatedBucket", () => {
+describe("dateBucket", () => {
   const now = new Date(2026, 8, 30, 10, 0);
   const at = (date: Date) => date.getTime() / 1000;
   it("buckets by local calendar day", () => {
-    expect(updatedBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("Today");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("Yesterday");
-    expect(updatedBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("Previous 7 days");
-    expect(updatedBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("Previous 30 days");
-    expect(updatedBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("Older");
+    expect(dateBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("today");
+    expect(dateBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("earlier");
   });
 });
 
@@ -737,6 +751,14 @@ describe("groupConversations", () => {
       ["Done", ["b"]],
     ]);
   });
+
+  it("retains an empty Working group in status order", () => {
+    const done = conversation("done", "Done", new Date(2026, 0, 1));
+    expect(groupConversations([done], () => "Done", STATUS_BUCKETS, "Working")).toEqual([
+      { title: "Working", conversations: [] },
+      { title: "Done", conversations: [done] },
+    ]);
+  });
 });
 
 describe("sessionsListAcceptsDrop", () => {
@@ -750,5 +772,124 @@ describe("sessionsListAcceptsDrop", () => {
     expect(sessionsListAcceptsDrop(drag("Customer X", false), true)).toBe(false);
     expect(sessionsListAcceptsDrop(drag("Customer X", true), true)).toBe(false);
     expect(sessionsListAcceptsDrop(drag(null, true), true)).toBe(true);
+  });
+});
+
+it("keeps Created stable across updates, active-row overrides, and hover freezes", () => {
+  const old = { ...conversation("a", "old", new Date(1000)), created_at: 1, updated_at: 300 };
+  const newer = { ...conversation("b", "new", new Date(2000)), created_at: 2, updated_at: 100 };
+  const sameSecond = { ...newer, id: "c" };
+  const frozen = new Map([
+    [old.id, 999],
+    [newer.id, 1],
+  ]);
+  const active = { id: newer.id, updatedAt: 500 };
+  const ids = (rows: Conversation[]) =>
+    sortConversations(rows, active, frozen, "created_at").map((row) => row.id);
+  expect(ids([old, newer, sameSecond])).toEqual(["c", "b", "a"]);
+  expect(ids([{ ...old, updated_at: 1000 }, sameSecond, newer])).toEqual(["c", "b", "a"]);
+  expect(sortConversations([old, newer], null).map((row) => row.id)).toEqual(["a", "b"]);
+});
+
+it("orders equal-updated_at rows by id whether or not the order is frozen", () => {
+  const same = new Date("2026-10-14T10:00:00Z");
+  const a = conversation("a", "A", same);
+  const b = conversation("b", "B", same);
+  const c = conversation("c", "C", same);
+  const frozen = new Map<string, number>();
+  const first = sortConversations([a, b, c], null, frozen).map((row) => row.id);
+  // A refresh can hand the same rows back in another order while the pointer is inside.
+  expect(sortConversations([c, a, b], null, frozen).map((row) => row.id)).toEqual(first);
+  // With the pointer outside, arrival order still must not show through.
+  expect(first).toEqual(["c", "b", "a"]);
+  expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
+});
+
+describe("Custom order", () => {
+  // Whole-second server timestamps, as the API returns them.
+  const row = (id: string, createdAt: number, updatedAt = createdAt): Conversation => ({
+    ...conversation(id, id, new Date(0)),
+    created_at: createdAt,
+    updated_at: updatedAt,
+  });
+  const ids = (rows: Conversation[]) => rows.map((c) => c.id);
+
+  it("starts from the automatic order on screen at the newest server time", () => {
+    const rows = [row("a", 10, 300), row("b", 20, 100), row("c", 30, 200)];
+    expect(startCustomOrder("updated", rows, null, null)).toEqual({
+      base: "updated",
+      since: 300,
+      ids: ["a", "c", "b"],
+    });
+    expect(startCustomOrder("created", rows, null, null).ids).toEqual(["c", "b", "a"]);
+    // A hover-frozen key is what the viewer sees, so it is what Custom keeps.
+    expect(startCustomOrder("updated", rows, null, new Map([["b", 400]])).ids).toEqual([
+      "b",
+      "a",
+      "c",
+    ]);
+    expect(startCustomOrder("created", [], null, null)).toEqual({
+      base: "created",
+      since: 0,
+      ids: [],
+    });
+  });
+
+  it("fixes saved rows, puts new sessions above them and history below", () => {
+    const order = customSortOrder({ base: "updated", since: 100, ids: ["s1", "s2"] });
+    const rows = [
+      row("history-tie", 100),
+      row("s2", 1, 900),
+      row("history", 50, 80),
+      row("new-older", 101, 999),
+      row("s1", 2, 3),
+      row("new-newer", 150),
+      row("history-active", 40, 999),
+    ];
+    expect(ids(sortConversations(rows, null, null, "updated_at", order))).toEqual([
+      "new-newer",
+      "new-older",
+      "s1",
+      "s2",
+      "history-active",
+      "history-tie",
+      "history",
+    ]);
+  });
+
+  it("moves within a list and saves only through the deepest row it touches", () => {
+    const order = { base: "updated" as const, since: 100, ids: ["s1", "s2", "s3"] };
+    // s2 is saved but not loaded; h1..h3 are history loaded after Custom started.
+    const rows = [
+      row("n1", 200),
+      row("s1", 1),
+      row("s3", 3),
+      ...["h1", "h2", "h3"].map((id, index) => row(id, 50 - index, 90 - index)),
+    ];
+    expect(moveCustomOrder(order, rows, "s1", "s3", null, null)?.ids).toEqual([
+      "n1",
+      "s2",
+      "s3",
+      "s1",
+    ]);
+    expect(moveCustomOrder(order, rows, "s3", "n1", null, null)?.ids).toEqual([
+      "s3",
+      "n1",
+      "s1",
+      "s2",
+    ]);
+    const deep = moveCustomOrder(order, rows, "h2", "s1", null, null)!;
+    expect(deep.ids).toEqual(["n1", "h2", "s1", "s2", "s3", "h1"]);
+    // The saved order renders exactly as moved; unsaved h3 keeps following Updated.
+    expect(ids(sortConversations(rows, null, null, "updated_at", customSortOrder(deep)))).toEqual([
+      "n1",
+      "h2",
+      "s1",
+      "s3",
+      "h1",
+      "h3",
+    ]);
+    expect(moveCustomOrder(order, rows, "s1", "s1", null, null)).toBeNull();
+    expect(moveCustomOrder(order, rows, "s1", "deleted", null, null)).toBeNull();
   });
 });

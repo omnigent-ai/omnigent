@@ -2,6 +2,10 @@
 
 Only Responses replies are mocked. The installed Codex binary supplies the
 catalog, runs its app-server and TUI, and sends the recorded HTTP requests.
+Set ``OMNIGENT_TEST_CODEX_STANDARD_MODEL`` to change the low..xhigh model,
+``OMNIGENT_TEST_CODEX_EXTENDED_MODEL`` for max/ultra, and
+``OMNIGENT_TEST_CODEX_SWITCH_MODEL`` for a different default effort.
+All replies stay on the local mock server, including with these overrides.
 Run with ``uv run --no-sync pytest tests/e2e/test_codex_native_supported_efforts_e2e.py -v -s``.
 """
 
@@ -14,6 +18,7 @@ import os
 import shutil
 import subprocess
 import time
+import tomllib
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
@@ -23,7 +28,6 @@ from typing import Any
 
 import httpx
 import pytest
-import tomllib
 
 from omnigent.harnesses.codex_native.app_server import client_for_transport
 from omnigent.harnesses.codex_native.bridge import read_bridge_state
@@ -31,7 +35,111 @@ from tests._helpers.live_server import terminate_process
 from tests._helpers.native_session import create_native_session
 from tests._helpers.server_runner import ServerRunner, server_runner
 
+# Keep capability roles explicit: substituting a model must preserve the assertions.
+_STANDARD_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_STANDARD_MODEL", "gpt-5.5")
+_EXTENDED_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_EXTENDED_MODEL", "gpt-6-sol")
+_SWITCH_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_SWITCH_MODEL", "gpt-5.6-sol")
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.mark.parametrize("codex_effort_rig", [30], indirect=True)
+def test_terminal_only_work_survives_runner_inactivity(codex_effort_rig: _Rig) -> None:
+    """A real native turn pins a runner until it settles, without a web message."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium", terminal=True)
+        terminate_process(rig.stack.runner)
+        rig.stack.runner = None
+        rig.stack.start_runner(cwd=_REPO_ROOT, env=rig.runner_env)
+        session.ensure_terminal(rig)
+        runner_log = max((rig.stack.runner_home / ".omnigent/logs/runner").glob("*.log"))
+        assert "Runner session initialization started" not in runner_log.read_text()
+        marker = f"TERMINAL_ONLY_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            state = read_bridge_state(session.bridge)
+            requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+            own = [
+                request
+                for request in requests
+                if state is not None and request.get("prompt_cache_key") == state.thread_id
+            ]
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            if own and snapshot.get("status") == "running":
+                break
+            time.sleep(0.2)
+        else:
+            pytest.fail(
+                "Terminal input did not reach the mock provider.\n"
+                f"{session.tmux('capture-pane', '-p')}"
+            )
+        assert len(own) == 1
+        assert state is not None
+        assert rig.stack.runner is not None
+        held_at = time.monotonic()
+        try:
+            # Do not send runner requests or keep a terminal WebSocket attached here.
+            while time.monotonic() - held_at < 36:
+                assert rig.stack.runner.poll() is None, rig.stack.log_tail()
+                time.sleep(0.25)
+            held_seconds = time.monotonic() - held_at
+            (rig.stack.root / "held-terminal.txt").write_text(session.tmux("capture-pane", "-p"))
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                items = _json(
+                    rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100})
+                )["data"]
+                replies = [
+                    item
+                    for item in items
+                    if item.get("role") == "assistant"
+                    and marker in json.dumps(item.get("content"))
+                ]
+                state = read_bridge_state(session.bridge)
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                if replies and snapshot.get("status") == "idle":
+                    break
+                time.sleep(0.2)
+            else:
+                pytest.fail(f"Terminal turn did not settle.\n{rig.stack.log_tail()}")
+            assert len(replies) == 1
+            assert len([item for item in items if item.get("role") == "user"]) == 2
+            return_code = rig.stack.runner.wait(timeout=50)
+            assert return_code == 0, rig.stack.log_tail()
+            log = runner_log.read_text()
+            assert "idle timeout reached" in log, log[-4000:]
+            assert "Runner session initialization started" not in log
+            (rig.stack.root / "terminal-only-evidence.json").write_text(
+                json.dumps(
+                    {
+                        "held_seconds": held_seconds,
+                        "idle_timeout_s": 30,
+                        "requests": own,
+                        "reply_count": len(replies),
+                        "runner_exit": return_code,
+                    },
+                    indent=2,
+                )
+            )
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),
@@ -59,13 +167,26 @@ class _Rig:
     def capabilities(self, model: str) -> set[str]:
         row = next((row for row in self.catalog["models"] if row["slug"] == model), None)
         if row is None:
+            if any(
+                os.environ.get(name) == model
+                for name in (
+                    "OMNIGENT_TEST_CODEX_STANDARD_MODEL",
+                    "OMNIGENT_TEST_CODEX_EXTENDED_MODEL",
+                    "OMNIGENT_TEST_CODEX_SWITCH_MODEL",
+                )
+            ):
+                pytest.fail(
+                    f"Configured test model {model!r} is absent from the installed Codex catalog"
+                )
             pytest.skip(f"installed Codex does not advertise {model}")
         return {level["effort"] for level in row["supported_reasoning_levels"]}
 
 
 @pytest.fixture(scope="module")
 def codex_effort_rig(
-    tmp_path_factory: pytest.TempPathFactory, mock_llm_server_url: str
+    tmp_path_factory: pytest.TempPathFactory,
+    mock_llm_server_url: str,
+    request: pytest.FixtureRequest,
 ) -> Iterator[_Rig]:
     """Own a real server, runner, and private Codex home without ambient credentials."""
     root = tmp_path_factory.mktemp("codex-supported-efforts")
@@ -76,7 +197,7 @@ def codex_effort_rig(
     (config / "config.yaml").write_text(
         json.dumps(
             {
-                "runner": {"idle_timeout_s": 0},
+                "runner": {"idle_timeout_s": getattr(request, "param", 0)},
                 "providers": {
                     "effort-test": {
                         "kind": "key",
@@ -85,7 +206,7 @@ def codex_effort_rig(
                             "base_url": f"{mock_llm_server_url}/v1",
                             "api_key": "mock-key",
                             "wire_api": "responses",
-                            "models": {"default": "gpt-5.4"},
+                            "models": {"default": _STANDARD_MODEL},
                         },
                     }
                 },
@@ -369,9 +490,9 @@ def _assert_turn(
 @pytest.mark.parametrize(
     ("model", "requested", "expected"),
     [
-        ("gpt-5.4", "minimal", "low"),
-        ("gpt-5.4", "max", "xhigh"),
-        ("gpt-5.6-sol", "minimal", "low"),
+        (_STANDARD_MODEL, "minimal", "low"),
+        (_STANDARD_MODEL, "max", "xhigh"),
+        (_SWITCH_MODEL, "minimal", "low"),
     ],
 )
 def test_codex_clamps_unsupported_effort(
@@ -394,7 +515,8 @@ def test_codex_clamps_unsupported_effort(
 
 
 @pytest.mark.parametrize(
-    ("model", "effort"), [("gpt-5.4", "xhigh"), ("gpt-6-sol", "max"), ("gpt-6-sol", "ultra")]
+    ("model", "effort"),
+    [(_STANDARD_MODEL, "xhigh"), (_EXTENDED_MODEL, "max"), (_EXTENDED_MODEL, "ultra")],
 )
 def test_codex_preserves_supported_effort(codex_effort_rig: _Rig, model: str, effort: str) -> None:
     """Supported high levels survive both launch and subsequent settings changes."""
@@ -409,56 +531,151 @@ def test_codex_preserves_supported_effort(codex_effort_rig: _Rig, model: str, ef
 def test_codex_model_switch_clamps_inherited_effort(codex_effort_rig: _Rig) -> None:
     """Changing only the model revalidates the existing session's supported max effort."""
     rig = codex_effort_rig
-    assert "max" in rig.capabilities("gpt-6-sol")
-    assert "max" not in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-6-sol", "max") as session:
-        _assert_turn(rig, session, "gpt-6-sol", "max")
-        _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"model_override": "gpt-5.4"}))
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
+    assert "max" in rig.capabilities(_EXTENDED_MODEL)
+    assert "max" not in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _EXTENDED_MODEL, "max") as session:
+        _assert_turn(rig, session, _EXTENDED_MODEL, "max")
+        _json(
+            rig.api.patch(f"/v1/sessions/{session.id}", json={"model_override": _STANDARD_MODEL})
+        )
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+
+
+@pytest.mark.parametrize("main_turn_first", [True, False], ids=["after_main_turn", "side_first"])
+def test_codex_side_chat_uses_switched_model_and_effort(
+    codex_effort_rig: _Rig, main_turn_first: bool
+) -> None:
+    """A /side fork opened after a model and effort switch sends the parent's new settings."""
+    rig = codex_effort_rig
+    assert "max" in rig.capabilities(_EXTENDED_MODEL)
+    assert "max" not in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "high") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "high")
+        _json(
+            rig.api.patch(
+                f"/v1/sessions/{session.id}",
+                json={"model_override": _EXTENDED_MODEL, "reasoning_effort": "max"},
+            )
+        )
+        if main_turn_first:
+            _assert_turn(rig, session, _EXTENDED_MODEL, "max")
+
+        # Longer than the turn markers, which the fork's inherited history also contains.
+        marker = f"SIDE_CHAT_REPLY_OK_{uuid.uuid4().hex}"
+        _json(
+            rig.model.post(
+                "/mock/configure", json={"key": marker, "responses": [], "match": marker}
+            )
+        )
+        _json(rig.model.post("/mock/set_fallback", json={"key": marker, "text": marker}))
+        before = len(_json(rig.model.get("/mock/requests"))["requests"])
+        rig.api.post(
+            f"/v1/sessions/{session.id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"/side Reply with {marker}"}],
+                },
+            },
+        ).raise_for_status()
+        deadline = time.monotonic() + 90
+        side_requests: list[dict[str, Any]] = []
+        replied = False
+        while time.monotonic() < deadline and not (side_requests and replied):
+            requests = _json(rig.model.get("/mock/requests"))["requests"][before:]
+            side_requests = [
+                request for request in requests if marker in json.dumps(request.get("input"))
+            ]
+            children = _json(rig.api.get(f"/v1/sessions/{session.id}/child_sessions"))["data"]
+            replied = any(
+                item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+                for child in children
+                for item in _json(
+                    rig.api.get(f"/v1/sessions/{child['id']}/items", params={"limit": 100})
+                )["data"]
+            )
+            time.sleep(0.5)
+        observed = [
+            (request.get("model"), request.get("reasoning", {}).get("effort"))
+            for request in side_requests
+        ]
+        assert side_requests, f"The side fork never reached the model.\n{rig.stack.log_tail()}"
+        assert set(observed) == {(_EXTENDED_MODEL, "max")}, observed
+        assert replied, f"The side chat never showed its reply.\n{rig.stack.log_tail()}"
+
+
+def test_codex_model_pick_recreates_closed_terminal(codex_effort_rig: _Rig) -> None:
+    """A model pick restores an exited TUI and keeps the live Codex thread."""
+    rig = codex_effort_rig
+    assert "high" in rig.capabilities("gpt-6-sol")
+    assert "low" in rig.capabilities("gpt-6-astra")
+    with _session(rig, "gpt-6-sol", "high") as session:
+        _assert_turn(rig, session, "gpt-6-sol", "high")
+        original = read_bridge_state(session.bridge)
+        assert original is not None
+        terminal_path = f"/v1/sessions/{session.id}/resources/terminals/{session.terminal['id']}"
+        _json(rig.api.delete(terminal_path))
+        assert rig.api.get(terminal_path).status_code == 404
+
+        _json(
+            rig.api.patch(
+                f"/v1/sessions/{session.id}",
+                json={"model_override": "gpt-6-astra", "reasoning_effort": "low"},
+            )
+        )
+        session.terminal = _json(rig.api.get(terminal_path))
+        recovered = read_bridge_state(session.bridge)
+        assert recovered is not None
+        assert recovered.thread_id == original.thread_id
+        assert recovered.socket_path == original.socket_path
+        _assert_turn(rig, session, "gpt-6-astra", "low", terminal=True)
+        _assert_turn(rig, session, "gpt-6-astra", "low")
 
 
 def test_codex_effort_reset_survives_next_turn(codex_effort_rig: _Rig) -> None:
     """Clearing the picker uses the real model default without restoring the saved effort."""
     rig = codex_effort_rig
-    assert "xhigh" in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-5.4", "xhigh") as session:
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
-        settings = asyncio.run(_native_settings(session, "gpt-5.4"))
+    assert "xhigh" in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "xhigh") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+        settings = asyncio.run(_native_settings(session, _STANDARD_MODEL))
         default = settings["model"]["defaultReasoningEffort"]
         assert default != "xhigh", "Reset must select a different effort than the prior setting"
         # REST's default selection forwards an explicit effort:null to the native runner.
         _json(rig.api.patch(f"/v1/sessions/{session.id}", json={"reasoning_effort": "default"}))
-        _assert_turn(rig, session, "gpt-5.4", default, terminal=True)
-        _assert_turn(rig, session, "gpt-5.4", default)
+        _assert_turn(rig, session, _STANDARD_MODEL, default, terminal=True)
+        _assert_turn(rig, session, _STANDARD_MODEL, default)
 
 
 def test_codex_combined_model_and_reset_uses_target_default(codex_effort_rig: _Rig) -> None:
     """A combined public update selects the new model's real advertised default."""
     rig = codex_effort_rig
-    supported = rig.capabilities("gpt-5.6-sol")
-    with _session(rig, "gpt-5.4", "xhigh") as session:
-        _assert_turn(rig, session, "gpt-5.4", "xhigh")
-        previous = asyncio.run(_native_settings(session, "gpt-5.4"))["model"]
-        target = asyncio.run(_native_settings(session, "gpt-5.6-sol"))["model"]
+    supported = rig.capabilities(_SWITCH_MODEL)
+    assert "xhigh" in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "xhigh") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "xhigh")
+        previous = asyncio.run(_native_settings(session, _STANDARD_MODEL))["model"]
+        target = asyncio.run(_native_settings(session, _SWITCH_MODEL))["model"]
         default = target["defaultReasoningEffort"]
         assert previous["defaultReasoningEffort"] != default
         assert previous["defaultReasoningEffort"] in supported
         _json(
             rig.api.patch(
                 f"/v1/sessions/{session.id}",
-                json={"model_override": "gpt-5.6-sol", "reasoning_effort": "default"},
+                json={"model_override": _SWITCH_MODEL, "reasoning_effort": "default"},
             )
         )
-        _assert_turn(rig, session, "gpt-5.6-sol", default, terminal=True)
-        _assert_turn(rig, session, "gpt-5.6-sol", default)
+        _assert_turn(rig, session, _SWITCH_MODEL, default, terminal=True)
+        _assert_turn(rig, session, _SWITCH_MODEL, default)
 
 
 def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
     """Restart the real runner, resume the same Codex thread, and send from its TUI."""
     rig = codex_effort_rig
-    assert "minimal" not in rig.capabilities("gpt-5.4")
-    with _session(rig, "gpt-5.4", "medium") as session:
-        _assert_turn(rig, session, "gpt-5.4", "medium")
+    assert "minimal" not in rig.capabilities(_STANDARD_MODEL)
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        _assert_turn(rig, session, _STANDARD_MODEL, "medium")
         original = read_bridge_state(session.bridge)
         assert original is not None
         terminate_process(rig.stack.runner)
@@ -478,4 +695,114 @@ def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
         assert resumed is not None
         assert resumed.socket_path != original.socket_path, "A new app-server must own the resume"
         assert resumed.thread_id == original.thread_id, "Resume must retain the existing thread"
-        _assert_turn(rig, session, "gpt-5.4", "low", terminal=True)
+        _assert_turn(rig, session, _STANDARD_MODEL, "low", terminal=True)
+
+
+def test_fresh_terminal_turn_reports_running_before_first_model_output(
+    codex_effort_rig: _Rig,
+) -> None:
+    """Fresh subscription recovers running status before any model output arrives."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        marker = f"FRESH_QUIET_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        logs = rig.stack.runner_home / ".omnigent/logs/runner"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(
+                "not ready yet (no/empty rollout)" in path.read_text()
+                for path in logs.glob("*.log")
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("The fresh native thread never reached its no-rollout subscription wait")
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        try:
+            deadline = time.monotonic() + 20
+            requests = []
+            while time.monotonic() < deadline:
+                state = read_bridge_state(session.bridge)
+                requests = [
+                    request
+                    for request in _json(rig.model.get("/mock/requests"))["requests"]
+                    if state is not None and request.get("prompt_cache_key") == state.thread_id
+                ]
+                if requests:
+                    break
+                time.sleep(0.1)
+            assert len(requests) == 1, session.tmux("capture-pane", "-p")
+            assert state is not None
+
+            async def native_snapshot() -> dict[str, Any]:
+                observer = client_for_transport(
+                    state.socket_path, client_name="fresh-turn-observer"
+                )
+                await observer.connect()
+                try:
+                    response = await observer.request(
+                        "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                    )
+                    return response["result"]["thread"]
+                finally:
+                    await observer.close()
+
+            native = asyncio.run(native_snapshot())
+            (rig.stack.root / "fresh-native-thread.json").write_text(json.dumps(native, indent=2))
+            assert len(native["turns"]) == 1
+            turn = native["turns"][0]
+            assert turn["status"] == "inProgress", native
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                bridge = read_bridge_state(session.bridge)
+                if (
+                    snapshot.get("status") == "running"
+                    and bridge is not None
+                    and bridge.active_turn_id == turn["id"]
+                ):
+                    break
+                time.sleep(0.1)
+            (rig.stack.root / "fresh-quiet-terminal.txt").write_text(
+                session.tmux("capture-pane", "-p")
+            )
+            (rig.stack.root / "fresh-session-before-output.json").write_text(
+                json.dumps(snapshot, indent=2)
+            )
+            assert snapshot.get("status") == "running", snapshot.get("status")
+            assert bridge is not None and bridge.active_turn_id == turn["id"]
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            assert len([item for item in items if item.get("role") == "user"]) == 1
+            assert not any(item.get("role") == "assistant" for item in items)
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            replies = [
+                item
+                for item in items
+                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+            ]
+            if snapshot.get("status") == "idle" and replies:
+                break
+            time.sleep(0.1)
+        assert len(replies) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot.get("status") == "idle"
+        bridge = read_bridge_state(session.bridge)
+        assert bridge is not None and bridge.active_turn_id is None

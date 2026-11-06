@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
-from sqlalchemy import event, update
+from sqlalchemy import event, insert, update
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session
 
-from omnigent.db.db_models import SqlHost, workspace_scope
-from omnigent.db.utils import get_or_create_engine, now_epoch
+from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.db_models import SqlHost, SqlUser, current_workspace_id, workspace_scope
+from omnigent.db.utils import get_or_create_engine, now_epoch, run_write_transaction
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import (
@@ -398,6 +401,7 @@ def test_reown_host_id_across_owner_change_preserves_conversation_binding(
 
 def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store: HostStore,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without reown opt-in, a different owner cannot claim a host_id.
 
@@ -413,6 +417,14 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
     host_store.upsert_on_connect(
         host_id="5d23e459b50e20479abf5d3fa8e2f936", name="alice-box", user_id="alice@example.com"
     )
+    attempts = 0
+
+    def count_attempts(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return run_write_transaction(*args, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", count_attempts)
 
     with pytest.raises(IntegrityError):
         host_store.upsert_on_connect(
@@ -420,6 +432,7 @@ def test_reown_disabled_rejects_foreign_owner_claiming_host_id(
             name="bob-box",
             user_id="bob@example.com",
         )
+    assert attempts == 1
 
     # Alice still owns host_x; Bob got nothing.
     assert [h.user_id for h in host_store.list_hosts(user_id="alice@example.com")] == [
@@ -459,6 +472,69 @@ def test_set_offline_noop_for_unknown_host(
     host_store.set_offline("aababcc3941edb738172734a9ab7bb8c")
 
 
+def test_reconnect_waits_for_offline_transaction(
+    host_store: HostStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reconnect must read the status after a pending offline write commits."""
+    now = now_epoch()
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: now)
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+    offline_written = threading.Event()
+    release_offline = threading.Event()
+    reconnect_started = threading.Event()
+    reconnect_finished = threading.Event()
+    worker_ids: dict[str, int] = {}
+    engine = get_or_create_engine(db_uri)
+
+    def delay_offline_commit(_session, _flush_context) -> None:
+        if threading.get_ident() == worker_ids.get("offline"):
+            offline_written.set()
+            assert release_offline.wait(timeout=10)
+
+    def observe_reconnect(_connection, _cursor, statement, _parameters, _context, _many) -> None:
+        if threading.get_ident() == worker_ids.get("reconnect"):
+            sql = statement.upper()
+            if "FROM HOSTS" in sql or sql.startswith("BEGIN IMMEDIATE"):
+                reconnect_started.set()
+
+    def disconnect() -> None:
+        worker_ids["offline"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            host_store.set_offline(host_id)
+
+    def reconnect() -> Host:
+        worker_ids["reconnect"] = threading.get_ident()
+        with workspace_scope(workspace_id):
+            try:
+                return host_store.upsert_on_connect(host_id, "laptop", "alice@example.test")
+            finally:
+                reconnect_finished.set()
+
+    event.listen(Session, "after_flush", delay_offline_commit)
+    event.listen(engine, "before_cursor_execute", observe_reconnect)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            disconnected = executor.submit(disconnect)
+            try:
+                assert offline_written.wait(timeout=10)
+                connected = executor.submit(reconnect)
+                assert reconnect_started.wait(timeout=10)
+                returned_before_commit = reconnect_finished.wait(timeout=0.5)
+            finally:
+                release_offline.set()
+            disconnected.result(timeout=10)
+            assert connected.result(timeout=10).status == "online"
+    finally:
+        release_offline.set()
+        event.remove(Session, "after_flush", delay_offline_commit)
+        event.remove(engine, "before_cursor_execute", observe_reconnect)
+
+    assert host_store.is_online(host_id)
+    assert not returned_before_commit
+
+
 def test_heartbeat_advances_updated_at_without_changing_status(
     host_store: HostStore,
     db_uri: str,
@@ -493,6 +569,185 @@ def test_heartbeat_noop_for_unknown_host(host_store: HostStore) -> None:
     A heartbeat can race a just-deregistered host; it must not raise.
     """
     host_store.heartbeat("aababcc3941edb738172734a9ab7bb8c")
+
+
+@pytest.mark.parametrize(("expires_in", "token_ttl_s"), [(30, 60), (3600, 60), (30, None)])
+@pytest.mark.parametrize(
+    "write_state", ["ready", "delayed", "observed", "cancelled-before", "cancelled-after"]
+)
+def test_managed_heartbeat_renews_connected_host_token(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    expires_in: int,
+    token_ttl_s: int | None,
+    write_state: str,
+) -> None:
+    """Renewal uses observed liveness and stops when its tunnel is abandoned."""
+    host_id = uuid.uuid4().hex
+    started_at = now_epoch()
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="connected-sandbox",
+        user_id="alice@example.com",
+        token="launch-token",
+        provider="kubernetes",
+        sandbox_id="sandbox",
+        token_expires_at=started_at + expires_in,
+    )
+    connected = host_store.upsert_on_connect(
+        host_id, "connected-sandbox", "alice@example.com", managed_token="launch-token"
+    )
+    heartbeat_at = started_at + 40
+    current_time = heartbeat_at + (1000 if write_state == "observed" else 0)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: current_time)
+    if expires_in < 40:
+        assert host_store.resolve_launch_token(host_id, "launch-token") is None
+
+    def delayed_transaction(*args, **kwargs):
+        nonlocal current_time
+        current_time += 1000
+        return run_write_transaction(*args, **kwargs)
+
+    if write_state == "delayed":
+        monkeypatch.setattr(
+            "omnigent.stores.host_store.run_write_transaction", delayed_transaction
+        )
+    cancelled = threading.Event()
+    if write_state == "cancelled-before":
+        cancelled.set()
+    statements: list[str] = []
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+        if write_state == "cancelled-after" and statement.startswith("UPDATE hosts"):
+            cancelled.set()
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "after_cursor_execute", record_statement)
+    try:
+        host_store.heartbeat(
+            host_id,
+            managed_token="launch-token",
+            token_ttl_s=token_ttl_s,
+            observed_at=heartbeat_at if write_state == "observed" else None,
+            cancelled=cancelled.is_set,
+        )
+    finally:
+        event.remove(engine, "after_cursor_execute", record_statement)
+    if token_ttl_s is None:
+        operations = [statement.split()[0] for statement in statements]
+        assert [operation for operation in operations if operation not in {"PRAGMA", "BEGIN"}] == (
+            [] if write_state == "cancelled-before" else ["UPDATE"]
+        )
+
+    expected_expiry = started_at + expires_in
+    if token_ttl_s is not None and not cancelled.is_set():
+        expected_expiry = max(expected_expiry, heartbeat_at + token_ttl_s)
+    with Session(get_or_create_engine(db_uri)) as session:
+        row = session.get(SqlHost, (current_workspace_id(), host_id))
+        assert row is not None
+        assert row.token_expires_at == expected_expiry
+        assert row.updated_at == (connected.updated_at if cancelled.is_set() else heartbeat_at)
+    assert (host_store.resolve_launch_token(host_id, "launch-token") is not None) == (
+        expected_expiry >= current_time
+    )
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["replace", "revoke", "detach", "delete", "offline", "workspace", "delete-owner", "new-owner"],
+)
+def test_managed_heartbeat_cannot_restore_stale_authority(
+    host_store: HostStore,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    host_id = uuid.uuid4().hex
+    workspace_id = current_workspace_id()
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(SqlUser).values(
+                workspace_id=workspace_id,
+                id="alice@example.com",
+                account_generation="original-owner",
+            )
+        )
+    host_store.register_managed_host(
+        host_id=host_id,
+        name="stale-sandbox",
+        user_id="alice@example.com",
+        token="old-token",
+        provider="kubernetes",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    host = host_store.upsert_on_connect(
+        host_id, "stale-sandbox", "alice@example.com", managed_token="old-token"
+    )
+    if change == "replace":
+        host_store.replace_managed_host_sandbox(
+            host_id=host_id,
+            user_id=host.user_id,
+            token="new-token",
+            provider="kubernetes",
+            sandbox_id="new-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        host_store.upsert_on_connect(host_id, host.name, host.user_id, managed_token="new-token")
+    elif change == "revoke":
+        host_store.revoke_launch_token(host_id)
+    elif change == "detach":
+        assert host_store.detach_stale_managed_sandbox(
+            host_id, sandbox_id="old-sandbox", expected_updated_at=host.updated_at
+        )
+    elif change == "delete":
+        host_store.delete_host(host_id)
+    elif change == "offline":
+        host_store.set_offline(host_id)
+    elif change in {"delete-owner", "new-owner"}:
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlUser)
+                .where(SqlUser.workspace_id == workspace_id, SqlUser.id == host.user_id)
+                .values(
+                    {"deleted_at": now_epoch()}
+                    if change == "delete-owner"
+                    else {"account_generation": "replacement-owner"}
+                )
+            )
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        before = (row.token_hash, row.token_expires_at, row.updated_at)
+    monkeypatch.setattr("omnigent.stores.host_store.now_epoch", lambda: before[2] + 40)
+
+    if change in {"delete-owner", "new-owner"}:
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=7200)
+    else:
+        with workspace_scope(workspace_id + 1 if change == "workspace" else workspace_id):
+            for token_ttl_s in (None, 7200):
+                host_store.heartbeat(host_id, managed_token="old-token", token_ttl_s=token_ttl_s)
+
+    with Session(engine) as session:
+        row = session.get(SqlHost, (workspace_id, host_id))
+        assert row is not None
+        assert (row.token_hash, row.token_expires_at, row.updated_at) == before
+
+
+@pytest.mark.parametrize(
+    ("managed_token", "token_ttl_s"), [(None, 60), ("token", 0), ("token", -1)]
+)
+def test_managed_heartbeat_rejects_invalid_renewal(
+    host_store: HostStore, managed_token: str | None, token_ttl_s: int
+) -> None:
+    with pytest.raises(ValueError):
+        host_store.heartbeat(
+            uuid.uuid4().hex, managed_token=managed_token, token_ttl_s=token_ttl_s
+        )
 
 
 def test_is_online_true_for_fresh_online_host(host_store: HostStore) -> None:
@@ -737,6 +992,312 @@ def test_upsert_conflict_preserves_created_at(
     assert fetched[0].created_at == original_created
     # updated_at should be >= the original (reconnect bumps it).
     assert fetched[0].updated_at >= original_created
+
+
+_RESERVED_HOST_ID = "ab" * 16
+
+
+def _reserve(
+    host_store: HostStore, *, owner: str = "alice@example.test", provider: str = "modal"
+) -> Host | None:
+    return host_store.reserve_sandbox_host(
+        host_id=_RESERVED_HOST_ID, name="managed-host", user_id=owner, provider=provider
+    )
+
+
+def test_reservation_is_durable_offline_and_tokenless(host_store: HostStore, db_uri: str) -> None:
+    reserved = _reserve(host_store)
+    assert reserved is not None
+    assert reserved == HostStore(db_uri).get_host(_RESERVED_HOST_ID)
+    assert reserved.user_id == "alice@example.test"
+    assert reserved.sandbox_provider == "modal"
+    assert reserved.sandbox_id is None
+    assert not host_store.is_online(_RESERVED_HOST_ID)
+    with Session(get_or_create_engine(db_uri)) as session:
+        row = session.get(SqlHost, (current_workspace_id(), _RESERVED_HOST_ID))
+        assert row is not None
+        assert row.token_hash is None
+        assert row.token_expires_at is None
+    assert _reserve(host_store) == reserved
+
+
+def test_reservation_preserves_live_host_and_credentials(host_store: HostStore) -> None:
+    host_store.register_managed_host(
+        host_id=_RESERVED_HOST_ID,
+        name="existing-host",
+        user_id="alice@example.test",
+        token="launch-token",
+        provider="modal",
+        sandbox_id="existing-environment",
+        token_expires_at=now_epoch() + 3600,
+    )
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID,
+        "existing-host",
+        "alice@example.test",
+        configured_harnesses={"codex": True},
+        managed_token="launch-token",
+    )
+    assert _reserve(host_store) == connected
+    assert host_store.resolve_launch_token(_RESERVED_HOST_ID, "launch-token") == connected
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+def test_reservation_rejects_another_owner(host_store: HostStore) -> None:
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID, "existing-host", "alice@example.test"
+    )
+    with pytest.raises(ValueError, match="different user"):
+        _reserve(host_store, owner="bob@example.com")
+    assert host_store.get_host(_RESERVED_HOST_ID) == connected
+
+
+@pytest.mark.parametrize("existing_kind", ["external", "managed", "deleted"])
+def test_reservation_refuses_name_owned_by_another_identity(
+    host_store: HostStore, existing_kind: str
+) -> None:
+    other_id = "cd" * 16
+    original = host_store.upsert_on_connect(other_id, "managed-host", "alice@example.test")
+    if existing_kind != "external":
+        original = host_store.bind_sandbox(other_id, provider="modal", sandbox_id="other")
+    if existing_kind == "deleted":
+        host_store.delete_host(other_id)
+        original = None
+    assert _reserve(host_store) is None
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+    assert host_store.get_host(other_id) == original
+
+
+def test_reservation_is_workspace_scoped(host_store: HostStore) -> None:
+    first = _reserve(host_store)
+    with workspace_scope(current_workspace_id() + 1):
+        second = _reserve(host_store, owner="bob@example.com")
+        assert second is not None
+        assert second.user_id == "bob@example.com"
+    assert host_store.get_host(_RESERVED_HOST_ID) == first
+
+
+def test_reservation_and_binding_reject_conflicting_sandbox(host_store: HostStore) -> None:
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(
+        _RESERVED_HOST_ID, provider="modal", sandbox_id="existing-environment"
+    )
+    assert bound is not None
+    assert _reserve(host_store, provider="kubernetes") is None
+    assert _reserve(host_store) == bound
+    assert (
+        host_store.bind_sandbox(
+            _RESERVED_HOST_ID, provider="modal", sandbox_id="other-environment"
+        )
+        is None
+    )
+    assert (
+        host_store.bind_sandbox(
+            _RESERVED_HOST_ID, provider="kubernetes", sandbox_id="existing-environment"
+        )
+        is None
+    )
+    assert host_store.get_host(_RESERVED_HOST_ID) == bound
+
+
+def test_reservation_cannot_revive_deleted_host(host_store: HostStore) -> None:
+    _reserve(host_store)
+    host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+    assert host_store.delete_host(_RESERVED_HOST_ID) is not None
+    assert _reserve(host_store) is None
+    assert (
+        host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+        is None
+    )
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+
+
+def test_stale_request_cannot_reserve_host(host_store: HostStore) -> None:
+    with account_authority_scope("alice@example.test", "revoked-generation"):
+        with pytest.raises(OmnigentError, match="authority has been revoked"):
+            _reserve(host_store)
+    assert host_store.get_host(_RESERVED_HOST_ID) is None
+
+
+@pytest.mark.parametrize("operation", ["reserve", "bind"])
+def test_sandbox_metadata_cannot_cross_account_generation(
+    host_store: HostStore, db_uri: str, operation: str
+) -> None:
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(SqlUser).values(
+                workspace_id=current_workspace_id(),
+                id="alice@example.test",
+                account_generation="old-generation",
+            )
+        )
+    reserved = _reserve(host_store)
+    with engine.begin() as connection:
+        connection.execute(
+            update(SqlUser)
+            .where(
+                SqlUser.workspace_id == current_workspace_id(), SqlUser.id == "alice@example.test"
+            )
+            .values(account_generation="new-generation")
+        )
+    with pytest.raises(OmnigentError, match="authority has been revoked"):
+        if operation == "reserve":
+            _reserve(host_store)
+        else:
+            host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
+    assert host_store.get_host(_RESERVED_HOST_ID) == reserved
+
+
+def test_connection_racing_reservation_keeps_managed_classification(host_store: HostStore) -> None:
+    workspace_id = current_workspace_id()
+    barrier = threading.Barrier(2)
+
+    def connect() -> None:
+        with workspace_scope(workspace_id):
+            barrier.wait(timeout=5)
+            host_store.upsert_on_connect(
+                _RESERVED_HOST_ID,
+                "managed-host",
+                "alice@example.test",
+                configured_harnesses={"codex": True},
+            )
+
+    def reserve() -> None:
+        with workspace_scope(workspace_id):
+            barrier.wait(timeout=5)
+            assert _reserve(host_store) is not None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        connected = executor.submit(connect)
+        reserved = executor.submit(reserve)
+        connected.result(timeout=10)
+        reserved.result(timeout=10)
+    host = host_store.get_host(_RESERVED_HOST_ID)
+    assert host is not None
+    assert host.sandbox_provider == "modal"
+    assert host.configured_harnesses == {"codex": True}
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+@pytest.mark.parametrize("loser", ["reservation", "connection"])
+def test_insert_conflict_retry_adopts_the_competing_row(
+    host_store: HostStore, monkeypatch: pytest.MonkeyPatch, loser: str
+) -> None:
+    """
+    Reservation and connect both insert when the host row is missing. SQLite
+    serializes writers, so the lost race is injected: the loser's first
+    transaction fails after the other side committed, and its retry must adopt
+    that row rather than raise or insert a duplicate.
+    """
+    operation = "reserve_sandbox_host" if loser == "reservation" else "upsert_host_on_connect"
+    attempts: list[str] = []
+
+    def connect() -> Host:
+        return host_store.upsert_on_connect(
+            _RESERVED_HOST_ID,
+            "managed-host",
+            "alice@example.test",
+            configured_harnesses={"codex": True},
+        )
+
+    def lose_first_attempt(session_maker, operation_name, callback, **kwargs):
+        if operation_name == operation:
+            attempts.append(operation_name)
+            if len(attempts) == 1:
+                if loser == "reservation":
+                    connect()
+                else:
+                    assert _reserve(host_store) is not None
+                raise IntegrityError(
+                    "UNIQUE constraint failed: hosts.workspace_id, hosts.host_id",
+                    params={"host_id": _RESERVED_HOST_ID},
+                    orig=Exception("duplicate primary key"),
+                )
+        return run_write_transaction(session_maker, operation_name, callback, **kwargs)
+
+    monkeypatch.setattr("omnigent.stores.host_store.run_write_transaction", lose_first_attempt)
+    host = _reserve(host_store) if loser == "reservation" else connect()
+    assert attempts == [operation, operation]
+    assert host is not None
+    assert host.status == "online"
+    assert host.sandbox_provider == "modal"
+    assert host.configured_harnesses == {"codex": True}
+    assert host_store.get_host(_RESERVED_HOST_ID) == host
+
+
+@pytest.mark.parametrize("connection_state", ["offline", "stale", "live"])
+@pytest.mark.parametrize("retry_dialect", [None, "mysql", "cockroachdb"])
+def test_binding_preserves_connection_liveness(
+    host_store: HostStore,
+    db_uri: str,
+    connection_state: str,
+    retry_dialect: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if connection_state != "offline":
+        host_store.upsert_on_connect(_RESERVED_HOST_ID, "managed-host", "alice@example.test")
+    if connection_state == "stale":
+        _set_updated_at(db_uri, _RESERVED_HOST_ID, 1)
+    reserved = _reserve(host_store)
+    assert reserved is not None
+    attempts = 0
+
+    class ConcurrencyFailure(Exception):
+        sqlstate = "40001"
+
+    def fail_first_flush(session, _context):
+        nonlocal attempts
+        if any(
+            isinstance(row, SqlHost) and row.sandbox_id == "environment" for row in session.dirty
+        ):
+            attempts += 1
+            if attempts == 1:
+                raise DBAPIError("UPDATE hosts", {}, ConcurrencyFailure(1213, "deadlock"), False)
+
+    # Inject the server's concurrency error after a real write, retaining rollback and retry.
+    engine = get_or_create_engine(db_uri)
+    with monkeypatch.context() as patch:
+        if retry_dialect is not None:
+            patch.setattr(engine.dialect, "name", retry_dialect)
+            event.listen(Session, "after_flush", fail_first_flush)
+        try:
+            bound = host_store.bind_sandbox(
+                _RESERVED_HOST_ID, provider="modal", sandbox_id="environment"
+            )
+        finally:
+            if retry_dialect is not None:
+                event.remove(Session, "after_flush", fail_first_flush)
+    assert attempts == (0 if retry_dialect is None else 2)
+    assert bound is not None
+    if connection_state == "live":
+        assert bound.updated_at == reserved.updated_at
+        assert bound.status == "online"
+    else:
+        assert bound.updated_at >= reserved.updated_at
+        assert bound.status == "offline"
+    assert host_store.is_online(_RESERVED_HOST_ID) == (connection_state == "live")
+    connected = host_store.upsert_on_connect(
+        _RESERVED_HOST_ID, "managed-host", "alice@example.test"
+    )
+    assert connected.sandbox_provider == "modal"
+    assert connected.sandbox_id == "environment"
+    assert host_store.is_online(_RESERVED_HOST_ID)
+
+
+def test_binding_cannot_reactivate_sandbox_pending_termination(host_store: HostStore) -> None:
+    assert host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old") is None
+    _reserve(host_store)
+    bound = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old")
+    assert bound is not None
+    assert host_store.detach_stale_managed_sandbox(
+        _RESERVED_HOST_ID, sandbox_id="old", expected_updated_at=bound.updated_at
+    )
+    assert host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="old") is None
+    replacement = host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="new")
+    assert replacement is not None
+    assert replacement.sandbox_id == "new"
+    assert replacement.terminating_sandbox_id == "old"
 
 
 # ── Managed-host credential methods ────────────────────────

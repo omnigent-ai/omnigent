@@ -3,7 +3,8 @@ import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { useFileViewerConversationId } from "./FileViewerContext";
 
 /**
- * Anchor for a URL (`https:`, `mailto:`, `//host`) in a read-only file preview.
+ * Anchor for a URL (`https:`, `mailto:`, `//host`) in a read-only file preview
+ * or the Markdown editor's link popup.
  * Shares chat's external-link handling, so a click opens outside the app window
  * instead of navigating the app itself off its server.
  */

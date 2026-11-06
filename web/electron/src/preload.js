@@ -14,7 +14,7 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer, webFrame } = require("electron");
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
@@ -99,6 +99,78 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("omnigent:open-path", listener);
     return () => ipcRenderer.removeListener("omnigent:open-path", listener);
   },
+  /**
+   * Subscribe to the find bar opening (Cmd/Ctrl+F or Edit > Find…), so the
+   * page can render content it would otherwise virtualize away. Returns an
+   * unsubscribe function.
+   * @param {() => void} callback
+   * @returns {() => void}
+   */
+  onFindOpened: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on("omnigent:find-opened", listener);
+    return () => ipcRenderer.removeListener("omnigent:find-opened", listener);
+  },
+  /**
+   * Subscribe to native menu commands for this window (Close, New Terminal,
+   * New Browser Tab, Pin/Archive Session). `browserViewId` names the embedded
+   * browser view that held focus when Close fired, else null; `quitDetail` says
+   * what Quit stops, for its prompt. Returns an unsubscribe function.
+   * @param {(payload: {command: string, browserViewId: string | null, closingQuits: boolean, quitDetail: string | null}) => void} callback
+   * @returns {() => void}
+   */
+  onDesktopCommand: (callback) => {
+    const listener = (_event, payload) => {
+      if (!payload || typeof payload.command !== "string") return;
+      callback({
+        command: payload.command,
+        browserViewId: typeof payload.browserViewId === "string" ? payload.browserViewId : null,
+        closingQuits: payload.closingQuits === true,
+        quitDetail: typeof payload.quitDetail === "string" ? payload.quitDetail : null,
+      });
+    };
+    ipcRenderer.on("omnigent:desktop-command", listener);
+    return () => ipcRenderer.removeListener("omnigent:desktop-command", listener);
+  },
+  /**
+   * Report which menu commands this page can act on right now, plus the open
+   * session's pin/archive state, so the native menu can enable and label them.
+   * Fire-and-forget.
+   * @param {{commands: string[], sessionPinned: boolean, sessionArchived: boolean}} state
+   */
+  setDesktopCommandState: (state) => {
+    ipcRenderer.send("omnigent:set-desktop-command-state", {
+      commands: Array.isArray(state?.commands) ? state.commands.map(String) : [],
+      sessionPinned: state?.sessionPinned === true,
+      sessionArchived: state?.sessionArchived === true,
+    });
+  },
+  /** Close this window once the page has confirmed. Resolves whether it closed. */
+  closeWindow: () => ipcRenderer.invoke("omnigent:close-window"),
+  /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
+  confirmQuit: (options) =>
+    ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
+  /** The "Show Omnigent from anywhere" shortcut (off by default). */
+  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
+   * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
+   * saved setting is unchanged.
+   */
+  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+    ipcRenderer.invoke(
+      "omnigent:set-global-shortcut",
+      enabled !== true && accelerator === undefined
+        ? { enabled: false }
+        : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+    ),
+  /**
+   * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
+   * Resolves its accelerator, or null when Escape or the cancel call ends recording.
+   */
+  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  cancelGlobalShortcutRecording: () =>
+    ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
    *  "remote"), returned once, else null. */
   takeOnboardingRunner: () => ipcRenderer.invoke("omnigent:take-onboarding-runner"),
@@ -120,6 +192,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   },
   /** Reveal one of this machine's files in the OS file manager. */
   revealFile: (hostId, path) => ipcRenderer.invoke("omnigent:reveal-file", hostId, path),
+  /** OS folder chooser on this machine; resolves the chosen path, or null on cancel. */
+  chooseDirectory: (defaultPath) => ipcRenderer.invoke("omnigent:choose-directory", defaultPath),
+  /**
+   * This machine's path for a File dropped from the OS file manager. Resolves
+   * "" when it has none or the page isn't the pinned server.
+   */
+  getPathForFile: (file) =>
+    ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this
@@ -145,8 +225,26 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  // Windows' built-in ssh can't share one connection, so it gets this later.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Connect a machine the user reaches over SSH to the window's server as
+         * a host. Consent and ssh prompts happen in a shell-owned window.
+         * Resolves `{ ok, error?, canceled?, identity? }`.
+         */
+        connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
+  /**
+   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
+   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   */
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -220,7 +318,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are
   // structured-clone-safe. SECURITY: no generic agent `evaluate` is exposed —
-  // `browserExecute` runs relay templates only (see README).
+  // `browserPerformAction` accepts fixed actions only (see README).
 
   /**
    * Open (create-if-absent) or navigate a conversation's view. `opts.force`
@@ -229,7 +327,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, sessionHostProtocol?: number, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -238,8 +336,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * active one). Pass null to detach everything (no pane mounted).
    * @param {string | null} conversationId
    */
-  browserSetActive: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-set-active", { conversationId }),
+  browserSetActive: (conversationId, options) =>
+    ipcRenderer.invoke("omnigent:browser-set-active", {
+      conversationId,
+      focus: options?.focus === true,
+    }),
+  /** The attached browser page's view id if it has keyboard focus, else null. */
+  browserFocusedView: () => ipcRenderer.invoke("omnigent:browser-focused-view"),
   /**
    * Hide (true) or show (false) the active browser view while a DOM overlay is
    * open, so the native layer doesn't cover dialogs/menus/tooltips/toasts.
@@ -259,18 +362,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
-  browserScreenshot: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
-  /**
-   * Run a relay-template JS string in the conversation's view. PRIVATE to the
-   * relay's fixed templates (snapshot / click / type) — never an agent-facing
-   * generic evaluate.
-   * @param {string} conversationId
-   * @param {string} js
-   * @returns {Promise<{ ok: boolean, result?: string, error?: string }>}
-   */
-  browserExecute: (conversationId, js) =>
-    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
+  browserScreenshot: (conversationId, opts) =>
+    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+  /** Perform a fixed snapshot, click or type action in the conversation's view. */
+  browserPerformAction: (conversationId, action, params, opts) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
+  browserExecute: (conversationId, js, opts) =>
+    ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
   /**
    * Destroy the conversation's view (explicit close — unmount only detaches).
    * @param {string} conversationId
@@ -323,7 +422,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Whether a view already exists for a conversation — lets a re-mounting pane
    * re-attach it without waiting for a fresh create event.
    * @param {string} conversationId
-   * @returns {Promise<{ exists: boolean }>}
+   * @returns {Promise<{ exists: boolean, url?: string, pendingUrl?: string, title?: string, canGoBack?: boolean, canGoForward?: boolean }>}
    */
   browserHasView: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-has-view", { conversationId }),
@@ -373,9 +472,36 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
   /**
-   * Subscribe to the real url of a view as it navigates (redirects, links,
-   * back/forward) so the URL bar stays honest. Returns an unsubscribe.
-   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * Inspect the user's local Google Chrome profiles for cookies in the site
+   * tree the conversation's view is currently on. Metadata only (profile name +
+   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * @param {string} conversationId
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   */
+  browserChromeCookiePreview: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
+  /**
+   * Copy ONLY that site's cookies out of one Chrome profile into the
+   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
+   * first import shows a system approval prompt. `expectedHost` must still match
+   * the view's site.
+   * @param {string} conversationId
+   * `scope` is the site tree to copy (the page's host or a parent domain); main
+   * rejects anything that isn't an ancestor of the page.
+   * @param {{ profileId: string, expectedHost: string, scope?: string }} args
+   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
+   */
+  browserChromeCookieImport: (conversationId, args) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-import", {
+      conversationId,
+      profileId: args?.profileId,
+      expectedHost: args?.expectedHost,
+      scope: args?.scope,
+    }),
+  /**
+   * Subscribe to URL and title changes, including background views, so the
+   * address bar and tab labels stay current. Returns an unsubscribe.
+   * @param {(payload: { conversationId: string, url: string, title?: string }) => void} callback
    * @returns {() => void}
    */
   onBrowserUrlChanged: (callback) => {

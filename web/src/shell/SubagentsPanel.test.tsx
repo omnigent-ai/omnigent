@@ -11,10 +11,12 @@ import {
   ScanSearchIcon,
   SearchIcon,
 } from "lucide-react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
+import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
@@ -158,7 +160,14 @@ beforeEach(() => {
   });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+});
+
+function CurrentPath() {
+  return <output data-testid="current-path">{useLocation().pathname}</output>;
+}
 
 describe("SubagentsPanel", () => {
   it("always renders a 'main' row linking to the root session", () => {
@@ -490,6 +499,29 @@ describe("SubagentsPanel", () => {
     // by the dedicated "shows the status word only for notable states" test.
   });
 
+  it.each([
+    [true, "/c/conv_parent"],
+    [false, "/c/conv_child_a"],
+  ])("with the panel setting %s, a child-row click lands on %s", (enabled, pathname) => {
+    writeOpenSubagentsInPanel(enabled);
+    mockChildTree({ conv_parent: [childInfo({ id: "conv_child_a", title: "researcher:auth" })] });
+    const opener = vi.fn(() => true);
+    render(
+      <MemoryRouter initialEntries={["/c/conv_parent"]}>
+        <SubagentPanelOpenerContext.Provider value={opener}>
+          <SubagentsPanel conversationId="conv_parent" rootSessionId="conv_parent" />
+        </SubagentPanelOpenerContext.Provider>
+        <CurrentPath />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByTestId("subagent-row"));
+
+    expect(screen.getByTestId("current-path")).toHaveTextContent(pathname);
+    if (enabled) expect(opener).toHaveBeenCalledWith("conv_child_a");
+    else expect(opener).not.toHaveBeenCalled();
+  });
+
   it("uses spawned task titles as the primary child-row labels", () => {
     mockChildTree({
       conv_root: [
@@ -622,41 +654,15 @@ describe("SubagentsPanel", () => {
     expect(kiroRow.querySelector('[data-harness-icon="kiro"]')).not.toBeNull();
   });
 
-  it("gives native sub-agent children role/bot icons, not the brand logo", () => {
-    // A native session's sub-agents are all the same brand, so the logo
-    // is reserved for full native sessions; sub-agent rows read by role,
-    // with the generic bot as the fallback.
+  it("gives native sub-agent children their harness logo, keeping the nickname as the label", () => {
     mockChildTree({
       conv_root: [
         childInfo({
-          id: "conv_generic",
-          title: "claude:tell-a-joke",
-          tool: "claude",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
-        }),
-        childInfo({
-          id: "conv_explore",
+          id: "conv_claude_explore",
           title: "Explore:find-the-bug",
           tool: "Explore",
           labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
-      ],
-    });
-
-    const { container } = renderPanel({ rootSessionId: "conv_root" });
-
-    const genericRow = childRow(container, "conv_generic");
-    expect(genericRow.querySelector(".lucide-bot")).not.toBeNull();
-    expect(genericRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
-
-    const exploreRow = childRow(container, "conv_explore");
-    expect(exploreRow.querySelector(".lucide-search")).not.toBeNull();
-    expect(exploreRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
-  });
-
-  it("uses a native sub-agent's role for its icon while keeping its nickname as the label", () => {
-    mockChildTree({
-      conv_root: [
         childInfo({
           id: "conv_codex_researcher",
           title: "codex-native-ui-subagent:thread-1",
@@ -671,11 +677,15 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    const row = childRow(container, "conv_codex_researcher");
-    expect(row).toHaveTextContent("Archimedes");
-    expect(row.querySelector(".lucide-book-open")).not.toBeNull();
-    expect(row.querySelector(".lucide-bot")).toBeNull();
-    expect(row.querySelector('[data-harness-icon="codex"]')).toBeNull();
+    const claudeRow = childRow(container, "conv_claude_explore");
+    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
+    expect(claudeRow.querySelector(".lucide-search")).toBeNull();
+
+    const codexRow = childRow(container, "conv_codex_researcher");
+    expect(codexRow).toHaveTextContent("Archimedes");
+    expect(codexRow.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector(".lucide-bot")).toBeNull();
+    expect(codexRow.querySelector(".lucide-book-open")).toBeNull();
   });
 
   it("does not infer native logos from child title or tool names alone", () => {
