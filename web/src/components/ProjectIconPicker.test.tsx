@@ -73,15 +73,62 @@ describe("ProjectLandingIcon", () => {
       use_worktree: true,
       base_branch: "main",
     };
-    renderIcon({ config: { ...config, color: "nord" } });
+    renderIcon({ config: { ...config, lucide_icon: "FlaskConical", color: "nord" } });
 
     fireEvent.click(screen.getByTestId("project-icon-tile"));
     fireEvent.click(screen.getByTestId("project-emoji-button"));
     fireEvent.click(await screen.findByTestId("pick-fire"));
 
     await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
-    // The whole prior config survives; the emoji replaces the color.
+    // The whole prior config survives; the emoji replaces the lucide icon and color.
     expect(updateMock).toHaveBeenCalledWith("p_1", { ...config, icon: "🔥" });
+  });
+
+  it("saves a searched lucide icon and keeps the project's color", async () => {
+    renderIcon({ config: { host_id: "h1", color: "nord" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-lucide-button"));
+    fireEvent.change(await screen.findByRole("searchbox", { name: "Search icons" }), {
+      target: { value: "flask con" },
+    });
+    expect(screen.queryByTestId("lucide-icon-Rocket")).toBeNull();
+    fireEvent.click(screen.getByTestId("lucide-icon-FlaskConical"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      host_id: "h1",
+      lucide_icon: "FlaskConical",
+      color: "nord",
+    });
+  });
+
+  it("keeps the lucide icon when a color is picked", async () => {
+    renderIcon({ config: { lucide_icon: "FlaskConical", color: "nord" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-color-dracula"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", {
+      lucide_icon: "FlaskConical",
+      color: "dracula",
+    });
+  });
+
+  it("goes back to the folder from the icon grid, keeping the color", async () => {
+    renderIcon({ config: { lucide_icon: "FlaskConical", color: "nord" } });
+
+    fireEvent.click(screen.getByTestId("project-icon-tile"));
+    fireEvent.click(screen.getByTestId("project-lucide-button"));
+    expect(await screen.findByTestId("lucide-icon-FlaskConical")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByTestId("lucide-icon-default"));
+
+    await waitFor(() => expect(updateMock).toHaveBeenCalledTimes(1));
+    expect(updateMock).toHaveBeenCalledWith("p_1", { color: "nord" });
   });
 
   it("replaces the emoji with a picked color while preserving the other defaults", async () => {

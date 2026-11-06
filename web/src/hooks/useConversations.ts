@@ -2316,6 +2316,9 @@ export interface ProjectSummary {
   /** Chosen emoji icon (a unicode grapheme), or null/absent for the default
       folder glyph. Sourced from the project's `config.icon`. */
   icon?: string | null;
+  /** Chosen lucide-react icon name, or null/absent for the folder glyph.
+      Sourced from the project's `config.lucide_icon`. */
+  lucide_icon?: string | null;
   /** Chosen color (a theme palette id), or null/absent for the muted folder.
       Sourced from the project's `config.color`. */
   color?: string | null;
@@ -3080,6 +3083,7 @@ export function useUpdateProjectConfig() {
           id: project.id,
           name: project.name,
           icon: project.config?.icon,
+          lucide_icon: project.config?.lucide_icon,
           color: project.config?.color,
         };
         return prev.some((p) => p.name === project.name)

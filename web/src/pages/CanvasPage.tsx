@@ -622,7 +622,11 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
                 title={project.name}
                 onClick={() => selectCanvas(canvasId)}
               >
-                <ProjectRowIcon icon={project.icon} />
+                <ProjectRowIcon
+                  icon={project.icon}
+                  lucideIcon={project.lucide_icon}
+                  color={project.color}
+                />
                 <span className="truncate">{project.name}</span>
               </button>
             );

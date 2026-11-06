@@ -6023,6 +6023,9 @@ class SessionProjectSummary(BaseModel):
     :param icon: The project's chosen emoji icon (a unicode grapheme), read
         from its ``config``; ``None`` when unset or for a label-only folder,
         so the sidebar falls back to the default folder glyph.
+    :param lucide_icon: The project's chosen lucide-react icon name (e.g.
+        ``"FlaskConical"``), read from its ``config``; ``None`` when unset or
+        for a label-only folder. The web UI draws it in ``color``.
     :param color: The project's chosen color (a web theme palette id), read
         from its ``config``; ``None`` when unset or for a label-only folder.
     """
@@ -6030,6 +6033,7 @@ class SessionProjectSummary(BaseModel):
     id: str | None = None
     name: str
     icon: str | None = None
+    lucide_icon: str | None = None
     color: str | None = None
 
 
