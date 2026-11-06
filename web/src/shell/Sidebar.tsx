@@ -124,7 +124,11 @@ import {
   useRebasePath,
   useSearchParams,
 } from "@/lib/routing";
-import { SidebarHeaderActions, SidebarSettingsButton } from "./SidebarHeaderActions";
+import {
+  SidebarHeaderActions,
+  SidebarSearchButton,
+  SidebarSettingsButton,
+} from "./SidebarHeaderActions";
 import omnigentWordmark from "@/assets/omnigent-wordmark.svg";
 import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
@@ -232,7 +236,12 @@ import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { SESSION_HOTKEY_DIGITS, useSessionNumberHotkeys } from "@/hooks/useSessionNumberHotkeys";
 import { useCommandHoldStore, useCommandHoldTracking } from "@/hooks/useCommandHold";
 import { type DesktopCommand, useAvailableDesktopCommands } from "@/lib/desktopCommands";
-import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import {
+  isAndroidShell,
+  isElectronShell,
+  isIOSShell,
+  isMacElectronShell,
+} from "@/lib/nativeBridge";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import {
   type SessionFilter,
@@ -1234,11 +1243,11 @@ function SidebarImpl({
           <SettingsSidebarBody onNavClick={onNavClick} />
         ) : (
           <>
-            {/* sidebar-header-row is the hook for the macOS Electron shell, where
-          this row shares the window's top strip with the traffic lights: the
-          brand mark is dropped and the actions slide left to sit beside the
-          window controls (see the [data-electron-mac] rules in index.css).
-          Inert in a browser and on other platforms, which keep the row below. */}
+            {/* sidebar-header-row is the hook for the macOS Electron shell. It
+          reserves the window's top strip for the traffic lights and title-bar
+          actions, then keeps this brand row directly below it (see the
+          [data-electron-mac] rules in index.css). Browsers and other platforms
+          keep the standard single row. */}
             {/* Mobile Search shares the floating chat controls' 16px edge inset. */}
             <div className="sidebar-header-row flex shrink-0 items-center justify-between p-4 md:h-12 md:py-0 md:pr-3">
               {/* Brand mark doubles as the "home" affordance: clicking it
@@ -1267,10 +1276,17 @@ function SidebarImpl({
                   />
                 )}
               </Link>
-              {/* On the macOS shell this copy is hidden and an identical cluster
-            renders in the title-bar strip instead (see AppShell), so the icons
-            keep their place when the sidebar collapses or peeks. Everywhere
-            else this is the only copy. */}
+              {isMacElectronShell() && (
+                <SidebarSearchButton
+                  onOpenSearch={onOpenSearch}
+                  className="hidden md:inline-flex"
+                  testId="electron-sidebar-search-button"
+                />
+              )}
+              {/* On the macOS shell this copy is hidden: Search renders beside
+            the wordmark above, while Settings and the sidebar toggle stay in
+            AppShell's persistent title-bar strip. Everywhere else this is the
+            only action cluster. */}
               <SidebarHeaderActions
                 expanded={!peek}
                 // onOpen is optional (the sidebar renders standalone in tests), so
