@@ -4,12 +4,12 @@ A runner is busy while it has active work (a turn running or an event dispatch
 pending) or while its work progress advanced since the previous check: a session
 event was published (so a turn that started and ended between two checks still
 counts) or mirrored native events kept flowing after the parent went idle. A
-runner that is merely alive does not count: runners are retained for
-``runner.idle_timeout_s`` after their last activity, and keeping a sandbox awake
-for that whole window defeats the platform's idle stop.
+runner that is merely connected does not count: viewing a session keeps it
+connected without any work.
 
 The runner reports this on each tunnel pong (``PongFrame.busy``), and the server
-extends a managed sandbox only for intervals in which the runner was busy (see
+extends a managed sandbox while the runner was recently busy, and for a
+keep-warm grace (by default the runner idle timeout) after its last work (see
 :mod:`omnigent.server.managed_host_keepalive`).
 """
 

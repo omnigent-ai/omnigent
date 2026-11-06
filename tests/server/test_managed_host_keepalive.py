@@ -446,6 +446,55 @@ def test_work_that_resumes_while_a_job_is_in_flight_is_refreshed_when_it_ends(
     assert gate.now == 1000.0
 
 
+def test_a_failure_before_submission_does_not_strand_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nothing would ever clear an in-flight mark left by a job that was never
+    # submitted, and every later touch would skip the runner.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.record_pong("r1", True)  # refreshed
+    assert gate.submitted == ["r1"]
+
+    def _broken_prune(_now: float) -> None:
+        raise RuntimeError("Set changed size during iteration")
+
+    monkeypatch.setattr(managed_host_keepalive, "_THROTTLE_MAX_ENTRIES", -1)  # always prune
+    monkeypatch.setattr(managed_host_keepalive, "_prune_throttle", _broken_prune)
+    gate.now += 300.0
+    with pytest.raises(RuntimeError):
+        managed_host_keepalive.touch("r1", force=True)  # e.g. a deferred forced refresh
+    assert managed_host_keepalive._inflight == set()
+
+    monkeypatch.setattr(managed_host_keepalive, "_THROTTLE_MAX_ENTRIES", 4096)
+    managed_host_keepalive.record_pong("r1", True)  # still working
+    gate.tick()
+    assert gate.submitted == ["r1", "r1"], "the runner can still be renewed"
+
+
+def test_pruning_reads_snapshots_of_the_shared_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A job finishing on the worker thread can prune while the event loop
+    # records pongs; pruning must not iterate the live collections.
+    gate = _BusyGate(monkeypatch)
+    for rid in ("r1", "r2", "r3"):
+        managed_host_keepalive.record_pong(rid, None)
+
+    class _ShrinkingSet(set):
+        def __iter__(self):  # a concurrent record_pong removes a legacy runner mid-scan
+            items = super().__iter__()
+            first = next(items)
+            self.discard(next(rid for rid in set.copy(self) if rid != first))
+            yield first
+            yield from items
+
+    monkeypatch.setattr(
+        managed_host_keepalive,
+        "_unreporting_runners",
+        _ShrinkingSet(managed_host_keepalive._unreporting_runners),
+    )
+    managed_host_keepalive._prune_throttle(gate.now + 5000.0)  # must not raise
+    assert managed_host_keepalive._last_kept == {}
+
+
 def test_pruning_drops_a_legacy_runner_gone_before_its_first_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

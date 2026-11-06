@@ -292,12 +292,19 @@ def touch(runner_id: str, *, force: bool = False) -> None:
                 _pending_forced.add(runner_id)
             return
         _inflight.add(runner_id)
-    if not force:
-        _last_kept[runner_id] = now
-    if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
-        _prune_throttle(now)
-    ctx = contextvars.copy_context()
-    _executor.submit(ctx.run, _keep_alive_for_runner, runner_id)
+    try:
+        if not force:
+            _last_kept[runner_id] = now
+        if len(_last_kept) > _THROTTLE_MAX_ENTRIES:
+            _prune_throttle(now)
+        ctx = contextvars.copy_context()
+        _executor.submit(ctx.run, _keep_alive_for_runner, runner_id)
+    except BaseException:
+        # Nothing was submitted, so nothing will clear the in-flight mark: clear
+        # it here, or every later touch would skip this runner for good.
+        with _inflight_lock:
+            _inflight.discard(runner_id)
+        raise
 
 
 def _recently_busy(runner_id: str, now: float) -> bool:
@@ -321,18 +328,24 @@ def _recently_busy(runner_id: str, now: float) -> bool:
 def _prune_throttle(now: float) -> None:
     """Drop throttle entries older than two slow intervals (their runners are gone)."""
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
+    # Iterate snapshots: a job finishing on the worker thread can prune while the
+    # event loop records pongs. (dict.copy and set.copy run without yielding.)
+    kept, reported, unreporting = (
+        _last_kept.copy(),
+        _last_report_at.copy(),
+        _unreporting_runners.copy(),
+    )
     # A connected idle runner keeps reporting but is no longer refreshed, so a
     # runner is stale only when neither its refresh nor its reports are recent.
     stale = [
         rid
-        for rid in set(_last_kept) | set(_last_report_at)
-        if max(_last_kept.get(rid, float("-inf")), _last_report_at.get(rid, float("-inf")))
-        < cutoff
+        for rid in kept.keys() | reported.keys()
+        if max(kept.get(rid, float("-inf")), reported.get(rid, float("-inf"))) < cutoff
     ]
     # A legacy runner's first refresh is forced and leaves no timestamp; one gone
     # before its first periodic tick has none at all. If it is still connected,
     # its next pong re-registers it.
-    stale.extend(rid for rid in _unreporting_runners if rid not in _last_kept)
+    stale.extend(rid for rid in unreporting if rid not in kept)
     for runner_id in stale:
         _last_kept.pop(runner_id, None)
         _runner_interval_s.pop(runner_id, None)
