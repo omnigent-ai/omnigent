@@ -708,6 +708,11 @@ async def _wait_for_shell_completion(
                 ),
                 preserve_session=True,
             )
+        failure = read_bridge_startup_failure(bridge_dir)
+        if failure is not None and failure.code == CODEX_APP_SERVER_STOPPED.code:
+            if not require_idle:
+                return current
+            raise _CodexNativeInputUndelivered(failure)
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
         remaining = deadline - asyncio.get_running_loop().time()
@@ -787,6 +792,10 @@ async def _wait_for_compaction_turn(
                         remediation="Send the message again in the current session.",
                     )
                 )
+            failure = read_bridge_startup_failure(bridge_dir)
+            if failure is not None and failure.code == CODEX_APP_SERVER_STOPPED.code:
+                outcome = "app_server_stopped"
+                raise _CodexNativeInputUndelivered(failure)
             if current.active_turn_id != state.active_turn_id:
                 outcome = "settled"
                 return current

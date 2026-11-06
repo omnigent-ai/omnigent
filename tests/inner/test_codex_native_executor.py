@@ -27,6 +27,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
+    record_app_server_stopped,
     update_active_turn_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
@@ -523,6 +524,62 @@ async def test_compact_steer_wait_cancellation_propagates_without_resubmission(
         await asyncio.gather(delivery, return_exceptions=True)
     assert len(draining_client.requests) == 1
     assert draining_client.closes == 1
+
+
+@pytest.mark.parametrize("operation", ["compaction", "pending-shell", "running-shell"])
+async def test_native_operation_wait_reports_its_stopped_app_server(
+    draining_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, operation: str
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_work")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    if operation != "compaction":
+        state = replace(
+            state,
+            pending_shell_command_id="pending" if operation == "pending-shell" else None,
+            active_shell_turn_id="turn_work" if operation == "running-shell" else None,
+        )
+        write_bridge_state(tmp_path, state)
+    draining_client.delivery_errors = (
+        [_compact_steer_refusal()] if operation == "compaction" else []
+    )
+
+    class WaitingClient(draining_client):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if operation != "compaction" and method == "turn/steer":
+                assert params["input"] == []
+                type(self).requests.append((method, params))
+                return {"result": {}}
+            return await super().request(method, params)
+
+    real_sleep = asyncio.sleep
+
+    async def stop_after_wait_starts(_seconds: float) -> None:
+        record_app_server_stopped(tmp_path)
+        await real_sleep(0)
+
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.sleep = stop_after_wait_starts
+    monkeypatch.setattr(codex_native_executor, "asyncio", local_asyncio)
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", WaitingClient
+    )
+
+    async def deliver():
+        return [
+            event
+            async for event in CodexNativeExecutor(bridge_dir=tmp_path).run_turn(
+                [{"role": "user", "content": "queued input"}], [], ""
+            )
+        ]
+
+    [failure] = await asyncio.wait_for(deliver(), timeout=1)
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert failure.undelivered is True
+    assert WaitingClient.accepted_inputs == []
+    assert read_bridge_state(tmp_path) == state
 
 
 @pytest.mark.parametrize("reply_lost", [True, False], ids=["reply-lost", "refused-again"])
@@ -1516,8 +1573,9 @@ async def test_shell_reconciliation_requires_a_core_fence_refusal(
     assert read_bridge_state(tmp_path) == pending
 
 
+@pytest.mark.parametrize("owner_outcome", ["replacement", "stopped"])
 def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, owner_outcome: str
 ) -> None:
     """Post-acceptance reconciliation must never invite a retry of the original command."""
     _seed_bridge(tmp_path)
@@ -1526,9 +1584,18 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     replacement = replace(initial, thread_id="replacement_thread")
 
     class _RotatingShellClient(_FakeCodexNativeClient):
+        requests = []
+
         async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            if method == "turn/steer":
+                assert params["input"] == []
+                raise ConnectionError("app-server stopped")
             assert method == "thread/shellCommand"
-            write_bridge_state(tmp_path, replacement)
+            if owner_outcome == "stopped":
+                record_app_server_stopped(tmp_path)
+            else:
+                write_bridge_state(tmp_path, replacement)
             return {"result": {}}
 
     monkeypatch.setattr(
@@ -1539,7 +1606,12 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     )
 
     assert [type(event) for event in events] == [TurnComplete]
-    assert read_bridge_state(tmp_path) == replacement
+    assert sum(method == "thread/shellCommand" for method, _ in _RotatingShellClient.requests) == 1
+    if owner_outcome == "replacement":
+        assert read_bridge_state(tmp_path) == replacement
+    else:
+        current = read_bridge_state(tmp_path)
+        assert current is not None and current.pending_shell_command_id is not None
 
 
 @pytest.mark.asyncio
