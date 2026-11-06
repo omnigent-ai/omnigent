@@ -372,6 +372,10 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
             record_video_size={"width": 1280, "height": 900},
         ) as member,
     ):
+        page.goto(f"{multi_user_server.public_url}/settings")
+        admin_mode = page.get_by_role("switch", name="Admin mode", exact=True)
+        admin_mode.click()
+        expect(admin_mode).to_be_checked(timeout=30_000)
         page.goto(f"{multi_user_server.public_url}/settings/sharing")
         ceiling = page.get_by_role("combobox", name="Maximum public permission")
         expect(ceiling).to_have_text("Read", timeout=30_000)
@@ -487,22 +491,31 @@ def test_multi_user_shows_enabled_share_button(
     expect(share).to_be_enabled()
 
 
-def test_multi_user_admin_sees_members_and_sharing_settings(
+def test_multi_user_admin_can_toggle_admin_mode(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """On a NON-single-user server an admin's Settings nav shows the full Admin
-    group — Members, Policies, and Sharing.
+    """Admin settings follow the browser's mode while eligibility survives switching off."""
+    with user_page(browser, headers={"X-Forwarded-Email": ADMIN_EMAIL}) as page:
+        page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
+        page.get_by_test_id("settings-button").click()
+        page.wait_for_url("**/settings**", timeout=30_000)
 
-    Counterpart to ``test_single_user_hides_members_and_sharing_settings``: the
-    same auth shape (accounts off / no login) keeps these when the server isn't
-    single-user. The admin browser identity is what surfaces the Admin group.
-    """
-    page = _admin_page(browser)
-    page.goto(f"{multi_user_server.public_url}/c/{multi_user_server.session_id}")
-    page.get_by_test_id("settings-button").click()
-    page.wait_for_url("**/settings**", timeout=30_000)
+        admin_mode = page.get_by_role("switch", name="Admin mode", exact=True)
+        expect(admin_mode).not_to_be_checked(timeout=30_000)
+        for section in ("members", "sharing", "policies"):
+            expect(page.get_by_test_id(f"settings-nav-{section}")).to_have_count(0)
 
-    expect(page.get_by_test_id("settings-nav-members")).to_be_visible(timeout=30_000)
-    expect(page.get_by_test_id("settings-nav-sharing")).to_be_visible()
-    expect(page.get_by_test_id("settings-nav-policies")).to_be_visible()
+        admin_mode.click()
+        expect(admin_mode).to_be_checked(timeout=30_000)
+        for section in ("members", "sharing", "policies"):
+            expect(page.get_by_test_id(f"settings-nav-{section}")).to_be_visible()
+        assert page.evaluate("async () => (await fetch('/v1/me')).json()")["is_admin"] is True
+
+        admin_mode.click()
+        expect(admin_mode).not_to_be_checked(timeout=30_000)
+        for section in ("members", "sharing", "policies"):
+            expect(page.get_by_test_id(f"settings-nav-{section}")).to_have_count(0)
+        identity = page.evaluate("async () => (await fetch('/v1/me')).json()")
+        assert identity["is_admin"] is False
+        assert identity["can_enable_admin_mode"] is True

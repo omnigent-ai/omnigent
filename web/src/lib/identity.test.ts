@@ -116,6 +116,89 @@ describe("resolveIdentity", () => {
   });
 });
 
+describe("admin mode bootstrap", () => {
+  const cookieName = "omnigent_admin_mode_identity_test";
+  const supportedIdentity = {
+    user_id: "admin@example.test",
+    is_admin: false,
+    can_enable_admin_mode: true,
+    admin_mode_enabled: false,
+    admin_mode_cookie_name: cookieName,
+  };
+
+  afterEach(() => {
+    document.cookie = `${cookieName}=; Path=/; Max-Age=0`;
+    document.cookie = "omnigent_admin_mode_foreign=; Path=/; Max-Age=0";
+  });
+
+  it("preserves raw callers without browser opt-in or a readable mode cookie", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ ...supportedIdentity, is_admin: true, admin_mode_enabled: true }),
+    );
+    const identity = await import("./identity");
+
+    expect(await identity.resolveIdentity()).toBe("admin@example.test");
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/v1/me", undefined);
+    expect(identity.getCurrentIsAdmin()).toBe(true);
+    expect(identity.getIdentityResolutionState()).toBe("ready");
+  });
+
+  it("requests uncached browser identity and waits for its scoped cookie before resolving", async () => {
+    const mode = await import("./adminMode");
+    mode.initializeAdminMode();
+    document.cookie = "omnigent_admin_mode_foreign=on; Path=/";
+    fetchMock.mockResolvedValue(mockJsonResponse(supportedIdentity));
+    const identity = await import("./identity");
+
+    expect(identity.getIdentityResolutionState()).toBe("loading");
+    expect(await identity.resolveIdentity()).toBeNull();
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith("/v1/me", {
+      headers: { "X-Omnigent-Admin-Mode": "browser" },
+      cache: "no-store",
+    });
+    expect(document.cookie).not.toContain("omnigent_admin_mode=");
+    expect(identity.getCurrentUserId()).toBeNull();
+    expect(identity.getIdentityResolutionState()).toBe("retrying");
+
+    document.cookie = `${cookieName}=off; Path=/`;
+    expect(await identity.resolveIdentity()).toBe("admin@example.test");
+    expect(identity.getIdentityResolutionState()).toBe("ready");
+    expect(identity.getCurrentIsAdmin()).toBe(false);
+    expect(mode.getAdminMode()).toBe(false);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("accepts an old server without admin mode support after browser opt-in", async () => {
+    const mode = await import("./adminMode");
+    mode.initializeAdminMode();
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: "admin@example.test", is_admin: true }),
+    );
+    const identity = await import("./identity");
+
+    expect(await identity.resolveIdentity()).toBe("admin@example.test");
+    expect(identity.getIdentityResolutionState()).toBe("ready");
+    expect(identity.getCurrentIsAdmin()).toBe(true);
+    expect(mode.getAdminMode()).toBeNull();
+    expect(document.cookie).not.toContain("omnigent_admin_mode=");
+  });
+
+  it("finishes a signed-out identity probe so the login page remains available", async () => {
+    vi.stubGlobal("location", { pathname: "/login", search: "", href: "" });
+    const mode = await import("./adminMode");
+    mode.initializeAdminMode();
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ user_id: null, login_url: "/login" }, { ok: false, status: 401 }),
+    );
+    const identity = await import("./identity");
+
+    expect(await identity.resolveIdentity()).toBeNull();
+    expect(identity.getIdentityResolutionState()).toBe("ready");
+    expect(identity.isLoginRedirectPending()).toBe(false);
+    expect(mode.getAdminMode()).toBeNull();
+  });
+});
+
 describe("resolveIdentity transient failures", () => {
   afterEach(() => {
     vi.useRealTimers();

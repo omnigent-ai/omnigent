@@ -28,6 +28,7 @@ from omnigent.host.frames import HostHelloFrame
 from omnigent.runtime import inflight_text, session_stream
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import presence
+from omnigent.server.admin_mode import ADMIN_MODE_COOKIE
 from omnigent.server.app import create_app
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_MANAGE, LEVEL_OWNER, LEVEL_READ
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -1188,6 +1189,90 @@ async def test_admin_user_bypasses_permission_checks(
     assert resp.status_code == 200, (
         f"admin user should be able to list permissions, got {resp.status_code}."
     )
+
+
+async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    agent = await create_test_agent(auth_client, user="bryan")
+    session = await _create_session_as(auth_client, agent["id"], "user-a")
+    store = SqlAlchemyPermissionStore(db_uri)
+    store.ensure_user("admin-user", is_admin=True)
+    admin_headers = {"X-Forwarded-Email": "admin-user"}
+    session_url = f"/v1/sessions/{session['id']}"
+
+    # Warm the raw access cache before the browser enters ordinary-user mode.
+    assert (await auth_client.get(session_url, headers=admin_headers)).status_code == 200
+    identity = (
+        await auth_client.get(
+            "/v1/me", headers={**admin_headers, "X-Omnigent-Admin-Mode": "browser"}
+        )
+    ).json()
+    cookie_name = identity["admin_mode_cookie_name"]
+    assert cookie_name.startswith(f"{ADMIN_MODE_COOKIE}_")
+    assert identity == {
+        "user_id": "admin-user",
+        "is_admin": False,
+        "can_enable_admin_mode": True,
+        "admin_mode_enabled": False,
+        "admin_mode_cookie_name": cookie_name,
+    }
+    assert auth_client.cookies.get(cookie_name) == "off"
+    for path in (session_url, f"{session_url}/permissions", "/v1/sharing"):
+        response = await auth_client.get(path, headers=admin_headers)
+        assert response.status_code in (403, 404), (path, response.text)
+
+    # Explicit grants still work, with the same permission level as a member.
+    granted = await _grant_permission(
+        auth_client,
+        session["id"],
+        granter="user-a",
+        target_user="admin-user",
+        level=LEVEL_READ,
+    )
+    assert granted.status_code == 200
+    response = await auth_client.get(session_url, headers=admin_headers)
+    assert response.status_code == 200
+    assert response.json()["permission_level"] == LEVEL_READ
+
+    response = await auth_client.post(
+        "/v1/me/admin-mode", headers=admin_headers, json={"enabled": True}
+    )
+    assert response.status_code == 200
+    assert response.json()["admin_mode_enabled"] is True
+    assert response.json()["admin_mode_cookie_name"] == cookie_name
+    assert response.headers["set-cookie"].startswith(f"{cookie_name}=")
+    assert "Max-Age=" not in response.headers["set-cookie"]
+    assert "HttpOnly" not in response.headers["set-cookie"]
+    assert (await auth_client.get("/v1/sharing", headers=admin_headers)).status_code == 200
+    assert (await auth_client.get(session_url, headers=admin_headers)).json()[
+        "permission_level"
+    ] == LEVEL_OWNER
+    assert (
+        await auth_client.post(
+            "/v1/me/admin-mode", headers=admin_headers, json={"enabled": "false"}
+        )
+    ).status_code == 422
+    assert (
+        await auth_client.post(
+            "/v1/me/admin-mode",
+            headers={**admin_headers, "Content-Type": "text/plain"},
+            content='{"enabled": false}',
+        )
+    ).status_code in (415, 422)
+
+    # Another identity cannot borrow the enabled browser mode or enable its own.
+    member_headers = {"X-Forwarded-Email": "user-a"}
+    assert (await auth_client.get("/v1/me", headers=member_headers)).json()["is_admin"] is False
+    assert (
+        await auth_client.post("/v1/me/admin-mode", headers=member_headers, json={"enabled": True})
+    ).status_code == 403
+    assert (
+        await auth_client.post("/v1/me/admin-mode", headers=admin_headers, json={"enabled": False})
+    ).status_code == 200
+    assert (await auth_client.get("/v1/sharing", headers=admin_headers)).status_code == 403
+    assert store.is_admin("admin-user")
 
 
 # ── Revoke nonexistent: idempotent 204 ──────────────────────

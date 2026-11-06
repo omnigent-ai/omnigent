@@ -1,4 +1,5 @@
 import { appConfig } from "./appConfig";
+import { initializeAdminMode } from "./lib/adminMode";
 import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
@@ -7,6 +8,7 @@ import { createRoot } from "react-dom/client";
 import { BrowserRouter } from "react-router-dom";
 import App from "./App.tsx";
 import { PageLoading } from "./components/PageLoading";
+import { AdminModeBoundary } from "./components/AdminModeBoundary";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { ImageLightboxProvider } from "./components/ImageLightbox";
@@ -18,7 +20,7 @@ import { getBasePath, withBasePath } from "./lib/basePath";
 import { resolveServerInfo, type ServerInfo } from "./lib/capabilities";
 import { CapabilitiesProvider } from "./lib/CapabilitiesContext";
 import { ExtensionProvider } from "./extensions/ExtensionProvider";
-import { createBootServerInfo, withBootTimeout } from "./lib/bootCapabilities";
+import { createBootServerInfo } from "./lib/bootCapabilities";
 import { isLoginRedirectPending, resolveIdentity, setSessionHostResolver } from "./lib/identity";
 import { hideNativeChatTerminalBar } from "./lib/nativeChatTerminalBar";
 import { applyMacElectronShellAttribute } from "./lib/nativeBridge";
@@ -41,6 +43,7 @@ import "./index.css";
 // Start tracing before any request fires so fetch/XHR are patched in time
 // and a trace begins in the browser. No-op unless a collector endpoint is
 // configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
+initializeAdminMode();
 initBrowserTelemetry();
 
 // Single client at module scope — shared across the whole app.
@@ -67,18 +70,8 @@ setSessionHostResolver((sessionId, options) =>
   prefetchSessionHostChain(queryClient, sessionId, options),
 );
 
-// Discover the current user identity from the server. Once resolved,
-// all subsequent fetch calls include X-Forwarded-Email so session
-// routes know who's making the request.
-//
-// Started here but AWAITED at the render gate below, alongside the
-// /v1/info probe. The app's shell mounts ~8 queries (hosts, agents,
-// conversations, projects, harnesses) with no auth gating of their own,
-// so rendering before this settles fans them all out at once — logged
-// out, every one 401s in parallel and the login redirect races the
-// burst. Kicked off at module scope so it runs CONCURRENTLY with
-// `resolveServerInfo()`; the gate waits on the slower of the two rather
-// than chaining a second round-trip onto first paint.
+// Start identity discovery alongside capabilities; AdminModeBoundary waits
+// for the scoped-cookie handshake before mounting data and stream providers.
 const bootIdentity = resolveIdentity();
 
 // Mirror the iOS shell's native bar footprints into the inset CSS variables.
@@ -124,11 +117,6 @@ applyThemePalette(readThemePalette());
 // something on screen.
 const bootServerInfo = createBootServerInfo(resolveServerInfo());
 
-// Same 1.5s safety net for the identity probe: a hung /v1/me must not
-// deadlock first paint. On timeout we render anyway and the app degrades
-// exactly as it did before this gate existed.
-const bootIdentityGate = withBootTimeout<string | null>(bootIdentity, null);
-
 function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
   const [info, setInfo] = useState<ServerInfo | "loading">(initialInfo);
   useEffect(() => {
@@ -157,33 +145,34 @@ function RootApp({ initialInfo }: { initialInfo: ServerInfo | "loading" }) {
   return (
     <CapabilitiesProvider info={info}>
       <QueryClientProvider client={queryClient}>
-        <ExtensionProvider>
-          <ThemeProvider>
-            <TooltipProvider>
-              <ImageLightboxProvider>
-                <BrowserRouter basename={getBasePath() || undefined}>
-                  <IdentityAwareSidebarDataProvider config={appConfig.sidebar}>
-                    <SessionUpdatesProvider>
-                      <RunnerHealthProvider>
-                        <QueueFlushProvider>
-                          <App />
-                        </QueueFlushProvider>
-                      </RunnerHealthProvider>
-                    </SessionUpdatesProvider>
-                  </IdentityAwareSidebarDataProvider>
-                </BrowserRouter>
-              </ImageLightboxProvider>
-            </TooltipProvider>
-          </ThemeProvider>
-        </ExtensionProvider>
+        <ThemeProvider>
+          <AdminModeBoundary>
+            <ExtensionProvider>
+              <TooltipProvider>
+                <ImageLightboxProvider>
+                  <BrowserRouter basename={getBasePath() || undefined}>
+                    <IdentityAwareSidebarDataProvider config={appConfig.sidebar}>
+                      <SessionUpdatesProvider>
+                        <RunnerHealthProvider>
+                          <QueueFlushProvider>
+                            <App />
+                          </QueueFlushProvider>
+                        </RunnerHealthProvider>
+                      </SessionUpdatesProvider>
+                    </IdentityAwareSidebarDataProvider>
+                  </BrowserRouter>
+                </ImageLightboxProvider>
+              </TooltipProvider>
+            </ExtensionProvider>
+          </AdminModeBoundary>
+        </ThemeProvider>
       </QueryClientProvider>
     </CapabilitiesProvider>
   );
 }
 
-// Mount immediately so the shell renders before the server probes settle.
-// The CapabilitiesProvider starts with "loading"; bootServerInfo.settled
-// updates it once /v1/info returns (see RootApp's useEffect above).
+// Render the loading view immediately; the boundary mounts data providers
+// once identity and the browser's scoped mode are ready.
 const root = createRoot(document.getElementById("root")!);
 root.render(
   <StrictMode>
@@ -195,6 +184,6 @@ root.render(
 // there. Replace the shell to stop its queries firing against an invalid
 // session mid-redirect. Header mode never lands here (no login page), so
 // a proxy-less deploy is unaffected.
-void bootIdentityGate.then(() => {
+void bootIdentity.then(() => {
   if (isLoginRedirectPending()) root.render(<PageLoading label="Opening sign-in…" />);
 });

@@ -116,6 +116,12 @@ export interface OmnigentHostConfig {
   /** Stable server/workspace identity used to scope browser-local extension storage. */
   serverIdentity?: string;
   /**
+   * Opt into browser admin mode when this page and HTTP, WebSocket, and media
+   * requests share an origin and cookie path. Must match the backend's Set-Cookie path.
+   * The host must forward the identity bootstrap header and its Set-Cookie response.
+   */
+  adminModeCookiePath?: string;
+  /**
    * Maps an web API path (always starting with `/v1`, `/health`, or
    * `/api/...`) to a `Response`. The host implementation is responsible for
    * prefixing the real API base and attaching auth (e.g. the monolith's

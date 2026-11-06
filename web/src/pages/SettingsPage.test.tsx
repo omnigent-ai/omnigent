@@ -45,6 +45,8 @@ const mocks = vi.hoisted(() => ({
   bulkArchiveMutate: vi.fn(),
   bulkDeleteMutate: vi.fn(),
   accountsEnabled: true,
+  adminMode: null as boolean | null,
+  setAdminMode: vi.fn(),
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
@@ -90,6 +92,11 @@ vi.mock("@/shell/ImportSessionsPanel", () => ({
 vi.mock("@/lib/accountsApi", () => ({
   logout: vi.fn(),
   changePassword: vi.fn(),
+}));
+vi.mock("@/lib/adminMode", () => ({
+  useAdminMode: () => mocks.adminMode,
+  getAdminMode: () => mocks.adminMode,
+  setAdminMode: mocks.setAdminMode,
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: () => Promise.resolve(mocks.me?.id ?? null),
@@ -270,6 +277,8 @@ beforeEach(() => {
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
+  mocks.adminMode = null;
+  mocks.setAdminMode.mockReset().mockResolvedValue(undefined);
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
   mocks.loginUrl = "/login";
@@ -365,6 +374,34 @@ describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
     localStorage.removeItem(OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY);
+  });
+
+  it("offers admin mode at the bottom of General only for an eligible account", async () => {
+    const page = renderPage("/settings/general");
+    expect(screen.queryByRole("switch", { name: "Admin mode" })).toBeNull();
+    page.unmount();
+
+    mocks.adminMode = false;
+    renderPage("/settings/general");
+    const toggle = screen.getByRole("switch", { name: "Admin mode" });
+    const group = screen.getByTestId("settings-group-admin-mode");
+    expect(group.nextElementSibling).toBeNull();
+    expect(toggle).toHaveAttribute("aria-checked", "false");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(mocks.setAdminMode).toHaveBeenCalledWith(true));
+    expect(toggle).toBeDisabled();
+  });
+
+  it("keeps admin mode enabled and allows retry when the server rejects turning it off", async () => {
+    mocks.adminMode = true;
+    mocks.setAdminMode.mockRejectedValue(new Error("Could not change admin mode. Try again."));
+    renderPage("/settings/general");
+    const toggle = screen.getByRole("switch", { name: "Admin mode" });
+    fireEvent.click(toggle);
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not change admin mode");
+    expect(mocks.setAdminMode).toHaveBeenCalledWith(false);
+    expect(toggle).toHaveAttribute("aria-checked", "true");
+    expect(toggle).not.toBeDisabled();
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {

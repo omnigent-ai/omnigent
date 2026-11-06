@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { getOmnigentServerIdentity } from "./host";
 import { getCurrentUserId } from "./identity";
+import { getAdminMode } from "./adminMode";
 import {
   modelCatalogCacheKey,
   readModelCatalogCache,
@@ -9,6 +10,7 @@ import {
 
 vi.mock("./host", () => ({ getOmnigentServerIdentity: vi.fn() }));
 vi.mock("./identity", () => ({ getCurrentUserId: vi.fn() }));
+vi.mock("./adminMode", () => ({ getAdminMode: vi.fn() }));
 const models = [
   {
     id: "model-a",
@@ -23,6 +25,7 @@ beforeEach(() => {
   localStorage.clear();
   vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-a");
   vi.mocked(getCurrentUserId).mockReturnValue("alice");
+  vi.mocked(getAdminMode).mockReturnValue(null);
 });
 afterEach(() => {
   vi.restoreAllMocks();
@@ -45,12 +48,14 @@ it("does not restore Fusion configurations as selectable model IDs", () => {
   expect(readModelCatalogCache(key())?.models).toEqual(models);
 });
 
-it.each(["server", "user", "target", "kind", "harness", "agent"])(
+it.each(["server", "user", "target", "kind", "harness", "agent", "admin mode"])(
   "isolates catalogs by %s",
   (dimension) => {
+    if (dimension === "admin mode") vi.mocked(getAdminMode).mockReturnValue(true);
     writeModelCatalogCache(key(), models, true);
     if (dimension === "server") vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
     if (dimension === "user") vi.mocked(getCurrentUserId).mockReturnValue("bob");
+    if (dimension === "admin mode") vi.mocked(getAdminMode).mockReturnValue(false);
     const other = modelCatalogCacheKey(
       dimension === "kind" ? "host" : "sandbox",
       dimension === "target" ? "other-provider" : "company",

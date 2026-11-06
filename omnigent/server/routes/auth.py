@@ -44,6 +44,7 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 
 from omnigent.server.accounts_store import SqlAlchemyAccountStore
 from omnigent.server.admin_list import AdminList, promote_if_listed
+from omnigent.server.admin_mode import effective_admin
 from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
@@ -693,7 +694,7 @@ def create_auth_router(
             is_admin = (
                 permission_store is not None and permission_store.is_admin(caller)
             ) or admin_list.is_admin(caller)
-            if not is_admin:
+            if not effective_admin(is_admin):
                 return JSONResponse(status_code=403, content={"error": "admin only"})
 
             token_id = secrets.token_urlsafe(32)
@@ -1163,7 +1164,7 @@ def create_auth_router(
         is_admin = (
             permission_store is not None and permission_store.is_admin(caller)
         ) or admin_list.is_admin(caller)
-        if not is_admin:
+        if not effective_admin(is_admin):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
         users = permission_store.list_users(limit=limit) if permission_store is not None else []

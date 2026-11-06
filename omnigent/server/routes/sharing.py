@@ -23,6 +23,7 @@ from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.admin_mode import effective_admin
 from omnigent.server.auth import AuthProvider, SharingMode, local_single_user_enabled
 from omnigent.server.routes._auth_helpers import get_user_id
 from omnigent.server.sharing_settings import (
@@ -104,7 +105,7 @@ async def _require_admin(
     if user_id is None:
         raise OmnigentError("Authentication required", code=ErrorCode.UNAUTHORIZED)
     is_admin = await asyncio.to_thread(permission_store.is_admin, user_id)
-    if not is_admin:
+    if not effective_admin(is_admin):
         raise OmnigentError(
             "Admin privileges required to manage sharing settings",
             code=ErrorCode.FORBIDDEN,

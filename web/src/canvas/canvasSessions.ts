@@ -15,6 +15,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
+import { getAdminMode } from "@/lib/adminMode";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { sessionUpdatesSocket } from "@/lib/sessionUpdatesSocket";
 import { sessionVisibility } from "@/lib/sessionVisibility";
@@ -70,7 +71,10 @@ function currentServerId(): string {
 }
 
 function sessionCachePrefix(serverId: string = currentServerId()): string {
-  return `${SESSION_CACHE_KEY_PREFIX}:${serverId}`;
+  const mode = getAdminMode();
+  let modeSuffix = "";
+  if (mode !== null) modeSuffix = mode ? ":admin" : ":member";
+  return `${SESSION_CACHE_KEY_PREFIX}:${serverId}${modeSuffix}`;
 }
 
 function sessionCacheKey(viewerId: string, serverId: string = currentServerId()): string {
