@@ -1,5 +1,6 @@
 import { Button } from "@/components/ui/button";
 import { getEmbedRoot } from "@/lib/host";
+import { cn } from "@/lib/utils";
 import type { ComponentProps, ReactNode, RefObject } from "react";
 import { cloneElement, isValidElement, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -104,11 +105,35 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
   );
 }
 
+// Mermaid's own <svg id="mermaid-…">, or the card that explains why it couldn't draw.
+const DRAWN_DIAGRAM = 'svg[id^="mermaid-"], [data-testid="mermaid-error"]';
+
 // The .chat-mermaid rule reserves a slot beside Streamdown's download/copy toolbar.
-export function MermaidBlock({ block }: { block: ReactNode }) {
+export function MermaidBlock({
+  block,
+  className,
+  onDrawn,
+}: {
+  block: ReactNode;
+  className?: string;
+  onDrawn?: () => void;
+}) {
   const blockRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const root = blockRef.current;
+    if (!root || !onDrawn) return;
+    if (root.querySelector(DRAWN_DIAGRAM)) {
+      onDrawn();
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      if (root.querySelector(DRAWN_DIAGRAM)) onDrawn();
+    });
+    observer.observe(root, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [onDrawn]);
   return (
-    <div ref={blockRef} className="chat-mermaid relative">
+    <div ref={blockRef} className={cn("chat-mermaid relative", className)}>
       {block}
       <div className="absolute top-2 right-2 z-20 flex items-center rounded-md border border-sidebar bg-sidebar/80 px-1.5 py-1 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur">
         <MermaidFullscreen blockRef={blockRef} />
