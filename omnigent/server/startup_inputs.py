@@ -728,6 +728,18 @@ class ManagedStartupInputs:
                 else "not_sent",
                 exception_type=type(exc).__name__,
             )
+            harness_refusal = (
+                isinstance(exc, OmnigentError)
+                and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
+                and not (context and context.submitted)
+            )
+            if harness_refusal:
+                _logger.warning(
+                    "Saved message for session %s is waiting for harness setup: %s",
+                    session_id,
+                    exc,
+                )
+                return
             _logger.exception("Unable to deliver saved message for session %s", session_id)
             uncertain = bool(context and context.submitted)
             await self._report_failure(
