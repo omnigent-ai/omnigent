@@ -282,6 +282,19 @@ def test_other_missing_credentials_are_not_reported_as_dbcert() -> None:
     assert diagnosis is None or diagnosis.title != "Client certificate missing or expired"
 
 
+def test_dbcert_line_in_an_earlier_message_does_not_vouch_for_another_failure() -> None:
+    diagnosis = classify_terminal_failure(
+        command="claude",
+        exit_status=1,
+        output=(
+            "dbcert: credentials loaded successfully\n"
+            "FileNotFoundError: Missing required credential files in directory: "
+            "/custom/cloud-profile"
+        ),
+    )
+    assert diagnosis is None or diagnosis.title != "Client certificate missing or expired"
+
+
 def test_unclassified_failure_returns_none() -> None:
     assert (
         classify_terminal_failure(

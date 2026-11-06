@@ -120,6 +120,8 @@ _DBCERT_MARKERS = (
     "missingrequiredcredentialfiles",
     "certificateexpirestoosoon",
 )
+# Each exception message starts its own line (lowercased output).
+_EXCEPTION_MESSAGE_START = re.compile(r"(?m)^(?=[\s│┃]*\w*(?:error|exception):)")
 
 # --- Claude Code install failed or left broken -------------------------------
 # A launcher that installs Claude Code before starting it reports npm's
@@ -177,10 +179,7 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
     ),
     _TerminalMatcher(
         "dbcert_missing",
-        lambda s: (
-            "dbcert" in _PANE_WRAP.sub("", s.output)
-            and any(m in _PANE_WRAP.sub("", s.output) for m in _DBCERT_MARKERS)
-        ),
+        lambda s: _is_dbcert_certificate_failure(s.output),
         FailureDiagnosis(
             title="Client certificate missing or expired",
             cause=(
@@ -289,6 +288,15 @@ def _claude_install_is_broken(output: str) -> bool:
     return any(m in compact for m in _BROKEN_CLAUDE_INSTALL_MARKERS) or bool(
         _EXEC_FORMAT_ERROR.search(compact)
     )
+
+
+def _is_dbcert_certificate_failure(output: str) -> bool:
+    # The dbcert reference and the marker must come from the same exception message.
+    for message in _EXCEPTION_MESSAGE_START.split(output):
+        compact = _PANE_WRAP.sub("", message)
+        if "dbcert" in compact and any(m in compact for m in _DBCERT_MARKERS):
+            return True
+    return False
 
 
 # A tmux kill run inside the pane acts on Omnigent's private server via $TMUX;
