@@ -233,6 +233,7 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
+      ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -1160,6 +1161,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         </div>
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
+        )}
+        {bubble.pending && bubble.stillSending && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-still-sending"
+          >
+            <Loader2Icon size={12} className="animate-spin" aria-hidden />
+            Still sending…
+          </div>
         )}
         {visibilityToggle}
         <div
