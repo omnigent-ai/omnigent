@@ -142,6 +142,8 @@ describe("KeyboardShortcutsDialog", () => {
     isNativeShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList variant="settings" />);
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);
   });
 
   it("renders nothing until opened", () => {
@@ -170,12 +172,13 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
-    expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
+    expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
-    const workspaceTabRow = screen.getByText("Select a workspace tab").closest("li");
-    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "Alt", "]", "1…4"]);
-    expect(workspaceTabRow?.textContent?.match(/\+/g)).toHaveLength(1);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "Alt", "["]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "Alt", "]"]);
+    // Ctrl+digit opens sidebar sessions off macOS, so the tab chord takes Alt.
+    expect(keysFor("Select a workspace tab")).toEqual(["Alt", "1…4"]);
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
