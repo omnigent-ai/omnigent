@@ -23,6 +23,8 @@ _logger = logging.getLogger(__name__)
 
 _DEFAULT_STARTUP_DELAY_S = 3.0
 _DEFAULT_LOCK_RETRY_S = 0.5
+# Closed logs retain a month of diagnostics after their last write.
+_PROCESS_LOG_RETENTION_S = 30 * 24 * 3600.0
 
 MaintenanceStage = tuple[str, Callable[[], Awaitable[object]]]
 _LockOutcome = Literal["acquired", "busy", "failed"]
@@ -71,6 +73,30 @@ def _maintenance_lock(path: Path) -> Iterator[_LockOutcome]:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             with contextlib.suppress(OSError):
                 os.close(fd)
+
+
+def prune_stale_process_logs(
+    log_dir: Path,
+    pattern: str,
+    *,
+    max_age_s: float = _PROCESS_LOG_RETENTION_S,
+    now: float | None = None,
+) -> int:
+    """Delete old allocated logs only after acquiring their exclusive inode lease.
+
+    Capture descriptors retain shared locks across child inheritance. Legacy
+    logs without the allocation marker remain untouched.
+
+    :param log_dir: Process-log directory, e.g. ``~/.omnigent/logs/runner``.
+    :param pattern: Glob for the logs to consider, e.g. ``"runner-*.log"``.
+    :param max_age_s: Minimum idle age before a log can be removed.
+    :param now: Reference time as epoch seconds; defaults to the current time.
+    :returns: Number of files removed.
+    """
+    from omnigent.process_logging import unlink_closed_process_log
+
+    cutoff = (time.time() if now is None else now) - max_age_s
+    return sum(unlink_closed_process_log(path, before=cutoff) for path in log_dir.glob(pattern))
 
 
 class HostMaintenanceJanitor:
@@ -142,12 +168,23 @@ class HostMaintenanceJanitor:
 
             return await _run_sync_stage(reap_orphaned_native_bridge_dirs)
 
+        async def _prune_process_logs() -> object:
+            from omnigent.process_logging import process_log_dir
+
+            def _prune_all() -> int:
+                return prune_stale_process_logs(
+                    process_log_dir("runner"), "runner-*.log"
+                ) + prune_stale_process_logs(process_log_dir("host"), "host-*.log")
+
+            return await _run_sync_stage(_prune_all)
+
         return cls(
             stages=(
                 ("harness_process_orphans", _reap_harness_processes),
                 ("codex_process_registry", _reconcile_codex_processes),
                 ("terminal_orphans", _reap_terminals),
                 ("native_bridge_orphans", _reap_native_bridge_dirs),
+                ("process_log_retention", _prune_process_logs),
             ),
             lock_path=data_dir().resolve() / "locks" / "host-maintenance.lock",
             stage_skip_reasons={"native_bridge_orphans": {"runner_superseded"}},

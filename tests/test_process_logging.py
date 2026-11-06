@@ -1193,16 +1193,15 @@ def test_configure_process_logging_forwards_custom_debug_log_send(
 
 def test_unlink_if_empty_sweeps_only_empty_files(tmp_path: Path) -> None:
     """The exit sweep removes an empty log, keeps a written one, tolerates absence."""
-    empty = tmp_path / "empty.log"
-    empty.touch()
-    written = tmp_path / "written.log"
+    empty = process_logging.create_process_log_path("runner", root=tmp_path)
+    written = process_logging.create_process_log_path("runner", root=tmp_path)
     written.write_text("one line\n")
 
     _unlink_if_empty(empty)
     _unlink_if_empty(written)
     _unlink_if_empty(tmp_path / "missing.log")
 
-    assert not empty.exists()
+    assert empty.exists() is (process_logging.fcntl is None)
     assert written.exists()
 
 
@@ -1229,7 +1228,9 @@ def test_configure_registers_the_empty_log_sweep_for_self_allocated_paths(
 
     path = configure_process_logging("host", logger_names=(logger_name,), root=False)
     try:
-        assert registered == [(_unlink_if_empty, path)]
+        assert len(registered) == 1
+        assert registered[0][:2] == (_unlink_if_empty, path)
+        assert isinstance(registered[0][2], logging.FileHandler)
 
         registered.clear()
         explicit = configure_process_logging(

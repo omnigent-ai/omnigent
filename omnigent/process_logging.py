@@ -15,10 +15,16 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from io import TextIOWrapper
 from pathlib import Path
 from typing import BinaryIO, TextIO, TypedDict, cast
 
 from omnigent._platform import IS_POSIX
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no flock.
+    fcntl = None  # type: ignore[assignment]
 
 DATA_DIR_ENV_VAR = "OMNIGENT_DATA_DIR"
 LOG_LEVEL_ENV_VAR = "OMNIGENT_LOG_LEVEL"
@@ -84,6 +90,69 @@ class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
 
 class _ProcessLogFileHandler(logging.FileHandler):
     _omnigent_process_log_path: str
+
+    def _open(self) -> TextIOWrapper:
+        with contextlib.ExitStack() as cleanup:
+            stream = cleanup.enter_context(super()._open())
+            _lock_process_log_writer(Path(self.baseFilename), stream)
+            cleanup.pop_all()
+            return stream
+
+
+def process_log_lease_marker(path: Path) -> Path:
+    """Return the allocation marker for logs whose writers use shared inode locks."""
+    return path.with_name(path.name + ".lease-v1")
+
+
+def _lock_process_log_writer(path: Path, stream: BinaryIO | TextIO) -> None:
+    """Keep the allocated log's inode leased for this descriptor's lifetime."""
+    if fcntl is None:
+        return
+    marker = process_log_lease_marker(path)
+    try:
+        stat = os.fstat(stream.fileno())
+        if marker.read_text(encoding="ascii") != f"{stat.st_dev}:{stat.st_ino}\n":
+            return
+    except (OSError, UnicodeError):
+        return
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+    except OSError:
+        # An unleased writer makes this allocation ineligible for cleanup.
+        marker.unlink(missing_ok=True)
+        return
+    current = path.stat()
+    if (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino):
+        raise OSError("process log changed while acquiring its writer lease")
+
+
+def unlink_closed_process_log(
+    path: Path, *, before: float | None = None, empty_only: bool = False
+) -> bool:
+    """Unlink an allocated log only while its exclusive inode lease is held."""
+    if fcntl is None:
+        return False
+    marker = process_log_lease_marker(path)
+    try:
+        if path.is_symlink() or marker.is_symlink():
+            return False
+        with path.open("r+b") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stat = os.fstat(stream.fileno())
+            current = path.stat()
+            if (
+                (before is not None and stat.st_mtime >= before)
+                or (empty_only and stat.st_size != 0)
+                or (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino)
+                or marker.read_text(encoding="ascii") != f"{stat.st_dev}:{stat.st_ino}\n"
+            ):
+                return False
+            path.unlink()
+            with contextlib.suppress(OSError):
+                marker.unlink()
+            return True
+    except (OSError, UnicodeError):
+        return False
 
 
 DEFAULT_LOG_SOURCE_WIDTH = 32
@@ -339,6 +408,14 @@ def create_process_log_path(
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             continue
+        if fcntl is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                stat = os.fstat(fd)
+                marker = process_log_lease_marker(candidate)
+                with marker.open("x", encoding="utf-8") as lease:
+                    os.chmod(marker, 0o600)
+                    lease.write(f"{stat.st_dev}:{stat.st_ino}\n")
         os.close(fd)
         return candidate
     raise FileExistsError(f"could not allocate a {destination!r} log file in {log_dir}")
@@ -352,7 +429,11 @@ def open_process_log_file(
 ) -> tuple[Path, BinaryIO]:
     """Create and open a process log file for binary stdout/stderr capture."""
     path = create_process_log_path(destination, root=root, prefix=prefix)
-    return path, open(path, "ab", buffering=0)
+    with contextlib.ExitStack() as cleanup:
+        stream = cleanup.enter_context(open(path, "ab", buffering=0))
+        _lock_process_log_writer(path, stream)
+        cleanup.pop_all()
+        return path, stream
 
 
 def env_truthy(value: str | None) -> bool:
@@ -912,14 +993,11 @@ def terminal_log_formatter() -> logging.Formatter:
     return RedactingLogFormatter(use_colors=terminal_supports_color())
 
 
-def _unlink_if_empty(path: Path) -> None:
-    """Remove *path* if it is still an empty file.
-
-    :param path: Log file to sweep, e.g. a self-allocated host log.
-    """
-    with contextlib.suppress(OSError):
-        if path.stat().st_size == 0:
-            path.unlink()
+def _unlink_if_empty(path: Path, writer: logging.Handler | None = None) -> None:
+    """Release this process's writer and remove a provably closed empty allocation."""
+    if writer is not None:
+        writer.close()
+    unlink_closed_process_log(path, empty_only=True)
 
 
 def ensure_stdio_survives_unencodable_output() -> None:
@@ -972,13 +1050,13 @@ def configure_process_logging(
 
     resolved_level = effective_log_level() if level is None else level
     path = Path(log_path).expanduser() if log_path is not None else _process_log_file_from_env()
+    self_allocated = path is None
     if path is None:
         path = create_process_log_path(destination)
         # A process that dies before its first record would leave this
         # freshly created file empty forever (crash-at-birth hosts littered
         # dozens a day); sweep it on exit. Self-allocated paths only — a
         # parent-published or explicit path is the caller's to manage.
-        atexit.register(_unlink_if_empty, path)
     path.parent.mkdir(parents=True, exist_ok=True)
     _current_process_log_path = path
 
@@ -989,6 +1067,8 @@ def configure_process_logging(
     file_handler.setLevel(resolved_level)
     file_handler.setFormatter(formatter)
     file_handler._omnigent_process_log_path = str(path)
+    if self_allocated:
+        atexit.register(_unlink_if_empty, path, file_handler)
     handlers.append(file_handler)
 
     mirror = should_log_to_stderr() if log_to_stderr is None else log_to_stderr

@@ -4,14 +4,30 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import pytest
 
-from omnigent.host.maintenance import HostMaintenanceJanitor
+from omnigent.host import maintenance
+from omnigent.host.maintenance import HostMaintenanceJanitor, prune_stale_process_logs
+from omnigent.process_logging import (
+    _ProcessLogFileHandler,
+    _unlink_if_empty,
+    create_process_log_path,
+    open_process_log_file,
+    process_log_lease_marker,
+)
 
 
-def test_host_janitor_covers_global_runner_cleanup() -> None:
+async def test_host_janitor_covers_global_runner_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    prune = Mock(side_effect=[2, 3])
+    monkeypatch.setattr("omnigent.host.maintenance.prune_stale_process_logs", prune)
     janitor = HostMaintenanceJanitor.for_host()
 
     assert [name for name, _stage in janitor._stages] == [
@@ -19,10 +35,130 @@ def test_host_janitor_covers_global_runner_cleanup() -> None:
         "codex_process_registry",
         "terminal_orphans",
         "native_bridge_orphans",
+        "process_log_retention",
     ]
     assert janitor._stage_skip_reasons == {
         "native_bridge_orphans": frozenset({"runner_superseded"})
     }
+    assert await dict(janitor._stages)["process_log_retention"]() == 5
+    assert prune.call_args_list == [
+        call(tmp_path / "logs" / "runner", "runner-*.log"),
+        call(tmp_path / "logs" / "host", "host-*.log"),
+    ]
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+def test_prune_stale_process_logs_removes_only_idle_leased_matches(tmp_path: Path) -> None:
+    now = 2_000_000_000.0
+    retention = 30 * 24 * 3600.0
+    log_dir = tmp_path / "runner"
+
+    def allocate(age_s: float, *, destination: str = "runner") -> Path:
+        path = create_process_log_path(destination, root=tmp_path)
+        path.write_text("diagnostics\n")
+        os.utime(path, (now - age_s, now - age_s))
+        return path
+
+    stale = allocate(retention + 1)
+    at_cutoff = allocate(retention)
+    before_cutoff = allocate(retention - 1)
+    recent = allocate(10)
+    foreign = allocate(retention + 1, destination="host")
+    unmarked = log_dir / "runner-legacy.log"
+    unmarked.write_text("legacy diagnostics\n")
+    os.utime(unmarked, (0, 0))
+    mismatched = allocate(retention + 1)
+    process_log_lease_marker(mismatched).write_text("another inode\n")
+    malformed = allocate(retention + 1)
+    process_log_lease_marker(malformed).write_bytes(b"\xff")
+    held = allocate(retention + 1)
+    link = log_dir / "runner-link.log"
+    link.symlink_to(stale)
+    handler = _ProcessLogFileHandler(held, encoding="utf-8")
+    try:
+        assert prune_stale_process_logs(log_dir, "runner-*.log", now=now) == 1
+        assert not stale.exists()
+        assert not process_log_lease_marker(stale).exists()
+        assert all(
+            path.exists()
+            for path in [
+                at_cutoff,
+                before_cutoff,
+                recent,
+                foreign,
+                unmarked,
+                mismatched,
+                malformed,
+                held,
+            ]
+        )
+        assert link.is_symlink()
+    finally:
+        handler.close()
+    assert prune_stale_process_logs(log_dir, "runner-*.log", now=now) == 1
+    assert not held.exists()
+    assert foreign.exists()
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+def test_process_log_lease_survives_inherited_child_descriptor(tmp_path: Path) -> None:
+    path, capture = open_process_log_file("runner", root=tmp_path)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; sys.stdin.readline(); print('child diagnostics', flush=True)",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=capture,
+        stderr=capture,
+        text=True,
+    )
+    capture.close()
+    try:
+        os.utime(path, (0, 0))
+        assert prune_stale_process_logs(path.parent, "runner-*.log") == 0
+        assert path.exists()
+        _unlink_if_empty(path)
+        assert path.exists(), "exit cleanup must preserve the inherited writer too"
+        child.communicate("finish\n", timeout=10)
+        assert child.returncode == 0
+        assert path.read_text() == "child diagnostics\n"
+        os.utime(path, (0, 0))
+        assert prune_stale_process_logs(path.parent, "runner-*.log") == 1
+        assert not path.exists()
+        assert not process_log_lease_marker(path).exists()
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+def test_process_log_cleanup_preserves_files_when_lease_cannot_be_proven(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = create_process_log_path("runner", root=tmp_path)
+    eligible = create_process_log_path("runner", root=tmp_path)
+    os.utime(path, (0, 0))
+    os.utime(eligible, (0, 0))
+    denied_inode = path.stat().st_ino
+    flock = maintenance.fcntl.flock
+
+    def refuse_lock(fd: int, operation: int) -> None:
+        if os.fstat(fd).st_ino == denied_inode:
+            raise PermissionError("lease is unavailable")
+        flock(fd, operation)
+
+    monkeypatch.setattr(maintenance.fcntl, "flock", refuse_lock)
+    assert prune_stale_process_logs(path.parent, "runner-*.log") == 1
+    assert path.exists()
+    assert process_log_lease_marker(path).exists()
+    assert not eligible.exists()
+
+
+def test_process_log_cleanup_handles_missing_directory(tmp_path: Path) -> None:
+    assert prune_stale_process_logs(tmp_path / "absent", "runner-*.log") == 0
 
 
 async def test_start_runs_stages_in_background_and_in_order(tmp_path: Path) -> None:
