@@ -863,9 +863,9 @@ def test_scheduled_task_edit_switches_the_harness(
 # ── Permission-mode selector ───────────────────────────────────────────────
 #
 # The dialog renders a Permission-mode select alongside Model/Effort, gated on
-# the same ``permissionMode`` capability (Claude Code). Because an automation
-# fires a fresh session each run, the whole launch vocabulary is offered —
-# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
+# the same ``permissionMode`` capability (Claude Code). Modes that skip approval
+# (``dontAsk`` / ``bypassPermissions``) are not offered, since nobody is there to
+# answer a prompt during an unattended run. Left on
 # "Default" the field is omitted (agent default); a concrete pick persists
 # ``permission_mode``, which the fire path turns into the runner's
 # ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
@@ -931,10 +931,9 @@ def test_scheduled_task_edit_prefills_permission_mode(
 ) -> None:
     """The edit dialog prefills the Permission control from the loaded task.
 
-    Seeds a Claude Code task carrying ``permission_mode="bypassPermissions"`` (a
-    launch-only mode, valid for automations), opens its Edit dialog, and asserts
-    ``task-permission-trigger`` renders the stored pick ("Bypass permissions"),
-    not the "Default" sentinel.
+    Seeds a Claude Code task carrying ``permission_mode="acceptEdits"``, opens its
+    Edit dialog, and asserts ``task-permission-trigger`` renders the stored pick
+    ("Accept edits"), not the "Default" sentinel.
     """
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
     _create_task(
@@ -942,7 +941,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
         claude_agent_id,
         "Permission prefill",
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        permission_mode="bypassPermissions",
+        permission_mode="acceptEdits",
     )
 
     _open_automations_page(page, live_server)
@@ -956,7 +955,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("task-permission-control")).to_be_visible()
-    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Accept edits")
 
 
 @pytest.mark.usefixtures("online_host")

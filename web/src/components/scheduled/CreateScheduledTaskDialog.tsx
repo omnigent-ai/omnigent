@@ -109,9 +109,8 @@ interface AutomationTypeDraft {
 }
 
 /**
- * The saved mode to prefill when editing. A task saved before automations
- * stopped accepting approval-skipping modes reverts to the harness default, so
- * the next save sends null instead of a mode the server refuses.
+ * The saved mode to prefill when editing. A stored override may hold a mode
+ * automations refuse; it reverts to the harness default so saving sends null.
  */
 function editablePermissionMode(mode: string | null | undefined): string {
   return mode && !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(mode) ? mode : "";
@@ -661,7 +660,7 @@ export function CreateScheduledTaskDialog({
     ? (editingTask?.reasoningEffort ?? "")
     : pickedEffort;
   const displayedPermission = reusesExistingSession
-    ? (editingTask?.permissionMode ?? "")
+    ? editablePermissionMode(editingTask?.permissionMode)
     : effectivePermission;
   const summarySettings = editingWorkerSettings ? workerHarnessSettings : harnessSettings;
   const summaryModel = editingWorkerSettings ? (workerSettings?.model ?? "") : displayedModel;
@@ -804,9 +803,13 @@ export function CreateScheduledTaskDialog({
         resolveProjectId,
       );
       if (editingTask) {
-        // Continued-session edits omit launch settings; new targets clear stale overrides.
+        // Continued-session edits omit launch settings, except to clear a stored
+        // permission override automations now refuse; new targets clear stale overrides.
         const overrides = reusesExistingSession
-          ? {}
+          ? editablePermissionMode(editingTask.permissionMode) !==
+            (editingTask.permissionMode ?? "")
+            ? { permissionMode: null }
+            : {}
           : {
               ...(supportsModel || !originalTargetSelected
                 ? {

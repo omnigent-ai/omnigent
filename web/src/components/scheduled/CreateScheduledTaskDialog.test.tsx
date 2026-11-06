@@ -2119,6 +2119,46 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     },
   );
 
+  it.each([
+    ["bypassPermissions", { permissionMode: null }],
+    ["acceptEdits", {}],
+  ])(
+    "on a continued-session edit, clears only a refused %s override",
+    async (savedMode, expectedPermission) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              modelOverride: "opus",
+              reasoningEffort: "high",
+              permissionMode: savedMode,
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "Keep going" } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input).toMatchObject({ prompt: "Keep going", ...expectedPermission });
+      // The session binding and the session's own model settings are left alone.
+      expect(input).not.toHaveProperty("sessionId");
+      expect(input).not.toHaveProperty("modelOverride");
+      expect(input).not.toHaveProperty("reasoningEffort");
+      if (!("permissionMode" in expectedPermission)) {
+        expect(input).not.toHaveProperty("permissionMode");
+      }
+    },
+  );
+
   it("allows configuring a continuing task before its first session exists", () => {
     render(
       <CreateScheduledTaskDialog

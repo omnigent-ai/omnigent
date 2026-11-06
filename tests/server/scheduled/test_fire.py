@@ -65,6 +65,7 @@ class _FakeConversation:
     runner_last_seen: int | None = None
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
+    terminal_launch_args: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id
@@ -2856,6 +2857,14 @@ async def test_new_session_mode_never_keeps_the_session() -> None:
             {},
             "permission_mode_not_allowed",
         ),
+        # Codex's full bypass, as spec-derived launch args emit it, with no label.
+        (
+            _continued_session(
+                terminal_launch_args=["--dangerously-bypass-approvals-and-sandbox"]
+            ),
+            {},
+            "permission_mode_not_allowed",
+        ),
         (
             _continued_session(
                 git_branch="main",
@@ -3770,6 +3779,17 @@ async def test_sdk_agent_default_mode_gates_the_fire(spec_mode: str | None, fire
         ({}, ["--permission-mode", "bypassPermissions"], "--permission-mode bypassPermissions"),
         ({}, ["--dangerously-skip-permissions"], "--dangerously-skip-permissions"),
         ({}, ["--yolo"], "--yolo"),
+        (
+            {},
+            ["--dangerously-bypass-approvals-and-sandbox"],
+            "--dangerously-bypass-approvals-and-sandbox",
+        ),
+        (
+            {},
+            ["--sandbox", "read-only", "--ask-for-approval", "never"],
+            "--ask-for-approval never",
+        ),
+        ({}, ["--sandbox", "read-only", "--ask-for-approval", "on-request"], None),
         ({CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY: "1"}, None, "bypass"),
     ],
 )

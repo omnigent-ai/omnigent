@@ -769,7 +769,8 @@ async def test_create_persists_permission_mode(
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 200
     assert got.json()["permission_mode"] == mode
-    if mode == "read-only":
+    if mode == "default":
+        # Patch to a different allowed mode so the read-back proves the update was saved.
         changed = await auth_client.patch(
             f"/v1/scheduled-tasks/{task_id}",
             json={"permission_mode": "read-only"},
@@ -777,6 +778,8 @@ async def test_create_persists_permission_mode(
         )
         assert changed.status_code == 200, changed.text
         assert changed.json()["permission_mode"] == "read-only"
+        reread = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
+        assert reread.json()["permission_mode"] == "read-only"
 
 
 @pytest.mark.parametrize(

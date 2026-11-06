@@ -911,6 +911,10 @@ _UNATTENDED_DISALLOWED_LAUNCH_ARGS: tuple[tuple[str, ...], ...] = (
         if mode in UNATTENDED_DISALLOWED_PERMISSION_MODES and args
     ),
     ("--dangerously-skip-permissions",),
+    # Codex's full bypass, which spec-derived launch args emit for ``yolo``, and
+    # any launch that turns off its approval prompts.
+    ("--dangerously-bypass-approvals-and-sandbox",),
+    ("--ask-for-approval", "never"),
 )
 
 
