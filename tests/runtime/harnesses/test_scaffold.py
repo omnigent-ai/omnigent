@@ -48,6 +48,8 @@ from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
     ElicitationResult,
+    HeartbeatEvent,
+    OutputTextDeltaEvent,
 )
 
 _TEST_HARNESS_NAME = "scaffold_fixture"
@@ -279,6 +281,191 @@ async def test_elicit_emits_resolved_on_every_exit(cancel: bool) -> None:
     assert resolved.reason == ("unanswered" if cancel else None)
     assert ctx._pending_elicitations == {}
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_dispatch_tool_holds_idle_watchdog_while_parked(cancel: bool) -> None:
+    """A parked client-owned tool call counts as a human-approval wait for the idle watchdog.
+
+    Without this, a client-tool call that waits on a person for longer than
+    the idle window (default 1h) would fail the turn via the idle watchdog
+    even though the harness is healthy and simply waiting on an answer —
+    the same reason ``elicit`` already holds the watchdog open. Pins the
+    counter transition directly (0 -> 1 while parked -> 0 once settled),
+    for both a normal answer and a cancelled (interrupted) wait. Passes
+    ``client_owned=True`` explicitly (the default) to document the branch
+    under test — see ``test_dispatch_tool_with_client_owned_false_...``
+    below for the server-executed counterpart.
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_dispatch_tool", queue, asyncio.Event())
+    assert ctx._pending_human_waits == 0
+
+    task = asyncio.create_task(
+        ctx.dispatch_tool("call_test", "lookup", "{}", "test-agent", client_owned=True)
+    )
+    parked_event = await queue.get()
+    assert parked_event.item["status"] == "action_required"
+    # Parked: the idle watchdog's hold hook must now be eligible to fire on
+    # every heartbeat — without this, an unanswered call would eventually
+    # fail the turn even though nothing is actually wedged.
+    assert ctx._pending_human_waits == 1
+
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_tool_calls["call_test"].set_result("the answer")
+        assert await task == "the answer"
+
+    # Settled either way: the hold must release so a later, unrelated
+    # approval wait on the same turn isn't left permanently "held".
+    assert ctx._pending_human_waits == 0
+    assert ctx._pending_tool_calls == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_dispatch_tool_with_client_owned_false_never_holds_idle_watchdog(
+    cancel: bool,
+) -> None:
+    """A server-executed tool call (``client_owned=False``) never counts as a human wait.
+
+    A host-tool-bridge dispatch (e.g. ``sys_os_shell``) is answered by
+    Omnigent's own machinery, not a person — if it wedged, a ``dispatch_tool``
+    that unconditionally incremented ``_pending_human_waits`` would suppress
+    the idle watchdog for a genuinely stuck server-side call. Pins the
+    counter stays at 0 throughout, for both a normal answer and a cancelled
+    (interrupted) wait.
+    """
+    queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext("resp_dispatch_tool_server", queue, asyncio.Event())
+    assert ctx._pending_human_waits == 0
+
+    task = asyncio.create_task(
+        ctx.dispatch_tool("call_host", "sys_os_shell", "{}", "test-agent", client_owned=False)
+    )
+    parked_event = await queue.get()
+    assert parked_event.item["status"] == "action_required"
+    # Never held — nothing here is waiting on a person, so a wedged call
+    # must still be caught by the idle watchdog like any other stalled step.
+    assert ctx._pending_human_waits == 0
+
+    if cancel:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        ctx._pending_tool_calls["call_host"].set_result("shell output")
+        assert await task == "shell output"
+
+    assert ctx._pending_human_waits == 0
+    assert ctx._pending_tool_calls == {}
+
+
+async def test_client_owned_wait_outlives_idle_timeout_without_failing_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A genuine client-owned wait survives past the idle window via heartbeats.
+
+    Mirrors what a live turn does: the heartbeat loop keeps calling
+    ``ctx.emit`` on a fixed cadence, and each heartbeat holds the idle
+    deadline open while ``_pending_human_waits > 0``. The parked call here
+    outlives the (shortened) idle window several times over purely on
+    heartbeats, then answers — the turn must complete normally, proving the
+    exemption actually works end to end through ``_guarded_run_turn``, not
+    just as an isolated counter check.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _ParksOnClientOwnedCall(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            del request
+            result = await ctx.dispatch_tool(
+                "call_human", "ask_human", "{}", "test-agent", client_owned=True
+            )
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta=result))
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10.0)
+
+    app = _ParksOnClientOwnedCall()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_client_owned_long_wait",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+
+    async def _hold_with_heartbeats_then_answer() -> None:
+        # Six heartbeats at 0.15s > the 0.2s idle window's total elapsed
+        # (0.9s) — without the hold, the idle watchdog would have fired
+        # well before the human answers.
+        for _ in range(6):
+            await asyncio.sleep(0.15)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+        future = ctx._pending_tool_calls.get("call_human")
+        assert future is not None and not future.done()
+        future.set_result("the human's answer")
+
+    async with asyncio.timeout(5):
+        await asyncio.gather(
+            app._guarded_run_turn(None, ctx),  # type: ignore[arg-type]
+            _hold_with_heartbeats_then_answer(),
+        )
+    assert ctx._pending_human_waits == 0
+
+
+async def test_server_executed_wait_still_times_out_via_idle_watchdog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A wedged server-executed call (``client_owned=False``) still fails the turn.
+
+    Even with the same heartbeat cadence that holds a genuine client-owned
+    wait open, a server-executed dispatch must not be exempted — nothing is
+    waiting on a person, so a stuck host-tool-bridge call is exactly the
+    wedge the idle watchdog exists to catch.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    class _ParksOnServerExecutedCall(HarnessApp):
+        async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+            del request
+            await ctx.dispatch_tool(
+                "call_host_wedge", "sys_os_shell", "{}", "test-agent", client_owned=False
+            )
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10.0)
+
+    app = _ParksOnServerExecutedCall()
+    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+    ctx = TurnContext(
+        response_id="resp_server_executed_wedge",
+        event_queue=event_queue,
+        cancelled=asyncio.Event(),
+    )
+
+    async def _emit_heartbeats_forever() -> None:
+        # Same cadence as the client-owned test — proves these heartbeats do
+        # NOT hold the deadline open when nothing is counted as a human wait.
+        while True:
+            await asyncio.sleep(0.15)
+            ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+
+    heartbeat_task = asyncio.create_task(_emit_heartbeats_forever())
+    try:
+        async with asyncio.timeout(5):
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    finally:
+        heartbeat_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat_task
 
 
 @pytest.mark.asyncio

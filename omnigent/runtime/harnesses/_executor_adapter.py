@@ -210,6 +210,13 @@ class ExecutorAdapter(HarnessApp):
         # current turn's ctx, not turn 1's dead ctx.
         self._current_ctx: TurnContext | None = None
         self._current_agent: str | None = None
+        # Bare names of THIS turn's client-declared tools (``request.tools`` —
+        # the caller-supplied, caller-executed set; see
+        # ``CreateResponseRequest.tools``). The authoritative source for the
+        # idle watchdog's client-owned classification: anything NOT in this
+        # set is dispatched/answered by Omnigent's own machinery (a host
+        # tool, an MCP-bridged tool, a spec-local tool), never by a person.
+        self._current_client_tool_names: frozenset[str] = frozenset()
         # FIFO queue of inner-SDK tool-use ids from ToolCallRequest events. Drained by
         # _stable_tool_executor so each dispatch reuses the same call_id as the inline
         # observed event, letting BlockStream dedupe the two renders into one.
@@ -301,6 +308,36 @@ class ExecutorAdapter(HarnessApp):
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
         self._current_ctx = ctx
         self._current_agent = request.model
+        # Authoritative client-tool-name set for this turn, read ONLY from
+        # the sender's own verified ownership record
+        # (``request.client_side_tool_names`` — the runner computes this as
+        # client names minus any name a spec tool already claims; see
+        # ``omnigent.runner.app._compute_client_side_tool_names``). A
+        # request's own ``tools`` list mixes spec and client schemas
+        # indistinguishably once the runner has merged them, so it is NEVER
+        # used as a fallback source here — doing so would treat a spec/
+        # server tool as client-owned whenever it shares the request with a
+        # real client tool, silently re-opening the idle watchdog and the
+        # reconnect snapshot to exactly the misclassification this field
+        # exists to close.
+        #
+        # Fails CLOSED when the field is absent or not a list (an older
+        # runner that doesn't send it yet, or a malformed/synthetic
+        # caller): nothing is treated as client-owned rather than guessing
+        # from ``tools``. The practical cost is a genuine client wait going
+        # unrecognized until the sender is updated to send the field (it
+        # still parks and eventually resolves normally — it only loses the
+        # idle-watchdog hold and reconnect-snapshot visibility); the
+        # alternative (failing open) would wrongly exempt a server tool
+        # from the watchdog, which is strictly worse. A real client-owned
+        # turn always gets an explicit list from this runner, including
+        # ``[]`` when it is genuinely empty — absence is reserved for a
+        # sender that doesn't compute the set at all.
+        self._current_client_tool_names = (
+            frozenset(name for name in request.client_side_tool_names if isinstance(name, str))
+            if isinstance(request.client_side_tool_names, list)
+            else frozenset()
+        )
         # Clear per-turn state so stale entries from an errored prior turn don't bleed through.
         self._pending_mcp_call_ids.clear()
         # Reset orphan counter: measures only post-bind orphans (no intervening clean turn).
@@ -597,6 +634,7 @@ class ExecutorAdapter(HarnessApp):
             if self._current_ctx is ctx:
                 self._current_ctx = None
                 self._current_agent = None
+                self._current_client_tool_names = frozenset()
             # Detach before background cleanup so a continuation cannot reuse this executor.
             if not clean_exit:
                 abandoned_executor = self._executor
@@ -703,6 +741,7 @@ class ExecutorAdapter(HarnessApp):
                 self._executor = None
                 self._current_ctx = None
                 self._current_agent = None
+                self._current_client_tool_names = frozenset()
                 # Do NOT touch _in_flight or _active_turn_ctx — those are scaffold-owned and
                 # back pending tool futures; clearing them would strand or hang dispatches.
                 self._orphan_callback_count = 0
@@ -850,12 +889,26 @@ class ExecutorAdapter(HarnessApp):
 
         dispatch_call_id = correlated_call_id or f"call_{uuid.uuid4().hex[:12]}"
         self._dispatched_call_ids.add(dispatch_call_id)
+        # Client-owned iff this turn's request actually declared the tool
+        # (``_current_client_tool_names``, straight from ``request.tools``) —
+        # the same kind of authoritative per-run ownership record the runner
+        # uses (``TurnDispatch.client_side_tool_names`` in
+        # ``omnigent/runner/app.py``), not a name-prefix heuristic. Every
+        # other tool (host-tool-bridge, MCP-bridged, spec-local, runner
+        # builtin) is executed by Omnigent's own machinery, never by a
+        # person, so a wedge there must still trip the idle watchdog.
+        # (The runner's own local-dispatch marker,
+        # ``omnigent_runner_dispatched``, lives one process over for the
+        # native-harness/subprocess model and never reaches this in-process
+        # SDK-executor path.)
+        client_owned = _strip_mcp_tool_prefix(tool_name) in self._current_client_tool_names
         return await _bridge_one_dispatch(
             ctx,
             agent,
             tool_name,
             args,
             call_id=dispatch_call_id,
+            client_owned=client_owned,
         )
 
     async def _stable_elicitation_handler(
@@ -1494,10 +1547,16 @@ async def _bridge_one_dispatch(
     args: dict[str, Any],
     *,
     call_id: str | None = None,
+    client_owned: bool = True,
 ) -> dict[str, Any]:
     """Round-trip one tool call through ``ctx.dispatch_tool``; returns an MCP-compatible dict.
 
     When ``call_id`` matches the inline observed event's id, BlockStream dedupes into one render.
+
+    :param client_owned: Forwarded to ``ctx.dispatch_tool`` — ``False`` for a
+        server-executed call (e.g. a host-tool-bridge dispatch), so a wedge
+        there still trips the idle watchdog instead of being held open as if
+        a person were answering it.
     """
     import json
 
@@ -1509,6 +1568,7 @@ async def _bridge_one_dispatch(
             name=tool_name,
             arguments=json.dumps(args),
             agent=agent,
+            client_owned=client_owned,
         )
     except Exception as exc:
         _logger.exception("dispatch_tool failed for %s", tool_name)
