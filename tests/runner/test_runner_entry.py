@@ -4066,6 +4066,43 @@ def test_runner_global_cleanup_ownership_is_explicit(
 
 
 @pytest.mark.asyncio
+async def test_runner_hides_scheduled_task_tools_only_when_server_turns_automations_off(tmp_path):
+    from omnigent.automations_availability import AUTOMATIONS_HEADER
+    from omnigent.tools.manager import ToolManager
+    from tests.server.helpers import build_agent_bundle
+
+    bundle = build_agent_bundle("automations-agent")
+    # "1" is on; no header is an older server, which keeps the tools.
+    gate_headers = [{AUTOMATIONS_HEADER: "0"}, {AUTOMATIONS_HEADER: "1"}, {}]
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            content=bundle,
+            headers={
+                "X-Agent-Version": "1",
+                "X-Agent-Session-Scoped": "true",
+                **gate_headers.pop(0),
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server.test"
+    ) as client:
+        results = [
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_automations", session_id="session"
+            )
+            for _ in range(3)
+        ]
+
+    def advertised(spec):
+        names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
+        return "sys_scheduled_task_create" in names and "sys_scheduled_task_list" in names
+
+    assert [advertised(result.spec) for result in results] == [False, True, True]
+
+
 async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path):
     import json
 
