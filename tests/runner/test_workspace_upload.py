@@ -2860,7 +2860,7 @@ async def test_ipc_executor_shutdown(
             )
             assert await asyncio.to_thread(entered.wait, 5)
             stopping = asyncio.create_task(manager.stop())
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.02)  # custom-lint: disable=sleep-then-assert -- stop() blocks
             assert not stopping.done()
             release.set()
             assert (await request).status_code == 200
