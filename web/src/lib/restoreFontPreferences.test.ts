@@ -48,8 +48,8 @@ describe("restoreFontPreferences", () => {
 
   it("applies defaults when nothing is stored (no throw)", () => {
     expect(() => restoreFontPreferences()).not.toThrow();
-    // Default size 13px; families unset → no overrides.
-    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("13px");
+    // Default size 14px; families unset → no overrides.
+    expect(document.documentElement.style.getPropertyValue("--desktop-ui-font-size")).toBe("14px");
     expect(document.documentElement.style.getPropertyValue("--ui-font-family")).toBe("");
     expect(document.documentElement.style.getPropertyValue("--ui-mono-font-family")).toBe("");
   });
