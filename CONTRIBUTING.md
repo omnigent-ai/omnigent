@@ -490,7 +490,9 @@ command. Submit pending review comments before posting the command.
 `/address` does not authorize merging. These PRs retain the `otto-address` label
 and require a maintainer's approval of the current commit, including after
 subsequent bot pushes. Contributors cannot grant that approval through the
-feedback allowlist.
+feedback allowlist. The label's documented scope is this Resolve workflow;
+other automation policies, including Dependabot's existing exemption, remain
+unchanged.
 
 ### Database migration reviews
 

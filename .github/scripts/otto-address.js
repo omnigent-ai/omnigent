@@ -6,7 +6,7 @@ module.exports = async ({ github, context, core, reviewers = "" }) => {
   const comment_id = context.payload.comment.id;
   const { data: comment } = await github.rest.issues.getComment({ owner, repo, comment_id });
   if (
-    comment.body.trim() !== "/address" ||
+    (comment.body ?? "").trim() !== "/address" ||
     comment.user?.type !== "User" ||
     comment.issue_url !== `https://api.github.com/repos/${owner}/${repo}/issues/${issue_number}`
   ) return;

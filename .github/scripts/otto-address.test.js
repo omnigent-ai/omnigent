@@ -67,6 +67,7 @@ for (const login of ["second-reader", "third-reader"]) {
 
 for (const comment of [
   { body: "/address anything" }, { body: "quoted /address" },
+  { body: null },
   { user: { login: "reader", type: "Bot" } },
   { user: null },
   { issue_url: "https://api.github.com/repos/omnigent-ai/omnigent/issues/8" },
