@@ -496,10 +496,11 @@ async def test_requested_work_on_a_child_releases_the_ancestors_that_recover_it(
 
 
 @pytest.mark.asyncio
-async def test_requested_work_releases_a_bounded_ancestry(
-    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("hosted_above_budget", [False, True], ids=["hostless", "hosted"])
+async def test_requested_work_releases_a_deep_ancestry_in_bounded_reads(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch, hosted_above_budget: bool
 ) -> None:
-    """Work on a deeply nested child reads at most 16 rows of its lineage."""
+    """Past 16 row reads, one spawn-tree read finishes a deep child's lineage."""
     store, parent, _, _, _, _ = recovery_tree
     lineage = [parent]
     for _ in range(20):
@@ -511,22 +512,31 @@ async def test_requested_work_releases_a_bounded_ancestry(
                 runner_id=parent.runner_id,
             )
         )
+    if hosted_above_budget:
+        store.set_host_id(lineage[2].id, "a" * 32, workspace="/tmp")
     for row in lineage:
         await hold_reconnect_recovery(row.id, store)
-    read = store.get_conversation
+    read, read_tree = store.get_conversation, store.list_spawn_tree
     reads: list[str] = []
+    tree_reads: list[tuple[str, int]] = []
 
     def counted_read(session_id: str) -> Conversation | None:
         reads.append(session_id)
         return read(session_id)
 
+    def counted_tree_read(root_conversation_id: str, *, limit: int) -> Any:
+        tree_reads.append((root_conversation_id, limit))
+        return read_tree(root_conversation_id, limit=limit)
+
     monkeypatch.setattr(store, "get_conversation", counted_read)
+    monkeypatch.setattr(store, "list_spawn_tree", counted_tree_read)
     await release_reconnect_recovery(lineage[-1].id, store)
     monkeypatch.setattr(store, "get_conversation", read)
 
     assert reads == [row.id for row in reversed(lineage[-16:])]
+    assert tree_reads == [(parent.id, 2000)]
     held = [RECONNECT_RECOVERY_HELD_LABEL_KEY in read(row.id).labels for row in lineage]
-    assert held == [True] * 5 + [False] * 16
+    assert held == [hosted_above_budget] * 2 + [False] * 19
 
 
 @pytest.mark.asyncio

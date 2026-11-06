@@ -538,25 +538,6 @@ describe("FilesPanel on an asleep sandbox", () => {
     },
   );
 
-  it("keeps starting the sandbox while a cached tab shows and it still sleeps", async () => {
-    useAsleepMock.mockReturnValue(true);
-    const { rerender } = renderPanel({
-      conversationId: "conv_asleep",
-      files: [],
-      listsLoaded: false,
-    });
-    await act(async () => {});
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    useChangedFilesMock.mockReturnValue(changedFilesResult());
-    rerender(panelAt("conv_asleep", { flatView: true }));
-    expect(screen.getByText("No workspace changes yet")).toBeInTheDocument();
-
-    rerender(panelAt("conv_asleep"));
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-  });
-
   it("starts the sandbox when the mobile Files drawer opens", async () => {
     useAsleepMock.mockReturnValue(true);
     useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
@@ -647,7 +628,7 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
   });
 
-  it("loads the files once the sandbox is back, and only offers to start it once it sleeps again", async () => {
+  it("keeps starting the sandbox past a cached tab, loads the files once it is back, and only offers to start it once it sleeps again", async () => {
     useAsleepMock.mockReturnValue(true);
     const { rerender } = renderPanel({
       conversationId: "conv_asleep",
@@ -655,6 +636,13 @@ describe("FilesPanel on an asleep sandbox", () => {
       listsLoaded: false,
     });
     await act(async () => {});
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+
+    useChangedFilesMock.mockReturnValue(changedFilesResult());
+    rerender(panelAt("conv_asleep", { flatView: true }));
+    expect(screen.getByText("No workspace changes yet")).toBeInTheDocument();
+
+    rerender(panelAt("conv_asleep"));
     expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
     expect(wakeSessionMock).toHaveBeenCalledTimes(1);
 

@@ -29,6 +29,8 @@ _logger = logging.getLogger(__name__)
 RECOVERY_STORE_CONCURRENCY = 8
 # A release reads the session and its ancestors within the routing-host lookup budget.
 _RELEASE_MAX_READS = 16
+# A deeper lineage is finished from one spawn-tree read of at most this many rows.
+_RELEASE_SPAWN_TREE_CAP = 2000
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
@@ -82,10 +84,19 @@ async def release_reconnect_recovery(session_id: str, store: ConversationStore) 
     seen: set[str] = set()
     child: Conversation | None = None
     next_id: str | None = session_id
-    for _ in range(_RELEASE_MAX_READS):
-        if next_id is None or next_id in seen:
-            return
-        conv = await asyncio.to_thread(store.get_conversation, next_id)
+    spawn_tree: dict[str, Conversation] | None = None
+    while next_id is not None and next_id not in seen:
+        if child is None or len(seen) < _RELEASE_MAX_READS:
+            conv = await asyncio.to_thread(store.get_conversation, next_id)
+        else:
+            if spawn_tree is None:
+                page = await asyncio.to_thread(
+                    store.list_spawn_tree,
+                    child.root_conversation_id,
+                    limit=_RELEASE_SPAWN_TREE_CAP,
+                )
+                spawn_tree = {row.id: row for row in page.data}
+            conv = spawn_tree.get(next_id)
         if conv is None or (child is not None and conv.runner_id != child.runner_id):
             return
         wake_running = conv.id in _wake_only_retries

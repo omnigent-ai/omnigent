@@ -745,6 +745,7 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     assert not reconnect_recovery_deferred(store.get_conversation(interrupted.id))
 
 
+@pytest.mark.parametrize("depth", [1, 20], ids=["child", "deep-child"])
 @pytest.mark.parametrize("during_wake", [False, True], ids=["after-wake", "during-wake"])
 async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wake(
     app: FastAPI,
@@ -752,8 +753,9 @@ async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wa
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     during_wake: bool,
+    depth: int,
 ) -> None:
-    """Work started on a child during or after its parent's wake recovers when the runner drops."""
+    """Work on a descendant during or after its root's wake recovers when the runner drops."""
     from omnigent.server import child_session_recovery
     from omnigent.server.routes._sessions import orchestration
     from omnigent.server.routes.sessions import routes_events
@@ -763,9 +765,18 @@ async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wa
     for module in (routes_events, orchestration):
         monkeypatch.setattr(module, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
     parent = _create_session(app, agent.id)
-    child = _create_session(
-        app, agent.id, interrupted=False, kind="sub_agent", parent_conversation_id=parent.id
-    )
+    lineage = [parent]
+    for _ in range(depth):
+        lineage.append(
+            _create_session(
+                app,
+                agent.id,
+                interrupted=False,
+                kind="sub_agent",
+                parent_conversation_id=lineage[-1].id,
+            )
+        )
+    child = lineage[-1]
     holding = asyncio.Event()
     work_requested = asyncio.Event()
 
@@ -822,7 +833,7 @@ async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wa
 
     async with _recover(app, monkeypatch, respond) as (_relays, finished):
         await asyncio.wait_for(finished.wait(), budget(5))
-        await poll_until_async(lambda: len(inits) == 2, timeout_s=budget(5))
+        await poll_until_async(lambda: len(inits) == depth + 1, timeout_s=budget(5))
 
     # The child's input ended the wake's hold, so its tree recovers as usual.
-    assert inits == [(parent.id, False), (child.id, True)]
+    assert inits == [(row.id, row is child) for row in lineage]
