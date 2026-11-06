@@ -195,7 +195,7 @@ export interface NativeViewModeParams {
 interface ElectronDesktopApi extends NativeShellApi {
   kind: "electron";
   /** The runner picked during onboarding for this server, returned once. */
-  takeOnboardingRunner?: () => Promise<"local" | "remote" | null>;
+  takeOnboardingRunner?: () => Promise<OnboardingRunner | null>;
   /**
    * Desktop auto-update bridge — CONFIG ONLY on current shells. Update
    * notifications are shell-owned (native corner overlay + Server menu); this
@@ -1186,16 +1186,41 @@ export async function getHostIdentity(): Promise<HostIdentity | null> {
   }
 }
 
-/**
- * The runner ("local" | "remote") picked during desktop onboarding for this
- * server, handed over once; null otherwise or outside Electron.
- */
-export async function takeOnboardingRunner(): Promise<"local" | "remote" | null> {
+/** Where desktop onboarding connected a runner: this machine, or a remote host like Arca. */
+export type OnboardingRunner = "local" | "remote";
+
+/** Features that each take the onboarding runner once per page load. */
+export type OnboardingRunnerConsumer = "hostPicker" | "importReview";
+
+// The shell clears its value on the first IPC read, so every consumer shares one.
+let onboardingRunnerRead: Promise<OnboardingRunner | null> | null = null;
+const onboardingRunnerTakenBy = new Set<OnboardingRunnerConsumer>();
+
+async function readOnboardingRunner(): Promise<OnboardingRunner | null> {
   try {
     return (await electronApi()?.takeOnboardingRunner?.()) ?? null;
   } catch {
     return null;
   }
+}
+
+/**
+ * The runner picked during desktop onboarding for this server, handed to
+ * each *consumer* once; null otherwise or outside Electron.
+ */
+export function takeOnboardingRunner(
+  consumer: OnboardingRunnerConsumer,
+): Promise<OnboardingRunner | null> {
+  if (onboardingRunnerTakenBy.has(consumer)) return Promise.resolve(null);
+  onboardingRunnerTakenBy.add(consumer);
+  onboardingRunnerRead ??= readOnboardingRunner();
+  return onboardingRunnerRead;
+}
+
+/** Test-only: forget this page load's onboarding runner read. */
+export function resetOnboardingRunnerForTests(): void {
+  onboardingRunnerRead = null;
+  onboardingRunnerTakenBy.clear();
 }
 
 /**

@@ -18,6 +18,7 @@ import {
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
+  resetOnboardingRunnerForTests,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
@@ -27,6 +28,7 @@ import {
   supportsArcaConnect,
   supportsBrowser,
   switchServer,
+  takeOnboardingRunner,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -214,6 +216,59 @@ describe("supportsArcaConnect", () => {
       window as unknown as { omnigentDesktop: Record<string, unknown> }
     ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
     expect(supportsArcaConnect()).toBe(true);
+  });
+});
+
+describe("takeOnboardingRunner", () => {
+  const shellTake = vi.fn<() => Promise<"local" | "remote" | null>>();
+
+  beforeEach(() => {
+    resetOnboardingRunnerForTests();
+    // Like the shell, answer once and then report nothing.
+    shellTake.mockReset().mockResolvedValueOnce("remote").mockResolvedValue(null);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      takeOnboardingRunner: () => shellTake(),
+    };
+  });
+
+  it("shares one shell read between consumers", async () => {
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("shares a read still in flight", async () => {
+    let answer: (runner: "local" | "remote" | null) => void = () => {};
+    shellTake.mockReset().mockReturnValueOnce(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const picker = takeOnboardingRunner("hostPicker");
+    const review = takeOnboardingRunner("importReview");
+    answer("local");
+    expect(await Promise.all([picker, review])).toEqual(["local", "local"]);
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("hands each consumer the runner only once per page load", async () => {
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBeNull();
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
+
+  it("resolves null when the shell read fails or there's no shell", async () => {
+    shellTake.mockReset().mockRejectedValue(new Error("ipc down"));
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    // An older shell without the handoff.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    setElectron(false);
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
   });
 });
 
