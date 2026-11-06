@@ -59,6 +59,7 @@ import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   acknowledgeLocalElicitationResolution,
@@ -1957,7 +1958,8 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 const MAX_TRANSIENT_404_RETRIES = 10;
 // An auth layer answering the stream with its login page means the sign-in
 // expired, which no retry can renew. A maintenance page during a restart looks
-// the same, so give up only once an unbroken run of those answers outlasts a restart.
+// the same, so give up only once those answers outlast a restart with no
+// successful stream open in between.
 const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
 
 /**
@@ -5054,8 +5056,18 @@ async function refreshFailedInputs(id: string): Promise<void> {
 /** Retries of a snapshot load that failed in a way a retry can fix. */
 const SNAPSHOT_LOAD_RETRIES = 2;
 
+/**
+ * A large first page on a slow phone network can take longer than one read
+ * deadline. Each retry waits longer (15, 30, then 60 s), so a slow load still
+ * finishes while a hung one stays bounded.
+ */
+const snapshotLoadDeadlineMs = (attempt: number): number => SESSION_READ_TIMEOUT_MS * 2 ** attempt;
+
 /** Run a session read, rejecting with a retryable timeout if the server never answers. */
-async function withReadTimeout<T>(read: (signal: AbortSignal) => Promise<T>): Promise<T> {
+async function withReadTimeout<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = SESSION_READ_TIMEOUT_MS,
+): Promise<T> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timedOut = new Promise<never>((_resolve, reject) => {
@@ -5063,7 +5075,7 @@ async function withReadTimeout<T>(read: (signal: AbortSignal) => Promise<T>): Pr
       const error = new DOMException("session read timed out", "TimeoutError");
       controller.abort(error);
       reject(error);
-    }, SESSION_READ_TIMEOUT_MS);
+    }, timeoutMs);
   });
   try {
     // The race also bounds a read that is stuck before it reaches the signal.
@@ -5078,7 +5090,10 @@ async function withReadTimeout<T>(read: (signal: AbortSignal) => Promise<T>): Pr
  * 5xx, or a dropped connection while the server restarts) while the
  * conversation is still open. Other failures, such as a 404, throw at once.
  */
-async function withSnapshotRetries<T>(id: string, load: () => Promise<T>): Promise<T> {
+async function withSnapshotRetries<T>(
+  id: string,
+  load: (attempt: number) => Promise<T>,
+): Promise<T> {
   const entry = conversationRegistry.peek(id);
   const stillOpen = () =>
     entry !== undefined && conversationRegistry.peek(id) === entry && !entry.disposed;
@@ -5086,7 +5101,7 @@ async function withSnapshotRetries<T>(id: string, load: () => Promise<T>): Promi
   for (let failures = 0; ; failures += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      return await load();
+      return await load(failures);
     } catch (error) {
       if (failures >= SNAPSHOT_LOAD_RETRIES || !isRetryableRequestError(error) || !stillOpen()) {
         throw error;
@@ -5229,7 +5244,7 @@ async function bindStream(
     const client = queryClient;
     // Each request retries on its own, so a failed one doesn't repeat the other.
     const [session, page] = await Promise.all([
-      withSnapshotRetries(id, () =>
+      withSnapshotRetries(id, (attempt) =>
         withReadTimeout((signal) => {
           // A timed-out attempt may have joined another caller's request; drop
           // that request so the retry reads afresh instead of joining it again.
@@ -5244,11 +5259,12 @@ async function bindStream(
             staleTime: 0,
             retry: false,
           });
-        }),
+        }, snapshotLoadDeadlineMs(attempt)),
       ),
-      withSnapshotRetries(id, () =>
-        withReadTimeout((signal) =>
-          fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+      withSnapshotRetries(id, (attempt) =>
+        withReadTimeout(
+          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+          snapshotLoadDeadlineMs(attempt),
         ),
       ),
     ]);
@@ -6594,7 +6610,7 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // When the current unbroken run of login-page answers began.
+  // When login-page answers began, since the last successful stream open.
   let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
@@ -6659,7 +6675,6 @@ export async function startStreamPump(
           }
           if (isConversationDisposed(id)) break;
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
-          nonSseAnswersSince = null;
           failedOpens += 1;
           continue;
         }
@@ -6669,7 +6684,6 @@ export async function startStreamPump(
           // Release the unconsumed error-response body so the underlying fetch
           // connection is freed promptly rather than lingering across retries.
           void streamRes.body?.cancel().catch(() => {});
-          nonSseAnswersSince = null;
           // 401/403 won't fix themselves by retrying — give up and settle the
           // local send lifecycle so the user isn't left on a silent spinner.
           // `sessionStatus` is NOT touched: losing our stream says nothing
@@ -6678,7 +6692,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            failUnavailableStream(set);
+            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
             set({ status: "idle" });
             break;
           }
@@ -6718,7 +6732,7 @@ export async function startStreamPump(
             console.warn(
               `Session ${id}: stream open returned '${contentType}' for ${NON_SSE_STREAM_GIVE_UP_MS} ms, giving up`,
             );
-            failUnavailableStream(set);
+            failUnavailableStream(set, null);
             set({ status: "idle" });
             break;
           }
@@ -9775,31 +9789,42 @@ function finalizeActive(
 
 const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
 
-/** Fail a live turn and surface one notice that the connection is gone. */
-function failUnavailableStream(set: Setter): void {
-  set((s) => ({
-    // A settled turn keeps its outcome; a live one fails without its own banner, so the
-    // card is the only notice.
-    ...(s.activeResponse?.state === "streaming"
-      ? {
-          activeResponse: {
-            ...s.activeResponse,
-            state: "failed" as const,
-            error: null,
-            completedAt: Date.now(),
-          },
-        }
-      : {}),
-    blocks: [
-      ...s.blocks.filter(
-        (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
-      ),
-      {
-        ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
-        title: "The live connection to the assistant is unavailable",
-      },
-    ],
-  }));
+/**
+ * Fail the live turn once its stream is gone for good. A status the bubble can
+ * show (`error`) gets the standalone card only when no bubble can show it; a
+ * null `error` (a login-page give-up) always gets the card. A settled turn keeps
+ * its outcome.
+ */
+function failUnavailableStream(set: Setter, error: string | null): void {
+  set((s) => {
+    const live = s.activeResponse?.state === "streaming" ? s.activeResponse : null;
+    const failed =
+      live === null ? null : { ...live, state: "failed" as const, error, completedAt: Date.now() };
+    const blocks = s.blocks.filter(
+      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+    );
+    const hasVisibleFailure =
+      failed !== null &&
+      error !== null &&
+      buildBubbles(blocks, failed).some(
+        (bubble) => bubble.kind === "assistant" && bubble.responseId === failed.responseId,
+      );
+    if (hasVisibleFailure) {
+      return blocks.length === s.blocks.length
+        ? { activeResponse: failed }
+        : { activeResponse: failed, blocks };
+    }
+    return {
+      ...(failed !== null ? { activeResponse: failed } : {}),
+      blocks: [
+        ...blocks,
+        {
+          ...makeClientErrorBlock("Reload the page to reconnect.", STREAM_UNAVAILABLE_CODE),
+          title: "The live connection to the assistant is unavailable",
+        },
+      ],
+    };
+  });
 }
 
 /**

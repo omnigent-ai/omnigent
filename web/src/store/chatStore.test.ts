@@ -3250,6 +3250,34 @@ describe("chatStore — send (first-send ordering)", () => {
       await switched;
     });
 
+    it("lets a first load that is slow but progressing succeed on a longer retry", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_slow_load", []);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (
+          path === "/v1/sessions/conv_slow_load" ||
+          path === "/v1/sessions/conv_slow_load/items"
+        ) {
+          // Each answer arrives 20 s in, past the first read deadline but within the retry's.
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(defaultFetchHandler(input, init)), 20_000);
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const switched = useChatStore.getState().switchTo("conv_slow_load");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await switched;
+
+      expect(conversationRegistry.peek("conv_slow_load")!.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+    });
+
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
       const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
@@ -14874,69 +14902,91 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     expect(state.activeResponse).toMatchObject({
       responseId: "resp_401_blank",
       state: "failed",
-      error: null,
+      error: "stream unavailable (401)",
     });
     const errors = state.blocks.filter((block) => block.type === "error");
     expect(errors).toHaveLength(1);
     expect(errors[0]).toMatchObject({ code: "stream_unavailable" });
   });
 
-  const isStreamOpen = (url: string) => /\/v1\/sessions\/[^/]+\/stream$/.test(url);
-  it.each([
-    [
-      "a 401",
-      6_000,
-      (url: string) => (isStreamOpen(url) ? mockResponse({}, { ok: false, status: 401 }) : null),
-    ],
-    // An expired sign-in answers every API read with the login page, not just the stream.
-    [
-      "persistent login pages",
-      70_000,
-      (url: string) => (url.includes("/v1/") ? loginPageResponse() : null),
-    ],
-  ])(
-    "fails a streaming reply with one connection card after %s",
-    async (_answer, giveUpAfterMs, answerRequest) => {
-      const response = assistantMessage("resp_unavailable_visible", "Partial reply");
-      seedSession("conv_unavailable_visible", [response]);
-      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        return answerRequest(url) ?? defaultFetchHandler(input, init);
-      });
-      const controller = new AbortController();
-      useChatStore.setState({
-        conversationId: "conv_unavailable_visible",
-        abortController: controller,
-        sessionStatus: "running",
-        blocks: itemsToBlocks([response]),
-        activeResponse: { responseId: "resp_unavailable_visible", state: "streaming", error: null },
-      });
+  it("renders a 401 failure on an existing assistant bubble without a standalone error", async () => {
+    const response = assistantMessage("resp_401_visible", "Partial reply");
+    seedSession("conv_401_visible", [response]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return mockResponse({}, { ok: false, status: 401 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_401_visible",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: itemsToBlocks([response]),
+      activeResponse: { responseId: "resp_401_visible", state: "streaming", error: null },
+    });
 
-      const loop = startStreamPump("conv_unavailable_visible", controller, setState, getState);
-      await vi.advanceTimersByTimeAsync(giveUpAfterMs);
-      await loop;
+    const loop = startStreamPump("conv_401_visible", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
 
-      const state = useChatStore.getState();
-      expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toHaveLength(0);
+    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+      expect.arrayContaining([
         expect.objectContaining({
-          code: "stream_unavailable",
-          title: "The live connection to the assistant is unavailable",
-          message: "Reload the page to reconnect.",
+          kind: "assistant",
+          responseId: "resp_401_visible",
+          lifecycle: "failed",
+          error: "stream unavailable (401)",
         }),
-      ]);
-      // The bubble carries no banner of its own, so the card is the only notice.
-      expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            kind: "assistant",
-            responseId: "resp_unavailable_visible",
-            lifecycle: "failed",
-            error: null,
-          }),
-        ]),
-      );
-    },
-  );
+      ]),
+    );
+  });
+
+  // An expired sign-in answers every API read with the login page, not just the stream.
+  it("fails a streaming reply with one connection card after persistent login pages", async () => {
+    const response = assistantMessage("resp_unavailable_visible", "Partial reply");
+    seedSession("conv_unavailable_visible", [response]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      return url.includes("/v1/") ? loginPageResponse() : defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_unavailable_visible",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: itemsToBlocks([response]),
+      activeResponse: { responseId: "resp_unavailable_visible", state: "streaming", error: null },
+    });
+
+    const loop = startStreamPump("conv_unavailable_visible", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(70_000);
+    await loop;
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+      expect.objectContaining({
+        code: "stream_unavailable",
+        title: "The live connection to the assistant is unavailable",
+        message: "Reload the page to reconnect.",
+      }),
+    ]);
+    // The bubble carries no banner of its own, so the card is the only notice.
+    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "assistant",
+          responseId: "resp_unavailable_visible",
+          lifecycle: "failed",
+          error: null,
+        }),
+      ]),
+    );
+  });
 
   it("gives up after exhausting the transient-404 retry cap", async () => {
     seedSession("conv_404", []);
@@ -16695,20 +16745,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     },
   );
 
-  it.each([
-    ["a successful stream open", "open"],
-    ["a 503", "503"],
-    ["a failed connection", "network"],
-  ] as const)("restarts the login-page window after %s", async (_label, interruption) => {
+  it("restarts the login-page window after a successful stream open", async () => {
     seedSession("conv_html_reset", []);
-    let answer: "login" | typeof interruption = "login";
+    let answer: "login" | "open" = "login";
     const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
         if (answer === "login") return loginPageResponse();
-        if (answer === "503") return mockResponse(null, { ok: false, status: 503 });
-        if (answer === "network") return Promise.reject(new TypeError("Failed to fetch"));
         const sink = pushableStream();
         sinks.push(sink);
         return mockResponse(null, { bodyStream: sink.stream });
@@ -16723,16 +16767,47 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     const loop = startStreamPump("conv_html_reset", controller, setState, getState);
     await vi.advanceTimersByTimeAsync(50_000);
-    answer = interruption;
-    const opensBeforeInterruption = streamOpens();
+    answer = "open";
+    const opensBeforeOpen = streamOpens();
     await vi.advanceTimersByTimeAsync(6_000);
-    expect(streamOpens()).toBeGreaterThan(opensBeforeInterruption);
+    expect(streamOpens()).toBeGreaterThan(opensBeforeOpen);
 
     answer = "login";
     sinks[0]?.close();
     await vi.advanceTimersByTimeAsync(50_000);
     expect(errorBlocks()).toEqual([]);
     await vi.advanceTimersByTimeAsync(20_000);
+    expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
+
+    controller.abort();
+    await loop;
+  });
+
+  // Only a successful open ends the window: a 503 or a failed connection between
+  // login pages must not restart it, or a phone alternating with no network gives up never.
+  it("keeps the login-page window across failed connections and 503s", async () => {
+    seedSession("conv_html_mixed", []);
+    const answers = ["login", "503", "network"] as const;
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const answer = answers[opens % answers.length];
+        opens += 1;
+        if (answer === "login") return loginPageResponse();
+        if (answer === "503") return mockResponse(null, { ok: false, status: 503 });
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_html_mixed", abortController: controller });
+    const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+    const loop = startStreamPump("conv_html_mixed", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(errorBlocks()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(100_000);
     expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
 
     controller.abort();
