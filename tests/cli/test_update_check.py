@@ -1577,7 +1577,7 @@ def test_build_upgrade_suggestion_uv_target_version() -> None:
         _build_upgrade_suggestion(
             _make_info("uv", extras=("all",)), target_version="0.2.0"
         ).command
-        == f"uv tool install --reinstall{_UV_PY} omnigent==0.2.0[all]"
+        == f"uv tool install --reinstall{_UV_PY} omnigent[all]==0.2.0"
     )
 
 

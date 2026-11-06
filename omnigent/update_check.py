@@ -1486,13 +1486,13 @@ def _package_spec(*, version: str | None = None, extras: Collection[str] = ()) -
 
     :param version: Optional pinned version, e.g. ``"0.2.0"``.
     :param extras: Optional extras to append.
-    :returns: ``"omnigent"``, ``"omnigent[all]"``, ``"omnigent==0.2.0[all]"``,
+    :returns: ``"omnigent"``, ``"omnigent[all]"``, ``"omnigent[all]==0.2.0"``,
         etc., depending on which arguments were provided.
     """
-    spec = _DIST_NAME
+    # PEP 508 requires extras before the version specifier.
+    spec = _DIST_NAME + _extras_str(extras)
     if version:
         spec += f"=={version}"
-    spec += _extras_str(extras)
     return spec
 
 
