@@ -16,6 +16,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import java.io.ByteArrayInputStream
 import java.net.InetSocketAddress
 import java.security.MessageDigest
 import java.util.Base64
@@ -26,6 +27,77 @@ import java.util.concurrent.TimeUnit
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class OidcLoginManagerTest {
+    @Test
+    fun `ticket errors inspect only a capped 400 body`() {
+        var streamRequests = 0
+        assertFalse(
+            isUpgradeRequiredErrorResponse(502) {
+                streamRequests++
+                ByteArrayInputStream("unneeded".toByteArray())
+            },
+        )
+        assertEquals(0, streamRequests)
+
+        val prefix = "code_challenge (S256) is required."
+        val oversizedBody = ("x".repeat(8_000) + prefix + "y".repeat(12_000)).toByteArray()
+        val body = ByteArrayInputStream(oversizedBody)
+        assertTrue(isUpgradeRequiredErrorResponse(400) { body })
+        assertEquals(8 * 1024, oversizedBody.size - body.available())
+    }
+
+    @Test
+    fun `PKCE update notice opens no browser and asks the shell to show upgrade`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(
+                    400,
+                    """{"error":"code_challenge (S256) is required. Upgrade Omnigent to sign in"}""",
+                )
+            } else {
+                LocalHttpServer.Response(404)
+            }
+        }.use { server ->
+            val activity = this.activity
+            var updates = 0
+            assertTrue(manager.start(activity, server.origin, {}, onUpdateRequired = { updates++ }))
+            val deadline = System.currentTimeMillis() + 10_000
+            while (updates == 0 && System.currentTimeMillis() < deadline) {
+                drainMainLooper()
+                Thread.sleep(5)
+            }
+            assertEquals(1, updates)
+            assertNull(shadowOf(activity).nextStartedActivity)
+        }
+    }
+
+    @Test
+    fun `malformed successful ticket reports refusal without polling`() {
+        LocalHttpServer { request ->
+            if (request.path == "/auth/cli-login") {
+                LocalHttpServer.Response(200, """{"login_url":"/auth/login"}""")
+            } else {
+                LocalHttpServer.Response(202)
+            }
+        }.use { server ->
+            var failure: Throwable? = null
+            assertTrue(
+                manager.start(
+                    activity,
+                    server.origin,
+                    {},
+                    onTicketFailure = { failure = it },
+                ),
+            )
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (failure == null && System.nanoTime() < deadline) {
+                drainMainLooper()
+                Thread.sleep(5)
+            }
+            assertTrue(failure is LegacyTicketFailure.Refused)
+            assertFalse(server.requests.any { it.path == "/auth/cli-poll" })
+        }
+    }
+
     private val manager = OidcLoginManager()
     private val activity: Activity
         get() = Robolectric.buildActivity(Activity::class.java).setup().get()
@@ -42,11 +114,23 @@ class OidcLoginManagerTest {
     @Test
     fun `second start while in-flight returns false`() {
         val activity = this.activity
-        // Start a flow against an unreachable server — the background task stays
-        // in-flight until it fails or times out, but inFlight is set synchronously.
-        manager.start(activity, UNREACHABLE, {})
-
-        assertFalse(manager.start(activity, UNREACHABLE, {}))
+        val requestEntered = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        val (origin, _) =
+            startOrigin(onLogin = {
+                requestEntered.countDown()
+                releaseRequest.await(10, TimeUnit.SECONDS)
+            })
+        try {
+            assertTrue(manager.start(activity, origin, {}))
+            assertTrue(
+                "first ticket request did not start",
+                requestEntered.await(10, TimeUnit.SECONDS),
+            )
+            assertFalse(manager.start(activity, origin, {}))
+        } finally {
+            releaseRequest.countDown()
+        }
     }
 
     @Test
