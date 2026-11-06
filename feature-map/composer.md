@@ -172,6 +172,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   of "No skills available".
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
+- `clone-repository`: the new-session working-directory menu's **Clone
+  repository…** clones an https:// or git@ URL onto the selected connected host
+  with that host's own git credentials, into `~` or a chosen folder, then uses
+  the clone as the working directory. Git never prompts; failures, an occupied
+  destination, or a host too old to clone show in the dialog. Retrying the same
+  URL reuses an existing checkout of it. Sandbox hosts keep their own repo field.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
 - `dictation`: the microphone button beside the message box dictates speech

@@ -74,6 +74,10 @@ the header menu), and each place is a separate entry point.
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
+- `project-clone`: New project's optional **Clone a repository** section clones
+  a URL onto a chosen connected host first, then saves the clone as the
+  project's default host and working directory; the name defaults to the
+  repository name. A failed clone keeps the dialog open and creates no project.
 - `project-show-more`: an expanded project folder lists its five newest
   sessions; each Show more slides five more in until none remain. Re-expanding
   starts at five again, the open session stays listed once the sidebar has
