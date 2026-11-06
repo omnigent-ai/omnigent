@@ -9,7 +9,7 @@ The behavior under test:
 - A session's **owner** sees it, with the
   kebab's **Rename** and **Share** items **enabled**.
 - A **non-owner the session is shared with** (even at EDIT) sees it under the
-  **"Shared sessions"** filter, with **Rename** and **Share** **disabled**
+  **"Shared with me"** filter, with **Rename** and **Share** **disabled**
   ("Only the session owner can …"). Editing shared *content* still happens in
   the open session — that path reads the real level from the single-session
   snapshot and is unaffected — but the sidebar affordances are owner-only.
@@ -134,11 +134,11 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
     browser: Browser,
     multi_user_server: MultiUserServer,
 ) -> None:
-    """A non-owner (granted EDIT): "Shared sessions" filter, Rename + Share disabled.
+    """A non-owner (granted EDIT): "Shared with me" filter, Rename + Share disabled.
 
     The behavior this PR introduces: an EDIT grant is enough to open and edit
     the session, but the sidebar's Rename/Share are owner-only — so a shared
-    session shows under the "Shared sessions" filter, and its
+    session shows under the "Shared with me" filter, and its
     kebab Rename/Share are disabled regardless of the granted level.
     """
     server = multi_user_server
@@ -150,7 +150,7 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         page.goto(f"{server.public_url}/c/{sid}")
 
         # The shared session is not the viewer's own, so the default "My
-        # sessions" filter hides it; it shows under the "Shared sessions" filter.
+        # sessions" filter hides it; it shows under the "Shared with me" filter.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
         page.locator(_FILTER).click()
         page.locator(_FILTER_SHARED).click()

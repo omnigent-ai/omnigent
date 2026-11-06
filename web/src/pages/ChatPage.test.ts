@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from "vitest";
+import { act, renderHook } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
 import type { RoutingScope } from "@/lib/routingDecision";
 import type { ToolExecution } from "@/lib/blocks";
-import type { ServerInfo } from "@/lib/capabilities";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -13,11 +14,14 @@ import { isSessionSharedWithOthers } from "@/lib/permissionsApi";
 import {
   buildPendingBubbles,
   buildSlashCommandMap,
+  composerOffersClear,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
   computeIsWorking,
   computeShowsWorking,
+  hasSentNativeInputPending,
+  useWorkingSignals,
   containsMarkdownTable,
   dispatchInitialPrompt,
   failedSessionLastError,
@@ -980,6 +984,53 @@ describe("computeShowsWorking", () => {
     );
   });
 
+  it("counts only input this tab sent to a native terminal as awaiting pickup", () => {
+    // A claude-native send's response completes once the message reaches the terminal,
+    // ~200ms before the agent reports running; the indicator must not drop in between.
+    const sent = { tempId: "pend_1", content: [], createdAtS: 1_700_000_000 };
+    const replayed = { tempId: "pi_1", content: [] };
+    expect(hasSentNativeInputPending(true, [sent])).toBe(true);
+    expect(hasSentNativeInputPending(false, [sent])).toBe(false);
+    // Snapshot-replayed input may wait on an offline runner; it doesn't count.
+    expect(hasSentNativeInputPending(true, [replayed])).toBe(false);
+    expect(
+      hasSentNativeInputPending(true, [{ ...sent, initialDraft: { text: "hi", files: [] } }]),
+    ).toBe(false);
+  });
+
+  describe("useWorkingSignals", () => {
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+    const signals = (overrides: Partial<Parameters<typeof useWorkingSignals>[0]> = {}) => ({
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      hasPendingInitialMessage: false,
+      nativeInputPending: false,
+      conversationId: "conv-a",
+      ...overrides,
+    });
+
+    it("keeps Working lit for a first message held past the terminal's ready idle", () => {
+      const { result } = renderHook(() =>
+        useWorkingSignals(signals({ hasPendingInitialMessage: true })),
+      );
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+
+    it("lights Working, not Stop, while a native agent picks up input, for at most 3s", () => {
+      const { result, rerender } = renderHook((props) => useWorkingSignals(props), {
+        initialProps: signals({ nativeInputPending: true }),
+      });
+      expect(result.current).toEqual({ isWorking: false, indicatorSendInFlight: true });
+      act(() => vi.advanceTimersByTime(3_000));
+      expect(result.current.indicatorSendInFlight).toBe(false);
+
+      // Another session's pickup gets its own window.
+      rerender(signals({ nativeInputPending: true, conversationId: "conv-b" }));
+      expect(result.current.indicatorSendInFlight).toBe(true);
+    });
+  });
+
   it("an in-flight local send lights the indicator before any server edge", () => {
     // Pressing Enter sets chatStore.status = "streaming" synchronously, while
     // `sessionStatus` stays `idle` until the server publishes `running` (for
@@ -1396,6 +1447,33 @@ describe("collectBubbleMarkdown", () => {
 });
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
+
+describe("composer /clear gating", () => {
+  const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
+
+  it.each([
+    ["claude-native", true],
+    ["codex-native", true],
+    ["claude-sdk", false],
+    ["openai-agents", false],
+    [null, false],
+  ] as const)(
+    "offers native /clear for %s when the server lists the control",
+    (harness, offered) => {
+      expect(composerOffersClear(harness, info({ session_event_types: ["clear"] }))).toBe(offered);
+      expect(composerOffersClear(harness, info({ session_event_types: ["message"] }))).toBe(false);
+      expect(composerOffersClear(harness, "loading")).toBe(false);
+    },
+  );
+
+  it("offers claude-sdk /clear only when the server continues it in a new session", () => {
+    const sdkClear = info({ session_event_types: ["clear"], session_claude_sdk_clear: true });
+    expect(composerOffersClear("claude-sdk", sdkClear)).toBe(true);
+    expect(composerOffersClear("openai-agents", sdkClear)).toBe(false);
+    // An older server lists "clear" for native sessions only.
+    expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
+  });
+});
 
 describe("buildSlashCommandMap", () => {
   const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];

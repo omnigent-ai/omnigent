@@ -26,6 +26,13 @@ import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import {
+  CompactShortcutKeys,
+  newSessionShortcutKeys,
+  RIGHT_SIDEBAR_TOGGLE_KEYS,
+  SETTINGS_KEYS,
+  SIDEBAR_TOGGLE_KEYS,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -46,6 +53,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
+  rightSidebarShortcutEnabled?: boolean;
 }
 
 interface ActionCommand {
@@ -56,6 +65,8 @@ interface ActionCommand {
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
   run: () => void;
+  /** Chord shown beside the row when the same action has a shortcut. */
+  shortcut?: readonly string[];
 }
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -108,30 +119,33 @@ interface PaletteSession {
 }
 
 /** Flatten list pages into palette rows, dropping repeated ids and, unless
-    `includeArchived`, archived sessions. */
+    `includeArchived`, archived sessions. `newestFirst` re-sorts the rows by
+    `updated_at`, because pushed updates reorder sessions without a refetch. */
 function paletteSessions(
   pages: readonly ConversationsPage[],
   {
     includeArchived = false,
     excludeIds = new Set(),
-  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string> } = {},
+    newestFirst = false,
+  }: { includeArchived?: boolean; excludeIds?: ReadonlySet<string>; newestFirst?: boolean } = {},
 ): PaletteSession[] {
   const seen = new Set(excludeIds);
   const out: PaletteSession[] = [];
-  for (const page of pages) {
-    for (const c of page.data) {
-      if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
-      seen.add(c.id);
-      out.push({
-        id: c.id,
-        label: conversationDisplayLabel(c),
-        agent: getConversationAgentType(c),
-        archived: c.archived === true,
-        // Present only when the match was in chat content (not the title);
-        // the server omits it otherwise. Shown as a dimmed second line.
-        snippet: c.search_snippet ?? null,
-      });
-    }
+  const rows = pages.flatMap((page) => page.data);
+  // Stable, so rows with the same timestamp keep the server's order.
+  if (newestFirst) rows.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0));
+  for (const c of rows) {
+    if ((c.archived && !includeArchived) || seen.has(c.id)) continue;
+    seen.add(c.id);
+    out.push({
+      id: c.id,
+      label: conversationDisplayLabel(c),
+      agent: getConversationAgentType(c),
+      archived: c.archived === true,
+      // Present only when the match was in chat content (not the title);
+      // the server omits it otherwise. Shown as a dimmed second line.
+      snippet: c.search_snippet ?? null,
+    });
   }
   return out;
 }
@@ -142,6 +156,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  rightSidebarShortcutEnabled = true,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -173,6 +188,7 @@ export function CommandPalette({
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
+        shortcut: newSessionShortcutKeys(),
       },
       {
         id: "go-inbox",
@@ -194,6 +210,7 @@ export function CommandPalette({
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
+        shortcut: SETTINGS_KEYS,
       },
       {
         id: "toggle-left-sidebar",
@@ -201,6 +218,7 @@ export function CommandPalette({
         icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
+        shortcut: SIDEBAR_TOGGLE_KEYS,
       },
       {
         id: "toggle-right-sidebar",
@@ -208,9 +226,10 @@ export function CommandPalette({
         icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
+        shortcut: rightSidebarShortcutEnabled ? RIGHT_SIDEBAR_TOGGLE_KEYS : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
   );
 
   const filteredActions = useMemo(() => {
@@ -280,7 +299,7 @@ export function CommandPalette({
   const sessions = useMemo(() => {
     if (searching) return paletteSessions(titleSearch.data?.pages ?? [], { includeArchived: true });
     // Rows archived after they loaded are still cached here, so drop them.
-    const out = paletteSessions(data?.pages ?? []);
+    const out = paletteSessions(data?.pages ?? [], { newestFirst: true });
     if (sessionsOnly) {
       if (!query.trim()) return out;
       return out
@@ -554,6 +573,7 @@ export function CommandPalette({
                     <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
                       <Icon />
                       <span className="flex-1 truncate text-left">{a.label}</span>
+                      {a.shortcut && <CompactShortcutKeys keys={a.shortcut} />}
                     </CommandItem>
                   );
                 })}
