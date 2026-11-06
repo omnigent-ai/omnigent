@@ -38,9 +38,11 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
     initialTemplateId,
     sessionLink,
     editingTask,
+    onCreated,
   }: {
     open: boolean;
     onOpenChange: (open: boolean) => void;
+    onCreated?: () => void;
     initialName?: string;
     initialPrompt?: string;
     initialTrigger?: string | null;
@@ -61,6 +63,15 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
       >
         <button type="button" onClick={() => onOpenChange(false)}>
           Close setup
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            onCreated?.();
+            onOpenChange(false);
+          }}
+        >
+          Create setup
         </button>
       </div>
     ) : null,
@@ -519,6 +530,49 @@ describe("automation view navigation", () => {
     fireEvent.click(screen.getByRole("button", { name: "Close setup" }));
     fireEvent.click(screen.getByTestId("new-task-button"));
     expect(screen.getByTestId("manual-dialog-open")).toHaveAttribute("data-initial-trigger", "");
+  });
+});
+
+describe("after creating an automation", () => {
+  beforeEach(() => setTasks([task()]));
+
+  it("leaves the template gallery for the list of automations", () => {
+    renderPage("/tasks?view=templates");
+    expect(screen.getByRole("region", { name: "Automation templates" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+    expect(showToast).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+
+    expect(screen.queryByRole("region", { name: "Automation templates" })).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith("Automation created");
+  });
+
+  it("stays on the list when created from the list", () => {
+    renderPage("/tasks");
+    fireEvent.click(screen.getAllByRole("button", { name: "New automation" })[0]);
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(showToast).toHaveBeenCalledExactlyOnceWith("Automation created");
+  });
+
+  it("clears a filter and search that would hide the new automation", () => {
+    renderPage("/tasks");
+    fireEvent.click(screen.getByTestId("tasks-filter-paused"));
+    fireEvent.change(screen.getByPlaceholderText(/search/i), { target: { value: "zzz" } });
+    selectView("Templates");
+    fireEvent.click(screen.getByTestId("suggestion-trigger-jira"));
+    fireEvent.click(screen.getByRole("button", { name: "Create setup" }));
+
+    expect(screen.getByTestId("tasks-filter-all")).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByPlaceholderText(/search/i)).toHaveValue("");
   });
 });
 
