@@ -106,6 +106,7 @@ import {
   terminalDisplayLabel,
   useCreateTerminal,
   useDeleteTerminal,
+  type TerminalInfo,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
@@ -898,14 +899,57 @@ function AppShellImpl() {
   // a waking (runner-asleep) session resolves well after the reconcile poll /
   // SSE has already surfaced the tab.
   const pendingShellCreateRef = useRef<Set<string> | null>(null);
+  // The rail as it stood before a "+"→Shell create: the new shell's tab is
+  // selected before its create returns, so a failed create puts this back.
+  const railSelection = {
+    conversationId,
+    terminalKey: selectedTerminalKey,
+    filePath: selectedFilePath,
+    executionLogsKey,
+    filesPanelOpen,
+    subagentsPanelOpen,
+    shellsPanelOpen,
+    rightPanelOpen,
+  };
+  const railSelectionRef = useRef(railSelection);
+  railSelectionRef.current = railSelection;
+  const railBeforeShellCreateRef = useRef<typeof railSelection | null>(null);
   const markShellCreateStarted = useCallback(() => {
     pendingShellCreateRef.current = new Set(openTerminals);
+    railBeforeShellCreateRef.current = railSelectionRef.current;
   }, [openTerminals]);
   // The create POST failed — disarm the focus snapshot so a later
-  // agent-spawned shell isn't mistaken for the one the user tried to open.
-  const clearShellCreatePending = useCallback(() => {
-    pendingShellCreateRef.current = null;
-  }, []);
+  // agent-spawned shell isn't mistaken for the one the user tried to open,
+  // and restore the rail if the failed shell is still what it shows.
+  const clearShellCreatePending = useCallback(
+    (failed?: TerminalInfo) => {
+      pendingShellCreateRef.current = null;
+      const before = railBeforeShellCreateRef.current;
+      railBeforeShellCreateRef.current = null;
+      const now = railSelectionRef.current;
+      if (!failed || !before || before.conversationId !== now.conversationId) return;
+      if (now.terminalKey !== terminalTabKey(failed)) return;
+      setSelectedTerminalKey(before.terminalKey);
+      setExecutionLogsKey(before.executionLogsKey);
+      setFilesPanelOpen(before.filesPanelOpen);
+      setSubagentsPanelOpen(before.subagentsPanelOpen);
+      setShellsPanelOpen(before.shellsPanelOpen);
+      const filePath = before.filePath;
+      if (filePath) {
+        setSelectedFilePath(filePath);
+        setSearchParams(
+          (prev) => {
+            const params = new URLSearchParams(prev);
+            params.set("file", filePath);
+            return params;
+          },
+          { replace: true },
+        );
+      }
+      if (!before.rightPanelOpen) setRightPanelOpenAnimated(false);
+    },
+    [setSearchParams, setRightPanelOpenAnimated],
+  );
   // Whether the agent's spec declares shell access (a ``terminals:`` block).
   // The desktop rail's Shells TAB shows only once a shell exists (creation is
   // via the tab-strip "+" menu), but the MOBILE Shells drawer — which has no
@@ -2104,7 +2148,7 @@ function AppShellImpl() {
     markShellCreateStarted();
     createTerminal.launch(name, {
       onOpen: (info) => openTerminalTab(terminalTabKey(info)),
-      onError: () => clearShellCreatePending(),
+      onError: (_error, opened) => clearShellCreatePending(opened),
     });
   }, [
     boundAgent,

@@ -301,7 +301,7 @@ export async function createTerminal(
  * return the same terminal every time.
  */
 function newTerminalSessionKey(): string {
-  return `u-${randomUUID().replace(/-/g, "").slice(0, 6)}`;
+  return `u-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
 }
 
 interface TerminalCreateRequest {
