@@ -1901,7 +1901,7 @@ class TestResolveGatewayEnv(unittest.TestCase):
             env["ANTHROPIC_CUSTOM_HEADERS"].splitlines(),
             [
                 "Databricks-Custom-Coding-Agent: claude-code",
-                "Databricks-Custom-Client-Surfaces: omnigent, omnigent-web",
+                "Databricks-Custom-Client-Surfaces: omnigent-web",
             ],
         )
 
@@ -3731,6 +3731,159 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     # ``_tee_stderr`` must be unwired in the finally so the buffer can be
     # GC'd and post-connect stderr flows directly to the original callback.
     assert options.stderr is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    status_file = tmp_path / "mcp-auth-status.json"
+    monkeypatch.setenv("OMNIGENT_MCP_AUTH_STATUS_FILE", str(status_file))
+    reported = dict.fromkeys(
+        ("notes", "wiki", "docs", "figjam", "drive", "calendar", "slow", "late"),
+        "sign_in_required",
+    )
+    reported["jira"] = "connected"
+
+    def report(**statuses: str) -> None:
+        reported.update(statuses)
+        entries = [{"harness": "claude", "name": n, "status": s} for n, s in reported.items()]
+        entries.append({"harness": "codex", "name": "codex-docs", "status": "connected"})
+        status_file.write_text(json.dumps({"servers": entries}))
+
+    live = {
+        "notes": "failed",
+        "wiki": "needs-auth",
+        "docs": "pending",
+        # The CLI names plugin servers ``plugin:<plugin>:<server>``; the host reports ``<server>``.
+        "plugin:figma:figjam": "failed",
+        "drive": "failed",
+        "calendar": "failed",
+        "slow": "failed",
+        "late": "failed",
+        "linear": "connected",
+        "jira": "failed",
+        "codex-docs": "failed",
+    }
+    status_reply = "ok"
+    fail_once = {"notes"}
+    reconnects: list[str] = []
+    in_flight: set[str] = set()
+    overlapped = False
+    reconnect_hung = asyncio.Event()
+    fake_sdk = _make_recovery_fake_sdk()
+
+    class _McpClient(fake_sdk.ClaudeSDKClient):
+        async def get_mcp_status(self) -> dict[str, object]:
+            if status_reply == "error":
+                raise RuntimeError("control channel busy")
+            if status_reply == "hang":
+                await asyncio.Event().wait()
+            return {"mcpServers": [{"name": n, "status": s} for n, s in live.items()]}
+
+        async def reconnect_mcp_server(self, server_name: str) -> None:
+            nonlocal overlapped
+            overlapped = overlapped or bool(in_flight)
+            reconnects.append(server_name)
+            in_flight.add(server_name)
+            try:
+                if server_name == "late":
+                    reconnect_hung.set()
+                    await asyncio.Event().wait()
+                await asyncio.sleep(0.3 if server_name in ("drive", "calendar") else 0)
+            finally:
+                in_flight.discard(server_name)
+            if server_name in fail_once:
+                fail_once.discard(server_name)
+                raise RuntimeError("still unauthorized")
+            live[server_name] = "connected"
+
+    fake_sdk.ClaudeSDKClient = _McpClient
+    executor = ClaudeSDKExecutor()
+    messages: list[dict[str, object]] = []
+
+    async def turn(text: str) -> _McpClient:
+        messages.append({"role": "user", "content": text, "session_id": "mcp"})
+        events = [event async for event in executor.run_turn(messages, [], "")]
+        assert not [event for event in events if isinstance(event, ExecutorError)]
+        assert any(isinstance(event, TurnComplete) for event in events)
+        messages.append({"role": "assistant", "content": f"answer to {text}"})
+        return executor._clients["mcp"].client
+
+    report()
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock) as close,
+    ):
+        first = await turn("q0")
+        assert await turn("q1") is first
+        assert reconnects == []
+
+        report(notes="connected", wiki="connected", docs="connected", figjam="connected")
+        report(linear="connected")
+        status_reply = "error"
+        assert await turn("q2") is first
+        assert reconnects == []
+
+        # One failed reconnect neither fails the turn nor stops the others.
+        status_reply = "ok"
+        assert await turn("q3") is first
+        assert reconnects == ["notes", "wiki", "plugin:figma:figjam"]
+        # The CLI handles control requests one at a time.
+        assert not overlapped
+
+        # The failed and still-pending servers are checked again.
+        live["docs"] = "failed"
+        assert await turn("q4") is first
+        assert reconnects[3:] == ["notes", "docs"]
+        assert await turn("q5") is first
+        assert len(reconnects) == 5
+
+        report(drive="connected", calendar="connected")
+        assert await turn("/compact") is first
+        assert len(reconnects) == 5
+
+        # Reconnects share one budget. A CLI still busy when it runs out would hold the prompt,
+        # so a new one runs it.
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 0.5
+        )
+        second = await turn("q6")
+        assert second is not first
+        assert reconnects[5:] == ["drive", "calendar"]
+        close.assert_awaited_once_with(first)
+        assert "answer to q5" in second.prompts[-1]
+        # The new CLI connects every server as it starts.
+        assert await turn("q7") is second
+        assert len(reconnects) == 7
+
+        report(slow="connected")
+        status_reply = "hang"
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._MCP_STATUS_TIMEOUT_SECONDS", 0.05)
+        third = await turn("q8")
+        assert third is not second
+        assert len(reconnects) == 7
+        assert "answer to q7" in third.prompts[-1]
+
+        # A turn cancelled mid-reconnect does not leave the busy CLI for the next turn.
+        report(late="connected")
+        status_reply = "ok"
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor._MCP_RECONNECT_TIMEOUT_SECONDS", 30
+        )
+        messages.append({"role": "user", "content": "q9", "session_id": "mcp"})
+        reconnect_hung.clear()
+        cancelled = asyncio.ensure_future(executor.run_turn(messages, [], "").__anext__())
+        await asyncio.wait_for(reconnect_hung.wait(), timeout=5)
+        assert reconnects[-1] == "late"
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+        assert "mcp" not in executor._clients
+        await asyncio.gather(*executor._cancel_close_tasks)
+        close.assert_awaited_with(third)
 
 
 def test_resolve_sandbox_cwd_roots_relative_at_runner_workspace(monkeypatch) -> None:

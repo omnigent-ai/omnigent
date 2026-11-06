@@ -10,7 +10,10 @@ import {
 describe("nativePermissionOptions", () => {
   it.each([
     ["claude-native", ["default", "auto", "acceptEdits", "plan", "dontAsk", "bypassPermissions"]],
-    ["codex-native", ["default", "full-access", "read-only", "bypass"]],
+    [
+      "codex-native",
+      ["default", "ask-for-approval", "approve-for-me", "full-access", "read-only", "bypass"],
+    ],
     ["cursor-native", ["default", "auto-review", "plan", "ask", "yolo"]],
     ["antigravity-native", ["default", "skip"]],
     ["devin-native", ["normal", "accept-edits", "smart", "dangerous"]],
@@ -27,7 +30,9 @@ describe("permissionModeConcept", () => {
   it("maps Claude and Codex vocabularies onto shared concepts", () => {
     expect(permissionModeConcept("claude-native", "default")).toBe("manual");
     expect(permissionModeConcept("claude-native", "plan")).toBe("read-only");
-    expect(permissionModeConcept("codex-native", "default")).toBe("automatic");
+    expect(permissionModeConcept("codex-native", "default")).toBe("manual");
+    expect(permissionModeConcept("codex-native", "ask-for-approval")).toBe("manual");
+    expect(permissionModeConcept("codex-native", "approve-for-me")).toBe("automatic");
     expect(permissionModeConcept("codex-native", "read-only")).toBe("read-only");
     expect(permissionModeConcept("codex-native", "full-access")).toBe("full-access");
     expect(permissionModeConcept("codex-native", "bypass")).toBe("full-access");

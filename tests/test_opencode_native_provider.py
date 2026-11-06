@@ -170,7 +170,7 @@ def test_write_provider_config_attributes_unity_gateway_models(
         "User-Agent": "ucode/0.1.0 opencode/1.2.0",
         "Databricks-Custom-Coding-Agent": "opencode",
         "Databricks-Custom-Client-Surfaces": (
-            "omnigent, omnigent-desktop, ug" if client_surface else "omnigent, ug"
+            "omnigent-desktop, ug" if client_surface else "omnigent, ug"
         ),
     }
     assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
