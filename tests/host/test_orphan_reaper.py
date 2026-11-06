@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ from omnigent.host.connect import HostProcess, _RunnerHandle
 from omnigent.host.frames import HostLaunchRunnerFrame
 from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import ZygoteManager, ZygoteRunnerProc
+from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
 
 pytestmark = pytest.mark.posix_only
 
@@ -440,3 +442,64 @@ async def test_launch_protects_child_until_spawn_worker_returns(
         finally:
             resume.set()
             await asyncio.wait_for(asyncio.gather(launch, return_exceptions=True), timeout=5.0)
+
+
+def test_hangup_signals_live_runners_but_not_the_zygote(
+    host: HostProcess, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    zygote_pid = 4000
+    monkeypatch.setattr(host, "_zygote", SimpleNamespace(unreaped_pid=zygote_pid))
+    # Direct handles are polled so an unreaped exit never signals a reused PID.
+    for name, pid, code in (
+        ("live_a", 4001, None),
+        ("exited", 4002, 0),
+        ("live_b", 4003, None),
+        ("zygote_alias", zygote_pid, None),
+    ):
+        proc = SimpleNamespace(pid=pid, poll=lambda c=code: c)
+        host._runners[name] = _RunnerHandle(proc=proc, log_path=tmp_path / "runner.log")  # type: ignore[arg-type]
+    # A forked runner reports its cached status without a blocking zygote
+    # round trip, which the exit thread must never make.
+    manager = ZygoteManager()
+    monkeypatch.setattr(
+        manager, "poll", lambda *a, **k: pytest.fail("exit thread blocked on zygote IPC")
+    )
+    # The zygote, not the host, reaps forked runners, so a forked PID can be
+    # recycled; the sweep signals one only when its live start time still
+    # matches the identity recorded at launch.
+    live_create_times = {4005: 111.0, 4007: 222.0}
+    monkeypatch.setattr(
+        "omnigent.inner._proc.process_create_time", lambda pid: live_create_times.get(pid)
+    )
+    forked = ZygoteRunnerProc(4005, manager)
+    host._runners["forked_live"] = _RunnerHandle(
+        proc=forked, log_path=tmp_path / "runner.log", create_time=111.0
+    )
+    # A forked runner the zygote already reaped reports its cached exit code, so
+    # its reused PID is skipped from that cache without a blocking poll.
+    forked_exited = ZygoteRunnerProc(4006, manager)
+    forked_exited.returncode = 1
+    host._runners["forked_exited"] = _RunnerHandle(
+        proc=forked_exited, log_path=tmp_path / "runner.log", create_time=333.0
+    )
+    # A forked runner whose cache still reads live but whose PID the OS reused
+    # for an unrelated process (a different start time) must not be signalled.
+    forked_reused = ZygoteRunnerProc(4007, manager)
+    host._runners["forked_reused"] = _RunnerHandle(
+        proc=forked_reused, log_path=tmp_path / "runner.log", create_time=999.0
+    )
+    sent: list[tuple[int, int]] = []
+
+    def kill(pid: int, sig: int) -> None:
+        sent.append((pid, sig))
+        if pid == 4001:
+            raise ProcessLookupError(pid)  # a runner that just exited must not stop the sweep
+
+    host.signal_runners_finish_work(kill=kill)
+
+    assert sent == [
+        (4001, RUNNER_FINISH_WORK_SIGNAL),
+        (4003, RUNNER_FINISH_WORK_SIGNAL),
+        (4005, RUNNER_FINISH_WORK_SIGNAL),
+    ]
+    assert 4007 not in [pid for pid, _ in sent]  # the reused PID was never signalled

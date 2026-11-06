@@ -10,8 +10,9 @@ import re
 import stat
 import sys
 import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import cast
+from typing import TextIO, cast
 
 from filelock import FileLock
 
@@ -132,15 +133,26 @@ def _events(value: object, omitted: object) -> tuple[list[dict[str, object]], in
 
 
 def record_hook_lifecycle(
-    bridge_dir: Path, payload: dict[str, object], recorded_at: float
+    bridge_dir: Path,
+    payload: dict[str, object],
+    recorded_at: float,
+    env: Mapping[str, str] | None = None,
+    diagnostics: TextIO | None = None,
 ) -> None:
-    """Persist source evidence before rotations/forwarding; never affect the hook result."""
+    """Persist source evidence before rotations/forwarding; never affect the hook result.
+
+    *env* holds the hook terminal's launch variables when the runner records
+    the hook for it; ``None`` reads this process's environment. Failure
+    messages go to *diagnostics*, or stderr when it is ``None``.
+    """
+    if env is None:
+        env = os.environ
     try:
         name = _known(payload.get("hook_event_name"), _EVENTS)
         if name is None or payload.get("agent_id"):
             return
-        instance_id = os.environ.get(TERMINAL_INSTANCE_ID_ENV, "")
-        launch_id = os.environ.get(TERMINAL_LAUNCH_ID_ENV, "")
+        instance_id = env.get(TERMINAL_INSTANCE_ID_ENV, "")
+        launch_id = env.get(TERMINAL_LAUNCH_ID_ENV, "")
         if not _LAUNCH_ID.fullmatch(instance_id) or not _LAUNCH_ID.fullmatch(launch_id):
             return
         from omnigent.harnesses.claude_native.bridge import (
@@ -231,9 +243,7 @@ def record_hook_lifecycle(
                     "schema_version": 1,
                     "terminal_instance_id": instance_id,
                     "launch_id": launch_id,
-                    "launch_session_id": _identifier(
-                        os.environ.get(TERMINAL_LAUNCH_SESSION_ID_ENV)
-                    ),
+                    "launch_session_id": _identifier(env.get(TERMINAL_LAUNCH_SESSION_ID_ENV)),
                     "session_start": session_start,
                     "events": events[-_MAX_EVENTS:],
                     "events_omitted": omitted + max(0, len(events) - _MAX_EVENTS),
@@ -242,7 +252,10 @@ def record_hook_lifecycle(
     except Exception:  # noqa: BLE001 - telemetry must never block Claude's shutdown.
         # The exception or payload can contain paths or user input.
         with contextlib.suppress(Exception):
-            print("omnigent claude lifecycle: could not record hook evidence", file=sys.stderr)
+            print(
+                "omnigent claude lifecycle: could not record hook evidence",
+                file=sys.stderr if diagnostics is None else diagnostics,
+            )
 
 
 def read_lifecycle_snapshot(
