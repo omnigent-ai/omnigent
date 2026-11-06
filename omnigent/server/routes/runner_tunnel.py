@@ -1035,8 +1035,9 @@ async def _keepalive_loop(runner_id: str) -> None:
     what lets the sandbox's shutdown window be short) or slower to save calls.
     Ticks immediately, then every
     :func:`managed_host_keepalive.keepalive_interval_s`; a runner is refreshed
-    from its first pong on, and one that reports busy on its pongs only while it
-    works (see :func:`managed_host_keepalive.record_pong`). Best-effort:
+    from its first pong on (the first ping goes out at connect), and one that
+    reports busy on its pongs only while it works (see
+    :func:`managed_host_keepalive.record_pong`). Best-effort:
     :func:`managed_host_keepalive.touch` swallows its own errors and no-ops when
     the host has no extendable sandbox, so this loop only ever ends when it is
     cancelled at tunnel teardown.
@@ -1062,6 +1063,10 @@ async def _ping_loop(
 ) -> None:
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
+    With managed sandboxes configured the first ping goes out at once: its pong
+    carries the runner's first busy report, which the managed-sandbox keepalive
+    waits for before refreshing, and a short sandbox window cannot wait 30s.
+
     Each tick that the runner is still alive also re-stamps
     ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
     so replicas that don't hold this tunnel keep deriving
@@ -1081,8 +1086,9 @@ async def _ping_loop(
     :returns: None when the session goes stale or the runner is
         declared dead.
     """
-    while True:
+    if not managed_host_keepalive.is_enabled():
         await asyncio.sleep(PING_INTERVAL_S)
+    while True:
         # Check if any frame arrived recently (not just pongs).
         elapsed = registry.seconds_since_last_frame(session)
         if elapsed is None:
@@ -1136,3 +1142,4 @@ async def _ping_loop(
             )
         except Exception:  # noqa: BLE001 -- any send failure ends the ping loop cleanly.
             return
+        await asyncio.sleep(PING_INTERVAL_S)

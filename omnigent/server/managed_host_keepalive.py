@@ -136,6 +136,11 @@ def configure(
         _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="managed-keepalive")
 
 
+def is_enabled() -> bool:
+    """Whether managed sandboxes are configured, so the keepalive is active."""
+    return _sandbox_config is not None and _host_store is not None
+
+
 def _interval_for(runner_id: str) -> float:
     """The keepalive cadence for *runner_id*: its provider's, once cached, else
     the fast agent_sandbox cadence so a short-window sandbox is never under-refreshed."""
@@ -180,6 +185,9 @@ def record_pong(runner_id: str, busy: bool | None, *, idle_s: float | None = Non
     now = time.monotonic()
     first_report = runner_id not in _last_report_at
     _last_report_at[runner_id] = now
+    if first_report and len(_last_report_at) > _THROTTLE_MAX_ENTRIES:
+        # Idle runners report without being refreshed, so prune from here too.
+        _prune_throttle(now)
     if busy:
         resumed = first_report or not _recently_busy(runner_id, now)
         _last_busy_at[runner_id] = now
@@ -263,7 +271,10 @@ def touch(runner_id: str, *, force: bool = False) -> None:
     if runner_id not in _unreporting_runners:
         # Wait for the runner's first pong to say whether it reports; then leave
         # one that has not worked within its window to the platform's idle stop.
-        if runner_id not in _last_report_at or not _recently_busy(runner_id, now):
+        # Until its provider's grace is known, the worker resolves it and decides.
+        if runner_id not in _last_report_at:
+            return
+        if runner_id in _runner_warm_grace_s and not _recently_busy(runner_id, now):
             return
     with _inflight_lock:
         if runner_id in _inflight:
@@ -360,6 +371,15 @@ def _keep_alive_for_runner(runner_id: str) -> None:
             _runner_warm_grace_s[runner_id] = float(
                 getattr(config, "keep_warm_after_work_s", DEFAULT_RUNNER_IDLE_TIMEOUT_S)
             )
+            # touch() lets a reporting runner through before its grace is known
+            # (a fresh replica); decide now, rather than renew to learn the grace.
+            if runner_id in _last_report_at and not _recently_busy(runner_id, time.monotonic()):
+                _logger.debug(
+                    "runner %s idle past its window; not extending sandbox %s",
+                    runner_id,
+                    host.sandbox_id,
+                )
+                continue
             try:
                 # Owner-identity launchers (e.g. Databricks) refresh with the
                 # host owner's own credential, never a server identity.

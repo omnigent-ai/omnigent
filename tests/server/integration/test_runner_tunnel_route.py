@@ -2475,6 +2475,29 @@ async def test_app_heartbeat_round_trip_is_retained_on_disconnect(
     assert row["send_errors"] == 0
 
 
+async def test_first_app_ping_is_sent_at_connect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With managed sandboxes, the first pong carries the runner's first busy
+    report, so it must not wait a whole ping interval; later pings keep the
+    normal interval."""
+    from omnigent.server import managed_host_keepalive
+    from omnigent.server.routes import runner_tunnel
+
+    monkeypatch.setattr(runner_tunnel, "PING_INTERVAL_S", 60.0)
+    monkeypatch.setattr(managed_host_keepalive, "is_enabled", lambda: True)
+    route_app = _tunnel_route_app()
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-first-ping")
+        ping = decode_frame((await communicator.receive_output(timeout=budget(1)))["text"])
+        assert isinstance(ping, PingFrame)
+        assert await communicator.receive_nothing(timeout=0.1), "the next ping waits an interval"
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await asyncio.wait_for(communicator.future, timeout=budget(1))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+
 async def test_ping_timeout_retains_blocked_send_and_queued_heartbeats(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -360,8 +360,8 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
 class _BusyGate:
     """Drive touch()/record_pong() with a fake clock and a recording executor.
 
-    The refresh interval is 600s, so with no grace a runner's window is
-    600 + 2 * 30 = 660s after its last work.
+    The refresh interval is 600s, so with no grace (the default here) a runner's
+    window is 600 + 2 * 30 = 660s after its last work.
     """
 
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -382,6 +382,8 @@ class _BusyGate:
             monkeypatch.setattr(managed_host_keepalive, name, {})
         monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
         monkeypatch.setattr(managed_host_keepalive, "_unreporting_runners", set())
+        # Provider grace already resolved (no grace) unless a test sets its own.
+        managed_host_keepalive._runner_warm_grace_s["r1"] = 0.0
         monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _runner_id: 600.0)
         monkeypatch.setattr(managed_host_keepalive.time, "monotonic", lambda: self.now)
 
@@ -609,20 +611,38 @@ def test_provider_grace_reaches_the_runner_cache(
     assert managed_host_keepalive._runner_warm_grace_s == {"r1": expected}
 
 
-def test_a_fresh_server_resumes_the_remaining_grace_from_the_runner(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("grace", "idle_s", "renewed"),
+    [(3600.0, 300.0, True), (300.0, 900.0, False), (float("inf"), 5000.0, True)],
+    ids=["within-grace", "grace-expired", "unlimited"],
+)
+def test_a_fresh_server_learns_the_grace_before_deciding(
+    monkeypatch: pytest.MonkeyPatch, grace: float, idle_s: float, renewed: bool
 ) -> None:
-    # After a server restart this runner has no history here; its reported idle
-    # time restores the keep-warm grace without counting as new work.
+    # A restarted server (or another replica) has no cached grace for this
+    # runner: it must resolve the provider's grace, then renew only if the
+    # runner's reported idle time is still within it. Idle time is not new work.
     gate = _BusyGate(monkeypatch)
-    managed_host_keepalive._runner_warm_grace_s["r1"] = 1500.0
-    managed_host_keepalive.touch("r1")  # the new server's first tick
-    managed_host_keepalive.record_pong("r1", False, idle_s=300.0)  # last work 5 min ago
-    assert managed_host_keepalive._last_busy_at["r1"] == 700.0, "idle time is not new work"
-    assert gate.submitted == ["r1"], "refreshed at once: still within the grace"
-    gate.tick()  # 900s after the last work: inside the 1500s grace
-    gate.tick()  # 1500s after: grace over
-    assert gate.submitted == ["r1", "r1"]
+    monkeypatch.setattr(managed_host_keepalive, "_runner_warm_grace_s", {})
+    launcher = _Launcher()
+    _wire(
+        monkeypatch,
+        launcher=launcher,
+        host=SimpleNamespace(user_id="alice", sandbox_id="sbx1", sandbox_provider="modal"),
+    )
+    config = SimpleNamespace(launcher_factory=lambda: launcher, keep_warm_after_work_s=grace)
+    monkeypatch.setattr(
+        managed_host_keepalive, "_sandbox_config", SimpleNamespace(for_provider=lambda _p: config)
+    )
+    # Run the worker inline: touch() submits ctx.run(_keep_alive_for_runner, runner_id).
+    monkeypatch.setattr(
+        managed_host_keepalive, "_executor", SimpleNamespace(submit=lambda fn, *args: fn(*args))
+    )
+    managed_host_keepalive.touch("r1")  # the new tunnel's first tick: no pong yet
+    managed_host_keepalive.record_pong("r1", False, idle_s=idle_s)
+    assert managed_host_keepalive._runner_warm_grace_s == {"r1": grace}
+    assert managed_host_keepalive._last_busy_at["r1"] == gate.now - idle_s
+    assert launcher.calls == (["sbx1"] if renewed else [])
 
 
 def test_an_unlimited_grace_keeps_an_idle_runner_warm(monkeypatch: pytest.MonkeyPatch) -> None:
