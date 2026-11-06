@@ -1,0 +1,19 @@
+---
+# Grants the server SA the sandbox-manager ClusterRole in THIS namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: omnigent-sandbox-manager
+  namespace: omnigent-u-alice
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+    omnigent.ai/tenant: alice
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: omnigent-sandbox-manager
+subjects:
+  - kind: ServiceAccount
+    name: omnigent-server
+    namespace: omnigent

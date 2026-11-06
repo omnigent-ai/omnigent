@@ -41,6 +41,66 @@ Secrets, or execute commands inside any Pod. The runner namespace enforces Pod S
 the generated runner Pod is already restricted-compliant (non-root uid 1000, drop
 `ALL` caps, `seccompProfile: RuntimeDefault`, no privilege escalation).
 
+## Per-user namespaces (dual-layer data plane)
+
+The two-namespace split above is still **flat** on the runner side: every
+user's Jobs, token Secrets and Pods are peers in `omnigent-sandboxes`, told
+apart only by name and label. Kubernetes attaches its tenancy controls —
+`ResourceQuota`, `NetworkPolicy`, Pod Security Admission, RBAC, chargeback —
+to **namespaces**, so `sandbox.kubernetes.namespace_strategy: per-user` places
+each session owner's sandboxes in **their own namespace** instead:
+
+| Namespace | Holds |
+|---|---|
+| `omnigent` | the server (unchanged) |
+| `omnigent-u-alice`, `omnigent-u-bob`, … | that owner's runner Jobs/Pods, token Secrets, the runner SA and a RoleBinding of the `omnigent-sandbox-manager` **ClusterRole** |
+
+The namespace is rendered from `namespace_template` (default
+`omnigent-u-{owner}`) and the session owner (`host.user_id`): a label-safe owner
+such as `alice` renders verbatim; one that needs normalizing (`alice@example.com`)
+or truncating renders as the normalized form plus an 8-hex SHA-256 suffix
+(`omnigent-u-alice-example-com-ff8d9819`) so two owners can never share a
+namespace. Launch, resume, relaunch, terminate and the reaper all resolve the
+namespace from the host's owner — never from a global default — and a namespace
+labelled `omnigent.ai/tenant` for somebody else is refused, not shared. `shared`
+(the default) is byte-for-byte today's behaviour.
+
+Two provisioning modes, because clusters differ in who may create namespaces:
+
+| `namespace_provisioning` | Who creates the tenant namespace | Server RBAC |
+|---|---|---|
+| `external` (default, least privilege) | an operator — Helm/Kustomize loop, GitOps, IdP export. Copy [`tenant-namespaces/example-tenant/`](tenant-namespaces/example-tenant/) per user: Namespace (labelled `omnigent.ai/tenant`), runner SA, RoleBinding, and optionally a `ResourceQuota` and the `default-deny-ingress` `NetworkPolicy`. A session whose owner has no namespace fails fast with a clear error. | `tenant-namespaces/clusterrole-sandbox-manager.yaml` only (the Role's rules as a ClusterRole, bound **per namespace** by each RoleBinding). |
+| `server` | the server, on the owner's first launch: Namespace (+ `namespace_labels`, Pod Security labels), runner SA, RoleBinding of the ClusterRole to `server_service_account`, then `namespace_defaults` (`resource_quota`, `network_policy: default-deny-ingress`). Idempotent (409 = already there); defaults apply on **first creation only**, so later operator edits survive. | additionally `tenant-namespaces/clusterrole-namespace-provisioner.yaml`: `namespaces` get/create, `serviceaccounts`/`resourcequotas`/`networkpolicies`/`rolebindings` create, and `bind` pinned to the one ClusterRole. This widens the server SA from one namespace to *namespaces it creates*; prefer `external` where you can. |
+
+```yaml
+sandbox:
+  provider: kubernetes
+  kubernetes:
+    namespace_strategy: per-user            # shared (default) | per-user
+    namespace_template: "omnigent-u-{owner}" # must contain {owner} once
+    namespace_provisioning: server          # external (default) | server
+    namespace_labels: { omnigent.ai/team: "{owner}" }   # server mode, optional
+    namespace_defaults:                     # server mode, first creation only
+      resource_quota: { pods: "10", requests.cpu: "8", requests.memory: "32Gi" }
+      network_policy: default-deny-ingress  # the one bundled template, or null
+      pod_security: restricted              # privileged | baseline | restricted | null
+    server_service_account: omnigent/omnigent-server   # RoleBinding subject (ns/name)
+```
+
+Apply the cluster-scoped pieces on top of this overlay:
+
+```bash
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners/tenant-namespaces   # ClusterRole (+ provisioner, if uncommented)
+kubectl apply -k deploy/kubernetes/overlays/sandbox-runners/tenant-namespaces/example-tenant  # external mode: one namespace per user
+kubectl -n omnigent-u-alice get pods                                             # only Alice's runners
+```
+
+Trade-offs: agent-sandbox **warm pools** are namespace-scoped, so with
+`per-user` a `SandboxWarmPool` must exist in each tenant namespace (pre-warm per
+tenant in `external` mode) — otherwise keep `shared` for warm-pooled
+deployments. `per-team` (owner → team via an OIDC claim) and namespace garbage
+collection are not implemented yet; a namespace outlives its last sandbox.
+
 ## Agent classifier label (`omnigent.ai/agent`)
 
 Each runner Pod is stamped with `omnigent.ai/agent: <name>` naming the built-in
@@ -207,6 +267,10 @@ writing nothing to disk — use HTTPS repository URLs. Details by provider match
 | `keep_warm_s` | Optional, top-level under `sandbox:` (`agent_sandbox` only): seconds an idle sandbox stays warm (runner alive) after the last turn before it suspends — the single idle-suspend timing knob. Maps to the in-sandbox `runner.idle_timeout_s` and is authoritative over an explicit one. Unset → ~1h default. See [Watching and tuning the lifecycle](#watching-and-tuning-the-lifecycle). |
 | `host_config` | Optional, top-level under `sandbox:` (provider-agnostic, not inside `kubernetes:`): verbatim in-sandbox `~/.omnigent/config.yaml` content installed before `omnigent host` starts — e.g. a `providers:` block routing the `pi` harness through a self-hosted gateway (LiteLLM/vLLM). Server-managed: entries injected by a previous launch are replaced or removed on the next launch/resume; config created inside the sandbox survives. Keep secrets out via `api_key_ref: env:VAR`, resolved inside the runner Pod against the `secret_name` Secret. Validated at server startup. |
 | `namespace` | Runner-Pod namespace (defaults to `omnigent-sandboxes`). |
+| `namespace_strategy` | `shared` (default: everything in `namespace`) or `per-user` (each owner's sandboxes in their own namespace) — see [Per-user namespaces](#per-user-namespaces-dual-layer-data-plane). |
+| `namespace_template` | Per-user namespace name with `{owner}` once (default `omnigent-u-{owner}`); the owner is DNS-label normalized with a stable hash suffix when that is lossy. |
+| `namespace_provisioning` | `external` (default: an operator pre-creates tenant namespaces; a missing one fails the launch) or `server` (the server creates and seeds them on first use). |
+| `namespace_labels` / `namespace_defaults` / `server_service_account` | Server-mode extras: labels for new namespaces (`{owner}` allowed in values), first-creation `resource_quota` / `network_policy` / `pod_security`, and the `namespace/name` of the server SA the per-namespace RoleBinding targets (default `omnigent/omnigent-server`). |
 | `secret_name` | Harness-creds Secret projected into every Pod via `envFrom`. |
 | `service_account` | ServiceAccount the runner Pods run as (powerless). |
 | `image` | Optional runner image override (defaults to the official multi-arch amd64/arm64 host image). |

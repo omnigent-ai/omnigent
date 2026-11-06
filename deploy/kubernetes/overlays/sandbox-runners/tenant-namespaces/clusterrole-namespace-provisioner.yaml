@@ -1,0 +1,51 @@
+---
+# ONLY for `namespace_provisioning: server`: lets the server create a tenant
+# namespace on an owner's first launch and seed it. This widens the server SA
+# from "one namespace" to "namespaces it creates" — the `external` mode (an
+# operator pre-creates tenant namespaces) needs none of this and is the
+# least-privilege choice.
+#
+# `bind` on the omnigent-sandbox-manager ClusterRole is what lets the server
+# create a RoleBinding referencing it WITHOUT holding every permission that role
+# grants cluster-wide (RBAC escalation prevention); resourceNames pins it so the
+# server can bind only that one ClusterRole, never cluster-admin.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: omnigent-namespace-provisioner
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "create"]
+  - apiGroups: [""]
+    resources: ["serviceaccounts", "resourcequotas"]
+    verbs: ["create"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["rolebindings"]
+    verbs: ["create"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterroles"]
+    resourceNames: ["omnigent-sandbox-manager"]
+    verbs: ["bind"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: omnigent-namespace-provisioner
+  labels:
+    app.kubernetes.io/name: omnigent
+    app.kubernetes.io/component: server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: omnigent-namespace-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: omnigent-server
+    namespace: omnigent
