@@ -102,6 +102,7 @@ import {
   isTempConvId,
   initChatStore,
   pumpStreamEvents,
+  SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
@@ -13762,6 +13763,41 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sinks[1]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
     await vi.advanceTimersByTimeAsync(20);
     expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("reopens a stream once it reaches the max age, before the ingress cap", async () => {
+    seedSession("conv_max_age", []);
+    // Like the real fetch, aborting the attempt severs the body read.
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_max_age", abortController: controller });
+
+    const loop = startStreamPump("conv_max_age", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sinks).toHaveLength(1);
+
+    await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+    expect(sinks).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(15_001);
+    expect(sinks).toHaveLength(2);
 
     sinks[1]!.push("data: [DONE]\n\n");
     sinks[1]!.close();
