@@ -21,6 +21,7 @@ lifespan) since none of these paths need the runtime.
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 import httpx
@@ -804,13 +805,39 @@ async def test_peer_messaging_validates_mixed_update_before_writes(
 
 
 @pytest.mark.parametrize(
-    "raw,enabled", [(None, True), ("on", True), ("off", False), ("", False), ("typo", False)]
+    "raw,error,enabled",
+    [
+        (None, None, True),
+        ("on", None, True),
+        ("off", None, False),
+        ("", None, False),
+        ("typo", None, False),
+        ("off", "read_text", False),
+        ("off", "stat", False),
+    ],
 )
-def test_peer_messaging_override_values(raw: str | None, enabled: bool) -> None:
+def test_peer_messaging_override_values(
+    raw: str | None, error: str | None, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = sharing_settings.resolve_data_dir() / "peer_session_messaging"
     if raw is not None:
-        path = sharing_settings.resolve_data_dir() / "peer_session_messaging"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(raw)
+    if error is not None:
+        sharing_settings.write_peer_session_messaging_override(False)
+        if error == "stat":
+            assert (
+                sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is False
+            )
+        original = getattr(Path, error)
+
+        def storage_error(self, *args, **kwargs):
+            if self == path:
+                raise OSError(errno.EIO, "Storage unavailable")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, error, storage_error)
+        assert sharing_settings._read_override_text(path) is None
     assert sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is enabled
 
 

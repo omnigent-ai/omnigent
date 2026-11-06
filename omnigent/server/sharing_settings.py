@@ -158,23 +158,24 @@ class DefaultPublicSessions(str, Enum):
         return cls.OFF
 
 
-def _read_override_text(path: Path) -> str | None:
+def _read_override_text(path: Path, *, raise_errors: bool = False) -> str | None:
     """mtime-cached read of an override file's stripped contents.
 
-    Returns ``None`` for a missing or unreadable file (never raises), so callers
-    fall back to their env-var default.
+    Missing files return ``None``. Other storage errors also return ``None``
+    unless ``raise_errors`` is set.
     """
     key = str(path)
     try:
         mtime = path.stat().st_mtime
-    except OSError:
-        return None
-    cached = _cache.get(key)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    try:
+        cached = _cache.get(key)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
         raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
     except OSError:
+        if raise_errors:
+            raise
         return None
     _cache[key] = (mtime, raw)
     return raw
@@ -262,7 +263,13 @@ def peer_session_messaging_enabled(flags: FeatureFlags) -> bool:
     """Apply the live admin setting within the deployment's limits."""
     if not peer_session_messaging_available(flags):
         return False
-    raw = _read_override_text(resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE)
+    try:
+        raw = _read_override_text(
+            resolve_data_dir() / _PEER_SESSION_MESSAGING_FILE, raise_errors=True
+        )
+    except OSError:
+        logger.warning("Cannot read peer messaging setting; refusing messages", exc_info=True)
+        return False
     # Invalid stored values must not restore messaging after an admin disabled it.
     return raw is None or raw.lower() == "on"
 
