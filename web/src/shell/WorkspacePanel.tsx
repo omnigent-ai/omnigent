@@ -70,6 +70,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
+import { useSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1392,6 +1393,7 @@ function WorkspacePanelImpl({
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
+  const { wakeIfAsleep: wakeSandboxForFiles } = useSandboxWake(conversationId ?? undefined);
   const terminalLabelFor = useCallback(
     (key: string) => {
       const t = terminals.find((term) => terminalTabKey(term) === key);
@@ -1456,6 +1458,9 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
+    // Choosing Files or Changes (click, hotkey) starts an asleep sandbox, even
+    // when the panel is already open on the other scope or mounts on this pick.
+    if (tab === "files" || tab === "changes") wakeSandboxForFiles();
     onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {

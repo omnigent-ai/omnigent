@@ -438,18 +438,25 @@ toast while the dot keeps spinning on the server's stage.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.
-Opening Files or Changes on such a session wakes the sandbox for editors, in the
-desktop Workspace rail and the mobile Files drawer alike. The wake only
-reconnects: it resumes no interrupted turn, its own or a sub-agent's, and
-retries no failed startup input; interrupted work resumes on the next message
-or on Resume, including a Resume clicked while the wake is still running.
-On a phone only the Files drawer counts as open, not the hidden desktop rail.
-The panel shows **Starting sandbox…**, then the file list; a failed wake shows
-the reason and **Try again**. If the sandbox sleeps again while the panel stays
-open, it shows **Start sandbox** rather than waking again. Read-only viewers,
-sessions whose access level isn't known, and servers that don't list
-`wake_session` in `/v1/info` `session_event_types` keep the send-a-message
-hint, as does a panel whose wake a server rejects as an unknown event.
+Opening such a session wakes the sandbox for editors once the session has
+stayed open for a second in a visible tab, so stepping through sessions wakes
+none of the ones passed over. Choosing Files or Changes in the Workspace rail,
+opening the rail on them, or opening the mobile Files drawer wakes it too, as
+do the composer and terminal triggers in the composer and terminals maps. A
+view that is already open when the session changes doesn't count, and a
+session that sleeps again while it stays open is left alone. Grid cells never
+wake on their own. The wake only reconnects: it resumes no interrupted turn,
+its own or a sub-agent's, retries no failed startup input, and keeps the
+terminal view from restarting the agent on its own; interrupted work resumes
+on the next message or on Resume, including a Resume clicked while the wake is
+still running. On a phone only the Files drawer counts as open, not the hidden
+desktop rail. While it wakes, the Files view shows **Starting sandbox…**, then
+the file list. A wake that fails or never lands just ends: the session shows
+what it showed before, including **Reconnect host**, and the next of these
+actions tries again. Read-only viewers, sessions whose access level isn't
+known, and servers that don't list `wake_session` in `/v1/info`
+`session_event_types` keep the send-a-message hint, as does a session whose
+wake a server rejects as an unknown event.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -979,12 +986,15 @@ plain `uv run pytest`, which starts a private server for the test.
   online. Sibling tests cover a failed wake's error toast and retry, a
   session opened mid-wake, and a wake whose stage outlasts its limit. None
   of them resume a live sandbox.
-- **`reconnect`, Files view on an asleep sandbox:**
+- **`reconnect`, opening an asleep sandbox's session:**
   `tests/e2e_ui/files/test_asleep_sandbox_auto_wake.py` uses the same patch,
-  with workspace reads failing until the wake succeeds. It checks that opening
-  Files in the desktop rail sends only a `wake_session` event and then
-  lists the files. A failed wake's Try again, the mobile drawer, and the
-  older-server fallback are covered by `web/src/shell/FilesPanel.test.tsx`.
+  with workspace reads failing until the wake succeeds. It checks that
+  opening the session sends only a `wake_session` event, the Files rail shows
+  **Starting sandbox…**, and the files then load. The triggers (the open
+  dwell, Files/Changes selection and opening, the mobile drawer), a failed
+  wake followed by reopening Files, and the older-server fallback are covered
+  by `web/src/hooks/useSandboxAutoWake.test.ts`,
+  `web/src/shell/FilesPanel.test.tsx` and `web/src/shell/WorkspacePanel.test.tsx`.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

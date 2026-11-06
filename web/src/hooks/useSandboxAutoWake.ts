@@ -40,6 +40,11 @@ interface WakeAttempt {
 const attempts = new Map<string, WakeAttempt>();
 const listeners = new Set<() => void>();
 
+// Sessions whose sandbox this page woke without the user asking for work.
+// Automatic work recovery (the terminal view's auto-Resume) must not run on
+// them; an explicit Resume, a message, or the sandbox sleeping again ends it.
+const passiveWakes = new Set<string>();
+
 function subscribe(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
@@ -68,6 +73,7 @@ function setAttemptWithDeadline(conversationId: string, attempt: WakeAttempt, ms
  */
 async function startSandboxWake(conversationId: string): Promise<void> {
   if (attempts.has(conversationId)) return;
+  passiveWakes.add(conversationId);
   const attempt: WakeAttempt = { step: "requesting" };
   setAttemptWithDeadline(conversationId, attempt, SANDBOX_WAKE_REQUEST_MS);
   try {
@@ -83,8 +89,27 @@ async function startSandboxWake(conversationId: string): Promise<void> {
       error.status === 400 &&
       error.code === "invalid_input" &&
       error.message.startsWith("Unknown event type");
+    passiveWakes.delete(conversationId);
     setAttempt(conversationId, unsupported ? { step: "unsupported" } : undefined);
   }
+}
+
+/**
+ * Whether this page woke the session's sandbox passively and no explicit
+ * work has followed, so automatic recovery must wait for the user.
+ */
+export function useSandboxPassivelyWoken(conversationId: string | null | undefined): boolean {
+  const get = useCallback(
+    () => (conversationId ? passiveWakes.has(conversationId) : false),
+    [conversationId],
+  );
+  return useSyncExternalStore(subscribe, get);
+}
+
+/** Explicit work started on the session: automatic recovery may run again. */
+export function endPassiveSandboxWake(conversationId: string | null | undefined): void {
+  if (!conversationId || !passiveWakes.delete(conversationId)) return;
+  for (const listener of listeners) listener();
 }
 
 /** Forget every session's wake attempt and its pending timeout. */
@@ -93,6 +118,7 @@ export function resetSandboxWakesForTesting(): void {
     if (attempt.timer !== undefined) window.clearTimeout(attempt.timer);
   }
   attempts.clear();
+  passiveWakes.clear();
   for (const listener of listeners) listener();
 }
 
@@ -143,6 +169,10 @@ export function useSandboxWake(conversationId: string | undefined): SandboxWake 
   }, []);
 
   const step = attempt?.step;
+  useEffect(() => {
+    // Asleep again with no wake running: that passive wake is over.
+    if (asleep && step === undefined) endPassiveSandboxWake(conversationId);
+  }, [asleep, conversationId, step]);
   useEffect(() => {
     // Runner online, by this wake or any other: forget the attempt, even one still in flight.
     if (conversationId && runnerOnline === true && (step === "requesting" || step === "settling")) {

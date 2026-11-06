@@ -20,6 +20,12 @@ import { TerminalFirstContextProvider } from "./TerminalFirstContext";
 // the existing one — the signal the stale-scrollback regression test needs.
 let terminalMountSeq = 0;
 
+let passivelyWoken = false;
+const endPassiveWakeMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", () => ({
+  useSandboxPassivelyWoken: () => passivelyWoken,
+  endPassiveSandboxWake: (id: string) => endPassiveWakeMock(id),
+}));
 vi.mock("@/components/blocks/TerminalView", () => ({
   TerminalView: ({
     sessionId,
@@ -221,6 +227,27 @@ describe("MainTerminalView — automatic recovery", () => {
     expect(await screen.findByTestId("terminal-view")).toBeInTheDocument();
     expect(screen.queryByRole("status")).toBeNull();
     expect(onResume).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a passively woken sandbox to the Resume button", async () => {
+    hostOnlineMock.mockReturnValue(true);
+    passivelyWoken = true;
+    endPassiveWakeMock.mockClear();
+    try {
+      const onResume = vi.fn().mockResolvedValue(undefined);
+      const props = { terminals: [], runnerOnline: true, onResume };
+      const { rerender } = renderView(props);
+
+      expect(onResume).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "Resume session" })).toBeInTheDocument();
+      expect(endPassiveWakeMock).not.toHaveBeenCalled();
+
+      // The agent terminal running (after Resume or a message) ends the passive wake.
+      await act(async () => rerender(viewTree({ ...props, terminals: [REPL_TERMINAL] })));
+      expect(endPassiveWakeMock).toHaveBeenCalledWith("conv_sdk");
+    } finally {
+      passivelyWoken = false;
+    }
   });
 
   it("does not duplicate recovery during StrictMode effects", async () => {

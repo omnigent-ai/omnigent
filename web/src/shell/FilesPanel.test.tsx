@@ -551,7 +551,8 @@ describe("FilesPanel on an asleep sandbox", () => {
       "stays open while the user switches sessions",
       () => {
         const view = renderPanel({ ...asleepPanel, conversationId: "conv_other" });
-        view.rerender(panelAt("conv_asleep"));
+        view.rerender(panelAt("conv_other", { conversationId: "conv_asleep" }));
+        expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
         return view;
       },
     ],
@@ -638,13 +639,25 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
   });
 
-  it("goes back to the offline hint when the wake fails, with no new controls", async () => {
+  it("goes back to the offline hint when the wake fails, and wakes again on reopen", async () => {
     wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
     const { rerender } = renderPanel({ ...asleepPanel, active: false });
     await act(async () => rerender(panelAt("conv_asleep", { active: true })));
 
     expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
+    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
+
+    rerender(panelAt("conv_asleep", { active: false }));
+    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
+    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
+
+    useAsleepMock.mockReturnValue(false);
+    useRunnerOnlineMock.mockReturnValue(true);
+    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
+    rerender(panelAt("conv_asleep", { active: true }));
+    expect(screen.getByText("README.md")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: /start sandbox|try again/i }),
     ).not.toBeInTheDocument();

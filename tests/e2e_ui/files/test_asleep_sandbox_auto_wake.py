@@ -1,10 +1,10 @@
-"""E2E: opening an asleep sandbox's session, or its Files view, wakes it without a message.
+"""E2E: opening an asleep sandbox's session wakes it without a message.
 
 A session whose managed sandbox idle-stopped reads ``host_asleep``, and the
-Files panel has no workspace to list. Opening the session, and opening the
-Files panel on it, must ask the server to resume the sandbox with a
-``wake_session`` event, show that it is starting, and list the files once the
-sandbox reads online, without the user sending a chat message.
+Files panel has no workspace to list. Opening the session must ask the server
+to resume the sandbox with a ``wake_session`` event, show that it is starting,
+and list the files once the sandbox reads online, without the user sending a
+chat message.
 ``force_host_asleep`` patches the browser's view into ``host_asleep`` and
 workspace reads answer the runner-offline 503 until a wake request succeeds;
 the seeded runner stays really connected, so the file list and
@@ -156,36 +156,4 @@ def test_opening_asleep_session_wakes_sandbox(
     _expect_file_listed(rail)
     # The wake is the only session event: no chat message was sent.
     assert recorder.events == [_WAKE_SESSION]
-    _hold_for_viewer(request, page)
-
-
-def test_opening_files_wakes_sandbox_after_a_failed_wake(
-    request: pytest.FixtureRequest,
-    asleep_session_file: tuple[str, str],
-) -> None:
-    """A failed wake leaves today's offline hint; reopening the Files rail wakes it again."""
-    base_url, session_id = asleep_session_file
-    page, recorder, held = _open_asleep_session(request, base_url, session_id)
-    expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    next_held_wake(page, held, timeout_ms=30_000).fulfill(
-        status=500,
-        content_type="application/json",
-        body=json.dumps({"error": {"code": "internal", "message": "Sandbox resume failed."}}),
-    )
-
-    open_right_rail(page)
-    rail = page.get_by_role("complementary", name="Workspace")
-    expect(rail.get_by_text("Sandbox is offline")).to_be_visible(timeout=30_000)
-    expect(rail.get_by_text("Send a message in the chat to start it again.")).to_be_visible()
-    expect(rail.get_by_role("button", name=re.compile("Start sandbox|Try again"))).to_have_count(0)
-    _hold_for_viewer(request, page)
-
-    page.get_by_role("button", name="Collapse right panel").first.click()
-    open_right_rail(page)
-    wake = next_held_wake(page, held, timeout_ms=30_000)
-    expect(rail.get_by_text("Starting sandbox…")).to_be_visible()
-    wake.continue_()
-
-    _expect_file_listed(rail)
-    assert recorder.events == [_WAKE_SESSION, _WAKE_SESSION]
     _hold_for_viewer(request, page)

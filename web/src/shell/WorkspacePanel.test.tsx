@@ -124,6 +124,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   })),
 }));
 // The "+" menu reads the agent's declared terminals to gate the Shell entry.
+const wakeSandboxMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", () => ({
+  useSandboxWake: () => ({ waking: false, ready: true, wakeIfAsleep: wakeSandboxMock }),
+}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
@@ -568,6 +572,20 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("wakes an asleep sandbox when Files or Changes is chosen, not other tabs", () => {
+    wakeSandboxMock.mockClear();
+    writeDefaultWorkspaceTab("changes");
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
+
+    // Changes → Files keeps the same mounted panel open; Agents isn't a host view.
+    expect(pressTabNumber(2)).toBe(false);
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(4)).toBe(false);
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(1)).toBe(false);
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {

@@ -40,6 +40,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   connected, disconnected, asleep (resumable managed host), unknown, no host,
   and a launching or failed sandbox with its stage; before launch also a
   selected sandbox and connecting.
+- `asleep-sandbox-wake`: clicking into or typing in the composer, or opening
+  the model picker (click or hotkey), wakes the session's asleep managed
+  sandbox for editors without sending a message. The composer focusing itself
+  on a session switch does not count.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Long catalogs scroll inside a compact menu
   capped at 40% of viewport height, between 20rem and 36rem, and never taller

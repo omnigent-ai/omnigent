@@ -15,6 +15,9 @@ reattach when the session moves to another host.
   (Resume offered after recovery fails or when the host is offline), connected.
   Automatic recovery runs once when opening Terminal. Leaving it open does not
   revive an idle-reaped pane. Failed recovery stays manual across view switches.
+  Switching to Terminal on a session whose managed sandbox is asleep wakes the
+  sandbox without starting the agent; after such a wake the view offers Resume
+  instead of recovering on its own, until the agent terminal runs.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
