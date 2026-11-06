@@ -2,24 +2,35 @@
 // checkbox in each file's header, and the progress and "Hide viewed" row in the toolbar.
 // The Changes tab renders them only while viewed state is available.
 
+import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Progress } from "@/components/ui/progress";
 
-/** The "Viewed" checkbox in a file's header. */
+/** The "Viewed" checkbox in a file's header, with a badge when the file changed since it was viewed. */
 export function PullRequestViewedToggle({
   path,
   viewed,
+  changed,
   onToggle,
 }: {
   path: string;
   viewed: boolean;
+  changed: boolean;
   onToggle: () => void;
 }) {
+  // The badge stacks under the checkbox, so the column is as wide as the badge.
   return (
-    <label className="flex shrink-0 cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
-      <Checkbox checked={viewed} onCheckedChange={onToggle} aria-label={`Viewed ${path}`} />
-      Viewed
-    </label>
+    <div className="flex shrink-0 flex-col items-end gap-0.5">
+      <label className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
+        <Checkbox checked={viewed} onCheckedChange={onToggle} aria-label={`Viewed ${path}`} />
+        Viewed
+      </label>
+      {changed && (
+        <Badge variant="outline" className="text-xs">
+          Changed since viewed
+        </Badge>
+      )}
+    </div>
   );
 }
 

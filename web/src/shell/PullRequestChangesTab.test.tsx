@@ -14,7 +14,12 @@ import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
 import type * as ClipboardModule from "@/lib/clipboard";
 import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
-import { viewedStorageKey, writeViewed, type PullRequestIdentity } from "@/lib/pullRequestViewed";
+import {
+  unverifiedPatchHash,
+  viewedStorageKey,
+  writeViewed,
+  type PullRequestIdentity,
+} from "@/lib/pullRequestViewed";
 import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
@@ -518,6 +523,7 @@ function viewedTab({
   threads = [],
   diffHead = head,
   listHead = head,
+  patch,
 }: {
   conversationId: string;
   head?: string;
@@ -529,6 +535,8 @@ function viewedTab({
   diffHead?: string;
   /** The list's pinned head; null models a provider that doesn't pin revisions. */
   listHead?: string | null;
+  /** The whole-PR patch the diff reports. Without one, every file is unverified. */
+  patch?: string;
 }) {
   const props = {
     conversationId,
@@ -543,7 +551,7 @@ function viewedTab({
     canEdit: false,
     selected: true,
     changes: { data: { available: true, data: files, has_more: hasMore, head_sha: listHead } },
-    prDiff: { data: { head_sha: diffHead, base_sha: "base" }, isLoading: false },
+    prDiff: { data: { head_sha: diffHead, base_sha: "base", patch }, isLoading: false },
     reviews: {
       page: { data: threads, head_sha: head, base_sha: "base" },
       isFetching: false,
@@ -559,6 +567,16 @@ function viewedTab({
       </Tabs>
     </TooltipProvider>
   );
+}
+
+/** One file's patch with a single hunk whose added line is `line`. */
+function filePatch(file: string, line: string): string {
+  return `diff --git a/${file} b/${file}\nindex 1111111..2222222 100644\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-old\n+${line}\n`;
+}
+
+/** A patch for a.ts and b.ts; each file's hunk changes only with its own argument. */
+function twoFilePatch(aLine: string, bLine = "y"): string {
+  return filePatch("a.ts", aLine) + filePatch("b.ts", bLine);
 }
 
 /** The file's section root; its first button is the header's collapse toggle. */
@@ -651,19 +669,86 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(isListed("a.ts")).toBe(true);
   });
 
-  it("resets viewed marks on a new head and shows a dismissible notice", () => {
-    const { rerender } = render(viewedTab({ conversationId: "viewed-head", head: "head1" }));
+  it("resets a changed file's mark on a new head and shows a dismissible notice", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-head", head: "head1", patch: twoFilePatch("new") }),
+    );
     fireEvent.click(viewedBox("a.ts"));
 
-    rerender(viewedTab({ conversationId: "viewed-head", head: "head2" }));
+    rerender(
+      viewedTab({ conversationId: "viewed-head", head: "head2", patch: twoFilePatch("newer") }),
+    );
     expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(screen.getByText("Changed since viewed")).toBeInTheDocument();
     expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
-    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
-    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
-    rerender(viewedTab({ conversationId: "viewed-head", head: "head2" }));
-    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    rerender(
+      viewedTab({ conversationId: "viewed-head", head: "head2", patch: twoFilePatch("newer") }),
+    );
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+  });
+
+  it("keeps an unchanged file's mark and collapse on a new head, and flags only the changed file", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-hunks", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    rerender(
+      viewedTab({ conversationId: "viewed-hunks", head: "head2", patch: twoFilePatch("new", "z") }),
+    );
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(viewedBox("b.ts")).not.toBeChecked();
+    expect(screen.getByText("Changed since viewed")).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+    // The unchanged file stays collapsed; the changed one opens for review.
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(false);
+  });
+
+  it("does not show the notice for a marked file that left the PR", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-removed", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    rerender(
+      viewedTab({
+        conversationId: "viewed-removed",
+        head: "head2",
+        files: [changed("a.ts")],
+        patch: filePatch("a.ts", "new"),
+      }),
+    );
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.queryByText("Changed since viewed")).toBeNull();
+  });
+
+  it("does not raise the notice for a changed mark on a file the list omits", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-omitted", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    // b.ts still changes in the patch, but the list no longer shows it.
+    rerender(
+      viewedTab({
+        conversationId: "viewed-omitted",
+        head: "head2",
+        files: [changed("a.ts")],
+        patch: twoFilePatch("new", "changed"),
+      }),
+    );
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.queryByText("Changed since viewed")).toBeNull();
   });
 
   it("hides viewed state when the list is not pinned to a head", () => {
@@ -676,28 +761,50 @@ describe("PullRequestChangesTab viewed files", () => {
   });
 
   it("waits for the list and the patch to agree on a head", () => {
-    const { rerender } = render(viewedTab({ conversationId: "viewed-mismatch", head: "head1" }));
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-mismatch", head: "head1", patch: twoFilePatch("new") }),
+    );
     fireEvent.click(viewedBox("a.ts"));
 
     // The list moved to head2 while the patch on screen is still head1.
-    rerender(viewedTab({ conversationId: "viewed-mismatch", head: "head2", diffHead: "head1" }));
+    rerender(
+      viewedTab({
+        conversationId: "viewed-mismatch",
+        head: "head2",
+        diffHead: "head1",
+        patch: twoFilePatch("new"),
+      }),
+    );
     expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
-    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
 
-    rerender(viewedTab({ conversationId: "viewed-mismatch", head: "head2" }));
+    rerender(
+      viewedTab({ conversationId: "viewed-mismatch", head: "head2", patch: twoFilePatch("newer") }),
+    );
     expect(viewedBox("a.ts")).not.toBeChecked();
-    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
   });
 
-  it("clears the reset notice once a file is marked on the new head", () => {
-    const { rerender } = render(viewedTab({ conversationId: "viewed-new-mark", head: "head1" }));
+  it("clears the notice once every changed file is marked on the new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-new-mark", head: "head1", patch: twoFilePatch("new") }),
+    );
     fireEvent.click(viewedBox("a.ts"));
-    rerender(viewedTab({ conversationId: "viewed-new-mark", head: "head2" }));
-    expect(screen.getByText(/viewed marks were reset/)).toBeInTheDocument();
-
     fireEvent.click(viewedBox("b.ts"));
-    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
-    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+    rerender(
+      viewedTab({
+        conversationId: "viewed-new-mark",
+        head: "head2",
+        patch: twoFilePatch("newer", "z"),
+      }),
+    );
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+
+    fireEvent.click(viewedBox("a.ts"));
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+    fireEvent.click(viewedBox("b.ts"));
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.getByText("2 / 2 files viewed")).toBeInTheDocument();
   });
 
   it("keeps viewed marks when a poll returns the same head", () => {
@@ -706,7 +813,7 @@ describe("PullRequestChangesTab viewed files", () => {
 
     rerender(viewedTab({ conversationId: "viewed-same", head: "head1" }));
     expect(viewedBox("a.ts")).toBeChecked();
-    expect(screen.queryByText(/viewed marks were reset/)).toBeNull();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
     expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
   });
 
@@ -796,9 +903,11 @@ describe("PullRequestChangesTab viewed files", () => {
     expect(isCollapsed("a.ts")).toBe(true);
     expect(isCollapsed("b.ts")).toBe(true);
 
-    // H2 has a saved mark on a.ts, as if another tab marked it. Loading H2 keeps a.ts
+    // Another tab saved a mark on a.ts at head2. Loading H2 keeps a.ts
     // collapsed, and that collapse still belongs to the mark: a fresh H3 expands it again.
-    writeViewed(viewedStorageKey(window.location.origin, "alice", IDENTITY, "head2"), ["a.ts"]);
+    writeViewed(viewedStorageKey(window.location.origin, "alice", IDENTITY), {
+      "a.ts": [unverifiedPatchHash("head2")],
+    });
     rerender(viewedTab({ conversationId: "viewed-collapse", head: "head2" }));
     expect(viewedBox("a.ts")).toBeChecked();
     expect(isCollapsed("a.ts")).toBe(true);
@@ -853,7 +962,9 @@ describe("PullRequestChangesTab viewed files", () => {
 
   it("keeps a manual collapse made before identity loads when viewed files seed later", () => {
     const origin = window.location.origin;
-    writeViewed(viewedStorageKey(origin, "alice", IDENTITY, "head1"), ["a.ts"]);
+    writeViewed(viewedStorageKey(origin, "alice", IDENTITY), {
+      "a.ts": [unverifiedPatchHash("head1")],
+    });
     const { rerender } = render(
       viewedTab({ conversationId: "viewed-late-identity", identity: null }),
     );

@@ -1,7 +1,8 @@
-// Browser-local "viewed" marks for pull request files, scoped to one server,
-// user, pull request and head revision. Each head has its own storage key, so
-// a new head starts with no marks and writes for different heads never collide.
+// Browser-local viewed marks for a pull request's files. A mark records the hunk hash a file was
+// viewed at, so the file stays viewed on a new head while its hunks are unchanged. Marks are kept
+// per server, user and pull request, whichever head the reader is on.
 
+import type { FileDiffMetadata } from "@pierre/diffs";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 import { z } from "zod";
 import type { PullRequestAssociation } from "@/hooks/usePullRequests";
@@ -14,11 +15,18 @@ export type PullRequestIdentity = Pick<
   "provider" | "host" | "repository" | "number"
 >;
 
-const KEY_PREFIX = "omnigent:pr-viewed:v1:";
+/** The hunk hashes each marked file was viewed at, oldest first. */
+export type ViewedMarks = Record<string, string[]>;
+
+const KEY_PREFIX = "omnigent:pr-viewed:v2:";
+// Version 1 stored bare paths per head. Nothing reads it, and pruning removes it.
+const LEGACY_KEY_PREFIX = "omnigent:pr-viewed:v1:";
+const UNVERIFIED_PREFIX = "unverified:";
 const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 const MAX_ENTRIES = 500;
+const MAX_HASHES_PER_PATH = 3;
 
-function pullRequestKey(server: string, user: string, pr: PullRequestIdentity): string {
+export function viewedStorageKey(server: string, user: string, pr: PullRequestIdentity): string {
   return `${KEY_PREFIX}${JSON.stringify([
     server,
     user,
@@ -27,21 +35,94 @@ function pullRequestKey(server: string, user: string, pr: PullRequestIdentity): 
     pr.host.toLowerCase(),
     pr.repository.toLowerCase(),
     pr.number,
-  ])}|`;
+  ])}`;
 }
 
-export function viewedStorageKey(
-  server: string,
-  user: string,
-  pr: PullRequestIdentity,
-  headSha: string,
-): string {
-  return `${pullRequestKey(server, user, pr)}${headSha}`;
+/**
+ * Stands in for a file's hash when its hunks can't be compared: the file is missing from the patch,
+ * has no text hunks, or its hunks were cut short. It matches only on the head it was made for.
+ */
+export function unverifiedPatchHash(headSha: string): string {
+  return `${UNVERIFIED_PREFIX}${headSha}`;
+}
+
+function isVerified(hash: string): boolean {
+  return !hash.startsWith(UNVERIFIED_PREFIX);
+}
+
+/** A 53-bit string hash (cyrb53): synchronous, and the same in every browser. */
+function hashText(text: string): string {
+  let hashA = 0xdeadbeef;
+  let hashB = 0x41c6ce57;
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
+    hashA = Math.imul(hashA ^ code, 2654435761);
+    hashB = Math.imul(hashB ^ code, 1597334677);
+  }
+  hashA =
+    Math.imul(hashA ^ (hashA >>> 16), 2246822507) ^ Math.imul(hashB ^ (hashB >>> 13), 3266489909);
+  hashB =
+    Math.imul(hashB ^ (hashB >>> 16), 2246822507) ^ Math.imul(hashA ^ (hashA >>> 13), 3266489909);
+  return (4294967296 * (2097151 & hashB) + (hashA >>> 0)).toString(36);
+}
+
+/**
+ * The hunk headers and lines of one parsed file, each line with its diff marker. Null when the file
+ * has no hunks, or a hunk's lines disagree with its header, which means the patch was cut short.
+ */
+function hunkText(file: FileDiffMetadata): string | null {
+  // A file with no hunks (binary, pure rename) has nothing to compare.
+  if (!file.hunks?.length) return null;
+  const lines: string[] = [];
+  for (const hunk of file.hunks) {
+    const hunkLines: string[] = [];
+    let deletionTotal = 0;
+    let additionTotal = 0;
+    for (const part of hunk.hunkContent) {
+      if (part.type === "context") {
+        for (let offset = 0; offset < part.lines; offset++) {
+          hunkLines.push(` ${file.additionLines[part.additionLineIndex + offset]}`);
+        }
+        deletionTotal += part.lines;
+        additionTotal += part.lines;
+        continue;
+      }
+      for (let offset = 0; offset < part.deletions; offset++) {
+        hunkLines.push(`-${file.deletionLines[part.deletionLineIndex + offset]}`);
+      }
+      for (let offset = 0; offset < part.additions; offset++) {
+        hunkLines.push(`+${file.additionLines[part.additionLineIndex + offset]}`);
+      }
+      deletionTotal += part.deletions;
+      additionTotal += part.additions;
+    }
+    if (deletionTotal !== hunk.deletionCount || additionTotal !== hunk.additionCount) return null;
+    lines.push(
+      `@@ -${hunk.deletionStart},${hunk.deletionCount} +${hunk.additionStart},${hunk.additionCount} @@`,
+      ...hunkLines,
+    );
+  }
+  return lines.join("\n");
+}
+
+/**
+ * The hash of each parsed file's hunks, keyed by the parser's file name. Files without comparable
+ * hunks are left out. Pass the map the Changes tab renders from, before any diff is expanded.
+ */
+export function patchFileHashes(
+  filesByPath: ReadonlyMap<string, FileDiffMetadata>,
+): ReadonlyMap<string, string> {
+  const hashes = new Map<string, string>();
+  for (const [path, file] of filesByPath) {
+    const text = hunkText(file);
+    if (text !== null) hashes.set(path, hashText(text));
+  }
+  return hashes;
 }
 
 const storedSchema = z.object({
-  v: z.literal(1),
-  paths: z.array(z.string()),
+  v: z.literal(2),
+  marks: z.record(z.string(), z.array(z.string())),
   updatedAt: z.number(),
 });
 
@@ -61,6 +142,10 @@ function subscribe(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+function isStoredKey(key: string): boolean {
+  return key.startsWith(KEY_PREFIX) || key.startsWith(LEGACY_KEY_PREFIX);
+}
+
 if (typeof window !== "undefined") {
   // Other tabs' writes arrive only as `storage` events; a null key means storage.clear().
   window.addEventListener("storage", (event) => {
@@ -70,12 +155,13 @@ if (typeof window !== "undefined") {
       // Unreadable storage: treat the event as ours and re-read.
     }
     if (event.key === null) memoryFallback.clear();
-    else if (event.key.startsWith(KEY_PREFIX)) memoryFallback.delete(event.key);
+    else if (isStoredKey(event.key)) memoryFallback.delete(event.key);
     else return;
     notify();
   });
 }
 
+/** The entry under `key`, or null when it is absent, unreadable or not a version 2 entry. */
 function readStored(key: string): z.infer<typeof storedSchema> | null {
   try {
     const raw = memoryFallback.get(key) ?? window.localStorage.getItem(key);
@@ -86,8 +172,8 @@ function readStored(key: string): z.infer<typeof storedSchema> | null {
   }
 }
 
-export function readViewed(key: string): Set<string> {
-  return new Set(readStored(key)?.paths);
+function readMarks(key: string): ViewedMarks {
+  return readStored(key)?.marks ?? {};
 }
 
 function storedKeys(): string[] {
@@ -95,7 +181,7 @@ function storedKeys(): string[] {
   try {
     for (let position = 0; position < window.localStorage.length; position++) {
       const key = window.localStorage.key(position);
-      if (key?.startsWith(KEY_PREFIX)) keys.add(key);
+      if (key !== null && isStoredKey(key)) keys.add(key);
     }
   } catch {
     // Unreadable storage: only in-memory values are known.
@@ -103,11 +189,14 @@ function storedKeys(): string[] {
   return [...keys];
 }
 
-/** Evict other entries past the age and count limits; corrupt entries count as oldest. */
-function pruneEntries(currentKey: string, now: number): void {
+/**
+ * Removes entries past the age or count limit, and every version 1 entry, which is never read.
+ * Unreadable entries count as oldest. `keepKey` is never removed.
+ */
+function pruneEntries(keepKey: string, now: number): void {
   // Parses every stored entry per write; cache their ages if this shows up in profiles.
   const entries = storedKeys()
-    .filter((key) => key !== currentKey && !memoryFallback.has(key))
+    .filter((key) => key !== keepKey && !memoryFallback.has(key))
     .map((key) => [key, readStored(key)?.updatedAt ?? -Infinity] as const)
     .sort((a, b) => b[1] - a[1]);
   try {
@@ -121,13 +210,10 @@ function pruneEntries(currentKey: string, now: number): void {
   }
 }
 
-/**
- * Store the viewed paths under `key`; keeps them in memory if storage fails. localStorage
- * is not atomic across tabs, so two tabs writing one head within milliseconds can lose a change.
- */
-export function writeViewed(key: string, paths: Iterable<string>): { persisted: boolean } {
+/** Store a pull request's marks under `key`. Keeps them in memory if storage fails. */
+export function writeViewed(key: string, marks: ViewedMarks): { persisted: boolean } {
   const updatedAt = Date.now();
-  const value = JSON.stringify({ v: 1, paths: [...new Set(paths)], updatedAt });
+  const value = JSON.stringify({ v: 2, marks, updatedAt });
   pruneEntries(key, updatedAt);
   let persisted = true;
   try {
@@ -141,93 +227,105 @@ export function writeViewed(key: string, paths: Iterable<string>): { persisted: 
   return { persisted };
 }
 
+/** Viewed when the current hash was marked; changed when it was marked only at other hashes. */
+function classify(
+  marks: ViewedMarks,
+  fingerprintOf: (path: string) => string,
+): { viewed: Set<string>; changed: Set<string> } {
+  const viewed = new Set<string>();
+  const changed = new Set<string>();
+  for (const [path, hashes] of Object.entries(marks)) {
+    const current = fingerprintOf(path);
+    if (hashes.includes(current)) viewed.add(path);
+    else if (hashes.length > 0 && isVerified(current)) changed.add(path);
+  }
+  return { viewed, changed };
+}
+
 interface ViewedSnapshot {
   /** False until server, user, PR and head are known; mutations do nothing meanwhile. */
   available: boolean;
+  /** Marked files whose current hunks match a hash they were viewed at. */
   viewed: ReadonlySet<string>;
-  /** True while marks were changed on another head of this PR but never on this one. */
-  resetNotice: boolean;
-  /** False while the marks live only in memory because storage failed. */
+  /**
+   * Marked files whose current hunks match none of their marked hashes. Covers files outside the
+   * PR's list too, so callers show only the ones they render.
+   */
+  changed: ReadonlySet<string>;
+  /** False while the marks come only from memory because storage failed. */
   persisted: boolean;
 }
 
 const UNAVAILABLE: ViewedSnapshot = {
   available: false,
   viewed: new Set(),
-  resetNotice: false,
+  changed: new Set(),
   persisted: true,
 };
 
 /** A `useSyncExternalStore` reader that returns the same snapshot until the store changes. */
-function snapshotReader(pullRequest: string | null, headSha: string | null): () => ViewedSnapshot {
-  if (pullRequest === null || headSha === null) return () => UNAVAILABLE;
-  const key = `${pullRequest}${headSha}`;
+function snapshotReader(
+  storageKey: string | null,
+  head: string | null,
+  fingerprintOf: (path: string) => string,
+): () => ViewedSnapshot {
+  if (storageKey === null || head === null) return () => UNAVAILABLE;
   let seenVersion = -1;
   let snapshot = UNAVAILABLE;
   return () => {
     if (seenVersion !== version) {
       seenVersion = version;
-      const stored = readStored(key);
-      snapshot = {
-        available: true,
-        viewed: new Set(stored?.paths),
-        resetNotice:
-          stored === null &&
-          storedKeys().some(
-            (other) => other.startsWith(pullRequest) && other !== key && readStored(other),
-          ),
-        persisted: !memoryFallback.has(key),
-      };
+      const { viewed, changed } = classify(readMarks(storageKey), fingerprintOf);
+      snapshot = { available: true, viewed, changed, persisted: !memoryFallback.has(storageKey) };
     }
     return snapshot;
   };
 }
 
+/**
+ * Viewed state for the pull request. `patchHashes` holds each file's hash in the patch fetched for
+ * `headSha` (see `patchFileHashes`); a file missing from it is unverified.
+ */
 export function useViewedFiles(
   pr: PullRequestIdentity | null,
   headSha: string | null,
-): ViewedSnapshot & {
-  toggle: (path: string) => void;
-  setMany: (paths: string[], viewed: boolean) => void;
-} {
+  patchHashes: ReadonlyMap<string, string>,
+): ViewedSnapshot & { setMany: (paths: string[], viewed: boolean) => void } {
   const server = getOmnigentServerIdentity();
   const user = useViewerId();
-  const pullRequest = server && user && pr ? pullRequestKey(server, user, pr) : null;
+  const storageKey = server && user && pr ? viewedStorageKey(server, user, pr) : null;
   const head = headSha || null;
-  const getSnapshot = useMemo(() => snapshotReader(pullRequest, head), [pullRequest, head]);
+  const fingerprintOf = useMemo(
+    () => (path: string) => patchHashes.get(path) ?? unverifiedPatchHash(head ?? ""),
+    [patchHashes, head],
+  );
+  const getSnapshot = useMemo(
+    () => snapshotReader(storageKey, head, fingerprintOf),
+    [storageKey, head, fingerprintOf],
+  );
   const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 
-  const update = useCallback(
-    (change: (paths: Set<string>) => void) => {
-      if (pullRequest === null || head === null) return;
-      const key = `${pullRequest}${head}`;
-      // Start from storage so back-to-back calls and other tabs' writes are not lost.
-      const before = readViewed(key);
-      const after = new Set(before);
-      change(after);
-      // Skipping no-op writes keeps "this head has a record" meaning "marks were changed here".
-      if (after.size === before.size && [...after].every((path) => before.has(path))) return;
-      writeViewed(key, after);
-    },
-    [pullRequest, head],
-  );
-  const toggle = useCallback(
-    (path: string) =>
-      update((paths) => {
-        if (!paths.delete(path)) paths.add(path);
-      }),
-    [update],
-  );
   const setMany = useCallback(
-    (paths: string[], viewed: boolean) =>
-      update((viewedPaths) => {
-        for (const path of paths) {
-          if (viewed) viewedPaths.add(path);
-          else viewedPaths.delete(path);
-        }
-      }),
-    [update],
+    (paths: string[], viewed: boolean) => {
+      if (storageKey === null || head === null) return;
+      // Read what is stored now, so back-to-back calls and other tabs' writes are not lost.
+      const after = new Map(Object.entries(readMarks(storageKey)));
+      let modified = false;
+      for (const path of paths) {
+        const hash = fingerprintOf(path);
+        const hashes = after.get(path) ?? [];
+        if (hashes.includes(hash) === viewed) continue;
+        modified = true;
+        // Only the current head's hash moves, so marks recorded at other heads stay as they are.
+        const remaining = hashes.filter((stored) => stored !== hash);
+        const next = viewed ? [...remaining, hash].slice(-MAX_HASHES_PER_PATH) : remaining;
+        if (next.length > 0) after.set(path, next);
+        else after.delete(path);
+      }
+      if (modified) writeViewed(storageKey, Object.fromEntries(after));
+    },
+    [storageKey, head, fingerprintOf],
   );
 
-  return useMemo(() => ({ ...snapshot, toggle, setMany }), [snapshot, toggle, setMany]);
+  return useMemo(() => ({ ...snapshot, setMany }), [snapshot, setMany]);
 }
