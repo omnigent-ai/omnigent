@@ -1148,3 +1148,22 @@ def test_spawn_scan_leaves_concurrent_appends_for_the_next_poll(
         "toolu_first",
         "toolu_later",
     }
+
+
+@pytest.mark.parametrize("separator", ["\x85", "\u2028", "\u2029"], ids=["nel", "ls", "ps"])
+def test_spawn_scan_accepts_unicode_separators_inside_json_strings(
+    tmp_path: Path, separator: str
+) -> None:
+    """JSON string separators belong to the record rather than delimit records."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            _spawn_record("toolu_unicode", f"before{separator}after", sidechain=False),
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    assert forwarder._tool_use_ids_in_transcript(transcript_path, include_sidechains=False) == {
+        "toolu_unicode"
+    }
