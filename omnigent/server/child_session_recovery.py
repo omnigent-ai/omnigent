@@ -13,7 +13,8 @@ import cachetools
 import httpx
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
-from omnigent.entities import Conversation
+from omnigent.entities import Conversation, PagedList
+from omnigent.errors import restart_on_stale_cursor
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
@@ -29,8 +30,8 @@ _logger = logging.getLogger(__name__)
 RECOVERY_STORE_CONCURRENCY = 8
 # A release reads the session and its ancestors within the routing-host lookup budget.
 _RELEASE_MAX_READS = 16
-# A deeper lineage is finished from one spawn-tree read of at most this many rows.
-_RELEASE_SPAWN_TREE_CAP = 2000
+# A deeper lineage is finished from spawn-tree pages of at most this many rows.
+_RELEASE_SPAWN_TREE_PAGE = 2000
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
@@ -79,23 +80,31 @@ async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> 
         await asyncio.to_thread(store.delete_label, session_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
 
 
+@restart_on_stale_cursor
 async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
     """When *session_id* is given work, end its hold and those of ancestors that recover it."""
     seen: set[str] = set()
     child: Conversation | None = None
     next_id: str | None = session_id
-    spawn_tree: dict[str, Conversation] | None = None
+    spawn_tree: dict[str, Conversation] = {}
+    page: PagedList[Conversation] | None = None
     while next_id is not None and next_id not in seen:
         if child is None or len(seen) < _RELEASE_MAX_READS:
             conv = await asyncio.to_thread(store.get_conversation, next_id)
         else:
-            if spawn_tree is None:
+            # Pages follow the tree's id index, so read on until the ancestor or the tree ends.
+            while next_id not in spawn_tree and (page is None or page.has_more):
                 page = await asyncio.to_thread(
-                    store.list_spawn_tree,
-                    child.root_conversation_id,
-                    limit=_RELEASE_SPAWN_TREE_CAP,
+                    store.list_conversations,
+                    limit=_RELEASE_SPAWN_TREE_PAGE,
+                    after=page.last_id if page is not None else None,
+                    kind=None,
+                    include_archived=True,
+                    root_conversation_id=child.root_conversation_id,
+                    order="asc",
+                    sort_by="id",
                 )
-                spawn_tree = {row.id: row for row in page.data}
+                spawn_tree.update((row.id, row) for row in page.data)
             conv = spawn_tree.get(next_id)
         if conv is None or (child is not None and conv.runner_id != child.runner_id):
             return

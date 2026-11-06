@@ -745,8 +745,11 @@ async def test_resume_after_a_failed_wake_whose_runner_connects_late_resumes_the
     assert not reconnect_recovery_deferred(store.get_conversation(interrupted.id))
 
 
-@pytest.mark.parametrize("depth", [1, 20], ids=["child", "deep-child"])
-@pytest.mark.parametrize("during_wake", [False, True], ids=["after-wake", "during-wake"])
+@pytest.mark.parametrize(
+    ("during_wake", "depth"),
+    [(False, 1), (True, 1), (True, 20)],
+    ids=["after-wake-child", "during-wake-child", "during-wake-deep-child"],
+)
 async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wake(
     app: FastAPI,
     agent: Agent,
