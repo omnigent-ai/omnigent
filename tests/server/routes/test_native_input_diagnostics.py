@@ -215,6 +215,70 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
     assert saved[record.attributes["error_item_id"]].data.code == "native_prompt_not_recorded"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "stage"),
+    [
+        ({"code": "required_terminal_exited"}, "native_turn_failed"),
+        ({"code": "native_input_rejected", "undelivered": True}, "rejected_before_handoff"),
+    ],
+)
+async def test_skipped_input_whose_turn_failed_does_not_add_a_second_error(
+    db_uri: str,
+    caplog: pytest.LogCaptureFixture,
+    error: dict[str, object],
+    stage: str,
+) -> None:
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "claude-native-ui"})
+    first = pending_inputs.record(
+        conv.id, [{"type": "input_text", "text": "lost in the crash"}], stable_id="a" * 32
+    )
+    pending_inputs.record(conv.id, [{"type": "input_text", "text": "later"}], stable_id="b" * 32)
+    _record_native_input_lifecycle(
+        conv.id,
+        {
+            "type": "response.failed",
+            "input_stable_id": "a" * 32,
+            "response": {"id": "resp_failed", "error": error},
+        },
+    )
+    caplog.set_level(logging.INFO)
+
+    await _persist_external_conversation_item(
+        conv.id,
+        conv,
+        SessionEventInput(
+            type="external_conversation_item",
+            data={
+                "item_type": "message",
+                "item_data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "later"}],
+                },
+                "response_id": "resp_later",
+                "source_id": "native:later-record:0",
+            },
+        ),
+        store,
+    )
+
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_settled"
+        and record.attributes.get("pending_id") == first
+    ]
+    assert record.attributes["outcome"] == "skipped_after_failed_turn"
+    assert record.attributes["last_delivery_stage"] == stage
+    assert "error_item_id" not in record.attributes
+    items = store.list_items(conv.id).data
+    [lost] = [item for item in items if item.id == record.attributes["item_id"]]
+    assert lost.data.content[0]["text"] == "lost in the crash"
+    assert lost.response_id == record.attributes["response_id"] == "resp_failed"
+    assert not [item for item in items if item.type == "error"]
+
+
 @pytest.mark.parametrize("invalid_key", ["input_stable_id", "pending_id", "delivery_attempt_id"])
 def test_malformed_lifecycle_identity_does_not_fall_back_to_another_identifier(
     invalid_key: str,

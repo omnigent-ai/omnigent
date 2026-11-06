@@ -3240,15 +3240,16 @@ async def _persist_external_conversation_item_unlocked(
         item = item.model_copy(update={"replaces_pending_id": drained.stable_id})
     # Build the batch: skipped entries first (their positions must precede
     # the matched item to match broadcast order), then the anchor. Each
-    # skipped entry gets a pair of items (user message + error) with stable
-    # IDs derived from pending_id, so the whole batch is idempotent under the
-    # append lock. A drain reports at most ``pending_inputs.
-    # _MAX_ENTRIES_PER_CONVERSATION`` skipped entries, so one append writes at
-    # most ``2 * cap + 1`` rows whatever state a rolled-back drain left the
-    # queue in. A concurrent retry that slipped past the probe above comes
-    # back deduplicated and its queue entries are unheld.
+    # skipped entry gets a group of items (user message, plus an error unless
+    # its turn already failed) with stable IDs derived from pending_id, so the
+    # whole batch is idempotent under the append lock. A drain reports at most
+    # ``pending_inputs._MAX_ENTRIES_PER_CONVERSATION`` skipped entries, so one
+    # append writes at most ``2 * cap + 1`` rows whatever state a rolled-back
+    # drain left the queue in. A concurrent retry that slipped past the probe
+    # above comes back deduplicated and its queue entries are unheld.
     try:
-        skipped_new_items = _build_skipped_native_items(session_id, conv, skipped_pending)
+        skipped_groups = _build_skipped_native_items(session_id, conv, skipped_pending)
+        skipped_new_items = [entry_item for group in skipped_groups for entry_item in group]
         batch = [*skipped_new_items, item, *claude_subagent_completion_markers(item)]
         pending_background_title = prepare_background_session_title(
             coordinator=background_title_coordinator,
@@ -3284,23 +3285,29 @@ async def _persist_external_conversation_item_unlocked(
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
-    # Not a duplicate: publish side effects for each skipped pair. Items are
-    # [user0, error0, user1, error1, ...]; 2 per skipped entry. The consumed
-    # event names each skipped entry so clients settle those bubbles in order
-    # before the matched message's own receipt arrives.
-    for i, skipped in enumerate(skipped_pending):
-        persisted_user = persisted_items[i * 2]
-        persisted_error = persisted_items[i * 2 + 1]
+    # Not a duplicate: publish side effects for each skipped group, laid out
+    # in queue order as [user, error?] per entry. The consumed event names each
+    # skipped entry so clients settle those bubbles in order before the matched
+    # message's own receipt arrives.
+    offset = 0
+    for skipped, group in zip(skipped_pending, skipped_groups, strict=True):
+        persisted_user = persisted_items[offset]
+        persisted_error = persisted_items[offset + 1] if len(group) > 1 else None
+        offset += len(group)
         if not persisted_user.deduplicated:
             log_input_event(
                 _logger,
                 "native_input_settled",
                 session_id=session_id,
                 attributes=pending_inputs.delivery_attributes(skipped),
-                outcome="skipped_without_native_record",
+                outcome=(
+                    "skipped_without_native_record"
+                    if persisted_error is not None
+                    else "skipped_after_failed_turn"
+                ),
                 item_id=persisted_user.id,
-                error_item_id=persisted_error.id,
-                response_id=persisted_error.response_id,
+                **({"error_item_id": persisted_error.id} if persisted_error is not None else {}),
+                response_id=persisted_user.response_id,
                 matched_item_id=persisted.id,
                 matched_response_id=persisted.response_id,
                 matched_pending_id=cleared_pending_id,
@@ -3309,7 +3316,8 @@ async def _persist_external_conversation_item_unlocked(
             _publish_input_consumed(
                 session_id, persisted_user, cleared_pending_id=skipped.pending_id
             )
-            _publish_external_conversation_item(session_id, persisted_error)
+            if persisted_error is not None:
+                _publish_external_conversation_item(session_id, persisted_error)
     if drained is not None:
         log_input_event(
             _logger,
@@ -3659,18 +3667,26 @@ def _release_drained_inputs(
             pending_inputs.release(session_id, entry)
 
 
+# Lifecycle stages whose turn already persisted its own error item, so a later
+# match that skips the input must not add a second "never recorded" error.
+_FAILED_TURN_DELIVERY_STAGES = frozenset({"native_turn_failed", "rejected_before_handoff"})
+
+
 def _build_skipped_native_items(
     session_id: str,
     conv: Conversation,
     skipped_entries: list[pending_inputs.DrainedInput],
-) -> list[NewConversationItem]:
+) -> list[list[NewConversationItem]]:
     """
-    Build ``NewConversationItem`` pairs for web inputs the native TUI never recorded.
+    Build ``NewConversationItem`` groups for web inputs the native TUI never recorded.
 
     Each skipped entry produces ``[user_message, error_item]``: the message the
     person sent, followed by an error saying the harness never recorded it, so
-    the transcript keeps the lost message instead of silently dropping it.
-    Stable IDs derived from ``pending_id`` make each pair idempotent under the
+    the transcript keeps the lost message instead of silently dropping it. An
+    entry whose own turn already failed (see :data:`_FAILED_TURN_DELIVERY_STAGES`)
+    produces only ``[user_message]`` in that turn's response: the turn's error
+    item already reported the failure, so a second error would be a duplicate.
+    Stable IDs derived from ``pending_id`` make each group idempotent under the
     batch append so no pre-flight has_item probe is needed — if the anchor item
     is already persisted (a forwarder retry), these items are too, and append
     returns the whole batch deduplicated.
@@ -3678,7 +3694,8 @@ def _build_skipped_native_items(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param conv: Conversation row, used to name the harness in the error.
     :param skipped_entries: Older queue entries skipped by a text-matched drain.
-    :returns: The item pairs in queue order, empty when nothing was skipped.
+    :returns: One item group per skipped entry in queue order, empty when
+        nothing was skipped.
     """
     if not skipped_entries:
         return []
@@ -3699,10 +3716,15 @@ def _build_skipped_native_items(
             "accepting a later one, so it was not delivered. The native terminal may "
             "have shown the underlying error."
         )
-    items: list[NewConversationItem] = []
+    groups: list[list[NewConversationItem]] = []
     for skipped in skipped_entries:
-        turn_id = generate_task_id()
-        items.append(
+        turn_failed = skipped.last_delivery_stage in _FAILED_TURN_DELIVERY_STAGES
+        turn_id = (
+            skipped.lifecycle_response_id
+            if turn_failed and skipped.lifecycle_response_id is not None
+            else generate_task_id()
+        )
+        group = [
             NewConversationItem(
                 type="message",
                 response_id=turn_id,
@@ -3714,19 +3736,21 @@ def _build_skipped_native_items(
                 ).hex,
                 replaces_pending_id=skipped.stable_id,
             )
-        )
-        items.append(
-            NewConversationItem(
-                type="error",
-                response_id=turn_id,
-                data=ErrorData(source="execution", code=code, message=message),
-                stable_id=uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
-                ).hex,
+        ]
+        if not turn_failed:
+            group.append(
+                NewConversationItem(
+                    type="error",
+                    response_id=turn_id,
+                    data=ErrorData(source="execution", code=code, message=message),
+                    stable_id=uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"omnigent-skipped-{harness_key}-error:{session_id}:{skipped.pending_id}",
+                    ).hex,
+                )
             )
-        )
-    return items
+        groups.append(group)
+    return groups
 
 
 async def _enrich_terminal_status_with_subagent_output(
