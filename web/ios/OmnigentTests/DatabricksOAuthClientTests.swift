@@ -88,7 +88,13 @@ final class DatabricksOAuthClientTests: XCTestCase {
         code: "code", for: server.attempt())
       XCTFail("Expected network failure")
     } catch {
-      XCTAssertEqual(error as? DatabricksOAuthError, .networkUnavailable)
+      // Only the domain and code survive, so the message names the failure without the URL.
+      XCTAssertEqual(
+        error as? DatabricksOAuthError,
+        .networkUnavailable(DatabricksTransportFailure(URLError(.notConnectedToInternet))))
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Could not reach Databricks. Please try again. (NSURLErrorDomain -1009)")
     }
   }
 
