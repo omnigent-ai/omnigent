@@ -497,9 +497,11 @@ sequenceDiagram
 ### Browser previews on this machine
 
 Sessions running on this desktop machine can open HTTP(S) `localhost`,
-`127.0.0.1`, and `[::1]` through the address bar, opted-in chat/file links,
-and the agent's browser tools. Start the app locally, open **+** > **Browser**,
-and enter its URL. `localhost` always names the desktop machine.
+`127.0.0.1`, `[::1]`, and `*.localhost` subdomains such as
+`spog.dev.localhost` through the address bar, opted-in chat/file links, and
+the agent's browser tools. Start the app locally, open **+** > **Browser**,
+and enter its URL. `localhost` and its subdomains always name the desktop
+machine; the page still receives the subdomain in its `Host` header.
 
 Main verifies this machine's current host identity and a live host daemon
 record enrolled with the window's server. That enrollment is the trust boundary:
@@ -519,9 +521,14 @@ Other remote and unknown sessions have public-only **document** access. Use a
 public preview URL or your regular browser.
 
 Eligibility is per view: a public page in an eligible view can frame loopback
-documents too. Private networks, link-local/metadata addresses, `*.localhost`,
-`0.0.0.0`, and DNS aliases resolving to loopback remain blocked. Normal TLS,
-CORS, authentication, and local-network permission rules still apply.
+documents too. A `*.localhost` request is sent only on a direct route and must
+connect to a loopback address. Chromium already sends these names around
+ordinary system and PAC proxies; a proxy rule that removes that bypass
+(`<-loopback>`) leaves the page blank. Private networks,
+link-local/metadata addresses, `0.0.0.0`, trailing-dot or empty-label forms
+such as `app.localhost.`, and DNS aliases resolving to loopback remain blocked.
+Normal TLS, CORS, authentication, and local-network permission rules still
+apply.
 
 Hide/reopen the Workspace or switch tabs to retain a page without reloading.
 Closing the tab destroys it. User-created Browser tabs are separate from the
@@ -563,8 +570,9 @@ A decline briefly suppresses repeat prompts, while failed runs remain retryable.
 **Run on Arca** is hidden for an online remembered host only when the desktop
 advertises preview recovery; older shells keep the action visible.
 
-The exception covers HTTP(S) `localhost`, `127.0.0.1`, and `[::1]`, including
-redirects and links that would open a new window (which stay in the same pane).
+The exception covers HTTP(S) `localhost`, `127.0.0.1`, `[::1]`, and
+`*.localhost` subdomains, including redirects and links that would open a new
+window (which stay in the same pane).
 Other loopback addresses, private-network and metadata destinations, hostnames
 that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
@@ -630,7 +638,7 @@ including the address bar, chat links, and agent actions, enforces this policy.
   "Copy Link Address".
 - `src/browserUrlPolicy.js` — the browser navigation policy: http(s) only, and
   no private, link-local, metadata, or other non-public address in
-  any literal form, except exact loopback hosts for eligible views. A
+  any literal form, except loopback names for eligible views. A
   hostname is resolved through the view's Chromium session and refused if it
   does not resolve or any address is non-public. `main.js` also applies the
   policy to every HTTP(S) and WebSocket request of a policy-enforced view through
@@ -641,8 +649,13 @@ including the address bar, chat links, and agent actions, enforces this policy.
   tab makes sibling service-worker requests public-only until it navigates
   with an eligible context. Every guarded request to a named host resolves DNS
   through its partition before sending, including GET/HEAD subresources and
-  WebSockets. IP literals use the URL check without DNS. Exact loopback hosts
-  remain available to eligible Arca and this-machine sessions. Enforcement cancels requests and
+  WebSockets. IP literals use the URL check without DNS. Loopback names
+  (`localhost`, `127.0.0.1`, `[::1]`, and `*.localhost`) remain available to
+  eligible Arca and this-machine sessions without DNS. A `*.localhost` request
+  is cancelled before sending unless the partition's proxy lookup returns
+  `DIRECT` alone, and its response must come from a loopback address on a
+  route that is still direct, since a local proxy also answers from loopback.
+  Enforcement cancels requests and
   keeps the view open.
   Guarded HTTP requests skip cache reads to obtain connected-address metadata;
   a response whose address is missing
@@ -651,7 +664,11 @@ including the address bar, chat links, and agent actions, enforces this policy.
   network round trips and may increase latency and bandwidth. WebSocket upgrades
   can omit the connected IP; those repeat the partition DNS check at the 101
   response. This is not connected-IP verification and cannot rule out a DNS
-  change between check and connection. Limits: a DNS
+  change between check and connection. An IP-less `*.localhost` upgrade
+  repeats the direct-route check instead, because Chromium pins those names to
+  loopback and only a proxy could route them elsewhere. The route lookup uses
+  the WebSocket's own `ws:`/`wss:` URL, because Chromium can pick a different
+  proxy for it (an `https=` rule) than for plain HTTP. Limits: a DNS
   change between preflight and connection can still send a request to a private
   address; the HTTP response check prevents the page from reading its response.
   Pages restored from the back-forward cache and navigations answered by a service worker make no
@@ -754,9 +771,9 @@ the native view); no server flag.
 All renderer IPC navigation uses the same URL policy, including the URL bar.
 A renderer's `agent: false` flag does not exempt a tab from address checks.
 Main-owned eligibility for sessions on this machine and verified Arca sessions
-applies to exact loopback hosts. Other internal sites must be opened in a
-separate browser; this also keeps later redirects in these tabs under the same
-policy.
+applies to loopback names, including `*.localhost`. Other internal sites must
+be opened in a separate browser; this also keeps later redirects in these tabs
+under the same policy.
 
 **Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
 (Google sign-in is the common one) can't be signed in from this pane, so the
