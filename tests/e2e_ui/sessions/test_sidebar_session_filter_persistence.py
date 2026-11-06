@@ -11,7 +11,7 @@ against a live server: seed an owned session and a shared one over the REST
 API, pick a filter through the live funnel, reload the browser, and assert
 the list is still scoped and the radio item still reads checked.
 
-Also covered is the read-side guard. "Shared sessions" is dropped from the
+Also covered is the read-side guard. "Shared with me" is dropped from the
 menu on a loopback-only server (one user, so the slice is meaningless), so a
 value stored against a multi-user server must not be honored there — it would
 scope the list to a slice with no menu entry to leave it by. That half runs
@@ -190,7 +190,7 @@ def test_stored_shared_filter_is_dropped_on_a_single_user_server(
 ) -> None:
     """A persisted "shared" doesn't strand the viewer on a single-user server.
 
-    ``live_server`` is loopback-only, so the funnel drops "Shared sessions" —
+    ``live_server`` is loopback-only, so the funnel drops "Shared with me" —
     there's one user and the slice is meaningless. Seeding the stored value
     that a multi-user server would have written (or a hand-edited entry) must
     therefore fall back to the "My sessions" default: honoring it would scope
