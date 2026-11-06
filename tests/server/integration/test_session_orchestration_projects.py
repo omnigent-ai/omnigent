@@ -27,9 +27,12 @@ from tests.server.integration.test_sessions_permissions import _create_session_a
 pytestmark = pytest.mark.asyncio
 
 
-@pytest.fixture(autouse=True)
-def orchestration_environment(monkeypatch):
-    monkeypatch.setenv("OMNIGENT_FEATURES", "sibling_sessions")
+@pytest.fixture(autouse=True, params=[False, True], ids=["standalone", "nested"])
+def orchestration_environment(monkeypatch, request):
+    monkeypatch.setenv(
+        "OMNIGENT_FEATURES", "sibling_sessions" if request.param else "-sibling_sessions"
+    )
+    return request.param
 
 
 @pytest.fixture
@@ -58,8 +61,10 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
-async def _start_worker(auth_client, auth_app, db_uri, monkeypatch, source) -> str:
-    """Start a managed worker through the real ``sys_session_create`` tool."""
+async def _start_worker(
+    auth_client, auth_app, db_uri, monkeypatch, source, *, body: dict | None = None
+) -> str:
+    """Use the MCP tool, or its create route for explicit project overrides."""
     from omnigent.server.routes.sessions import routes_core
 
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
@@ -71,18 +76,27 @@ async def _start_worker(auth_client, auth_app, db_uri, monkeypatch, source) -> s
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     try:
-        result = json.loads(
-            await execute_tool(
-                tool_name="sys_session_create",
-                arguments=json.dumps(
-                    {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
-                ),
-                server_client=auth_client,
-                conversation_id=source["id"],
+        if body is None:
+            result = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_create",
+                    arguments=json.dumps(
+                        {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
+                    ),
+                    server_client=auth_client,
+                    conversation_id=source["id"],
+                )
             )
-        )
-        assert "error" not in result, result
-        worker_id = result["conversation_id"]
+            assert "error" not in result, result
+            worker_id = result["conversation_id"]
+        else:
+            response = await auth_client.post(
+                "/v1/sessions/orchestrated",
+                headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+                json={"agent_id": source["agent_id"], "host_type": "managed", **body},
+            )
+            assert response.status_code == 201, response.text
+            worker_id = response.json()["id"]
         await asyncio.wait_for(launched.wait(), timeout=2)
     finally:
         await auth_app.state.startup_inputs.shutdown()
@@ -108,7 +122,7 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
 @pytest.mark.parametrize("filed", [True, False])
 @pytest.mark.parametrize("child_sender", [True, False])
 async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
-    auth_client, auth_app, db_uri, monkeypatch, filed, child_sender
+    auth_client, auth_app, db_uri, monkeypatch, filed, child_sender, orchestration_environment
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
@@ -135,23 +149,32 @@ async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
 
     worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
     assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == sender["id"]
-    assert worker.family_id == source["id"]
+    assert worker.family_id == (source["id"] if orchestration_environment else None)
     assert worker.parent_conversation_id is None
-    assert worker.project_id == project_id
+    assert worker.project_id == (
+        project_id if orchestration_environment or not child_sender else None
+    )
     # Only the filing carries over: the worker keeps its own agent and placement.
     assert worker.agent_id == source["agent_id"]
     assert worker.workspace != "/project-default"
     assert worker.git_branch is None
 
 
-async def test_worker_rejects_unavailable_source_project(
-    auth_client, auth_app, db_uri, monkeypatch
+async def test_worker_handles_unavailable_source_project(
+    auth_client, auth_app, db_uri, monkeypatch, orchestration_environment
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
     await _file(auth_client, db_uri, source["id"], await _project(auth_client, "Triage"))
     # The source still points at a project the owner can no longer read.
     monkeypatch.setattr(SqlAlchemyProjectStore, "get", lambda self, pid, *, user_id: None)
+
+    if not orchestration_environment:
+        worker_id = await _start_worker(auth_client, auth_app, db_uri, monkeypatch, source)
+        worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
+        assert worker.project_id is None
+        assert worker.family_id is None
+        return
 
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
     response = await auth_client.post(
@@ -164,14 +187,23 @@ async def test_worker_rejects_unavailable_source_project(
 
 
 @pytest.mark.parametrize("requested", ["other", "none"])
-async def test_nested_worker_cannot_choose_a_different_project(
-    auth_client, auth_app, db_uri, monkeypatch, requested
+async def test_worker_project_override_requires_standalone_mode(
+    auth_client, auth_app, db_uri, monkeypatch, requested, orchestration_environment
 ):
     auth_client.headers["X-Forwarded-Email"] = "alice"
     source = await _create_session_as(auth_client, "", "alice")
     await _file(auth_client, db_uri, source["id"], await _project(auth_client, "Triage"))
     other = await _project(auth_client, "Elsewhere")
     project_id = other if requested == "other" else None
+
+    if not orchestration_environment:
+        worker_id = await _start_worker(
+            auth_client, auth_app, db_uri, monkeypatch, source, body={"project_id": project_id}
+        )
+        worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
+        assert worker.project_id == project_id
+        assert worker.family_id is None
+        return
 
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
     response = await auth_client.post(

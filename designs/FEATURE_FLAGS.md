@@ -66,8 +66,10 @@ after a page reload; stale clients are still refused by the server.
 Disabling nested agents stops new sibling admission, without cancelling accepted
 work or removing existing families. Keep shared-sandbox retention enabled: those
 protections apply to any sessions sharing compute, regardless of the flag.
-MCP child creation and ordinary user-created roots remain available; MCP
-`same_host` and `managed` placements fail without falling back to a root.
+MCP child creation and ordinary user-created roots remain available. MCP
+`same_host` and `managed` placements create private standalone sessions while
+the flag is off. Disable `session_orchestration` separately to stop independent
+MCP creation and peer messages.
 
 1. Deploy an immutable image with `-feature_name` in `OMNIGENT_FEATURES` to
    explicitly disable the feature, including one that defaults on.

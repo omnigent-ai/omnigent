@@ -220,7 +220,8 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
 
 
-Workers created with `sys_session_create` on the same host or a new sandbox join
-the source session's family. A family holds up to 100 retained sessions, including
-archived workers. Delete completed workers to release slots before a continued
+When `sibling_sessions` is enabled, workers created with `sys_session_create` on
+the same host or a new sandbox join the source session's family. With the flag
+off, these workers are private standalone sessions. A family holds up to 100
+retained sessions, including archived workers. Delete completed workers to release slots before a continued
 automation reaches that limit; archiving alone does not release a slot.
