@@ -156,6 +156,21 @@ describe("ExecutionLogsPanel open/close gating", () => {
     expect(onReject).not.toHaveBeenCalled();
   });
 
+  it("marks itself as closing on Escape only while open", () => {
+    // Page-wide Escape shortcuts (declining an approval) leave keys inside it alone.
+    const { rerender } = renderPanel({ open: true });
+    expect(screen.getByTestId("execution-logs-panel")).toHaveAttribute("data-escape-owner");
+    rerender(
+      <ExecutionLogsPanel
+        open={false}
+        conversationId="conv_main"
+        initialKey={executionLogTabKey("main")}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByTestId("execution-logs-panel")).not.toHaveAttribute("data-escape-owner");
+  });
+
   it("fires onClose when the header close button is clicked", () => {
     // WHY: the X button is the primary dismiss affordance.
     const { onClose } = renderPanel({ open: true });

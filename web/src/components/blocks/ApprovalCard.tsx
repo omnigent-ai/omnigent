@@ -50,7 +50,7 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
-import { APPROVE_KEYS, useApprovesOnHotkey } from "@/hooks/useApproveHotkey";
+import { APPROVE_KEYS, DECLINE_KEYS, useApprovesOnHotkey } from "@/hooks/useApproveHotkey";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
@@ -328,10 +328,10 @@ export function ApprovalCard({
   keyboardActive,
   className,
 }: ApprovalCardProps) {
-  // Only the prompt the chord would approve names it on its Approve button.
-  const approveKeys = useApprovesOnHotkey(elicitationId, status === "pending")
-    ? APPROVE_KEYS
-    : undefined;
+  // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
+  const hotkeyTarget = useApprovesOnHotkey(elicitationId, status === "pending");
+  const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
+  const declineKeys = hotkeyTarget ? DECLINE_KEYS : undefined;
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
@@ -643,16 +643,18 @@ export function ApprovalCard({
           Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-        componentId="approval.reject"
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+          componentId="approval.reject"
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
   const codexCommandButtons = (
@@ -683,15 +685,17 @@ export function ApprovalCard({
           Approve and remember
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
 
