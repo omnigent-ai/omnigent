@@ -12,7 +12,7 @@ Journey (all user-observable):
 1. create a codex-native session in "Approve for me" whose workspace is
    folder A;
 2. ask Codex to create a file in folder B, outside A;
-3. the turn completes with no approval card.
+3. the turn completes and the file is written, with no approval card.
 
 With ``LLM_API_KEY`` set (CI / local dev) the real gateway model drives the
 journey; it escalates the command itself. Without the key, the in-process
@@ -160,27 +160,35 @@ def test_codex_approve_for_me_outside_workspace_completes_without_approval(
     # Stray internal Codex calls (model-routed, no transcript) must not stall.
     set_fallback_mock_llm(mock_llm_server_url, _CODEX_MOCK_MODEL, "")
 
-    page.goto(f"{base_url}/c/{session_id}")
-    _ensure_chat_view(page)
-    _send(
-        page,
-        f"Context marker {user_marker}. Create a notes file in {outside_dir} "
-        f"(outside this workspace), then reply with exactly: {assistant_token}",
-    )
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        _ensure_chat_view(page)
+        _send(
+            page,
+            f"Context marker {user_marker}. Create a notes file in {outside_dir} "
+            f"(outside this workspace), then reply with exactly: {assistant_token}",
+        )
 
-    approval_card = page.locator(_APPROVAL_CARD)
-    reply = page.locator(_ASSISTANT, has_text=assistant_token)
+        approval_card = page.locator(_APPROVAL_CARD)
+        reply = page.locator(_ASSISTANT, has_text=assistant_token)
 
-    # Wait for the turn to reach a decisive state: either it completed (the
-    # token bubble rendered) or it parked on the approval card.
-    expect(approval_card.or_(reply).first).to_be_visible(timeout=_TURN_OUTCOME_TIMEOUT_MS)
+        # Wait for the turn to reach a decisive state: either it completed (the
+        # token bubble rendered) or it parked on the approval card.
+        expect(approval_card.or_(reply).first).to_be_visible(timeout=_TURN_OUTCOME_TIMEOUT_MS)
 
-    # The automatic reviewer, not the user, must settle the escalation.
-    expect(
-        approval_card,
-        'Codex "Approve for me" still asked for user approval: an '
-        "out-of-workspace command raised an approval card instead of running.",
-    ).to_have_count(0)
+        # The automatic reviewer, not the user, must settle the escalation.
+        expect(
+            approval_card,
+            'Codex "Approve for me" still asked for user approval: an '
+            "out-of-workspace command raised an approval card instead of running.",
+        ).to_have_count(0)
 
-    # And the turn must actually have completed.
-    expect(reply.first).to_be_visible(timeout=60_000)
+        # And the turn must actually have completed.
+        expect(reply.first).to_be_visible(timeout=60_000)
+
+        # The escalated command really ran: the sandbox alone cannot write here.
+        notes = outside_dir / "notes.txt"
+        assert notes.is_file(), f"approved command did not write {notes}"
+        assert notes.read_text() == "notes\n"
+    finally:
+        shutil.rmtree(outside_dir, ignore_errors=True)
