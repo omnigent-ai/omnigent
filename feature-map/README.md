@@ -113,11 +113,21 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Automation failure visibility](./automation-failures.md) covers failed-run card
+  warnings, Inbox surfacing, session deduplication and browser-local dismissal.
+
+- [Automation templates](./automation-templates.md) covers the gallery tabs,
+  suggestions on Your automations, and direct template setup.
+
 - [Automations introduction](./automations-introduction.md) covers the first-visit
   walkthrough, capability-dependent content, and browser-local dismissal.
 
 - [Pull request conversations](./pull-request-conversations.md) covers inline
   GitHub threads and replies through Workspace, composer, mobile and Canvas.
+
+- [Pull request review navigation](./pull-request-review-navigation.md) covers the
+  Changes tab's path filter, find in the fetched patch, copy and open actions, and
+  browser-local viewed marks with progress and hide-viewed.
 
 - [Session orchestration](./session-orchestration.md) covers private-owner
   messaging, top-level worker creation, polling results and sharing restrictions.
