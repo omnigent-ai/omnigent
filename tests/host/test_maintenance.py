@@ -17,10 +17,10 @@ from omnigent.process_logging import (
     _ProcessLogFileHandler,
     _unlink_if_empty,
     create_process_log_path,
-    open_process_log_file,
     process_log_lease_marker,
     unlink_closed_process_log,
 )
+from tests._helpers.polling import poll_until
 
 
 async def test_host_janitor_covers_global_runner_cleanup(
@@ -103,36 +103,57 @@ def test_prune_stale_process_logs_removes_only_idle_leased_matches(tmp_path: Pat
 
 @pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
 def test_process_log_lease_survives_inherited_child_descriptor(tmp_path: Path) -> None:
-    path, capture = open_process_log_file("runner", root=tmp_path)
-    child = subprocess.Popen(
+    child_done = tmp_path / "child-done"
+    child_code = (
+        "import sys; from pathlib import Path; sys.stdin.readline(); "
+        "print('child diagnostics', flush=True); Path(sys.argv[1]).touch()"
+    )
+    parent_code = "\n".join(
         [
-            sys.executable,
-            "-c",
-            "import sys; sys.stdin.readline(); print('child diagnostics', flush=True)",
-        ],
+            "import subprocess, sys",
+            "from omnigent.process_logging import open_process_log_file",
+            "path, capture = open_process_log_file('runner', root=sys.argv[1])",
+            "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[3]], "
+            "stdin=sys.stdin, stdout=capture, stderr=capture)",
+            "print(path, flush=True)",
+        ]
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", parent_code, str(tmp_path), child_code, str(child_done)],
         stdin=subprocess.PIPE,
-        stdout=capture,
-        stderr=capture,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
-    capture.close()
+    assert parent.stdout is not None and parent.stdin is not None
     try:
+        raw_path = parent.stdout.readline().strip()
+        assert raw_path
+        path = Path(raw_path)
+        assert parent.wait(timeout=10) == 0
         os.utime(path, (0, 0))
         assert prune_stale_process_logs(path.parent, "runner-*.log") == 0
         assert path.exists()
         _unlink_if_empty(path)
-        assert path.exists(), "exit cleanup must preserve the inherited writer too"
-        child.communicate("finish\n", timeout=10)
-        assert child.returncode == 0
+        assert path.exists(), "parent exit must preserve the inherited writer too"
+        parent.stdin.write("finish\n")
+        parent.stdin.flush()
+        poll_until(child_done.exists, timeout_s=10)
         assert path.read_text() == "child diagnostics\n"
         os.utime(path, (0, 0))
-        assert prune_stale_process_logs(path.parent, "runner-*.log") == 1
+        poll_until(
+            lambda: prune_stale_process_logs(path.parent, "runner-*.log") == 1, timeout_s=10
+        )
         assert not path.exists()
         assert not process_log_lease_marker(path).exists()
     finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait(timeout=10)
+        parent.stdin.close()
+        if parent.poll() is None:
+            parent.kill()
+        parent.wait(timeout=10)
+        parent.stdout.close()
+        assert parent.stderr is not None
+        parent.stderr.close()
 
 
 @pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
@@ -156,6 +177,29 @@ def test_process_log_cleanup_preserves_files_when_lease_cannot_be_proven(
     assert path.exists()
     assert process_log_lease_marker(path).exists()
     assert not eligible.exists()
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+@pytest.mark.parametrize("unavailable", ["missing", "malformed"])
+def test_active_log_writer_stays_leased_when_the_marker_is_temporarily_unavailable(
+    tmp_path: Path, unavailable: str
+) -> None:
+    path = create_process_log_path("runner", root=tmp_path)
+    marker = process_log_lease_marker(path)
+    value = marker.read_text()
+    if unavailable == "missing":
+        marker.unlink()
+    else:
+        marker.write_text("unavailable")
+    writer = _ProcessLogFileHandler(path, encoding="utf-8")
+    try:
+        marker.write_text(value)
+        os.utime(path, (0, 0))
+        assert not unlink_closed_process_log(path, before=1.0)
+        assert path.exists()
+    finally:
+        writer.close()
+    assert unlink_closed_process_log(path, before=1.0)
 
 
 @pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")

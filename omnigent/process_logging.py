@@ -145,21 +145,10 @@ def _lock_process_log_writer(path: Path, stream: BinaryIO | TextIO) -> None:
     """Keep the allocated log's inode leased for this descriptor's lifetime."""
     if fcntl is None:
         return
-    marker = process_log_lease_marker(path)
-    try:
-        stat = os.fstat(stream.fileno())
-        if _read_process_log_lease_marker(marker) != f"{stat.st_dev}:{stat.st_ino}\n":
-            return
-    except (OSError, UnicodeError):
-        return
-    try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
-    except OSError:
-        # An unleased writer makes this allocation ineligible for cleanup.
-        marker.unlink(missing_ok=True)
-        return
+    fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
+    info = os.fstat(stream.fileno())
     current = path.lstat()
-    if (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino):
+    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
         raise OSError("process log changed while acquiring its writer lease")
 
 
@@ -176,13 +165,14 @@ def unlink_closed_process_log(
                 return False
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             stat = os.fstat(stream.fileno())
-            current = path.lstat()
             if (
                 (before is not None and stat.st_mtime >= before)
                 or (empty_only and stat.st_size != 0)
-                or (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino)
                 or _read_process_log_lease_marker(marker) != f"{stat.st_dev}:{stat.st_ino}\n"
             ):
+                return False
+            current = path.lstat()
+            if (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino):
                 return False
             path.unlink()
             with contextlib.suppress(OSError):
