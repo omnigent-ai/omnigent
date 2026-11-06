@@ -14,7 +14,7 @@ import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
 import { useCreateProject } from "@/hooks/useConversations";
 import type { ProjectAppearance } from "@/lib/projectColors";
 
-const UNMARKED: ProjectAppearance = { icon: null, color: null };
+const UNMARKED: ProjectAppearance = { icon: null, lucideIcon: null, color: null };
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that

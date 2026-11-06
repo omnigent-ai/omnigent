@@ -24,12 +24,15 @@ export function HeaderProjectTag({
   conversationId,
   projectName,
   projectIcon,
+  projectLucideIcon,
   projectColor,
 }: {
   conversationId: string;
   projectName: string | null;
   /** The filed project's emoji icon, or `null`/absent for the folder glyph. */
   projectIcon?: string | null;
+  /** The filed project's lucide icon name, or `null`/absent for the folder glyph. */
+  projectLucideIcon?: string | null;
   /** The filed project's palette color, or `null`/absent for a muted folder. */
   projectColor?: string | null;
 }) {
@@ -60,6 +63,7 @@ export function HeaderProjectTag({
                   {projectName ? (
                     <ProjectRowIcon
                       icon={projectIcon}
+                      lucideIcon={projectLucideIcon}
                       color={projectColor}
                       className="size-4 text-[16px]"
                     />

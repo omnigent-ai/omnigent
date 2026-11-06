@@ -193,6 +193,7 @@ import { PermissionsModal } from "@/components/PermissionsModal";
 import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
 import { ProjectRowIcon } from "./ProjectPicker";
 import { ProjectAppearanceButton } from "@/components/ProjectIconPicker";
+import { LucideProjectIcon } from "@/components/LucideProjectIcon";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
@@ -323,6 +324,7 @@ import {
   type ProjectAppearance,
   projectAppearance,
   projectColorValue,
+  sameProjectAppearance,
   withProjectAppearance,
 } from "@/lib/projectColors";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
@@ -1537,6 +1539,7 @@ function ProjectFolder({
   name,
   projectId,
   icon,
+  lucideIcon,
   color,
   windowConversations,
   archived,
@@ -1579,6 +1582,8 @@ function ProjectFolder({
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
       folder glyph. */
   icon?: string | null;
+  /** Chosen lucide-react icon name, or null/absent for the folder glyph. */
+  lucideIcon?: string | null;
   /** Chosen color (a theme palette id), or null/absent for the muted folder. */
   color?: string | null;
   /** This folder's members from the globally-loaded window (may lag or lead
@@ -1733,6 +1738,7 @@ function ProjectFolder({
     projectId,
     icon,
     color,
+    lucideIcon,
   );
   const folderColor = projectColorValue(color, useResolvedThemeMode());
 
@@ -1801,17 +1807,10 @@ function ProjectFolder({
         icon={
           icon ? (
             <span className="text-[14px] leading-none">{icon}</span>
-          ) : expanded ? (
-            <FolderOpenIcon
-              data-project-color={color ?? undefined}
-              style={{ color: folderColor }}
-              className={cn(
-                "ui-icon",
-                active ? "text-[var(--sidebar-active-foreground)]" : "text-muted-foreground",
-              )}
-            />
           ) : (
-            <FolderIcon
+            <LucideProjectIcon
+              iconName={lucideIcon}
+              fallback={expanded ? FolderOpenIcon : FolderIcon}
               data-project-color={color ?? undefined}
               style={{ color: folderColor }}
               className={cn(
@@ -2153,8 +2152,12 @@ function ConversationList({
   const projectMarksById = useMemo(() => {
     const map = new Map<string, ProjectAppearance>();
     for (const p of projects) {
-      const mark = projectAppearance({ icon: p.icon ?? undefined, color: p.color ?? undefined });
-      if (p.id !== null && (mark.icon || mark.color)) map.set(p.id, mark);
+      const mark = projectAppearance({
+        icon: p.icon ?? undefined,
+        lucide_icon: p.lucide_icon ?? undefined,
+        color: p.color ?? undefined,
+      });
+      if (p.id !== null && (mark.icon || mark.lucideIcon || mark.color)) map.set(p.id, mark);
     }
     return map;
   }, [projects]);
@@ -3233,6 +3236,9 @@ function ConversationList({
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
+                            lucideIcon={
+                              group.id !== null ? projectMarksById.get(group.id)?.lucideIcon : null
+                            }
                             color={group.color}
                             windowConversations={group.conversations}
                             archived={activeTab === "archived"}
@@ -6414,7 +6420,11 @@ function PinnedProjectFlyoutContent({
           the DOM. */}
       <p className="sidebar-compact-text line-clamp-3 font-medium">{title}</p>
       <p className="mt-1 flex items-center gap-1.5 text-sm text-muted-foreground">
-        <ProjectRowIcon icon={projectMark?.icon} color={projectMark?.color} />
+        <ProjectRowIcon
+          icon={projectMark?.icon}
+          lucideIcon={projectMark?.lucideIcon}
+          color={projectMark?.color}
+        />
         <span className="truncate">{projectName}</span>
       </p>
       {gitBranch && (
@@ -6577,6 +6587,7 @@ function useProjectFolderMenu(
   projectId: string | null,
   icon?: string | null,
   color?: string | null,
+  lucideIcon?: string | null,
 ): { actions: ProjectFolderMenuActions; dialogs: ReactNode } {
   const [menuOpen, setMenuOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -6608,7 +6619,11 @@ function useProjectFolderMenu(
   // This gates only the mark path; renaming the name never needs the config.
   const configReady = projectId === null || iconConfig !== undefined;
   const savedAppearance = projectAppearance(
-    iconConfig ?? { icon: icon ?? undefined, color: color ?? undefined },
+    iconConfig ?? {
+      icon: icon ?? undefined,
+      lucide_icon: lucideIcon ?? undefined,
+      color: color ?? undefined,
+    },
   );
   const displayAppearance = pendingAppearance ?? savedAppearance;
 
@@ -6665,8 +6680,7 @@ function useProjectFolderMenu(
               const nameChanged = newName !== "" && newName !== projectName;
               const appearanceChanged =
                 pendingAppearance !== undefined &&
-                (pendingAppearance.icon !== savedAppearance.icon ||
-                  pendingAppearance.color !== savedAppearance.color);
+                !sameProjectAppearance(pendingAppearance, savedAppearance);
               // Only the mark write needs a loaded config to merge onto; a
               // name-only rename must proceed even if the config fetch failed.
               if (appearanceChanged && !configReady) return;
@@ -6923,7 +6937,7 @@ function ProjectPickerMenu({
             textValue={p.name}
             onSelect={() => onSelect(p.name)}
           >
-            <ProjectRowIcon icon={p.icon} color={p.color} />
+            <ProjectRowIcon icon={p.icon} lucideIcon={p.lucide_icon} color={p.color} />
             <span className="flex-1 truncate text-left">{p.name}</span>
             {currentProject === p.name && (
               <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
@@ -6952,7 +6966,11 @@ function ProjectPickerMenu({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={current?.icon} color={current?.color} />
+            <ProjectRowIcon
+              icon={current?.icon}
+              lucideIcon={current?.lucide_icon}
+              color={current?.color}
+            />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

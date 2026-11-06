@@ -8074,6 +8074,18 @@
             "description": "First-class project id when one exists, or `None` for a label-only project not yet promoted to the `projects` table.",
             "title": "Id"
           },
+          "lucide_icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The project's chosen lucide-react icon name (e.g. `\"FlaskConical\"`), read from its `config`; `None` when unset or for a label-only folder. The web UI draws it in `color`.",
+            "title": "Lucide Icon"
+          },
           "name": {
             "description": "Project name (the folder's display name and union key).",
             "title": "Name",

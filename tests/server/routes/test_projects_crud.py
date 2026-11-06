@@ -147,13 +147,18 @@ async def test_rename_missing_project_404(project_client: httpx.AsyncClient) -> 
 async def test_create_assigns_the_least_used_color_unless_marked(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """Unmarked projects get the least-used color; an emoji is kept."""
+    """Unmarked projects get the least-used color; an emoji is kept, and a
+    lucide icon gets a color to tint it."""
     first = (await project_client.post("/v1/projects", json={"name": "A"})).json()
     second = (await project_client.post("/v1/projects", json={"name": "B"})).json()
     emoji = await project_client.post("/v1/projects", json={"name": "E", "config": {"icon": "🔥"}})
+    lucide = await project_client.post(
+        "/v1/projects", json={"name": "L", "config": {"lucide_icon": "FlaskConical"}}
+    )
     assert first["config"] == {"color": "omni"}
     assert second["config"] == {"color": "dracula"}
     assert emoji.json()["config"] == {"icon": "🔥"}
+    assert lucide.json()["config"] == {"lucide_icon": "FlaskConical", "color": "github"}
 
 
 async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
@@ -240,33 +245,60 @@ async def test_session_projects_unions_first_class_and_labels(
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": both["id"], "name": "Both", "icon": None, "color": both["config"]["color"]},
-        {"id": empty["id"], "name": "Empty FC", "icon": None, "color": "omni"},
-        {"id": None, "name": "Label Only", "icon": None, "color": None},
+        {
+            "id": both["id"],
+            "name": "Both",
+            "icon": None,
+            "lucide_icon": None,
+            "color": both["config"]["color"],
+        },
+        {
+            "id": empty["id"],
+            "name": "Empty FC",
+            "icon": None,
+            "lucide_icon": None,
+            "color": "omni",
+        },
+        {"id": None, "name": "Label Only", "icon": None, "lucide_icon": None, "color": None},
     ]
 
 
 async def test_session_projects_surfaces_config_icon_and_color(
     project_client: httpx.AsyncClient,
 ) -> None:
-    """A first-class project's ``config.icon`` and ``config.color`` surface in
-    the sidebar listing; non-string/absent values stay None."""
+    """A first-class project's ``config.icon``, ``config.lucide_icon`` and
+    ``config.color`` surface in the sidebar listing; non-string/absent values
+    stay None."""
     fire = (
         await project_client.post(
             "/v1/projects", json={"name": "Fire", "config": {"icon": "🔥", "color": "nord"}}
         )
     ).json()
-    # Absent icon and non-string color both surface None (default folder glyph).
+    lab = (
+        await project_client.post(
+            "/v1/projects",
+            json={"name": "Lab", "config": {"lucide_icon": "FlaskConical", "color": "nord"}},
+        )
+    ).json()
+    # Absent icon and non-string values surface None (default folder glyph).
     plain = (await project_client.post("/v1/projects", json={"name": "Plain"})).json()
     await project_client.patch(
-        f"/v1/projects/{plain['id']}", json={"config": {"host_id": "h", "color": 3}}
+        f"/v1/projects/{plain['id']}",
+        json={"config": {"host_id": "h", "lucide_icon": 7, "color": 3}},
     )
 
     resp = await project_client.get("/v1/sessions/projects")
     assert resp.status_code == 200
     assert resp.json() == [
-        {"id": fire["id"], "name": "Fire", "icon": "🔥", "color": "nord"},
-        {"id": plain["id"], "name": "Plain", "icon": None, "color": None},
+        {"id": fire["id"], "name": "Fire", "icon": "🔥", "lucide_icon": None, "color": "nord"},
+        {
+            "id": lab["id"],
+            "name": "Lab",
+            "icon": None,
+            "lucide_icon": "FlaskConical",
+            "color": "nord",
+        },
+        {"id": plain["id"], "name": "Plain", "icon": None, "lucide_icon": None, "color": None},
     ]
 
 

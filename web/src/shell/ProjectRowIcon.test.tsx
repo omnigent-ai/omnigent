@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { ProjectRowIcon } from "./ProjectPicker";
 
@@ -41,5 +41,28 @@ describe("ProjectRowIcon", () => {
 
     rerender(<ProjectRowIcon icon="🚀" color="nord" />);
     expect(container.querySelector("[data-project-color]")).toBeNull();
+  });
+
+  it("draws a lucide icon in the palette color once the catalog loads", async () => {
+    const { container } = render(<ProjectRowIcon lucideIcon="FlaskConical" color="nord" />);
+    await waitFor(() =>
+      expect(container.querySelector('[data-lucide-icon="FlaskConical"]')).not.toBeNull(),
+    );
+    const icon = container.querySelector('[data-lucide-icon="FlaskConical"]');
+    expect(icon).toHaveStyle({ color: "#5e81ac" });
+    expect(icon).toHaveAttribute("data-project-color", "nord");
+  });
+
+  it("keeps the folder for an unknown lucide name, and an emoji wins over a lucide icon", async () => {
+    const { container, rerender } = render(<ProjectRowIcon lucideIcon="NotALucideIcon" />);
+    await act(async () => {
+      await import("@/lib/lucideIconCatalog");
+    });
+    expect(container.querySelector("svg")).not.toBeNull();
+    expect(container.querySelector("[data-lucide-icon]")).toBeNull();
+
+    rerender(<ProjectRowIcon icon="🚀" lucideIcon="FlaskConical" />);
+    expect(screen.getByTestId("project-icon")).toHaveTextContent("🚀");
+    expect(container.querySelector("svg")).toBeNull();
   });
 });

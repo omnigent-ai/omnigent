@@ -26,8 +26,10 @@ export interface ProjectConfig {
   workspace?: string;
   /** Default agent id for new sessions. */
   agent_id?: string;
-  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Wins over `color`. */
+  /** Chosen emoji icon (a unicode grapheme, e.g. "🔥"). Wins over `lucide_icon` and `color`. */
   icon?: string;
+  /** Chosen lucide-react icon name (e.g. "FlaskConical"), tinted by `color`. Unset → folder. */
+  lucide_icon?: string;
   /** Chosen color: a theme palette id (see lib/projectColors). Unset → muted folder. */
   color?: string;
   /**

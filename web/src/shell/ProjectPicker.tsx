@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { CheckIcon, FolderIcon, PlusIcon, SearchIcon } from "lucide-react";
+import { LucideProjectIcon } from "@/components/LucideProjectIcon";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useProjects } from "@/hooks/useConversations";
@@ -8,8 +9,8 @@ import { cn } from "@/lib/utils";
 
 /**
  * Leading visual for a project row: the project's emoji icon when set,
- * otherwise a folder glyph in its palette color (muted when it has none).
- * Decorative only — row names carry the semantics.
+ * otherwise its lucide icon (or a folder glyph) in its palette color, muted
+ * when it has none. Decorative only — row names carry the semantics.
  *
  * Defaults to the `size-3.5` (14px) footprint the dropdown and sidebar rows
  * use; callers pass `className` to resize both branches together (the header
@@ -18,10 +19,12 @@ import { cn } from "@/lib/utils";
  */
 export function ProjectRowIcon({
   icon,
+  lucideIcon,
   color,
   className,
 }: {
   icon?: string | null;
+  lucideIcon?: string | null;
   color?: string | null;
   className?: string;
 }) {
@@ -40,7 +43,9 @@ export function ProjectRowIcon({
       {icon}
     </span>
   ) : (
-    <FolderIcon
+    <LucideProjectIcon
+      iconName={lucideIcon}
+      fallback={FolderIcon}
       aria-hidden="true"
       data-project-color={folderColor ? (color ?? undefined) : undefined}
       className={cn("size-3.5 shrink-0 text-muted-foreground", className)}
@@ -99,7 +104,11 @@ export function ProjectPicker({
             textValue={project.name}
             onSelect={() => onSelect(project.name)}
           >
-            <ProjectRowIcon icon={project.icon} color={project.color} />
+            <ProjectRowIcon
+              icon={project.icon}
+              lucideIcon={project.lucide_icon}
+              color={project.color}
+            />
             <span className="flex-1 truncate text-left">{project.name}</span>
             {currentProject === project.name && (
               <CheckIcon className="size-3.5 shrink-0 text-primary" />
@@ -128,7 +137,11 @@ export function ProjectPicker({
             textValue={`Remove from ${currentProject}`}
             onSelect={() => onSelect("")}
           >
-            <ProjectRowIcon icon={current?.icon} color={current?.color} />
+            <ProjectRowIcon
+              icon={current?.icon}
+              lucideIcon={current?.lucide_icon}
+              color={current?.color}
+            />
             Remove from{" "}
             <span className="rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {currentProject}

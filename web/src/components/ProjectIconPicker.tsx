@@ -1,9 +1,10 @@
-// A project is marked by an emoji or a palette color, never both. emoji-mart is
-// code-split so its ~600KB dataset loads only on first open.
+// A project is marked by an emoji, or a lucide icon and/or a palette color.
+// emoji-mart and the lucide catalog are code-split, so each loads on first use.
 
 import { type CSSProperties, lazy, Suspense, useEffect, useRef, useState } from "react";
-import { CheckIcon, FolderIcon, PencilIcon, SmilePlusIcon } from "lucide-react";
+import { CheckIcon, FolderIcon, PencilIcon, ShapesIcon, SmilePlusIcon } from "lucide-react";
 
+import { LucideProjectIcon } from "@/components/LucideProjectIcon";
 import { Button } from "@/components/ui/button";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -24,6 +25,9 @@ import { cn } from "@/lib/utils";
 // closed picker never touch the emoji JSON, which Node refuses under vitest).
 const Picker = lazy(() => import("@emoji-mart/react"));
 const loadEmojiData = async () => (await import("@emoji-mart/data")).default;
+const LucideIconSearch = lazy(async () => ({
+  default: (await import("./LucideIconSearch")).LucideIconSearch,
+}));
 
 const TILE_SIZES = {
   sm: { tile: "size-[38px]", emoji: "text-xl", folder: "size-4" },
@@ -79,15 +83,20 @@ function ProjectAppearanceTile({
       {appearance.icon ? (
         <span className={cn("leading-none", sizes.emoji)}>{appearance.icon}</span>
       ) : (
-        <FolderIcon className={cn("text-brand-accent", sizes.folder)} style={{ color }} />
+        <LucideProjectIcon
+          iconName={appearance.lucideIcon}
+          fallback={FolderIcon}
+          className={cn("text-brand-accent", sizes.folder)}
+          style={{ color }}
+        />
       )}
     </span>
   );
 }
 
 /**
- * The mark tile that opens the emoji / color picker. Pass `open` and
- * `onOpenChange` to also open it from elsewhere.
+ * The mark tile that opens the emoji / lucide icon / color picker. Pass `open`
+ * and `onOpenChange` to also open it from elsewhere.
  */
 export function ProjectAppearanceButton({
   value,
@@ -108,10 +117,11 @@ export function ProjectAppearanceButton({
 }) {
   const mode = useResolvedThemeMode();
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
-  const [showEmoji, setShowEmoji] = useState(false);
+  const [view, setView] = useState<"marks" | "emoji" | "lucide">("marks");
   const open = controlledOpen ?? uncontrolledOpen;
+  const tint = projectColorValue(value.color, mode);
   const setOpen = (next: boolean) => {
-    if (!next) setShowEmoji(false);
+    if (!next) setView("marks");
     setUncontrolledOpen(next);
     onOpenChange?.(next);
   };
@@ -166,15 +176,25 @@ export function ProjectAppearanceButton({
         }
         className={cn(
           "emoji-picker-popover w-auto",
-          showEmoji &&
+          view === "emoji" &&
             "flex max-h-[var(--radix-popover-content-available-height)] flex-col overflow-hidden p-0",
         )}
         // A Dialog's scroll lock preventDefaults wheel events over the emoji
         // grid's shadow DOM; stop them reaching it so the grid scrolls.
         onWheel={(event) => event.stopPropagation()}
       >
-        {showEmoji ? (
-          <EmojiPicker onSelect={(native) => pick({ icon: native, color: null })} />
+        {view === "emoji" ? (
+          <EmojiPicker
+            onSelect={(native) => pick({ icon: native, lucideIcon: null, color: null })}
+          />
+        ) : view === "lucide" ? (
+          <Suspense fallback={<div className="h-72 w-[296px]" aria-hidden />}>
+            <LucideIconSearch
+              selected={value.lucideIcon}
+              color={tint}
+              onSelect={(name) => pick({ icon: null, lucideIcon: name, color: value.color })}
+            />
+          </Suspense>
         ) : (
           <div className="flex items-center gap-2" data-testid="project-appearance">
             <Button
@@ -185,13 +205,30 @@ export function ProjectAppearanceButton({
               aria-pressed={Boolean(value.icon)}
               data-testid="project-emoji-button"
               disabled={disabled}
-              onClick={() => setShowEmoji(true)}
+              onClick={() => setView("emoji")}
             >
               {value.icon ? (
                 <span className="text-base leading-none">{value.icon}</span>
               ) : (
                 <SmilePlusIcon className="size-4" />
               )}
+            </Button>
+            <Button
+              type="button"
+              variant={value.lucideIcon ? "secondary" : "ghost"}
+              size="icon-sm"
+              aria-label="Choose an icon"
+              aria-pressed={Boolean(value.lucideIcon)}
+              data-testid="project-lucide-button"
+              disabled={disabled}
+              onClick={() => setView("lucide")}
+            >
+              <LucideProjectIcon
+                iconName={value.lucideIcon}
+                fallback={ShapesIcon}
+                className="size-4"
+                style={{ color: value.lucideIcon ? tint : undefined }}
+              />
             </Button>
             <span aria-hidden className="h-5 w-px bg-border" />
             <div role="radiogroup" aria-label="Project color" className="flex gap-2">
@@ -206,7 +243,9 @@ export function ProjectAppearanceButton({
                     aria-label={option.label}
                     data-testid={`project-color-${option.id}`}
                     disabled={disabled}
-                    onClick={() => pick({ icon: null, color: option.id })}
+                    onClick={() =>
+                      pick({ icon: null, lucideIcon: value.lucideIcon, color: option.id })
+                    }
                     className={cn(
                       "flex size-6 items-center justify-center rounded-full ring-1 ring-foreground/10 outline-none transition-shadow focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50",
                       checked && "ring-2 ring-foreground/40 ring-offset-2 ring-offset-background",

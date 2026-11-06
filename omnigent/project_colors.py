@@ -1,5 +1,7 @@
-"""Projects are marked by an emoji (``config["icon"]``) or a web theme palette id
-(``config["color"]``); a project created with neither gets the least-used color."""
+"""Projects are marked by an emoji (``config["icon"]``), or by a web theme palette
+id (``config["color"]``) that tints the folder or a lucide icon
+(``config["lucide_icon"]``). A project created with neither an emoji nor a color
+gets the least-used color."""
 
 from __future__ import annotations
 
