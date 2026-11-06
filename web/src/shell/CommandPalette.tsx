@@ -6,6 +6,7 @@
 import type React from "react";
 import { defaultFilter } from "cmdk";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -24,10 +25,18 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { rememberOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import {
+  CompactShortcutKeys,
+  newSessionShortcutKeys,
+  rightSidebarToggleShortcutKeys,
+  settingsShortcutKeys,
+  sidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -49,6 +58,8 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
+  rightSidebarShortcutEnabled?: boolean;
 }
 
 interface ActionCommand {
@@ -59,6 +70,8 @@ interface ActionCommand {
   /** Extra terms the client-side filter matches against (beyond the label). */
   keywords: string[];
   run: () => void;
+  /** Chord shown beside the row when the same action has a shortcut. */
+  shortcut?: readonly string[];
 }
 
 /** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
@@ -148,6 +161,7 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  rightSidebarShortcutEnabled = true,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
@@ -179,6 +193,7 @@ export function CommandPalette({
         icon: SquarePenIcon,
         keywords: ["compose", "start", "new session"],
         run: () => navigate("/"),
+        shortcut: newSessionShortcutKeys(),
       },
       {
         id: "go-inbox",
@@ -200,6 +215,7 @@ export function CommandPalette({
         icon: SettingsIcon,
         keywords: ["preferences", "configuration", "account"],
         run: () => navigate("/settings"),
+        shortcut: settingsShortcutKeys(),
       },
       {
         id: "toggle-left-sidebar",
@@ -207,6 +223,7 @@ export function CommandPalette({
         icon: PanelLeftIcon,
         keywords: ["panel", "left", "sessions list"],
         run: onToggleLeftSidebar,
+        shortcut: sidebarToggleShortcutKeys(),
       },
       {
         id: "toggle-right-sidebar",
@@ -214,9 +231,10 @@ export function CommandPalette({
         icon: PanelRightIcon,
         keywords: ["panel", "right", "files", "terminal"],
         run: onToggleRightSidebar,
+        shortcut: rightSidebarShortcutEnabled ? rightSidebarToggleShortcutKeys() : undefined,
       },
     ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+    [navigate, onToggleLeftSidebar, onToggleRightSidebar, rightSidebarShortcutEnabled],
   );
 
   const filteredActions = useMemo(() => {
@@ -377,7 +395,15 @@ export function CommandPalette({
     navigate(`/?project=${encodeURIComponent(name)}`);
   };
 
+  const queryClient = useQueryClient();
   const goToSession = (id: string): void => {
+    // Search results are dropped when the palette closes; the sidebar lists
+    // the opened session from this copy, which keeps its owner.
+    const searchRow = [titleSearch.data, contentSearch.data]
+      .flatMap((results) => results?.pages ?? [])
+      .flatMap((page) => page.data)
+      .find((row) => row.id === id);
+    if (searchRow) rememberOpenSessionRow(queryClient, searchRow);
     close();
     navigate(`/c/${id}`);
   };
@@ -578,6 +604,7 @@ export function CommandPalette({
                     <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
                       <Icon />
                       <span className="flex-1 truncate text-left">{a.label}</span>
+                      {a.shortcut && <CompactShortcutKeys keys={a.shortcut} />}
                     </CommandItem>
                   );
                 })}

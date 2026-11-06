@@ -210,6 +210,8 @@ describe("createSession", () => {
       contextWindow: undefined,
       labels: undefined,
       projectId: null,
+      sideChatParentId: null,
+      sideChatAllowed: null,
       lastTaskError: undefined,
       lastTotalTokens: undefined,
       usageIncluded: true,
@@ -1175,6 +1177,8 @@ describe("getSession", () => {
         status: "running",
         created_at: 1704067200,
         items: [],
+        side_chat_parent_id: "conv_parent",
+        side_chat_allowed: false,
       }),
     );
 
@@ -1184,6 +1188,8 @@ describe("getSession", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_abc");
     expect(session.agentId).toBe("agent_xyz");
     expect(session.createdAt).toBe(1704067200);
+    expect(session.sideChatParentId).toBe("conv_parent");
+    expect(session.sideChatAllowed).toBe(false);
   });
 
   it("url-encodes the session id", async () => {
@@ -1684,6 +1690,14 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reads the session a claude-sdk clear continued in", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, session_id: "conv_new" }));
+
+    const out = await postEvent("conv_abc", { type: "clear", data: {} });
+
+    expect(out.sessionId).toBe("conv_new");
   });
 
   it("surfaces 4xx as a thrown error (does not silently swallow)", async () => {
