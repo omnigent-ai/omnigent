@@ -39,6 +39,14 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `cli-unresponsive`: a host CLI that resolves but does not answer its
+  `--version` check (for example, a wrapper waiting at a setup prompt) reads as
+  "did not respond", not outdated. New Chat keeps the harness selectable with a
+  notice and no **Set up** action, and launches and resumes still start the CLI,
+  so its own prompt shows in the terminal. Settings → Harnesses labels the card
+  **CLI did not respond**; the card and its gear open the harness settings,
+  whose warning offers no Install, Update or Reconfigure action and marks the
+  credential **Not checked**.
 - `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
   action opens the shared Reconfigure flow in place for native agents on
   connected user hosts when a fix is available. Missing binaries install before
@@ -293,6 +301,11 @@ picks tmux up on its next periodic readiness refresh, about a minute later.
 The desktop app keeps the PATH it started with, so if tmux went into a new PATH
 directory, quit and reopen the app. Signing in or saving a credential on a host
 without tmux continues to the same tmux step.
+
+**Unresponsive harness CLI:** put a harness wrapper that never answers
+`--version` first on the host's PATH and restart the host. Open New Chat with
+that agent, then Settings → Harnesses → the **CLI did not respond** card or its
+gear, then send a message in an existing session for that harness.
 
 **Harness account sign-in and switching:** Settings → Harnesses → Codex or
 Claude. Use **Sign in again** on an expired Codex card, or open the configured
@@ -591,6 +604,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`cli-unresponsive`:**
+  `tests/onboarding/test_harness_readiness.py::test_unanswered_pi_version_probe_is_not_reported_as_outdated`,
+  `tests/host/test_connect.py::test_handle_launch_does_not_ask_to_install_a_resolvable_pi_that_never_answers`,
+  `tests/onboarding/test_harness_install.py::test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch`,
+  and the "did not respond" cases in
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` and
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`model-and-effort`, Claude runtime selection (own environment):**
   `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
   uses real Claude catalog discovery, tmux, statusLine and the runner event
