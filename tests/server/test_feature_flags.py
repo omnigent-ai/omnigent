@@ -27,6 +27,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.CODEX_PLAN_AT_LAUNCH,
             Feature.CUSTOM_AGENTS_SETTINGS_UI,
             Feature.SESSION_ORCHESTRATION,
+            Feature.SIDEBAR_GROUPING_UI,
         }
     )
     assert flags.frontend_dict() == {
@@ -37,7 +38,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": True,
-        "sidebar_grouping_ui": False,
+        "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
@@ -58,6 +59,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "custom_agents_settings_ui",
         "harness_install",
         "session_orchestration",
+        "sidebar_grouping_ui",
         "usage_page",
     )
 
@@ -71,7 +73,13 @@ def test_resolves_comma_separated_enabled_set() -> None:
     ],
 )
 @pytest.mark.parametrize(
-    "feature", ["claude_osc_status", "custom_agents_settings_ui", "session_orchestration"]
+    "feature",
+    [
+        "claude_osc_status",
+        "custom_agents_settings_ui",
+        "session_orchestration",
+        "sidebar_grouping_ui",
+    ],
 )
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
     features = override.format(feature=feature)
@@ -82,6 +90,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
         "session_orchestration",
+        "sidebar_grouping_ui",
         "usage_page",
     } - {feature}
 
@@ -94,6 +103,7 @@ def test_default_off_features_can_also_be_explicitly_disabled() -> None:
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
         "session_orchestration",
+        "sidebar_grouping_ui",
     )
 
 
@@ -119,6 +129,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "codex_plan_at_launch",
         "custom_agents_settings_ui",
         "session_orchestration",
+        "sidebar_grouping_ui",
     )
 
 
