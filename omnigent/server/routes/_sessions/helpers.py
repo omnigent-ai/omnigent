@@ -7951,12 +7951,17 @@ def _stable_id_reuse_is_exact_retry(
             code=ErrorCode.CONFLICT,
         )
     # Runner retention is delivery lifecycle state, not the caller's payload.
-    lifecycle_fields = {"startup_options": {"runner_wait"}}
-    persisted_payload = persisted.data.model_dump(
-        mode="json", by_alias=True, exclude=lifecycle_fields
-    )
-    request_payload = item.data.model_dump(mode="json", by_alias=True, exclude=lifecycle_fields)
-    return persisted.type == item.type and persisted_payload == request_payload
+    payloads = []
+    for data in (persisted.data, item.data):
+        payload = data.model_dump(mode="json", by_alias=True, exclude={"startup_options"})
+        if isinstance(data, (MessageData, SlashCommandData)) and data.startup_options is not None:
+            options = data.startup_options.model_dump(
+                mode="json", by_alias=True, exclude={"runner_wait"}, exclude_defaults=True
+            )
+            if options:
+                payload["startup_options"] = options
+        payloads.append(payload)
+    return persisted.type == item.type and payloads[0] == payloads[1]
 
 
 def _parse_skill_slash_command(body: SessionEventInput) -> tuple[str, str]:
