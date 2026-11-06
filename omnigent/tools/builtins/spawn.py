@@ -677,7 +677,7 @@ class SysSessionGetInfoTool(Tool):
     status, title, agent binding (id + name), runner binding and live
     connectivity, host and its reported harness readiness, reasoning effort,
     effective model, parent
-    linkage, workspace / git branch, persisted last-activity time, and
+    linkage, workspace / git branch, project, persisted last-activity time, and
     the count of outstanding approval prompts. Comparing
     ``last_activity_at`` across polls distinguishes a running session that
     is advancing from one whose persisted output has stalled. For the
@@ -706,7 +706,7 @@ class SysSessionGetInfoTool(Tool):
             "Return a session's metadata: lifecycle status, title, "
             "agent binding (id/name), runner binding + connectivity, "
             "host + configured harness readiness, reasoning effort, model, "
-            "parent session, workspace, "
+            "parent session, workspace, project_id, "
             "persisted last-activity time, and outstanding approval "
             "prompts. Global read — any "
             "session you can access. Pass session_id to target another "
@@ -900,8 +900,9 @@ class SysSessionCreateTool(Tool):
     An optional ``message`` starts the session's first user turn;
     an optional ``title`` labels the session.
 
-    Returns a handle ``{conversation_id, agent_id, title, status}``. The
-    session runs asynchronously — use ``sys_session_get_history`` /
+    Returns a handle ``{conversation_id, agent_id, title, status}``, plus
+    ``project_id`` for an independent session. The session runs
+    asynchronously — use ``sys_session_get_history`` /
     ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
     further child work and ``sys_session_message`` for independent sessions.
     """
@@ -946,7 +947,8 @@ class SysSessionCreateTool(Tool):
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
             "read their status/history, and use sys_session_message for subsequent work. "
-            "Returns {conversation_id, agent_id, title, status}; the "
+            "Returns {conversation_id, agent_id, title, status}, plus project_id "
+            "for an independent session; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
             "with sys_session_send for children or sys_session_message for independent sessions."

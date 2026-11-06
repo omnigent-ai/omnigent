@@ -3430,18 +3430,25 @@ async def _add_named_project(
                 f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
             )
         except httpx.HTTPError as exc:
-            return json.dumps({"error": f"Could not check project {project_id}: {exc}"})
+            return json.dumps(
+                {"error": f"Could not check project {project_id}: {type(exc).__name__}: {exc}"}
+            )
         if resp.status_code == 404:
             return json.dumps({"error": "project_not_found", "project_id": project_id})
         if resp.status_code >= 400:
             return json.dumps(
-                {"error": f"Could not check project {project_id}: HTTP {resp.status_code}"}
+                {
+                    "error": f"Could not check project {project_id}: HTTP {resp.status_code}",
+                    "detail": resp.text[:200],
+                }
             )
     else:
         try:
             project_id = await _project_id_for_name(server_client, str(project_name))
         except (httpx.HTTPError, ValueError) as exc:
-            return json.dumps({"error": f"Could not resolve project_name: {exc}"})
+            return json.dumps(
+                {"error": f"Could not resolve project_name: {type(exc).__name__}: {exc}"}
+            )
     body.update({"project_id": project_id, "workspace": None, "git": None})
     return None
 
@@ -3640,9 +3647,8 @@ async def _execute_session_create(
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        host_id = None
         if placement == "managed":
-            from omnigent.runner.session_requests import post_on_host
-
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
@@ -3661,18 +3667,17 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-            project_error = await _add_named_project(body, args, server_client)
-            if project_error is not None:
-                return project_error
-            create_requested = True
+        project_error = await _add_named_project(body, args, server_client)
+        if project_error is not None:
+            return project_error
+        create_requested = True
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
             )
         else:
-            project_error = await _add_named_project(body, args, server_client)
-            if project_error is not None:
-                return project_error
-            create_requested = True
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
@@ -5432,8 +5437,8 @@ async def _session_get_info_via_rest(
     snapshot, and projects the metadata fields — status, title, agent
     binding, runner binding, host and its reported harness readiness,
     reasoning effort, effective model,
-    parent linkage, workspace / git branch, persisted last-activity time,
-    and the outstanding approval prompts (the prompts themselves plus a
+    parent linkage, workspace / git branch, project, persisted last-activity
+    time, and the outstanding approval prompts (the prompts themselves plus a
     count). Runner connectivity
     is resolved best-effort via
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when

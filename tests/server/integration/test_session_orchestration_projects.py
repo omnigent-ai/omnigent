@@ -1,4 +1,4 @@
-"""Independent sessions an orchestrating session starts are filed in its project."""
+"""Independent sessions an orchestrating session starts are filed in its project or a named one."""
 
 import asyncio
 import json
@@ -133,6 +133,9 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
     )
 
 
+_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER = {"workspace": "/project-default", "git": {"base": "main"}}
+
+
 @pytest.mark.parametrize("filed", [True, False])
 async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
     auth_client, auth_app, db_uri, monkeypatch, filed
@@ -146,7 +149,7 @@ async def test_worker_is_filed_in_the_project_of_the_session_that_started_it(
         project_id = await _project(
             auth_client,
             "Triage",
-            {"agent_id": other_agent, "workspace": "/project-default", "git": {"base": "main"}},
+            {"agent_id": other_agent, **_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER},
         )
         await _file(auth_client, db_uri, source["id"], project_id)
 
@@ -192,9 +195,6 @@ async def test_a_project_named_in_the_request_wins_over_the_source_project(
     assert SqlAlchemyConversationStore(db_uri).get_conversation(worker_id).project_id == (
         project_id
     )
-
-
-_DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER = {"workspace": "/project-default", "git": {"base": "main"}}
 
 
 @pytest.mark.parametrize("by", ["id", "name"])

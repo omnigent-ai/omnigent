@@ -142,8 +142,6 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
     assert len(requests) == (2 if placement == "same_host" else 1)
     body = json.loads(requests[0].content)
     assert not {"project_id", "workspace", "git"} & body.keys()
-    if placement != "child":
-        assert result["project_id"] is None
     if placement == "child":
         assert requests[0].url.path == "/v1/sessions"
         assert body["parent_session_id"] == "manager"
@@ -154,6 +152,7 @@ async def test_create_placement(placement, monkeypatch, profile, capability, num
         assert requests[0].headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
         assert result["agent_id"] == "worker"
         assert result["title"] == "Worker task"
+        assert result["project_id"] is None
         register.assert_not_called()
     if placement == "managed":
         if profile:
@@ -653,8 +652,6 @@ async def test_independent_create_files_a_named_project(placement, named_by):
             return httpx.Response(200, json={"data": [{"id": "other", "name": "Other"}, *found]})
         if path == "/v1/projects":
             return httpx.Response(200, json={"id": _PROJECT_ID, "name": "Triage"})
-        if path.endswith("/events"):
-            return httpx.Response(202, json={"queued": True})
         project_id = json.loads(request.content).get("project_id")
         return httpx.Response(201, json={"id": session_id, "project_id": project_id})
 
@@ -665,9 +662,7 @@ async def test_independent_create_files_a_named_project(placement, named_by):
         result = json.loads(
             await execute_tool(
                 tool_name="sys_session_create",
-                arguments=json.dumps(
-                    {"agent_id": "worker", "placement": placement, "message": "Start", **project}
-                ),
+                arguments=json.dumps({"agent_id": "worker", "placement": placement, **project}),
                 server_client=client,
                 conversation_id="manager",
             )
@@ -679,9 +674,9 @@ async def test_independent_create_files_a_named_project(placement, named_by):
         "new_name": [("GET", "/v1/projects"), ("POST", "/v1/projects")],
     }[named_by]
     calls = [(r.method, r.url.path) for r in requests if r.url.path != "/v1/info"]
-    assert calls[: len(lookup) + 1] == [*lookup, ("POST", "/v1/sessions/orchestrated")]
+    assert calls == [*lookup, ("POST", "/v1/sessions/orchestrated")]
     if placement == "managed":
-        # The project is resolved last, so a refusal earlier in the create leaves no new project.
+        # The project is resolved after the managed capability read.
         assert requests[0].url.path == "/v1/info"
     create = next(r for r in requests if r.url.path == "/v1/sessions/orchestrated")
     body = json.loads(create.content)
@@ -707,6 +702,10 @@ async def test_independent_create_files_a_named_project(placement, named_by):
         ({"placement": "managed", "project_id": 123}, "nonempty strings"),
         ({"placement": "managed", "project_name": "  "}, "nonempty strings"),
         ({"placement": "same_host", "project_id": "a/b"}, "Project id must contain only"),
+        (
+            {"agent_id": None, "config_path": "agent.yaml", "project_id": _PROJECT_ID},
+            "require placement='same_host' or 'managed'",
+        ),
     ],
 )
 async def test_project_arguments_are_refused_before_any_request(arguments, error):
@@ -732,6 +731,39 @@ async def test_project_arguments_are_refused_before_any_request(arguments, error
 
 
 @pytest.mark.asyncio
+async def test_a_refused_managed_create_resolves_no_project():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"features": {"sandbox_profiles": False}})
+        return httpx.Response(500)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": "worker",
+                        "placement": "managed",
+                        "sandbox_profile_id": "build",
+                        "project_name": "New project",
+                    }
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert "sandbox profile support" in result["error"]
+    # The project is resolved last, so this refusal creates no project.
+    assert [r.url.path for r in requests] == ["/v1/info"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "arguments",
     [
@@ -747,8 +779,6 @@ async def test_null_project_arguments_count_as_absent(arguments):
         requests.append(request)
         if request.url.path == "/v1/info":
             return httpx.Response(200, json={})
-        if request.url.path.endswith("/events"):
-            return httpx.Response(202, json={"queued": True})
         return httpx.Response(201, json={"id": uuid4().hex, "project_id": "inherited"})
 
     async with httpx.AsyncClient(
