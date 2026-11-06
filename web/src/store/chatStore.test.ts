@@ -15412,52 +15412,36 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await pump.stop();
   });
 
-  it("keeps a reconnect backfill's success when an older retry fails after it", async () => {
-    const id = "conv_retry_outrun";
+  it.each([
+    ["success when an older retry fails after it", false],
+    ["failure owed when an older retry succeeds after it", true],
+  ])("keeps a reconnect backfill's %s", async (_outcome, reconnectFails) => {
+    const id = `conv_retry_outrun_${reconnectFails ? "by_failure" : "by_success"}`;
     const { pump, reply, newestSink, releaseItems, setItemsDown } = await holdOwedRetry(id);
+    const renderedIds = () => pump.bound.get().blocks.map((b) => b.ctx.itemId);
+    const recovered = [pump.before.id, reply.id];
 
-    setItemsDown(false);
+    setItemsDown(reconnectFails);
     newestSink().error();
     await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
     await drainAsync();
     expect(pump.sinks).toHaveLength(3);
-    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
-    releaseItems(true);
-    await drainAsync();
-
-    const fetchesAfterRecovery = pump.itemFetches();
-    await advanceWithHeartbeats(newestSink, 2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
-    await drainAsync();
-    expect(pump.itemFetches()).toBe(fetchesAfterRecovery);
-    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
-
-    await pump.stop();
-  });
-
-  it("keeps a reconnect backfill's failure owed when an older retry succeeds after it", async () => {
-    const id = "conv_retry_outrun_by_failure";
-    const { pump, reply, newestSink, releaseItems, setItemsDown } = await holdOwedRetry(id);
-
-    setItemsDown(true);
-    newestSink().error();
-    await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
-    await drainAsync();
-    expect(pump.sinks).toHaveLength(3);
-    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id]);
+    expect(renderedIds()).toEqual(reconnectFails ? [pump.before.id] : recovered);
     setItemsDown(false);
-    releaseItems(false);
+    releaseItems(!reconnectFails);
     await drainAsync();
-    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+    expect(renderedIds()).toEqual(recovered);
 
-    const fetchesBeforeRetry = pump.itemFetches();
+    // Only the newer reconnect's failure leaves history owed to the next status check.
+    const fetchesBeforeCheck = pump.itemFetches();
     await advanceWithHeartbeats(newestSink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
-    expect(pump.itemFetches()).toBeGreaterThan(fetchesBeforeRetry);
-    const fetchesAfterRetry = pump.itemFetches();
+    expect(pump.itemFetches() > fetchesBeforeCheck).toBe(reconnectFails);
+    const fetchesAfterCheck = pump.itemFetches();
     await advanceWithHeartbeats(newestSink, 2 * ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
     await drainAsync();
-    expect(pump.itemFetches()).toBe(fetchesAfterRetry);
-    expect(pump.bound.get().blocks.map((b) => b.ctx.itemId)).toEqual([pump.before.id, reply.id]);
+    expect(pump.itemFetches()).toBe(fetchesAfterCheck);
+    expect(renderedIds()).toEqual(recovered);
 
     await pump.stop();
   });
