@@ -2765,8 +2765,8 @@ export function useDeleteProject() {
 export function useCreateProject() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ name, icon }: { name: string; icon?: string }) =>
-      apiCreateProject(name, icon ? { icon } : undefined),
+    mutationFn: ({ name, icon, config }: { name: string; icon?: string; config?: ProjectConfig }) =>
+      apiCreateProject(name, icon || config ? { ...config, ...(icon ? { icon } : {}) } : undefined),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["projects"] });
     },

@@ -192,11 +192,12 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 
 
 def _fail_pending_worktrees(conn: HostConnection) -> None:
-    """Fail worktree requests as soon as their host disappears."""
+    """Fail worktree and repository-clone requests as soon as their host disappears."""
     for pending in (
         conn.pending_create_worktrees,
         conn.pending_remove_worktrees,
         conn.pending_list_worktrees,
+        conn.pending_repository_clones,
     ):
         _fail_pending_inventory(pending, conn.host_id)
 
@@ -442,6 +443,9 @@ class HostConnection:
         host sends ``host.create_dir_result``. Values carry the
         result fields (``status``, ``path``, ``error``). Same
         ``Any`` typing rationale as ``pending_stats``.
+    :param pending_repository_clones: Per-``request_id`` futures for
+        in-flight ``host.clone_repository`` requests, resolved by
+        ``host.clone_repository_result`` and failed when the tunnel drops.
     :param pending_installs: Per-``request_id`` futures for in-flight
         ``host.install_harness`` requests. Resolved when the host sends
         ``host.install_harness_result``. Values carry the result fields
@@ -528,6 +532,9 @@ class HostConnection:
         default_factory=dict,
     )
     pending_create_dirs: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_repository_clones: dict[str, asyncio.Future[dict[str, Any]]] = field(
         default_factory=dict,
     )
     pending_installs: dict[str, asyncio.Future[dict[str, Any]]] = field(

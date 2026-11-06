@@ -190,6 +190,7 @@ import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerH
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { CloneRepositoryDialog } from "./CloneRepository";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
@@ -2720,6 +2721,7 @@ export function NewChatLandingScreen() {
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [cloneRepositoryOpen, setCloneRepositoryOpen] = useState(false);
   const [workspacePickerInitialPath, setWorkspacePickerInitialPath] = useState<string | undefined>(
     undefined,
   );
@@ -6639,6 +6641,25 @@ export function NewChatLandingScreen() {
                   Open folder
                 </button>
               </MenuItem>
+              <MenuItem
+                asChild
+                density="compact"
+                className="max-md:hover:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-2 max-md:focus-visible:ring-ring/50"
+              >
+                <button
+                  type="button"
+                  className="w-full text-left"
+                  disabled={selectedHostId === null}
+                  onClick={() => {
+                    setWorkspacePopoverOpen(false);
+                    setCloneRepositoryOpen(true);
+                  }}
+                  data-testid="new-chat-landing-workspace-clone-repository"
+                >
+                  <FolderGit2Icon className="size-4 shrink-0 text-muted-foreground" />
+                  Clone repository…
+                </button>
+              </MenuItem>
             </PopoverContent>
           </Popover>
           {/* Worktree selection stays a separate real action from the directory picker. */}
@@ -7559,6 +7580,16 @@ export function NewChatLandingScreen() {
                     occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
                 : undefined
             }
+          />
+          <CloneRepositoryDialog
+            open={cloneRepositoryOpen}
+            onOpenChange={setCloneRepositoryOpen}
+            hostId={selectedHostId}
+            onCloned={({ path }) => {
+              workspaceFromConfigRef.current = false;
+              setWorkspace(path);
+              addRecent(path);
+            }}
           />
         </fieldset>
         <div

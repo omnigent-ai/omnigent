@@ -282,6 +282,19 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
 }));
+const cloneHostRepositoryMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useCloneHostRepository", () => ({
+  useCloneHostRepository: () => ({
+    mutate: (
+      variables: { hostId: string; url: string; parentDirectory: string },
+      options?: { onSuccess?: (clone: unknown) => void },
+    ) => options?.onSuccess?.(cloneHostRepositoryMock(variables)),
+    reset: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
+}));
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
 vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
@@ -5533,6 +5546,36 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
     expect(screen.queryByTestId("workspace-picker")).toBeNull();
     expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
+  });
+
+  it("uses a repository cloned from the working-directory menu as the workspace", () => {
+    cloneHostRepositoryMock.mockReturnValue({
+      path: "/Users/corey/code/widgets",
+      name: "widgets",
+      reusedExisting: false,
+    });
+    renderLanding();
+
+    const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    fireEvent.click(workspace);
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-clone-repository"));
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "https://github.com/acme/widgets" },
+    });
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "/Users/corey/code" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+
+    expect(cloneHostRepositoryMock).toHaveBeenCalledWith({
+      hostId: "host_1",
+      url: "https://github.com/acme/widgets",
+      parentDirectory: "/Users/corey/code",
+    });
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/code/widgets");
+    expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1).toContain(
+      "/Users/corey/code/widgets",
+    );
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {

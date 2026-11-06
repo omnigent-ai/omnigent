@@ -76,6 +76,8 @@ from omnigent.host.frames import (
     RUNNER_LOG_TAIL_HEADING,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -146,6 +148,7 @@ from omnigent.host.frames import (
     parse_server_capabilities,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import CloneError, clone_repository
 from omnigent.host.git_worktree import (
     WorktreeError,
     create_worktree,
@@ -3285,6 +3288,45 @@ class HostProcess:
             path=created,
         )
 
+    def _handle_clone_repository(
+        self, frame: HostCloneRepositoryFrame
+    ) -> HostCloneRepositoryResultFrame:
+        """Handle a ``host.clone_repository`` request from the server.
+
+        Runs ``git clone`` with this host user's credentials. Every outcome
+        answers, so the server never waits out its whole clone bound.
+
+        :param frame: The clone request frame.
+        :returns: Result frame with the checkout path, or a ``conflict`` /
+            ``failed`` status and the reason.
+        """
+        try:
+            cloned = clone_repository(
+                url=frame.url,
+                parent_directory=frame.parent_directory,
+                directory_name=frame.directory_name,
+                timeout_s=frame.timeout_s,
+            )
+        except CloneError as exc:
+            return HostCloneRepositoryResultFrame(
+                request_id=frame.request_id,
+                status="conflict" if exc.conflict else "failed",
+                error=exc.message,
+            )
+        except Exception as exc:
+            _logger.exception("Repository clone crashed for %s", frame.url)
+            return HostCloneRepositoryResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"the clone crashed on the host ({type(exc).__name__})",
+            )
+        return HostCloneRepositoryResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            path=cloned.path,
+            reused_existing=cloned.reused_existing,
+        )
+
     def _handle_install_harness(
         self, frame: HostInstallHarnessFrame
     ) -> HostInstallHarnessResultFrame:
@@ -5945,6 +5987,13 @@ class HostProcess:
         elif isinstance(frame, HostCreateDirFrame):
             create_dir_result = await asyncio.to_thread(self._handle_create_dir, frame)
             await self._send_text(ws, self._encode_frame(create_dir_result))
+        elif isinstance(frame, HostCloneRepositoryFrame):
+            # A clone can run for minutes; keep the tunnel loop free and keep
+            # the orphan reaper away from git's child processes meanwhile.
+            clone_result = await self._run_host_subprocess_in_thread(
+                lambda: self._handle_clone_repository(frame)
+            )
+            await self._send_text(ws, self._encode_frame(clone_result))
         elif isinstance(frame, HostInstallHarnessFrame):
             # The installer shells out (npm) and can run for minutes, so run
             # it off the event loop and reply when it completes.

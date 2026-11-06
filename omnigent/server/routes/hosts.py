@@ -41,11 +41,13 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness, harness_account_key
 from omnigent.host.frames import (
+    CAP_CLONE_REPOSITORY,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
     HostCreateDirFrame,
     HostDetectCredentialsFrame,
     HostHarnessLoginCancelFrame,
@@ -61,6 +63,7 @@ from omnigent.host.frames import (
     optional_str_bool_map,
     workspace_missing_message,
 )
+from omnigent.host.git_clone import CLONE_REPOSITORY_BUDGET_S
 from omnigent.onboarding.harness_install import (
     ui_credential_configurable_harnesses,
     ui_install_key,
@@ -83,6 +86,7 @@ from omnigent.server.host_registry import (
     HostRegistry,
     update_harness_accounts,
 )
+from omnigent.server.managed_hosts import parse_repo_workspace
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._host_launch import (
     LAUNCH_TIMEOUT_ENV_VAR,
@@ -139,6 +143,8 @@ _LIST_DIR_MAX_LIMIT = 1000
 # for transient network slowness without making the picker feel hung.
 _CREATE_DIR_TIMEOUT_S = 5.0
 _MODEL_OPTIONS_TIMEOUT_S = 15.0
+# The host bounds the clone itself; wait a little longer for its reply.
+_CLONE_REPOSITORY_TIMEOUT_S = CLONE_REPOSITORY_BUDGET_S + 60.0
 # Per-call timeout for host.install_harness round-trips. The host runs
 # `npm install -g <pkg>` — install_harness_cli caps that subprocess at 300s —
 # then recomputes readiness and sends the result back over the tunnel. The
@@ -398,6 +404,64 @@ async def _proxy_create_dir(
         # Cleanup runs on every path so a cancelled caller doesn't
         # leave an orphan in the pending dict.
         host_conn.pending_create_dirs.pop(request_id, None)
+
+
+async def _proxy_clone_repository(
+    *,
+    host_registry: HostRegistry,
+    host_conn: HostConnection,
+    url: str,
+    parent_directory: str,
+    directory_name: str,
+) -> dict[str, Any]:
+    """
+    Send a ``host.clone_repository`` frame and await the result.
+
+    Mirrors :func:`_proxy_create_dir`. The pending future is also failed when
+    the tunnel drops, so a long clone does not wait out its whole bound.
+
+    :param host_registry: Server-side registry; used to enqueue the frame.
+    :param host_conn: Live host connection.
+    :param url: Validated clone URL, e.g. ``"https://github.com/org/repo"``.
+    :param parent_directory: Absolute or ``~`` folder for the checkout.
+    :param directory_name: Checkout folder name, e.g. ``"repo"``.
+    :returns: Dict with ``status`` (``"ok"`` / ``"conflict"`` / ``"failed"``),
+        ``path``, ``reused_existing`` and ``error``.
+    :raises HTTPException: 504 on timeout, 502 on connection drop.
+    """
+    request_id = secrets.token_hex(8)
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[dict[str, Any]] = loop.create_future()
+    host_conn.pending_repository_clones[request_id] = future
+
+    frame = encode_host_frame(
+        HostCloneRepositoryFrame(
+            request_id=request_id,
+            url=url,
+            parent_directory=parent_directory,
+            directory_name=directory_name,
+            timeout_s=CLONE_REPOSITORY_BUDGET_S,
+        )
+    )
+    try:
+        try:
+            host_registry.send_text(host_conn, frame)
+            return await asyncio.wait_for(future, timeout=_CLONE_REPOSITORY_TIMEOUT_S)
+        except ConnectionError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"host '{host_conn.host_id}' connection lost during the clone",
+            ) from exc
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"host '{host_conn.host_id}' did not finish the clone "
+                    f"within {_CLONE_REPOSITORY_TIMEOUT_S:.0f}s"
+                ),
+            ) from exc
+    finally:
+        host_conn.pending_repository_clones.pop(request_id, None)
 
 
 async def _proxy_install_harness(
@@ -668,6 +732,26 @@ async def _proxy_detect_credentials(
         host_conn.pending_credential_detects.pop(request_id, None)
 
 
+def _require_host_resolvable_path(path: str, *, field: str) -> None:
+    """Reject a path the host could not resolve on its own.
+
+    :param path: Caller-supplied host path, e.g. ``"~/code"``.
+    :param field: Request field named in the error, e.g. ``"path"``.
+    :raises HTTPException: 400 when the path is empty, contains NUL, or is
+        neither absolute nor tilde-prefixed.
+    """
+    if not path.strip():
+        raise HTTPException(status_code=400, detail=f"{field} must not be empty")
+    if "\x00" in path:
+        raise HTTPException(status_code=400, detail=f"{field} must not contain NUL bytes")
+    # A relative path has no stable meaning on the host.
+    if not (path.startswith(("/", "~", "\\\\")) or _is_windows_absolute_path(path)):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field} must be absolute or tilde-prefixed",
+        )
+
+
 class CreateDirectoryRequest(BaseModel):
     """Request body for ``POST /v1/hosts/{host_id}/directories``.
 
@@ -678,6 +762,20 @@ class CreateDirectoryRequest(BaseModel):
     """
 
     path: str
+
+
+class CloneRepositoryRequest(BaseModel):
+    """Request body for ``POST /v1/hosts/{host_id}/repositories``.
+
+    :param url: Repository to clone, ``https://<host>/<path>`` or
+        ``git@<host>:<path>``, e.g. ``"git@github.com:org/repo.git"``.
+    :param parent_directory: Absolute or tilde-prefixed folder on the host
+        that will hold the checkout, e.g. ``"~/code"``. Created when missing.
+        The checkout lands in ``<parent_directory>/<repository name>``.
+    """
+
+    url: str
+    parent_directory: str
 
 
 class StoreHarnessCredentialRequest(BaseModel):
@@ -1719,20 +1817,7 @@ def create_hosts_router(
             raise HTTPException(status_code=403, detail="not your host")
 
         path = body.path
-        if not path.strip():
-            raise HTTPException(status_code=400, detail="path must not be empty")
-        if "\x00" in path:
-            raise HTTPException(
-                status_code=400,
-                detail="path must not contain NUL bytes",
-            )
-        # Absolute or tilde-prefixed only — the host needs a path it can
-        # resolve on its own; a relative path has no stable meaning here.
-        if not (path.startswith(("/", "~", "\\\\")) or _is_windows_absolute_path(path)):
-            raise HTTPException(
-                status_code=400,
-                detail="path must be absolute or tilde-prefixed",
-            )
+        _require_host_resolvable_path(path, field="path")
 
         conn = host_registry.get(host.host_id)
         if conn is None:
@@ -1762,6 +1847,86 @@ def create_hosts_router(
         return {
             "object": "directory",
             "path": result.get("path"),
+        }
+
+    @router.post("/hosts/{host_id}/repositories")
+    async def clone_host_repository(
+        request: Request,
+        host_id: str,
+        body: CloneRepositoryRequest,
+    ) -> dict[str, Any]:
+        """
+        Clone a git repository onto a host.
+
+        Backs the Web UI's "Clone repository" actions so a user can start work
+        in a repository they have not checked out yet. The host runs
+        ``git clone`` with its own credentials into
+        ``<parent_directory>/<repository name>``. Owner-scoped like the other
+        filesystem routes; the workspace-boundary check still runs when a
+        session is created in the checkout.
+
+        :param request: FastAPI request (for auth).
+        :param host_id: Host identifier, e.g. ``"host_a1b2c3d4..."``.
+        :param body: The repository URL and the destination parent folder.
+        :returns: ``{"object": "repository_clone", "path": str, "name": str,
+            "reused_existing": bool}``. ``reused_existing`` is ``True`` when
+            the destination already held a checkout of the same remote.
+        :raises HTTPException: 400 on an invalid URL or path, 404 if the host
+            is not found, 403 if not owned by the caller, 409 if the host is
+            offline, too old to clone, or the destination is taken, 422 when
+            git cannot clone, 502 on host I/O failure, 504 on host timeout.
+        """
+        user_id = require_user(request, auth_provider)
+
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None:
+            raise HTTPException(status_code=404, detail="host not found")
+        if user_id is not None and host.user_id != user_id:
+            raise HTTPException(status_code=403, detail="not your host")
+
+        url = body.url.strip()
+        if "#" in url:
+            raise HTTPException(
+                status_code=400,
+                detail="the repository URL must not include a '#' fragment",
+            )
+        try:
+            repository = parse_repo_workspace(url)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        parent_directory = body.parent_directory.strip()
+        _require_host_resolvable_path(parent_directory, field="parent_directory")
+
+        conn = host_registry.get(host.host_id)
+        if conn is None:
+            raise _host_absent_error(host)
+        if CAP_CLONE_REPOSITORY not in conn.hello.capabilities:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "this host's Omnigent version can't clone repositories. "
+                    "Update Omnigent on the host, then try again."
+                ),
+            )
+
+        result = await _proxy_clone_repository(
+            host_registry=host_registry,
+            host_conn=conn,
+            url=repository.url,
+            parent_directory=parent_directory,
+            directory_name=repository.repo_name,
+        )
+        status = result.get("status")
+        error = result.get("error") or "unknown error"
+        if status == "conflict":
+            raise HTTPException(status_code=409, detail=str(error))
+        if status != "ok" or not result.get("path"):
+            raise HTTPException(status_code=422, detail=f"Couldn't clone the repository: {error}")
+        return {
+            "object": "repository_clone",
+            "path": result["path"],
+            "name": repository.repo_name,
+            "reused_existing": bool(result.get("reused_existing")),
         }
 
     @router.post("/hosts/{host_id}/harnesses/refresh")
