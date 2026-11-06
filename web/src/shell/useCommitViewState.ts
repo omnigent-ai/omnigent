@@ -30,10 +30,8 @@ const emptySlice = (commitSha: string | null): Slice => ({
 /** The view state of the commit at `commitSha`, fresh whenever a different commit is opened. */
 export function useCommitViewState(commitSha: string | null): CommitViewState {
   const [stored, setStored] = useState<Slice>(() => emptySlice(commitSha));
-  // Opening another commit, or coming back to this one, starts it fresh: the stored state is
-  // replaced during render, before anything reads it.
+  // React re-renders at once with the reset slice, so nothing reads the stale one.
   if (stored.commitSha !== commitSha) setStored(emptySlice(commitSha));
-  const current = stored.commitSha === commitSha ? stored : emptySlice(commitSha);
   // A write from a callback captured for another commit, fired after this one opened, is dropped.
   const write = useCallback(
     (change: (slice: Slice) => Slice) =>
@@ -65,8 +63,8 @@ export function useCommitViewState(commitSha: string | null): CommitViewState {
     [write],
   );
   return {
-    collapsedPaths: current.collapsedPaths,
-    revealedPaths: current.revealedPaths,
+    collapsedPaths: stored.collapsedPaths,
+    revealedPaths: stored.revealedPaths,
     setCollapsedPaths,
     reveal,
     clearReveal,
