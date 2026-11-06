@@ -3,7 +3,7 @@
 import { Loader2Icon } from "lucide-react";
 import { useMemo, useState } from "react";
 import { Input } from "@/components/ui/input";
-import type { PullRequestCommit } from "@/hooks/usePullRequests";
+import { PULL_REQUEST_COMMITS_LIMIT, type PullRequestCommit } from "@/hooks/usePullRequests";
 import { relativeTime } from "@/lib/relativeTime";
 
 /** Commits whose sha, title or author contains `query`, ignoring case. */
@@ -37,6 +37,44 @@ export function PullRequestCommitsList({
   const [query, setQuery] = useState("");
   const visible = useMemo(() => filterCommits(commits, query), [commits, query]);
 
+  const renderBody = () => {
+    if (commits.length === 0) {
+      return <p className="p-3 text-ui text-muted-foreground">No commits on this pull request.</p>;
+    }
+    if (visible.length === 0) {
+      return (
+        <p className="p-3 text-ui text-muted-foreground">{`No commits match "${query.trim()}"`}</p>
+      );
+    }
+    return (
+      <ul className="min-h-0 flex-1 overflow-y-auto">
+        {visible.map((commit) => {
+          const authoredAt = commit.date ? Date.parse(commit.date) : Number.NaN;
+          return (
+            <li key={commit.sha}>
+              <button
+                type="button"
+                onClick={() => onSelect(commit.sha)}
+                className="flex w-full flex-col gap-0.5 border-b border-border px-3 py-2 text-left text-ui hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-none"
+              >
+                <span className="truncate">{commit.title || commit.sha}</span>
+                <span className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                  <span className="shrink-0 font-mono">{commit.sha.slice(0, 7)}</span>
+                  {commit.author && <span className="truncate">{commit.author}</span>}
+                  {Number.isFinite(authoredAt) && (
+                    <time dateTime={commit.date ?? undefined} className="shrink-0">
+                      {relativeTime(authoredAt)}
+                    </time>
+                  )}
+                </span>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    );
+  };
+
   if (errorMessage) {
     return (
       <p role="alert" className="p-3 text-ui text-destructive">
@@ -52,14 +90,17 @@ export function PullRequestCommitsList({
       </div>
     );
   }
+  // The root fills the diff pane, so the header and search stay put while the list scrolls.
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border px-3 py-1.5 text-ui">
         <span className="font-medium">
           {commits.length} {commits.length === 1 ? "commit" : "commits"}
         </span>
         {hasMore && (
-          <span className="text-xs text-muted-foreground">History limited to 250 commits</span>
+          <span className="text-xs text-muted-foreground">
+            {`History limited to ${PULL_REQUEST_COMMITS_LIMIT} commits`}
+          </span>
         )}
       </div>
       <div className="shrink-0 border-b border-border p-2">
@@ -77,37 +118,7 @@ export function PullRequestCommitsList({
           }}
         />
       </div>
-      {commits.length === 0 ? (
-        <p className="p-3 text-ui text-muted-foreground">No commits on this pull request.</p>
-      ) : visible.length === 0 ? (
-        <p className="p-3 text-ui text-muted-foreground">{`No commits match "${query.trim()}"`}</p>
-      ) : (
-        <ul className="min-h-0 flex-1 overflow-y-auto">
-          {visible.map((commit) => {
-            const authoredAt = commit.date ? Date.parse(commit.date) : Number.NaN;
-            return (
-              <li key={commit.sha}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(commit.sha)}
-                  className="flex w-full flex-col gap-0.5 border-b border-border px-3 py-2 text-left text-ui hover:bg-muted/50 focus-visible:bg-muted/50 focus-visible:outline-none"
-                >
-                  <span className="truncate">{commit.title || commit.sha}</span>
-                  <span className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-                    <span className="shrink-0 font-mono">{commit.sha.slice(0, 7)}</span>
-                    {commit.author && <span className="truncate">{commit.author}</span>}
-                    {Number.isFinite(authoredAt) && (
-                      <time dateTime={commit.date ?? undefined} className="shrink-0">
-                        {relativeTime(authoredAt)}
-                      </time>
-                    )}
-                  </span>
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
+      {renderBody()}
     </div>
   );
 }

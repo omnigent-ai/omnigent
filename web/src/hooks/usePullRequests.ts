@@ -739,19 +739,28 @@ export interface PullRequestDiffResponse {
   message?: string;
 }
 
-async function fetchPullRequestDiff(
+/** GET one patch resource of the session's GitHub panel: the whole PR, or one commit. */
+async function fetchPullRequestPatch(
   conversationId: string,
-  prUrl?: string,
-  revision?: string,
+  resource: "diff" | "commit-diff",
+  query: string,
 ): Promise<PullRequestDiffResponse> {
   const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff${pinnedPrQuery(prUrl, revision)}`,
+    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}${query}`,
   );
   if (res.status === 503 && (await isRunnerUnavailable503(res))) {
     throw new RunnerOfflineError();
   }
   if (!res.ok) throw await errorFromResponse(res);
   return (await res.json()) as PullRequestDiffResponse;
+}
+
+async function fetchPullRequestDiff(
+  conversationId: string,
+  prUrl?: string,
+  revision?: string,
+): Promise<PullRequestDiffResponse> {
+  return fetchPullRequestPatch(conversationId, "diff", pinnedPrQuery(prUrl, revision));
 }
 
 /**
@@ -790,9 +799,12 @@ export interface PullRequestCommit {
   date: string | null;
 }
 
+/** The most commits the server lists for one pull request (GitHub's own limit). */
+export const PULL_REQUEST_COMMITS_LIMIT = 250;
+
 export interface PullRequestCommitsResult {
   object: "list";
-  /** Oldest first; at most 250, with `has_more` when the PR has more. */
+  /** Oldest first; at most {@link PULL_REQUEST_COMMITS_LIMIT}, with `has_more` when the PR has more. */
   data: PullRequestCommit[];
   has_more: boolean;
 }
@@ -842,17 +854,13 @@ async function fetchPullRequestCommitDiff(
   commitSha: string,
 ): Promise<PullRequestDiffResponse> {
   const query = new URLSearchParams({ pr_url: prUrl, commit_sha: commitSha });
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/diff?${query}`,
-  );
-  if (res.status === 503 && (await isRunnerUnavailable503(res))) {
-    throw new RunnerOfflineError();
-  }
-  if (!res.ok) throw await errorFromResponse(res);
-  return (await res.json()) as PullRequestDiffResponse;
+  return fetchPullRequestPatch(conversationId, "commit-diff", `?${query}`);
 }
 
-/** One commit's patch, read by its full id. Enabled only while a commit is open. */
+/**
+ * One commit's patch, read by its full id. Enabled only while a commit is open.
+ * A commit's patch never changes, so it stays fresh for the whole cache lifetime.
+ */
 export function usePullRequestCommitDiff(
   conversationId: string | undefined,
   prUrl: string | undefined,
@@ -866,7 +874,7 @@ export function usePullRequestCommitDiff(
     enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: 30_000,
+    staleTime: Infinity,
     gcTime: 30 * 60_000,
   });
 }

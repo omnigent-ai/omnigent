@@ -197,24 +197,25 @@ export function pullRequestRepoUrl(provider: string | null, prUrl: string): stri
   return match ? match[1] : null;
 }
 
+function patchFileStatus(
+  diff: FileDiffMetadata,
+  previousPath: string | null,
+): PullRequestChangedFile["status"] {
+  if (diff.type === "new") return "created";
+  if (diff.type === "deleted") return "deleted";
+  return previousPath ? "renamed" : "modified";
+}
+
 /** The files one commit's patch changes, in patch order, with their line counts. */
 export function changedFilesFromPatch(
   diffs: ReadonlyMap<string, FileDiffMetadata>,
 ): PullRequestChangedFile[] {
   return [...diffs.values()].map((diff) => {
     const previousPath = diff.prevName && diff.prevName !== diff.name ? diff.prevName : null;
-    const status: PullRequestChangedFile["status"] =
-      diff.type === "new"
-        ? "created"
-        : diff.type === "deleted"
-          ? "deleted"
-          : previousPath
-            ? "renamed"
-            : "modified";
     return {
       path: diff.name,
       name: diff.name.split("/").pop() ?? diff.name,
-      status,
+      status: patchFileStatus(diff, previousPath),
       lines_added: diff.hunks.reduce((sum, hunk) => sum + hunk.additionLines, 0),
       lines_removed: diff.hunks.reduce((sum, hunk) => sum + hunk.deletionLines, 0),
       previous_path: previousPath,

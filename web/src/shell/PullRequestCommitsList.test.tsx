@@ -55,6 +55,29 @@ describe("PullRequestCommitsList", () => {
     expect(onSelect).toHaveBeenCalledWith(COMMITS[1]!.sha);
   });
 
+  it("keeps Escape inside the search while it has a query, and passes it on when empty", () => {
+    const enclosingKeyDown = vi.fn();
+    render(
+      <div onKeyDown={enclosingKeyDown}>
+        <PullRequestCommitsList
+          commits={COMMITS}
+          hasMore={false}
+          loading={false}
+          errorMessage={null}
+          onSelect={vi.fn()}
+        />
+      </div>,
+    );
+    const search = screen.getByRole("searchbox", { name: "Search commits" });
+
+    fireEvent.change(search, { target: { value: "parser" } });
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(enclosingKeyDown).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(search, { key: "Escape" });
+    expect(enclosingKeyDown).toHaveBeenCalledTimes(1);
+  });
+
   it("says when GitHub's history is truncated", () => {
     render(
       <PullRequestCommitsList
