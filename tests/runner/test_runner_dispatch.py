@@ -9907,7 +9907,9 @@ async def test_unresolvable_sub_agent_warns_again_on_later_turns(
         spec_version=1,
         name="worker",
         instructions="Root instructions.",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        executor=ExecutorSpec(
+            type="omnigent", model="mock-claude", config={"harness": "claude-sdk"}
+        ),
     )
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:

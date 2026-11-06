@@ -72,7 +72,10 @@ from omnigent.harness_plugins import (
 )
 from omnigent.llms.errors import detect_request_size_overflow
 from omnigent.native.failure_telemetry import failure_log_attributes, normalize_failure_context
-from omnigent.native.input_diagnostics import input_attributes
+from omnigent.native.input_diagnostics import (
+    TERMINAL_EXITED_BEFORE_DELIVERY_CODE,
+    input_attributes,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
 )
@@ -1520,6 +1523,10 @@ def create_runner_app(
     _required_terminal_exit_errors: dict[str, dict[str, Any]] = {}
     app.state.required_terminal_exit_errors = _required_terminal_exit_errors
     _clean_terminal_exit_responses: dict[str, str | None] = {}
+    # Sessions whose last turn ended because Claude's terminal died before the
+    # message was typed; the server sends that message again, so the terminal's
+    # exit is not reported as the session failing.
+    _turns_ended_before_delivery: set[str] = set()
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -2009,13 +2016,21 @@ def create_runner_app(
         if process_manager is None:
             return
 
+        turn_epoch = _turn_bind_epoch.get(session_id)
+
         async def _release() -> None:
             # Let a live turn stream converge first (bounded): the harness's own
             # failure event may already be on the wire, and releasing now would
             # sever the stream carrying it.
             deadline = time.monotonic() + grace_s
-            while session_id in _live_response_id and time.monotonic() < deadline:
+            while (
+                session_id in _live_response_id
+                and _turn_bind_epoch.get(session_id) == turn_epoch
+                and time.monotonic() < deadline
+            ):
                 await asyncio.sleep(0.05)
+            if _turn_bind_epoch.get(session_id) != turn_epoch:
+                return
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -2124,6 +2139,57 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        if event.terminal_name == "claude" and (
+            event.session_id in _live_response_id
+            or event.session_id in _turns_ended_before_delivery
+        ):
+            # Claude's live turn may still report that its message was never
+            # typed; the server then sends it again, so wait for that turn.
+            task = asyncio.create_task(
+                _fail_after_turn_settles(
+                    event, error, diagnosis, _turn_bind_epoch.get(event.session_id)
+                ),
+                name=f"required-terminal-exit:{event.session_id}",
+            )
+            task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(task)
+            return
+        _fail_turn_for_terminal_exit(event, error, diagnosis)
+
+    async def _fail_after_turn_settles(
+        event: TerminalExitEvent,
+        error: dict[str, str],
+        diagnosis: FailureDiagnosis | None,
+        turn_epoch: int | None,
+    ) -> None:
+        """Fail the owning turn unless it ended undelivered or another turn replaced it."""
+        deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+        while (
+            event.session_id in _live_response_id
+            and _turn_bind_epoch.get(event.session_id) == turn_epoch
+            and time.monotonic() < deadline
+        ):
+            await asyncio.sleep(0.05)
+        if _turn_bind_epoch.get(event.session_id) != turn_epoch:
+            return
+        if event.session_id not in _turns_ended_before_delivery:
+            _fail_turn_for_terminal_exit(event, error, diagnosis)
+            return
+        _turns_ended_before_delivery.discard(event.session_id)
+        _logger.info(
+            "required terminal %s exited before its message was typed; the server "
+            "sends it again: session=%s",
+            event.terminal_name,
+            event.session_id,
+            extra={"session_id": event.session_id},
+        )
+        _native_interrupt_runner.clear_pending_interrupt(event.session_id)
+        _release_required_terminal_session(event.session_id)
+
+    def _fail_turn_for_terminal_exit(
+        event: TerminalExitEvent, error: dict[str, str], diagnosis: FailureDiagnosis | None
+    ) -> None:
+        """Report a required terminal's exit as the session's turn failure."""
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
         exit_log["attributes"] = {
             **{
@@ -4183,6 +4249,8 @@ def create_runner_app(
 
         _active_turns.pop(conv_id, None)
         _turn_pending_ids.pop(conv_id, None)
+        if error is not None and error.get("code") == TERMINAL_EXITED_BEFORE_DELIVERY_CODE:
+            _turns_ended_before_delivery.add(conv_id)
         _release_live_turn_markers(conv_id)
         # A claude-sdk `/compact` turn that ended without emitting
         # `response.compaction.completed` produced no compaction (nothing to
@@ -6153,6 +6221,7 @@ def create_runner_app(
         # earlier stream; only exits observed from here on can end this one.
         _required_terminal_exit_errors.pop(conv_id, None)
         _clean_terminal_exit_responses.pop(conv_id, None)
+        _turns_ended_before_delivery.discard(conv_id)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:

@@ -100,9 +100,12 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
     LEVEL_READ,
+    RESERVED_USER_LOCAL,
     AuthProvider,
+    authentication_requires_identity,
 )
 from omnigent.server.background_session_titles import (
+    BACKGROUND_SESSION_TITLES_HEADER,
     BackgroundSessionTitleCoordinator,
     background_session_titles_enabled,
     background_title_prompt,
@@ -184,6 +187,7 @@ from omnigent.server.routes._sessions.common import (
     _logger,
     _pushed_model_options_cache,
     _session_active_response_cache,
+    _session_last_response_cache,
     _session_mcp_startup_cache,
     _session_sandbox_status_cache,
     _session_status_cache,
@@ -272,6 +276,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _interrupt_native_input_resends,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -873,6 +878,15 @@ class _RunnerEventContext:
     runner_id: str
 
 
+@dataclass(frozen=True)
+class _NativeInputResendContext:
+    """The original sender of a message the server sends again on its own."""
+
+    app: Any
+    headers: Headers
+    user_id: str | None
+
+
 _RUNNER_EVENT_TYPES = frozenset(
     {
         _EXTERNAL_CONVERSATION_ITEM_TYPE,
@@ -969,6 +983,7 @@ def register_events_routes(
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
     | None = None,
+    register_native_input_resend: Callable[[Callable[..., Awaitable[object]]], None] | None = None,
 ) -> None:
     """Register the events, stream, and delete routes on router.
 
@@ -980,7 +995,8 @@ def register_events_routes(
     event_router = APIRouter(route_class=_SessionEventBodyLimitRoute)
 
     def _has_bound_runner_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | _NativeInputResendContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return conv.runner_id == request.runner_id
@@ -991,7 +1007,7 @@ def register_events_routes(
         return isinstance(runner_id, str) and token_bound_runner_id(token) == runner_id
 
     def _reporting_runner_id(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _NativeInputResendContext,
     ) -> str | None:
         """Return the runner that sent *request*, or ``None`` for a non-runner caller."""
         if isinstance(request, _RunnerEventContext):
@@ -1000,7 +1016,8 @@ def register_events_routes(
         return token_bound_runner_id(token) if token else None
 
     def _has_runner_created_by_authority(
-        request: Request | _RunnerEventContext | StartupInputContext, conv: Any
+        request: Request | _RunnerEventContext | StartupInputContext | _NativeInputResendContext,
+        conv: Any,
     ) -> bool:
         if isinstance(request, _RunnerEventContext):
             return _has_bound_runner_authority(request, conv)
@@ -1010,7 +1027,7 @@ def register_events_routes(
         return _has_bound_runner_authority(request, conv)
 
     async def _authorized_conversation(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _NativeInputResendContext,
         session_id: str,
         *,
         external_transcript: bool = False,
@@ -1018,7 +1035,9 @@ def register_events_routes(
         """Authorize event writes, reserving transcripts for owners and bound runners."""
         user_id = (
             request.user_id
-            if isinstance(request, (_RunnerEventContext, StartupInputContext))
+            if isinstance(
+                request, (_RunnerEventContext, StartupInputContext, _NativeInputResendContext)
+            )
             else _get_user_id(request, auth_provider)
         )
         conv = None
@@ -1215,7 +1234,7 @@ def register_events_routes(
             )
 
     async def _post_event_impl(
-        request: Request | _RunnerEventContext | StartupInputContext,
+        request: Request | _RunnerEventContext | StartupInputContext | _NativeInputResendContext,
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
@@ -1653,7 +1672,9 @@ def register_events_routes(
 
         startup = getattr(request.app.state, "startup_inputs", None)
         if (
-            not isinstance(request, (StartupInputContext, _RunnerEventContext))
+            not isinstance(
+                request, (StartupInputContext, _RunnerEventContext, _NativeInputResendContext)
+            )
             and startup is not None
             and (
                 (body.type == "message" and body.data.get("role") == "user")
@@ -2067,6 +2088,7 @@ def register_events_routes(
                 _interrupt_fenced_sessions.discard(session_id)
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+                _interrupt_native_input_resends(session_id)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
@@ -2095,6 +2117,8 @@ def register_events_routes(
             if not stop_delivered:
                 # No runner resolved: nothing else lifts the fence (same as interrupt).
                 _interrupt_fenced_sessions.discard(session_id)
+            else:
+                _interrupt_native_input_resends(session_id)
             if (
                 stop_delivered
                 and not conv.host_id
@@ -3852,10 +3876,17 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
+            **(
+                {"native_input_resend": True}
+                if isinstance(request, _NativeInputResendContext)
+                else {}
+            ),
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)
         response: dict[str, Any] = {"queued": True}
+        if isinstance(request, _NativeInputResendContext):
+            response["accepted"] = dispatch.accepted
         if dispatch.item_id is not None:
             response["item_id"] = dispatch.item_id
         # Native-terminal web message: hand back the pending-input id. It
@@ -3870,6 +3901,30 @@ def register_events_routes(
 
     if register_startup_dispatch is not None:
         register_startup_dispatch(_post_event_impl)
+
+    async def resend_native_input(
+        app: Any,
+        session_id: str,
+        body: SessionEventInput,
+        created_by: str | None,
+        background_titles_enabled: bool,
+    ) -> dict[str, bool | str]:
+        """Send a web message again as its original sender, through the message route."""
+        headers = Headers(
+            {BACKGROUND_SESSION_TITLES_HEADER: "on" if background_titles_enabled else "off"}
+        )
+        # A single-user server records its one user as no sender at all.
+        user_id = (
+            created_by
+            if created_by is not None or authentication_requires_identity(auth_provider)
+            else RESERVED_USER_LOCAL
+        )
+        return await _post_event_impl(
+            _NativeInputResendContext(app, headers, user_id), session_id, body
+        )
+
+    if register_native_input_resend is not None:
+        register_native_input_resend(resend_native_input)
 
     # ── GET /sessions/{session_id}/stream ────────────────────────
 
@@ -4222,6 +4277,7 @@ def register_events_routes(
                     failed_blob_count,
                     len(orphaned_blob_keys),
                 )
+        _interrupt_native_input_resends(session_id)
         _interrupt_fenced_sessions.discard(session_id)
         _intentional_stop_sessions.pop(session_id, None)
         deleted = await conversation_store.delete_conversation(session_id)
@@ -4240,6 +4296,7 @@ def register_events_routes(
         # for reload visibility while the session exists, so a session
         # whose MCP startup never settled clean would leak its entry.
         _session_mcp_startup_cache.pop(session_id, None)
+        _session_last_response_cache.pop(session_id, None)
         # Same for the extension-pushed model catalog: kept across reloads
         # while the session exists (the extension only pushes on start), so a
         # deleted session would otherwise leak its entry for the process life.
