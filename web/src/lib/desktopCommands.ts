@@ -37,9 +37,12 @@ let lastReported: string | null = null;
 let availableCommands: ReadonlySet<DesktopCommand> = new Set();
 const availabilityListeners = new Set<() => void>();
 
+// Reload still works behind a dialog or menu, as the native menu's Reload did.
+const COMMANDS_THROUGH_DIALOGS: ReadonlySet<DesktopCommand> = new Set(["reload"]);
+
 function dispatch(event: DesktopCommandEvent): void {
   // A modal dialog or open menu owns the keyboard, like a sheet in a native app.
-  if (isFocusInDialogOrMenu()) return;
+  if (isFocusInDialogOrMenu() && !COMMANDS_THROUGH_DIALOGS.has(event.command)) return;
   const candidates = [...registrations]
     .filter((registration) => registration.command === event.command)
     .sort((a, b) => b.priority - a.priority);

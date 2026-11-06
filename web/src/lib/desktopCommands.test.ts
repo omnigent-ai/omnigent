@@ -110,6 +110,24 @@ describe("useDesktopCommand", () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
+  it("still reloads while a dialog holds focus", () => {
+    const reload = vi.fn();
+    const newTab = vi.fn();
+    renderHook(() => useDesktopCommand("reload", reload));
+    renderHook(() => useDesktopCommand("new-browser-tab", newTab));
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    const input = document.createElement("input");
+    dialog.append(input);
+    document.body.append(dialog);
+    input.focus();
+
+    send("reload");
+    send("new-browser-tab");
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(newTab).not.toHaveBeenCalled();
+  });
+
   it("uses the latest handler without re-registering", async () => {
     const first = vi.fn();
     const second = vi.fn();
