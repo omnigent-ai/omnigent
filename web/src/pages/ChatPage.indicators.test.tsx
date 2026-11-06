@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { WorkingIndicatorRow } from "@/components/chat/chatBubbleParts";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import {
   TerminalFirstContextProvider,
@@ -59,9 +60,7 @@ describe("SandboxFailedIndicator", () => {
 describe("ConnectionIndicator", () => {
   const onShowReconnectHelp = () => {};
 
-  it("renders the failed-sandbox band when a launch died (sandboxStatus wins)", () => {
-    // WHY: a failed launch owns this band ahead of any liveness state — the
-    // sandbox branch short-circuits before the liveness checks.
+  it("leaves a failed launch to the transcript instead of duplicating it below the composer", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "boom" } });
     render(
       <ConnectionIndicator
@@ -69,7 +68,7 @@ describe("ConnectionIndicator", () => {
         onShowReconnectHelp={onShowReconnectHelp}
       />,
     );
-    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("sandbox-failed-indicator")).not.toBeInTheDocument();
   });
 
   it("renders nothing while a launch is still in flight (non-failed sandbox)", () => {
@@ -164,29 +163,89 @@ describe("RunnerStartingIndicator", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it("renders nothing for a terminal sandbox stage (ready/failed handled elsewhere)", () => {
-    // WHY: "failed" gets the destructive band in ConnectionIndicator, so this
-    // in-thread indicator must skip it rather than show stale launch copy.
+  it("replaces launch progress with the recorded failure", () => {
     useChatStore.setState({ sandboxStatus: { stage: "failed", error: "x" } });
-    const { container } = render(<RunnerStartingIndicator variant="row" />);
-    expect(container).toBeEmptyDOMElement();
+    render(<RunnerStartingIndicator variant="row" />);
+    expect(screen.getByTestId("sandbox-failed-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("runner-starting-indicator")).not.toBeInTheDocument();
+  });
+});
+
+describe("WorkingIndicatorRow", () => {
+  const closings: { onfinish: (() => void) | null; cancel: () => void }[] = [];
+
+  beforeEach(() => {
+    useChatStore.setState({ backgroundTaskCount: 0, blockedOn: null, sessionStatus: "running" });
+    // jsdom has no Web Animations; record each close so the test can finish it.
+    Element.prototype.animate = vi.fn(() => {
+      const closing = { onfinish: null, cancel: vi.fn() };
+      closings.push(closing);
+      return closing as unknown as Animation;
+    });
+  });
+
+  afterEach(() => {
+    delete (Element.prototype as { animate?: unknown }).animate;
+    closings.length = 0;
+    vi.unstubAllGlobals();
+    cleanup();
+  });
+
+  it("keeps the row while it eases closed after the turn ends", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(closings).toHaveLength(1);
+
+    act(() => closings[0]!.onfinish?.());
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+  });
+
+  it("stays when the next turn starts while it closes", () => {
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+    rerender(<WorkingIndicatorRow show />);
+
+    expect(closings[0]!.cancel).toHaveBeenCalled();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
+  it("goes at once under reduced motion", () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query.includes("reduce") }));
+    const { rerender } = render(<WorkingIndicatorRow show />);
+    rerender(<WorkingIndicatorRow show={false} />);
+
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(closings).toHaveLength(0);
   });
 });
 
 describe("WorkingIndicator", () => {
-  it("stays hidden when only background tasks remain and returns for foreground work", () => {
+  it("shows a background-task spinner after the turn ends and the shimmer for foreground work", () => {
     useChatStore.setState({
-      backgroundTaskCount: 1,
+      backgroundTaskCount: 2,
       blockedOn: null,
       sessionStatus: "idle",
       status: "idle",
     });
     const { rerender } = render(<WorkingIndicator />);
     expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveTextContent(
+      "2 background tasks running",
+    );
+    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
+    // The composer pill owns the announcement; the transcript log must not repeat it.
+    expect(screen.getByTestId("background-tasks-indicator")).toHaveAttribute("aria-hidden", "true");
+    expect(screen.queryByRole("status")).toBeNull();
 
     act(() => useChatStore.setState({ sessionStatus: "running" }));
     rerender(<WorkingIndicator />);
     expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
+
+    act(() => useChatStore.setState({ sessionStatus: "idle", backgroundTaskCount: 0 }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
   });
 
   describe("parked on a terminal permission prompt", () => {

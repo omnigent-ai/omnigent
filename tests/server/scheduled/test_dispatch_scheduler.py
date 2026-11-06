@@ -159,9 +159,18 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
 
 
-async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
+async def test_scan_pages_past_unowned_tasks_and_ownership_errors(
+    store, caplog, monkeypatch
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
     caplog.set_level(logging.INFO)
-    tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
+    clock = FakeClock()
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: int(clock.now()))
+    tasks = []
+    for seed in range(3):
+        tasks.append(_task(store, str(seed), host_id=uuid.uuid4().hex))
+        clock.advance(1)
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
     own = ordered[-1]
@@ -192,7 +201,10 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog)
     assert {event["task_id"] for event in observed} == {task.id for task in tasks}
     assert all(event["observed_at"] == int(clock.now()) for event in observed)
     assert all(event["rrule"] == tasks[0].rrule for event in observed)
-    assert all(event["schedule_anchor"] == tasks[0].created_at for event in observed)
+    created_at_by_task_id = {task.id: task.created_at for task in tasks}
+    assert all(
+        event["schedule_anchor"] == created_at_by_task_id[event["task_id"]] for event in observed
+    )
 
     await scheduler.poll_once()
     await _drain(scheduler)
@@ -1305,10 +1317,10 @@ async def test_schedule_search_failure_preserves_next_run_at_and_retries(
     original_validate = dispatch_scheduler.validate_rrule
     failing = True
 
-    def validate(rule):
+    def validate(rule, **kwargs):
         if failing and failure == "validation" and rule == "FREQ=HOURLY":
             raise RRuleSearchError("RRULE validation exceeds the supported time limit")
-        return original_validate(rule)
+        return original_validate(rule, **kwargs)
 
     def calculate(rule, after, tz, *, anchor=None):
         # Distinguish the task without replacing schedule error handling.
@@ -2420,3 +2432,52 @@ def test_unusable_poll_interval_waits_poll_seconds(store, caplog, reading) -> No
     assert caplog.records
     # Only that wait falls back; the next reading applies again.
     assert scheduler._next_poll_delay() == 7.0
+
+
+@pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
+async def test_ten_minute_persisted_schedule_by_execution(store, session_mode, execution_target):
+    eligible = session_mode == "continue" or execution_target == "connected_host"
+    store.configure_dispatch(not eligible)
+    task = _task(
+        store,
+        rrule="FREQ=MINUTELY;INTERVAL=10",
+        session_mode=session_mode,
+        execution_target=execution_target,
+    )
+    store.configure_dispatch(True)
+    clock = FakeClock(task.created_at if eligible else task.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    executor = AsyncMock(side_effect=fire)
+    scheduler = PersistentTaskScheduler(
+        store, executor, AsyncMock(return_value=None), now=clock.now
+    )
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    saved = store.get(task.id)
+    if eligible:
+        assert task.next_run_at is None
+        executor.assert_not_awaited()
+        assert saved.state == "active"
+        assert 0 < saved.next_run_at - clock.now() <= 600
+        initialized_at = saved.next_run_at
+        clock.advance(initialized_at - clock.now())
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        executor.assert_awaited_once()
+        assert store.get(task.id).next_run_at == initialized_at + 600
+        # A recreated scheduler dispatches the next persisted occurrence once.
+        scheduler = PersistentTaskScheduler(
+            store, executor, AsyncMock(return_value=None), now=clock.now
+        )
+        clock.advance(600)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert executor.await_count == 2
+    else:
+        executor.assert_not_awaited()
+        assert saved.state == "paused"
+        assert saved.next_run_at is None

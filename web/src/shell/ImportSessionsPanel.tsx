@@ -160,7 +160,7 @@ export function ImportSessionsPanel() {
           <SettingsLabel
             label={`How many recent sessions${source === "all" ? " (across all harnesses)" : ""}`}
             className="flex-1"
-            description="The most recent sessions you opened in the harness. Sub-agent and automation runs are skipped, and sessions you've already imported are counted separately, not re-imported."
+            description="Recent sessions you opened in the harness. Sub-agent and automation runs are skipped; prior imports are counted separately and skipped."
             descriptionTestId="import-limit-help"
           />
           <Select
