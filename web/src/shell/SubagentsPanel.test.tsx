@@ -1,3 +1,4 @@
+import type * as GridSessionsModule from "@/grid/GridSessionsContext";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -13,7 +14,11 @@ import {
 } from "lucide-react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+import {
+  type ChildSessionInfo,
+  useChildSessions,
+  useDescendantSessions,
+} from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
@@ -24,6 +29,13 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   // hook itself is replaced.
   ...(await importOriginal<typeof UseChildSessionsModule>()),
   useChildSessions: vi.fn(),
+  useDescendantSessions: vi.fn(() => ({ descendants: [], isLoading: false })),
+}));
+
+const grids = vi.hoisted(() => ({ enabled: false }));
+vi.mock("@/grid/GridSessionsContext", async (importOriginal) => ({
+  ...(await importOriginal<typeof GridSessionsModule>()),
+  useGridSessions: () => (grids.enabled ? { enabled: true } : null),
 }));
 
 vi.mock("@/hooks/useSession", () => ({
@@ -163,6 +175,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+  grids.enabled = false;
 });
 
 function CurrentPath() {
@@ -190,6 +203,30 @@ describe("SubagentsPanel", () => {
       "border",
     );
     expect(screen.queryByTestId("subagent-row")).toBeNull();
+  });
+
+  it("offers the sub-agents grid only with grids enabled and two or more sub-agents", () => {
+    useChildSessionsMock.mockReturnValue({ children: [], isLoading: false, error: null });
+    const descendants = [childInfo({ id: "conv_a" }), childInfo({ id: "conv_a1" })];
+    vi.mocked(useDescendantSessions).mockReturnValue({ descendants, isLoading: false });
+    const view = renderPanel({ rootSessionId: "conv_root" });
+    expect(screen.queryByTestId("display-subagents-in-grid")).toBeNull();
+    view.unmount();
+
+    grids.enabled = true;
+    renderPanel({ rootSessionId: "conv_root" });
+    expect(screen.getByRole("link", { name: "Display sub-agents in grid" })).toHaveAttribute(
+      "href",
+      "/grid/agents:conv_root",
+    );
+    cleanup();
+
+    vi.mocked(useDescendantSessions).mockReturnValue({
+      descendants: descendants.slice(0, 1),
+      isLoading: false,
+    });
+    renderPanel({ rootSessionId: "conv_root" });
+    expect(screen.queryByTestId("display-subagents-in-grid")).toBeNull();
   });
 
   it("labels the main row with the root agent's name when available", () => {

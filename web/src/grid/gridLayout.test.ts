@@ -4,6 +4,7 @@ import {
   gridSessionIds,
   parseSessionGrids,
   removeGridSession,
+  sessionsGridLayout,
   splitGrid,
   swapGridSessions,
   type SplitEdge,
@@ -79,5 +80,23 @@ describe("session grid layouts", () => {
       JSON.stringify([{ id: "bad", layout: { axis: "rows", children: ["temp:a", "b"] } }]),
     ])
       expect(parseSessionGrids(raw)).toEqual([]);
+  });
+
+  it("lays out one to four sessions in reading order", () => {
+    const areas = (ids: string[]) =>
+      gridPanes(sessionsGridLayout(ids)).map((pane) => `${pane.sessionId} ${pane.area}`);
+    expect(areas(["a"])).toEqual(["a 1 / 1 / span 2 / span 2"]);
+    expect(areas(["a", "b"])).toEqual(["a 1 / 1 / span 2 / span 1", "b 1 / 2 / span 2 / span 1"]);
+    expect(areas(["a", "b", "c"])).toEqual([
+      "a 1 / 1 / span 1 / span 1",
+      "b 1 / 2 / span 1 / span 1",
+      "c 2 / 1 / span 1 / span 2",
+    ]);
+    expect(areas(["a", "b", "c", "d"])).toEqual([
+      "a 1 / 1 / span 1 / span 1",
+      "b 1 / 2 / span 1 / span 1",
+      "c 2 / 1 / span 1 / span 1",
+      "d 2 / 2 / span 1 / span 1",
+    ]);
   });
 });
