@@ -2,7 +2,7 @@
 
 This module is a fan-out broadcaster keyed by ``conversation_id``.
 Every active call to :func:`subscribe` owns its own bounded ephemeral
-``asyncio.Queue``; :func:`publish` fans the event out to all queues
+mailbox; :func:`publish` fans the event out to all mailboxes
 currently subscribed to that conversation_id. A subscriber that falls
 behind past the bound is disconnected so it can recover through the
 snapshot + live-tail reconnect contract. Events emitted before any
@@ -30,7 +30,9 @@ import asyncio
 import contextlib
 import logging
 import threading
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -59,43 +61,53 @@ class SubscriberOverflowError(RuntimeError):
     """Raised when a subscriber falls behind the bounded live-event queue."""
 
 
-# Subscriber registry: conversation_id -> set of
-# (queue, event_loop) pairs. The event_loop reference is needed
-# so the sync producer thread can safely deliver items via
-# ``call_soon_threadsafe`` into the queue's owning loop.
-_subscribers: WorkspaceScopedCache[
-    str,
-    set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
-] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
-def _enqueue_or_overflow(
-    queue: asyncio.Queue[dict[str, Any] | object],
-    item: dict[str, Any] | object,
-) -> None:
-    """Enqueue *item*, replacing a full backlog with an overflow signal."""
-    try:
-        queue.put_nowait(item)
-        return
-    except asyncio.QueueFull:
-        pass
+@dataclass(eq=False)
+class _Subscriber:
+    """A bounded mailbox shared by producer threads and one async consumer."""
 
-    while True:
-        try:
-            queue.get_nowait()
-        except asyncio.QueueEmpty:
-            break
-    queue.put_nowait(_OVERFLOW)
+    loop: asyncio.AbstractEventLoop
+    pending: deque[dict[str, Any] | object] = field(default_factory=deque)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    notified: bool = False
+    overflowed: bool = False
+
+    def enqueue(self, item: dict[str, Any] | object) -> None:
+        """Append under ``_lock``; retain at most one loop wakeup per backlog."""
+        if self.overflowed:
+            return
+        if len(self.pending) >= _SUBSCRIBER_QUEUE_MAX_EVENTS:
+            self.pending.clear()
+            self.pending.append(_OVERFLOW)
+            self.overflowed = True
+        else:
+            self.pending.append(item)
+        if not self.notified:
+            self.loop.call_soon_threadsafe(self.ready.set)
+            self.notified = True
+
+    async def receive(self) -> dict[str, Any] | object:
+        """Wait for a producer notification and consume the oldest item."""
+        await self.ready.wait()
+        with _lock:
+            item = self.pending.popleft()
+            if not self.pending:
+                self.ready.clear()
+                self.notified = False
+            return item
+
+
+_subscribers: WorkspaceScopedCache[str, set[_Subscriber]] = WorkspaceScopedCache()
 
 
 def _schedule_delivery(
     conversation_id: str,
-    subscriber: tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop],
+    subscriber: _Subscriber,
     item: dict[str, Any] | object,
 ) -> bool:
     """Schedule one delivery, dropping a slot whose loop has closed."""
-    queue, loop = subscriber
     # Re-check membership under the same lock subscribe cleanup uses. A slot
     # removed after the caller's snapshot must not count as a live recipient.
     with _lock:
@@ -103,7 +115,9 @@ def _schedule_delivery(
         if subs is None or subscriber not in subs:
             return False
         try:
-            loop.call_soon_threadsafe(_enqueue_or_overflow, queue, item)
+            if subscriber.loop.is_closed():
+                raise RuntimeError("subscriber loop is closed")
+            subscriber.enqueue(item)
         except RuntimeError:
             subs.discard(subscriber)
             if not subs:
@@ -404,8 +418,9 @@ def shutdown_all() -> None:
         # Shutdown spans every workspace and runs context-free, so sweep the
         # whole backing rather than the current workspace's slice.
         all_subs = [entry for subs in _subscribers.all_values() for entry in subs]
-    for queue, _ in all_subs:
-        _enqueue_or_overflow(queue, _DONE)
+        for subscriber in all_subs:
+            with contextlib.suppress(RuntimeError):
+                subscriber.enqueue(_DONE)
 
 
 async def subscribe(
@@ -419,7 +434,7 @@ async def subscribe(
     """
     Subscribe to live events for a conversation.
 
-    Creates a fresh bounded ephemeral queue for this subscriber, registers
+    Creates a fresh bounded ephemeral mailbox for this subscriber, registers
     it under ``conversation_id``, and yields events as they arrive
     from :func:`publish`. Ends when :func:`close` broadcasts the
     end-of-stream sentinel or when the caller stops iterating
@@ -441,7 +456,9 @@ async def subscribe(
 
     Must be called from the asyncio event loop that the caller
     intends to iterate on; the sync producer side uses
-    ``loop.call_soon_threadsafe`` to enqueue across threads.
+    ``loop.call_soon_threadsafe`` to wake the consumer across threads. Events
+    enter the bounded mailbox before that wakeup is scheduled, so a stalled
+    event loop cannot retain an unbounded backlog of callbacks and payloads.
 
     :param conversation_id: The conversation to subscribe to,
         e.g. ``"conv_abc123"``.
@@ -484,11 +501,7 @@ async def subscribe(
     :raises SubscriberOverflowError: If this subscriber falls behind the
         bounded event queue.
     """
-    queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue(
-        maxsize=_SUBSCRIBER_QUEUE_MAX_EVENTS
-    )
-    loop = asyncio.get_running_loop()
-    entry = (queue, loop)
+    entry = _Subscriber(asyncio.get_running_loop())
     with _lock:
         _subscribers.setdefault(conversation_id, set()).add(entry)
     # Read the pre-ready snapshot synchronously here — after slot
@@ -533,10 +546,10 @@ async def subscribe(
                 yield snapshot_event
         while True:
             if heartbeat_interval_s is None:
-                item = await queue.get()
+                item = await entry.receive()
             else:
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=heartbeat_interval_s)
+                    item = await asyncio.wait_for(entry.receive(), timeout=heartbeat_interval_s)
                 except TimeoutError:
                     # Queue was idle past the heartbeat deadline. Emit
                     # a synthetic keepalive. Its wire bytes give the
