@@ -3972,3 +3972,207 @@ def test_databricks_setup_recovers_from_malformed_profile(
     assert "Traceback" not in result.output
     assert "private-malformed-secret" not in result.output
     assert "databricks-gemini-broken" not in _config_yaml(isolated_config).get("providers", {})
+
+
+# ---------------------------------------------------------------------------
+# ``config list`` follows ``inference.harnesses`` bindings
+# ---------------------------------------------------------------------------
+
+
+def _binding_config(
+    monkeypatch: pytest.MonkeyPatch,
+    harnesses: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    """Two gateways: ``openrouter`` is the legacy Pi default, ``proxy8787`` serves every family.
+
+    Credentials are ``env:`` references backed by a dummy variable, so loading
+    the providers never touches a keyring.
+    """
+    monkeypatch.setenv("OMNIGENT_TEST_GATEWAY_KEY", "dummy")
+    config: dict[str, object] = {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.example/api/v1",
+                    "api_key_ref": "env:OMNIGENT_TEST_GATEWAY_KEY",
+                    "wire_api": "chat",
+                },
+            },
+            "proxy8787": {
+                "kind": "gateway",
+                "default": "gemini",
+                "gemini": {
+                    "base_url": "http://127.0.0.1:8787",
+                    "api_key_ref": "env:OMNIGENT_TEST_GATEWAY_KEY",
+                },
+                "openai": {
+                    "base_url": "http://127.0.0.1:8787/v1",
+                    "api_key_ref": "env:OMNIGENT_TEST_GATEWAY_KEY",
+                    "wire_api": "chat",
+                },
+            },
+        }
+    }
+    if harnesses is not None:
+        config["inference"] = {"harnesses": harnesses}
+    return config
+
+
+def _render_listing_by_harness(monkeypatch: pytest.MonkeyPatch, config: dict[str, object]) -> str:
+    """Render the ``config list`` credentials view for *config* and return its plain text."""
+    import io
+
+    from rich.console import Console
+
+    from omnigent.onboarding.configure_models import render_provider_listing_by_harness
+    from omnigent.onboarding.provider_config import load_providers
+
+    buffer = io.StringIO()
+    monkeypatch.setattr(
+        "omnigent.onboarding.configure_models.console",
+        Console(file=buffer, force_terminal=False, width=200),
+    )
+    render_provider_listing_by_harness(config, load_providers(config))
+    return buffer.getvalue()
+
+
+def _listing_section(text: str, label: str) -> list[str]:
+    """Return the provider rows under the ``label`` surface header of a rendered listing."""
+    lines = text.splitlines()
+    start = lines.index(f"  {label}") + 1
+    rows: list[str] = []
+    for line in lines[start:]:
+        if not line.startswith("    "):
+            break
+        rows.append(line)
+    return rows
+
+
+def _row_for(rows: list[str], provider: str) -> str:
+    return next(row for row in rows if f" {provider} " in f"{row} ")
+
+
+def test_listing_marks_the_bound_provider_in_use_for_pi_native(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``pi-native`` binding wins over the legacy Pi default in the listing.
+
+    Reproduces the wrong mark: the runtime resolves the bound provider and
+    model, but the listing kept ``openrouter`` as the Pi default.
+    """
+    config = _binding_config(
+        monkeypatch, {"pi-native": {"provider": "proxy8787", "default_model": "gemini-3.8-flash"}}
+    )
+    rows = _listing_section(_render_listing_by_harness(monkeypatch, config), "Pi")
+
+    bound = _row_for(rows, "proxy8787")
+    assert "in use" in bound
+    assert "pi-native" in bound
+    assert "gemini-3.8-flash" in bound
+    assert "inference.harnesses" in bound
+    legacy = _row_for(rows, "openrouter")
+    assert "in use" not in legacy
+    assert "default for harnesses without" in legacy
+
+
+def test_listing_shows_a_bound_provider_with_no_legacy_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no legacy Pi default left, the bound provider is still the one in use."""
+    config = _binding_config(
+        monkeypatch, {"pi-native": {"provider": "proxy8787", "default_model": "gemini-3.8-flash"}}
+    )
+    providers = config["providers"]
+    assert isinstance(providers, dict)
+    del providers["openrouter"]
+    rows = _listing_section(_render_listing_by_harness(monkeypatch, config), "Pi")
+
+    assert "in use" in _row_for(rows, "proxy8787")
+
+
+def test_listing_without_bindings_keeps_the_legacy_default_mark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``inference`` block: the legacy per-surface default marking is unchanged."""
+    rows = _listing_section(
+        _render_listing_by_harness(monkeypatch, _binding_config(monkeypatch)), "Pi"
+    )
+
+    assert "default" in _row_for(rows, "openrouter")
+    assert "in use" not in _row_for(rows, "openrouter")
+    assert "in use" not in _row_for(rows, "proxy8787")
+
+
+@pytest.mark.parametrize(
+    ("harness", "label"),
+    [
+        ("claude-sdk", "Claude"),
+        ("claude-native", "Claude"),
+        ("codex", "Codex"),
+        ("codex-native", "Codex"),
+        ("openai-agents", "Codex"),
+        ("qwen", "Codex"),
+        ("jcode", "Codex"),
+        ("opencode-native", "Codex"),
+        ("pi", "Pi"),
+        ("pi-native", "Pi"),
+    ],
+)
+def test_listing_marks_every_bindable_harness_under_its_surface(
+    monkeypatch: pytest.MonkeyPatch, harness: str, label: str
+) -> None:
+    """Each harness key an ``inference`` binding accepts is shown under its own surface."""
+    config = _binding_config(
+        monkeypatch, {harness: {"provider": "proxy8787", "default_model": "model-x"}}
+    )
+    text = _render_listing_by_harness(monkeypatch, config)
+
+    row = _row_for(_listing_section(text, label), "proxy8787")
+    assert "in use" in row
+    assert harness in row
+    assert "model-x" in row
+
+
+def test_listing_reports_a_binding_that_has_no_surface(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An ACP binding has no model-family surface, so it gets its own line."""
+    config = _binding_config(
+        monkeypatch, {"acp:goose": {"provider": "proxy8787", "default_model": "model-x"}}
+    )
+    text = _render_listing_by_harness(monkeypatch, config)
+
+    line = next(line for line in text.splitlines() if "acp:goose" in line)
+    assert "proxy8787" in line
+    assert "model-x" in line
+
+
+def test_listing_names_an_invalid_binding_instead_of_guessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A binding the runtime would reject is called out, not silently ignored."""
+    config = _binding_config(monkeypatch, {"pi-native": {"provider": "no-such-provider"}})
+    text = _render_listing_by_harness(monkeypatch, config)
+
+    assert "inference.harnesses" in text
+    assert "configured provider" in text
+
+
+def test_listing_agrees_with_the_pi_native_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The provider and model the listing marks are the ones the runtime resolves."""
+    from omnigent.harnesses.pi_native.credentials import resolve_pi_native_provider
+
+    config = _binding_config(
+        monkeypatch, {"pi-native": {"provider": "proxy8787", "default_model": "gemini-3.8-flash"}}
+    )
+    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    resolved = resolve_pi_native_provider(config_loader=lambda: config)
+    assert resolved is not None
+    assert resolved.inference_bound
+    assert resolved.model == "gemini-3.8-flash"
+
+    row = _row_for(
+        _listing_section(_render_listing_by_harness(monkeypatch, config), "Pi"), "proxy8787"
+    )
+    assert "in use" in row
+    assert resolved.model in row
