@@ -21,7 +21,11 @@ from omnigent.tools.base import Tool
 _RRULE_DESC = (
     "RFC 5545 recurrence rule, e.g. 'FREQ=DAILY;BYHOUR=9;BYMINUTE=0' (daily at "
     "9am) or 'FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0' (weekday "
-    "mornings). Must fire at least twice and no more often than once per hour."
+    "mornings). Must fire at least twice. The minimum is 10 minutes on "
+    "connected hosts in either session mode, or "
+    "in managed sandboxes with session_mode 'continue' "
+    "(e.g. 'FREQ=MINUTELY;INTERVAL=10'). New sandbox sessions, or servers "
+    "without sub-hour support, require 1 hour."
 )
 
 
@@ -99,7 +103,7 @@ class SysScheduledTaskCreateTool(Tool):
                                 "Optional permission mode for native coding agents that "
                                 "support one. Use the selected harness's vocabulary: "
                                 "Claude Code (e.g. 'acceptEdits'), Codex ('default', "
-                                "'read-only', 'full-access', 'bypass'), "
+                                "'ask-for-approval', 'approve-for-me', 'read-only'), "
                                 "Cursor (e.g. 'auto-review'), "
                                 "Antigravity ('default', 'skip'), or Devin (e.g. 'smart'). "
                                 "Runs are unattended, so a prompting mode ('default'/'plan') "

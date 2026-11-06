@@ -1502,6 +1502,8 @@ function PullRequestPanelDetails({
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
+  // The server's association carries the PR identity; `storedPr` is set only while offline.
+  const identity = info.data?.prs?.find((association) => association.url === prUrl) ?? null;
   const headSha = info.data?.pr?.head_sha;
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
@@ -1871,6 +1873,7 @@ function PullRequestPanelDetails({
           changes={changes}
           prDiff={prDiff}
           reviews={reviews}
+          identity={identity}
         />
       </Tabs>
     </TooltipProvider>
