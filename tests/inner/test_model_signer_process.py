@@ -479,7 +479,7 @@ async def test_signer_gateway_attribution_reaches_tls_upstream(
     attributed = binding_id == "databricks-ucode-v1"
     assert (b"Databricks-Custom-Coding-Agent: codex\r\n" in captured[0]) is attributed
     assert (
-        b"Databricks-Custom-Client-Surfaces: omnigent, omnigent-desktop, ug\r\n" in captured[0]
+        b"Databricks-Custom-Client-Surfaces: omnigent-desktop, ug\r\n" in captured[0]
     ) is attributed
     assert b"stale-agent" not in captured[0]
     assert b"stale-app" not in captured[0]

@@ -70,12 +70,15 @@ from typing import Any
 from urllib.parse import quote
 
 from omnigent import config as _config
+from omnigent.git_providers import host_of
 from omnigent.host.identity_env import in_managed_sandbox
 from omnigent.runner import pr_resource
 from omnigent.runner.git_providers import (
+    COMMIT_OBJECT,
     MERGE_OPTIONS_OBJECT,
     PR_ATTACHMENT_OBJECT,
     PR_DETAILS_OBJECT,
+    PR_DIFF_OBJECT,
     PR_LABELS_OBJECT,
     PR_MERGE_OBJECT,
     PR_REVIEWERS_OBJECT,
@@ -673,16 +676,53 @@ def _commit_lookup_repo(root: str) -> str | None:
     wasn't pushed to this repo won't be in the base repo either — so querying more
     repos for the same commit is redundant.
     """
+    return _remote_nwo(root, _commit_lookup_remote(root))
+
+
+def _commit_lookup_remote(root: str) -> str:
+    """The branch's tracking remote if it names a repo, else ``origin``."""
     rc, br, _ = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=root)
     branch = br.strip()
     if rc == 0 and branch and branch != "HEAD":
         rc, remote, _ = _git(["config", f"branch.{branch}.remote"], cwd=root)
         remote = remote.strip()
-        if rc == 0 and remote and remote != ".":
-            nwo = _remote_nwo(root, remote)
-            if nwo:
-                return nwo
-    return _remote_nwo(root, "origin")
+        if rc == 0 and remote and remote != "." and _remote_nwo(root, remote):
+            return remote
+    return "origin"
+
+
+def _remotes_by_repo(root: str, lookup_remote: str) -> dict[str, list[str]]:
+    """Remotes keyed by lower-cased ``owner/repo`` on the host of ``lookup_remote``."""
+    rc, out, _ = _git(["remote"], cwd=root)
+    urls: dict[str, str] = {}
+    for remote in out.split() if rc == 0 else []:
+        rc, url, _ = _git(["remote", "get-url", remote], cwd=root)
+        if rc == 0:
+            urls[remote] = url.strip()
+    if lookup_remote not in urls:
+        return {}
+    # A same-named repo on another host, such as a GitLab mirror, is a different repo.
+    lookup_host = host_of(urls[lookup_remote])
+    by_repo: dict[str, list[str]] = {}
+    for remote, url in urls.items():
+        nwo = _owner_repo_from_url(url)
+        if nwo and host_of(url) == lookup_host:
+            by_repo.setdefault(nwo.lower(), []).append(remote)
+    return by_repo
+
+
+def _contained_in_base_branch(root: str, sha: str, remotes: Sequence[str], base_ref: str) -> bool:
+    """Whether the local tracking ref of ``base_ref`` on any of ``remotes`` contains ``sha``."""
+    for remote in remotes:
+        # An exact ref lookup, so a lookalike branch or tag can't stand in for a missing one.
+        tracking_ref = f"refs/remotes/{remote}/{base_ref}"
+        rc, tracking_oid, _ = _git(["show-ref", "--verify", "--hash", tracking_ref], cwd=root)
+        if rc != 0:
+            continue
+        rc, _, _ = _git(["merge-base", "--is-ancestor", sha, tracking_oid.strip()], cwd=root)
+        if rc == 0:
+            return True
+    return False
 
 
 def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int, str] | None:
@@ -699,12 +739,38 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
     Only **open** PRs are accepted. For a commit already on the default branch
     (master/main, or any merged tip) the endpoint returns the *merged* PR that
     introduced it, which is a false positive — never the branch's own outgoing
-    PR — so a closed/merged row is skipped rather than surfaced.
+    PR — so a closed/merged row is skipped rather than surfaced. Open rows are
+    false positives too when the queried fork's default branch lags the base:
+    GitHub then lists every open PR that merges the base past the commit. So an
+    open row is skipped when the commit is already on that PR's base branch
+    locally (:func:`_contained_in_base_branch`), read from remotes of the base repo
+    on the host of the queried fork's remote.
     """
     shas = _head_commit_shas(root)
     repo = _commit_lookup_repo(root)
     if not shas or not repo:
         return None
+    base_remotes: dict[str, list[str]] | None = None
+    on_base_branch: dict[tuple[str, str, str], bool] = {}
+
+    def _is_candidate(row: Any, sha: str) -> bool:
+        nonlocal base_remotes
+        if not isinstance(row, dict) or str(row.get("state", "")).lower() != "open":
+            return False
+        base = row.get("base")
+        base_ref = base.get("ref") if isinstance(base, dict) else None
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+        base_full = base_repo.get("full_name") if isinstance(base_repo, dict) else None
+        if not isinstance(base_ref, str) or not isinstance(base_full, str):
+            return True
+        key = (sha, base_full.lower(), base_ref)
+        if key not in on_base_branch:
+            if base_remotes is None:
+                base_remotes = _remotes_by_repo(root, _commit_lookup_remote(root))
+            remotes = base_remotes.get(base_full.lower(), [])
+            on_base_branch[key] = _contained_in_base_branch(root, sha, remotes, base_ref)
+        return not on_base_branch[key]
+
     for sha in shas:
         rc, out, _ = _gh(["api", f"repos/{repo}/commits/{sha}/pulls"], cwd=root, token=token)
         if rc != 0:
@@ -716,16 +782,10 @@ def _resolve_pr_via_commit(root: str, *, token: str | None = None) -> tuple[int,
         if not isinstance(rows, list) or not rows:
             continue
 
-        def _is_open(row: Any) -> bool:
-            return isinstance(row, dict) and str(row.get("state", "")).lower() == "open"
-
-        # Accept only an OPEN PR. On the default branch (and any branch whose tip
-        # is already merged) this endpoint returns the *merged* PR that introduced
-        # the commit — a false positive, since it's not the branch's own outgoing
-        # PR. A genuine fallback hit (a fork / renamed branch gh can't name) is
-        # always open, so a closed row is never the PR we want; skip it rather
-        # than falling back to the first row.
-        chosen = next((r for r in rows if _is_open(r)), None)
+        # Accept only an OPEN PR that adds the commit beyond its base branch. Merged
+        # rows, and others' PRs listed because the fork's default branch lags, aren't
+        # this branch's own PR; skip them rather than falling back to the first row.
+        chosen = next((r for r in rows if _is_candidate(r, sha)), None)
         if chosen is None:
             continue
         number = chosen.get("number")
@@ -1500,13 +1560,107 @@ def _pr_patch_at_revision(
 
 
 def _check_pr_revision(
-    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str
+    root: str, reference: PullRequestRef, *, head_sha: str, base_sha: str | None = None
 ) -> dict[str, Any]:
-    """Return the PR's REST payload, raising when its head or base moved."""
+    """Return the PR's REST payload, raising when its head, or its base if given, moved."""
     pr = _pr_api(root, reference, f"repos/{reference.repository}/pulls/{reference.number}")
-    if _api_string(pr, "head", "sha") != head_sha or _api_string(pr, "base", "sha") != base_sha:
-        raise ValueError("The pull request changed; refresh before viewing its conversations.")
+    moved_head = _api_string(pr, "head", "sha") != head_sha
+    moved_base = base_sha is not None and _api_string(pr, "base", "sha") != base_sha
+    if moved_head or moved_base:
+        raise ValueError("The pull request changed; refresh to see its latest revision.")
     return pr
+
+
+# GitHub lists at most this many commits for one pull request.
+_MAX_PR_COMMITS = 250
+
+
+def _commit_payload(entry: dict[str, Any]) -> dict[str, Any]:
+    """Shape one REST commit as ``session.github.commit``: title is the message's first line."""
+    commit = entry.get("commit") if isinstance(entry.get("commit"), dict) else {}
+    author = commit.get("author") if isinstance(commit.get("author"), dict) else {}
+    message = commit.get("message") if isinstance(commit.get("message"), str) else ""
+    return {
+        "object": COMMIT_OBJECT,
+        "sha": entry["sha"],
+        "title": message.strip().split("\n", 1)[0].strip(),
+        "author": author.get("name"),
+        "date": author.get("date"),
+    }
+
+
+def _pr_commit_entries(root: str, reference: PullRequestRef) -> list[dict[str, Any]]:
+    """Fetch every commit page GitHub returns for the PR, oldest first."""
+    rc, out, _ = _gh(
+        [
+            "api",
+            *_host_args(root, reference),
+            "--paginate",
+            "--slurp",
+            f"repos/{reference.repository}/pulls/{reference.number}/commits?per_page=100",
+        ],
+        cwd=root,
+        token=_pr_token(root, reference),
+    )
+    if rc != 0:
+        raise ValueError("GitHub could not load the PR's commits. Refresh to retry.")
+    try:
+        pages = json.loads(out)
+    except ValueError:
+        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.") from None
+    if not isinstance(pages, list):
+        raise ValueError("GitHub returned an invalid commit list. Refresh to retry.")
+    entries = [entry for page in pages for entry in (page if isinstance(page, list) else [page])]
+    return [
+        _commit_payload(entry)
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("sha"), str)
+    ]
+
+
+def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[str, Any]:
+    """List the PR's commits at ``head_sha``, capped at 250; ``has_more`` reports the rest.
+
+    The PR's head is checked before and after the listing, so the list describes the
+    revision the panel shows.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        pr = _check_pr_revision(root, reference, head_sha=head_sha)
+        commits = _pr_commit_entries(root, reference)
+        _check_pr_revision(root, reference, head_sha=head_sha)
+    shown = commits[:_MAX_PR_COMMITS]
+    total = pr.get("commits")
+    return {
+        "object": "list",
+        "data": shown,
+        "has_more": isinstance(total, int) and total > len(shown),
+    }
+
+
+def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
+    """Return one commit's patch, read as GitHub's diff media type for that commit.
+
+    The commit must be one of the pull request's own commits; otherwise any commit
+    the token can read in the repository would be served. ``commit_sha`` is a full
+    object id, so the patch is the commit the user selected.
+    """
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        if commit_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
+            raise ValueError("That commit is not part of the selected pull request.")
+        rc, out, _ = _gh(
+            [
+                "api",
+                *_host_args(root, reference),
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{reference.repository}/commits/{commit_sha}",
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
+    if rc != 0:
+        raise ValueError("GitHub could not load the commit's diff. Refresh or open it on GitHub.")
+    return {"object": PR_DIFF_OBJECT, "patch": out}
 
 
 def _host_args(root: str, reference: PullRequestRef) -> list[str]:

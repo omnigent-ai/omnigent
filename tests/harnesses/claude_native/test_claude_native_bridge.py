@@ -26,7 +26,7 @@ from contextlib import contextmanager, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, TextIO
 from unittest.mock import Mock
@@ -60,6 +60,7 @@ from omnigent.harnesses.claude_native.bridge import (
     pane_killed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
+    program_status_turn_error,
     read_assistant_text_since,
     read_claude_session_id,
     read_hook_events_from_offset,
@@ -81,6 +82,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     OSEnvSandboxSpec,
 )
+from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
@@ -4132,7 +4134,7 @@ def test_augment_claude_args_mirrors_launch_overrides_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-fable-5"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "xhigh"
 
 
@@ -4256,6 +4258,95 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
     assert settings.get("skillOverrides") == {"auto-mode-setup": "off"}
 
 
+@pytest.mark.parametrize(
+    ("launch_args", "default_mode"),
+    [
+        ((), None),
+        (("--permission-mode", "default"), "default"),
+        (("--permission-mode", "auto"), "auto"),
+    ],
+    ids=["none", "default", "auto"],
+)
+def test_augment_claude_args_allows_reading_session_attachments(
+    launch_args: tuple[str, ...],
+    default_mode: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claude reads this session's attachment cache, outside the workspace, without a prompt."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    bridge_dir = tmp_path / "bridge"
+    attachment = materialize_attachment(
+        {
+            "type": "input_image",
+            "image_url": "data:image/png;base64,iVBORw0KGgo=",
+            "filename": "image.png",
+        },
+        bridge_dir,
+    )
+    assert attachment is not None
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=bridge_dir, python_executable="/venv/bin/python"
+        )
+    )
+
+    permissions = settings.get("permissions", {})
+    assert permissions.get("defaultMode") == default_mode
+    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+
+
+@pytest.mark.parametrize(
+    ("launch_args", "expected_permissions"),
+    [((), None), (("--permission-mode", "auto"), {"defaultMode": "auto"})],
+    ids=["none", "auto"],
+)
+def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
+    launch_args: tuple[str, ...],
+    expected_permissions: dict[str, str] | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cache path Claude would read as a glob gets no allow rule; the launch mode stays."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data[1]"))
+
+    settings = _load_invocation_settings(
+        augment_claude_args(
+            launch_args, bridge_dir=tmp_path / "bridge", python_executable="/venv/bin/python"
+        )
+    )
+
+    assert settings.get("permissions") == expected_permissions
+
+
+@pytest.mark.parametrize(
+    ("directory", "expected"),
+    [
+        (
+            PureWindowsPath(r"C:\Users\alice\.omnigent\attachments\k"),
+            "Read(//c/Users/alice/.omnigent/attachments/k/**)",
+        ),
+        (PureWindowsPath(r"\\server\share\attachments\k"), None),
+        (PureWindowsPath(r"C:attachments\k"), None),
+        (PurePosixPath("attachments/k"), None),
+        (PurePosixPath("/home/a[1]/.omnigent/attachments/k"), None),
+    ],
+    ids=[
+        "windows-drive",
+        "windows-unc",
+        "windows-drive-relative",
+        "relative",
+        "glob-metacharacters",
+    ],
+)
+def test_claude_read_rule_only_emits_exact_absolute_patterns(
+    directory: PurePath, expected: str | None
+) -> None:
+    """Paths Claude would not match literally get no rule, so reads still prompt."""
+    assert claude_native_bridge._claude_read_rule(directory) == expected
+
+
 def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
     tmp_path: Path,
 ) -> None:
@@ -4268,7 +4359,7 @@ def test_augment_claude_args_mirrors_joined_model_arg_into_settings(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-sonnet-5"
-    assert "permissions" not in settings
+    assert "defaultMode" not in settings.get("permissions", {})
     assert "effortLevel" not in settings
 
 
@@ -4295,26 +4386,112 @@ def test_augment_claude_args_uses_last_repeated_launch_override(
 
     settings = _load_invocation_settings(args)
     assert settings["model"] == "claude-new"
-    assert settings["permissions"] == {"defaultMode": "auto"}
+    assert settings["permissions"]["defaultMode"] == "auto"
     assert settings["effortLevel"] == "high"
 
 
+_FRAMEWORK_PROMPT = "Keep framework metadata separate."
+
+
+@pytest.mark.parametrize(
+    ("user_args", "merged_args"),
+    [
+        ((), None),
+        (
+            ("--append-system-prompt", "--- Reviewer profile ---"),
+            ("--append-system-prompt", f"{_FRAMEWORK_PROMPT}\n\n--- Reviewer profile ---"),
+        ),
+        (
+            ("--append-system-prompt=Review carefully.",),
+            (f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nReview carefully.",),
+        ),
+        (
+            ("--append-system-prompt", "Earlier.", "--append-system-prompt=Later."),
+            (
+                "--append-system-prompt",
+                "Earlier.",
+                f"--append-system-prompt={_FRAMEWORK_PROMPT}\n\nLater.",
+            ),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", ""),
+            ("--append-system-prompt=Earlier.", "--append-system-prompt", _FRAMEWORK_PROMPT),
+        ),
+        (
+            ("--append-system-prompt=Earlier.", "--append-system-prompt="),
+            ("--append-system-prompt=Earlier.", f"--append-system-prompt={_FRAMEWORK_PROMPT}"),
+        ),
+        (("--append-system-prompt-file", "profile.md"), None),
+        (("--append-system-prompt-file=profile.md",), None),
+        (
+            ("--append-system-prompt-file", "profile.md", "--append-system-prompt", "Review."),
+            (
+                "--append-system-prompt-file",
+                "profile.md",
+                "--append-system-prompt",
+                f"{_FRAMEWORK_PROMPT}\n\nReview.",
+            ),
+        ),
+        (("--", "--append-system-prompt=Positional."), None),
+    ],
+    ids=[
+        "no-user-prompt",
+        "user-prompt-separate-value",
+        "user-prompt-joined-value",
+        "repeated-flags-last-wins",
+        "final-empty-value-clears",
+        "final-empty-joined-value-clears",
+        "caller-file-separate-value",
+        "caller-file-joined-value",
+        "caller-file-and-prompt",
+        "after-end-of-options",
+    ],
+)
 def test_augment_claude_args_appends_caller_system_prompt(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    user_args: tuple[str, ...],
+    merged_args: tuple[str, ...] | None,
 ) -> None:
-    """Claude native appends framework instructions supplied by its launcher."""
-    framework_instruction = "Keep framework metadata separate."
+    """Omnigent's prompt joins the caller's last prompt value, or is added when there is none."""
+    # Claude reads a caller's prompt file itself, so Omnigent must never open it.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "profile.md").write_text("Reviewer profile.\n", encoding="utf-8")
 
-    args = augment_claude_args(
+    def refuse_caller_prompt_file(real_open: Callable[..., Any]) -> Callable[..., Any]:
+        def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(file, str | os.PathLike) and os.path.basename(file) == "profile.md":
+                raise AssertionError("Omnigent opened the caller's prompt file")
+            return real_open(file, *args, **kwargs)
+
+        return guarded_open
+
+    monkeypatch.setattr("builtins.open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(io, "open", refuse_caller_prompt_file(io.open))
+    monkeypatch.setattr(os, "open", refuse_caller_prompt_file(os.open))
+    omnigent_args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
         python_executable="/venv/bin/python",
-        append_system_prompt=framework_instruction,
+        append_system_prompt=_FRAMEWORK_PROMPT,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=_FRAMEWORK_PROMPT,
+    )
+
+    prompt_index = omnigent_args.index("--append-system-prompt")
+    assert omnigent_args.count("--append-system-prompt") == 1
+    assert omnigent_args[prompt_index + 1] == _FRAMEWORK_PROMPT
+    if merged_args is None:
+        assert args == [*user_args, *omnigent_args]
+    else:
+        # The caller's prompt is sent once, so the launch command does not grow by its size.
+        del omnigent_args[prompt_index : prompt_index + 2]
+        assert args == [*merged_args, *omnigent_args]
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -5549,6 +5726,83 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
 
     assert tui["pane"] == _composer_pane(), "The draft was left unsent in the input box."
     assert tui["enters"] == 2
+
+
+def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A paste that lands while a resumed TUI is still replaying must not be submitted blind.
+
+    The composer frame is absent when the paste wait ends, so an Enter would submit
+    nothing and report success. Delivery waits for the composer, clears, pastes once
+    more, and presses Enter only after the draft is visible in the input box.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    replay_pane = "Resuming the conversation from the transcript...\n"
+    pasted_pane = _composer_pane().replace("❯ \n", "❯\n  [Pasted text #1 +7 lines]\n")
+    tui: dict[str, Any] = {
+        "pane": _composer_pane(),
+        "replaying": False,
+        "replay_captures": 0,
+        "pastes": 0,
+        "enter_saw_draft": [],
+    }
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that drops the paste while replaying a resumed transcript.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            if tui["replaying"]:
+                tui["replay_captures"] += 1
+                if tui["replay_captures"] > 25:
+                    tui["replaying"] = False
+                    tui["pane"] = _composer_pane()
+                else:
+                    return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pastes"] += 1
+            if tui["pastes"] == 1:
+                # The first paste is swallowed while the resumed TUI replays its transcript.
+                tui["replaying"] = True
+                tui["pane"] = replay_pane
+            else:
+                tui["pane"] = pasted_pane
+        if cmd[-1] == "Enter":
+            tui["enter_saw_draft"].append("[Pasted text" in tui["pane"])
+            if "[Pasted text" in tui["pane"]:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["enter_saw_draft"] == [True], (
+        "An Enter was pressed while the composer was not showing the draft: "
+        f"{tui['enter_saw_draft']}"
+    )
+    assert tui["pastes"] == 2, "The message should be pasted again once the composer is back."
+    assert tui["pane"] == _composer_pane(), "The message was left unsent in the input box."
 
 
 _SUBMITTED_ECHO = """\
@@ -9214,6 +9468,31 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert "omni setup" in login.failure_message
 
 
+@pytest.mark.parametrize(
+    ("text", "code", "starts_with"),
+    [
+        # Claude's own refusal before any model call: no StopFailure hook follows.
+        ("Prompt is too long", "context_length_exceeded", "Context limit reached"),
+        (
+            "Prompt is too long · the request is ~1070450 tokens (limit 1000000)",
+            "context_length_exceeded",
+            "Context limit reached",
+        ),
+        ("Login expired · Please run /login", "native_turn_error", "Login expired"),
+        ("API Error: 500 upstream failed", "native_turn_error", "API Error: 500 upstream failed"),
+    ],
+)
+def test_program_status_turn_error_matches_stop_failure_guidance(
+    text: str, code: str, starts_with: str
+) -> None:
+    """A terminal-status error reads like the same error from ``StopFailure``."""
+    hook = _hook_record_from_jsonl_record(
+        _make_jsonl_record({"hook_event_name": "StopFailure", "error_details": text})
+    )
+    assert program_status_turn_error(text) == (code, hook.failure_message)
+    assert program_status_turn_error(text)[1].startswith(starts_with)
+
+
 def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -11083,12 +11362,13 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
 
 
 @pytest.mark.parametrize(
-    ("prompt", "description"),
+    ("prompt", "description", "awaits_answer"),
     [
-        ("Enter password to configure settings.\nPassword:", "a password"),
+        ("Enter password to configure settings.\nPassword:", "a password", False),
         (
             "No Claude Code installation found. Would you like to install it? [Y/n]:",
             "installation confirmation",
+            True,
         ),
     ],
     ids=["password", "install-confirmation"],
@@ -11097,9 +11377,13 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
     monkeypatch: pytest.MonkeyPatch,
     prompt: str,
     description: str,
+    awaits_answer: bool,
 ) -> None:
     """
     A launcher waiting for an answer reports its prompt without reaping the pane.
+
+    The install question is answered in the terminal, so its refusal awaits an
+    answer and the delivery holds the message for it.
     """
     monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     captures: list[int] = []
@@ -11123,6 +11407,7 @@ def test_wait_for_claude_prompt_ready_reports_a_launcher_input_prompt(
         f"Claude Code's launch command is waiting for {description} in its terminal"
     )
     assert prompt in str(raised.value)
+    assert raised.value.awaits_answer is awaits_answer
     assert len(captures) == 2
 
 
@@ -14157,18 +14442,23 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
     ]
 
 
-def test_a_lowercase_escape_hint_still_marks_a_surface_dismissible(
+@pytest.mark.parametrize(
+    "hint", ["esc to cancel", "Esc to\n  cancel"], ids=["lowercase", "wrapped"]
+)
+def test_a_lowercase_or_wrapped_escape_hint_still_marks_a_surface_dismissible(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    hint: str,
 ) -> None:
     """
-    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts.
+    Footer casing is not reliable (see ``_DIALOG_FOOTER_RE``): ``esc to`` counts,
+    as does a hint a narrow pane wrapped between words.
 
     A dismissible surface read as unclearable would be refused instead of
-    cleared, so the hint check must not depend on the capital E.
+    cleared, so the hint check must not depend on the capital E or one row.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", "esc to cancel")
+    pane = _MODEL_PICKER_PANE.replace("Esc to cancel", hint)
     sends = _fake_tmux(
         monkeypatch,
         [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
@@ -15772,19 +16062,21 @@ _BTW_BORDER = "▔" * 120
 _BTW_COMPLETE_FOOTER = "    ↑/↓ to scroll · c to copy · f to fork · Esc to close"
 
 
-def _btw_pane(*body_lines: str) -> str:
+def _btw_pane(*body_lines: str, rows: int = 40) -> str:
     """
     Build a captured-pane string with a ``/btw`` overlay at the bottom.
 
-    Prepends some inert scrollback and the ``▔`` overlay border, then the
-    supplied overlay body lines, mirroring the real capture layout.
+    Pads inert scrollback above the ``▔`` overlay border so the capture is
+    *rows* tall, as ``capture-pane`` returns every row of the pane.
 
     :param body_lines: Overlay lines below the border (questions, answer,
         footer), verbatim.
+    :param rows: Pane height, e.g. ``14``.
     :returns: A synthetic pane string for the parser under test.
     """
-    prefix = ["welcome banner line", "another line", _BTW_BORDER]
-    return "\n".join([*prefix, *body_lines])
+    overlay = [_BTW_BORDER, *"\n".join(body_lines).splitlines()]
+    scrollback = [f"scrollback line {n}" for n in range(rows - len(overlay))]
+    return "\n".join([*scrollback, *overlay])
 
 
 @pytest.mark.parametrize(
@@ -15825,7 +16117,32 @@ def test_btw_overlay_parses_completed_single_turn(footer: str) -> None:
     assert overlay.truncated is False
 
 
-def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
+def test_btw_overlay_flags_an_answer_clipped_by_a_short_pane() -> None:
+    """A 14-row pane shows 5 rows of a 12-line answer, under the fixed span threshold."""
+    pane = _btw_pane(
+        "",
+        "    /btw list the numbers 1 to 12, one per line",
+        "",
+        *[f"      {n}" for n in range(1, 6)],
+        "",
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close",
+        rows=14,
+    )
+    overlay = claude_native_bridge._btw_overlay_from_pane(pane)
+    assert overlay is not None
+    assert overlay.answer == "1\n2\n3\n4\n5"
+    assert overlay.truncated is True
+
+
+_BTW_HISTORY_HINTS = pytest.mark.parametrize(
+    "history_hint",
+    ["←/→ to switch", "⇧←/→ to browse", "⇧ ←/→ to browse"],
+    ids=["switch", "shift-browse", "shift-space-browse"],
+)
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_takes_current_turn_and_flags_truncation(history_hint: str) -> None:
     """
     With stacked side turns, only the LAST question is taken, and a tall
     overflowing overlay is flagged truncated.
@@ -15837,7 +16154,7 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
         "",
         *answer_lines,
         "",
-        "    ←/→ to switch · c to copy · f to fork · x to clear history · Esc to close",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · Esc to close",
     )
     overlay = claude_native_bridge._btw_overlay_from_pane(pane)
     assert overlay is not None
@@ -15847,12 +16164,13 @@ def test_btw_overlay_takes_current_turn_and_flags_truncation() -> None:
     assert overlay.truncated is True
 
 
-def test_btw_overlay_none_while_generating() -> None:
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_none_while_generating(history_hint: str) -> None:
     """An overlay still generating (Answering… / no copy·fork) is skipped."""
     pane = _btw_pane(
         "    /btw write a long thing",
         "      ✻ Answering…",
-        "    ←/→ to switch · x to clear history · Esc to close",
+        f"    {history_hint} · x to clear history · Esc to close",
     )
     assert claude_native_bridge._btw_overlay_from_pane(pane) is None
 
@@ -15886,8 +16204,11 @@ def test_btw_overlay_preserves_relative_indentation() -> None:
     assert overlay.answer == "- top\n  - nested"
 
 
+@_BTW_HISTORY_HINTS
 @pytest.mark.parametrize("close_hint", ["Esc to close", "Esc to\n    close"])
-def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint: str) -> None:
+def test_btw_overlay_present_matches_settled_multiturn_and_generating(
+    close_hint: str, history_hint: str
+) -> None:
     """The dismiss guard matches every /btw overlay state, settled or not."""
     settled = _btw_pane(
         "    /btw q",
@@ -15901,16 +16222,25 @@ def test_btw_overlay_present_matches_settled_multiturn_and_generating(close_hint
         "    /btw q2",
         "",
         "      A",
-        f"    ←/→ to switch · c to copy · f to fork · x to clear history · {close_hint}",
+        f"    {history_hint} · c to copy · f to fork · x to clear history · {close_hint}",
     )
     generating = _btw_pane(
         "    /btw q",
         "      ✻ Answering…",
-        f"    ←/→ to switch · x to clear history · {close_hint}",
+        f"    {history_hint} · x to clear history · {close_hint}",
     )
-    assert claude_native_bridge._btw_overlay_present(settled) is True
-    assert claude_native_bridge._btw_overlay_present(multiturn) is True
-    assert claude_native_bridge._btw_overlay_present(generating) is True
+    for pane in (settled, multiturn, generating):
+        assert claude_native_bridge._btw_overlay_present(pane) is True
+        assert claude_native_bridge._ESCAPE_DISMISS_HINT.search(pane)
+
+
+@_BTW_HISTORY_HINTS
+def test_btw_overlay_present_from_history_footer_alone(history_hint: str) -> None:
+    """Stacked side turns are recognised by the history hint without copy/fork or a spinner."""
+    pane = _btw_pane(
+        "    /btw q1", "    /btw q2", f"    {history_hint} · x to clear history · Esc to close"
+    )
+    assert claude_native_bridge._btw_overlay_present(pane) is True
 
 
 @pytest.mark.parametrize("quoted_overlay", ["none", "one-row", "wrapped"])

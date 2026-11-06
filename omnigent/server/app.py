@@ -273,6 +273,9 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``session_mode`` and ``session_id``; older servers
     # reject them.
     scheduled_task_session_modes: bool = True
+    # Connected hosts and continued sandbox sessions accept ten-minute schedules.
+    scheduled_task_subhour: bool = True
+    automation_trigger_poll_minutes: int = 10
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
     scheduled_task_sandbox_workspaces: bool = True
@@ -281,6 +284,9 @@ class ServerInfoResponse(BaseModel):
     request_managed_sandbox_host_id: bool = True
     # A managed fork accepts ``workspaces``; older servers reject the field.
     session_fork_workspaces: bool = True
+    # A multipart create's metadata accepts ``model_override``; older servers
+    # reject it.
+    session_bundle_model_override: bool = True
     # User agents (`omnigent agent add`, GET /v1/agents?scope=user); absent on
     # older servers, which clients treat as unsupported.
     agent_install: bool = False
@@ -290,6 +296,9 @@ class ServerInfoResponse(BaseModel):
     agent_config_edit: bool = False
     # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
     session_event_types: list[str] = []
+    # A claude-sdk ``clear`` continues in a new session; older servers only clear native
+    # sessions, so clients treat absent as unsupported.
+    session_claude_sdk_clear: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
@@ -1772,6 +1781,7 @@ def create_app(
     )
 
     from omnigent.server.server_config import (
+        automation_trigger_poll_minutes,
         load_branding_snapshot,
         load_picker_curation,
         load_server_config,
@@ -1782,6 +1792,7 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     picker_curation = load_picker_curation(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
+    trigger_poll_minutes = automation_trigger_poll_minutes(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
     if harness_install is None:
         app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
@@ -2316,6 +2327,13 @@ def create_app(
     app.state.feature_flags = resolved_feature_flags
     app.state.harness_install = app_harness_install
     app.state.automations = True if automations is None else automations
+
+    def automations_available() -> bool:
+        return scheduled_task_store is not None and deployment_gate_enabled(
+            app.state.automations, "automations"
+        )
+
+    app.state.automations_available = automations_available
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -2719,6 +2737,7 @@ def create_app(
                         create_persistence_ms=_bag.get("create_persistence_ms"),
                         create_identity_ms=_bag.get("create_identity_ms"),
                         create_acl_ms=_bag.get("create_acl_ms"),
+                        create_host_launch_ms=_bag.get("create_host_launch_ms"),
                         stage="create_request",
                         status_code=status_code,
                         error_code=(
@@ -3603,9 +3622,7 @@ def create_app(
 
         dictation_available, _ = engine_availability()
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
-        automations_available = scheduled_task_store is not None and deployment_gate_enabled(
-            app.state.automations, "automations"
-        )
+        automations_enabled = app.state.automations_available()
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3634,11 +3651,13 @@ def create_app(
                 "session_search_scope": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
+                "session_bundle_model_override": True,
                 "agent_install": agent_store.supports_user_agents,
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "session_claude_sdk_clear": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
                 "filesystem_attachments": {
@@ -3646,8 +3665,9 @@ def create_app(
                     "all_types": filesystem_attachment_policy.all_types,
                 },
                 "scheduled_task_projects": project_store is not None,
-                "scheduled_task_inbox": automations_available,
-                "automations_enabled": automations_available,
+                "scheduled_task_inbox": automations_enabled,
+                "automations_enabled": automations_enabled,
+                "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
             }
@@ -3954,6 +3974,7 @@ def create_app(
                 artifact_store=artifact_store,
                 project_store=project_store,
                 automations=app.state.automations,
+                liveness_lookup=_bulk_session_liveness,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
@@ -4931,6 +4952,7 @@ def create_app(
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,
+                sandbox_config=sandbox_config,
             ),
             prefix="/v1",
             tags=["hosts"],

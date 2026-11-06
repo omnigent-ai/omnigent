@@ -52,7 +52,7 @@ import httpx
 from fastapi.responses import JSONResponse, Response
 
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
-from omnigent.debug_logging import debug_event, runner_primary_session_id
+from omnigent.debug_logging import StageTimings, debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
     session_resource_view_to_dict,
@@ -3071,14 +3071,14 @@ async def _auto_create_pi_terminal(
             warning=credential_warning,
         )
     if effort_notice is not None:
-        await _post_pi_native_notice(
+        await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
             code="pi_native_effort_ignored",
             notice=effort_notice,
         )
     if model_notice is not None:
-        await _post_pi_native_notice(
+        await _post_native_launch_notice(
             session_id=session_id,
             server_client=server_client,
             code="pi_native_model_rerouted",
@@ -3151,7 +3151,7 @@ async def _post_pi_native_credential_warning(
         )
 
 
-async def _post_pi_native_notice(
+async def _post_native_launch_notice(
     *,
     session_id: str,
     server_client: httpx.AsyncClient | None,
@@ -3189,9 +3189,9 @@ async def _post_pi_native_notice(
             timeout=30.0,
         )
         resp.raise_for_status()
-    except httpx.HTTPError:
+    except (httpx.HTTPError, RuntimeError):  # a closed client only loses the notice
         _logger.warning(
-            "pi-native: failed to surface %s notice for session %s",
+            "native launch: failed to surface %s notice for session %s",
             code,
             session_id,
             exc_info=True,
@@ -5375,26 +5375,22 @@ async def _auto_create_codex_terminal(
             extra={"session_id": session_id},
         )
     pick_to_reset: str | None = None
-    # Explicit launches (model-flows design §4): validate an explicit request
-    # against the shared catalog, and give a Default launch on codex's own
-    # login the ACCOUNT's real default — so the ``model =`` line copied from
-    # the user's shared config can never govern a session (the stale-gpt-5.4
-    # 400 class). Profile-backed shapes already resolve their default at
-    # materialization time and are left alone.
+    model_reset_notice: str | None = None
+    # Validate an explicit pick against the launch's model list. A Default launch on
+    # codex's own login pins the account default, so a ``model =`` line copied from the
+    # shared config never governs it. Profile shapes resolve their default when built.
     if codex_binding is None and (
         launch_config.model_override
         or (_codex_launch.model is None and _codex_launch.profile is None)
     ):
-        from omnigent.harnesses.codex_native.app_server import (
-            codex_launch_catalog,
-            codex_launch_catalog_is_stale,
-            codex_reprobed_launch_catalog,
+        from omnigent.harnesses.codex_native.app_server import codex_launch_models
+        from omnigent.models.codex_model_vocabulary import (
+            codex_reachable_model_slug,
+            codex_spawn_model,
         )
-        from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.models.model_catalog_store import default_row
 
-        _codex_catalog: list[_JsonObject] | None = None
-        _codex_catalog_was_stale = False
+        _launch_models = None
         try:
             if _catalog_launch is None:
                 _catalog_launch = await asyncio.to_thread(
@@ -5403,69 +5399,72 @@ async def _auto_create_codex_terminal(
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
-            # Read staleness before the fetch can start a background probe.
-            # The fingerprint and probe must use this session's provider.
-            _codex_catalog_was_stale = await codex_launch_catalog_is_stale(
-                codex_path=_codex_cli_path, launch=_catalog_launch
-            )
-            _codex_catalog = await codex_launch_catalog(
+            # The list and any reload must use this session's provider.
+            _launch_models = await codex_launch_models(
                 codex_path=_codex_cli_path, launch=_catalog_launch
             )
         except Exception:  # discovery must not prevent a launch
             _logger.warning(
-                "codex launch catalog unavailable for session=%s",
+                "codex launch model list unavailable for session=%s",
                 session_id,
                 exc_info=True,
                 extra={"session_id": session_id},
             )
-        if launch_config.model_override and _codex_catalog:
+        if launch_config.model_override and _launch_models is not None:
             pick = launch_config.model_override
-            reachable = codex_reachable_model_slug(pick, _codex_catalog)
-            fresh_rows = _codex_catalog
-            if reachable is None and _codex_catalog_was_stale:
-                fresh_rows = await codex_reprobed_launch_catalog(
-                    codex_path=_codex_cli_path, launch=_catalog_launch
+            reachable = codex_reachable_model_slug(pick, _launch_models.rows)
+            if reachable is None and _launch_models.stale and _catalog_launch is not None:
+                _launch_models = await codex_launch_models(
+                    codex_path=_codex_cli_path, launch=_catalog_launch, reload=True
                 )
-                if fresh_rows:
-                    _codex_catalog = fresh_rows
-                    _codex_catalog_was_stale = False
-                    reachable = codex_reachable_model_slug(pick, fresh_rows)
-            if reachable is None:
+                if _launch_models is not None:
+                    reachable = codex_reachable_model_slug(pick, _launch_models.rows)
+            if _launch_models is None or (reachable is None and _launch_models.cached_fallback):
+                # Only a live list can retire the pick; Codex or the gateway reports a real miss.
+                _logger.warning(
+                    "codex-native: no live model list confirms the pick %r for session %s; "
+                    "launching on the pick",
+                    pick,
+                    session_id,
+                    extra={"session_id": session_id},
+                )
+            elif reachable is None:
                 # Re-resolve so provider overrides cannot retain the old model.
-                # A failed probe permits fallback, but cannot retire the pick.
+                listed = _launch_models.rows
                 fallback_model = unpinned_model
                 if (
                     fallback_model is not None
-                    and fresh_rows
-                    and codex_reachable_model_slug(fallback_model, fresh_rows) is None
+                    and codex_reachable_model_slug(fallback_model, listed) is None
                 ):
                     # `omnigent codex --model` pins the same id in the spec, so
                     # falling back to it would relaunch the unlisted model.
                     fallback_model = None
+                listed_default = default_row(listed)
+                if fallback_model is None and _codex_launch.profile is not None and listed_default:
+                    # Pin the workspace default so the notice names the model that runs.
+                    fallback_model = str(listed_default["id"])
                 _codex_launch = await asyncio.to_thread(
                     resolve_native_codex_launch,
                     model=fallback_model,
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
-                pick_to_reset = pick if fresh_rows else None
-                outcome = (
-                    "resetting the pick to Default after terminal launch"
-                    if pick_to_reset is not None
-                    else "keeping the pick because the catalog re-probe failed"
-                )
-                offered = ", ".join(
-                    str(row.get("id") or row.get("model") or "") for row in _codex_catalog
-                )
+                pick_to_reset = pick
+                offered = ", ".join(str(row.get("id") or row.get("model") or "") for row in listed)
                 _logger.warning(
-                    "codex-native: model pick %r for session %s is not in the provider's "
-                    "model list (it offers: %s); launching on the default and %s",
+                    "codex-native: model pick %r for session %s is not in the launch's "
+                    "model list (it offers: %s); launching on the default and resetting "
+                    "the pick after terminal launch",
                     pick,
                     session_id,
                     offered,
-                    outcome,
                     extra={"session_id": session_id},
                 )
+        _codex_catalog: list[_JsonObject] | None = None
+        _codex_catalog_was_stale = False
+        if _launch_models is not None and _codex_launch.profile is None:
+            # A workspace listing is not Codex's model/list, so only Codex rows seed the launch.
+            _codex_catalog, _codex_catalog_was_stale = _launch_models.rows, _launch_models.stale
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
             # Same staleness rule as the claude branch: never convert a stale
             # entry's default into an explicit model pin.
@@ -5486,6 +5485,14 @@ async def _auto_create_codex_terminal(
                     _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
         if _codex_catalog and not _codex_catalog_was_stale:
             _fresh_codex_catalog = _codex_catalog
+        if pick_to_reset is not None:
+            launched = _codex_launch.model
+            launched_label = (
+                (codex_spawn_model(launched) or launched) if launched else "the default model"
+            )
+            model_reset_notice = (
+                f"{pick_to_reset} isn't available on this host; using {launched_label}."
+            )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
@@ -6105,6 +6112,13 @@ async def _auto_create_codex_terminal(
             session_id,
             server_client,
             expected_model_override=pick_to_reset,
+        )
+    if model_reset_notice is not None:
+        await _post_native_launch_notice(
+            session_id=session_id,
+            server_client=server_client,
+            code="codex_native_model_unavailable",
+            notice=model_reset_notice,
         )
 
     # A prompt a previous launch blocked for routing but never got to replay
@@ -9158,6 +9172,7 @@ async def _auto_create_claude_terminal(
         )
     )
     started_at = time.monotonic()
+    timings = StageTimings()
     _logger.info(
         "Claude terminal auto-create starting: session=%s workspace=%s bundle_dir=%s "
         "agent_name=%s skills_filter=%s",
@@ -9250,6 +9265,7 @@ async def _auto_create_claude_terminal(
         session_id,
         extra={"session_id": session_id},
     )
+    timings.mark("bridge")
     from omnigent.runner._entry import _make_auth_token_factory, _RunnerDatabricksAuth
 
     # The Omnigent server URL + auth are needed in two places below: the
@@ -9287,6 +9303,7 @@ async def _auto_create_claude_terminal(
         session_id=session_id,
         session_init=session_init,
     )
+    timings.mark("launch_metadata")
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
@@ -9494,6 +9511,7 @@ async def _auto_create_claude_terminal(
     # Claude's own login — so a host-spawned native-claude session honors the
     # provider selection just like the in-process claude-sdk harness and the
     # CLI path.
+    timings.mark("resume_transcript")
     claude_config: ClaudeNativeUcodeConfig | None = None
     _launch_config_resolution_failed = False
     from omnigent.inference_config import (
@@ -9554,6 +9572,7 @@ async def _auto_create_claude_terminal(
         launch_model = resolve_bound_model(
             inference_config, "claude-native", session_model_override or unpinned_launch_model
         )
+    timings.mark("launch_config")
     # A pick the provider cannot serve is dropped only once the fallback
     # terminal is actually up, so a failed launch never loses it.
     reset_pick_after_launch = False
@@ -9705,6 +9724,7 @@ async def _auto_create_claude_terminal(
     # no gain — nothing later re-picks the launch model there.
     if launch_metadata.routing_enabled:
         claude_config = claude_config_with_launch_model_pinned(claude_config, launch_model)
+    timings.mark("catalog")
     if record_launch_config is not None and not _launch_config_resolution_failed:
         record_launch_config(session_id, claude_config)
     # Persist the vocabulary + launch model onto the bridge so mid-session
@@ -9939,6 +9959,7 @@ async def _auto_create_claude_terminal(
         env_spec.scrollback,
         extra={"session_id": session_id},
     )
+    timings.mark("prepare_terminal")
     try:
         terminal_view = await resource_registry.launch_required_terminal(
             session_id=session_id,
@@ -9964,6 +9985,7 @@ async def _auto_create_claude_terminal(
         with contextlib.suppress(Exception):
             await asyncio.to_thread(ClaudeDebugLogFollower(bridge_dir).close, session_id)
         raise
+    timings.mark("tmux_launch")
     if reset_pick_after_launch:
         await _clear_session_model_override(session_id, server_client)
     # Surface the terminal on the live SSE stream so an already-connected
@@ -9988,7 +10010,13 @@ async def _auto_create_claude_terminal(
         terminal_metadata.get("tmux_socket"),
         terminal_metadata.get("tmux_target"),
         (time.monotonic() - started_at) * 1000,
-        extra={"session_id": session_id},
+        # Stage split of this launch, to find which step dominates startup.
+        extra=debug_event(
+            "claude_terminal_launched",
+            session_id=session_id,
+            terminal_id=terminal_payload.get("id"),
+            **timings.attributes(),
+        ),
     )
 
     publish_event(
