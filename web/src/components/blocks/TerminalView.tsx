@@ -60,7 +60,6 @@ import {
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
   terminalTheme,
-  WS_CLOSE_TERMINAL_NOT_FOUND,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
 
@@ -680,20 +679,22 @@ export function TerminalView({
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  // An early attach may get 4404 before registration. After the create
-  // succeeds, retry once without ``await_launch``.
+  // An early attach can close before its shell exists (4404 before
+  // registration, 4500 while the runner is being rebound). After the create
+  // succeeds, retry once without ``await_launch``. Closes the reconnect effect
+  // already re-dials are left to it.
+  const closedByOwnLaunch =
+    state.kind === "closed" &&
+    state.code !== WS_CLOSE_WRONG_REPLICA &&
+    !isReconnectableTerminalClose(state.code);
   useEffect(() => {
-    if (!dialedDuringLaunchRef.current || launchMode !== null) return;
-    if (state.kind !== "closed" || state.code !== WS_CLOSE_TERMINAL_NOT_FOUND) return;
+    if (!dialedDuringLaunchRef.current || launchMode !== null || !closedByOwnLaunch) return;
     dialedDuringLaunchRef.current = false;
     reconnectAttemptsRef.current = 0;
     disposeActiveSession();
     setConnectAttempt((attempt) => attempt + 1);
-  }, [launchMode, state, disposeActiveSession]);
-  const refusedDuringLaunch =
-    launchMode === "attach" &&
-    state.kind === "closed" &&
-    state.code === WS_CLOSE_TERMINAL_NOT_FOUND;
+  }, [launchMode, closedByOwnLaunch, disposeActiveSession]);
+  const refusedDuringLaunch = launchMode === "attach" && closedByOwnLaunch;
   const previousResumeGeneration = useRef(resumeGeneration);
   useEffect(() => {
     if (previousResumeGeneration.current === resumeGeneration) return;

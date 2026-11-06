@@ -598,6 +598,34 @@ describe("useCreateTerminal launch", () => {
     expect(cached()).toEqual([{ ...opened, directAttachUrl }]);
   });
 
+  it("ignores a second launch from another entry point while one is in flight", async () => {
+    runnerOnlineMock.mockReturnValue(true);
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementation((_url: string, init?: RequestInit) => {
+      requestBody = init?.body as string;
+      return new Promise<Response>((resolve) => {
+        respond = resolve;
+      });
+    });
+    const menu = renderLaunch("conv_one_at_a_time");
+    // The shortcut and split controls own separate hook instances.
+    const shortcut = renderLaunch("conv_one_at_a_time");
+    const onOpenMenu = vi.fn();
+    const onOpenShortcut = vi.fn();
+
+    act(() => menu.hook.result.current.launch("zsh", { onOpen: onOpenMenu }));
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+    expect(shortcut.hook.result.current.isPending).toBe(true);
+    act(() => shortcut.hook.result.current.launch("bash", { onOpen: onOpenShortcut }));
+
+    expect(onOpenShortcut).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    await act(async () => respond(createdResponse(requestBody)));
+    await vi.waitFor(() => expect(shortcut.hook.result.current.isPending).toBe(false));
+  });
+
   it("removes the early-opened terminal and reports it when the create fails", async () => {
     runnerOnlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValueOnce(

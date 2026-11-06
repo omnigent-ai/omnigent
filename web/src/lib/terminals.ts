@@ -324,6 +324,11 @@ export function clearClosedDuringLaunch(terminalId: string): void {
   closedDuringLaunch.delete(terminalId);
 }
 
+/** Whether any shell create is in flight; launches don't overlap. */
+export function anyTerminalLaunching(): boolean {
+  return launchingTerminals.size > 0;
+}
+
 /** Subscribe to launch-state changes (for ``useSyncExternalStore``). */
 export function subscribeTerminalLaunches(listener: () => void): () => void {
   launchListeners.add(listener);

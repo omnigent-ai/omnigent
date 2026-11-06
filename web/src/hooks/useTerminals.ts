@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { authenticatedFetch } from "../lib/identity";
@@ -6,10 +6,12 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { randomUUID } from "@/lib/randomUUID";
 import {
+  anyTerminalLaunching,
   clearClosedDuringLaunch,
   isClosedDuringLaunch,
   requestCloseDuringLaunch,
   setTerminalLaunching,
+  subscribeTerminalLaunches,
   terminalInfoFromResource,
   terminalResourceId,
   terminalsQueryKey,
@@ -332,7 +334,9 @@ export interface TerminalLaunchCallbacks {
  * id and opens its tab at once. With the runner online the attach WebSocket
  * (``await_launch``) runs alongside the create; otherwise (runner asleep or
  * unknown, where the create may wake it) the tab shows "Starting shell…"
- * and attaches once the create returns.
+ * and attaches once the create returns. Only one launch runs at a time
+ * across all entry points: ``isPending`` covers any launch in flight, and
+ * ``launch`` ignores a request while one is.
  *
  * :param conversationId: Session/conversation identifier.
  * :returns: TanStack mutation taking the declared terminal name, plus ``launch``.
@@ -363,7 +367,12 @@ export function useCreateTerminal(conversationId: string) {
       if (!isClosedDuringLaunch(info.id)) addToCache(info);
     },
   });
+  // Every entry point (rail menu, shortcut, split controls) has its own hook
+  // instance; this shared flag keeps their launches from overlapping, so a
+  // failed create's rollback never races another launch.
+  const launchInFlight = useSyncExternalStore(subscribeTerminalLaunches, anyTerminalLaunching);
   const launch = (terminal: string, callbacks: TerminalLaunchCallbacks = {}) => {
+    if (anyTerminalLaunching()) return;
     const sessionKey = newTerminalSessionKey();
     const predicted: TerminalInfo = {
       id: terminalResourceId(terminal, sessionKey),
@@ -415,7 +424,7 @@ export function useCreateTerminal(conversationId: string) {
       })
       .finally(() => setTerminalLaunching(predicted.id, null));
   };
-  return { ...mutation, launch };
+  return { ...mutation, isPending: mutation.isPending || launchInFlight, launch };
 }
 
 /**
