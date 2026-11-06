@@ -103,6 +103,7 @@ import {
   initChatStore,
   pumpStreamEvents,
   retryConversationLoad,
+  SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
   startStreamPump,
@@ -7839,6 +7840,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(rows.find((c) => c.id === "conv_other")?.status).toBe("idle");
     });
 
+    it("patches the open session's fetched sidebar row outside the loaded pages", () => {
+      client.setQueryData(["conversation-backfill", "conv_old"], conv("conv_old", "idle"));
+      handleSessionEvent({ type: "session_status", conversationId: "conv_old", status: "running" });
+      expect(client.getQueryData<Conversation>(["conversation-backfill", "conv_old"])?.status).toBe(
+        "running",
+      );
+    });
+
+    it("leaves the fetched sidebar row untouched when its status hasn't changed", () => {
+      const backfillKey = ["conversation-backfill", "conv_old"];
+      client.setQueryData(backfillKey, conv("conv_old", "running"));
+      const backfillWrites = vi.fn();
+      const unsubscribe = client.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && event.query.queryKey[0] === "conversation-backfill") {
+          backfillWrites();
+        }
+      });
+      handleSessionEvent({ type: "session_status", conversationId: "conv_old", status: "running" });
+      unsubscribe();
+      expect(backfillWrites).not.toHaveBeenCalled();
+    });
+
     it("collapses live 'waiting' to the list's 'running' (server-list parity)", () => {
       // GET /v1/sessions maps running/waiting → "running"; the live patch must
       // match so the badge agrees with the next poll instead of flapping.
@@ -13912,6 +13935,41 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     sinks[1]!.push(sse("response.output_text.delta", { message_id: "m1", index: 0, delta: "Hi" }));
     await vi.advanceTimersByTimeAsync(20);
     expect(preview()?.previewInterrupted).toBeUndefined();
+
+    sinks[1]!.push("data: [DONE]\n\n");
+    sinks[1]!.close();
+    await vi.advanceTimersByTimeAsync(20);
+    controller.abort();
+    await loop;
+  });
+
+  it("reopens a stream once it reaches the max age, before the ingress cap", async () => {
+    seedSession("conv_max_age", []);
+    // Like the real fetch, aborting the attempt severs the body read.
+    const sinks: StreamSink[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const sink = pushableStream();
+        sinks.push(sink);
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_max_age", abortController: controller });
+
+    const loop = startStreamPump("conv_max_age", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sinks).toHaveLength(1);
+
+    await advanceWithHeartbeats(sinks[0]!, SSE_MAX_STREAM_AGE_MS - 15_000);
+    expect(sinks).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(15_001);
+    expect(sinks).toHaveLength(2);
 
     sinks[1]!.push("data: [DONE]\n\n");
     sinks[1]!.close();

@@ -54,7 +54,12 @@ the header menu), and each place is a separate entry point.
   interleaved comments and existing attachments; removing a quote keeps its comments.
   Live side chats accept pasted images in every reply text field.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
-  menu of an archived session.
+  menu of an archived session. An archived session opened from ⌘K search or a
+  link also gets its row on the live sidebar views while it is open, outside
+  Pinned and project folders, so you can unarchive it from that row. A shared
+  session opened from search lists on All and Shared, without Unarchive unless
+  you own it. A shared session opened by direct link gets no row unless you
+  have owner-level access, because the session response carries no owner.
 - `delete`: confirmed, then removed from the list and the server.
 - `export`: Export in the header menu saves the transcript as a local file.
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
@@ -298,6 +303,12 @@ variant. Browsers without backdrop filtering receive a solid theme surface.
 The header controls sit 16px from the top and sides.
 The mobile header omits the session title and fading backdrop,
 retaining a Back link for child sessions.
+
+**Desktop Session menu:** in the desktop app, Session → Pin (⌥⌘P), Archive
+(⇧⌘A) and Fork Session… (⌥⌘F) act on the open session (Ctrl+Alt+P,
+Ctrl+Shift+A and Ctrl+Alt+F on Windows/Linux). They are enabled only while the
+session's header menu offers the action, and the open session's sidebar row
+shows the same chords on its pin button and in its row menu.
 
 **Rename shortcut:** in an owner-managed top-level session on desktop, press
 Cmd+Option+R on macOS or Ctrl+Alt+R elsewhere, including while writing a draft.
@@ -659,9 +670,16 @@ plain `uv run pytest`, which starts a private server for the test.
   expect the dialog each time; a session without a worktree archives silently.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
-  The sidebar row and bulk unarchive have web unit coverage only: archive a
-  session, open the archived view, choose Unarchive on the row, and expect the
-  session back in the main list.
+- **`unarchive`, open archived session's sidebar row:**
+  `tests/e2e_ui/sessions/test_open_session_sidebar_reveal.py::test_archived_session_opened_from_search_shows_unarchive_in_sidebar`
+  opens an archived session from ⌘K and unarchives it from its revealed row.
+  Placement, shared sessions, older live sessions and the display cap are
+  covered in `web/src/shell/Sidebar.openSession.test.tsx`. Direct link,
+  manually: archive one of your sessions, paste its `/c/<id>` URL into a new
+  tab, and expect its row in the sidebar with Unarchive on hover.
+- **`unarchive`, Archived view row and bulk selection:** web unit coverage
+  only. Manually: archive a session, open the archived view, choose Unarchive
+  on the row, and expect the session back in the main list.
 - **`unarchive`, Undo toast:**
   `tests/e2e_ui/sessions/test_sidebar_lifecycle.py::test_sidebar_session_organization_round_trip`
   archives two sessions and restores both to Mine through Undo, including after
@@ -1107,7 +1125,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
   orders them, then expand the folder and click Show more.
 
-For the desktop Close Tab shortcut, select a side-chat tab in an ordinary
+For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and
 siblings stay open. If stopping the side chat fails, its tab, draft and queued
 messages must remain. Narrow the desktop window below 768 pixels and repeat:

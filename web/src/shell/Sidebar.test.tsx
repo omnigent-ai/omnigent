@@ -13,7 +13,17 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // are no longer listed here — they live on the Settings page.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { resetDesktopCommandsForTests, useDesktopCommand } from "@/lib/desktopCommands";
 import { useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
@@ -2824,6 +2834,51 @@ describe("Sidebar project Show more", () => {
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
 
+  it("lists the desktop Session chords in the open session's row menu while they work", async () => {
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      onDesktopCommand: () => () => {},
+      setDesktopCommandState: () => {},
+    });
+    try {
+      mockConversations([conv("conv_open", "Claude Code"), conv("conv_other", "Claude Code")]);
+      renderOnSession("conv_open");
+      const keycapsOf = (rowId: string) => {
+        const row = screen.getByRole("link", { name: new RegExp(rowId) }).closest("li")!;
+        fireEvent.pointerDown(within(row).getByRole("button", { name: "Conversation actions" }), {
+          button: 0,
+          ctrlKey: false,
+        });
+        const keycaps = (name: string) =>
+          Array.from(
+            screen.getByRole("menuitem", { name: new RegExp(`^${name}`) }).querySelectorAll("kbd"),
+            (key) => key.textContent,
+          );
+        const result = { archive: keycaps("Archive"), fork: keycaps("Fork") };
+        fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+        return result;
+      };
+
+      // Without a session header handling them (a child or shared view), none are listed.
+      expect(keycapsOf("conv_open")).toEqual({ archive: [], fork: [] });
+
+      // The session header handles them; they act on the open session, so other rows don't claim them.
+      renderHook(() => {
+        useDesktopCommand("archive-session", () => {});
+        useDesktopCommand("fork-session", () => {});
+      });
+      await act(async () => {});
+      expect(keycapsOf("conv_open")).toEqual({
+        archive: ["Ctrl", "⇧", "A"],
+        fork: ["Ctrl", "Alt", "F"],
+      });
+      expect(keycapsOf("conv_other")).toEqual({ archive: [], fork: [] });
+    } finally {
+      resetDesktopCommandsForTests();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("keeps a folder's listed rows when an older session is filed into it", async () => {
     projectsMock.push("Customer X");
     const older = conv("conv_older", "Claude Code", { updated_at: 1 });
@@ -2848,6 +2903,31 @@ describe("Sidebar project Show more", () => {
     expect(screen.queryByRole("link", { name: "conv_older" })).toBeNull();
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual([...filedIds(6), "conv_older"]);
+  });
+
+  it("numbers the sessions above a folder's Show more and continues in the next folder", () => {
+    projectsMock.push("Customer X", "Customer Y");
+    mockConversations([
+      ...filedSessions(7),
+      conv("conv_other_folder", "Claude Code", {
+        labels: { omni_project: "Customer Y" },
+        updated_at: 1,
+      }),
+    ]);
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Customer X", "Customer Y"]),
+    );
+    renderOnSession("conv_filed_1");
+
+    // Five rows show above Customer X's Show more, so the sixth number is Customer Y's row.
+    fireEvent.keyDown(window, {
+      code: "Digit6",
+      key: "6",
+      altKey: true,
+      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+    });
+    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
 
   it("steps the session hotkey past the sessions behind Show more", () => {
