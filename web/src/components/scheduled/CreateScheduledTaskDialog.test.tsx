@@ -3558,6 +3558,39 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("call sys_session_create");
   });
 
+  it("watches Slack DMs from listed senders, or one group DM, with prefixed scopes", async () => {
+    renderTrigger("slack");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("#");
+    // Pasted channel names keep a single, visual "#".
+    type("task-trigger-scope", "#eng-support");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("eng-support");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-author");
+
+    pick("task-trigger-event", "task-trigger-event-dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where sender");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("@");
+    // Channel names aren't people, and Author repeats the sender.
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    expect(screen.queryByTestId("task-trigger-condition-0")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can send you a direct message from one of these accounts may direct the agent",
+    );
+
+    pick("task-trigger-event", "task-trigger-event-group_dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where group DM with");
+    expect(screen.queryByTestId("task-trigger-scope-operator")).not.toBeInTheDocument();
+    type("task-trigger-scope", "@alice");
+    type("task-trigger-instructions", "Answer the question.");
+    expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    type("task-trigger-scope", "alice, @bob");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("alice, bob");
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain("Watch: new Slack messages in your group DM with @alice and @bob\n");
+  });
+
   it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
     renderTrigger("linear");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");

@@ -19,10 +19,15 @@ import {
   MAX_INSTRUCTIONS_CHARS,
   MAX_SESSIONS_PER_RUN,
   OMNIGENT_ATTRIBUTION,
+  stripScopePrefix,
   TRIGGER_TEMPLATES,
+  triggerConditionFields,
+  triggerEvent,
   triggerOperatorLabel,
+  triggerScope,
   triggerServiceName,
   VALUELESS_OPERATORS,
+  withTriggerEvent,
   type TriggerCondition,
   type TriggerFields,
   type TriggerOperator,
@@ -57,9 +62,9 @@ export function TriggerTemplateFields({
   const [warningsOpen, setWarningsOpen] = useState(false);
   const template = TRIGGER_TEMPLATES[source];
   const Icon = template.icon;
-  const authorAction = (
-    template.events.find((event) => event.id === fields.event) ?? template.events[0]
-  ).authorAction;
+  const { authorAction } = triggerEvent(source, fields.event);
+  const scope = triggerScope(source, fields.event);
+  const conditionFields = triggerConditionFields(source, fields.event);
   const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
 
   function setCondition(index: number, next: TriggerCondition) {
@@ -70,7 +75,7 @@ export function TriggerTemplateFields({
   }
 
   function addCondition() {
-    const field = template.fields[0];
+    const field = conditionFields[0];
     onChange({
       ...fields,
       conditions: [
@@ -97,7 +102,7 @@ export function TriggerTemplateFields({
             {template.events.length > 1 ? (
               <Select
                 value={fields.event}
-                onValueChange={(event) => onChange({ ...fields, event })}
+                onValueChange={(event) => onChange(withTriggerEvent(source, fields, event))}
                 onOpenChange={onSelectOpenChange}
               >
                 <SelectTrigger
@@ -121,42 +126,64 @@ export function TriggerTemplateFields({
                 {template.events[0].label}
               </span>
             )}
-            <span className="text-muted-foreground">where {template.scopeLabel}</span>
-            <Select
-              value={fields.scopeOperator ?? "in"}
-              onValueChange={(operator) =>
-                onChange({ ...fields, scopeOperator: operator as "is" | "in" })
-              }
-              onOpenChange={onSelectOpenChange}
-            >
-              <SelectTrigger
-                size="sm"
-                className={CHIP}
-                aria-label="Scope operator"
-                data-testid="task-trigger-scope-operator"
+            <span className="text-muted-foreground">where {scope.label}</span>
+            {!scope.isGroup && (
+              <Select
+                value={fields.scopeOperator ?? "in"}
+                onValueChange={(operator) =>
+                  onChange({ ...fields, scopeOperator: operator as "is" | "in" })
+                }
+                onOpenChange={onSelectOpenChange}
               >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start">
-                <SelectItem value="is">equals</SelectItem>
-                <SelectItem value="in">in</SelectItem>
-              </SelectContent>
-            </Select>
-            <Input
-              value={fields.scope}
-              placeholder={
-                fields.scopeOperator === "is"
-                  ? template.scopePlaceholder.split(",")[0]
-                  : template.scopePlaceholder
-              }
-              aria-label={template.scopeLabel}
-              data-testid="task-trigger-scope"
-              className={cn(CHIP, "min-w-28 flex-1 placeholder:text-primary/50")}
-              onChange={(e) => onChange({ ...fields, scope: e.target.value })}
-            />
+                <SelectTrigger
+                  size="sm"
+                  className={CHIP}
+                  aria-label="Scope operator"
+                  data-testid="task-trigger-scope-operator"
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent position="popper" align="start">
+                  <SelectItem value="is">equals</SelectItem>
+                  <SelectItem value="in">in</SelectItem>
+                </SelectContent>
+              </Select>
+            )}
+            {/* The prefix wraps with its input, so it never ends a line on its own. */}
+            <span className="flex min-w-36 flex-1 items-center gap-1">
+              {scope.prefix !== "" && (
+                <span
+                  className="text-sm font-medium text-primary"
+                  aria-hidden="true"
+                  data-testid="task-trigger-scope-prefix"
+                >
+                  {scope.prefix}
+                </span>
+              )}
+              <Input
+                value={fields.scope}
+                placeholder={
+                  fields.scopeOperator === "is" && !scope.isGroup
+                    ? scope.placeholder.split(",")[0]
+                    : scope.placeholder
+                }
+                aria-label={scope.label}
+                data-testid="task-trigger-scope"
+                className={cn(CHIP, "min-w-0 flex-1 placeholder:text-primary/50")}
+                onChange={(e) =>
+                  onChange({ ...fields, scope: stripScopePrefix(e.target.value, scope.prefix) })
+                }
+              />
+            </span>
           </div>
 
-          {fields.scopeOperator === "is" && fields.scope.includes(",") && (
+          {scope.isGroup && fields.scope.trim() !== "" && !fields.scope.includes(",") && (
+            <p className="pl-6 text-sm text-muted-foreground" data-testid="task-trigger-group-hint">
+              List at least two people. For one person, choose Direct message received.
+            </p>
+          )}
+
+          {!scope.isGroup && fields.scopeOperator === "is" && fields.scope.includes(",") && (
             <p className="pl-6 text-sm text-destructive" role="alert">
               Equals matches one value. Choose in to match a comma-separated list.
             </p>
@@ -164,7 +191,7 @@ export function TriggerTemplateFields({
 
           {fields.conditions.map((condition, index) => {
             const field =
-              template.fields.find((f) => f.id === condition.field) ?? template.fields[0];
+              conditionFields.find((f) => f.id === condition.field) ?? conditionFields[0];
             return (
               <div
                 // Rows have no identity beyond their position.
@@ -177,7 +204,7 @@ export function TriggerTemplateFields({
                 <Select
                   value={field.id}
                   onValueChange={(id) => {
-                    const next = template.fields.find((f) => f.id === id) ?? field;
+                    const next = conditionFields.find((f) => f.id === id) ?? field;
                     setCondition(index, { field: next.id, operator: next.operators[0], value: "" });
                   }}
                   onOpenChange={onSelectOpenChange}
@@ -191,7 +218,7 @@ export function TriggerTemplateFields({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent position="popper" align="start">
-                    {template.fields.map((f) => (
+                    {conditionFields.map((f) => (
                       <SelectItem
                         key={f.id}
                         value={f.id}
