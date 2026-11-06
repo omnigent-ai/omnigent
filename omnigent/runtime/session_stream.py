@@ -30,7 +30,9 @@ import asyncio
 import contextlib
 import logging
 import threading
+from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -59,14 +61,18 @@ class SubscriberOverflowError(RuntimeError):
     """Raised when a subscriber falls behind the bounded live-event queue."""
 
 
-# Subscriber registry: conversation_id -> set of
-# (queue, event_loop) pairs. The event_loop reference is needed
-# so the sync producer thread can safely deliver items via
-# ``call_soon_threadsafe`` into the queue's owning loop.
-_subscribers: WorkspaceScopedCache[
-    str,
-    set[tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop]],
-] = WorkspaceScopedCache()
+@dataclass(eq=False)
+class _Subscriber:
+    """Bound queued events and cross-thread staging under the same budget."""
+
+    queue: asyncio.Queue[dict[str, Any] | object]
+    loop: asyncio.AbstractEventLoop
+    pending: deque[dict[str, Any] | object] = field(default_factory=deque)
+    delivery_scheduled: bool = False
+    overflowed: bool = False
+
+
+_subscribers: WorkspaceScopedCache[str, set[_Subscriber]] = WorkspaceScopedCache()
 _lock = threading.Lock()
 
 
@@ -91,25 +97,48 @@ def _enqueue_or_overflow(
 
 def _schedule_delivery(
     conversation_id: str,
-    subscriber: tuple[asyncio.Queue[dict[str, Any] | object], asyncio.AbstractEventLoop],
+    subscriber: _Subscriber,
     item: dict[str, Any] | object,
 ) -> bool:
     """Schedule one delivery, dropping a slot whose loop has closed."""
-    queue, loop = subscriber
     # Re-check membership under the same lock subscribe cleanup uses. A slot
     # removed after the caller's snapshot must not count as a live recipient.
     with _lock:
         subs = _subscribers.get(conversation_id)
         if subs is None or subscriber not in subs:
             return False
+        if subscriber.overflowed:
+            return True
+        if len(subscriber.pending) + subscriber.queue.qsize() >= subscriber.queue.maxsize:
+            subscriber.pending.clear()
+            subscriber.pending.append(_OVERFLOW)
+            subscriber.overflowed = True
+        else:
+            subscriber.pending.append(item)
+        if subscriber.delivery_scheduled:
+            return True
         try:
-            loop.call_soon_threadsafe(_enqueue_or_overflow, queue, item)
+            subscriber.loop.call_soon_threadsafe(_deliver_pending, subscriber)
         except RuntimeError:
+            subscriber.pending.clear()
             subs.discard(subscriber)
             if not subs:
                 _subscribers.pop(conversation_id, None)
             return False
+        subscriber.delivery_scheduled = True
         return True
+
+
+def _deliver_pending(subscriber: _Subscriber) -> None:
+    """Drain staging with one callback, releasing payloads on overflow."""
+    with _lock:
+        subscriber.delivery_scheduled = False
+        while subscriber.pending:
+            item = subscriber.pending.popleft()
+            if item is _OVERFLOW:
+                while not subscriber.queue.empty():
+                    subscriber.queue.get_nowait()
+            _enqueue_or_overflow(subscriber.queue, item)
 
 
 # ── SSE-event debug logging (ZeroBus table and/or local file; see
@@ -404,8 +433,9 @@ def shutdown_all() -> None:
         # Shutdown spans every workspace and runs context-free, so sweep the
         # whole backing rather than the current workspace's slice.
         all_subs = [entry for subs in _subscribers.all_values() for entry in subs]
-    for queue, _ in all_subs:
-        _enqueue_or_overflow(queue, _DONE)
+    for subscriber in all_subs:
+        _deliver_pending(subscriber)
+        _enqueue_or_overflow(subscriber.queue, _DONE)
 
 
 async def subscribe(
@@ -488,7 +518,7 @@ async def subscribe(
         maxsize=_SUBSCRIBER_QUEUE_MAX_EVENTS
     )
     loop = asyncio.get_running_loop()
-    entry = (queue, loop)
+    entry = _Subscriber(queue, loop)
     with _lock:
         _subscribers.setdefault(conversation_id, set()).add(entry)
     # Read the pre-ready snapshot synchronously here — after slot
@@ -557,6 +587,9 @@ async def subscribe(
             yield item
     finally:
         with _lock:
+            entry.pending.clear()
+            while not queue.empty():
+                queue.get_nowait()
             subs = _subscribers.get(conversation_id)
             if subs is not None:
                 subs.discard(entry)

@@ -23,8 +23,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
+import weakref
 from collections.abc import Iterator
 from typing import Any, Literal
+from unittest.mock import Mock
 
 import pytest
 
@@ -138,7 +141,7 @@ async def test_publish_drops_closed_loop_without_disturbing_healthy_subscriber()
     conversation_id = "conv_closed_loop"
     stale_loop = asyncio.new_event_loop()
     stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    stale_subscriber = (stale_queue, stale_loop)
+    stale_subscriber = session_stream._Subscriber(stale_queue, stale_loop)
     stale_loop.close()
     session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
 
@@ -156,7 +159,7 @@ async def test_close_drops_closed_loop_and_terminates_healthy_subscriber() -> No
     conversation_id = "conv_close_closed_loop"
     stale_loop = asyncio.new_event_loop()
     stale_queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    stale_subscriber = (stale_queue, stale_loop)
+    stale_subscriber = session_stream._Subscriber(stale_queue, stale_loop)
     stale_loop.close()
     session_stream._subscribers.setdefault(conversation_id, set()).add(stale_subscriber)
 
@@ -174,7 +177,7 @@ def test_schedule_delivery_does_not_count_already_removed_subscriber() -> None:
     conversation_id = "conv_removed_before_schedule"
     loop = asyncio.new_event_loop()
     queue: asyncio.Queue[dict[str, Any] | object] = asyncio.Queue()
-    subscriber = (queue, loop)
+    subscriber = session_stream._Subscriber(queue, loop)
     try:
         assert not session_stream._schedule_delivery(
             conversation_id, subscriber, {"type": "event"}
@@ -248,7 +251,8 @@ async def test_multi_subscriber_fan_out_independently_delivers() -> None:
 
 
 @pytest.mark.asyncio
-async def test_close_broadcasts_done_to_all_subscribers() -> None:
+@pytest.mark.parametrize("shutdown", [False, True])
+async def test_close_broadcasts_done_to_all_subscribers(shutdown: bool) -> None:
     """
     ``close`` signals end-of-stream to every connected subscriber.
 
@@ -272,7 +276,10 @@ async def test_close_broadcasts_done_to_all_subscribers() -> None:
     await asyncio.sleep(0)
     await asyncio.sleep(0)
     session_stream.publish("conv_close", {"type": "a", "i": 1})
-    session_stream.close("conv_close")
+    if shutdown:
+        session_stream.shutdown_all()
+    else:
+        session_stream.close("conv_close")
     # Both subscribers terminate cleanly under the close sentinel.
     await asyncio.wait_for(asyncio.gather(t1, t2), timeout=2.0)
     assert out1 == [{"type": "a", "i": 1}], (
@@ -356,8 +363,10 @@ async def test_subscribers_are_isolated_across_workspaces() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("threaded", [False, True])
+@pytest.mark.parametrize("queued", [False, True])
 async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, threaded: bool, queued: bool
 ) -> None:
     """
     A subscriber that falls behind is disconnected instead of growing forever.
@@ -376,17 +385,81 @@ async def test_slow_subscriber_overflow_is_bounded_and_disconnects(
     assert ready == {"type": "test.ready"}
 
     session_stream.publish(conv_id, {"type": "test.event", "i": 1})
+    if queued:
+        await asyncio.sleep(0)
     session_stream.publish(conv_id, {"type": "test.event", "i": 2})
-    session_stream.publish(conv_id, {"type": "test.event", "i": 3})
+    loop = asyncio.get_running_loop()
+    schedule = Mock(wraps=loop.call_soon_threadsafe)
+    monkeypatch.setattr(loop, "call_soon_threadsafe", schedule)
+
+    def publish_burst() -> None:
+        for index in range(3, 100):
+            session_stream.publish(conv_id, {"type": "test.event", "i": index})
+
+    if threaded:
+        publisher = threading.Thread(target=publish_burst)
+        publisher.start()
+        publisher.join(timeout=2)
+        assert not publisher.is_alive()
+    else:
+        publish_burst()
+
+    assert schedule.call_count == 0, "a pending drain must absorb the entire burst"
+    (subscriber,) = session_stream._subscribers[conv_id]
+    assert list(subscriber.pending) == [session_stream._OVERFLOW]
     await asyncio.sleep(0)
 
-    ((queue, _loop),) = session_stream._subscribers[conv_id]
+    queue = subscriber.queue
     assert queue.maxsize == 2
     assert queue.qsize() == 1, "overflow must replace the stale backlog with one signal"
 
     with pytest.raises(session_stream.SubscriberOverflowError, match=conv_id):
         await asyncio.wait_for(gen.__anext__(), timeout=1.0)
     assert conv_id not in session_stream._subscribers
+
+
+async def test_cross_thread_publish_reschedules_drain_and_preserves_close_order() -> None:
+    conversation_id = "conv_threaded_drain"
+    halfway = threading.Event()
+    received = []
+
+    async def collect() -> None:
+        async for event in session_stream.subscribe(conversation_id):
+            received.append(event["i"])
+            if len(received) == 100:
+                halfway.set()
+
+    def publish() -> None:
+        for index in range(100):
+            session_stream.publish(conversation_id, {"type": "test.event", "i": index})
+        assert halfway.wait(timeout=2)
+        for index in range(100, 200):
+            session_stream.publish(conversation_id, {"type": "test.event", "i": index})
+        session_stream.close(conversation_id)
+
+    collector = asyncio.create_task(collect())
+    await asyncio.sleep(0)
+    await asyncio.wait_for(asyncio.gather(asyncio.to_thread(publish), collector), timeout=5)
+    assert received == list(range(200))
+    assert conversation_id not in session_stream._subscribers
+
+
+@pytest.mark.parametrize("queued", [False, True])
+async def test_close_releases_payloads_before_scheduled_drain_runs(queued: bool) -> None:
+    class Payload:
+        pass
+
+    gen = session_stream.subscribe("conv_cancel_staging", ready_event={"type": "ready"})
+    await anext(gen)
+    payload = Payload()
+    reference = weakref.ref(payload)
+    session_stream.publish("conv_cancel_staging", {"type": "test.event", "payload": payload})
+    del payload
+    if queued:
+        await asyncio.sleep(0)
+    assert reference() is not None
+    await gen.aclose()
+    assert reference() is None
 
 
 # ── Side-channel: pending-elicitations index ─────────────────────────
