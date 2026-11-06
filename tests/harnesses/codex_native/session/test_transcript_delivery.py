@@ -671,6 +671,7 @@ def _run_steered_turn(
     follow_up_ahead_of_steer: bool = False,
     first_read_items: int | None = None,
     steer_echoes_client_id: bool = True,
+    follow_up_typed: bool = False,
 ) -> list[str]:
     """
     Run one turn that a web send steers, returning posts and forwarder reads in order.
@@ -689,6 +690,7 @@ def _run_steered_turn(
     :param follow_up_ahead_of_steer: Whether Codex records the follow-up steer first.
     :param first_read_items: Steered-turn items the first transcript read holds, if it lags.
     :param steer_echoes_client_id: Whether Codex reports the steer with its ``clientId``.
+    :param follow_up_typed: Whether the follow-up is typed in the terminal, without a ``clientId``.
     :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
@@ -697,6 +699,8 @@ def _run_steered_turn(
     if not steer_echoes_client_id:
         del steer["clientId"]
     follow_up = _native_user_message("item_follow_up", "and the changelog", _FOLLOW_UP_CLIENT_ID)
+    if follow_up_typed:
+        del follow_up["clientId"]
     next_prompt = _native_user_message("item_next", "run the tests", "client-next")
     steered_items = [first, steer] if steer_in_transcript else [first]
     if live_follow_up_steer and follow_up_ahead_of_steer:
@@ -739,12 +743,13 @@ def _run_steered_turn(
         if live_steer_copy:
             await deliver(_turn_item_event("item/completed", steer))
         if live_follow_up_steer:
-            await _accept_web_steer(
-                bridge_dir,
-                "and the changelog",
-                client_id=_FOLLOW_UP_CLIENT_ID,
-                stable_id="e" * 32,
-            )
+            if not follow_up_typed:
+                await _accept_web_steer(
+                    bridge_dir,
+                    "and the changelog",
+                    client_id=_FOLLOW_UP_CLIENT_ID,
+                    stable_id="e" * 32,
+                )
             await deliver(_turn_item_event("item/completed", follow_up))
         for index in range(1, replies_after_steer + 1):
             agent_item = {"type": "agentMessage", "id": f"msg_{index}"}
@@ -850,13 +855,21 @@ def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Pa
 
 
 @pytest.mark.parametrize(
-    ("follow_up_ahead_of_steer", "first_read_items", "fail_first_read", "expected_steer"),
+    (
+        "follow_up_typed",
+        "follow_up_ahead_of_steer",
+        "first_read_items",
+        "fail_first_read",
+        "expected_steer",
+    ),
     [
-        (False, None, False, [_RECOVERED_STEER]),
-        (False, 1, False, []),
-        (False, None, True, []),
-        (True, None, False, []),
-        (True, 2, False, []),
+        (False, False, None, False, [_RECOVERED_STEER]),
+        (False, False, 1, False, []),
+        (False, False, None, True, []),
+        (False, True, None, False, []),
+        (False, True, 2, False, []),
+        (True, False, None, False, [_RECOVERED_STEER]),
+        (True, False, 1, False, []),
     ],
     ids=[
         "read_holds_later_steer",
@@ -864,21 +877,25 @@ def test_forwarder_mirrors_steer_whose_reply_arrives_after_turn_end(tmp_path: Pa
         "read_fails",
         "later_steer_recorded_first",
         "read_lags_missed_steer",
+        "read_holds_typed_message",
+        "read_lags_typed_message",
     ],
 )
 def test_forwarder_mirrors_missed_steer_ahead_of_later_steer(
     tmp_path: Path,
+    follow_up_typed: bool,
     follow_up_ahead_of_steer: bool,
     first_read_items: int | None,
     fail_first_read: bool,
     expected_steer: list[str],
 ) -> None:
     """
-    A missed steer is mirrored before a later steer seen live, or not at all.
+    A missed steer is mirrored before a later message seen live, or not at all.
 
     The server reports inputs queued ahead of a mirrored message as undelivered, and
     one ignoring the delivery a late copy names would settle it against another input.
-    A steer the read before the later steer cannot place ahead of it is dropped.
+    A steer the read before the later message cannot place ahead of it is dropped;
+    a message typed in the terminal has no ``clientId``, so the read finds it by item id.
     """
     reads_started = 0
 
@@ -896,6 +913,7 @@ def test_forwarder_mirrors_missed_steer_ahead_of_later_steer(
         during_read=fail_read if fail_first_read else None,
         follow_up_ahead_of_steer=follow_up_ahead_of_steer,
         first_read_items=first_read_items,
+        follow_up_typed=follow_up_typed,
     )
 
     assert transcript == [
