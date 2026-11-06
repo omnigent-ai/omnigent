@@ -74,7 +74,8 @@ export type NativeCodingAgentIconKind =
   | "antigravity"
   | "kimi"
   | "hermes"
-  | "devin";
+  | "devin"
+  | "commandcode";
 export type NativeCodingAgentCapability =
   | "permissionMode"
   | "approvalMode"
@@ -259,6 +260,20 @@ export const NATIVE_CODING_AGENTS = [
     sortRank: 70,
   },
   {
+    // commandcode has no brand glyph yet, so it falls back to the generic bot
+    // icon (see AgentCard.iconForAgent) — the `iconKind: "commandcode"`
+    // intentionally matches no icon branch. Policies/approvals surface via the
+    // generated per-session Command Code mod plus the embedded terminal, so no
+    // capability flags are declared here.
+    key: "commandcode",
+    agentName: "commandcode-native-ui",
+    harness: "commandcode-native",
+    wrapperLabel: "commandcode-native-ui",
+    displayName: "Command Code",
+    iconKind: "commandcode",
+    sortRank: 75,
+  },
+  {
     // hermes has no brand glyph yet, so it falls back to the generic bot icon
     // (see AgentCard.iconForAgent / SubagentsPanel) — the `iconKind: "hermes"`
     // intentionally matches no icon branch. Auth/approval surface in the
@@ -307,6 +322,7 @@ const HARNESS_ALIASES: Record<string, string> = {
   "native-kimi": "kimi-native",
   "native-hermes": "hermes-native",
   "native-opencode": "opencode-native",
+  "native-commandcode": "commandcode-native",
 };
 
 // Vendors whose elicitation wire prefix differs from their registry `key`:

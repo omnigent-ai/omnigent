@@ -1769,7 +1769,10 @@ _HARNESS_COMMANDS: frozenset[str] = frozenset(
         "agy",
         "antigravity",
         "claude",
+        "cmd",
+        "cmdc",
         "codex",
+        "commandcode",
         "copilot",
         "cursor",
         "debby",
@@ -2117,7 +2120,10 @@ _CLICK_SUBCOMMANDS: frozenset[str] = frozenset(
         "antigravity",
         "attach",
         "claude",
+        "cmd",
+        "cmdc",
         "codex",
+        "commandcode",
         "config",
         "copilot",
         "cursor",
@@ -8273,6 +8279,11 @@ _NATIVE_TERMINAL_DISPATCH_SPECS: dict[str, _NativeTerminalDispatchSpec] = {
     "kimi": _NativeTerminalDispatchSpec(
         module="omnigent.harnesses.kimi_native.main",
         function="run_kimi_native",
+        args_param="extra_args",
+    ),
+    "commandcode": _NativeTerminalDispatchSpec(
+        module="omnigent.harnesses.commandcode_native.main",
+        function="run_commandcode_native",
         args_param="extra_args",
     ),
     "devin": _NativeTerminalDispatchSpec(

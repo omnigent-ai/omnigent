@@ -116,6 +116,7 @@ def register_resource_routes(
     _antigravity_terminal_ensure_locks: dict[str, asyncio.Lock],
     _claude_terminal_ensure_locks: dict[str, asyncio.Lock],
     _codex_terminal_ensure_locks: dict[str, asyncio.Lock],
+    _commandcode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _cursor_terminal_ensure_locks: dict[str, asyncio.Lock],
     _devin_terminal_ensure_locks: dict[str, asyncio.Lock],
     _discard_comment_relay: Callable[[str, ClaudeNativeToolRelay], None],
@@ -387,6 +388,7 @@ def register_resource_routes(
                     "qwen": _qwen_terminal_ensure_locks,
                     "kimi": _kimi_terminal_ensure_locks,
                     "devin": _devin_terminal_ensure_locks,
+                    "commandcode": _commandcode_terminal_ensure_locks,
                 }
             )[_ensure_agent.key]
             persist_resource_event = body.get("persist_resource_event") is not False

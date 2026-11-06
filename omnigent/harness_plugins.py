@@ -18,6 +18,7 @@ from omnigent._wrapper_labels import (
     ANTIGRAVITY_NATIVE_WRAPPER_VALUE,
     CLAUDE_NATIVE_WRAPPER_VALUE,
     CODEX_NATIVE_WRAPPER_VALUE,
+    COMMANDCODE_NATIVE_WRAPPER_VALUE,
     CURSOR_NATIVE_WRAPPER_VALUE,
     DEVIN_NATIVE_WRAPPER_VALUE,
     GOOSE_NATIVE_WRAPPER_VALUE,
@@ -266,6 +267,15 @@ HERMES_NATIVE_CODING_AGENT = NativeCodingAgent(
     terminal_name="hermes",
 )
 
+COMMANDCODE_NATIVE_CODING_AGENT = NativeCodingAgent(
+    key="commandcode",
+    display_name="Command Code",
+    agent_name="commandcode-native-ui",
+    harness="commandcode-native",
+    wrapper_label=COMMANDCODE_NATIVE_WRAPPER_VALUE,
+    terminal_name="commandcode",
+)
+
 
 # Native harnesses whose spawn-env builder takes a ``bridge_id=`` resolved from
 # a session label. Their label key follows the uniform
@@ -324,6 +334,7 @@ _BUILTIN_NATIVE_PROVIDERS: tuple[NativeHarnessProvider, ...] = tuple(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
         DEVIN_NATIVE_CODING_AGENT,
+        COMMANDCODE_NATIVE_CODING_AGENT,
     )
 )
 
@@ -499,6 +510,26 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         fork_history=_FH.NONE,
         shell_tool_name="Bash",
         shell_tool_prompt=_BASH_PROMPT,
+        instruction_delivery=_ID.NOT_DELIVERED,
+    ),
+    # commandcode-native wraps the resident `cmd` TUI. Command Code has no
+    # PermissionRequest hook, so policy ASK is bridged through a generated
+    # per-session mod (onPermissionRequest) while PreToolUse covers DENY.
+    # streaming is declared True by convention pending a live bench run; the
+    # JSONL forwarder tails per-turn-committed entries.
+    "commandcode-native": _C(
+        _IM.NATIVE_TUI,
+        _EL.HOOK,
+        _RS.WARM_REATTACH,
+        _EF.NONE,
+        _MF.MULTI,
+        _AU.OWN_AUTH,
+        subagents=False,
+        interrupt=True,
+        streaming=True,
+        fork_history=_FH.NONE,
+        shell_tool_name="shell_command",
+        shell_tool_prompt=_SHELL_PROMPT,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
     # OpenCode 2.x: streaming is backed by session.text.delta /
@@ -773,6 +804,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "claude-sdk",
             "codex",
             "codex-native",
+            "commandcode-native",
             "copilot",
             "cursor",
             "cursor-native",
@@ -807,6 +839,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "claude-sdk": "omnigent.inner.claude_sdk_harness",
         "codex": "omnigent.inner.codex_harness",
         "codex-native": "omnigent.inner.codex_native_harness",
+        "commandcode-native": "omnigent.inner.commandcode_native_harness",
         "copilot": "omnigent.inner.copilot_harness",
         "cursor": "omnigent.inner.cursor_harness",
         "cursor-native": "omnigent.inner.cursor_native_harness",
@@ -829,6 +862,9 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "agy": "antigravity",
         "agy-native": "antigravity-native",
         "claude": "claude-sdk",
+        "cmd": "commandcode-native",
+        "cmdc": "commandcode-native",
+        "commandcode": "commandcode-native",
         # Both vendor spellings resolve to the native wrap, mirroring
         # ``opencode`` -> ``opencode-native``. ``devin-acp`` was the built-in ACP
         # row, removed in 0.14: keeping the id aliased is what stops a session,
@@ -844,6 +880,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         "kimi-code": "kimi",
         "native-agy": "antigravity-native",
         "native-antigravity": "antigravity-native",
+        "native-commandcode": "commandcode-native",
         "native-devin": "devin-native",
         "native-goose": "goose-native",
         "native-hermes": "hermes-native",
@@ -862,6 +899,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "antigravity-native",
             "claude-native",
             "codex-native",
+            "commandcode-native",
             "cursor-native",
             "devin-native",
             "goose-native",
@@ -872,6 +910,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
             "native-antigravity",
             "native-claude",
             "native-codex",
+            "native-commandcode",
             "native-cursor",
             "native-devin",
             "native-goose",
@@ -899,6 +938,7 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         KIMI_NATIVE_CODING_AGENT,
         HERMES_NATIVE_CODING_AGENT,
         DEVIN_NATIVE_CODING_AGENT,
+        COMMANDCODE_NATIVE_CODING_AGENT,
     ),
     native_providers=_BUILTIN_NATIVE_PROVIDERS,
     # Catalog rows gate readiness on their vendor binary; the install spec also
