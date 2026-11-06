@@ -2480,6 +2480,39 @@ async def test_list_sessions_includes_owner_for_own_session(
     )
 
 
+async def test_list_sessions_shared_with_others_is_owner_only(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """``shared_with_others`` tracks the owner's grants and is hidden from grantees."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "bryan"))["id"]
+
+    async def row_as(user: str) -> dict[str, Any]:
+        rows = await _list_sessions_as(auth_client, user)
+        return next(s for s in rows if s["id"] == session_id)
+
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+    resp = await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="corey", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    assert (await row_as("bryan"))["shared_with_others"] is True
+    # The grantee's row omits the flag, so it never reveals the owner's grant list.
+    assert "shared_with_others" not in await row_as("corey")
+
+    resp = await _revoke_permission(auth_client, session_id, revoker="bryan", target_user="corey")
+    assert resp.status_code in (200, 204)
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+    # Public-by-default deployments grant __public__ on create, so it alone doesn't count.
+    resp = await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="__public__", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+
 # ── session-create authorization ─────────────
 
 
