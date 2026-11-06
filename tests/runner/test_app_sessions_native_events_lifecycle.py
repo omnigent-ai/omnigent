@@ -6054,7 +6054,7 @@ async def test_events_codex_stop_fences_delayed_output_limit_before_native_wait(
             if method == "turn/start":
                 starts.append(params)
                 return {"result": {"turn": {"id": "unexpected_continuation"}}}
-            if blocked_stage == "rpc":
+            if blocked_stage == "rpc" and method == "turn/interrupt":
                 blocked.set()
                 await release.wait()
             return await super().request(method, params)
