@@ -125,6 +125,7 @@ export function CreateScheduledTaskDialog({
   initialTemplateId,
   sessionLink = "",
   editingTask = null,
+  onCreated,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -137,6 +138,8 @@ export function CreateScheduledTaskDialog({
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
   editingTask?: ScheduledTask | null;
+  /** Called once after a new automation is created (not after an edit). */
+  onCreated?: () => void;
 }) {
   const { data: agents } = useAvailableAgents({ enabled: open });
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
@@ -851,6 +854,7 @@ export function CreateScheduledTaskDialog({
             ? { permissionMode: effectivePermission }
             : {}),
         });
+        onCreated?.();
       }
       handleOpenChange(false);
     } catch (err) {

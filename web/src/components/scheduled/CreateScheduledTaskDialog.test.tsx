@@ -312,6 +312,69 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
   } satisfies ScheduledTasksApiModule.ScheduledTask;
 }
 
+describe("onCreated", () => {
+  function fillRequiredFields() {
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "Morning review" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
+      target: { value: "Review pull requests" },
+    });
+  }
+
+  it("is called once, only after the create completes", async () => {
+    const onCreated = vi.fn();
+    const onOpenChange = vi.fn();
+    let finishCreate: (value: unknown) => void = () => {};
+    mutateAsync.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
+    render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, {
+      expandAdvanced: false,
+    });
+    fillRequiredFields();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(onOpenChange).not.toHaveBeenCalledWith(false);
+
+    finishCreate({ id: "st_new" });
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("is not called when the create is rejected", async () => {
+    const onCreated = vi.fn();
+    mutateAsync.mockRejectedValueOnce(new Error("create failed"));
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} onCreated={onCreated} />, {
+      expandAdvanced: false,
+    });
+    fillRequiredFields();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    expect(await screen.findByText("create failed")).toBeVisible();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it("is not called after an edit", async () => {
+    const onCreated = vi.fn();
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        onCreated={onCreated}
+        editingTask={scheduledTask()}
+      />,
+    );
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "Renamed" } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+});
+
 describe("prompt-first automation setup", () => {
   it("keeps Name visible and required while Advanced is collapsed", async () => {
     render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} />, { expandAdvanced: false });
