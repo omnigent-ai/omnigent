@@ -1,6 +1,6 @@
-// ⌘[ / ⌘] (Ctrl+[ / Ctrl+] on Win/Linux), the desktop Go menu, trackpad swipes,
-// and the mouse back/forward buttons step back and forward through in-app
-// navigation history. Bind ONCE.
+// In the desktop app, ⌘[ / ⌘] (Ctrl+[ / Ctrl+] on Win/Linux), the Go menu, trackpad
+// swipes, and the mouse back/forward buttons step back and forward through in-app
+// navigation history. A browser tab keeps the browser's own Back and Forward. Bind ONCE.
 
 import { useCallback, useEffect, useState } from "react";
 
@@ -53,19 +53,19 @@ export function useHistoryNavigation(isMac = isMacPlatform()): void {
       go(delta);
     };
     // Chromium already maps the mouse back/forward buttons to history; taking them here
-    // also stops them at the first in-app entry. Browser tabs keep the browser's handling.
+    // also stops them at the first in-app entry.
     const onMouseUp = (event: MouseEvent) => {
       const delta = event.button === 3 ? -1 : event.button === 4 ? 1 : 0;
       if (delta === 0) return;
       event.preventDefault();
       go(delta);
     };
-    const electron = isElectronShell();
+    if (!isElectronShell()) return;
     window.addEventListener("keydown", onKeyDown);
-    if (electron) window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mouseup", onMouseUp);
     return () => {
       window.removeEventListener("keydown", onKeyDown);
-      if (electron) window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mouseup", onMouseUp);
     };
   }, [go, isMac]);
 
