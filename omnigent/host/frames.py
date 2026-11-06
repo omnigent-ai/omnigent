@@ -89,6 +89,8 @@ CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 # The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
 CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
+# The host answers ``host.clone_repository`` by cloning a git URL onto its disk:
+CAP_CLONE_REPOSITORY = "clone_repository"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -106,6 +108,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
+    CAP_CLONE_REPOSITORY,
 ]
 
 # Server capabilities, advertised on the tunnel's WebSocket upgrade response (the
@@ -235,6 +238,8 @@ class HostFrameKind(str, Enum):
     LIST_WORKTREES_RESULT = "host.list_worktrees_result"
     CREATE_DIR = "host.create_dir"
     CREATE_DIR_RESULT = "host.create_dir_result"
+    CLONE_REPOSITORY = "host.clone_repository"
+    CLONE_REPOSITORY_RESULT = "host.clone_repository_result"
     INSTALL_HARNESS = "host.install_harness"
     INSTALL_HARNESS_RESULT = "host.install_harness_result"
     REFRESH_HARNESSES = "host.refresh_harnesses"
@@ -865,6 +870,54 @@ class HostCreateDirResultFrame:
     request_id: str
     status: str
     path: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostCloneRepositoryFrame:
+    """Server → host: clone a git repository into a directory on the host.
+
+    Backs ``POST /v1/hosts/{id}/repositories``, used by the Web UI so a user
+    can start work in a repository they have not checked out yet. The host
+    runs ``git clone`` with its own credentials and owns ``~`` resolution.
+
+    :param request_id: Correlates the result, e.g. ``"req_clone_1"``.
+    :param url: Validated ``https://`` or ``git@`` clone URL, e.g.
+        ``"https://github.com/org/repo"``.
+    :param parent_directory: Absolute or tilde-prefixed directory that will
+        hold the checkout, e.g. ``"~/code"``. Created when missing.
+    :param directory_name: Single path segment for the checkout, e.g.
+        ``"repo"``.
+    :param timeout_s: Seconds the host may spend on the clone, e.g.
+        ``1800.0``.
+    """
+
+    request_id: str
+    url: str
+    parent_directory: str
+    directory_name: str
+    timeout_s: float
+
+
+@dataclass
+class HostCloneRepositoryResultFrame:
+    """Host → server: outcome of a clone-repository request.
+
+    :param request_id: Correlates to the :class:`HostCloneRepositoryFrame`.
+    :param status: ``"ok"``, ``"conflict"`` when the destination is taken
+        (another folder is already there, or a clone into it is running), or
+        ``"failed"`` when git could not clone (bad URL, no access, timeout).
+    :param path: Absolute checkout path, e.g. ``"/Users/me/code/repo"``.
+        ``None`` when nothing usable is at the destination.
+    :param reused_existing: ``True`` when the destination already held a
+        checkout of the same remote and was returned instead of cloning.
+    :param error: Failure reason, e.g. ``"repository not found"``.
+    """
+
+    request_id: str
+    status: str
+    path: str | None = None
+    reused_existing: bool = False
     error: str | None = None
 
 
@@ -1537,6 +1590,8 @@ HostFrame = (
     | HostListWorktreesResultFrame
     | HostCreateDirFrame
     | HostCreateDirResultFrame
+    | HostCloneRepositoryFrame
+    | HostCloneRepositoryResultFrame
     | HostInstallHarnessFrame
     | HostInstallHarnessResultFrame
     | HostRefreshHarnessesFrame
@@ -1848,6 +1903,28 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "request_id": frame.request_id,
                 "status": frame.status,
                 "path": frame.path,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY.value,
+                "request_id": frame.request_id,
+                "url": frame.url,
+                "parent_directory": frame.parent_directory,
+                "directory_name": frame.directory_name,
+                "timeout_s": frame.timeout_s,
+            }
+        )
+    if isinstance(frame, HostCloneRepositoryResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.CLONE_REPOSITORY_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "path": frame.path,
+                "reused_existing": frame.reused_existing,
                 "error": frame.error,
             }
         )
@@ -2518,6 +2595,10 @@ def _decode_known_host_frame(
             return _decode_create_dir(msg)
         case HostFrameKind.CREATE_DIR_RESULT:
             return _decode_create_dir_result(msg)
+        case HostFrameKind.CLONE_REPOSITORY:
+            return _decode_clone_repository(msg)
+        case HostFrameKind.CLONE_REPOSITORY_RESULT:
+            return _decode_clone_repository_result(msg)
         case HostFrameKind.INSTALL_HARNESS:
             return _decode_install_harness(msg)
         case HostFrameKind.INSTALL_HARNESS_RESULT:
@@ -3059,6 +3140,40 @@ def _decode_create_dir_result(msg: _JsonObject) -> HostCreateDirResultFrame:
         request_id=_required_str(msg, "request_id"),
         status=_required_str(msg, "status"),
         path=_optional_nullable_str(msg, "path"),
+        error=_optional_nullable_str(msg, "error"),
+    )
+
+
+def _decode_clone_repository(msg: _JsonObject) -> HostCloneRepositoryFrame:
+    """Decode a host.clone_repository request frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository frame.
+    :raises ValueError: When ``timeout_s`` is missing or not positive.
+    """
+    timeout_s = _optional_positive_float(msg, "timeout_s")
+    if timeout_s is None:
+        raise ValueError("host.clone_repository frame requires a positive timeout_s")
+    return HostCloneRepositoryFrame(
+        request_id=_required_str(msg, "request_id"),
+        url=_required_str(msg, "url"),
+        parent_directory=_required_str(msg, "parent_directory"),
+        directory_name=_required_str(msg, "directory_name"),
+        timeout_s=timeout_s,
+    )
+
+
+def _decode_clone_repository_result(msg: _JsonObject) -> HostCloneRepositoryResultFrame:
+    """Decode a host.clone_repository_result frame.
+
+    :param msg: Decoded frame object.
+    :returns: Typed host.clone_repository_result frame.
+    """
+    return HostCloneRepositoryResultFrame(
+        request_id=_required_str(msg, "request_id"),
+        status=_required_str(msg, "status"),
+        path=_optional_nullable_str(msg, "path"),
+        reused_existing=_optional_bool(msg, "reused_existing"),
         error=_optional_nullable_str(msg, "error"),
     )
 

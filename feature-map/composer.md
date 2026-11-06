@@ -172,6 +172,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   of "No skills available".
 - `new-command`: `/new` opens a blank new-session composer in the same project;
   working-directory selection follows the project's defaults, not the old session.
+- `clone-repository`: the new-session working-directory menu's **Clone
+  repository…** clones an https:// or git@ URL onto the selected connected host
+  with that host's own git credentials, into `~` or a chosen folder, then uses
+  the clone as the working directory. Git never prompts; failures, an occupied
+  destination, or a host too old to clone show in the dialog. Retrying the same
+  URL reuses an existing checkout of it. Sandbox hosts keep their own repo field.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
 - `dictation`: the microphone button beside the message box dictates speech
@@ -329,6 +335,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   e.g. an Arclet whose owner's dbcert hasn't arrived. The session's chat
   transcript keeps showing **Provisioning sandbox…** and adds a yellow banner
   saying what to do. The terminal view doesn't show it.
+- With a connected (non-sandbox) host selected, open the working-directory chip
+  → **Clone repository…**, enter an https:// or git@ URL, adjust the folder if
+  needed, and click **Clone**. The chip switches to the new checkout. The item is
+  absent on a server without the clone route.
 - Open the host chip, expand **Offline hosts (N)**, then **Show more**. Check the
   same menu on mobile and with a managed sandbox available. Offline rows remain
   disabled; a remembered offline selection still requires an explicit switch.
@@ -468,6 +478,12 @@ Other connection providers alone do not enable the managed MCP picker.
   covers the connected-host and managed-sandbox variants with stubbed host responses.
   Repeat at a phone viewport; desktop reconnect exceptions also have component
   coverage in `web/src/shell/NewChatDialog.test.tsx`.
+- **`clone-repository`:**
+  `tests/e2e_ui/start_session/test_clone_repository.py::test_clone_repository_from_composer_workspace_menu`
+  starts its own `omnigent host`, whose git `insteadOf` rewrite maps
+  `https://git.example.test/` to local bare repositories, so no forge is needed.
+  By hand, clone a small repository the host can reach and expect the chip to show
+  its name. Error and older-server states: `web/src/shell/CloneRepository.test.tsx`.
 - **`pill-tooltip`, `pill-tooltip-suppressed`, in-session:**
   `tests/browser_ui/chat/test_composer_tooltips.py::test_pill_uses_one_tooltip_and_suppresses_it_while_picker_is_open`
   (runs with zero and one turn).

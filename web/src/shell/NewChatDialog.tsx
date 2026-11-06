@@ -190,6 +190,7 @@ import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerH
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
 import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+import { CloneRepositoryDialog } from "./CloneRepository";
 import { RecentWorkspaceList } from "./RecentWorkspaceList";
 import {
   WORKTREE_RADIO_SELECTOR_INPUT_CLASS,
@@ -2454,6 +2455,7 @@ export function NewChatLandingScreen() {
   // fails closed (option hidden) until the boot probe resolves.
   const profilesEnabled = sandboxProfilesEnabled(info);
   const managedSandboxesEnabled = info !== "loading" && info.managed_sandboxes_enabled;
+  const hostRepositoryCloneSupported = info !== "loading" && info.host_repository_clone === true;
   const mcpRegistryEnabled = info !== "loading" && !!info.enabled_connections?.includes("mcp");
   const {
     selected: mcpRegistryServices,
@@ -2720,6 +2722,11 @@ export function NewChatLandingScreen() {
   // Controls the working-directory popover so picking a directory closes it.
   const [workspacePopoverOpen, setWorkspacePopoverOpen] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [cloneRepositoryOpen, setCloneRepositoryOpen] = useState(false);
+  // Bumped when the composer switches project, so a clone started for the old
+  // project can't replace the new one's workspace when it finishes.
+  const [cloneTarget, setCloneTarget] = useState(0);
+  const cloneTargetRef = useRef(0);
   const [workspacePickerInitialPath, setWorkspacePickerInitialPath] = useState<string | undefined>(
     undefined,
   );
@@ -2930,6 +2937,9 @@ export function NewChatLandingScreen() {
     // would clone the previous project's repo into this project's sandbox.
     setSandboxRepoSelections([]);
     setPendingRepoUrl("");
+    cloneTargetRef.current += 1;
+    setCloneTarget(cloneTargetRef.current);
+    setCloneRepositoryOpen(false);
     agentFromConfigRef.current = false;
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
@@ -6639,6 +6649,27 @@ export function NewChatLandingScreen() {
                   Open folder
                 </button>
               </MenuItem>
+              {hostRepositoryCloneSupported && (
+                <MenuItem
+                  asChild
+                  density="compact"
+                  className="max-md:hover:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-2 max-md:focus-visible:ring-ring/50"
+                >
+                  <button
+                    type="button"
+                    className="w-full text-left"
+                    disabled={selectedHostId === null || selectedHost?.status !== "online"}
+                    onClick={() => {
+                      setWorkspacePopoverOpen(false);
+                      setCloneRepositoryOpen(true);
+                    }}
+                    data-testid="new-chat-landing-workspace-clone-repository"
+                  >
+                    <FolderGit2Icon className="size-4 shrink-0 text-muted-foreground" />
+                    Clone repository…
+                  </button>
+                </MenuItem>
+              )}
             </PopoverContent>
           </Popover>
           {/* Worktree selection stays a separate real action from the directory picker. */}
@@ -7559,6 +7590,18 @@ export function NewChatLandingScreen() {
                     occupancyByDir.get(normalizeWorkspacePath(absolutePath) ?? "") ?? 0
                 : undefined
             }
+          />
+          <CloneRepositoryDialog
+            key={cloneTarget}
+            open={cloneRepositoryOpen}
+            onOpenChange={setCloneRepositoryOpen}
+            hostId={selectedHostId}
+            onCloned={({ path }) => {
+              if (cloneTargetRef.current !== cloneTarget) return;
+              workspaceFromConfigRef.current = false;
+              setWorkspace(path);
+              addRecent(path);
+            }}
           />
         </fieldset>
         <div

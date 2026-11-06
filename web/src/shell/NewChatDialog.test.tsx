@@ -132,6 +132,7 @@ import {
 import { installAgentBundle } from "@/lib/agentsApi";
 import { useHostFilesystem, type HostFilesystemEntry } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
+import type * as CloneHostRepositoryModule from "@/hooks/useCloneHostRepository";
 import type * as HostWorktreesModule from "@/hooks/useHostWorktrees";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
@@ -281,6 +282,24 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
   // WorkspacePicker (rendered by the file browser) reads this on mount;
   // an idle mutation keeps it inert for these tests.
   useCreateHostDirectory: vi.fn(() => ({ mutateAsync: vi.fn(), isPending: false })),
+}));
+const cloneHostRepositoryMock = vi.hoisted(() => vi.fn());
+vi.mock("@/hooks/useCloneHostRepository", async (importOriginal) => ({
+  ...(await importOriginal<typeof CloneHostRepositoryModule>()),
+  useCloneHostRepository: () => ({
+    mutate: (
+      variables: { hostId: string; url: string; parentDirectory: string },
+      options?: { onSuccess?: (clone: unknown) => void },
+    ) => {
+      const clone = cloneHostRepositoryMock(variables);
+      if (clone instanceof Promise) void clone.then((done) => options?.onSuccess?.(done));
+      else options?.onSuccess?.(clone);
+    },
+    reset: () => {},
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
@@ -1380,6 +1399,9 @@ function LandingNavigationProbe() {
       </button>
       <button type="button" onClick={() => navigate("?prompt=Another+request")}>
         Open another prompt link
+      </button>
+      <button type="button" onClick={() => navigate("?project=Beta")}>
+        Open project Beta
       </button>
     </>
   );
@@ -5533,6 +5555,81 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
     expect(screen.queryByTestId("workspace-picker")).toBeNull();
     expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/repo");
+  });
+
+  it("uses a repository cloned from the working-directory menu as the workspace", () => {
+    cloneHostRepositoryMock.mockReturnValue({
+      path: "/Users/corey/code/widgets",
+      name: "widgets",
+      reusedExisting: false,
+    });
+    renderLanding({ host_repository_clone: true });
+
+    const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    fireEvent.click(workspace);
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-clone-repository"));
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "https://github.com/acme/widgets" },
+    });
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "/Users/corey/code" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+
+    expect(cloneHostRepositoryMock).toHaveBeenCalledWith({
+      hostId: "host_1",
+      url: "https://github.com/acme/widgets",
+      parentDirectory: "/Users/corey/code",
+    });
+    expect(workspace).toHaveAccessibleName("Working directory: /Users/corey/code/widgets");
+    expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1).toContain(
+      "/Users/corey/code/widgets",
+    );
+  });
+
+  it("drops a clone that finishes after the composer switched project", async () => {
+    let finishClone: (clone: unknown) => void = () => {};
+    cloneHostRepositoryMock.mockReturnValue(
+      new Promise((resolve) => {
+        finishClone = resolve;
+      }),
+    );
+    renderLanding({ host_repository_clone: true });
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-clone-repository"));
+    fireEvent.change(screen.getByTestId("clone-repository-url"), {
+      target: { value: "https://github.com/acme/widgets" },
+    });
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "/Users/corey/code" },
+    });
+    fireEvent.click(screen.getByTestId("clone-repository-confirm"));
+    fireEvent.click(screen.getByText("Open project Beta"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("clone-repository-dialog")).not.toBeInTheDocument(),
+    );
+    await act(async () => {
+      finishClone({ path: "/Users/corey/code/widgets", name: "widgets", reusedExisting: false });
+    });
+
+    expect(screen.getByTestId("new-chat-landing-workspace-chip")).not.toHaveAccessibleName(
+      "Working directory: /Users/corey/code/widgets",
+    );
+    expect(JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}").host_1 ?? []).not.toContain(
+      "/Users/corey/code/widgets",
+    );
+  });
+
+  it("hides Clone repository on a server without the clone route", () => {
+    renderLanding();
+
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+
+    expect(screen.getByTestId("new-chat-landing-workspace-open-folder")).toBeInTheDocument();
+    expect(
+      screen.queryByTestId("new-chat-landing-workspace-clone-repository"),
+    ).not.toBeInTheDocument();
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {

@@ -47,6 +47,8 @@ from omnigent.host.frames import (
     SERVER_CAP_TMUX_READINESS,
     SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -99,6 +101,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
 )
+from omnigent.host.git_clone import ClonedRepository, CloneError
 from omnigent.host.git_worktree import CreatedWorktree
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
@@ -5539,6 +5542,72 @@ def test_handle_list_dir_pagination_last_page_has_more_false(
     assert result.status == "ok"
     assert len(result.entries) == 2
     assert result.has_more is False
+
+
+# ── host.clone_repository handler ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (
+            ClonedRepository(path="/work/widgets", reused_existing=True),
+            {"status": "ok", "path": "/work/widgets", "reused_existing": True, "error": None},
+        ),
+        (
+            CloneError("/work/widgets already exists", conflict=True),
+            {"status": "conflict", "path": None, "error": "/work/widgets already exists"},
+        ),
+        (
+            CloneError("fatal: repository not found"),
+            {"status": "failed", "path": None, "error": "fatal: repository not found"},
+        ),
+        (
+            RuntimeError("boom"),
+            {
+                "status": "failed",
+                "path": None,
+                "error": "the clone crashed on the host (RuntimeError)",
+            },
+        ),
+    ],
+)
+def test_handle_clone_repository_answers_every_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: ClonedRepository | Exception,
+    expected: dict[str, object],
+) -> None:
+    """Each clone outcome becomes a result frame, so the server never waits out its bound."""
+    calls: list[dict[str, object]] = []
+
+    def _clone(**kwargs: object) -> ClonedRepository:
+        calls.append(kwargs)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr("omnigent.host.connect.clone_repository", _clone)
+    frame = HostCloneRepositoryFrame(
+        request_id="c1",
+        url="https://github.com/acme/widgets",
+        parent_directory="/work",
+        directory_name="widgets",
+        timeout_s=42.0,
+    )
+
+    result = _make_host_process()._handle_clone_repository(frame)
+
+    assert isinstance(result, HostCloneRepositoryResultFrame)
+    assert result.request_id == "c1"
+    assert {key: getattr(result, key) for key in expected} == expected
+    assert calls == [
+        {
+            "url": "https://github.com/acme/widgets",
+            "parent_directory": "/work",
+            "directory_name": "widgets",
+            "timeout_s": 42.0,
+        }
+    ]
 
 
 # ── host.create_dir handler ─────────────────────────────

@@ -225,6 +225,11 @@ export interface ServerInfo {
    * hidden there. Fails to ``false``.
    */
   archive_worktree_cleanup?: boolean;
+  /**
+   * True when ``POST /v1/hosts/{id}/repositories`` exists, so the composer and
+   * New project dialog offer cloning a repository. Fails to ``false``.
+   */
+  host_repository_clone?: boolean;
   /** True when scheduled tasks accept the optional random-worktree base ref. */
   scheduled_task_worktrees?: boolean;
   /**
@@ -420,6 +425,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   scheduled_task_worktrees: false,
   archive_worktree_cleanup: false,
+  host_repository_clone: false,
   session_search_scope: false,
   scheduled_task_session_modes: false,
   scheduled_task_subhour: false,
@@ -581,6 +587,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           scheduled_task_worktrees: data.scheduled_task_worktrees === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          host_repository_clone: data.host_repository_clone === true,
           session_search_scope: data.session_search_scope === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           scheduled_task_subhour: data.scheduled_task_subhour === true,

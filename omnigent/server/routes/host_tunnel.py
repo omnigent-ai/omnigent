@@ -39,6 +39,7 @@ from omnigent.host.frames import (
     IMPORT_SESSION_MAX_CONNECTION_REASSEMBLED_CHARS,
     SERVER_CAPABILITIES,
     SERVER_CAPABILITIES_HEADER,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirResultFrame,
     HostCreateWorktreeResultFrame,
@@ -1040,6 +1041,19 @@ async def _receive_loop(
                     {
                         "status": frame.status,
                         "path": frame.path,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostCloneRepositoryResultFrame):
+            clone_future = conn.pending_repository_clones.pop(frame.request_id, None)
+            if clone_future is not None and not clone_future.done():
+                clone_future.set_result(
+                    {
+                        "status": frame.status,
+                        "path": frame.path,
+                        "reused_existing": frame.reused_existing,
                         "error": frame.error,
                     }
                 )

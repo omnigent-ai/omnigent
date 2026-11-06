@@ -1261,6 +1261,27 @@
         "title": "ClientTaskCancelEvent",
         "type": "object"
       },
+      "CloneRepositoryRequest": {
+        "description": "Request body for `POST /v1/hosts/{host_id}/repositories`.",
+        "properties": {
+          "parent_directory": {
+            "description": "Absolute or tilde-prefixed folder on the host that will hold the checkout, e.g. `\"~/code\"`. Created when missing. The checkout lands in `<parent_directory>/<repository name>`.",
+            "title": "Parent Directory",
+            "type": "string"
+          },
+          "url": {
+            "description": "Repository to clone, `https://<host>/<path>` or `git@<host>:<path>`, e.g. `\"git@github.com:org/repo.git\"`.",
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url",
+          "parent_directory"
+        ],
+        "title": "CloneRepositoryRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -6171,6 +6192,11 @@
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
+            "type": "boolean"
+          },
+          "host_repository_clone": {
+            "default": true,
+            "title": "Host Repository Clone",
             "type": "boolean"
           },
           "installable_harnesses": {
@@ -13291,6 +13317,62 @@
           }
         },
         "summary": "Get Plugins",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/repositories": {
+      "post": {
+        "description": "Clone a git repository onto a host.\n\nBacks the Web UI's \"Clone repository\" actions so a user can start work\nin a repository they have not checked out yet. The host runs\n`git clone` with its own credentials into\n`<parent_directory>/<repository name>`. Owner-scoped like the other\nfilesystem routes; the workspace-boundary check still runs when a\nsession is created in the checkout.\n\n**Parameters**\n\n- `body` \u2014 The repository URL and the destination parent folder.\n\n**Returns:** `{\"object\": \"repository_clone\", \"path\": str, \"name\": str, \"reused_existing\": bool}`. `reused_existing` is `True` when the destination already held a checkout of the same remote.\n\n**Raises**\n\n- `HTTPException` \u2014 400 on an invalid URL or path, 404 if the host is not found, 403 if not owned by the caller, 409 if the host is offline, too old to clone, or the destination is taken, 422 when git cannot clone, 502 on host I/O failure, 504 on host timeout.",
+        "operationId": "clone_host_repository_v1_hosts__host_id__repositories_post",
+        "parameters": [
+          {
+            "description": "Host identifier, e.g. `\"host_a1b2c3d4...\"`.",
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CloneRepositoryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Host Repository V1 Hosts  Host Id  Repositories Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Host Repository",
         "tags": [
           "hosts"
         ]

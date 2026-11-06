@@ -14,6 +14,8 @@ from omnigent.host.frames import (
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
     SERVER_CAP_TMUX_READINESS,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostCloneRepositoryFrame,
+    HostCloneRepositoryResultFrame,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
     HostCreateDirResultFrame,
@@ -2342,6 +2344,46 @@ def test_create_dir_result_error_round_trip() -> None:
     assert decoded.status == "ok"
     assert decoded.path is None
     assert decoded.error == "directory already exists"
+
+
+# ── host.clone_repository frames ────────────────────────
+
+
+def test_clone_repository_frames_round_trip() -> None:
+    """The clone request and both result shapes survive encode → decode."""
+    request = HostCloneRepositoryFrame(
+        request_id="req_clone_1",
+        url="git@github.com:acme/widgets.git",
+        parent_directory="~/code",
+        directory_name="widgets",
+        timeout_s=1800.0,
+    )
+    success = HostCloneRepositoryResultFrame(
+        request_id="req_clone_1", status="ok", path="/home/me/code/widgets", reused_existing=True
+    )
+    conflict = HostCloneRepositoryResultFrame(
+        request_id="req_clone_2", status="conflict", error="/work/widgets already exists"
+    )
+
+    for frame in (request, success, conflict):
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize("timeout_s", [None, 0, -5, "soon"])
+def test_clone_repository_frame_requires_positive_timeout(timeout_s: object) -> None:
+    """A clone frame without a usable budget is rejected rather than unbounded."""
+    payload = {
+        "kind": "host.clone_repository",
+        "request_id": "r",
+        "url": "https://github.com/acme/widgets",
+        "parent_directory": "/work",
+        "directory_name": "widgets",
+    }
+    if timeout_s is not None:
+        payload["timeout_s"] = timeout_s
+
+    with pytest.raises(ValueError):
+        decode_host_frame(json.dumps(payload))
 
 
 def test_install_harness_frame_round_trip() -> None:
