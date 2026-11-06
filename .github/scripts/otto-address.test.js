@@ -2,9 +2,10 @@ const assert = require("node:assert/strict");
 const { test } = require("node:test");
 const authorize = require("./otto-address.js");
 
-async function run({ comment = {}, pull = {}, files = {}, apiFailure = false, reviewers = "Reader,second-reader\nthird-reader" } = {}) {
+async function run({ comment = {}, pull = {}, maintainers = "maintainer\n", apiFailure = false, reviewers = "Reader,second-reader\nthird-reader" } = {}) {
   const outputs = {};
   const calls = [];
+  let pullReads = 0;
   await authorize({
     reviewers,
     context: {
@@ -19,20 +20,23 @@ async function run({ comment = {}, pull = {}, files = {}, apiFailure = false, re
         created_at: "2026-11-06T01:00:00Z", updated_at: "2026-11-06T01:00:00Z",
         ...comment,
       } }) },
-      pulls: { get: async () => ({ data: {
-        state: "open", draft: false, user: { login: "omni-resolve-agent[bot]", type: "Bot" },
-        head: { repo: { full_name: "omnigent-ai/omnigent" }, ref: "resolve-agent/fix" },
-        base: { ref: "main" }, ...pull,
-      } }) },
+      pulls: { get: async () => {
+        pullReads += 1;
+        return { data: {
+          state: "open", draft: false, user: { login: "omni-resolve-agent[bot]", type: "Bot" },
+          head: { repo: { full_name: "omnigent-ai/omnigent" }, ref: "resolve-agent/fix" },
+          base: { ref: "main" }, ...pull,
+        } };
+      } },
       repos: { getContent: async ({ path, ref }) => {
         calls.push({ path, ref });
         if (apiFailure) throw new Error("API unavailable");
         assert.equal(path, ".github/MAINTAINER");
-        return { data: { content: Buffer.from(files[path] ?? "maintainer\n").toString("base64") } };
+        return { data: { content: Buffer.from(maintainers).toString("base64") } };
       } },
     } },
   });
-  return { outputs, calls };
+  return { outputs, calls, pullReads };
 }
 
 test("allows an explicitly listed reader without consulting repository Write permissions", async () => {
@@ -48,7 +52,7 @@ test("maintainers do not need a duplicate allowlist entry", async () => {
 });
 
 test("an unset variable does not authorize contributors", async () => {
-  assert.match((await run({ reviewers: "" })).outputs.reason, /OTTO_ADDRESS_REVIEWERS/);
+  assert.deepEqual((await run({ reviewers: "" })).outputs, {});
 });
 
 for (const login of ["second-reader", "third-reader"]) {
@@ -59,10 +63,8 @@ for (const login of ["second-reader", "third-reader"]) {
 
 for (const comment of [
   { body: "/address anything" }, { body: "quoted /address" },
-  { user: { login: "outsider", type: "User" } },
   { user: { login: "reader", type: "Bot" } },
   { issue_url: "https://api.github.com/repos/omnigent-ai/omnigent/issues/8" },
-  { updated_at: "2026-11-06T02:00:00Z" },
 ]) {
   test(`rejects unsupported or unauthorized command ${JSON.stringify(comment)}`, async () => {
     assert.equal((await run({ comment })).outputs.authorized, undefined);
@@ -86,11 +88,34 @@ test("authorization fails closed when the trusted configuration cannot be read",
   await assert.rejects(run({ apiFailure: true }), /API unavailable/);
 });
 
-for (const [comment, reason] of [
-  [{ user: { login: "outsider", type: "User" } }, /OTTO_ADDRESS_REVIEWERS/],
-  [{ updated_at: "2026-11-06T02:00:00Z" }, /Edited commands/],
+test("explains an authorized user's edited command without authorizing dispatch", async () => {
+  const { outputs } = await run({ comment: { updated_at: "2026-11-06T02:00:00Z" } });
+  assert.equal(outputs.authorized, undefined);
+  assert.match(outputs.reason, /Edited commands/);
+});
+
+for (const scenario of [
+  {},
+  { pull: { state: "closed" } },
+  { comment: { updated_at: "2026-11-06T02:00:00Z" } },
 ]) {
-  test(`explains rejection: ${reason}`, async () => {
-    assert.match((await run({ comment })).outputs.reason, reason);
+  test(`unlisted callers cannot cause public replies: ${JSON.stringify(scenario)}`, async () => {
+    const { outputs, pullReads } = await run({
+      ...scenario,
+      comment: { ...scenario.comment, user: { login: "outsider", type: "User" } },
+    });
+    assert.deepEqual(outputs, {});
+    assert.equal(pullReads, 0);
+  });
+}
+
+for (const [login, permitted] of [["maintainer", true], ["inline-comment", false], ["header", false]]) {
+  test(`parses maintainer comments and CRLF: ${login}`, async () => {
+    const { outputs } = await run({
+      reviewers: "",
+      maintainers: "# header\r\n\r\n  Maintainer  # inline-comment\r\n",
+      comment: { user: { login, type: "User" } },
+    });
+    assert.equal(outputs.authorized, permitted ? "true" : undefined);
   });
 }

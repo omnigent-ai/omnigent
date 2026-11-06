@@ -108,12 +108,13 @@ def test_address_requires_current_maintainer_approval_even_for_trusted_author():
 def test_address_contributor_cannot_supply_merge_approval():
     approval = review("APPROVED", "new")
     approval["user"] = {"login": "feedback-contributor"}
-    assert not decide(
-        author="omni-resolve-agent[bot]",
-        reviews=[approval],
-        commits=[commit("new")],
-        require_current_head=True,
-    ).approved
+    arguments = {
+        "author": "omni-resolve-agent[bot]",
+        "reviews": [approval],
+        "commits": [commit("new")],
+    }
+    assert decide(**arguments).approved
+    assert not decide(**arguments, require_current_head=True).approved
 
 
 def test_approval_survives_trusted_same_repo_successor_commits():

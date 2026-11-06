@@ -86,7 +86,10 @@ def approval_decision(
         if review_state == "APPROVED" and approved_sha == head_sha:
             return ApprovalDecision(True, f"Current head approved by maintainer @{login}.")
         if require_current_head:
-            failures.append(f"@{login}'s approval does not cover the current /address fixes")
+            failures.append(
+                f"@{login} has no active approval of {head_sha[:9]}; "
+                "otto-address PRs require current-head maintainer approval"
+            )
             continue
         # Only the contributor can push a fork head, so nothing there is
         # attributable to trusted automation.
