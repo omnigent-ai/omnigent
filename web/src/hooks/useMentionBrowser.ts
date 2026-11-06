@@ -136,7 +136,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     }
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
     // highlighted row as a unit — whole folder or file — without drilling.
-    if (e.key === "Enter" && !e.shiftKey && !e.altKey && !isMobile && active) {
+    if (e.key === "Enter" && !e.shiftKey && !isMobile && active) {
       e.preventDefault();
       if (active.type === "directory") openMentionDir(active.path);
       else attachMention(active.path, false);

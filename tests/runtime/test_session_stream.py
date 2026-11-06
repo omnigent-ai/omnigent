@@ -1178,6 +1178,106 @@ def test_log_sse_event_noop_when_sink_disabled(monkeypatch: pytest.MonkeyPatch) 
     assert records == []
 
 
+@pytest.mark.parametrize("event_type", ["session.usage", "response.completed"])
+def test_usage_reaches_debug_log_rows(monkeypatch: pytest.MonkeyPatch, event_type: str) -> None:
+    from omnigent.debug_logging import current_user_id_scope, record_to_row
+
+    monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "total_tokens": 135,
+        "cache_read_input_tokens": 10,
+        "cache_creation_input_tokens": 5,
+        "cost_usd": 0.25,
+        "prompt": "private prompt",
+    }
+    if event_type == "session.usage":
+        event = {
+            "type": event_type,
+            "usage_by_model": {
+                "private model name": usage,
+                "second": {
+                    "input_tokens": 50,
+                    "output_tokens": 10,
+                    "total_tokens": 60,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                },
+            },
+            "total_cost_usd": 0.5,
+        }
+    else:
+        event = {
+            "type": event_type,
+            "response": {"id": "response_1", "usage": usage, "output": "private output"},
+        }
+    with current_user_id_scope("owner@example.com"), _capturing_sse_logger() as records:
+        session_stream.publish("automation_session", event)
+        row = record_to_row(records[0], "server")
+
+    assert row["session_id"] == "automation_session"
+    assert row["user_id"] == "owner@example.com"
+    assert row["event_name"] == event_type
+    attrs = row["attributes"]
+    assert attrs["input_tokens"] == ("150" if event_type == "session.usage" else "100")
+    assert attrs["output_tokens"] == ("30" if event_type == "session.usage" else "20")
+    assert attrs["total_tokens"] == ("195" if event_type == "session.usage" else "135")
+    assert attrs["cache_read_input_tokens"] == "10"
+    assert attrs["cache_creation_input_tokens"] == "5"
+    if event_type == "session.usage":
+        assert attrs["usage_kind"] == "cumulative"
+        assert attrs["usage_scope"] == "session_subtree"
+        assert attrs["total_cost_usd"] == "0.5"
+        assert "cost_usd" not in attrs
+    else:
+        assert attrs["usage_kind"] == "delta"
+        assert attrs["usage_scope"] == "response"
+        assert attrs["cost_usd"] == "0.25"
+    assert "private" not in repr(row)
+
+
+@pytest.mark.parametrize(
+    "value", [None, -1, True, "private text", {}, [], float("nan"), float("inf")]
+)
+def test_sse_usage_omits_invalid_numbers(value: object) -> None:
+    usage = {"input_tokens": value, "cost_usd": value}
+    for event in (
+        {"type": "response.completed", "response": {"usage": usage}},
+        {"type": "session.usage", "usage_by_model": {"model": usage}},
+    ):
+        assert session_stream._sse_safe_attributes(event) == {}
+
+
+def test_sse_usage_keeps_missing_counts_unknown_and_ignores_other_events() -> None:
+    assert session_stream._sse_safe_attributes(
+        {"type": "session.usage", "context_tokens": 2000, "total_cost_usd": 0.25}
+    ) == {
+        "context_tokens": 2000,
+        "total_cost_usd": 0.25,
+        "usage_kind": "cumulative",
+        "usage_scope": "session_subtree",
+    }
+    for event_type in ("response.in_progress", "response.failed", "response.output_item.done"):
+        assert (
+            session_stream._sse_safe_attributes(
+                {"type": event_type, "response": {"usage": {"input_tokens": 100}}}
+            )
+            == {}
+        )
+
+
+@pytest.mark.parametrize("partial_bucket", [{"total_cost_usd": 0.5}, {"input_tokens": -1}, None])
+def test_sse_usage_does_not_report_partial_model_totals(partial_bucket: object) -> None:
+    assert session_stream._sse_safe_attributes(
+        {
+            "type": "session.usage",
+            "usage_by_model": {"reported": {"input_tokens": 100}, "unknown": partial_bucket},
+            "total_cost_usd": 1.0,
+        }
+    ) == {"total_cost_usd": 1.0, "usage_kind": "cumulative", "usage_scope": "session_subtree"}
+
+
 @contextlib.contextmanager
 def _capturing_audit_logger() -> Iterator[list[logging.LogRecord]]:
     records: list[logging.LogRecord] = []
