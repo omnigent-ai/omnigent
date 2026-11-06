@@ -2333,12 +2333,20 @@ async def test_watch_runner_reports_unexpected_exit(
         assert "task_id" not in died["attributes"]
 
 
-@pytest.mark.parametrize("connected", [False, True])
+@pytest.mark.parametrize(
+    ("connected", "log_line"),
+    [
+        (False, "tunnel rejected (HTTP 401)"),
+        (True, "tunnel rejected (HTTP 401)"),
+        (False, "runner tunnel has no credential available (HTTP 401 persisted)"),
+    ],
+)
 async def test_watch_runner_reports_refused_credentials_as_sign_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     connected: bool,
+    log_line: str,
 ) -> None:
     """A runner refused on credentials before connecting asks for a new sign-in.
 
@@ -2355,9 +2363,7 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     workspace = tmp_path / "project"
     workspace.mkdir()
     original_popen = subprocess.Popen
-    script = (
-        f"echo 'tunnel rejected (HTTP 401)' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
-    )
+    script = f"echo '{log_line}' >&2; sleep 0.2; exit {RUNNER_AUTH_REJECTED_EXIT_CODE}"
 
     def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
         """Spawn a runner that exits with the credential-rejection code."""
@@ -2387,11 +2393,17 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     died = next(
         record for record in caplog.records if getattr(record, "event_name", None) == "runner_died"
     )
-    assert "tunnel rejected (HTTP 401)" in report.error
+    assert log_line in report.error
     if connected:
         assert not report.error.startswith("The server rejected")
         assert died.attributes["error_category"] == "runner"
         assert died.attributes["error_phase"] == "unknown"
+    elif "no credential available" in log_line:
+        # No credential was sent, so the server did not reject this host.
+        assert report.error.startswith("The runner had no credential to send")
+        assert " login " in report.error
+        assert died.attributes["error_category"] == "config"
+        assert died.attributes["error_phase"] == "runner_launch"
     else:
         assert report.error.startswith("The server rejected this host's credentials")
         assert " login " in report.error
@@ -2764,10 +2776,12 @@ async def test_connect_watchdog_silent_when_runner_connects(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize("connects", [True, False])
 async def test_connect_watchdog_allows_the_runner_sign_in_budget(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
+    connects: bool,
 ) -> None:
     """A runner connecting after its allowed sign-in wait is not reported as hung."""
     from omnigent.host import connect as connect_module
@@ -2787,7 +2801,8 @@ async def test_connect_watchdog_allows_the_runner_sign_in_budget(
 
     async def _connect_after_sign_in(tasks: set[asyncio.Task[None]], *, timeout: float) -> None:
         # Advance the host wait to a connect just after the runner's permitted wait.
-        if timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
+        assert 0 < timeout < float("inf")
+        if connects and timeout >= _SIGN_IN_PENDING_WAIT_S + 1:
             marker.touch()
 
     monkeypatch.setattr(
@@ -2803,11 +2818,12 @@ async def test_connect_watchdog_allows_the_runner_sign_in_budget(
         exit_watcher.cancel()
         await asyncio.gather(exit_watcher, return_exceptions=True)
 
-    assert not [
+    errors = [
         record
         for record in caplog.records
         if getattr(record, "event_name", None) == "runner_never_connected"
     ]
+    assert bool(errors) is not connects
 
 
 async def test_connect_watchdog_silent_on_intentional_stop(

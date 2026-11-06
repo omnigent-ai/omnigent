@@ -209,6 +209,7 @@ from omnigent.runner.identity import (
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
     RUNNER_LAUNCH_HARNESS_ENV_VAR,
     RUNNER_PARENT_PID_ENV_VAR,
+    RUNNER_SIGN_IN_PENDING_WAIT_S,
     RUNNER_SLICE_KEY_ENV_VAR,
     RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_WORKSPACE_ENV_VAR,
@@ -379,9 +380,8 @@ _LOG_TAIL_MAX_LINES = 15
 # so a crashed runner is reported within about one client poll.
 _RUNNER_WATCH_INTERVAL_S = 0.5
 
-# The server's 30s send wait handles user feedback; this host check also covers
-# create-time launches and outlasts the runner's 150s pending-sign-in wait.
-_RUNNER_CONNECT_DEADLINE_S = 180.0
+# This check also covers create-time launches and outlasts the full sign-in wait.
+_RUNNER_CONNECT_DEADLINE_S = max(180.0, RUNNER_SIGN_IN_PENDING_WAIT_S + 30.0)
 
 
 def _connect_marker_path(log_path: Path) -> Path:
@@ -2800,12 +2800,23 @@ class HostProcess:
                 and had_connected is not True
             )
             if auth_rejected:
-                error = (
-                    f"{RUNNER_AUTH_REJECTED_CAUSE} Sign in again with "
-                    f"`{cli_invocation()} login "
-                    f"{self._login_hint_url()}` "
-                    f"on this host, then retry. Details: {error}"
+                from omnigent.runner.transports.ws_tunnel.serve import (
+                    RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
                 )
+
+                if RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX in error:
+                    # No credential was sent, so the server did not reject this host.
+                    error = (
+                        "The runner had no credential to send, so it could not connect. "
+                        f"Check this host's sign-in with `{cli_invocation()} login "
+                        f"{self._login_hint_url()}`, then retry. Details: {error}"
+                    )
+                else:
+                    error = (
+                        f"{RUNNER_AUTH_REJECTED_CAUSE} Sign in again with "
+                        f"`{cli_invocation()} login "
+                        f"{self._login_hint_url()}` on this host, then retry. Details: {error}"
+                    )
             _logger.warning(
                 "Runner %s died unexpectedly: %s",
                 runner_id,

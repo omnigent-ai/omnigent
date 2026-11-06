@@ -4413,6 +4413,43 @@ async def _wait_for_host_bound_runner_client(
     conversation_store: ConversationStore | None = None,
     startup_input: StartupInputContext | None = None,
 ) -> httpx.AsyncClient | None:
+    """Resolve a host-bound runner client through its bounded credential wait."""
+
+    async def wait_for_connection(budget_s: float) -> httpx.AsyncClient | None:
+        return await _wait_for_runner_client(
+            session_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=runner_id,
+            timeout_s=budget_s,
+            runner_exit_reports=runner_exit_reports,
+        )
+
+    return await _wait_for_host_bound_runner(
+        session_id,
+        runner_id=runner_id,
+        wait_for_connection=wait_for_connection,
+        timeout_s=timeout_s,
+        runner_exit_reports=runner_exit_reports,
+        host_conn=host_conn,
+        host_registry=host_registry,
+        conversation_store=conversation_store,
+        startup_input=startup_input,
+    )
+
+
+async def _wait_for_host_bound_runner[Connection](
+    session_id: str,
+    *,
+    runner_id: str,
+    wait_for_connection: Callable[[float], Awaitable[Connection | None]],
+    timeout_s: float,
+    runner_exit_reports: RunnerExitReports | None,
+    host_conn: HostConnection,
+    host_registry: HostRegistry,
+    conversation_store: ConversationStore | None = None,
+    startup_input: StartupInputContext | None = None,
+) -> Connection | None:
     """Wait for a live runner within its input's retained startup or sign-in budget.
 
     Saved startup inputs retain an alive launch and its persisted deadline.
@@ -4431,27 +4468,19 @@ async def _wait_for_host_bound_runner_client(
     startup_ceiling = started + STARTUP_RUNNER_CONNECT_TIMEOUT_S
     age_deadline: float | None = None
 
-    def wait_for_connection(budget_s: float) -> asyncio.Task[httpx.AsyncClient | None]:
-        return asyncio.create_task(
-            _wait_for_runner_client(
-                session_id,
-                runner_router,
-                tunnel_registry,
-                runner_id=runner_id,
-                timeout_s=budget_s,
-                runner_exit_reports=runner_exit_reports,
-            )
-        )
+    def start_connection_wait(budget_s: float) -> asyncio.Future[Connection | None]:
+        return asyncio.ensure_future(wait_for_connection(budget_s))
 
     async def query_status(*, pause: bool = False) -> str | None:
         nonlocal age_deadline
         if pause:
             await asyncio.sleep(_HOST_RUNNER_STARTUP_POLL_S)
-        if startup_input is None:
-            return await _query_host_runner_status(host_conn, host_registry, runner_id)
         current_connection = host_registry.get(host_conn.host_id)
         if current_connection is None:
             return None
+        if startup_input is None:
+            status = await _query_host_runner_status(current_connection, host_registry, runner_id)
+            return status if host_registry.get(host_conn.host_id) is current_connection else None
         query_started = time.monotonic()
         launch_age: float | None = None
 
@@ -4491,7 +4520,11 @@ async def _wait_for_host_bound_runner_client(
                 raise asyncio.CancelledError
         elif conversation_store is not None:
             current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if current is None or current.runner_id != runner_id:
+            if (
+                current is None
+                or current.runner_id != runner_id
+                or current.host_id != host_conn.host_id
+            ):
                 raise OmnigentError(
                     "session runner binding changed while waiting for host sign-in; retry",
                     code=ErrorCode.WRONG_REPLICA,
@@ -4504,7 +4537,7 @@ async def _wait_for_host_bound_runner_client(
         if startup_input.runner_wait is not None and startup_input.runner_wait.connected:
             remaining = timeout_s
         retained_deadline = time.monotonic() + remaining
-    connect_task = wait_for_connection(
+    connect_task = start_connection_wait(
         timeout_s if retained_deadline is None else max(0.0, retained_deadline - time.monotonic())
     )
     status_task = asyncio.create_task(query_status())
@@ -4520,7 +4553,11 @@ async def _wait_for_host_bound_runner_client(
                 if time.monotonic() >= retained_deadline:
                     assert startup_input is not None and conversation_store is not None
                     await startup_input.fail_unconnected(conversation_store, session_id)
-            if startup_input is not None or sign_in_deadline is not None:
+            if (
+                startup_input is not None
+                or sign_in_deadline is not None
+                or conversation_store is not None
+            ):
                 await check_pending_owner(check_deadline=connected_client is None)
             if connect_task in done:
                 if connected_client is not None:
@@ -4538,12 +4575,16 @@ async def _wait_for_host_bound_runner_client(
                 ):
                     return None
                 if retained_deadline is not None:
-                    connect_task = wait_for_connection(
+                    connect_task = start_connection_wait(
                         max(0.0, retained_deadline - time.monotonic())
                     )
                     if status_task not in done:
                         continue
-                if startup_input is None and host_registry.get(host_conn.host_id) is not host_conn:
+                if (
+                    startup_input is None
+                    and sign_in_deadline is None
+                    and host_registry.get(host_conn.host_id) is not host_conn
+                ):
                     return None
                 if status_task not in done:
                     # A responsive host may have entered sign-in between polls.
@@ -4563,6 +4604,9 @@ async def _wait_for_host_bound_runner_client(
                 and retained_deadline is None
                 and status not in {"alive", "sign_in_pending"}
             ):
+                if host_registry.get(host_conn.host_id) is not host_conn:
+                    status_task = asyncio.create_task(query_status(pause=True))
+                    continue
                 client = await connect_task
                 if client is not None and startup_input is not None:
                     await check_pending_owner(check_deadline=False)
@@ -4594,7 +4638,7 @@ async def _wait_for_host_bound_runner_client(
                         if narrowed_deadline != previous_deadline:
                             connect_task.cancel()
                             await asyncio.gather(connect_task, return_exceptions=True)
-                            connect_task = wait_for_connection(
+                            connect_task = start_connection_wait(
                                 max(0.0, narrowed_deadline - time.monotonic())
                             )
             elif status == "sign_in_pending" and not waiting_for_sign_in:
@@ -4606,7 +4650,7 @@ async def _wait_for_host_bound_runner_client(
                     return None
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = wait_for_connection(budget_s)
+                connect_task = start_connection_wait(budget_s)
                 waiting_for_sign_in = True
             elif status == "alive" and waiting_for_sign_in:
                 # Sign-in finished; normal startup must now make progress.
@@ -4614,13 +4658,8 @@ async def _wait_for_host_bound_runner_client(
                 budget_s = min(timeout_s, max(0.0, sign_in_deadline - time.monotonic()))
                 connect_task.cancel()
                 await asyncio.gather(connect_task, return_exceptions=True)
-                connect_task = wait_for_connection(budget_s)
+                connect_task = start_connection_wait(budget_s)
                 waiting_for_sign_in = False
-            if (
-                sign_in_deadline is not None
-                and host_registry.get(host_conn.host_id) is not host_conn
-            ):
-                return None
             status_task = asyncio.create_task(query_status(pause=True))
     finally:
         outstanding = [task for task in (connect_task, status_task) if not task.done()]
@@ -4897,6 +4936,7 @@ async def _bind_and_launch_managed_runner(
             await _note_workspace_reset_on_recreate(session_id, conversation_store)
         _publish_sandbox_status(session_id, "connecting")
         runner_id: str | None = None
+        host_conn = None
         if host_registry is not None:
             host_conn = host_registry.get(managed.host_id)
             if host_conn is not None:
@@ -4927,11 +4967,15 @@ async def _bind_and_launch_managed_runner(
                 if reason is not None:
                     return
         if runner_id is not None and tunnel_registry is not None:
+            assert host_conn is not None and host_registry is not None
             connected = await _wait_for_managed_runner_tunnel(
                 session_id,
                 runner_id,
                 tunnel_registry,
                 tracker,
+                host_conn=host_conn,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
                 settle_failure=False,
             )
             if not connected:
@@ -6036,11 +6080,15 @@ async def _run_managed_wake(
                 return
             runner_id = launch_attempt.runner_id
         if runner_id is not None and tunnel_registry is not None:
+            assert host_conn is not None and host_registry is not None
             connected = await _wait_for_managed_runner_tunnel(
                 session_id,
                 runner_id,
                 tunnel_registry,
                 tracker,
+                host_conn=host_conn,
+                host_registry=host_registry,
+                conversation_store=conversation_store,
             )
             if not connected:
                 return
@@ -14195,6 +14243,7 @@ __all__ = [
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
     "_stop_host_runner_intentionally",
+    "_wait_for_host_bound_runner",
     "_wait_for_host_bound_runner_client",
     "_wait_for_host_reconnect",
     "_wake_parent_for_blocked_child",

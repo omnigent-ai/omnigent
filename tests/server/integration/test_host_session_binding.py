@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -1597,11 +1597,14 @@ async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_pa
     assert runner_deregistered == [("runner_stale_tunnel", False)]
 
 
-async def test_managed_wake_fails_when_runner_never_reconnects(
+@pytest.mark.parametrize("credential_recovers", [False, True])
+async def test_managed_wake_waits_for_runner_or_reports_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    credential_recovers: bool,
 ) -> None:
-    """A wake cannot publish ready if the launched runner tunnel times out."""
+    """A wake preserves pending credentials and only publishes ready after connection."""
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
     session_id = "1a9de2e74d453be7cd665c5290b481b9"
     conv = SimpleNamespace(
@@ -1612,10 +1615,18 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         agent_id=None,
         sub_agent_name=None,
         inference_snapshot=None,
+        runner_id="runner_never_connects",
     )
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
+    launch = tracker.get(session_id)
+    assert launch is not None
     stages: list[tuple[str, str | None]] = []
+    waits: list[float] = []
+    connection = SimpleNamespace(host_id=conv.host_id, pending_runner_status={})
+    host_registry = Mock(
+        get=Mock(return_value=connection), send_text=Mock(side_effect=ConnectionError)
+    )
 
     async def _resume_noop(*_args: object, **_kwargs: object) -> None:
         pass
@@ -1623,14 +1634,19 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _TunnelRegistry:
-        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
-            del timeout_s
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> object | None:
+            waits.append(timeout_s)
+            if credential_recovers:
+                if len(waits) == 1:
+                    await asyncio.Future()
+                return object()
+            return None
 
+    if credential_recovers:
+        monkeypatch.setattr(
+            orchestration, "_query_host_runner_status", AsyncMock(return_value="sign_in_pending")
+        )
     monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(
@@ -1652,19 +1668,28 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
         tracker=tracker,
         conversation_store=SimpleNamespace(get_conversation=lambda _sid: conv),
         host_store=SimpleNamespace(),
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=host_registry,
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
 
-    launch = tracker.get(session_id)
-    assert launch is not None
     assert launch.settled.is_set()
-    assert launch.error == "managed runner did not connect after launch"
-    assert stages[-1] == ("failed", "managed runner did not connect after launch")
+    if credential_recovers:
+        assert launch.error is None
+        assert stages[-1] == ("ready", None)
+        assert len(waits) == 2 and waits[1] > waits[0]
+    else:
+        assert launch.error == "managed runner did not connect after launch"
+        assert stages[-1] == ("failed", "managed runner did not connect after launch")
 
 
-async def test_managed_launch_fails_when_runner_never_connects(
+@pytest.mark.parametrize(
+    "credential_recovers,host_reconnect",
+    [(False, None), (True, None), (True, "replaced"), (True, "absent")],
+)
+async def test_managed_launch_waits_for_runner_or_reports_timeout(
     monkeypatch: pytest.MonkeyPatch,
+    credential_recovers: bool,
+    host_reconnect: str | None,
 ) -> None:
     """Initial managed launch settlement also depends on the runner tunnel.
 
@@ -1673,15 +1698,27 @@ async def test_managed_launch_fails_when_runner_never_connects(
     running with a live launch token and no one who will ever use it.
     """
     from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
 
     session_id = "1a41e11887aca4570e42c0be40f24833"
     host_id = "3c8cdcdb61903904849174c864620a5c"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, runner_id="runner_never_connects", host_id=host_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
+    launch = tracker.get(session_id)
+    assert launch is not None
     stages: list[tuple[str, str | None]] = []
     terminated: list[object] = []
     sentinel_host = object()
+    waits: list[float] = []
+    connection = SimpleNamespace(host_id=host_id, pending_runner_status={})
+    replacement = SimpleNamespace(host_id=host_id, pending_runner_status={})
+    current_connection = [connection]
+    queried_connections: list[object] = []
+    host_registry = Mock(
+        get=Mock(side_effect=lambda _host_id: current_connection[0]),
+        send_text=Mock(side_effect=ConnectionError),
+    )
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
@@ -1689,19 +1726,35 @@ async def test_managed_launch_fails_when_runner_never_connects(
     async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
         terminated.append(host)
 
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
-
     class _TunnelRegistry:
-        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
-            del timeout_s
+        async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> object | None:
+            waits.append(timeout_s)
+            if credential_recovers:
+                if len(waits) == 1:
+                    await asyncio.Future()
+                return object()
+            return None
 
     class _HostStore:
         def get_host(self, requested_id: str) -> object:
             assert requested_id == host_id
             return sentinel_host
 
+    if credential_recovers:
+        monkeypatch.setattr(orchestration, "_HOST_RUNNER_STARTUP_POLL_S", 0)
+
+        async def _status(queried: object, *_args: object) -> str:
+            queried_connections.append(queried)
+            if host_reconnect is not None and queried is connection:
+                current_connection[0] = replacement if host_reconnect == "replaced" else None
+                if host_reconnect == "absent":
+                    asyncio.get_running_loop().call_soon(
+                        current_connection.__setitem__, 0, replacement
+                    )
+                return "dead"
+            return "sign_in_pending"
+
+        monkeypatch.setattr(orchestration, "_query_host_runner_status", _status)
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
     monkeypatch.setattr(
         sessions_module,
@@ -1726,18 +1779,26 @@ async def test_managed_launch_fails_when_runner_never_connects(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            get_conversation=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=host_registry,
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
     )
 
-    launch = tracker.get(session_id)
-    assert launch is not None
     assert launch.settled.is_set()
-    assert launch.error == "managed runner did not connect after launch"
-    assert stages[-1] == ("failed", "managed runner did not connect after launch")
-    assert terminated == [sentinel_host]
+    if credential_recovers:
+        assert launch.error is None
+        assert stages[-1] == ("ready", None)
+        assert len(waits) == 2 and waits[1] > waits[0]
+        assert terminated == []
+        if host_reconnect is not None:
+            assert queried_connections[0] is connection
+            assert queried_connections[-1] is replacement
+    else:
+        assert launch.error == "managed runner did not connect after launch"
+        assert stages[-1] == ("failed", "managed runner did not connect after launch")
+        assert terminated == [sentinel_host]
 
 
 async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
@@ -1828,20 +1889,20 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
 
     session_id = "d3a6e13f0dbf4b6ea4b6e37f4a76f2a9"
     host_id = "9e6cf6f52ebb4a2c9c9a1a5f8e8f5f42"
-    conv = SimpleNamespace(id=session_id)
+    conv = SimpleNamespace(id=session_id, runner_id="runner_never_connects", host_id=host_id)
     tracker = ManagedLaunchTracker()
     tracker.begin(session_id)
     terminated: list[object] = []
+    connection = SimpleNamespace(host_id=host_id, pending_runner_status={})
+    host_registry = Mock(
+        get=Mock(return_value=connection), send_text=Mock(side_effect=ConnectionError)
+    )
 
     async def _launch_runner(*_args: object, **_kwargs: object) -> object:
         return sessions_module._HostLaunchAttempt(runner_id="runner_never_connects")
 
     async def _fake_terminate(host: object, *_args: object, **_kwargs: object) -> None:
         terminated.append(host)
-
-    class _HostRegistry:
-        def get(self, _host_id: str) -> object:
-            return object()
 
     class _TunnelRegistry:
         async def wait_for_runner(self, _runner_id: str, *, timeout_s: float) -> None:
@@ -1870,9 +1931,10 @@ async def test_managed_relaunch_failure_leaves_the_host_identity_alone(
         tracker=tracker,
         conversation_store=SimpleNamespace(
             set_host_id=lambda _sid, _host_id, _workspace: conv,
+            get_conversation=lambda _sid: conv,
         ),
         host_store=_HostStore(),  # type: ignore[arg-type]
-        host_registry=_HostRegistry(),  # type: ignore[arg-type]
+        host_registry=host_registry,
         tunnel_registry=_TunnelRegistry(),  # type: ignore[arg-type]
         relaunch_host=object(),  # type: ignore[arg-type]
     )
