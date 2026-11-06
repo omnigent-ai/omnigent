@@ -131,7 +131,7 @@ def test_hover_reveals_timestamp_on_user_and_assistant_bubbles(
     # The assistant response is the final message, so its actions use their
     # fully visible hover color at rest.
     expect(assistant_row).to_have_css("opacity", "1")
-    assert round(assistant_row.bounding_box()["height"]) == 24
+    assert round(assistant_row.bounding_box()["height"]) == 16
 
     assistant_bubble.hover()
     expect(assistant_row).to_have_css("opacity", "1")
@@ -249,12 +249,7 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
     browser: Browser,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Below the md breakpoint the action row rests at 40% opacity.
-
-    Touch devices have no hover; a permanently invisible row would hide the
-    Copy action and the timestamp entirely. A failure means the
-    ``opacity-40`` touch fallback regressed.
-    """
+    """Taps toggle user actions; the latest assistant keeps its timestamp visible."""
     base_url, session_id = seeded_session
     _seed_assistant_text(base_url, session_id, "Touch probe assistant reply.")
     ctx = browser.new_context(viewport={"width": 375, "height": 812}, has_touch=True)
@@ -264,7 +259,7 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
 
         # The seeded reply is already on screen; the composer send still
         # exercises the real touch UI path for the user bubble.
-        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).first
+        assistant_bubble = page.locator(_ASSISTANT_BUBBLE).last
         expect(assistant_bubble).to_be_visible(timeout=30_000)
 
         _send(page, "Touch timestamp probe: say anything.")
@@ -275,12 +270,16 @@ def test_touch_viewport_keeps_timestamp_row_discoverable(
         expect(user_ts).to_have_count(1)
         expect(user_ts).to_have_text(_TIME_RE)
 
-        # No hover performed: the row must still be partially visible.
-        assert _opacity(_action_row(user_ts)) == "0.4"
+        user_row = _action_row(user_ts)
+        expect(user_row).to_have_css("opacity", "0")
+        user_bubble.tap()
+        expect(user_row).to_have_css("opacity", "1")
+        user_bubble.tap()
+        expect(user_row).to_have_css("opacity", "0")
 
         assistant_ts = assistant_bubble.locator(_TIMESTAMP)
         expect(assistant_ts).to_have_count(1)
         expect(assistant_ts).to_have_text(_TIME_RE)
-        expect(_action_row(assistant_ts)).to_have_css("opacity", "0.4")
+        expect(_action_row(assistant_ts)).to_have_css("opacity", "1")
     finally:
         ctx.close()

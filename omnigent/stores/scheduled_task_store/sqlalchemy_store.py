@@ -561,6 +561,24 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "adopt_task_session", write)
 
+    def release_session(self, scheduled_task_id: str, session_id: str) -> bool:
+        """Clear the task's session under the task lock, only if it is still *session_id*."""
+
+        def write(session: Session) -> bool:
+            row = session.get(
+                SqlScheduledTask, (current_workspace_id(), scheduled_task_id), with_for_update=True
+            )
+            if (
+                row is None
+                or row.state == encode_scheduled_task_state("deleted")
+                or row.session_id != session_id
+            ):
+                return False
+            row.session_id = None
+            return True
+
+        return run_write_transaction(self._session_immediate, "release_task_session", write)
+
     def delete(self, scheduled_task_id: str) -> bool:
         """Hide the task, then remove history in bounded transactions, preserving live claims."""
 

@@ -201,6 +201,19 @@ import {
   writeFoldAssistantNarration,
 } from "@/lib/foldNarrationPreferences";
 import {
+  DEFAULT_PROJECT_FOLDER_COLLAPSE,
+  parseProjectFolderPageSize,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_MAX,
+  PROJECT_FOLDER_PAGE_SIZE_MIN,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+  writeProjectFolderCollapse,
+  writeProjectFolderPageSize,
+} from "@/lib/projectFolderPaginationPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -271,6 +284,7 @@ import {
   isElectronShell,
   resetCliPath,
   supportsBrowser,
+  supportsGlobalShortcut,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
@@ -284,6 +298,7 @@ import {
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
 import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
+import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -952,6 +967,64 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** On by default: expanded project folders list a page of sessions behind "Show more". */
+function ProjectFolderPaginationControl() {
+  const collapse = useProjectFolderCollapse();
+  const pageSize = useProjectFolderPageSize();
+  // The text being typed; null shows the saved size, so a bad entry reverts on blur.
+  const [draft, setDraft] = useState<string | null>(null);
+  const collapseLabelId = useId();
+  const pageSizeLabelId = useId();
+  return (
+    <>
+      <div className="flex items-start justify-between gap-6">
+        <SettingsLabel
+          label='Collapse project sessions behind "Show more"'
+          labelId={collapseLabelId}
+          description="An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll."
+        />
+        <Switch
+          aria-labelledby={collapseLabelId}
+          checked={collapse}
+          onCheckedChange={writeProjectFolderCollapse}
+          data-testid="project-folder-collapse-toggle"
+          className="mt-0.5 shrink-0"
+          componentId="settings.appearance.project_folder_collapse"
+        />
+      </div>
+      {collapse && (
+        <div className="mt-4 flex items-center justify-between gap-6 border-t border-border pt-4">
+          <SettingsLabel
+            label='Sessions to show before "Show more"'
+            labelId={pageSizeLabelId}
+            description={`Each Show more click reveals this many more. Use a whole number from ${PROJECT_FOLDER_PAGE_SIZE_MIN} to ${PROJECT_FOLDER_PAGE_SIZE_MAX}.`}
+          />
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={PROJECT_FOLDER_PAGE_SIZE_MIN}
+            max={PROJECT_FOLDER_PAGE_SIZE_MAX}
+            step={1}
+            aria-labelledby={pageSizeLabelId}
+            data-testid="project-folder-page-size-input"
+            className="h-9 w-20 shrink-0 tabular-nums"
+            value={draft ?? String(pageSize)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              const next = parseProjectFolderPageSize(e.target.value);
+              if (next !== undefined) writeProjectFolderPageSize(next);
+            }}
+            onBlur={() => setDraft(null)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
 function AppearanceSection() {
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
@@ -980,6 +1053,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
+    writeProjectFolderCollapse(DEFAULT_PROJECT_FOLDER_COLLAPSE);
+    writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1008,6 +1083,8 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+          PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
           HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
@@ -1089,6 +1166,10 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabsControl />
             </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Sidebar" testId="settings-group-sidebar">
+            <ProjectFolderPaginationControl />
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
@@ -1864,6 +1945,11 @@ function GeneralSection() {
         {supportsBrowser() && (
           <SettingsGroup title="Links" testId="settings-group-links">
             <OpenLinksInAppControl />
+          </SettingsGroup>
+        )}
+        {supportsGlobalShortcut() && (
+          <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
+            <GlobalShortcutControl />
           </SettingsGroup>
         )}
       </div>
