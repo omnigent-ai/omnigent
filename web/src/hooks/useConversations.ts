@@ -33,6 +33,7 @@ import { filterSessionScope, sessionVisibility } from "@/lib/sessionVisibility";
 import { startTimedInteraction } from "@/lib/analyticsEmit";
 import {
   filtersFromConversationQueryKey,
+  findCachedListRow,
   lastIdAfterFiltering,
   insertNewRowsIntoPages,
   markRecentlyCreated,
@@ -46,6 +47,7 @@ import {
   PROJECT_LABEL_KEY,
   recentlyCreatedSessions,
   removeIdsFromPages,
+  settleOpenSessionRow,
   unmarkRecentlyCreated,
   type ConversationsInfiniteData,
   type SessionListWireItem,
@@ -195,6 +197,18 @@ export interface Conversation {
   harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
+  /**
+   * Work outlives the session's ended turn, such as a background shell or a
+   * Codex goal. The sidebar shows the session as working; `status` stays as
+   * reported.
+   */
+  background_work_running?: boolean;
+  /**
+   * Why a running session's agent is parked on a terminal prompt, e.g.
+   * `"permission prompt"`. The sidebar shows the session as needing input even
+   * when no web card exists for the prompt.
+   */
+  blocked_on?: string | null;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.
@@ -498,49 +512,6 @@ function withRecentlyCreated(
   }
   if (inject.length === 0) return page;
   return { ...page, data: [...inject, ...page.data], first_id: inject[0].id };
-}
-
-/**
- * Fetch a single session as a sidebar-shaped ``Conversation`` object.
- *
- * Used to backfill pinned sessions that fall outside the paginated
- * window. Returns ``null`` on 404 (session deleted) so the caller
- * can silently drop stale pins.
- */
-export async function fetchConversationById(id: string): Promise<Conversation | null> {
-  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const wire = await res.json();
-  // Seed the session→host map on this pin-backfill path too, not just the list
-  // seed / `sessionFromWire`: a pinned session outside the paginated window can
-  // enter client state only through here, and terminal-attach / session-scoped
-  // requests key their slice off this map — so record the host before returning
-  // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
-  setSessionParent(wire.id, wire.parent_session_id, wire.labels);
-  return {
-    id: wire.id,
-    object: "conversation",
-    title: wire.title ?? null,
-    created_at: wire.created_at,
-    updated_at: wire.updated_at ?? wire.created_at,
-    labels: wire.labels ?? {},
-    permission_level: wire.permission_level ?? null,
-    owner: wire.owner ?? null,
-    runner_id: wire.runner_id ?? null,
-    host_id: wire.host_id ?? null,
-    workspace: wire.workspace ?? null,
-    agent_id: wire.agent_id,
-    agent_name: wire.agent_name ?? null,
-    harness: wire.harness ?? null,
-    pending_elicitations_count: wire.pending_elicitations_count ?? 0,
-    status: wire.status ?? "idle",
-    runner_online: wire.runner_online ?? undefined,
-    host_online: wire.host_online ?? undefined,
-    git_branch: wire.git_branch ?? null,
-    archived: wire.archived ?? false,
-  };
 }
 
 export async function fetchConversationsPage({
@@ -983,21 +954,51 @@ export function useRenameConversation() {
 interface ArchiveListsSnapshot {
   lists: [readonly unknown[], ConversationsInfiniteData | undefined][];
   pinned: PinnedConversationsResult | undefined;
+  /** The archived sessions' own fetched rows, such as the sidebar's open-session row. */
+  backfill: [string, Conversation | null | undefined][];
 }
 
-function snapshotArchiveLists(queryClient: QueryClient): ArchiveListsSnapshot {
+function snapshotArchiveLists(
+  queryClient: QueryClient,
+  ids: readonly string[],
+): ArchiveListsSnapshot {
   return {
     lists: [
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] }),
       ...queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] }),
     ],
     pinned: queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY),
+    backfill: ids.map((id) => [
+      id,
+      queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]),
+    ]),
   };
 }
 
 function restoreArchiveLists(queryClient: QueryClient, snapshot: ArchiveListsSnapshot): void {
   for (const [key, data] of snapshot.lists) queryClient.setQueryData(key, data);
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, snapshot.pinned);
+  for (const [id, row] of snapshot.backfill) restoreOpenSessionRow(queryClient, id, row);
+}
+
+/**
+ * Put back a fetched open-session row that a failed write overlaid. A removal
+ * that landed meanwhile sticks: a local delete or leave drops the entry, and a
+ * remote one (`SessionUpdatesProvider`) leaves it `null`.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Session whose `["conversation-backfill", id]` row to restore.
+ * @param row - The row snapshotted before the write.
+ */
+function restoreOpenSessionRow(
+  queryClient: QueryClient,
+  id: string,
+  row: Conversation | null | undefined,
+): void {
+  const key = ["conversation-backfill", id];
+  if (row && queryClient.getQueryData<Conversation | null>(key)) {
+    queryClient.setQueryData<Conversation | null>(key, row);
+  }
 }
 
 /**
@@ -1019,10 +1020,14 @@ async function paintConversationsArchived(
   await Promise.all([
     queryClient.cancelQueries({ queryKey: ["conversations"] }),
     queryClient.cancelQueries({ queryKey: ["project-sessions"] }),
+    // Cancelling a first fetch would leave the row empty with nothing to refetch it.
+    ...ids
+      .filter((id) => queryClient.getQueryData(["conversation-backfill", id]) !== undefined)
+      .map((id) => queryClient.cancelQueries({ queryKey: ["conversation-backfill", id] })),
   ]);
   const marked = archived ? markSessionsArchiving(ids) : undefined;
   if (!archived) unmarkSessionsArchiving(ids);
-  const snapshot = snapshotArchiveLists(queryClient);
+  const snapshot = snapshotArchiveLists(queryClient, ids);
   for (const id of ids) overlayArchivedIntoCaches(queryClient, id, archived);
   if (archived) dropFromPinnedCache(queryClient, ids);
   return { snapshot, marked };
@@ -1064,6 +1069,7 @@ export function useArchiveConversation() {
       queryClient.setQueryData<Session>(["session", updated.id], (old) =>
         old ? { ...old, archived } : old,
       );
+      settleOpenSessionRow(queryClient, updated.id, { archived });
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, [updated.id]);
       }
@@ -1437,6 +1443,7 @@ export function useBulkArchiveConversations() {
       if (archived && context?.marked !== undefined) {
         expireSessionsArchiving(context.marked, ids);
       }
+      for (const id of ids) settleOpenSessionRow(queryClient, id, { archived });
     },
     onSettled: () => {
       // Project caches read the DB directly (no search-index lag), so unlike
@@ -1841,14 +1848,7 @@ function findCachedConversationRow(queryClient: QueryClient, id: string): Conver
     queryClient
       .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
       ?.conversations.find((c) => c.id === id) ??
-    queryClient
-      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
-      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id) ??
-    queryClient
-      .getQueriesData<ConversationsInfiniteData>({ queryKey: ["project-sessions"] })
-      .flatMap(([, data]) => data?.pages.flatMap((p) => p.data) ?? [])
-      .find((c) => c.id === id) ??
+    findCachedListRow(queryClient, id) ??
     queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]) ??
     cachedSessionRow(queryClient, id)
   );
@@ -2524,9 +2524,7 @@ export function useMoveToProject() {
       for (const [key, data] of [...previous.conversations, ...previous.projectSessions]) {
         if (data !== undefined) queryClient.setQueryData(key, data);
       }
-      if (previous.backfill !== undefined) {
-        queryClient.setQueryData(["conversation-backfill", id], previous.backfill);
-      }
+      restoreOpenSessionRow(queryClient, id, previous.backfill);
     },
     onSuccess: (updated, { project }) => {
       markConversationSeen(updated.id, updated.updated_at);

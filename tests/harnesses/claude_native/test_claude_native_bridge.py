@@ -5728,6 +5728,83 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
     assert tui["enters"] == 2
 
 
+def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A paste that lands while a resumed TUI is still replaying must not be submitted blind.
+
+    The composer frame is absent when the paste wait ends, so an Enter would submit
+    nothing and report success. Delivery waits for the composer, clears, pastes once
+    more, and presses Enter only after the draft is visible in the input box.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    replay_pane = "Resuming the conversation from the transcript...\n"
+    pasted_pane = _composer_pane().replace("❯ \n", "❯\n  [Pasted text #1 +7 lines]\n")
+    tui: dict[str, Any] = {
+        "pane": _composer_pane(),
+        "replaying": False,
+        "replay_captures": 0,
+        "pastes": 0,
+        "enter_saw_draft": [],
+    }
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that drops the paste while replaying a resumed transcript.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            if tui["replaying"]:
+                tui["replay_captures"] += 1
+                if tui["replay_captures"] > 25:
+                    tui["replaying"] = False
+                    tui["pane"] = _composer_pane()
+                else:
+                    return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pastes"] += 1
+            if tui["pastes"] == 1:
+                # The first paste is swallowed while the resumed TUI replays its transcript.
+                tui["replaying"] = True
+                tui["pane"] = replay_pane
+            else:
+                tui["pane"] = pasted_pane
+        if cmd[-1] == "Enter":
+            tui["enter_saw_draft"].append("[Pasted text" in tui["pane"])
+            if "[Pasted text" in tui["pane"]:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["enter_saw_draft"] == [True], (
+        "An Enter was pressed while the composer was not showing the draft: "
+        f"{tui['enter_saw_draft']}"
+    )
+    assert tui["pastes"] == 2, "The message should be pasted again once the composer is back."
+    assert tui["pane"] == _composer_pane(), "The message was left unsent in the input box."
+
+
 _SUBMITTED_ECHO = """\
 ❯ Task: ship the paste submit fix and verify
   Task: ship the paste submit fix and verify

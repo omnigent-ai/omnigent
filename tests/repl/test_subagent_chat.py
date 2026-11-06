@@ -195,7 +195,12 @@ class _DiscoverySessions:
         self._by_parent = by_parent
 
     async def child_sessions(
-        self, session_id: str, *, limit: int = 100, after: str | None = None
+        self,
+        session_id: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+        **_server_flags: object,  # e.g. descendants=True: answered like an older server
     ) -> PaginatedList:
         return PaginatedList(data=list(self._by_parent.get(session_id, [])), has_more=False)
 

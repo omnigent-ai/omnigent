@@ -65,6 +65,9 @@ with their own terminal retain the switcher.
 - Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
   is inert while the host is offline, the session is stranded, or a shell is
   still being created, and it yields to a focused terminal or editor.
+- In the desktop app, Control+` or File → New Terminal does the same, also
+  while an embedded browser tab has focus. The menu item is disabled whenever
+  the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
@@ -175,7 +178,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 
-For the desktop Close Tab shortcut, open a shell tab in an ordinary session,
+For the desktop Close shortcut, open a shell tab in an ordinary session,
 focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
 only that tab should close. Cancel the prompt to keep the tab and session.
 Repeat as a read-only viewer: the shortcut should leave the terminal open.
