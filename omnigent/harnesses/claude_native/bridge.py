@@ -6711,12 +6711,7 @@ def _restore_occupied_input(
         # Nothing an Escape can clear: launcher output before the input box
         # mounts, a dialog that offers no dismissal, or one Escape would quit.
         unclearable = surface == _OVERLAY_SURFACE and (
-            not (
-                _ESCAPE_DISMISS_HINT.search(pane)
-                or _btw_overlay_present(pane)
-                or _background_panel_close_hint(pane)
-            )
-            or _escape_quits_claude(pane)
+            not _overlay_escape_hint(pane) or _escape_quits_claude(pane)
         )
         if not confirmed:
             # One sighting is not enough to spend an Escape on: on a bare
@@ -6752,16 +6747,21 @@ def _restore_occupied_input(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def _background_panel_close_hint(pane: str) -> bool:
-    """Recognize the background panel's close footer across terminal line wraps."""
+def _overlay_escape_hint(pane: str) -> bool:
+    """Recognize a dismissal hint in the current overlay's footer."""
     lines = [line.strip() for line in pane.splitlines() if line.strip()]
     last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=-1)
     panel = lines[last_rule + 1 :]
-    if last_rule < 0 or not panel or panel[0] != "Background":
+    if not panel:
         return False
-    # Only this panel's navigation footer is collapsed, never decision-dialog text.
     footer = " ".join(" ".join(panel[-3:]).split())
-    return footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
+    if "↑/↓ to select" in footer:
+        return (
+            last_rule >= 0
+            and panel[0] == "Background"
+            and footer.endswith("↑/↓ to select · Enter to view · x to stop · Esc to close")
+        )
+    return bool(_ESCAPE_DISMISS_HINT.search("\n".join(panel[-3:]))) or _btw_overlay_present(pane)
 
 
 def _escape_quits_claude(pane: str) -> bool:
@@ -7712,11 +7712,7 @@ def _wait_for_claude_prompt_ready(
             and (
                 (
                     _occupying_surface(pane) == _OVERLAY_SURFACE
-                    and (
-                        _ESCAPE_DISMISS_HINT.search(pane)
-                        or _btw_overlay_present(pane)
-                        or _background_panel_close_hint(pane)
-                    )
+                    and _overlay_escape_hint(pane)
                     and _terminal_dialog_headline(pane) is None
                     and not _escape_quits_claude(pane)
                 )
