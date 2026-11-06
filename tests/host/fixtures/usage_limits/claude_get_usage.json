@@ -1,0 +1,112 @@
+{
+  "_source": "Shape recorded from Claude Code 2.1.316 get_usage on 2026-11-01; all values synthetic, identity removed, behaviors trimmed.",
+  "session": {
+    "total_cost_usd": 0,
+    "total_api_duration_ms": 0,
+    "total_duration_ms": 0,
+    "total_lines_added": 0,
+    "total_lines_removed": 0,
+    "model_usage": {}
+  },
+  "subscription_type": "max",
+  "rate_limits_available": true,
+  "rate_limits": {
+    "five_hour": {
+      "utilization": 16,
+      "resets_at": "2026-11-01T15:00:00.000000+00:00",
+      "limit_dollars": null,
+      "used_dollars": null,
+      "remaining_dollars": null,
+      "locked_reason": null
+    },
+    "seven_day": {
+      "utilization": 42,
+      "resets_at": "2026-11-05T09:00:00.000000+00:00",
+      "limit_dollars": null,
+      "used_dollars": null,
+      "remaining_dollars": null,
+      "locked_reason": null
+    },
+    "seven_day_oauth_apps": null,
+    "seven_day_opus": null,
+    "seven_day_sonnet": null,
+    "iguana_necktie": {
+      "utilization": 0,
+      "resets_at": "2026-12-01T00:00:00.000000+00:00",
+      "limit_dollars": 50,
+      "used_dollars": 0,
+      "remaining_dollars": 50,
+      "locked_reason": null
+    },
+    "extra_usage": {
+      "is_enabled": false,
+      "monthly_limit": null,
+      "used_credits": null,
+      "utilization": null,
+      "currency": null,
+      "decimal_places": null,
+      "disabled_reason": null,
+      "user_disabled": false,
+      "spend_limit_reached": false,
+      "credits_ever_enabled": false,
+      "daily": null,
+      "weekly": null
+    },
+    "limits": [
+      {
+        "kind": "session",
+        "group": "subscription",
+        "percent": 16,
+        "severity": "normal",
+        "resets_at": "2026-11-01T15:00:00.000000+00:00",
+        "scope": null,
+        "is_active": false
+      },
+      {
+        "kind": "weekly",
+        "group": "subscription",
+        "percent": 42,
+        "severity": "normal",
+        "resets_at": "2026-11-05T09:00:00.000000+00:00",
+        "scope": null,
+        "is_active": true
+      },
+      {
+        "kind": "weekly",
+        "group": "subscription",
+        "percent": 3,
+        "severity": "normal",
+        "resets_at": "2026-11-05T09:00:00.000000+00:00",
+        "scope": {"model": {"id": null, "display_name": "Fable"}, "surface": null},
+        "is_active": false
+      }
+    ],
+    "spend": {
+      "used": {"amount_minor": 0, "currency": "USD", "exponent": 2},
+      "limit": null,
+      "percent": 0,
+      "severity": "normal",
+      "enabled": false,
+      "disabled_reason": null,
+      "cap": null,
+      "balance": null,
+      "auto_reload": null,
+      "disclaimer": "synthetic",
+      "can_purchase_credits": false,
+      "can_toggle": false
+    },
+    "member_dashboard_available": false,
+    "seven_day_breakdown": {
+      "as_of": "synthetic",
+      "window_started_at": "2026-10-29T09:00:00.000000+00:00",
+      "rows": [{"key": "claude_code", "display_name": "Claude Code", "percent": 100}]
+    },
+    "weekly_scoped_shares": [
+      {"limit_index": 2, "used_percent_of_weekly": 7, "allowance_percent_of_weekly": 50}
+    ],
+    "model_scoped": [
+      {"display_name": "Fable", "utilization": 3, "resets_at": "2026-11-05T09:00:00.000000+00:00"}
+    ]
+  },
+  "behaviors": {"day": {"request_count": 1, "session_count": 1, "behaviors": []}}
+}
