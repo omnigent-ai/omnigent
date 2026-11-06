@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
@@ -43,6 +43,11 @@ import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  PROJECT_FOLDER_PAGE_SIZE,
+  writeProjectFolderCollapse,
+  writeProjectFolderPageSize,
+} from "@/lib/projectFolderPaginationPreferences";
 import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
@@ -264,20 +269,24 @@ function renderSidebar(
   config: SidebarConfig = sidebarConfig,
 ) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const sidebar = <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />;
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <CapabilitiesProvider info={info ?? "loading"}>
         <SidebarDataProvider config={config}>
           <ExtensionCatalogProvider extensions={extensions}>
             <TooltipProvider>
-              <MemoryRouter initialEntries={[initialEntry]}>{sidebar}</MemoryRouter>
+              <MemoryRouter initialEntries={[initialEntry]}>
+                <Sidebar open={open} onClose={onClose} onOpenSearch={onOpenSearch} />
+              </MemoryRouter>
             </TooltipProvider>
           </ExtensionCatalogProvider>
         </SidebarDataProvider>
       </CapabilitiesProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  // Re-render the same tree, as a query does when the hook mocks return new data.
+  return { ...result, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -311,6 +320,30 @@ function openProjectsMenu() {
     while open, so folder buttons aren't queryable until it closes). */
 function closeProjectsMenu() {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+}
+
+/** Replace the no-op IntersectionObserver with one that exposes its callback and options. */
+function stubIntersectionObserver() {
+  const observer = {
+    callback: undefined as IntersectionObserverCallback | undefined,
+    options: undefined as IntersectionObserverInit | undefined,
+    observe: vi.fn(),
+  };
+  class TestObserver {
+    constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+      observer.callback = callback;
+      observer.options = options;
+    }
+    observe = observer.observe;
+    unobserve = vi.fn();
+    disconnect = vi.fn();
+    takeRecords = () => [];
+    root = null;
+    rootMargin = "";
+    thresholds = [];
+  }
+  vi.stubGlobal("IntersectionObserver", TestObserver);
+  return observer;
 }
 
 beforeEach(() => {
@@ -2041,20 +2074,10 @@ describe("Sidebar tabs", () => {
     // so page 1 can be all-owned while shared sessions live on a later page.
     // The Shared tab must keep its pagination sentinel mounted rather than
     // stranding the user on a false "empty" state.
-    let observerCallback: IntersectionObserverCallback | undefined;
-    class TestObserver {
-      constructor(cb: IntersectionObserverCallback) {
-        observerCallback = cb;
-      }
-      observe = vi.fn();
-      unobserve = vi.fn();
-      disconnect = vi.fn();
-      takeRecords = () => [];
-      root = null;
-      rootMargin = "";
-      thresholds = [];
-    }
-    vi.stubGlobal("IntersectionObserver", TestObserver);
+    const observer = stubIntersectionObserver();
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
 
     const fetchNextPage = vi.fn();
     const rows = [conv("conv_mine", "Claude Code")]; // owned only on this page
@@ -2078,7 +2101,7 @@ describe("Sidebar tabs", () => {
     showSharedTab();
     // False-empty on the loaded window, but the sentinel is still mounted.
     expect(screen.getAllByText("No sessions")[0]).toBeInTheDocument();
-    observerCallback?.(
+    observer.callback?.(
       [{ isIntersecting: true } as IntersectionObserverEntry],
       {} as IntersectionObserver,
     );
@@ -2152,22 +2175,10 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
 
     // Capture the IntersectionObserver callback so the test can simulate the
     // sentinel entering the scroll viewport.
-    let observerCallback: IntersectionObserverCallback | undefined;
-    const observe = vi.fn();
-    const disconnect = vi.fn();
-    class TestObserver {
-      constructor(cb: IntersectionObserverCallback) {
-        observerCallback = cb;
-      }
-      observe = observe;
-      unobserve = vi.fn();
-      disconnect = disconnect;
-      takeRecords = () => [];
-      root = null;
-      rootMargin = "";
-      thresholds = [];
-    }
-    vi.stubGlobal("IntersectionObserver", TestObserver);
+    const observer = stubIntersectionObserver();
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
 
     const fetchNextPage = vi.fn();
     const rows = [conv("conv_mine", "Claude Code")];
@@ -2189,16 +2200,14 @@ describe("Sidebar load-more vs collapsed Sessions", () => {
     renderSidebar();
 
     // The sentinel is observed, and nothing is fetched until it intersects.
-    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observer.observe).toHaveBeenCalledTimes(1);
     expect(fetchNextPage).not.toHaveBeenCalled();
 
     // Simulate the sentinel leaving view, then entering it.
-    observerCallback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
+    observer.callback!([{ isIntersecting: false } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).not.toHaveBeenCalled();
-    observerCallback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+    observer.callback!([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
     expect(fetchNextPage).toHaveBeenCalledTimes(2);
-
-    vi.unstubAllGlobals();
   });
 });
 
@@ -2700,17 +2709,50 @@ describe("Sidebar project Show more", () => {
     expect(folderRowIds()).toEqual(moved);
   });
 
-  it("lists five more sessions per click until none remain", () => {
+  it("lists and reorders every member of a Custom-order folder listing all sessions", () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ ordering: "custom", custom: { base: "updated", since: 1000, ids: [] } }),
+    );
+    projectsMock.push("Customer X");
+    mockConversations([conv("conv_unfiled", "Claude Code")]);
+    projectSessionsMock.current["Customer X"] = filedSessions(7);
+    writeProjectFolderCollapse(false);
+    renderGroupingSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(7));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+
+    // The fifth row can move down past where a page would end.
+    const fifth = screen.getByRole("link", { name: "conv_filed_4" }).closest("li")!;
+    fireEvent.keyDown(within(fifth).getByTestId("conversation-actions"), { key: "Enter" });
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    expect(folderRowIds()).toEqual([
+      ...filedIds(4),
+      "conv_filed_5",
+      "conv_filed_4",
+      "conv_filed_6",
+    ]);
+  });
+
+  it("lists the configured number of sessions per Show more click until none remain", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
     renderSidebar();
     toggleFolder();
 
-    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(folderRowIds()).toEqual(filedIds(PROJECT_FOLDER_PAGE_SIZE));
     // The hand cursor, like the session rows' links.
     expect(screen.getByTestId("project-show-more")).toHaveClass("cursor-pointer");
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual(filedIds(10));
+
+    // A new count applies to the open folder without a reload, starting from one page.
+    act(() => writeProjectFolderPageSize(3));
+    expect(folderRowIds()).toEqual(filedIds(3));
+    fireEvent.click(screen.getByTestId("project-show-more"));
+    expect(folderRowIds()).toEqual(filedIds(6));
+    fireEvent.click(screen.getByTestId("project-show-more"));
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(folderRowIds()).toEqual(filedIds(12));
     expect(screen.queryByTestId("project-show-more")).toBeNull();
@@ -2800,6 +2842,50 @@ describe("Sidebar project Show more", () => {
     // Every loaded row is listed but the server has more, so the next click fetches.
     fireEvent.click(screen.getByTestId("project-show-more"));
     expect(fetchNextPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("lists every session and auto-loads more pages when folders list all sessions", async () => {
+    const observer = stubIntersectionObserver();
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+    });
+    projectsMock.push("Customer X");
+    mockConversations(filedSessions(12));
+    // The next server page brings three older sessions.
+    const fetchNextPage = vi.fn(() => {
+      projectSessionsMock.current["Customer X"] = filedSessions(15);
+    });
+    projectSessionsNextPage.current["Customer X"] = fetchNextPage;
+    const { refresh } = renderSidebar();
+    toggleFolder();
+    expect(folderRowIds()).toEqual(filedIds(5));
+
+    // Turning collapsing off applies to the open folder without a reload.
+    act(() => writeProjectFolderCollapse(false));
+    expect(folderRowIds()).toEqual(filedIds(12));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
+    // The folder's end is watched within the sidebar's own scroll container.
+    const scrollContainer = screen.getByText("Customer X").closest("nav");
+    expect(scrollContainer).not.toBeNull();
+    expect(observer.options?.root).toBe(scrollContainer);
+    // Scrolling the folder's end into view fetches its next server page.
+    // Await the settled fetch so the sentinel's follow-up render stays inside act.
+    await act(async () => {
+      observer.callback?.([{ isIntersecting: true } as IntersectionObserverEntry], {} as never);
+    });
+    expect(fetchNextPage).toHaveBeenCalledTimes(1);
+    refresh();
+    expect(folderRowIds()).toEqual(filedIds(15));
+
+    // Turning it back on returns the open folder to one page.
+    act(() => writeProjectFolderCollapse(true));
+    expect(folderRowIds()).toEqual(filedIds(5));
+    expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
+
+    // Turning it off right after that page reset still lists every loaded row.
+    act(() => writeProjectFolderCollapse(false));
+    expect(folderRowIds()).toEqual(filedIds(15));
+    expect(screen.queryByTestId("project-show-more")).toBeNull();
   });
 
   it("badges Show more with the state of the sessions it hides", () => {
@@ -2930,27 +3016,35 @@ describe("Sidebar project Show more", () => {
     expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
   });
 
-  it("steps the session hotkey past the sessions behind Show more", () => {
-    projectsMock.push("Customer X", "Customer Y");
-    mockConversations([
-      ...filedSessions(7),
-      conv("conv_other_folder", "Claude Code", {
-        labels: { omni_project: "Customer Y" },
-        updated_at: 1,
-      }),
-    ]);
-    localStorage.setItem(
-      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
-      JSON.stringify(["Customer X", "Customer Y"]),
-    );
-    renderOnSession("conv_filed_4");
+  it.each([
+    { collapse: true, next: "conv_other_folder" },
+    { collapse: false, next: "conv_filed_5" },
+  ])(
+    "steps the session hotkey past the fifth folder row (collapse behind Show more: $collapse)",
+    ({ collapse, next }) => {
+      // Collapsing leaves the sixth and seventh rows behind Show more.
+      writeProjectFolderCollapse(collapse);
+      projectsMock.push("Customer X", "Customer Y");
+      mockConversations([
+        ...filedSessions(7),
+        conv("conv_other_folder", "Claude Code", {
+          labels: { omni_project: "Customer Y" },
+          updated_at: 1,
+        }),
+      ]);
+      localStorage.setItem(
+        EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+        JSON.stringify(["Customer X", "Customer Y"]),
+      );
+      renderOnSession("conv_filed_4");
 
-    fireEvent.keyDown(window, {
-      code: "BracketRight",
-      ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
-    });
-    expect(screen.getByTestId("loc")).toHaveTextContent("/c/conv_other_folder");
-  });
+      fireEvent.keyDown(window, {
+        code: "BracketRight",
+        ...(isMacPlatform() ? { metaKey: true } : { ctrlKey: true }),
+      });
+      expect(screen.getByTestId("loc")).toHaveTextContent(`/c/${next}`);
+    },
+  );
 });
 
 // A collapsed project bubbles up its hidden rows' marker, using the same

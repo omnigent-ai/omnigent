@@ -79,7 +79,11 @@ the header menu), and each place is a separate entry point.
   starts at five again, the open session stays listed once the sidebar has
   loaded it, and Show more carries the badge of a hidden session that needs
   attention or is unread. Filing a session into the folder leaves its listed
-  rows as they are, so an older one lands behind Show more.
+  rows as they are, so an older one lands behind Show more. Settings →
+  Appearance → Sidebar sets the count per Show more (5 by default, 1–50, per
+  device); turning off "Collapse project sessions behind "Show more"" lists
+  every loaded session and loads more as the sidebar scrolls, with no Show more
+  row.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
   unarchive, or delete them.
 - `fork`: fork the whole session or from a message; the fork keeps images and
@@ -275,7 +279,8 @@ choose Rename project. Start typing as soon as the dialog opens.
 **Project folder sessions:** expand a project with more than five sessions,
 then click Show more under its rows. Opening one of its older sessions from
 the ⌘K / Ctrl+K palette or a link also lists down to that session, once the
-sidebar has loaded it.
+sidebar has loaded it. To change the count or list every session instead,
+use Settings → Appearance → Sidebar.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -1120,10 +1125,26 @@ plain `uv run pytest`, which starts a private server for the test.
   reveal, row-menu filing leaving the listed rows as they are, the
   hidden-session badge, and the ⌘[ / ⌘] hotkey;
   `web/src/shell/Sidebar.shiftSelect.test.tsx` covers shift ranges, bulk
-  actions, and bulk filing. By hand: create a project
-  (`POST /v1/projects`), file six or more sessions into it with
+  actions, and bulk filing. The Settings → Appearance → Sidebar controls are
+  covered by the Sidebar tests "lists the configured number of sessions per
+  Show more click", "lists every session and auto-loads more pages when
+  folders list all sessions" and "lists and reorders every member of a
+  Custom-order folder listing all sessions", `web/src/pages/SettingsPage.test.tsx`
+  (defaults, invalid counts, reload, reset),
+  `web/src/lib/projectFolderPaginationPreferences.test.ts` (storage and the
+  legacy `omnigent:project-folder-pagination` migration), and
+  `web/src/lib/settingsPortability.test.ts` (export/import). By hand: create a
+  project (`POST /v1/projects`), file six or more sessions into it with
   `PATCH /v1/sessions/{id}` and `project_id`, one second apart so `updated_at`
-  orders them, then expand the folder and click Show more.
+  orders them, then expand the folder and click Show more. In Settings →
+  Appearance → Sidebar, set "Sessions to show before "Show more"" to 3: the
+  folder lists three rows and each Show more adds three. For the switch, file
+  more than 20 sessions (one server page) and turn off "Collapse project
+  sessions behind "Show more"": the open folder lists every loaded session with
+  no Show more, and scrolling to its end loads the next page. Load more stays
+  under the folder while pages remain; after three automatic loads (the default
+  budget), further pages need a click on it. Turn the switch back on for the
+  saved count plus Show more.
 
 For the desktop Close shortcut, select a side-chat tab in an ordinary
 session and press Cmd/Ctrl+W. Only that side chat should close; the parent and

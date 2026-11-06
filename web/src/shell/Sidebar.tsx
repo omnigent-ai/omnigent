@@ -5,6 +5,10 @@ import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDr
 import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import {
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+} from "@/lib/projectFolderPaginationPreferences";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
@@ -1472,17 +1476,16 @@ export const Sidebar = memo(SidebarImpl);
 const projectDragId = (name: string) => `project-order:${name}`;
 type ProjectHeaderDrag = ReturnType<typeof useSortable>;
 
-// Sessions an expanded project folder lists before, and adds per, "Show more".
-const PROJECT_FOLDER_PAGE_SIZE = 5;
-
 /**
  * One project folder. Fetches its own sessions server-side (`?project=`) so it
  * shows ALL its members regardless of how far the global sidebar list has been
- * scrolled. It lists PROJECT_FOLDER_PAGE_SIZE rows at a time; "Show more"
- * reveals the next page, fetching another server page once the loaded rows run
- * out. Lazy: the fetch is gated on `expanded`, so a collapsed folder costs
- * nothing. The collapsed `marker` is supplied by the parent (best-effort, from
- * the globally-loaded window) since a collapsed folder hasn't fetched yet.
+ * scrolled. It lists `pageSize` rows at a time; "Show more" reveals the next
+ * page, fetching another server page once the loaded rows run out. With no
+ * `pageSize` (the Appearance setting turned off) it lists every loaded row and
+ * loads further server pages as the sidebar scrolls. Lazy: the fetch is gated
+ * on `expanded`, so a collapsed folder costs nothing. The collapsed `marker` is
+ * supplied by the parent (best-effort, from the globally-loaded window) since a
+ * collapsed folder hasn't fetched yet.
  */
 function ProjectFolder({
   name,
@@ -1507,7 +1510,13 @@ function ProjectFolder({
   onConversationsLoaded,
   reorderable,
   ordering,
+  scrollRoot,
+  pageSize,
 }: {
+  /** The sidebar's scroll container, the root for unpaginated auto-loading. */
+  scrollRoot: RefObject<HTMLElement | null>;
+  /** Rows listed before, and added by, each Show more; undefined lists them all. */
+  pageSize: number | undefined;
   /** Whether its rows take Custom-order drops and Move up/down. */
   reorderable: boolean;
   ordering: {
@@ -1608,11 +1617,13 @@ function ProjectFolder({
     name,
     viewerId,
   ]);
-  // Each expansion starts at one page; the open session is never left hidden.
+  // Each expansion, archive switch or re-sort restarts the page count and auto-load
+  // budget; when paginated, the open session is never left hidden.
+  const listScope = JSON.stringify([expanded, archived, sortBy]);
   const display = useSidebarDisplayPagination(
     conversations,
-    JSON.stringify([expanded, archived, sortBy]),
-    PROJECT_FOLDER_PAGE_SIZE,
+    listScope,
+    pageSize,
     query.hasNextPage,
     query.fetchNextPage,
     expanded ? conversations.findIndex((c) => c.id === activeConversationId) : -1,
@@ -1680,6 +1691,41 @@ function ProjectFolder({
     disabled: ordering.disabled,
   });
   const orderedMenuActions = { ...menuActions, ordering };
+
+  let footer: ReactNode = null;
+  if (loadingFirstPage) {
+    footer = (
+      <div className="pl-6">
+        <p
+          className={cn(
+            SIDEBAR_ROW,
+            "flex w-full flex-col justify-center text-left text-muted-foreground",
+          )}
+        >
+          Loading…
+        </p>
+      </div>
+    );
+  } else if (pageSize === undefined) {
+    footer = (
+      <InfiniteScrollSentinel
+        hasMore={query.hasNextPage}
+        isFetching={query.isFetchingNextPage}
+        fetchMore={query.fetchNextPage}
+        scrollRoot={scrollRoot}
+        scopeKey={listScope}
+        indent
+      />
+    );
+  } else if (display.hasMore) {
+    footer = (
+      <ProjectShowMoreRow
+        loading={query.isFetchingNextPage}
+        marker={hiddenMarker}
+        onShowMore={showMore}
+      />
+    );
+  }
 
   return (
     <div
@@ -1775,26 +1821,7 @@ function ProjectFolder({
             />
           </ContextMenuContent>
         }
-        footer={
-          loadingFirstPage ? (
-            <div className="pl-6">
-              <p
-                className={cn(
-                  SIDEBAR_ROW,
-                  "flex w-full flex-col justify-center text-left text-muted-foreground",
-                )}
-              >
-                Loading…
-              </p>
-            </div>
-          ) : display.hasMore ? (
-            <ProjectShowMoreRow
-              loading={query.isFetchingNextPage}
-              marker={hiddenMarker}
-              onShowMore={showMore}
-            />
-          ) : null
-        }
+        footer={footer}
       />
       {menuDialogs}
     </div>
@@ -2290,6 +2317,10 @@ function ConversationList({
   ]);
 
   const config = useContext(SidebarConfigContext);
+  // Read here, not in ProjectFolder: in React 18, a store change whose render also
+  // resets state (the folder's page window) leaves the next change unnoticed.
+  const projectFolderCollapse = useProjectFolderCollapse();
+  const projectFolderPageSize = useProjectFolderPageSize();
   // Shared renders above Sessions, so the display window pages through both in that order.
   const listRows = useMemo(
     () => [...loadedSections.shared, ...loadedSections.sessions],
@@ -3140,6 +3171,8 @@ function ConversationList({
                                     : "before"
                                   : undefined,
                             }}
+                            scrollRoot={scrollContainerRef}
+                            pageSize={projectFolderCollapse ? projectFolderPageSize : undefined}
                             name={group.name}
                             projectId={group.id}
                             icon={group.icon}
