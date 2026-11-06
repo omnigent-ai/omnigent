@@ -12,8 +12,10 @@ from the server itself (see :func:`probe_auth_mode`, mirroring the
   scoped, rotating delegated token.
 - **oidc** → the server's CLI-login ticket flow (``/auth/cli-login`` +
   ``/auth/cli-poll``). The user completes the real OIDC flow at the IdP;
-  the bot receives the server's session JWT (no refresh — re-login on
-  expiry), exactly as the ``omnigent`` CLI does.
+  the bot receives the server's session JWT, exactly as the ``omnigent``
+  CLI does. When the server has a grant store (a database), the poll also
+  returns a login grant's refresh token, which the bot renews through
+  ``/oauth/token``; without one, the user re-logs-in on expiry.
 
 Header/proxy mode is unsupported: identity is asserted by a trusted
 upstream proxy, so the server mints no token and mounts no login
@@ -93,10 +95,9 @@ class DeviceGrantUnavailableError(OAuthError):
 class TokenResult:
     """A token obtained from a completed login.
 
-    ``refresh_token`` is empty when the server issues none (an OIDC
-    deployment without a login-grant store — the bot re-logs-in on
-    expiry). When ``/auth/cli-poll`` carries one, the poller keeps it so
-    the session can renew silently until the grant ends.
+    ``refresh_token`` is empty when an OIDC server's cli-ticket login
+    issues no login grant (no grant store wired) — the session JWT then
+    stands alone and the bot re-logs-in on expiry.
     """
 
     access_token: str
@@ -105,9 +106,12 @@ class TokenResult:
 
 
 def _token_from_response(
-    resp: httpx.Response, *, access_key: str, has_refresh: bool, default_expires: int
+    resp: httpx.Response, *, access_key: str, refresh_required: bool, default_expires: int
 ) -> TokenResult:
     """Parse a 200 token body, mapping a malformed one to ``OAuthError``.
+
+    ``refresh_required`` makes a missing ``refresh_token`` malformed; when
+    false the field is optional and an absent one yields ``""``.
 
     A 200 whose body is non-JSON, missing the token field, or carries a
     non-numeric ``expires_in`` would otherwise raise
@@ -119,12 +123,10 @@ def _token_from_response(
     try:
         data = resp.json()
         access_token = str(data[access_key])
-        submit_refresh = has_refresh
-        if has_refresh and "refresh_token" not in data:
-            # The server skipped the grant; fall back to standalone-JWT
-            # behaviour instead of failing the whole login.
-            submit_refresh = False
-        refresh_token = str(data["refresh_token"]) if submit_refresh else ""
+        if refresh_required:
+            refresh_token = str(data["refresh_token"])
+        else:
+            refresh_token = str(data.get("refresh_token") or "")
         expires_in = int(data.get("expires_in", default_expires))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise OAuthError(f"Malformed token response: {exc}") from exc
@@ -296,7 +298,7 @@ async def _poll_device(
             continue  # transient — keep polling until the deadline (mirrors the ticket flow)
         if resp.status_code == 200:
             return _token_from_response(
-                resp, access_key="access_token", has_refresh=True, default_expires=3600
+                resp, access_key="access_token", refresh_required=True, default_expires=3600
             )
         error = _error_code(resp)
         if error == "slow_down":
@@ -378,13 +380,12 @@ async def _poll_cli_ticket(
         if resp.status_code == 202:
             continue  # pending: browser flow not finished
         if resp.status_code == 200:
-            # Keep the login grant when the server issues one: the proxy
-            # adds a session JWT *and* a ``refresh_token`` once a grant
-            # store is wired, so the bot can renew silently instead of
-            # re-prompting a login every session-JWT expiry. A server that
-            # issues none keeps the old standalone-JWT behaviour.
+            # With a grant store wired, the server returns a login grant's
+            # ``refresh_token`` beside the session JWT; keep it so the bot
+            # renews through /oauth/token instead of re-prompting a login on
+            # every session-JWT expiry. Without one, the JWT stands alone.
             return _token_from_response(
-                resp, access_key="token", has_refresh=True, default_expires=8 * 3600
+                resp, access_key="token", refresh_required=False, default_expires=8 * 3600
             )
         if resp.status_code in (400, 403, 410):
             raise AuthorizationExpiredError(
@@ -396,8 +397,9 @@ async def _poll_cli_ticket(
 class DeviceFlowClient:
     """Talks to a single Omnigent server's ``/oauth/*`` endpoints.
 
-    Used for token refresh and revocation of device-grant tokens (the
-    login start/poll now lives in :func:`start_login`). Sends the optional
+    Used for token refresh and revocation of device-grant and OIDC
+    login-grant tokens (the login start/poll now lives in
+    :func:`start_login`). Sends the optional
     device-grant client secret (when configured) on every call, since the
     ``/oauth/token`` and ``/oauth/revoke`` endpoints may be secret-gated.
     """
@@ -423,7 +425,7 @@ class DeviceFlowClient:
         if response.status_code != 200:
             raise OAuthError(f"Refresh failed: {_error_code(response) or response.status_code}")
         return _token_from_response(
-            response, access_key="access_token", has_refresh=True, default_expires=3600
+            response, access_key="access_token", refresh_required=True, default_expires=3600
         )
 
     async def revoke(self, refresh_token: str) -> None:

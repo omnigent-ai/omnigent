@@ -235,7 +235,7 @@ async def test_resolve_auth_refresh_drops_dead_grant(tmp_path: Path) -> None:
 
 @respx.mock
 async def test_oidc_login_stores_session_jwt_no_refresh(tmp_path: Path) -> None:
-    """OIDC mode uses the cli-ticket flow and stores a refreshless session JWT."""
+    """OIDC cli-ticket login without a grant store stores a refreshless session JWT."""
     respx.get(_BASE + "/v1/me").mock(
         return_value=httpx.Response(401, json={"login_url": "/auth/login"})
     )
@@ -277,7 +277,80 @@ async def test_oidc_login_stores_session_jwt_no_refresh(tmp_path: Path) -> None:
     rec = await store.get("T1", "U1", _BASE)
     assert rec is not None
     assert rec.access_token == "sess"
-    assert rec.refresh_token == ""  # session JWT — no refresh token
+    assert rec.refresh_token == ""  # no login grant — standalone session JWT
+
+
+@respx.mock
+async def test_oidc_login_grant_renews_after_session_jwt_expiry(tmp_path: Path) -> None:
+    """Issue #12493: an OIDC login's grant outlives the session JWT.
+
+    With a grant store, /auth/cli-poll returns a refresh token beside the
+    session JWT. On the expired JWT's 401 the bot renews through
+    /oauth/token instead of dropping the token, and logout revokes the
+    grant on the server.
+    """
+    respx.get(_BASE + "/v1/me").mock(
+        return_value=httpx.Response(401, json={"login_url": "/auth/login"})
+    )
+    respx.post(_BASE + "/auth/cli-login").mock(
+        return_value=httpx.Response(
+            200, json={"ticket": "T1", "login_url": "/auth/login?ticket=T1"}
+        )
+    )
+    respx.get(_BASE + "/auth/cli-poll").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "token": "sess",
+                "refresh_token": "grant-rt",
+                "user_id": "a@x",
+                "expires_in": 60,
+            },
+        )
+    )
+    # Login grants renew without rotating: the same refresh token comes back.
+    token = respx.post(_BASE + "/oauth/token").mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "renewed", "refresh_token": "grant-rt", "expires_in": 3600},
+        )
+    )
+    revoke = respx.post(_BASE + "/oauth/revoke").mock(return_value=httpx.Response(200))
+    mgr, store = await _manager(tmp_path)
+
+    pending = await mgr.authorize(server_url=_BASE, client_id="Slack-Omnigent-Test")
+    done: list[bool] = []
+
+    async def on_success() -> None:
+        done.append(True)
+
+    async def on_failure(reason: str) -> None:
+        raise AssertionError(f"unexpected failure: {reason}")
+
+    mgr.await_authorization_in_background(
+        pending=pending,
+        team_id="T1",
+        user_id="U1",
+        server_url=_BASE,
+        on_success=on_success,
+        on_failure=on_failure,
+    )
+    await _wait_for(done)
+    assert done == [True]
+
+    auth = await mgr.resolve_auth(_BASE, "T1:U1")
+    assert auth is not None
+    assert auth.access_token == "sess"
+    # The client calls refresh on the expired JWT's 401.
+    assert await auth.refresh(auth.access_token) == "renewed"
+    assert token.calls.last.request.content == b"grant_type=refresh_token&refresh_token=grant-rt"
+    rec = await store.get("T1", "U1", _BASE)
+    assert rec is not None
+    assert (rec.access_token, rec.refresh_token) == ("renewed", "grant-rt")
+
+    await mgr.logout("T1", "U1", _BASE)
+    assert revoke.calls.last.request.content == b"refresh_token=grant-rt"
+    assert await store.get("T1", "U1", _BASE) is None
 
 
 async def test_resolve_auth_no_refresh_token_drops_on_expiry(tmp_path: Path) -> None:

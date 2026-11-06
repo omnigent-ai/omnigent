@@ -232,9 +232,12 @@ socket server can drive the device flow.
 confirmation code; the user signs in at *your IdP* in their browser, then
 explicitly approves the request on the server's consent page (checking the
 code matches). The server hands back its session JWT — the same
-token a browser session gets. There is **no device grant and no refresh token**:
-the session lasts its normal TTL (default 8h), after which the user logs in
-again.
+token a browser session gets. When the server has a database, it also hands
+back a login grant's refresh token, and the bot renews the session through
+`/oauth/token` until the grant ends (`OMNIGENT_GRANT_MAX_LIFETIME_DAYS`,
+default 30) or is revoked; `/omnigent logout` revokes it. Without a database
+there is **no refresh token**: the session lasts its normal TTL (default 8h),
+after which the user logs in again.
 - `header` **/ proxy mode** → identity is asserted by a trusted upstream proxy
 header (e.g. `X-Forwarded-Email`), so the server mints no token and exposes no
 per-user login the auto-detect flow can drive. Two options:
