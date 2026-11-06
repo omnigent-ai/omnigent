@@ -108,9 +108,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     setManualOpen(true);
   }
 
-  // A template is picked from the gallery view; show the new automation in the
-  // list so it is obvious it was created. A filter or search left over from
-  // earlier could still hide the new row, so clear them.
+  // After an automation is created, show the list with filters cleared so the
+  // new row is visible (creating from a template starts on the gallery view).
   function handleCreated() {
     setFilter("all");
     setSearch("");

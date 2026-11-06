@@ -324,7 +324,11 @@ describe("onCreated", () => {
     const onCreated = vi.fn();
     const onOpenChange = vi.fn();
     let finishCreate: (value: unknown) => void = () => {};
-    mutateAsync.mockReturnValueOnce(new Promise((resolve) => (finishCreate = resolve)));
+    mutateAsync.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishCreate = resolve;
+      }),
+    );
     render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} onCreated={onCreated} />, {
       expandAdvanced: false,
     });
