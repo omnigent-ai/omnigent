@@ -2,7 +2,7 @@
 
 Covers the two pure-ish seams that carry a user's follow-up turn into the side
 chat's Codex thread: the server redirect (`_forward_codex_side_chat_turn`) and
-the runner's message-text extraction (`_side_chat_text_from_content`).
+the runner's message-text extraction (`side_chat_text_from_content`).
 """
 
 from __future__ import annotations
@@ -16,7 +16,9 @@ _JsonObject = dict[str, Any]
 
 
 def test_side_chat_text_from_content_joins_text_blocks() -> None:
-    from omnigent.runner.app import _side_chat_text_from_content
+    from omnigent.harnesses.codex_native.side_chat import (
+        side_chat_text_from_content as _side_chat_text_from_content,
+    )
 
     assert _side_chat_text_from_content([{"type": "input_text", "text": "and why?"}]) == "and why?"
     assert (
@@ -29,7 +31,8 @@ def test_side_chat_text_from_content_joins_text_blocks() -> None:
         )
         == "a\nb"
     )
-    assert _side_chat_text_from_content("nope") == ""  # not a list
+    assert _side_chat_text_from_content("typed  ") == "typed"  # plain text is typed text
+    assert _side_chat_text_from_content(None) == ""
     assert _side_chat_text_from_content([]) == ""
 
 
