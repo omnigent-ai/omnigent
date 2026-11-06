@@ -513,7 +513,11 @@ async def serve_tunnel(
             raise
         if not ever_connected and not sign_in_wait_ended:
             if pending and sign_in_wait_started is None:
-                sign_in_wait_started = time.monotonic()
+                sign_in_wait_started = (
+                    http_auth_rejection_started
+                    if http_auth_rejection_started is not None
+                    else time.monotonic()
+                )
                 mark_sign_in_pending(runner_id, sign_in_wait_started + _SIGN_IN_PENDING_WAIT_S)
                 _logger.warning(
                     "Runner tunnel is waiting up to %.0fs for the host sign-in to finish",

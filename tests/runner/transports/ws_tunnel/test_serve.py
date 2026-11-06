@@ -717,8 +717,12 @@ async def test_serve_tunnel_rejected_token_exits_only_after_the_window(
 
 
 @pytest.mark.asyncio
-async def test_rejected_upgrade_does_not_renew_an_existing_sign_in_deadline(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, _no_credential_window_elapsed: float
+@pytest.mark.parametrize("sign_in_first", [True, False])
+async def test_credential_recovery_phases_share_the_first_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    _no_credential_window_elapsed: float,
+    sign_in_first: bool,
 ) -> None:
     window = _no_credential_window_elapsed
     monkeypatch.setattr(serve_module, "_NO_CREDENTIAL_FATAL_WINDOW_S", window)
@@ -729,10 +733,24 @@ async def test_rejected_upgrade_does_not_renew_an_existing_sign_in_deadline(
     sleeps = _clock_advanced_by_sleep(monkeypatch)
     monkeypatch.setattr("omnigent.runner.identity.time", serve_module.time)
     original_deadline = serve_module.time.monotonic() + window
+    factory = _SignInFactory(pending_calls=3 if sign_in_first else 0, token="tok-refused")
     deadlines: list[float] = []
+    rejected = False
+    advance_clock = serve_module.asyncio.sleep
+
+    async def sleep(delay: float) -> None:
+        await advance_clock(180.0 if not sign_in_first and not sleeps else delay)
+
+    monkeypatch.setattr(
+        serve_module, "asyncio", SimpleNamespace(**{**vars(serve_module.asyncio), "sleep": sleep})
+    )
 
     async def reject(app: Any, **_kwargs: Any) -> None:
         del app
+        nonlocal rejected
+        if not sign_in_first and not rejected:
+            factory._pending_calls = factory.calls + 10
+        rejected = True
         pending = sign_in_pending_marker_path(marker)
         if pending.exists():
             deadlines.append(json.loads(pending.read_text())["deadline"])
@@ -745,7 +763,7 @@ async def test_rejected_upgrade_does_not_renew_an_existing_sign_in_deadline(
             server_url="https://synthetic.invalid/omnigent",
             runner_id="runner-owned",
             runner_version="test",
-            auth_token_factory=_SignInFactory(pending_calls=3, token="tok-refused"),
+            auth_token_factory=factory,
         )
     assert sum(sleeps) < window + serve_module._MAX_RECONNECT_DELAY_S
     assert deadlines and set(deadlines) == {original_deadline}
