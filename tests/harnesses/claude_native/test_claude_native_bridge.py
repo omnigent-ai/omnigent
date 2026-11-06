@@ -84,7 +84,8 @@ from omnigent.inner.datamodel import (
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
-from tests._helpers.stdio_jsonrpc import read_json_line, stop_process, write_json_line
+from tests._helpers.live_server import terminate_process
+from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
 
 
 @pytest.fixture(autouse=True)
@@ -4794,7 +4795,7 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
             "experimental", {}
         )
     finally:
-        stop_process(proc)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
@@ -7517,7 +7518,7 @@ async def test_channel_server_relays_active_omnigent_tools(
     finally:
         if relay is not None:
             relay.close()
-        stop_process(proc)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_call_relay_tool_returns_mcp_error_on_read_timeout(
@@ -7784,7 +7785,7 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
         httpd.shutdown()
         httpd.server_close()
         server_thread.join(timeout=5.0)
-        stop_process(proc)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.parametrize("concurrent_method", ["ping", "tools/call"])
@@ -17139,7 +17140,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         pending_approvals.resolve("elicit_cancel_relay", False)
         if stop != "relay_close":
             relay.close()
-        stop_process(proc)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.asyncio

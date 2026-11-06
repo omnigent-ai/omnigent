@@ -29,8 +29,9 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from tests._helpers.live_server import terminate_process
 from tests._helpers.managed_mcp import expand_entry_value
-from tests._helpers.stdio_jsonrpc import read_json_line, stop_process, write_json_line
+from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
 
 
 class _SDKClient:
@@ -3920,7 +3921,7 @@ def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: s
             while not replies or replies[-1].get("id") != request["id"]:
                 replies.append(read_json_line(process.stdout, timeout_s=30))
     finally:
-        stop_process(process)
+        terminate_process(process, timeout_s=5)
     return replies
 
 
@@ -4392,7 +4393,7 @@ def test_seatbelt_relay_answers_with_its_control_socket_dir_still_uncreated(
             listed = read_json_line(child.stdout, timeout_s=30)["result"]["tools"]
             assert [tool["name"] for tool in listed] == ["sys_ping"]
         finally:
-            stop_process(child)
+            terminate_process(child, timeout_s=5)
     finally:
         relay.close()
         loop.close()
