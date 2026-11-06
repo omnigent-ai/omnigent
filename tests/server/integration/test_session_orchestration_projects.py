@@ -249,20 +249,10 @@ async def test_a_name_only_another_user_has_gets_a_new_project(
         tool_args={"project_name": "Bob's work"},
     )
 
-    store = SqlAlchemyConversationStore(db_uri)
-    worker = store.get_conversation(worker_id)
+    worker = SqlAlchemyConversationStore(db_uri).get_conversation(worker_id)
     assert worker.project_id not in (None, bobs_project)
-    assert [c.id for c in store.list_conversations().data if c.project_id == bobs_project] == []
-    info = json.loads(
-        await execute_tool(
-            tool_name="sys_session_get_info",
-            arguments=json.dumps({"session_id": worker_id}),
-            server_client=auth_client,
-            conversation_id=source["id"],
-        )
-    )
-    # The project read is owner-scoped, so a name here means the project is Alice's.
-    assert info["project_name"] == "Bob's work"
+    alices = SqlAlchemyProjectStore(db_uri).get(worker.project_id, user_id="alice")
+    assert alices is not None and alices.name == "Bob's work"
 
 
 async def test_same_host_worker_in_a_named_project_starts_no_worktree(

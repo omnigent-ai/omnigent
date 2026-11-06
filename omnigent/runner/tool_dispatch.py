@@ -5416,11 +5416,12 @@ async def _project_name_or_none(
             f"/v1/projects/{_route_identifier(project_id, 'Project')}", timeout=30.0
         )
         if resp.status_code != 200:
+            _logger.debug("Project %s name read returned HTTP %s", project_id, resp.status_code)
             return None
-        name = resp.json().get("name")
-    except Exception:  # noqa: BLE001
+        return _optional_string(resp.json().get("name"))
+    except Exception:
+        _logger.debug("Project %s name read failed", project_id, exc_info=True)
         return None
-    return name if isinstance(name, str) else None
 
 
 async def _session_get_info_via_rest(
@@ -5443,8 +5444,7 @@ async def _session_get_info_via_rest(
     ``GET /v1/runners/{id}/status`` (``runner_online`` is ``None`` when
     the lookup fails or no runner is bound); host readiness is likewise
     best-effort via ``GET /v1/hosts/{id}``, and the project name via
-    ``GET /v1/projects/{id}`` (``None`` when the lookup fails or the project
-    isn't the caller's). The full transcript is
+    ``GET /v1/projects/{id}``. The full transcript is
     intentionally omitted — that is what ``sys_session_get_history`` returns.
 
     Maps a 404 to ``session_not_found`` and 401/403 to ``access_denied``

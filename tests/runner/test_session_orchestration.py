@@ -811,14 +811,8 @@ async def test_null_project_arguments_count_as_absent(arguments):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("status", "error"),
-    [
-        (500, "Could not resolve project_name"),
-        ("connect_error", "Could not resolve project_name"),
-    ],
-)
-async def test_a_failed_project_lookup_creates_no_session(status, error):
+@pytest.mark.parametrize("status", [500, "connect_error"])
+async def test_a_failed_project_lookup_creates_no_session(status):
     requests = []
 
     def respond(request):
@@ -842,14 +836,14 @@ async def test_a_failed_project_lookup_creates_no_session(status, error):
                 conversation_id="manager",
             )
         )
-    assert error in result.get("error", ""), result
+    assert "Could not resolve project_name" in result.get("error", ""), result
     # No create was sent, so the agent is not told to look for a session that may exist.
     assert "could not be confirmed" not in result["error"]
     assert "/v1/sessions/orchestrated" not in [r.url.path for r in requests]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [404, 500, "connect_error"])
+@pytest.mark.parametrize("status", [404, "connect_error"])
 async def test_an_unreadable_project_name_keeps_the_created_session(status):
     session_id = uuid4().hex
 

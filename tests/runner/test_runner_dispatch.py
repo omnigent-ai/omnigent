@@ -9304,17 +9304,19 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("host_response", [httpx.Response(503), httpx.Response(200, text="bad")])
-async def test_sys_session_get_info_tolerates_host_readiness_failure(
-    host_response: httpx.Response,
+@pytest.mark.parametrize("read_response", [httpx.Response(503), httpx.Response(200, text="bad")])
+async def test_sys_session_get_info_tolerates_host_and_project_read_failures(
+    read_response: httpx.Response,
 ) -> None:
     from omnigent.runner.tool_dispatch import execute_tool
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/sessions/conv_target":
-            return httpx.Response(200, json={"id": "conv_target", "host_id": "host_1"})
-        if request.url.path == "/v1/hosts/host_1":
-            return host_response
+            return httpx.Response(
+                200, json={"id": "conv_target", "host_id": "host_1", "project_id": "proj_1"}
+            )
+        if request.url.path in ("/v1/hosts/host_1", "/v1/projects/proj_1"):
+            return read_response
         return httpx.Response(404)
 
     async with httpx.AsyncClient(
@@ -9328,7 +9330,10 @@ async def test_sys_session_get_info_tolerates_host_readiness_failure(
             conversation_id="conv_caller",
         )
 
-    assert json.loads(output)["configured_harnesses"] is None
+    info = json.loads(output)
+    assert info["configured_harnesses"] is None
+    assert info["project_id"] == "proj_1"
+    assert info["project_name"] is None
 
 
 @pytest.mark.asyncio
