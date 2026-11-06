@@ -181,6 +181,28 @@ def test_parse_absent_section_disables_managed_hosts() -> None:
     assert parse_sandbox_config(None) is None
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_ttl"),
+    [(None, MODAL_MANAGED_TOKEN_TTL_S), (300, 300), (3600, 3600), (31_536_000, 31_536_000)],
+)
+def test_parse_token_ttl_override(value: int | None, expected_ttl: int) -> None:
+    config = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+    )
+    assert config is not None
+    assert config.default.token_ttl_s == expected_ttl
+
+
+@pytest.mark.parametrize(
+    "value", [False, True, 300.0, 300.5, "3600", 0, -1, 299, 31_536_001, 10**400]
+)
+def test_parse_token_ttl_rejects_malformed_value(value: object) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.token_ttl_s"):
+        parse_sandbox_config(
+            {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+        )
+
+
 def test_parse_reaper_defaults_disabled_with_thirty_day_cutoff() -> None:
     """Managed sandbox cleanup is opt-in and defaults to a 30-day age."""
     config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
@@ -4658,14 +4680,14 @@ def test_deployment_rejects_empty_configs() -> None:
 
 def test_parse_multi_provider_shares_top_level_keys() -> None:
     """
-    ``server_url`` / ``host_config`` are written once and ride into
-    every entry.
+    Shared server, host, and token settings apply to every entry.
     """
     host_config: dict[str, object] = {"telemetry": {"enabled": False}}
     config = parse_sandbox_config(
         {
             "server_url": "https://s.example.com",
             "host_config": host_config,
+            "token_ttl_s": 3600,
             "providers": [{"provider": "modal"}, {"provider": "e2b"}],
         }
     )
@@ -4673,6 +4695,27 @@ def test_parse_multi_provider_shares_top_level_keys() -> None:
     for entry in config.offered():
         assert entry.server_url == "https://s.example.com"
         assert entry.host_config == host_config
+        assert entry.token_ttl_s == 3600
+
+
+def test_parse_multi_provider_token_ttl_overrides_shared_value() -> None:
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "token_ttl_s": 3600,
+            "providers": [
+                {"provider": "modal", "token_ttl_s": 600},
+                {"provider": "daytona", "token_ttl_s": None},
+                {"provider": "blaxel", "token_ttl_s": None, "blaxel": {"ttl": "24h"}},
+            ],
+        }
+    )
+    assert config is not None
+    assert [entry.token_ttl_s for entry in config.offered()] == [
+        600,
+        DAYTONA_MANAGED_TOKEN_TTL_S,
+        blaxel_managed_token_ttl_s("24h"),
+    ]
 
 
 def test_parse_multi_provider_validates_provider_blocks() -> None:
