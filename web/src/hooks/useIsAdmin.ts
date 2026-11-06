@@ -18,9 +18,8 @@ export function useIsAdmin(): boolean {
       return getCurrentIsAdmin();
     },
     staleTime: 30_000,
-    // Seed from the already-resolved cache so first paint is correct when
-    // identity resolved during boot (the common case).
-    initialData: getCurrentIsAdmin,
+    // Preserve cached access on first paint while still awaiting pending identity.
+    placeholderData: getCurrentIsAdmin,
   });
-  return data;
+  return data ?? false;
 }

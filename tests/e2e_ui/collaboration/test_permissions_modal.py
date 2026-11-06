@@ -502,17 +502,16 @@ def test_multi_user_admin_can_toggle_admin_mode(
         for section in ("members", "sharing", "policies"):
             expect(page.get_by_test_id(f"settings-nav-{section}")).to_have_count(0)
 
-        admin_mode.check()
+        admin_mode.click()
         expect(admin_mode).to_be_checked(timeout=30_000)
         for section in ("members", "sharing", "policies"):
             expect(page.get_by_test_id(f"settings-nav-{section}")).to_be_visible()
-        identity_url = f"{multi_user_server.public_url}/v1/me"
-        assert page.request.get(identity_url).json()["is_admin"] is True
+        assert page.evaluate("async () => (await fetch('/v1/me')).json()")["is_admin"] is True
 
-        admin_mode.uncheck()
+        admin_mode.click()
         expect(admin_mode).not_to_be_checked(timeout=30_000)
         for section in ("members", "sharing", "policies"):
             expect(page.get_by_test_id(f"settings-nav-{section}")).to_have_count(0)
-        identity = page.request.get(identity_url).json()
+        identity = page.evaluate("async () => (await fetch('/v1/me')).json()")
         assert identity["is_admin"] is False
         assert identity["can_enable_admin_mode"] is True
