@@ -277,7 +277,7 @@ async def test_prompt_logs_measure_delivery_and_locate_failures(
 
     async def dispatch(conv, task):
         if native_refusal:
-            conv = SimpleNamespace(**vars(conv), kind="default", harness_override="claude-native")
+            conv = SimpleNamespace(**vars(conv), harness_override="claude-native")
             conv.labels = {**conv.labels, "omnigent.wrapper": "claude-native"}
         if post_acceptance:
             async with httpx.AsyncClient(
