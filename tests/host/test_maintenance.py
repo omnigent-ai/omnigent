@@ -19,6 +19,7 @@ from omnigent.process_logging import (
     create_process_log_path,
     open_process_log_file,
     process_log_lease_marker,
+    unlink_closed_process_log,
 )
 
 
@@ -155,6 +156,50 @@ def test_process_log_cleanup_preserves_files_when_lease_cannot_be_proven(
     assert path.exists()
     assert process_log_lease_marker(path).exists()
     assert not eligible.exists()
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+@pytest.mark.parametrize("replaced", ["log", "marker"])
+def test_process_log_cleanup_preserves_a_path_replaced_during_lease_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replaced: str
+) -> None:
+    path = create_process_log_path("runner", root=tmp_path)
+    os.utime(path, (0, 0))
+    marker = process_log_lease_marker(path)
+    selected = path if replaced == "log" else marker
+    original = selected.with_name(selected.name + ".moved")
+    flock = maintenance.fcntl.flock
+
+    def replace_after_lock(fd: int, operation: int) -> None:
+        flock(fd, operation)
+        if operation & maintenance.fcntl.LOCK_EX:
+            selected.rename(original)
+            selected.symlink_to(original)
+
+    monkeypatch.setattr(maintenance.fcntl, "flock", replace_after_lock)
+    assert not unlink_closed_process_log(path, before=1.0)
+    assert selected.is_symlink()
+    assert original.exists()
+    assert path.exists() and marker.exists()
+
+
+@pytest.mark.skipif(maintenance.fcntl is None, reason="process-log leases require flock")
+@pytest.mark.parametrize("replaced", ["log", "marker"])
+@pytest.mark.parametrize("special", ["symlink", "fifo"])
+def test_process_log_cleanup_requires_regular_unfollowed_files(
+    tmp_path: Path, replaced: str, special: str
+) -> None:
+    path = create_process_log_path("runner", root=tmp_path)
+    marker = process_log_lease_marker(path)
+    selected = path if replaced == "log" else marker
+    original = selected.with_name(selected.name + ".moved")
+    selected.rename(original)
+    if special == "symlink":
+        selected.symlink_to(original)
+    else:
+        os.mkfifo(selected)
+    assert not unlink_closed_process_log(path, before=1.0)
+    assert selected.lstat() and original.exists()
 
 
 def test_process_log_cleanup_handles_missing_directory(tmp_path: Path) -> None:

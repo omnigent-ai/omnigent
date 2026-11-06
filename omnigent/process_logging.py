@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from io import TextIOWrapper
 from pathlib import Path
+from stat import S_ISREG
 from typing import BinaryIO, TextIO, TypedDict, cast
 
 from omnigent._platform import IS_POSIX
@@ -125,6 +126,21 @@ def process_log_lease_marker(path: Path) -> Path:
     return path.with_name(path.name + ".lease-v1")
 
 
+def _read_process_log_lease_marker(marker: Path) -> str | None:
+    """Read only a regular allocation marker without following a replacement link."""
+    with os.fdopen(
+        os.open(marker, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "r", encoding="ascii"
+    ) as stream:
+        info = os.fstat(stream.fileno())
+        if not S_ISREG(info.st_mode):
+            return None
+        value = stream.read(128)
+        current = marker.lstat()
+        if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            return None
+        return value
+
+
 def _lock_process_log_writer(path: Path, stream: BinaryIO | TextIO) -> None:
     """Keep the allocated log's inode leased for this descriptor's lifetime."""
     if fcntl is None:
@@ -132,7 +148,7 @@ def _lock_process_log_writer(path: Path, stream: BinaryIO | TextIO) -> None:
     marker = process_log_lease_marker(path)
     try:
         stat = os.fstat(stream.fileno())
-        if marker.read_text(encoding="ascii") != f"{stat.st_dev}:{stat.st_ino}\n":
+        if _read_process_log_lease_marker(marker) != f"{stat.st_dev}:{stat.st_ino}\n":
             return
     except (OSError, UnicodeError):
         return
@@ -142,7 +158,7 @@ def _lock_process_log_writer(path: Path, stream: BinaryIO | TextIO) -> None:
         # An unleased writer makes this allocation ineligible for cleanup.
         marker.unlink(missing_ok=True)
         return
-    current = path.stat()
+    current = path.lstat()
     if (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino):
         raise OSError("process log changed while acquiring its writer lease")
 
@@ -155,17 +171,17 @@ def unlink_closed_process_log(
         return False
     marker = process_log_lease_marker(path)
     try:
-        if path.is_symlink() or marker.is_symlink():
-            return False
-        with path.open("r+b") as stream:
+        with os.fdopen(os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK), "r+b") as stream:
+            if not S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return False
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             stat = os.fstat(stream.fileno())
-            current = path.stat()
+            current = path.lstat()
             if (
                 (before is not None and stat.st_mtime >= before)
                 or (empty_only and stat.st_size != 0)
                 or (current.st_dev, current.st_ino) != (stat.st_dev, stat.st_ino)
-                or marker.read_text(encoding="ascii") != f"{stat.st_dev}:{stat.st_ino}\n"
+                or _read_process_log_lease_marker(marker) != f"{stat.st_dev}:{stat.st_ino}\n"
             ):
                 return False
             path.unlink()
