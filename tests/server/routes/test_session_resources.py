@@ -3876,20 +3876,74 @@ async def test_github_pr_diff_proxies_whole_patch(client: httpx.AsyncClient) -> 
 async def test_github_commit_diff_forwards_the_commit_to_the_runner(
     client: httpx.AsyncClient,
 ) -> None:
-    """GET /resources/github/diff?commit_sha=... proxies that one commit's patch."""
+    """GET /resources/github/commit-diff?commit_sha=... proxies that one commit's patch."""
     payload = {"object": "session.github.pr_diff", "patch": "commit patch\n"}
     fake_runner = _FakeRunnerClient(payload=payload)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     commit = "c" * 40
 
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/diff",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff",
         params={"commit_sha": commit},
     )
 
     assert resp.status_code == 200
     assert resp.json() == payload
     assert {"commit_sha": commit} in fake_runner.get_params
+    assert (
+        "GET",
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff",
+    ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+async def test_github_commit_diff_on_a_runner_without_the_route_is_not_a_whole_pr_patch(
+    client: httpx.AsyncClient,
+) -> None:
+    """A runner that predates the commit route answers 404, never the whole-PR patch."""
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/commit-diff"
+    fake_runner = _FakeRunnerClient(
+        responses={path: (404, {"detail": "Not Found"})},
+        payload={"object": "session.github.pr_diff", "patch": "whole PR patch"},
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path, params={"commit_sha": "c" * 40})
+
+    assert resp.status_code == 404
+    assert "whole PR patch" not in resp.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource", "params", "detail"),
+    [
+        ("commits", {}, "Expected head_sha to be a full commit SHA"),
+        (
+            "commits",
+            {"head_sha": "a" * 40},
+            "The pull request changed; refresh to see its latest revision.",
+        ),
+        ("commit-diff", {"commit_sha": "abc"}, "Expected commit_sha to be a full commit SHA"),
+        (
+            "commit-diff",
+            {"commit_sha": "e" * 40},
+            "That commit is not part of the selected pull request.",
+        ),
+    ],
+)
+async def test_github_commit_rejections_keep_the_runner_status_and_detail(
+    client: httpx.AsyncClient, resource: str, params: dict[str, str], detail: str
+) -> None:
+    """A runner 400 keeps its status and detail; the public route must not flatten it to 502."""
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(path, params={"pr_url": "https://github.com/a/b/pull/1", **params})
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": detail}
 
 
 @pytest.mark.asyncio
@@ -10578,6 +10632,7 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("", "github_info"),
         ("/changes", "github_changes"),
         ("/commits", "github_commits"),
+        ("/commit-diff", "github_commit_diff"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
         ("/labels", "github_labels"),
@@ -10608,6 +10663,8 @@ async def test_selected_pr_reaches_offline_host(
         params.update(after="cursor", head_sha="a" * 40, base_sha="b" * 40)
     if resource == "/commits":
         params["head_sha"] = "a" * 40
+    if resource == "/commit-diff":
+        params["commit_sha"] = "c" * 40
     response = await offline_env_client.get(
         f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}", params=params
     )
@@ -10615,6 +10672,10 @@ async def test_selected_pr_reaches_offline_host(
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"]["pr_url"] == url
+    if resource == "/commits":
+        assert captured["params"]["head_sha"] == "a" * 40
+    if resource == "/commit-diff":
+        assert captured["params"]["commit_sha"] == "c" * 40
     if resource.startswith("/review-threads"):
         assert captured["params"]["after"] == "cursor"
         if resource.endswith("/comments"):

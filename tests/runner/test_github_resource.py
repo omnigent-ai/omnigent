@@ -992,13 +992,16 @@ def test_github_pr_commits_list_oldest_first_with_title_and_author(
     assert "--slurp" in listing
 
 
-def test_github_pr_commits_cap_at_250_and_report_more(monkeypatch: pytest.MonkeyPatch) -> None:
-    entries = [_commit_entry(f"{index:040x}", f"Commit {index}") for index in range(250)]
-    _stub_pr_commits(monkeypatch, head=_HEAD, total=251, pages=[entries])
+def test_github_pr_commits_cap_at_250_keeping_the_first_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [_commit_entry(f"{index:040x}", f"Commit {index}") for index in range(255)]
+    _stub_pr_commits(monkeypatch, head=_HEAD, total=255, pages=[entries[:100], entries[100:]])
 
     result = github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
 
-    assert (len(result["data"]), result["has_more"]) == (250, True)
+    assert [item["sha"] for item in result["data"]] == [f"{index:040x}" for index in range(250)]
+    assert result["has_more"] is True
 
 
 def test_github_pr_commits_refuse_a_moved_head_before_listing(
@@ -1011,38 +1014,110 @@ def test_github_pr_commits_refuse_a_moved_head_before_listing(
     assert not any(call[-1].endswith("/commits?per_page=100") for call in calls)
 
 
-def test_github_commit_patch_reads_one_commit_as_a_diff(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_github_pr_commits_refuse_a_head_that_moves_while_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    heads = iter([_HEAD, "c" * 40])
     calls: list[list[str]] = []
 
     def fake_gh(
         argv: Sequence[str], *, cwd: str, token: str | None = None
     ) -> tuple[int, str, str]:
         calls.append(list(argv))
-        return 0, "diff --git a/x b/x\n", ""
+        if argv[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": next(heads)}, "base": {"sha": _BASE}, "commits": 1}
+            return 0, json.dumps(pr), ""
+        return 0, json.dumps([[_commit_entry(_COMMIT_ONE, "Add")]]), ""
 
     monkeypatch.setattr(github_resource, "_gh", fake_gh)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
 
+    with pytest.raises(ValueError, match="pull request changed"):
+        github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+    assert any(call[-1].endswith("/commits?per_page=100") for call in calls)
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ((1, "", "timeout"), "could not load the PR's commits"),
+        ((0, "not json", ""), "invalid commit list"),
+        ((0, json.dumps({"object": "list"}), ""), "invalid commit list"),
+    ],
+)
+def test_github_pr_commits_listing_failures_are_not_empty_successes(
+    monkeypatch: pytest.MonkeyPatch, response: tuple[int, str, str], message: str
+) -> None:
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps({"head": {"sha": _HEAD}, "base": {"sha": _BASE}}), ""
+        return response
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+
+    with pytest.raises(ValueError, match=message):
+        github_resource._pr_commits("/root", _PR, head_sha=_HEAD)
+
+
+def _stub_commit_patch(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    listed: list[str],
+    patch_response: tuple[int, str, str],
+) -> list[list[str]]:
+    """Answer the commit listing with ``listed`` shas and the diff with ``patch_response``."""
+    calls: list[list[str]] = []
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        calls.append(list(argv))
+        if argv[-1].endswith("/commits?per_page=100"):
+            return 0, json.dumps([[_commit_entry(sha, "Commit") for sha in listed]]), ""
+        return patch_response
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    return calls
+
+
+def test_github_commit_patch_reads_one_commit_as_a_diff(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _stub_commit_patch(
+        monkeypatch, listed=[_COMMIT_ONE], patch_response=(0, "diff --git a/x b/x\n", "")
+    )
+
     result = github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)
 
     assert result == {"object": "session.github.pr_diff", "patch": "diff --git a/x b/x\n"}
-    assert calls == [
-        [
-            "api",
-            "--hostname",
-            "github.com",
-            "-H",
-            "Accept: application/vnd.github.diff",
-            f"repos/example/two/commits/{_COMMIT_ONE}",
-        ]
+    assert calls[-1] == [
+        "api",
+        "--hostname",
+        "github.com",
+        "-H",
+        "Accept: application/vnd.github.diff",
+        f"repos/example/two/commits/{_COMMIT_ONE}",
     ]
+
+
+def test_github_commit_patch_refuses_a_commit_outside_the_pull_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _stub_commit_patch(
+        monkeypatch, listed=[_COMMIT_ONE], patch_response=(0, "other repo commit", "")
+    )
+
+    with pytest.raises(ValueError, match="not part of the selected pull request"):
+        github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_TWO)
+    assert not any("/commits/" in call[-1] for call in calls)
 
 
 def test_github_commit_patch_failure_is_not_an_empty_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(github_resource, "_gh", lambda *_a, **_kw: (1, "", "not found"))
-    monkeypatch.setattr(github_resource, "_pr_token", lambda *_args: None)
+    _stub_commit_patch(monkeypatch, listed=[_COMMIT_ONE], patch_response=(1, "", "not found"))
 
     with pytest.raises(ValueError, match="could not load the commit's diff"):
         github_resource._pr_commit_patch("/root", _PR, commit_sha=_COMMIT_ONE)

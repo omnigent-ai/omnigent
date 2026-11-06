@@ -1567,7 +1567,7 @@ def _check_pr_revision(
     moved_head = _api_string(pr, "head", "sha") != head_sha
     moved_base = base_sha is not None and _api_string(pr, "base", "sha") != base_sha
     if moved_head or moved_base:
-        raise ValueError("The pull request changed; refresh before viewing its conversations.")
+        raise ValueError("The pull request changed; refresh to see its latest revision.")
     return pr
 
 
@@ -1640,20 +1640,24 @@ def _pr_commits(root: str, reference: PullRequestRef, *, head_sha: str) -> dict[
 def _pr_commit_patch(root: str, reference: PullRequestRef, *, commit_sha: str) -> dict[str, Any]:
     """Return one commit's patch, read as GitHub's diff media type for that commit.
 
-    The caller has checked ``commit_sha`` is a full object id, so the patch is the
-    commit the user selected, not a branch that may have moved.
+    The commit must be one of the pull request's own commits; otherwise any commit
+    the token can read in the repository would be served. ``commit_sha`` is a full
+    object id, so the patch is the commit the user selected.
     """
-    rc, out, _ = _gh(
-        [
-            "api",
-            *_host_args(root, reference),
-            "-H",
-            "Accept: application/vnd.github.diff",
-            f"repos/{reference.repository}/commits/{commit_sha}",
-        ],
-        cwd=root,
-        token=_pr_token(root, reference),
-    )
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        if commit_sha not in {entry["sha"] for entry in _pr_commit_entries(root, reference)}:
+            raise ValueError("That commit is not part of the selected pull request.")
+        rc, out, _ = _gh(
+            [
+                "api",
+                *_host_args(root, reference),
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{reference.repository}/commits/{commit_sha}",
+            ],
+            cwd=root,
+            token=_pr_token(root, reference),
+        )
     if rc != 0:
         raise ValueError("GitHub could not load the commit's diff. Refresh or open it on GitHub.")
     return {"object": PR_DIFF_OBJECT, "patch": out}

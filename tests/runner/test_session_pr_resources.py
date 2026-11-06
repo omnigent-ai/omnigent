@@ -606,12 +606,16 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
             params={"pr_url": B, "head_sha": "d" * 40},
         )
         patch = await client.get(
-            "/v1/sessions/session/resources/github/diff",
+            "/v1/sessions/session/resources/github/commit-diff",
             params={"pr_url": B, "commit_sha": commit},
         )
         malformed = await client.get(
-            "/v1/sessions/session/resources/github/diff",
+            "/v1/sessions/session/resources/github/commit-diff",
             params={"pr_url": B, "commit_sha": "abc"},
+        )
+        foreign = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "e" * 40},
         )
 
     assert commits.status_code == 200, commits.text
@@ -634,8 +638,10 @@ async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
     assert "pull request changed" in moved.json()["detail"]
     assert patch.status_code == 200, patch.text
     assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
-    assert "Accept: application/vnd.github.diff" in gh_args[-1]
+    assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
     assert malformed.status_code == 400
+    assert foreign.status_code == 400
+    assert foreign.json()["detail"] == "That commit is not part of the selected pull request."
 
 
 @pytest.fixture
