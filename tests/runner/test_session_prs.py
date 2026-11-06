@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 from filelock import FileLock
 
-from omnigent.runner.pr_observer import extract_prs, observe_hook
+from omnigent.runner import pr_observer
+from omnigent.runner.pr_observer import _shell_segments, extract_prs, observe_hook
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from tests.budgets import budget
 
@@ -760,6 +761,162 @@ def test_mixed_operations_do_not_claim_creation() -> None:
     refs, created = extract_prs("Bash", {"command": "gh pr create; gh pr edit 42"}, A)
     assert [ref.url for ref in refs] == [A]
     assert not created
+
+
+_CREATED_A = {"stdout": A, "gitOperation": {"pr": {"url": A, "action": "created"}}}
+
+
+@pytest.mark.parametrize(
+    "command,result,urls,created",
+    [
+        pytest.param(
+            "cd /worktree && GH_TOKEN=$(gh auth token --user example-user) gh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="unquoted-substitution-assignment",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<'EOF'\n## Summary\nWe don't wait (anymore.\ngh pr view 7\nEOF\n"
+            "gh pr create --title t --body-file /tmp/body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="heredoc-body-then-create",
+        ),
+        pytest.param(
+            "cat > /tmp/body.md <<-EOF\n\tIt's done.\n\tEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="tab-stripped-heredoc",
+        ),
+        pytest.param(
+            "cat > notes.md <<'EOF'\ngh pr create\nEOF\ngh pr view 42",
+            A,
+            [],
+            False,
+            id="heredoc-body-is-not-run",
+        ),
+        pytest.param(
+            f'TOKEN=$(printf token # ) ; gh pr create\n)\nprintf "%s\\n" {A}',
+            {"stdout": A},
+            [],
+            False,
+            id="comment-inside-substitution",
+        ),
+        pytest.param(
+            f"cat <<EOF\nwe're not done\\\nEOF\ngh pr create\n{A}\nEOF",
+            {"stdout": A},
+            [],
+            False,
+            id="unquoted-heredoc-joins-continued-line",
+        ),
+        pytest.param(
+            "cat <<'EOF'\nwe're not done\\\nEOF\ngh pr create",
+            {"stdout": A},
+            [A],
+            True,
+            id="quoted-heredoc-keeps-continued-line",
+        ),
+        pytest.param(
+            # Read as a heredoc, ``shift`` would close a body holding the create.
+            "(( count = 8 << shift ))\ngh pr create --title t\nshift",
+            {"stdout": A},
+            [A],
+            True,
+            id="arithmetic-shift",
+        ),
+        pytest.param(
+            # Read as a heredoc, the closing ``EOF`` would swallow the create.
+            ": ${BODY:-<<EOF }\ngh pr create --title t\nEOF",
+            {"stdout": A},
+            [A],
+            True,
+            id="heredoc-text-in-parameter-expansion",
+        ),
+        pytest.param(
+            "cat <<\\\nEOF\ngh pr view 7\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-heredoc-delimiter",
+        ),
+        pytest.param(
+            "cat <<\\\n-EOF\n\tgh pr view 7\n\tEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="continued-tab-stripping-operator",
+        ),
+        pytest.param(
+            "cat <<EOF\r\ngh pr create\r\nEOF\r\ngh pr view 7",
+            {"stdout": A},
+            [],
+            False,
+            id="crlf-heredoc",
+        ),
+        pytest.param(
+            "cat <<'EOF' # PR body\ntext\nEOF\ngh pr create --title t",
+            {"stdout": A},
+            [A],
+            True,
+            id="comment-after-heredoc-operator",
+        ),
+        pytest.param(
+            "cat > body.md <<'EOF' # PR body\ntext\nEOF\ngh pr create --body-file body.md",
+            _CREATED_A,
+            [A],
+            True,
+            id="comment-after-heredoc-operator-with-metadata",
+        ),
+        pytest.param(
+            # Escapes in a delimiter are not modelled, so the command is lexed as before.
+            'cat <<"E\\$OF"\nbody\nE$OF\ngh pr create --title t',
+            {"stdout": A},
+            [A],
+            True,
+            id="unsupported-delimiter-uses-plain-lexing",
+        ),
+    ],
+)
+def test_create_beside_substitution_and_heredoc(
+    command: str, result: object, urls: list[str], created: bool
+) -> None:
+    refs, was_created = extract_prs("Bash", {"command": command}, result)
+    assert [ref.url for ref in refs] == urls
+    assert was_created is created
+
+
+def test_unquoted_substitution_stays_one_exact_token() -> None:
+    segments = _shell_segments("GH_TOKEN=$(gh auth token --user me) gh pr create")
+    assert [segment.raw_tokens for segment in segments] == [
+        ("GH_TOKEN=$(gh auth token --user me)", "gh", "pr", "create")
+    ]
+
+
+def test_heredoc_operator_reads_a_bounded_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    scanned: list[int] = []
+
+    class CountingSlices(str):
+        def __getitem__(self, key: object) -> str:
+            text = str.__getitem__(self, key)  # type: ignore[call-overload]
+            scanned.append(len(text))
+            return text
+
+    calls: list[int] = []
+    original = pr_observer._heredoc_operator_text
+
+    def counting(command: str, start: int) -> tuple[str, bool]:
+        calls.append(start)
+        return original(CountingSlices(command), start)
+
+    monkeypatch.setattr(pr_observer, "_heredoc_operator_text", counting)
+    operators = 500
+    # Continuations between operators would make an unbounded reader rescan the line.
+    _shell_segments("cat " + ("<<A " + "\\\n" * 50) * operators + "\n")
+    assert 0 < len(calls) <= operators
+    assert sum(scanned) <= pr_observer._HEREDOC_OPERATOR_LIMIT * len(calls)
 
 
 @pytest.mark.parametrize("tool_name", ["Bash", "exec_command"])

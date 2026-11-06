@@ -713,6 +713,73 @@ def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_
     assert proc.poll() == 3
 
 
+@pytest.mark.parametrize("actual_exit", [0, 7, -signal.SIGTERM])
+def test_concurrent_poll_preserves_known_exit(
+    monkeypatch: pytest.MonkeyPatch, actual_exit: int
+) -> None:
+    """A late unavailable-control fallback cannot replace a real exit reply."""
+    monkeypatch.setattr(psutil, "Process", Mock(return_value=Mock()))
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    actual_reply_ready = threading.Event()
+    release_actual_reply = threading.Event()
+    second_poll_ready = threading.Event()
+    release_fallback = threading.Event()
+    poll_lock = getattr(proc, "_poll_lock", threading.Lock())
+    exchanges: list[str] = []
+
+    class ObservePollLock:
+        def __enter__(self):
+            if not poll_lock.acquire(blocking=False):
+                second_poll_ready.set()
+                poll_lock.acquire()
+
+        def __exit__(self, *_exc):
+            poll_lock.release()
+
+    class PausedExitReply(dict):
+        def get(self, key, default=None):
+            # The manager's exchange lock has already been released here.
+            actual_reply_ready.set()
+            assert release_actual_reply.wait(timeout=5)
+            return super().get(key, default)
+
+    def exchange(request, *, zygote_generation=None):
+        with manager._lock:
+            exchanges.append(request["cmd"])
+            if len(exchanges) == 1:
+                return PausedExitReply(returncode=actual_exit)
+            raise ZygoteUnavailable("control lost after the real exit reply")
+
+    def runner_alive(pid):
+        assert pid == 123
+        second_poll_ready.set()
+        assert release_fallback.wait(timeout=5)
+        return False
+
+    # The lock observation and fallback provide the same barrier on old/new code.
+    monkeypatch.setattr(proc, "_poll_lock", ObservePollLock(), raising=False)
+    monkeypatch.setattr(manager, "_exchange", exchange)
+    monkeypatch.setattr(_proc, "process_alive", runner_alive)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        try:
+            first = workers.submit(proc.poll)
+            assert actual_reply_ready.wait(timeout=5)
+            second = workers.submit(proc.poll)
+            assert second_poll_ready.wait(timeout=5)
+            release_actual_reply.set()
+            assert first.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            release_fallback.set()
+
+            assert second.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            assert exchanges == ["poll"]
+        finally:
+            release_actual_reply.set()
+            release_fallback.set()
+
+
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
     """Forking after stop() raises ZygoteUnavailable so the daemon can fall back.
 

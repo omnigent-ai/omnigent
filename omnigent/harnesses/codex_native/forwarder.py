@@ -7782,12 +7782,12 @@ def _codex_tool_call_from_item(item: _JsonObject) -> _CodexToolCall | None:
 # guidance so a top-level session degrades with direction instead of an opaque
 # failure. The codex
 # ``--approval-mode`` presets do NOT disable this sandbox — only the "Full
-# access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
+# Access" preset's ``danger-full-access`` (or a config ``sandbox_mode``) does.
 _CODEX_SANDBOX_NAMESPACE_ERROR_MARKER = "No permissions to create new namespace"
 _CODEX_SANDBOX_BYPASS_GUIDANCE = (
     "Omnigent: Codex's command sandbox could not start because this container "
     "disallows unprivileged user namespaces, so the command did not run. To run "
-    'shell commands here, start a new Codex session with the "Full access" '
+    'shell commands here, start a new Codex session with the "Full Access" '
     "approval preset (New chat → permissions dropdown), or set "
     'sandbox_mode = "danger-full-access" in ~/.codex/config.toml on the runner.'
 )
