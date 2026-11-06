@@ -22,6 +22,8 @@
  *   stays fitted until the user pans or zooms by hand.
  * - The selected canvas lives in `?canvas=<id>` so a reload keeps the tab, and
  *   is remembered per server so coming back to `/canvas` reopens it.
+ * - With `canvas_whiteboard`, each canvas also carries a drawing layer
+ *   (`CanvasWhiteboard`), saved in localStorage beside the card layout.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -68,11 +70,14 @@ import {
 } from "@/canvas/canvasStorage";
 import { usePullRequests, type CanvasPullRequests } from "@/canvas/pullRequests";
 import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
+import { CanvasWhiteboard } from "@/canvas/CanvasWhiteboard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { NewProjectButton } from "@/shell/NewProjectButton";
@@ -154,6 +159,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const { trackClick } = useOmnigentAnalytics();
   const { fitView, getViewport, setViewport } = useReactFlow();
   const viewerId = useViewerId();
+  const whiteboardEnabled = isFeatureEnabled(useServerInfo(), "canvas_whiteboard");
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
@@ -681,6 +687,7 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
             onFit={() => fitCanvas(200)}
             onReset={resetLayout}
           />
+          {whiteboardEnabled && <CanvasWhiteboard canvasId={activeCanvas} viewerId={viewerId} />}
         </ReactFlow>
         {emptyState}
         <Button

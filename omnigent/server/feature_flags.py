@@ -29,6 +29,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    CANVAS_WHITEBOARD = "canvas_whiteboard"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
@@ -112,6 +113,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CANVAS_WHITEBOARD,
+        description="Canvas whiteboard: freehand strokes, frames, notes and arrows on each canvas",
+        owner="web",
+        review_by_release="0.25.0",
     ),
     FeatureDefinition(
         feature=Feature.ARCA_SHUTDOWN_WARNINGS,

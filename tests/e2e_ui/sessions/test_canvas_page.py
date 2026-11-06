@@ -15,12 +15,18 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
 def _stub_server_info(
-    page: Page, *, canvas: bool, usage: bool = False, session_pull_requests: bool = False
+    page: Page,
+    *,
+    canvas: bool,
+    usage: bool = False,
+    session_pull_requests: bool = False,
+    whiteboard: bool = False,
 ) -> None:
     """Advertise one deterministic ``canvas`` release-feature value.
 
     :param session_pull_requests: Whether the server stores session PRs, so
         Canvas cards read them from the session list rather than each runner.
+    :param whiteboard: Whether ``canvas_whiteboard`` adds the drawing layer.
     """
     body = json.dumps(
         {
@@ -28,7 +34,12 @@ def _stub_server_info(
             "single_user": True,
             "login_url": None,
             "needs_setup": False,
-            "features": {"canvas": canvas, "usage_page": usage, "harness_install": False},
+            "features": {
+                "canvas": canvas,
+                "canvas_whiteboard": whiteboard,
+                "usage_page": usage,
+                "harness_install": False,
+            },
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "session_pull_requests": session_pull_requests,
@@ -300,3 +311,92 @@ def test_canvas_cards_follow_live_session_updates(page: Page, live_server: str) 
         timeout=10_000
     )
     assert len(canvas_list_requests) == requests_after_load
+
+
+def _center(box: dict[str, float] | None) -> tuple[float, float]:
+    assert box is not None
+    return box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+
+
+def _drag(page: Page, start: tuple[float, float], end: tuple[float, float]) -> None:
+    page.mouse.move(*start)
+    page.mouse.down()
+    page.mouse.move(*end, steps=12)
+    page.mouse.up()
+
+
+def test_canvas_whiteboard_draws_on_the_board_and_keeps_the_drawing(
+    page: Page,
+    live_server: str,
+) -> None:
+    """An arrow between two cards, a named frame, a note and a pen stroke are drawn in the
+    board's coordinates, survive a reload, and leave Select free to open a card."""
+    page.set_viewport_size({"width": 1280, "height": 900})
+    sessions = [
+        _session("plan", "Plan the release", 2, owner="local"),
+        _session("build", "Build the release", 1, owner="local"),
+    ]
+    _stub_server_info(page, canvas=True, whiteboard=True)
+    page.route("**/v1/sessions?*", _serve_list(sessions))
+    page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=[]))
+
+    page.goto(f"{live_server}/canvas")
+    cards = page.get_by_test_id("session-card")
+    expect(cards).to_have_count(2)
+    plan = cards.filter(has_text="Plan the release")
+    build = cards.filter(has_text="Build the release")
+    toolbar = page.get_by_role("toolbar", name="Whiteboard")
+
+    toolbar.get_by_role("button", name="Arrow", exact=True).click()
+    _drag(page, _center(plan.bounding_box()), _center(build.bounding_box()))
+    expect(page.get_by_test_id("whiteboard-arrow")).to_have_count(1)
+
+    plan_box = plan.bounding_box()
+    build_box = build.bounding_box()
+    assert plan_box is not None and build_box is not None
+    left = min(plan_box["x"], build_box["x"]) - 40
+    top = min(plan_box["y"], build_box["y"]) - 40
+    right = max(plan_box["x"] + plan_box["width"], build_box["x"] + build_box["width"]) + 40
+    bottom = max(plan_box["y"] + plan_box["height"], build_box["y"] + build_box["height"]) + 40
+    toolbar.get_by_role("button", name="Frame", exact=True).click()
+    _drag(page, (left, top), (right, bottom))
+    expect(page.get_by_test_id("whiteboard-frame")).to_have_count(1)
+    page.get_by_text("Untitled frame", exact=True).dblclick()
+    page.get_by_role("textbox", name="Frame name").fill("Release train")
+    page.keyboard.press("Enter")
+
+    toolbar.get_by_role("button", name="Note", exact=True).click()
+    page.mouse.click(left + 120, bottom + 110)
+    page.get_by_role("textbox", name="Note text").fill("Ship after review")
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("note", name="Ship after review")).to_be_visible()
+
+    toolbar.get_by_role("button", name="Draw", exact=True).click()
+    page.mouse.move(right + 60, top + 20)
+    page.mouse.down()
+    for step in range(1, 13):
+        page.mouse.move(right + 60 + step * 8, top + 20 + (step % 2) * 30)
+    page.mouse.up()
+    toolbar.get_by_role("button", name="Select", exact=True).click()
+    expect(page.get_by_test_id("whiteboard-stroke")).to_have_count(1)
+    stroke_coordinates = page.evaluate(
+        """() => Object.entries(localStorage)
+            .filter(([key]) => key.startsWith("omnigent:canvas-whiteboard:"))
+            .flatMap(([, value]) => JSON.parse(value).elements)
+            .filter((element) => element.kind === "stroke")
+            .flatMap((element) => element.points)"""
+    )
+    # Pen samples follow the pointer rather than the cards' 32px snap grid.
+    assert any(value % 32 for value in stroke_coordinates)
+
+    page.reload()
+    expect(cards).to_have_count(2)
+    expect(page.get_by_test_id("whiteboard-arrow")).to_have_count(1)
+    expect(page.get_by_test_id("whiteboard-frame")).to_have_count(1)
+    expect(page.get_by_text("Release train", exact=True)).to_be_visible()
+    expect(page.get_by_role("note", name="Ship after review")).to_be_visible()
+    expect(page.get_by_test_id("whiteboard-stroke")).to_have_count(1)
+
+    # Drawings sit above the cards without taking their clicks.
+    plan.click()
+    expect(page).to_have_url(re.compile(r"/canvas/c/plan$"))

@@ -34,6 +34,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
+        "canvas_whiteboard": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
         "custom_agents_settings_ui": True,
