@@ -18,7 +18,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useLocation, useNavigate, useSearchParams } from "@/lib/routing";
+import { useNavigate, useReplaceSearchParams, useSearchParams } from "@/lib/routing";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation } from "@/canvas/canvasNavigation";
 import { MobileHeaderControlPortal } from "./MobileHeaderControlsSlot";
@@ -2161,7 +2161,7 @@ function NewChatWorkspaceControls({
 
 export function NewChatLandingScreen() {
   const navigate = useNavigate();
-  const location = useLocation();
+  const replaceSearchParams = useReplaceSearchParams();
   const [searchParams] = useSearchParams();
   const linkedPrompt = searchParams.get("prompt");
   const handoffToken = searchParams.get(NEW_SESSION_HANDOFF_PARAM);
@@ -2393,19 +2393,8 @@ export function NewChatLandingScreen() {
     remaining.delete("prompt");
     remaining.delete(NEW_SESSION_HANDOFF_PARAM);
     forgetNewSessionHandoff(handoffToken);
-    navigate(
-      { pathname: location.pathname, search: remaining.toString(), hash: location.hash },
-      { replace: true, state: location.state },
-    );
-  }, [
-    linkedPrompt,
-    handoffToken,
-    searchParams,
-    location.pathname,
-    location.hash,
-    location.state,
-    navigate,
-  ]);
+    replaceSearchParams(remaining);
+  }, [linkedPrompt, handoffToken, searchParams, replaceSearchParams]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.

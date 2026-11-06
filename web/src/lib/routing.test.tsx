@@ -1,7 +1,13 @@
 import { cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
-import { MemoryRouter, type To } from "react-router-dom";
+import { MemoryRouter, type To, useLocation, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { basenamedRouting, Link as RoutingLink, reactRouterRouting } from "./routing";
+import {
+  basenamedRouting,
+  Link as RoutingLink,
+  reactRouterRouting,
+  RoutingProvider,
+  useReplaceSearchParams,
+} from "./routing";
 import { setOmnigentHostConfig } from "@/lib/host";
 
 // `basenamedRouting` is the embed seam: it rebases web's absolute
@@ -85,6 +91,56 @@ describe("basenamedRouting navigation", () => {
     expect(result.current).toBe(navigate);
     await result.current("/c/abc");
     expect(baseNavigate).toHaveBeenCalledWith("/next/c/abc", undefined);
+  });
+});
+
+describe("local query replacement", () => {
+  it("preserves path, fragment and state and replaces history without host navigation", () => {
+    const hostNavigate = vi.fn();
+    function QueryEditor() {
+      const replaceSearch = useReplaceSearchParams();
+      const location = useLocation();
+      const navigate = useNavigate();
+      return (
+        <>
+          <output>{JSON.stringify({ ...location, key: undefined })}</output>
+          <button type="button" onClick={() => replaceSearch(new URLSearchParams({ o: "123" }))}>
+            Consume prompt
+          </button>
+          <button type="button" onClick={() => navigate(-1)}>
+            Back
+          </button>
+        </>
+      );
+    }
+    const view = render(
+      <MemoryRouter
+        initialEntries={[
+          "/previous",
+          {
+            pathname: "/omnigent",
+            search: "?o=123&prompt=hello",
+            hash: "#composer",
+            state: { context: "retained" },
+          },
+        ]}
+      >
+        <RoutingProvider value={{ ...reactRouterRouting, useNavigate: () => hostNavigate }}>
+          <QueryEditor />
+        </RoutingProvider>
+      </MemoryRouter>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Consume prompt" }));
+    expect(JSON.parse(view.getByRole("status").textContent!)).toEqual({
+      pathname: "/omnigent",
+      search: "?o=123",
+      hash: "#composer",
+      state: { context: "retained" },
+    });
+    expect(hostNavigate).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(JSON.parse(view.getByRole("status").textContent!).pathname).toBe("/previous");
+    view.unmount();
   });
 });
 

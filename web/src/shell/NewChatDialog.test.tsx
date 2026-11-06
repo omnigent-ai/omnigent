@@ -1385,11 +1385,14 @@ function LandingNavigationProbe() {
   );
 }
 
+const hostNavigationCalls = vi.fn();
+
 function useHostNavigate(): ReturnType<typeof useNavigate> {
   const navigate = useNavigate();
   // Embedded hosts serialize partial paths; createPath defaults a missing pathname to "/".
   return useCallback(
     (to: To | number, options?: NavigateOptions) => {
+      hostNavigationCalls(to, options);
       if (typeof to === "number") return navigate(to);
       return navigate(typeof to === "string" ? to : createPath(to), options);
     },
@@ -1481,6 +1484,7 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 
 describe("prompt URL handoff", () => {
   beforeEach(setupLandingMocks);
+  beforeEach(() => hostNavigationCalls.mockClear());
 
   it.each(["/omnigent", "/omnigent/", "/tools/omnigent"])(
     "keeps an embedded prompt link under %s with host navigation",
@@ -1495,6 +1499,7 @@ describe("prompt URL handoff", () => {
         `${pathname}?o=123#composer`,
       );
       expect(authenticatedFetchMock).not.toHaveBeenCalled();
+      expect(hostNavigationCalls).not.toHaveBeenCalled();
     },
   );
 
