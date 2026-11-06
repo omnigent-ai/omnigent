@@ -15,7 +15,7 @@ class WorkspaceSessionProbeTest {
 
         assertEquals(WorkspaceSessionCheck.Valid, check)
         val request = transport.requests.single()
-        assertEquals(URI("https://dbc-123.cloud.databricks.com/omnigent/v1/me"), request.uri)
+        assertEquals(URI("https://dbc-123.cloud.databricks.com/omnigent/v1/me?o=42"), request.uri)
         assertEquals("DBAUTH=session-value", request.headers["Cookie"])
     }
 

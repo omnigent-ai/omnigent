@@ -63,8 +63,17 @@ internal class WorkspaceSessionProbe(
         }
     }
 
-    private fun identityUri(pageUri: URI): URI =
-        URI(pageUri.scheme, pageUri.authority, "$WORKSPACE_UI_PATH/v1/me", null, null)
+    /** Keeps the `?o=` workspace selector: a shared host routes by it, not by hostname. */
+    private fun identityUri(pageUri: URI): URI {
+        val workspace = queryItems(pageUri).firstOrNull { it.first == "o" }?.second
+        return URI(
+            pageUri.scheme,
+            pageUri.authority,
+            "$WORKSPACE_UI_PATH/v1/me",
+            workspace?.let { "o=$it" },
+            null,
+        )
+    }
 
     private fun redirectsToSignIn(
         requested: URI,
