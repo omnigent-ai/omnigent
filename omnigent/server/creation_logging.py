@@ -68,7 +68,6 @@ def session_created(
     parent_session_id: str | None = None,
     *,
     agent_id: str | None = None,
-    created_by_session_id: str | None = None,
     harness: str | None = None,
     created_by_session_id: str | None = None,
 ) -> None:

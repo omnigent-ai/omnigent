@@ -12354,7 +12354,6 @@ async def _create_session_from_existing_agent(
         conv.id,
         conv.runner_id,
         parent_session_id=body.parent_session_id,
-        created_by_session_id=created_by_session_id,
         agent_id=conv.agent_id,
         harness=selected_harness,
         created_by_session_id=created_by_session_id,
