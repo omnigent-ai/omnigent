@@ -1,3 +1,4 @@
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import {
   act,
   cleanup,
@@ -523,6 +524,33 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("keeps numbered tab picks in a focused strip while a question waits", () => {
+    writeDefaultWorkspaceTab("changes");
+    const { onRightRailTabChange } = renderWorkspace({ rightRailTab: "changes" });
+    render(
+      <AskUserQuestionForm
+        elicitationId="elic_strip"
+        questions={[
+          {
+            id: "pick",
+            question: "Pick one",
+            multiSelect: false,
+            options: [{ label: "First" }, { label: "Second" }],
+          },
+        ]}
+        onSubmit={vi.fn()}
+        onReject={vi.fn()}
+        keyboardActive
+      />,
+    );
+    const changes = screen.getByRole("tab", { name: "Changes" });
+    changes.focus();
+    fireEvent.keyDown(changes, { key: "2" });
+
+    expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+    expect(screen.getByLabelText("Second")).not.toBeChecked();
   });
 
   it("selects permanent tabs by their visible number while the tab strip is focused", () => {

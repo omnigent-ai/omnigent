@@ -57,6 +57,8 @@ function MermaidFullscreen({ blockRef }: { blockRef: RefObject<HTMLDivElement | 
             onClick={(e) => {
               if (e.target === e.currentTarget) close();
             }}
+            // Page-wide shortcuts (a pending question's keys) leave Escape to this view.
+            data-fullscreen-overlay=""
             role="presentation"
           >
             <Button

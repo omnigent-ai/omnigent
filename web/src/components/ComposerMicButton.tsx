@@ -531,6 +531,7 @@ export const ComposerMicButton = ({
       aria-label={a11yLabel}
       data-composer-action="microphone"
       data-server-dictation-available={serverAvailable}
+      data-dictating={isListening || undefined}
       title={tooltip}
       className={cn(
         "size-9 mobile-touch-target md:size-8",
