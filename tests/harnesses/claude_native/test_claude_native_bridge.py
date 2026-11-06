@@ -14802,6 +14802,7 @@ _REPLY_QUOTING_DIALOGS_PANE = """\
         (_PERMISSION_PROMPT_PANE, False),
         (_REWIND_PANE, False),
         (_SETTINGS_PANEL_PANE, False),
+        (_TASK_DETAILS_PANE, False),
         ("", False),
     ],
     ids=[
@@ -14819,6 +14820,7 @@ _REPLY_QUOTING_DIALOGS_PANE = """\
         "permission-prompt",
         "rewind",
         "settings-panel",
+        "task-details",
         "empty",
     ],
 )

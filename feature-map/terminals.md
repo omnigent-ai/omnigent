@@ -35,7 +35,7 @@ reattach when the session moves to another host.
   need input, and the sidebar row moves to Needs attention with a "May need input"
   tag, until the input box returns. `!` shell mode, the ctrl+r history search
   and a draft quoting a dialog's title keep the input box in use, so they do
-  not count as hidden.
+  not count as hidden. A runner connected to an older server sends no alert.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 

@@ -383,6 +383,8 @@ _IN_FLIGHT_SESSION_STATUSES = ("running", "waiting")
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
 _server_version: str | None = None
+# Whether the server's init envelope said it accepts pane-inferred status edges.
+_server_accepts_inferred_status = False
 
 
 def _acknowledge_settings_rollback(response: Response) -> JSONResponse:
@@ -1850,7 +1852,10 @@ def create_runner_app(
             event["inferred"] = True
         _publish_event(session_id, event)
 
-    resource_registry.set_session_status_publisher(_publish_session_status)
+    resource_registry.set_session_status_publisher(
+        _publish_session_status,
+        accepts_inferred_status=lambda: _server_accepts_inferred_status,
+    )
     resource_registry.set_session_failure_publisher(
         lambda session_id, detail: _publish_session_status(
             session_id, "failed", failure_detail=detail
@@ -2332,6 +2337,8 @@ def create_runner_app(
         return runner_workspace.resolve() if runner_workspace is not None else None
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
+        global _server_accepts_inferred_status
+        _server_accepts_inferred_status = False
         await _get_server_version(server_client)
         return _SessionInitContext(envelope=None)
 
@@ -2347,8 +2354,9 @@ def create_runner_app(
             raise ValueError("session initialization envelope identity mismatch")
         validate_runner_inference_config(envelope.snapshot.inference_config)
 
-        global _server_version
+        global _server_version, _server_accepts_inferred_status
         _server_version = envelope.server_version
+        _server_accepts_inferred_status = envelope.accepts_inferred_status
         snapshot = envelope.snapshot
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,

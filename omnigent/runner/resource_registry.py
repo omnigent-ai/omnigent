@@ -605,6 +605,7 @@ class SessionResourceRegistry:
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
         self._session_status_publisher: SessionStatusPublisher | None = None
+        self._accepts_inferred_status: Callable[[], bool] = lambda: False
         self._session_failure_publisher: Callable[[str, str], None] | None = None
         # Optional callback ``(session_id, running) -> None`` invoked on the
         # event loop when a claude-native session's background shells start
@@ -674,7 +675,12 @@ class SessionResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
-    def set_session_status_publisher(self, publisher: SessionStatusPublisher) -> None:
+    def set_session_status_publisher(
+        self,
+        publisher: SessionStatusPublisher,
+        *,
+        accepts_inferred_status: Callable[[], bool] = lambda: False,
+    ) -> None:
         """Install the PTY-activity-derived session-status publisher.
 
         The runner passes a callback that publishes a ``session.status``
@@ -690,8 +696,11 @@ class SessionResourceRegistry:
             *blocked_on* is a short reason the agent is parked on a dialog
             (e.g. ``"permission prompt"``), or ``None``. Edges inferred from
             the pane also pass ``inferred=True``.
+        :param accepts_inferred_status: Whether the server keeps an inferred edge
+            from reopening a finished turn. Inference stays off until it does.
         """
         self._session_status_publisher = publisher
+        self._accepts_inferred_status = accepts_inferred_status
 
     def set_session_failure_publisher(self, publisher: Callable[[str, str], None]) -> None:
         """Publish a native status failure with its available error detail on the event loop."""
@@ -1951,7 +1960,7 @@ class SessionResourceRegistry:
                                 stage="native_input",
                             ),
                         )
-            if hidden_input_box_watch is not None:
+            if hidden_input_box_watch is not None and self._accepts_inferred_status():
                 # The alert is advisory; a probe failure must not stop the watcher.
                 try:
                     _check_hidden_input_box(hidden_input_box_watch)

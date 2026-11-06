@@ -1862,6 +1862,93 @@ async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ["idle", "failed"])
+@pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
+async def test_completion_racing_an_inferred_reason_stays_final(
+    monkeypatch: pytest.MonkeyPatch, completion: str, blocked_on: str | None
+) -> None:
+    """A hook closing the turn while the relay handles an inferred reason keeps the last word."""
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    label_writes: list[ErrorDetail | None] = []
+    label_write_started = asyncio.Event()
+    release_label_write = asyncio.Event()
+
+    async def gated_label_write(
+        _session_id: str, error: ErrorDetail | None, _store: object, **_kwargs: object
+    ) -> None:
+        label_writes.append(error)
+        label_write_started.set()
+        await release_label_write.wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._persist_session_status_error_labels",
+        gated_label_write,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    release = asyncio.Event()
+    edge: dict[str, Any] = {"type": "session.status", "status": "running", "inferred": True}
+    if blocked_on is not None:
+        edge["blocked_on"] = blocked_on
+    fake_runner = _ScriptedRunnerClient(release, [edge])
+    session_id = "f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_inferred_race",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=_RecordingLabelStore(live_status="running"),  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        release.set()
+        write_started = asyncio.ensure_future(label_write_started.wait())
+        await asyncio.wait(
+            {handle.task, write_started},
+            timeout=_TASK_TIMEOUT_S,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        write_started.cancel()
+        # The Stop or StopFailure hook lands at the relay's first await.
+        sessions_module._publish_status(
+            session_id,
+            completion,
+            ErrorDetail(code="agent_error", message="hook failure")
+            if completion == "failed"
+            else None,
+        )
+        release_label_write.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        statuses = []
+        while len(statuses) < 2:
+            event = await collector.next_event()
+            if event.get("type") == "session.status":
+                statuses.append((event.get("status"), event.get("blocked_on")))
+        assert statuses == [("running", blocked_on), (completion, None)]
+        assert sessions_module._session_status_cache.get(session_id) == completion
+        assert label_writes == []
+    finally:
+        release.set()
+        release_label_write.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RegisteredRunnerHttpErrorClient:
     """Fake runner client whose transport says the runner is present but every stream open fails.
 

@@ -190,7 +190,8 @@ async def test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal(
     resources = SessionResourceRegistry(terminals)
     statuses: list[tuple[str, str | None]] = []
     resources.set_session_status_publisher(
-        lambda _session, status, blocked_on, inferred=False: statuses.append((status, blocked_on))
+        lambda _session, status, blocked_on, inferred=False: statuses.append((status, blocked_on)),
+        accepts_inferred_status=lambda: True,
     )
     alert = ("running", NATIVE_TERMINAL_PROMPT_BLOCKED_ON)
     with _slow_messages_api() as base_url:

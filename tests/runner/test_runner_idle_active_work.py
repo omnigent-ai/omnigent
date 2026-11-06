@@ -623,6 +623,41 @@ async def test_only_pane_inferred_status_is_marked_inferred() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pane_inference_waits_for_a_server_that_accepts_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only a server whose init envelope says so receives pane-inferred status."""
+    from omnigent.entities import Conversation
+    from omnigent.runner.session_init_protocol import build_runner_session_init_payload
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setattr("omnigent.runner.app._server_accepts_inferred_status", False)
+    app = await _native_app_with_session("conv_native_current_server")
+    accepts_inferred_status = app.state.session_resource_registry._accepts_inferred_status
+    assert accepts_inferred_status() is False
+    current = Conversation(
+        id="conv_native_current_server",
+        created_at=1,
+        updated_at=1,
+        agent_id="ag",
+        root_conversation_id="conv_native_current_server",
+    )
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions",
+            json=build_runner_session_init_payload(current, server_version="0.22.0"),
+        )
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is True
+        # An older server sends no envelope.
+        created = await client.post(
+            "/v1/sessions", json={"session_id": "conv_native_older_server", "agent_id": "ag"}
+        )
+        assert created.status_code == 201, created.text
+        assert accepts_inferred_status() is False
+
+
+@pytest.mark.asyncio
 async def test_required_native_terminal_exit_releases_idle_pin() -> None:
     """A required terminal that dies after delivery cannot leave the runner pinned."""
     from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle

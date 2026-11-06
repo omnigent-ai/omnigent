@@ -1043,6 +1043,7 @@ async def _observe_native_with_real_poller(
     instance: TerminalInstance | None = None,
     published: list[tuple[str, str | None]] | None = None,
     inferred_edges: list[tuple[str, str | None]] | None = None,
+    accepts_inferred_status: bool = True,
     background_publisher: Callable[[str, bool], None] | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
     """Observe a Claude terminal with a real poller and caller-written status file.
@@ -1050,6 +1051,7 @@ async def _observe_native_with_real_poller(
     :param instance: Terminal to observe; a fresh test terminal when ``None``.
     :param published: Collects each published ``(status, blocked_on)`` edge.
     :param inferred_edges: Collects the edges among them published as pane-inferred.
+    :param accepts_inferred_status: Whether the server accepts pane-inferred edges.
     """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
@@ -1081,7 +1083,9 @@ async def _observe_native_with_real_poller(
         if inferred_edges is not None and inferred:
             inferred_edges.append((status, reason))
 
-    registry.set_session_status_publisher(_publish)
+    registry.set_session_status_publisher(
+        _publish, accepts_inferred_status=lambda: accepts_inferred_status
+    )
     if background_publisher is not None:
         registry.set_session_background_publisher(background_publisher)
     await registry.observe_required_terminal(
@@ -1675,6 +1679,7 @@ async def _hidden_input_box_session(
     session_id: str,
     *,
     during_probe: Callable[[], None] | None = None,
+    accepts_inferred_status: bool = True,
 ) -> _HiddenInputBoxSession:
     """Observe a Claude terminal whose input-box probe can run *during_probe*."""
     clock = {"now": 100.0}
@@ -1700,6 +1705,7 @@ async def _hidden_input_box_session(
         instance=instance,
         published=published,
         inferred_edges=inferred_edges,
+        accepts_inferred_status=accepts_inferred_status,
     )
     return _HiddenInputBoxSession(
         on_tick, instance, registry, status_file, published, inferred_edges, clock
@@ -1791,6 +1797,21 @@ async def test_hidden_input_box_without_structured_status_publishes_no_alert(
         await session.tick_at(now, _CLAUDE_NOTICE_PANE)
     assert ("running", "terminal prompt") not in session.published
     assert session.registry.session_turn_is_active("conv_hidden_fallback")
+
+
+@pytest.mark.asyncio
+async def test_server_without_inferred_status_support_gets_no_terminal_alert(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older server could let an inferred edge reopen a finished turn, so none is sent."""
+    session = await _hidden_input_box_session(
+        tmp_path, monkeypatch, "conv_hidden_old_server", accepts_inferred_status=False
+    )
+    session.write_claude_status("busy")
+    for now in (100.0, 116.0, 140.0):
+        await session.tick_at(now, _CLAUDE_NOTICE_PANE)
+    await session.tick_at(141.0, _CLAUDE_WORKING_PANE)
+    assert session.published == [("running", None)]
 
 
 @pytest.mark.asyncio
