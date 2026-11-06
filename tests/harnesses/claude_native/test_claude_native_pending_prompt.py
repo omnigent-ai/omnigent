@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
+from tests.harnesses.claude_native.test_claude_native_bridge import _fake_tmux
 
-# The clear sent to a one-row input box: two Ctrl+K, then two Ctrl+U (CSI-u).
-_CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2
+# Two Ctrl+K, two Ctrl+U (CSI-u), then a space to hide empty-input hints.
+_CLEAR_ONE_ROW_COMPOSER = "\x1b[107;5u" * 2 + "\x1b[117;5u" * 2 + " "
 
 _QUESTION = """\
 ────────────────────────────────────────────────────────────────────────────────
@@ -175,16 +176,21 @@ def test_prompt_appearing_after_slash_paste_receives_no_submit_enter(
             if prompt is None:
                 _park_hook(native_bridge)
 
+    _fake_tmux(monkeypatch, [_COMPOSER], on_send=send)
     monkeypatch.setattr(
         bridge, "_capture_pane", lambda *_: (prompt or "") if pasted else _COMPOSER
     )
-    monkeypatch.setattr(bridge, "_run_tmux", send)
     monkeypatch.setattr(bridge, "_PASTE_COMMIT_TIMEOUT_S", 0)
     monkeypatch.setattr(bridge, "_PASTE_SETTLE_S", 0)
     with pytest.raises(bridge.ClaudeUserPromptPending):
         bridge.inject_slash_command(native_bridge, command="/model different")
     assert pasted
-    assert [args[-1] for args in sent] == ["Space", _CLEAR_ONE_ROW_COMPOSER, "/model different"]
+    assert [args[-1] for args in sent] == [
+        "Space",
+        _CLEAR_ONE_ROW_COMPOSER,
+        "BSpace",
+        "/model different",
+    ]
 
 
 @pytest.mark.parametrize(
