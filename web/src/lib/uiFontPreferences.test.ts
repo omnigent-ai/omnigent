@@ -31,7 +31,7 @@ afterEach(() => {
 describe("uiFontPreferences", () => {
   it("returns the default when nothing is stored", () => {
     expect(readUiFontSizePx()).toBe(UI_FONT_SIZE_DEFAULT);
-    expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+    expect(UI_FONT_SIZE_DEFAULT).toBe(14);
   });
 
   it("uses a 15px default on mobile without scaling explicit choices", () => {
@@ -45,8 +45,8 @@ describe("uiFontPreferences", () => {
 
   it.each([
     ["narrow viewport", true, true, 15],
-    ["wide touch viewport", false, true, 13],
-    ["wide mouse viewport", false, false, 13],
+    ["wide touch viewport", false, true, 14],
+    ["wide mouse viewport", false, false, 14],
   ] as const)("uses one applied size on a %s", (_label, narrow, coarse, size) => {
     vi.stubGlobal(
       "matchMedia",

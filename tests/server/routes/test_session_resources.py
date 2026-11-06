@@ -7879,32 +7879,64 @@ async def test_native_dispatch_host_bound_tunnel_drop_forwards_after_runner_reco
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drops_first", [False, True], ids=["timeout_first", "timeout_on_repeat"])
-async def test_native_dispatch_host_bound_non_tunnel_error_stays_durable(
+@pytest.mark.parametrize("initial_status", ["idle", "running"])
+async def test_native_dispatch_host_bound_readiness_timeout_keeps_input(
     drops_first: bool,
+    initial_status: str,
+    published_stream_events: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a lost tunnel is refused; any other transport error still fails the turn durably."""
+    """A readiness timeout cannot consume input that has not reached the native agent."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
     store = _ConversationStore()
     conv = _host_bound_native_conv(store)
+    monkeypatch.setitem(sessions_module._session_status_cache, conv.id, initial_status)
     terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
-    failures: list[Exception] = [
-        httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
-    ]
+    timeout = httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
+    failures: list[Exception] = [timeout]
     if drops_first:
         failures.insert(0, _tunnel_loss("tunnel_closed", terminals_path))
     client = _FailingEnsureRunnerClient(terminals_path, failures)
     router = _ReconnectWaitRouter(reconnects=True)
 
-    result = await _send_native_message(store, conv, client, router)
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
 
-    # A tunnel drop waits and repeats the ensure once; a timeout does neither.
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.__cause__ is timeout
+    assert "before your message was sent" in exc.value.message
     assert len(router.waits) == int(drops_first)
     ensure_attempts = [("POST", terminals_path)] * len(failures)
     assert [call for call in client.calls if call[0] == "POST"] == ensure_attempts
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+    assert sessions_module._session_status_cache[conv.id] == initial_status
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_host_bound_non_timeout_failure_stays_durable() -> None:
+    """A transport failure outside the readiness timeout keeps its existing failure."""
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [httpx.ReadError("read failed", request=_ensure_request(terminals_path))]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    result = await _send_native_message(store, conv, client, router)
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
     assert result.pending_id is None
-    assert [i.type for i in store.appended_items] == ["message", "error"]
-    error = store.appended_items[1]
-    assert error.data.code == "native_terminal_ensure_failed"
-    assert error.data.message == "Native Claude terminal ensure request failed. read timed out"
+    assert [item.type for item in store.appended_items] == ["message", "error"]
+    assert store.appended_items[1].data.code == "native_terminal_ensure_failed"
+    assert store.appended_items[1].data.message == (
+        "Native Claude terminal ensure request failed. read failed"
+    )
 
 
 @pytest.mark.asyncio
