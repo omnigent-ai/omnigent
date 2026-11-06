@@ -270,6 +270,15 @@ class WaitingOnAuthorTest(unittest.TestCase):
 
 
 class WaitingForReviewTest(unittest.TestCase):
+    def setUp(self) -> None:
+        maintainer_patch = patch.object(
+            waiting_on_author,
+            "load_maintainers",
+            return_value={"maintainer1", "active", "paused"},
+        )
+        maintainer_patch.start()
+        self.addCleanup(maintainer_patch.stop)
+
     def test_invalid_pause_config_leaves_handoff_state_unchanged(self) -> None:
         invalid_configs = [
             "{",
@@ -336,6 +345,15 @@ class WaitingForReviewTest(unittest.TestCase):
         pull = pr(assignees=["paused", "active"], requested_reviewers=["PAUSED"])
         with patch.object(
             waiting_on_author.Path, "read_text", return_value='{"assignment_paused":["Paused"]}'
+        ):
+            waiting_on_author.hand_off_to_reviewer(api, pull, "author replied")
+        self.assertEqual(api.review_requests, [(12, ["active"])])
+
+    def test_handoff_excludes_former_maintainer(self) -> None:
+        api = FakeAPI()
+        pull = pr(assignees=["PattaraS", "active"])
+        with patch.object(
+            waiting_on_author.Path, "read_text", return_value='{"assignment_paused":[]}'
         ):
             waiting_on_author.hand_off_to_reviewer(api, pull, "author replied")
         self.assertEqual(api.review_requests, [(12, ["active"])])

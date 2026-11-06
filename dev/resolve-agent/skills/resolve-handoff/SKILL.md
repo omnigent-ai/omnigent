@@ -91,7 +91,7 @@ the message. Same discipline as repro-agent:
   "ui_preview": "labeled ui-preview on every PR; preview at https://…; posted connect instructions",
   "validation_surface": "server",
   "validation_prompt": "Reproduce and validate a bug fix. Steps: open the model picker in the catalog view… Before this fix, raw catalog IDs were shown. Confirm the fix by checking that friendly labels appear. Report whether each step now behaves correctly.",
-  "maintainer_review": "requested review from @PattaraS (issue assignee)",
+  "maintainer_review": "requested review from @TomeHirata (issue assignee)",
   "review_fingerprint": "",
   "handled_review_ids": [],
   "last_pushed_sha": "",

@@ -25,6 +25,15 @@ MAX_CLOSURES_PER_RUN = 30
 REVIEW_EVENTS = {"pull_request_review", "pull_request_review_comment"}
 
 
+def load_maintainers() -> set[str]:
+    path = Path(__file__).resolve().parents[1] / "MAINTAINER"
+    return {
+        line.strip().casefold()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+
 def label_names(item: dict[str, Any]) -> list[str]:
     return [
         label.get("name", label) if isinstance(label, dict) else label
@@ -246,6 +255,7 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> b
     ):
         raise ValueError("assignment_paused must be an array of non-empty GitHub logins")
     paused = {login.casefold() for login in paused_logins}
+    maintainers = load_maintainers()
 
     number = pull["number"]
     if not remove_waiting_label(api, number, reason):
@@ -264,7 +274,10 @@ def hand_off_to_reviewer(api: GitHubAPI, pull: dict[str, Any], reason: str) -> b
             (person or {}).get("login")
             for person in (pull.get("assignees") or []) + (pull.get("requested_reviewers") or [])
         )
-        if login and login.lower() != author and login.casefold() not in paused
+        if login
+        and login.lower() != author
+        and login.casefold() in maintainers
+        and login.casefold() not in paused
     ]
     queued = api.request_review(number, sorted(set(owners))) if owners else 0
     if not queued:
