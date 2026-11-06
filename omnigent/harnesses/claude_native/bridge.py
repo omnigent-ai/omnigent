@@ -467,13 +467,10 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
-# The dismissal every surface drawn over the input box advertises in its
-# footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
-# an action with "/", so the task details panels print "Esc/Enter/Space to
-# close". A screen without a composer that lacks it is not such a surface —
-# e.g. a launch wrapper's output before Claude Code has drawn its input box —
-# and an Escape cannot clear it.
-_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)* to \w", re.IGNORECASE)
+# Surfaces drawn over the input box advertise their dismissal in the footer
+# ("Esc to cancel", "Esc/Enter/Space to close"), possibly wrapped between words.
+# Escape cannot clear a screen with neither this nor a composer, e.g. a launch wrapper's output.
+_ESCAPE_DISMISS_HINT = re.compile(r"\b(?:\w+/)*Esc(?:/\w+)*\s+to\s+\w", re.IGNORECASE)
 # Headlines of startup dialogs whose "Esc to cancel" quits Claude Code rather
 # than closing the dialog (2.1.299: the settings error exits 1, the folder-trust
 # question exits 0). Only the person may answer them.
@@ -5381,6 +5378,10 @@ def _permission_mode_from_pane(pane: str) -> str | None:
 _BTW_OVERLAY_BORDER_GLYPH = "▔"
 # Whitespace is removed from footer hints because terminal wraps can split words.
 _BTW_FOOTER_CLOSE_HINT = "Esctoclose"
+# The footer opens with a scroll hint for one turn, or a history hint once side
+# turns stack: "←/→ to switch" in older Claude Code, "⇧←/→ to browse" in 2.1.283.
+_BTW_FOOTER_SHIFT_GLYPH = "⇧"
+_BTW_FOOTER_HISTORY_HINTS = ("←/→toswitch", "←/→tobrowse")
 # A settled overlay's footer offers copy + fork; while the answer is
 # still generating the footer carries neither and a ``✻ Answering…`` line
 # shows in the region. Both conditions gate "the exchange is complete".
@@ -5393,6 +5394,10 @@ _BTW_QUESTION_PREFIX = "/btw"
 # over-flags long *complete* answers, which is acceptable for the
 # best-effort relay (the note points the reader at the terminal).
 _BTW_TRUNCATION_MIN_SPAN_ROWS = 12
+# Claude Code 2.1.318 caps the answer so the overlay leaves this many pane rows
+# for the rest of its screen, but keeps at least 5 answer rows. A short pane
+# therefore clips below the span above; an overlay reaching the cap is flagged.
+_BTW_PANE_CHROME_ROWS = 5
 
 
 @dataclass(frozen=True)
@@ -5406,7 +5411,7 @@ class BtwOverlay:
     :param answer: The visible answer text, dedented and stripped.
     :param truncated: True when the overlay likely clipped a longer
         answer (best-effort heuristic; see
-        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS`).
+        :data:`_BTW_TRUNCATION_MIN_SPAN_ROWS` and :data:`_BTW_PANE_CHROME_ROWS`).
     """
 
     question: str | None
@@ -5440,14 +5445,18 @@ def _btw_overlay_parts(pane: str) -> tuple[list[str], str] | None:
         (
             index
             for index in range(len(lines) - 1, -1, -1)
-            if lines[index].lstrip().startswith(("↑/↓", "←/→"))
+            if lines[index]
+            .lstrip()
+            .lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+            .lstrip()
+            .startswith(("↑/↓", "←/→"))
         ),
         None,
     )
     if footer_idx is None:
         return None
-    footer = "".join("".join(lines[footer_idx:]).split())
-    if not footer.startswith(("↑/↓toscroll", "←/→toswitch")) or not footer.endswith(
+    footer = "".join("".join(lines[footer_idx:]).split()).lstrip(_BTW_FOOTER_SHIFT_GLYPH)
+    if not footer.startswith(("↑/↓toscroll", *_BTW_FOOTER_HISTORY_HINTS)) or not footer.endswith(
         _BTW_FOOTER_CLOSE_HINT
     ):
         return None
@@ -5504,7 +5513,11 @@ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
     answer = _dedent_overlay_lines(answer_lines)
     if not answer:
         return None
-    truncated = len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+    truncated = (
+        len(region) + 1 >= _BTW_TRUNCATION_MIN_SPAN_ROWS
+        # The border and the footer's first row bracket the region.
+        or len(region) + 2 + _BTW_PANE_CHROME_ROWS >= len(pane.splitlines())
+    )
     return BtwOverlay(question=question, answer=answer, truncated=truncated)
 
 
@@ -5526,13 +5539,13 @@ def _btw_overlay_present(pane: str) -> bool:
     if parts is None:
         return False
     region, footer = parts
-    # The /btw footer offers copy+fork (single, settled), switch (multi-turn),
+    # The /btw footer offers copy+fork (single, settled), history (multi-turn),
     # or the region shows the answering spinner (still generating). Requiring
     # one of these keeps a model picker / confirm dialog (other "Esc to close"
     # surfaces) from matching.
     if all(hint in footer for hint in _BTW_FOOTER_COMPLETE_HINTS):
         return True
-    if "toswitch" in footer:
+    if any(hint in footer for hint in _BTW_FOOTER_HISTORY_HINTS):
         return True
     return any(_BTW_ANSWERING_HINT in line for line in region)
 
