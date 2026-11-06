@@ -1,4 +1,5 @@
 import { fireEvent, render, screen } from "@testing-library/react";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 import type { PullRequestCommit } from "@/hooks/usePullRequests";
 import { filterCommits, PullRequestCommitsList } from "./PullRequestCommitsList";
@@ -15,6 +16,24 @@ const COMMITS = [
   commit("1a2b3c4d".padEnd(40, "0"), "Add the parser", "Ada"),
   commit("9f8e7d6c".padEnd(40, "0"), "Fix the typo", "Grace"),
 ];
+
+/** The list with its query held by the caller, as the Changes tab holds it. */
+function ControlledList(props: Partial<React.ComponentProps<typeof PullRequestCommitsList>>) {
+  const [query, setQuery] = useState("");
+  return (
+    <PullRequestCommitsList
+      commits={COMMITS}
+      hasMore={false}
+      loading={false}
+      unavailable={false}
+      errorMessage={null}
+      onSelect={vi.fn()}
+      {...props}
+      query={query}
+      onQueryChange={setQuery}
+    />
+  );
+}
 
 describe("filterCommits", () => {
   it("matches a case-insensitive substring of the sha, title or author", () => {
@@ -34,15 +53,7 @@ describe("filterCommits", () => {
 describe("PullRequestCommitsList", () => {
   it("searches, selects a commit by sha, and clears the search with Escape", () => {
     const onSelect = vi.fn();
-    render(
-      <PullRequestCommitsList
-        commits={COMMITS}
-        hasMore={false}
-        loading={false}
-        errorMessage={null}
-        onSelect={onSelect}
-      />,
-    );
+    render(<ControlledList onSelect={onSelect} />);
     expect(screen.getByText("2 commits")).toBeInTheDocument();
 
     const search = screen.getByRole("searchbox", { name: "Search commits" });
@@ -55,17 +66,46 @@ describe("PullRequestCommitsList", () => {
     expect(onSelect).toHaveBeenCalledWith(COMMITS[1]!.sha);
   });
 
+  it("keeps the query in the caller, so it survives the list being rendered again", () => {
+    const onQueryChange = vi.fn();
+    const { rerender } = render(
+      <PullRequestCommitsList
+        commits={COMMITS}
+        hasMore={false}
+        loading={false}
+        unavailable={false}
+        errorMessage={null}
+        query="parser"
+        onQueryChange={onQueryChange}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("searchbox", { name: "Search commits" })).toHaveValue("parser");
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search commits" }), {
+      target: { value: "fix" },
+    });
+    expect(onQueryChange).toHaveBeenCalledWith("fix");
+    rerender(
+      <PullRequestCommitsList
+        commits={COMMITS}
+        hasMore={false}
+        loading={false}
+        unavailable={false}
+        errorMessage={null}
+        query="fix"
+        onQueryChange={onQueryChange}
+        onSelect={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /Fix the typo/ })).toBeInTheDocument();
+  });
+
   it("keeps Escape inside the search while it has a query, and passes it on when empty", () => {
     const enclosingKeyDown = vi.fn();
     render(
       <div onKeyDown={enclosingKeyDown}>
-        <PullRequestCommitsList
-          commits={COMMITS}
-          hasMore={false}
-          loading={false}
-          errorMessage={null}
-          onSelect={vi.fn()}
-        />
+        <ControlledList />
       </div>,
     );
     const search = screen.getByRole("searchbox", { name: "Search commits" });
@@ -79,51 +119,38 @@ describe("PullRequestCommitsList", () => {
   });
 
   it("says when GitHub's history is truncated", () => {
-    render(
-      <PullRequestCommitsList
-        commits={COMMITS}
-        hasMore
-        loading={false}
-        errorMessage={null}
-        onSelect={vi.fn()}
-      />,
-    );
+    render(<ControlledList hasMore />);
 
     expect(screen.getByText("History limited to 250 commits")).toBeInTheDocument();
   });
 
   it("shows loading, error and empty states in place of the list", () => {
-    const { rerender } = render(
-      <PullRequestCommitsList
-        commits={[]}
-        hasMore={false}
-        loading
-        errorMessage={null}
-        onSelect={vi.fn()}
-      />,
-    );
+    const { rerender } = render(<ControlledList commits={[]} loading />);
     expect(screen.getByText("Loading commits…")).toBeInTheDocument();
 
     rerender(
-      <PullRequestCommitsList
+      <ControlledList
         commits={[]}
-        hasMore={false}
-        loading={false}
         errorMessage="GitHub could not load the PR's commits. Refresh to retry."
-        onSelect={vi.fn()}
       />,
     );
     expect(screen.getByRole("alert")).toHaveTextContent("GitHub could not load");
 
-    rerender(
-      <PullRequestCommitsList
-        commits={[]}
-        hasMore={false}
-        loading={false}
-        errorMessage={null}
-        onSelect={vi.fn()}
-      />,
-    );
+    rerender(<ControlledList commits={[]} />);
     expect(screen.getByText("No commits on this pull request.")).toBeInTheDocument();
+  });
+
+  it("keeps the loaded commits and notes a failed refresh above them", () => {
+    render(<ControlledList errorMessage="GitHub could not load the PR's commits." />);
+
+    expect(screen.getByRole("button", { name: /Fix the typo/ })).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("GitHub could not load");
+  });
+
+  it("says the history is unavailable, rather than empty, when it cannot be read here", () => {
+    render(<ControlledList commits={[]} unavailable />);
+
+    expect(screen.getByText("Commits are unavailable.")).toBeInTheDocument();
+    expect(screen.queryByText("No commits on this pull request.")).toBeNull();
   });
 });

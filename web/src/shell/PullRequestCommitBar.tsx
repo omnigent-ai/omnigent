@@ -28,8 +28,8 @@ export function PullRequestCommitBar({
       <Button variant="ghost" size="sm" aria-label="Back to commits" onClick={onBack}>
         Back
       </Button>
-      <span className="min-w-0 flex-1 truncate text-ui" title={title ?? sha}>
-        {title ?? sha.slice(0, 7)}
+      <span className="min-w-0 flex-1 truncate text-ui" title={title ?? undefined}>
+        {title ?? "Commit"}
       </span>
       <span className="shrink-0 font-mono text-xs text-muted-foreground">{sha.slice(0, 7)}</span>
       <IconButton

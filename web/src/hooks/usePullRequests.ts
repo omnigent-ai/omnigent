@@ -874,7 +874,9 @@ export function usePullRequestCommitDiff(
     enabled: !!conversationId && !!prUrl && !!commitSha && serveable !== false,
     retry,
     retryDelay: runnerOfflineRetryDelay,
-    staleTime: Infinity,
+    // Only a response that carries the patch is final; an unavailable one is retried like any other.
+    staleTime: (query) =>
+      query.state.data && !query.state.data.unavailable_reason ? Infinity : 30_000,
     gcTime: 30 * 60_000,
   });
 }

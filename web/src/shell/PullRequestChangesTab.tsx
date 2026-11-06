@@ -73,6 +73,7 @@ import {
   type Match,
 } from "./pullRequestReview";
 import { useChangesViewState, type FindState } from "./useChangesViewState";
+import { useCommitViewState } from "./useCommitViewState";
 
 /** Index of the match a step moves to; with none active, the first or last by direction. */
 function stepTarget(activeIndex: number, direction: 1 | -1, length: number): number {
@@ -507,6 +508,11 @@ export function PullRequestChangesTab({
   const [pendingReveal, setPendingReveal] = useState<{ path: string } | null>(null);
   // The match the reader navigated to. Null until seeded when the bar opens or its query changes.
   const [findTarget, setFindTarget] = useState<Match | null>(null);
+  // A match or a pending jump belongs to the patch it was made in, so it ends with a mode or commit change.
+  useEffect(() => {
+    setFindTarget(null);
+    setPendingReveal(null);
+  }, [mode, view.commitSha]);
   // The head the shown patch was fetched for. Viewed state needs both the list and the diff
   // pinned to the same head; unpinned providers (GitLab, Azure) can't prove it, so marks are withheld.
   const pinnedHead = changes.data?.head_sha ?? null;
@@ -617,32 +623,28 @@ export function PullRequestChangesTab({
   // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
   // drive every section; a path in the set is collapsed unless it is revealed.
   const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
-  // A commit has its own collapse set, starting empty for each commit, so the PR's viewed
-  // collapses never reach its patch and it never shows the PR's collapse state.
-  const [commitCollapse, setCommitCollapse] = useState<{
-    sha: string | null;
-    paths: ReadonlySet<string>;
-  }>({ sha: null, paths: NO_HIDDEN_PATHS });
-  const commitCollapsedPaths =
-    commitCollapse.sha === view.commitSha ? commitCollapse.paths : NO_HIDDEN_PATHS;
-  const modeCollapsedPaths = commitView ? commitCollapsedPaths : collapsedPaths;
-  // Writes go to the set the shown view reads; the viewed seed and mark keep writing the PR's.
-  const setModeCollapsedPaths = useCallback(
-    (update: (prev: ReadonlySet<string>) => ReadonlySet<string>) => {
-      if (!commitView) {
-        setCollapsedPaths(update);
-        return;
-      }
-      setCommitCollapse((prev) => ({
-        sha: view.commitSha,
-        paths: update(prev.sha === view.commitSha ? prev.paths : NO_HIDDEN_PATHS),
-      }));
-    },
-    [commitView, view.commitSha],
+  // Each view reads and writes only its own collapse and reveal state. A commit's is created
+  // fresh for that commit, so nothing a commit does reaches the PR's Changes view.
+  const commitState = useCommitViewState(view.commitSha);
+  const changesState = useMemo(
+    () => ({
+      collapsedPaths,
+      revealedPaths,
+      setCollapsedPaths,
+      reveal,
+      clearReveal,
+    }),
+    [collapsedPaths, revealedPaths, reveal, clearReveal],
   );
+  const pane = commitView ? commitState : changesState;
+  const {
+    setCollapsedPaths: setPaneCollapsed,
+    clearReveal: clearPaneReveal,
+    reveal: revealPane,
+  } = pane;
   const isCollapsed = useCallback(
-    (path: string) => modeCollapsedPaths.has(path) && !revealedPaths.has(path),
-    [modeCollapsedPaths, revealedPaths],
+    (path: string) => pane.collapsedPaths.has(path) && !pane.revealedPaths.has(path),
+    [pane.collapsedPaths, pane.revealedPaths],
   );
   // Viewed files start collapsed once per rendered head. A collapse that marks introduced
   // expands again on a new head, since its mark was reset; the reader's own collapses stay.
@@ -724,9 +726,10 @@ export function PullRequestChangesTab({
   const toggleOne = useCallback(
     (path: string) => {
       const collapse = !isCollapsed(path);
-      clearReveal(path);
-      releaseMarkCollapse([path]);
-      setModeCollapsedPaths((prev) => {
+      clearPaneReveal(path);
+      // Mark ownership belongs to the PR's Changes view; a commit's toggles leave it alone.
+      if (!commitView) releaseMarkCollapse([path]);
+      setPaneCollapsed((prev) => {
         if (prev.has(path) === collapse) return prev;
         const next = new Set(prev);
         if (collapse) next.add(path);
@@ -734,14 +737,14 @@ export function PullRequestChangesTab({
         return next;
       });
     },
-    [isCollapsed, clearReveal, releaseMarkCollapse, setModeCollapsedPaths],
+    [isCollapsed, clearPaneReveal, setPaneCollapsed, commitView, releaseMarkCollapse],
   );
 
   const allCollapsed = visibleFiles.length > 0 && visibleFiles.every((f) => isCollapsed(f.path));
   const toggleAll = useCallback(() => {
-    for (const file of visibleFiles) clearReveal(file.path);
-    releaseMarkCollapse(visibleFiles.map((file) => file.path));
-    setModeCollapsedPaths((prev) => {
+    for (const file of visibleFiles) clearPaneReveal(file.path);
+    if (!commitView) releaseMarkCollapse(visibleFiles.map((file) => file.path));
+    setPaneCollapsed((prev) => {
       const next = new Set(prev);
       for (const file of visibleFiles) {
         if (allCollapsed) next.delete(file.path);
@@ -749,7 +752,14 @@ export function PullRequestChangesTab({
       }
       return next;
     });
-  }, [visibleFiles, allCollapsed, clearReveal, releaseMarkCollapse, setModeCollapsedPaths]);
+  }, [
+    visibleFiles,
+    allCollapsed,
+    clearPaneReveal,
+    setPaneCollapsed,
+    commitView,
+    releaseMarkCollapse,
+  ]);
 
   // Expand-context loader: fetch a file's full old/new content on demand when
   // the reader expands unchanged regions.
@@ -839,10 +849,10 @@ export function PullRequestChangesTab({
   const jumpTo = useCallback(
     (path: string) => {
       setActivePath(path);
-      reveal(path);
+      revealPane(path);
       setPendingReveal({ path });
     },
-    [reveal],
+    [revealPane],
   );
 
   // A filtered-out target is visible only after the filter clears. With no filter left to
@@ -939,8 +949,8 @@ export function PullRequestChangesTab({
 
   // The active match's file opens even if the reader collapsed it earlier.
   useEffect(() => {
-    if (activeFilePath) reveal(activeFilePath);
-  }, [activeFilePath, findTarget, reveal]);
+    if (activeFilePath) revealPane(activeFilePath);
+  }, [activeFilePath, findTarget, revealPane]);
 
   const stepMatch = (direction: 1 | -1) => {
     // Matches for a query still being searched would navigate the previous results.
@@ -1188,7 +1198,9 @@ export function PullRequestChangesTab({
           sidebarCollapsed={sidebarCollapsed}
           onToggleSidebar={() => setSidebarCollapsed((v) => !v)}
           filterOpen={filterOpen}
-          onToggleFilter={files.length > 0 && sidebarCollapsed ? toggleInlineFilter : undefined}
+          onToggleFilter={
+            files.length > 0 && sidebarCollapsed && !commitsView ? toggleInlineFilter : undefined
+          }
           canNavigateThreads={unresolved.length > 0 && !commitsView}
           onNavigateThread={navigateThread}
           loadingThreads={reviews.isFetching}
@@ -1311,13 +1323,17 @@ export function PullRequestChangesTab({
               commits={commitList}
               hasMore={!!commits.data?.has_more}
               loading={commits.isLoading}
+              // A disabled query has no data, and that is not the same as an empty history.
+              unavailable={commits.data === undefined && !commits.isLoading && !commits.error}
               errorMessage={commits.error ? readErrorText(commits.error) : null}
+              query={view.commitQuery}
+              onQueryChange={view.setCommitQuery}
               onSelect={view.openCommit}
             />
           ) : listing.error || shownDiff.error || parseError ? (
             <PanelMessage>
               <p role="alert">
-                {parseError || ((listing.error || shownDiff.error) as Error).message}
+                {parseError || readErrorText((listing.error || shownDiff.error) as Error)}
               </p>
             </PanelMessage>
           ) : shownDiff.data?.unavailable_reason ? (
@@ -1364,8 +1380,8 @@ export function PullRequestChangesTab({
                 fileDiff={filesByPath.get(file.path)}
                 options={diffOptions}
                 registerRef={registerRef}
-                collapsed={modeCollapsedPaths.has(file.path)}
-                forceExpanded={revealedPaths.has(file.path)}
+                collapsed={pane.collapsedPaths.has(file.path)}
+                forceExpanded={pane.revealedPaths.has(file.path)}
                 forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}

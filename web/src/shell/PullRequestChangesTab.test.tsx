@@ -36,6 +36,8 @@ const mocks = vi.hoisted(() => ({
   commitPatches: new Map<string, string>(),
   /** The commit-diff query's error, when a test wants a failed read. */
   commitDiffError: null as Error | null,
+  /** The commit list's query cannot run here, so it has no data. */
+  commitsUnavailable: false,
 }));
 vi.mock("sonner", async (importOriginal) => ({
   ...(await importOriginal<typeof SonnerModule>()),
@@ -55,7 +57,12 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
     selectLines: vi.fn(),
     cancel: vi.fn(),
   }),
-  usePullRequestCommits: () => ({ data: mocks.commitList, isLoading: false, error: null }),
+  // A disabled query has no data, as when the workspace cannot be served.
+  usePullRequestCommits: () => ({
+    data: mocks.commitsUnavailable ? undefined : mocks.commitList,
+    isLoading: false,
+    error: null,
+  }),
   usePullRequestCommitDiff: (_conversationId: string, _prUrl: string, sha: string | null) => ({
     data: sha
       ? { object: "session.github.pr_diff", patch: mocks.commitPatches.get(sha) }
@@ -1419,6 +1426,8 @@ describe("PullRequestChangesTab commits", () => {
   });
 
   beforeEach(() => {
+    // Viewed marks are keyed by identity and head, so one test's marks would leak into the next.
+    localStorage.clear();
     mocks.commitList = {
       object: "list",
       has_more: false,
@@ -1467,6 +1476,82 @@ describe("PullRequestChangesTab commits", () => {
     fireEvent.click(screen.getByRole("button", { name: "Changes" }));
     expect(viewedBox("a.ts")).toBeChecked();
     expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps the PR's collapse and reveal state through commit toggles, and resets it on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "commits-isolated", commitHistory: true }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.click(screen.getByRole("button", { name: /Add a\.ts/ }));
+    expect(isCollapsed("a.ts")).toBe(false);
+    // The commit's own collapse toggles, and a sidebar jump reveals the file, in the commit only.
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(false);
+    fireEvent.click(document.querySelector<HTMLButtonElement>('button[title="a.ts"]')!);
+
+    fireEvent.click(screen.getByRole("button", { name: "Changes" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "commits-isolated", commitHistory: true, head: "head2" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps the commit search while the reader moves between the list and a commit", () => {
+    renderTab({
+      conversationId: "commits-query",
+      commitHistory: true,
+      listing: { head_sha: "head" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search commits" }), {
+      target: { value: "add b" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Add b\.ts/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Back to commits" }));
+
+    expect(screen.getByRole("searchbox", { name: "Search commits" })).toHaveValue("add b");
+    expect(screen.queryByRole("button", { name: /Add a\.ts/ })).toBeNull();
+  });
+
+  it("shows no file-filter toggle on the narrow commit list, where its input is not shown", () => {
+    mocks.mobile = true;
+    try {
+      renderTab({
+        conversationId: "commits-narrow",
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+      expect(screen.queryByRole("button", { name: "Show file filter" })).toBeNull();
+      expect(screen.getByRole("searchbox", { name: "Search commits" })).toBeInTheDocument();
+    } finally {
+      mocks.mobile = false;
+    }
+  });
+
+  it("says the history is unavailable, not empty, when the commit query cannot run here", () => {
+    mocks.commitsUnavailable = true;
+    try {
+      renderTab({
+        conversationId: "commits-offline",
+        commitHistory: true,
+        listing: { head_sha: "head" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Commits" }));
+
+      expect(screen.getByText("Commits are unavailable.")).toBeInTheDocument();
+    } finally {
+      mocks.commitsUnavailable = false;
+    }
   });
 
   it("offers no Commits view when the provider does not list commits", () => {
@@ -1564,5 +1649,7 @@ describe("PullRequestChangesTab commits", () => {
     });
 
     expect(screen.getByText("Deleted in this commit")).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: /Open in/ })).toHaveAttribute("data-disabled");
+    expect(screen.queryByRole("link", { name: /Open in/ })).toBeNull();
   });
 });

@@ -598,4 +598,31 @@ describe("changedFilesFromPatch", () => {
       },
     ]);
   });
+  it("gives hunk-less renames and mode-only changes their status and zero counts", () => {
+    const patch = [
+      "diff --git a/a.ts b/b.ts",
+      "similarity index 100%",
+      "rename from a.ts",
+      "rename to b.ts",
+      "diff --git a/run.sh b/run.sh",
+      "old mode 100644",
+      "new mode 100755",
+      "",
+    ].join("\n");
+
+    expect(
+      changedFilesFromPatch(parsed(patch)).map(
+        ({ path, status, lines_added, lines_removed, previous_path }) => ({
+          path,
+          status,
+          lines_added,
+          lines_removed,
+          previous_path,
+        }),
+      ),
+    ).toEqual([
+      { path: "b.ts", status: "renamed", lines_added: 0, lines_removed: 0, previous_path: "a.ts" },
+      { path: "run.sh", status: "modified", lines_added: 0, lines_removed: 0, previous_path: null },
+    ]);
+  });
 });

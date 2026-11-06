@@ -1,7 +1,7 @@
 // The Commits view's list: the PR's commits, oldest first, with a substring search.
 
 import { Loader2Icon } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { Input } from "@/components/ui/input";
 import { PULL_REQUEST_COMMITS_LIMIT, type PullRequestCommit } from "@/hooks/usePullRequests";
 import { relativeTime } from "@/lib/relativeTime";
@@ -24,20 +24,29 @@ export function PullRequestCommitsList({
   commits,
   hasMore,
   loading,
+  unavailable,
   errorMessage,
+  query,
+  onQueryChange,
   onSelect,
 }: {
   commits: readonly PullRequestCommit[];
   /** True when GitHub has more commits than the list shows. */
   hasMore: boolean;
   loading: boolean;
+  /** True when the history cannot be read here, so it is not an empty history. */
+  unavailable: boolean;
   errorMessage: string | null;
+  query: string;
+  onQueryChange: (query: string) => void;
   onSelect: (sha: string) => void;
 }) {
-  const [query, setQuery] = useState("");
   const visible = useMemo(() => filterCommits(commits, query), [commits, query]);
 
   const renderBody = () => {
+    if (unavailable) {
+      return <p className="p-3 text-ui text-muted-foreground">Commits are unavailable.</p>;
+    }
     if (commits.length === 0) {
       return <p className="p-3 text-ui text-muted-foreground">No commits on this pull request.</p>;
     }
@@ -75,14 +84,15 @@ export function PullRequestCommitsList({
     );
   };
 
-  if (errorMessage) {
+  // A failed refresh keeps the history already on screen; only an empty pane shows the error alone.
+  if (errorMessage && commits.length === 0) {
     return (
       <p role="alert" className="p-3 text-ui text-destructive">
         {errorMessage}
       </p>
     );
   }
-  if (loading) {
+  if (loading && commits.length === 0) {
     return (
       <div className="flex items-center justify-center gap-2 p-4 text-ui text-muted-foreground">
         <Loader2Icon className="size-4 animate-spin" aria-hidden="true" />
@@ -103,18 +113,26 @@ export function PullRequestCommitsList({
           </span>
         )}
       </div>
+      {errorMessage && (
+        <p
+          role="alert"
+          className="shrink-0 border-b border-border px-3 py-1 text-xs text-destructive"
+        >
+          {errorMessage}
+        </p>
+      )}
       <div className="shrink-0 border-b border-border p-2">
         <Input
           type="search"
           aria-label="Search commits"
           placeholder="Search commits…"
           value={query}
-          onChange={(event) => setQuery(event.target.value)}
+          onChange={(event) => onQueryChange(event.target.value)}
           onKeyDown={(event) => {
             // Escape clears the search without closing an enclosing drawer.
             if (event.key !== "Escape" || !query) return;
             event.stopPropagation();
-            setQuery("");
+            onQueryChange("");
           }}
         />
       </div>
