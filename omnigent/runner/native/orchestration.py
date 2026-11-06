@@ -5010,7 +5010,6 @@ async def _auto_create_commandcode_terminal(
     )
     from omnigent.harnesses.commandcode_native.credentials import (
         build_commandcode_session_env,
-        commandcode_bridge_mod_arg,
         resolve_user_commandcode_home,
         write_commandcode_bridge_mod,
     )
@@ -5056,9 +5055,16 @@ async def _auto_create_commandcode_terminal(
         headers=_runner_headers,
         session_id=session_id,
     )
-    write_commandcode_bridge_mod(bridge_dir)
-    commandcode_args.extend(commandcode_bridge_mod_arg(bridge_dir))
-    commandcode_env = build_commandcode_session_env(bridge_dir)
+    # The TUI may run inside a mount namespace where the host workspace path is
+    # remapped, so pass the mod path RELATIVE to the terminal cwd (the
+    # workspace); Command Code resolves it there. `.omnigent/` is the
+    # project-owned Omnigent directory.
+    mod_rel = Path(".omnigent") / "commandcode-native" / "omnigent-bridge.ts"
+    write_commandcode_bridge_mod(bridge_dir, dest=Path(workspace) / mod_rel)
+    commandcode_args.extend(["--mod", str(mod_rel)])
+    commandcode_env = build_commandcode_session_env(
+        bridge_dir, server_url=server_url, headers=_runner_headers, session_id=session_id
+    )
 
     # Inherit the agent's os_env so its declared sandbox, egress_rules and
     # env_passthrough are honoured (otherwise launch_required_terminal falls back

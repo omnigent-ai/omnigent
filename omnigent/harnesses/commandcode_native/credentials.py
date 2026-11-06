@@ -40,13 +40,21 @@ import {readFileSync} from 'node:fs';
 const CONFIG_PATH = {config_path};
 
 export default function (cmd) {
-  let cfg = null;
+  const env = (typeof process !== 'undefined' && process.env) ? process.env : {};
+  let cfg = {};
   try {
-    cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+    cfg = JSON.parse(readFileSync(CONFIG_PATH, 'utf8')) || {};
   } catch (err) {
-    return;
+    cfg = {};
   }
-  if (!cfg) return;
+  // Prefer env-provided routing: the TUI may run inside an OS sandbox where
+  // the bridge dir is not readable, but the terminal env is inherited.
+  if (env.OMNIGENT_POLICY_EVALUATE_URL) cfg.policy_evaluate_url = env.OMNIGENT_POLICY_EVALUATE_URL;
+  if (env.OMNIGENT_PERMISSION_URL) cfg.permission_url = env.OMNIGENT_PERMISSION_URL;
+  if (env.OMNIGENT_HOOK_HEADERS) {
+    try { cfg.headers = JSON.parse(env.OMNIGENT_HOOK_HEADERS); } catch (err) {}
+  }
+  if (!cfg.policy_evaluate_url) return;
 
   const headers = Object.assign({'Content-Type': 'application/json'}, cfg.headers || {});
 
@@ -123,18 +131,24 @@ def resolve_user_commandcode_home(env: dict[str, str] | None = None) -> Path:
     return (Path(home) if home else Path.home()) / ".commandcode"
 
 
-def write_commandcode_bridge_mod(bridge_dir: Path) -> Path:
+def write_commandcode_bridge_mod(bridge_dir: Path, dest: Path | None = None) -> Path:
     """
-    Write the generated per-session Command Code mod into *bridge_dir*.
+    Write the generated per-session Command Code mod.
 
-    The mod embeds the absolute path of the bridge's ``hook_config.json`` so it
-    can read the Omnigent routing at load time.
+    The mod embeds the absolute path of the bridge's ``hook_config.json`` as a
+    fallback, but reads live routing from environment variables first (see
+    :func:`build_commandcode_session_env`). Callers that run the TUI inside an
+    OS sandbox should pass *dest* inside the workspace (a bind-mounted write
+    root) so ``cmd --mod`` can read it.
 
-    :param bridge_dir: Session bridge dir (must already hold ``hook_config.json``).
+    :param bridge_dir: Session bridge dir (should hold ``hook_config.json``).
+    :param dest: Optional destination path (e.g. inside the workspace). Defaults
+        to ``<bridge_dir>/omnigent-bridge.ts``.
     :returns: Path to the generated ``.ts`` mod (pass to ``cmd --mod``).
     """
     config_path = bridge_dir / "hook_config.json"
-    mod_path = bridge_dir / _BRIDGE_MOD_FILENAME
+    mod_path = dest or (bridge_dir / _BRIDGE_MOD_FILENAME)
+    mod_path.parent.mkdir(parents=True, exist_ok=True)
     mod_path.write_text(
         _BRIDGE_MOD_TEMPLATE.replace("{config_path}", json.dumps(str(config_path))),
         encoding="utf-8",
@@ -142,33 +156,45 @@ def write_commandcode_bridge_mod(bridge_dir: Path) -> Path:
     return mod_path
 
 
-def build_commandcode_session_env(bridge_dir: Path) -> dict[str, str]:
+def build_commandcode_session_env(
+    bridge_dir: Path,
+    *,
+    server_url: str | None = None,
+    headers: dict[str, str] | None = None,
+    session_id: str | None = None,
+) -> dict[str, str]:
     """
     Build the env additions for the spawned Command Code TUI.
 
+    Carries the Omnigent routing as **environment variables** (not only the
+    ``hook_config.json`` file) because the TUI may run inside an OS sandbox
+    where the bridge dir is not readable; the terminal env is inherited into
+    the sandbox, so the generated mod can always reach the policy endpoints.
+
     :param bridge_dir: Session bridge dir.
-    :returns: ``{"COMMANDCODE_OMNIGENT_BRIDGE": <bridge dir>}`` — the pointer the
-        generated mod (and future forwarder) can read.
+    :param server_url: Omnigent server base URL (adds the two endpoint vars).
+    :param headers: Auth headers to forward (serialized as JSON).
+    :param session_id: Omnigent session id (used to build the endpoint URLs).
+    :returns: Env additions for the terminal.
     """
     bridge_dir.mkdir(parents=True, exist_ok=True)
-    return {"COMMANDCODE_OMNIGENT_BRIDGE": str(bridge_dir)}
-
-
-def commandcode_bridge_mod_arg(bridge_dir: Path) -> list[str]:
-    """
-    Return the ``--mod`` launch-arg pair for the generated bridge mod.
-
-    :param bridge_dir: Session bridge dir.
-    :returns: ``["--mod", "<bridge dir>/omnigent-bridge.ts"]``. The file must
-        already exist (see :func:`write_commandcode_bridge_mod`).
-    """
-    return ["--mod", str(bridge_dir / _BRIDGE_MOD_FILENAME)]
+    env: dict[str, str] = {"COMMANDCODE_OMNIGENT_BRIDGE": str(bridge_dir)}
+    if server_url and session_id:
+        base = server_url.rstrip("/")
+        env["OMNIGENT_POLICY_EVALUATE_URL"] = (
+            f"{base}/v1/sessions/{session_id}/policies/evaluate"
+        )
+        env["OMNIGENT_PERMISSION_URL"] = (
+            f"{base}/v1/sessions/{session_id}/hooks/permission-request"
+        )
+    if headers is not None:
+        env["OMNIGENT_HOOK_HEADERS"] = json.dumps(headers)
+    return env
 
 
 __all__ = [
     "COMMANDCODE_HOME_ENV_VAR",
     "build_commandcode_session_env",
-    "commandcode_bridge_mod_arg",
     "resolve_user_commandcode_home",
     "write_commandcode_bridge_mod",
 ]
