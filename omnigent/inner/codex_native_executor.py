@@ -847,7 +847,7 @@ async def _wait_for_shell_completion(
 ) -> CodexNativeBridgeState:
     """Retain prompts until a standalone shell turn can no longer swallow steering."""
     timeout = _SHELL_COMPLETION_WAIT_SECONDS if wait_seconds is None else wait_seconds
-    deadline = asyncio.get_running_loop().time() + (
+    deadline: float | None = asyncio.get_running_loop().time() + (
         timeout if timeout is not None else _SHELL_UNCONFIRMED_WAIT_SECONDS
     )
     while True:
@@ -878,7 +878,9 @@ async def _wait_for_shell_completion(
             raise _CodexNativeInputUndelivered(failure, preserve_session=True)
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
-        remaining = deadline - asyncio.get_running_loop().time()
+        remaining = (
+            deadline - asyncio.get_running_loop().time() if deadline is not None else float("inf")
+        )
         if remaining <= 0:
             if not require_idle:
                 return current
@@ -891,10 +893,14 @@ async def _wait_for_shell_completion(
             if not require_idle:
                 return current
             raise
-        if confirmed and timeout is None:
-            # Unknown probes retain a finite wait; authoritative busy state renews it.
-            deadline = asyncio.get_running_loop().time() + _SHELL_UNCONFIRMED_WAIT_SECONDS
-        remaining = deadline - asyncio.get_running_loop().time()
+        if timeout is None:
+            if confirmed:
+                deadline = None
+            elif deadline is None:
+                deadline = asyncio.get_running_loop().time() + _SHELL_UNCONFIRMED_WAIT_SECONDS
+        remaining = (
+            deadline - asyncio.get_running_loop().time() if deadline is not None else float("inf")
+        )
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 
 

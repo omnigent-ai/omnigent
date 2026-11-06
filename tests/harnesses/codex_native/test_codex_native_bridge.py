@@ -1635,9 +1635,8 @@ def test_codex_interrupt_does_not_retire_another_owner(tmp_path: Path, changed_f
     replacement = replace(observed, **{changed_field: "replacement"})
     write_bridge_state(tmp_path, replacement)
     assert codex_native_bridge.record_codex_interrupt(tmp_path, expected=observed) is None
-    if changed_field != "session_id":
-        replacement = replace(replacement, interrupt_generation=1)
     assert read_bridge_state(tmp_path) == replacement
+    assert codex_native_bridge.codex_input_was_interrupted(tmp_path, replacement) is False
 
 
 def test_codex_interrupt_retires_held_input_without_retargeting_a_newer_turn(

@@ -1570,6 +1570,64 @@ def test_accepted_shell_remains_delivered_when_the_native_thread_changes(
     assert read_bridge_state(tmp_path) == replacement
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
+@pytest.mark.parametrize("confirmed", [False, True], ids=["unconfirmed", "confirmed-busy"])
+async def test_shell_completion_waits_past_legacy_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool, confirmed: bool
+) -> None:
+    from types import SimpleNamespace
+
+    _seed_bridge(tmp_path)
+    initial = read_bridge_state(tmp_path)
+    assert initial is not None
+    pending = replace(
+        initial,
+        active_shell_turn_id="turn_shell" if observed else None,
+        pending_shell_command_id=None if observed else "pending_shell",
+    )
+    write_bridge_state(tmp_path, pending)
+    elapsed = 0.0
+
+    class RunningShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            assert method == "turn/steer" and params["input"] == []
+            if elapsed > 60:
+                raise CodexAppServerResponseError(
+                    {"code": -32600, "message": "no active turn to steer"}
+                )
+            if confirmed:
+                raise CodexAppServerResponseError(
+                    {
+                        "code": -32600,
+                        "message": f"expected active turn id `{params['expectedTurnId']}` "
+                        "but found `turn_shell`",
+                    }
+                )
+            return {"result": {}}
+
+    async def advance_shell(_seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += 61
+
+    local_asyncio = SimpleNamespace(**vars(asyncio))
+    local_asyncio.get_running_loop = lambda: SimpleNamespace(time=lambda: elapsed)
+    local_asyncio.sleep = advance_shell
+    monkeypatch.setattr(codex_native_executor, "asyncio", local_asyncio)
+    wait = codex_native_executor._wait_for_shell_completion(
+        RunningShellClient(), tmp_path, pending
+    )
+    if confirmed:
+        settled = await wait
+        assert settled.active_shell_turn_id is None
+        assert settled.pending_shell_command_id is None
+    else:
+        with pytest.raises(codex_native_executor._CodexNativeInputUndelivered):
+            await wait
+        assert read_bridge_state(tmp_path) == pending
+    assert elapsed > 60
+
+
 @pytest.mark.parametrize("observed", [False, True], ids=["unobserved-shell", "observed-shell"])
 def test_shell_wait_timeout_and_cancellation_do_not_consume_followup(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, observed: bool
@@ -5124,7 +5182,7 @@ def test_large_input_without_server_receipt_contract_is_refused_before_native_su
         for kind in ("compaction", "shell")
         for outcome in ("complete", "backend-exit", "stop", "rebind")
     ]
-    + [("shell", "unverifiable")],
+    + [("shell", "unverifiable"), ("shell", "confirmation-lost")],
 )
 async def test_owned_native_wait_past_sixty_seconds(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, waiting_on: str, outcome: str
@@ -5163,7 +5221,8 @@ async def test_owned_native_wait_past_sixty_seconds(
 
     async def probe(*_args):
         await advance(0)
-        return outcome != "unverifiable"
+        assert clock <= 120, "an unconfirmed shell lost its finite fallback"
+        return outcome != "unverifiable" and (outcome != "confirmation-lost" or clock < 30)
 
     local_asyncio.sleep = advance
     monkeypatch.setattr(codex_native_executor, "asyncio", local_asyncio)
@@ -5187,6 +5246,8 @@ async def test_owned_native_wait_past_sixty_seconds(
             await wait
     if outcome == "unverifiable":
         assert 60 <= clock < 75
+    elif outcome == "confirmation-lost":
+        assert 90 <= clock < 105
     else:
         assert clock >= 75
     assert sleeps and max(sleeps) <= 0.25

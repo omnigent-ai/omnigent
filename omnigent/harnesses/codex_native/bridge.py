@@ -1799,6 +1799,13 @@ def record_codex_interrupt(
         raise ValueError("Codex Stop requires a session identity")
     with _bridge_state_lock(bridge_dir):
         current = read_bridge_state(bridge_dir)
+        if (
+            expected is not None
+            and current is not None
+            and current.session_id == session_id
+            and not _bridge_owner_matches(current, expected)
+        ):
+            return None
         generations = read_interrupt_generations(bridge_dir)
         generation = max(
             generations.get(session_id, 0), expected.interrupt_generation if expected else 0
