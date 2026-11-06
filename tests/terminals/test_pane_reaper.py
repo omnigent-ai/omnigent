@@ -28,6 +28,7 @@ from omnigent.terminals.pane_reaper import (
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
+    resolve_sub_agent_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -150,6 +151,21 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
     assert f.busy_calls == 2  # classify + re-check
 
 
+async def test_scan_reaps_sub_agent_pane_while_top_level_reaping_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
+    f = _Fakes()
+    child = _pane("conv_child", "codex")._replace(sub_agent=True)
+    f.panes = [_pane("conv_top", "codex"), child]
+    r = _make(f, timeout=0.0)
+    idle_since = time.monotonic() - _DEFAULT_IDLE_TIMEOUT_S - 1
+    r._last_busy_at = {"conv_top": idle_since, "conv_child": idle_since}
+    await r._scan_once()
+    assert f.reaped == ["conv_child"]
+    assert f.busy_calls == 2  # the child's classify + re-check; the top-level pane is not probed
+
+
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
@@ -180,6 +196,27 @@ def test_resolve_invalid_falls_back(
 ) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, bad)
     assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("env", "session_timeout_s", "expected"),
+    [
+        (None, 86400.0, _DEFAULT_IDLE_TIMEOUT_S),
+        (None, 600.0, 600.0),
+        (None, 0.0, _DEFAULT_IDLE_TIMEOUT_S),
+        ("120", 120.0, 120.0),
+        ("7200", 7200.0, 7200.0),
+        ("0", 0.0, 0.0),
+    ],
+)
+def test_resolve_sub_agent_window_caps_session_window_at_native_default(
+    monkeypatch: pytest.MonkeyPatch, env: str | None, session_timeout_s: float, expected: float
+) -> None:
+    if env is None:
+        monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_IDLE_TIMEOUT_ENV, env)
+    assert resolve_sub_agent_pane_idle_timeout_s(session_timeout_s) == expected
 
 
 # ── Loop smoke (start/shutdown + disable) ───────────────────────────────────

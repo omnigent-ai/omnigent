@@ -27,6 +27,7 @@ import pytest
 from omnigent.errors import OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
+from omnigent.runner import subagent_work
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
@@ -75,10 +76,10 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
-from omnigent.terminals.pane_reaper import PaneRef
 from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
 from tests.budgets import budget
+from tests.runner.helpers import make_test_terminal_instance
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2038,10 +2039,10 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
 
 
 @pytest.mark.parametrize("timeout_s", [86400, 0])
-def test_create_app_native_panes_inherit_runner_idle_timeout(
+def test_create_app_native_pane_idle_windows_follow_runner_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
 ) -> None:
-    """Native terminals must survive the runner's configured idle window."""
+    """Top-level native terminals survive the runner's idle window; sub-agent ones last an hour."""
     import omnigent.runner._entry as entry_mod
 
     class _FakeProcessManager:
@@ -2063,11 +2064,32 @@ def test_create_app_native_panes_inherit_runner_idle_timeout(
     reaper = app.state.native_pane_reaper
     assert reaper is not None
     assert reaper._idle_timeout_s == timeout_s
-    if timeout_s:
-        pane = PaneRef("conv_idle", "terminal:codex:main", "codex", tmp_path / "tmux.sock")
-        assert reaper._classify(0.0, [pane], busy_convs=set()) == []
-        assert reaper._classify(3601.0, [pane], busy_convs=set()) == []
-        assert reaper._classify(float(timeout_s), [pane], busy_convs=set()) == [pane]
+    resource_registry = app.state.session_resource_registry
+    for conv in ("conv_idle", "conv_child"):
+        resource_registry.terminal_registry._by_conversation[conv] = {
+            ("codex", "main"): make_test_terminal_instance("codex", "main", tmp_path / conv)
+        }
+    monkeypatch.setattr(resource_registry, "terminal_resource_role", lambda *_args: "codex-native")
+    subagent_work.register_child_session(
+        "conv_child",
+        parent_session_id="conv_parent",
+        title="worker:child",
+        tool="worker",
+        session_name="child",
+    )
+    try:
+        panes = reaper._list_native_panes()
+
+        def reapable_at(now: float) -> set[str]:
+            return {pane.conversation_id for pane in reaper._classify(now, panes, set())}
+
+        assert reapable_at(0.0) == set()
+        assert reapable_at(3599.0) == set()
+        assert reapable_at(3600.0) == {"conv_child"}
+        if timeout_s:
+            assert reapable_at(float(timeout_s)) == {"conv_idle", "conv_child"}
+    finally:
+        subagent_work.unregister_child_session("conv_child")
 
 
 def test_load_runner_idle_timeout_zero_disables_watchdog(

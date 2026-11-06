@@ -97,6 +97,8 @@ class PaneRef(NamedTuple):
     :param socket_path: tmux socket for the attached-client probe.
     :param instance: The terminal the scan listed, so a reap leaves a pane that
         replaced it in the meantime alone. ``None`` when the caller has none.
+    :param sub_agent: ``True`` when another session spawned this one, e.g. an
+        orchestrator's child. Its idle window is capped at the native default.
     """
 
     conversation_id: str
@@ -104,6 +106,7 @@ class PaneRef(NamedTuple):
     terminal_name: str
     socket_path: Path
     instance: TerminalInstance | None = None
+    sub_agent: bool = False
 
 
 def resolve_native_pane_idle_timeout_s(
@@ -140,6 +143,21 @@ def resolve_native_pane_idle_timeout_s(
     return value
 
 
+def resolve_sub_agent_pane_idle_timeout_s(session_timeout_s: float) -> float:
+    """Resolve a sub-agent's native-pane idle window in seconds.
+
+    Agent-spawned sessions are short-lived, so their window is the shorter of
+    the top-level ``session_timeout_s`` and the native-pane default; ``0`` on
+    either side means no limit from that side.
+    """
+    native_default_s = resolve_native_pane_idle_timeout_s()
+    if native_default_s <= 0:
+        return session_timeout_s
+    if session_timeout_s <= 0:
+        return native_default_s
+    return min(session_timeout_s, native_default_s)
+
+
 class NativePaneReaper:
     """Background task that reaps idle, unattended native terminal panes.
 
@@ -151,7 +169,8 @@ class NativePaneReaper:
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
-        knob; ``<= 0`` disables reaping.
+        knob; ``<= 0`` disables reaping of top-level session panes. Sub-agent
+        panes use :func:`resolve_sub_agent_pane_idle_timeout_s` of this value.
     :param reaper_interval_s: Seconds between scans.
     """
 
@@ -170,6 +189,9 @@ class NativePaneReaper:
         self._idle_timeout_s = (
             idle_timeout_s if idle_timeout_s is not None else resolve_native_pane_idle_timeout_s()
         )
+        self._sub_agent_idle_timeout_s = resolve_sub_agent_pane_idle_timeout_s(
+            self._idle_timeout_s
+        )
         self._reaper_interval_s = reaper_interval_s
         # conversation_id -> monotonic time it was last observed busy.
         self._last_busy_at: dict[str, float] = {}
@@ -183,11 +205,20 @@ class NativePaneReaper:
         self._started = True
         self._task = asyncio.create_task(self._reap_loop(), name="native-pane-idle-reaper")
         _logger.info(
-            "native pane reaper started (idle_timeout=%ss, interval=%ss%s)",
+            "native pane reaper started (idle_timeout=%ss, sub_agent_idle_timeout=%ss, "
+            "interval=%ss%s)",
             self._idle_timeout_s,
+            self._sub_agent_idle_timeout_s,
             self._reaper_interval_s,
-            "; DISABLED" if self._idle_timeout_s <= 0 else "",
+            "; DISABLED" if self._disabled else "",
         )
+
+    @property
+    def _disabled(self) -> bool:
+        return self._idle_timeout_s <= 0 and self._sub_agent_idle_timeout_s <= 0
+
+    def _pane_idle_timeout_s(self, pane: PaneRef) -> float:
+        return self._sub_agent_idle_timeout_s if pane.sub_agent else self._idle_timeout_s
 
     async def shutdown(self) -> None:
         """Cancel the reaper loop."""
@@ -202,8 +233,8 @@ class NativePaneReaper:
         """Pure idle-clock decision: which panes are reapable right now.
 
         Given the set of conversation ids observed busy this scan, maintain the
-        per-conversation idle clock and return the panes idle for at least
-        ``idle_timeout_s``. A busy pane re-arms its clock; a newly-observed idle
+        per-conversation idle clock and return the panes idle for at least their
+        idle window. A busy pane re-arms its clock; a newly-observed idle
         pane gets one full window of grace before it is eligible. No I/O, so it is
         unit-testable with an injected ``now`` and ``busy_convs``.
         """
@@ -219,7 +250,8 @@ class NativePaneReaper:
             if last is None:
                 self._last_busy_at[conv] = now
                 continue
-            if now - last >= self._idle_timeout_s:
+            timeout_s = self._pane_idle_timeout_s(pane)
+            if timeout_s > 0 and now - last >= timeout_s:
                 reapable.append(pane)
         # Forget conversations whose pane is gone so the clock map can't grow.
         for gone in self._last_busy_at.keys() - live:
@@ -233,7 +265,7 @@ class NativePaneReaper:
             except asyncio.CancelledError:
                 return
             # ``<= 0`` disables reaping entirely (mirrors the SDK reaper guard).
-            if self._idle_timeout_s <= 0:
+            if self._disabled:
                 continue
             try:
                 await self._scan_once()
@@ -241,7 +273,7 @@ class NativePaneReaper:
                 _logger.exception("native pane reaper: scan failed")
 
     async def _scan_once(self) -> None:
-        panes = self._list_native_panes()
+        panes = [p for p in self._list_native_panes() if self._pane_idle_timeout_s(p) > 0]
         now = time.monotonic()
         busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
         for pane in self._classify(now, panes, busy_convs):
@@ -255,7 +287,7 @@ class NativePaneReaper:
                 "reaping idle native pane for conversation %s (%s; idle > %.0fs)",
                 pane.conversation_id,
                 pane.terminal_name,
-                self._idle_timeout_s,
+                self._pane_idle_timeout_s(pane),
             )
             # Drop the clock entry up front: a reap failure then re-arms the grace
             # window next scan instead of permanently skipping the conversation.
