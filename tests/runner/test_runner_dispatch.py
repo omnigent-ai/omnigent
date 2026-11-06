@@ -8408,18 +8408,33 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_spawns_child_under_caller() -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [None, "message-post", "parent-snapshot", "child-snapshot"],
+    ids=[
+        "message-sent",
+        "message-failed",
+        "malformed-parent-snapshot",
+        "malformed-child-snapshot",
+    ],
+)
+async def test_sys_session_create_spawns_child_under_caller(failure: str | None) -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
     ``parent_session_id`` forced to the caller (child-only), passes the
-    agent_id, title, and a queued initial message, and returns a handle
-    carrying the new child's id. If parent_session_id weren't forced to
-    the caller, an orchestrator could create top-level/sibling sessions —
-    so the asserted request body is the security-critical check.
+    agent_id and title, and returns a handle carrying the new child's id.
+    If parent_session_id weren't forced to the caller, an orchestrator could
+    create top-level/sibling sessions — so the asserted request body is the
+    security-critical check. The initial message is sent like a by-id
+    ``sys_session_send`` so the child's completion is tracked as sub-agent
+    work that reaches the caller's inbox and wakes it. A failed send, including
+    a malformed snapshot while preparing it, leaves no tracked work and reports
+    the error with the created child's id.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     captured: dict[str, Any] = {}
+    posted: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -8433,29 +8448,74 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
                     "status": "idle",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            if failure == "parent-snapshot":
+                return httpx.Response(200, content=b"<html>proxy error</html>")
+            return httpx.Response(404, json={"error": "not found"})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            if failure == "child-snapshot":
+                return httpx.Response(200, json=["conv_child"])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "researcher",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            posted.append(json.loads(request.content))
+            if failure == "message-post":
+                return httpx.Response(500, json={"error": "events unavailable"})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
-    # Child-only: parent forced to the caller; agent + title + queued
-    # message threaded through to the create body.
+    # Child-only: parent forced to the caller; agent + title threaded
+    # through to the create body.
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
-    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    assert "initial_items" not in captured
+    assert [event["data"]["content"][0]["text"] for event in posted] == (
+        [] if failure in ("parent-snapshot", "child-snapshot") else ["start"]
+    )
     handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
+    assert handle["conversation_id"] == "conv_child", output
+    if failure is not None:
+        assert handle["error"].startswith("child session created but message failed"), output
+        assert "Do not create a replacement" in handle["error"]
+        assert entry is None
+        return
+    assert entry is not None, output
+    assert (entry.parent_session_id, entry.agent, entry.title) == (
+        "conv_caller",
+        "researcher",
+        "auth",
+    )
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+    assert handle["handle_id"] == "conv_child"
+    assert handle["status"] == "launching"
 
 
 @pytest.mark.asyncio
@@ -8532,8 +8592,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 ) -> None:
     """
     Bundle mode bundles a local agent config, POSTs the multipart
-    create with ``parent_session_id`` forced to the caller, queues the
-    optional message as the child's first event, and returns a handle
+    create with ``parent_session_id`` forced to the caller, sends the
+    optional message as tracked sub-agent work, and returns a handle
     built from the server's created-agent identifiers.
 
     The asserted multipart metadata is the security-critical check
@@ -8565,6 +8625,20 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "agent_name": "helper",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "helper",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={})
@@ -8574,21 +8648,25 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {
-                    "config_path": "helper.yaml",
-                    "title": "auth",
-                    "message": "start",
-                    "model": "databricks-claude-sonnet-4-6",
-                    "reasoning_effort": "low",
-                }
-            ),
-            server_client=server_client,
-            conversation_id="conv_caller",
-            runner_workspace=tmp_path,
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "config_path": "helper.yaml",
+                        "title": "auth",
+                        "message": "start",
+                        "model": "databricks-claude-sonnet-4-6",
+                        "reasoning_effort": "low",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                runner_workspace=tmp_path,
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
     # Exactly one multipart create; parent forced to the caller
     # (child-only), and title, model and effort threaded into the
@@ -8613,10 +8691,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         assert member is not None
         assert member.read().decode() == config_text
 
-    # The optional message was queued as the child's first user event —
-    # this is what starts the child's turn (same pattern as named send).
+    # The optional message is the child's first user event and its turn is
+    # tracked, so the completion reaches the caller like a by-id send.
     assert len(event_bodies) == 1
     assert event_bodies[0]["data"]["content"][0]["text"] == "start"
+    assert entry is not None, output
+    assert entry.parent_session_id == "conv_caller"
 
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
@@ -10188,6 +10268,68 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+async def test_spawn_async_tool_requests_wake_for_uncancelled_results(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """
+    A completed or failed background result asks the runner to wake its
+    session once the result is in the inbox. A cancelled task does not: the
+    caller that cancelled it is not waiting for the result.
+    """
+    from omnigent.runner import tool_dispatch
+
+    release = asyncio.Event()
+
+    async def _tool(**_kw: Any) -> str:
+        await release.wait()
+        if outcome == "failed":
+            raise RuntimeError("tool broke")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _tool)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    wakes: list[tuple[str, str, str, str, int]] = []
+
+    def _wake(session_id: str, handle_id: str, tool_name: str, status: str) -> None:
+        wakes.append((session_id, handle_id, tool_name, status, inbox.qsize()))
+
+    handle = json.loads(
+        tool_dispatch._spawn_async_tool(
+            {"tool": "slow", "args": "{}"},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            wake_on_async_result=_wake,
+            server_client=None,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_wake",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+    )
+    bg_task, cancel_event = tasks[handle["handle_id"]]
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    if outcome == "cancelled":
+        cancel_event.set()
+    else:
+        release.set()
+    await bg_task
+
+    assert inbox.get_nowait()["status"] == outcome
+    expected = (
+        [] if outcome == "cancelled" else [("conv_wake", handle["handle_id"], "slow", outcome, 1)]
+    )
+    assert wakes == expected
 
 
 @pytest.mark.asyncio
