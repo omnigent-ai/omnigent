@@ -1615,6 +1615,7 @@ def _build_session_response(
         # sessions whose forwarder stamps a turn id; ``None`` otherwise.
         active_response_id=_session_active_response_cache.get(conv.id),
         project_id=conv.project_id,
+        side_chat_parent_id=conv.side_chat_parent_id,
     )
 
 
@@ -2828,6 +2829,8 @@ async def _persist_external_codex_subagent_start(
     parent_conv: Conversation,
     body: SessionEventInput,
     conversation_store: ConversationStore,
+    *,
+    allow_side_chat: bool = False,
 ) -> str:
     """
     Mint or update a child Conversation for a Codex AgentControl sub-agent.
@@ -2840,6 +2843,7 @@ async def _persist_external_codex_subagent_start(
     :param parent_conv: Pre-fetched parent row.
     :param body: POST event body with ``data.thread_id`` required.
     :param conversation_store: Store for reading/creating child rows.
+    :param allow_side_chat: Whether the caller is the owner or bound runner.
     :returns: Child conversation id, e.g. ``"conv_child456"``.
     :raises OmnigentError: If ``thread_id`` is missing or parent has
         no bound agent.
@@ -2860,6 +2864,12 @@ async def _persist_external_codex_subagent_start(
         _find_codex_native_subagent_child, conversation_store, parent_id, thread_id
     )
     labels = _codex_subagent_labels_from_body(thread_id, body)
+    from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+
+    if is_side_chat_child(labels) and not allow_side_chat:
+        raise OmnigentError(
+            "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+        )
     if existing is not None:
         await asyncio.to_thread(conversation_store.set_labels, existing.id, labels)
         await record_subagent_activity(
@@ -2867,7 +2877,11 @@ async def _persist_external_codex_subagent_start(
         )
         return existing.id
     return await _create_and_publish_codex_child(
-        parent_id, parent_conv, thread_id, labels, conversation_store
+        parent_id,
+        parent_conv,
+        thread_id,
+        labels,
+        conversation_store,
     )
 
 
@@ -6150,19 +6164,20 @@ async def _ensure_native_terminal_ready(
     Ask the runner to create or return the native terminal for a message.
 
     The runner's explicit ``ensure_native_terminal`` endpoint is the
-    authoritative readiness check for native user messages. Any non-2xx
-    response or transport failure fails this user turn quickly with a
-    durable error item; a 2xx response preserves the normal boot grace
+    authoritative readiness check for native user messages. Definitive failures
+    return a durable error item; a 2xx response preserves the normal boot grace
     because the runner has accepted responsibility for terminal startup.
 
-    A runner tunnel that drops while the request is in flight is the one
-    transport failure that is not definitive: the runner is usually alive
-    but stalled and re-registers shortly. With a *runner_router* the probe
-    waits up to ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
+    A runner tunnel that drops while the request is in flight is not definitive:
+    the runner is usually alive but stalled and re-registers shortly. With a
+    *runner_router*, the probe waits up to
+    ``_NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S`` for the
     session's runner to reconnect and asks once more; the runner-side ensure
     is idempotent, so a terminal created before the drop is simply returned.
     If the tunnel is still lost, a host-bound session's send is refused
     with ``RUNNER_UNAVAILABLE`` rather than recorded as a boot failure.
+    A timed-out readiness request also leaves its input unconsumed: terminal
+    creation may still finish, but no message has reached the native agent.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g.
@@ -6176,7 +6191,7 @@ async def _ensure_native_terminal_ready(
     :returns: The probe outcome — a definitive ``error`` when the terminal
         could not start, else ``error=None``.
     :raises OmnigentError: ``RUNNER_UNAVAILABLE`` when a host-bound session's
-        runner tunnel is lost and the probe cannot reach it.
+        readiness request times out or its runner tunnel remains unreachable.
     """
     display_name, _, harness = _native_terminal_runtime(conv)
     terminal_name = _native_terminal_name_for_harness(harness)
@@ -6213,6 +6228,12 @@ async def _ensure_native_terminal_ready(
             exc_info=exc,
             extra={"session_id": session_id},
         )
+        if conv.host_id is not None and isinstance(exc, httpx.TimeoutException):
+            raise OmnigentError(
+                "The terminal readiness check timed out before your message was sent. "
+                "Retry your message.",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            ) from exc
         if conv.host_id is not None and _is_tunnel_loss(exc):
             # A lost tunnel doesn't show the terminal failed to boot; refuse the send
             # so the client keeps the message, instead of consuming it into a failed turn.
@@ -7001,6 +7022,16 @@ def _unavailable_routing_card(reason: str) -> tuple[str, dict[str, Any]]:
         :func:`_emit_server_routing_decision`.
     """
     return _UNAVAILABLE_ROUTED_MODEL, {"rationale": reason, "applied": False}
+
+
+def _opens_codex_side_chat(harness: str | None, body: SessionEventInput) -> bool:
+    """Whether this is a Codex ``/side`` command, using the runner's parser."""
+    from omnigent.harnesses.codex_native.side_chat import side_chat_question_from_content
+
+    return (
+        harness == "codex-native"
+        and side_chat_question_from_content(body.data.get("content")) is not None
+    )
 
 
 def _native_pane_harness(
@@ -7933,22 +7964,49 @@ async def _record_create_route_prompt(
 _dispatch_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
 
 
+# Sessions whose work a slash command (e.g. claude-sdk ``/clear``) is moving
+# into another session; messages to them are refused until the move ends.
+# Process-local like ``_dispatch_in_flight``.
+_session_moves_in_flight: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+
+
 @contextlib.contextmanager
-def _mark_dispatch_in_flight(conversation_id: str) -> Iterator[None]:
+def _count_in_flight(
+    counts: WorkspaceScopedCache[str, int], conversation_id: str
+) -> Iterator[None]:
+    """Count *conversation_id* in *counts* until the block exits."""
+    counts[conversation_id] = counts.get(conversation_id, 0) + 1
+    try:
+        yield
+    finally:
+        remaining = counts.get(conversation_id, 1) - 1
+        if remaining > 0:
+            counts[conversation_id] = remaining
+        else:
+            counts.pop(conversation_id, None)
+
+
+def _mark_dispatch_in_flight(conversation_id: str) -> contextlib.AbstractContextManager[None]:
     """
     Count a message as in flight for *conversation_id* until the block exits.
 
     :param conversation_id: Session/conversation identifier.
     """
-    _dispatch_in_flight[conversation_id] = _dispatch_in_flight.get(conversation_id, 0) + 1
-    try:
-        yield
-    finally:
-        remaining = _dispatch_in_flight.get(conversation_id, 1) - 1
-        if remaining > 0:
-            _dispatch_in_flight[conversation_id] = remaining
-        else:
-            _dispatch_in_flight.pop(conversation_id, None)
+    return _count_in_flight(_dispatch_in_flight, conversation_id)
+
+
+def _mark_session_moving(conversation_id: str) -> contextlib.AbstractContextManager[None]:
+    """
+    Hold *conversation_id* as moving to another session until the block exits.
+
+    :param conversation_id: Session/conversation identifier.
+    """
+    return _count_in_flight(_session_moves_in_flight, conversation_id)
+
+
+def _session_is_moving(conversation_id: str) -> bool:
+    """Whether a slash command is moving *conversation_id*'s work elsewhere."""
+    return _session_moves_in_flight.get(conversation_id, 0) > 0
 
 
 def _session_is_starting(conversation_id: str) -> bool:
@@ -8193,6 +8251,7 @@ async def _dispatch_session_event_to_runner_impl(
         if side_result is not None:
             return side_result
     if body.type == "message" and _is_native_terminal_session(conv):
+        native_harness = await asyncio.to_thread(_native_pane_harness, conv)
         # Validate before touching the runner. The ensure probe is only
         # for syntactically valid user messages; assistant/system-shaped
         # inputs should still fail locally without creating terminals.
@@ -8243,11 +8302,7 @@ async def _dispatch_session_event_to_runner_impl(
         # A codex /side command never reaches the main thread — the executor
         # forks it into a side chat — so the transcript forwarder never mirrors
         # it back and this bubble would sit in the parent chat forever.
-        from omnigent.harnesses.codex_native.side_chat import is_side_chat_command
-
-        opens_side_chat = _native_pane_harness(conv) == "codex-native" and is_side_chat_command(
-            _extract_user_text_for_routing(body)
-        )
+        opens_side_chat = _opens_codex_side_chat(native_harness, body)
         # An older host forwards `/side` to Codex as a plain prompt (no fork), so
         # the web side chat opens and hangs and the question lands on the main
         # thread. Refuse here — before the forward — with a clear reason instead.
@@ -8266,7 +8321,7 @@ async def _dispatch_session_event_to_runner_impl(
         # mirrors it back to drain an entry (the web clears its own bubble). With an attachment
         # pasted ahead of the text it is an ordinary prompt, so only text-only content counts.
         is_btw = (
-            _native_pane_harness(conv) == "claude-native"
+            native_harness == "claude-native"
             and isinstance(content, list)
             and all(
                 isinstance(block, dict) and block.get("type") == "input_text" for block in content
@@ -12297,6 +12352,7 @@ async def _create_session_from_existing_agent(
         parent_session_id=body.parent_session_id,
         agent_id=conv.agent_id,
         harness=selected_harness,
+        created_by_session_id=created_by_session_id,
     )
     telemetry.set_session_id(conv.id)
 
@@ -12543,7 +12599,7 @@ def _create_session_from_bundle(
     from omnigent.server.routes.sandbox_inference import configured_snapshot
 
     if _spec_harness(spec) == "acp" and not configured_snapshot(inference_snapshot):
-        _validate_acp_spec_models(spec)
+        _validate_acp_spec_models(spec, inference_model)
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
@@ -13969,7 +14025,7 @@ async def _get_session_snapshot(
     response.usage_included = include_usage
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:
-        queued = await startup.pending_snapshot(session_id)
+        queued, response.failed_inputs = await startup.snapshot(session_id)
         known = {item["pending_id"] for item in response.pending_inputs}
         response.pending_inputs.extend(item for item in queued if item["pending_id"] not in known)
     return response

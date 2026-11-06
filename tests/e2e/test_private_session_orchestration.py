@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -134,6 +135,11 @@ def test_private_manager_launch_send_read_and_sharing(
                         "workspace": str(stack.workspace),
                     }
                     if harness == "codex-native":
+                        # Codex's own default asks before each Omnigent tool call;
+                        # the mocked automatic reviewer approves them instead.
+                        metadata["terminal_launch_args"] = PERMISSION_LAUNCH_ARGS["codex-native"][
+                            "approve-for-me"
+                        ]
                         created = create_native_session(
                             client,
                             stack.base_url,
@@ -454,6 +460,13 @@ def test_private_manager_launch_send_read_and_sharing(
                         "agent_id": agent,
                         "host_id": host_id,
                         "workspace": str(stack.workspace),
+                        # Nobody watches an automation's turn, so Codex's own
+                        # default would park on the first Omnigent tool call.
+                        **(
+                            {"permission_mode": "approve-for-me"}
+                            if harness == "codex-native"
+                            else {}
+                        ),
                     },
                 )
                 assert response.status_code == 200, response.text

@@ -13,8 +13,10 @@ to customize.
   old template-page links open the Templates tab.
 - `preview`: empty and populated lists show suggested automations in the All
   filter with no search; searches and Active/Paused filters hide the preview.
-- `create`: a gallery item or suggested automation opens integration setup;
-  New automation opens a blank form.
+- `create`: New automation opens with Trigger type set to Schedule. Choose
+  Jira, Slack, GitHub, or Linear in the same form to configure matching items.
+  Gallery items preselect their integration. Switching types preserves each
+  draft until the dialog closes, including the schedule and any custom prompt edits.
 - `scope`: **equals** matches one project, channel, repository, or team.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
   the entered values; Slack placeholders omit the optional leading `#`.
@@ -102,15 +104,17 @@ to customize.
   keep one session, and editing keeps only the reset to a new session.
 - `responsive`: gallery items have icons, descriptions, access requirements,
   pointer cursors, and keyboard focus indicators. Continued trigger cadence is
-  fixed; other tasks expose schedule controls. The modal opens with Instructions
-  focused and Name visible above it. Run on and session mode precede Repeat and
-  Time because both determine the minimum interval. Time and timezone are separate
-  controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
+  fixed; other tasks expose schedule controls. Name comes first, followed by
+  Trigger type during creation. The modal opens with Instructions focused.
+  Agent sits directly below Run on, outside Advanced. When editing a recognized
+  trigger, Harness for matching sessions appears there instead. Run on and session
+  mode precede Repeat and Time because both determine the minimum interval. Time
+  and timezone are separate controls in the same row. Type a 12-hour or 24-hour time directly; the timezone
   opens its searchable dropdown. Custom schedules use the same typed time input.
   Advanced starts collapsed and contains Workspace or
-  Repository, Project, agent settings, and Ends. Name remains required and editable
-  without opening Advanced; changing instructions preserves it. Configured overrides
-  are summarized beside Advanced, and invalid
+  Repository, Project, model/effort/permission settings, and Ends. Name remains
+  required and editable without opening Advanced; changing instructions preserves
+  it. Configured overrides are summarized beside Advanced, and invalid
   settings reveal their controls. Escape closes the active selector or folder browser
   without discarding the automation draft. The footer stays visible while the form scrolls.
   Gallery cards use two columns on desktop and one on narrow screens.
@@ -121,10 +125,12 @@ to customize.
   follow `/tasks?view=templates`. Old `/tasks/templates` links redirect here.
 - **Your automations:** select a suggestion beneath the saved automations or
   empty-state message, with All selected and the search cleared.
-- **Creation modal:** click New automation on either tab to start from scratch.
-  Choose Run on and session mode above Repeat. Expand Advanced to change agent
-  settings or an ending. With `automations_v2` on a server supporting sub-hour
-  schedules, use Repeat → Interval
+- **Creation modal:** click New automation on either tab. Schedule is selected
+  by default; use Trigger type to select an integration and reveal its conditions
+  and session instructions. Returning to Schedule restores the schedule draft.
+  Choose Run on, Agent, and session mode above Repeat. Expand Advanced to change
+  model, effort, permissions, or an ending. With `automations_v2` on a server
+  supporting sub-hour schedules, use Repeat → Interval
   for a connected host or a continued sandbox session.
 - **Editing:** open Edit automation from a row menu or a task's detail page;
   the same workspace and sandbox Repository controls apply. Unrelated edits
@@ -146,14 +152,15 @@ No agent turn is needed.
 Minute-schedule checks use the server’s advertised sub-hour capability and `automations_v2`.
 
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`
-  covers the preview and Templates tab with reload. It creates
+  covers the preview and Templates tab with reload, plus New automation's
+  trigger selector on desktop and mobile. It creates
   a Jira automation and cross-checks the saved schedule and prompt through REST
-  with trigger controls always active. It also converts a template to new-session mode and verifies schedule controls, list
+  with trigger controls always active. The gallery variants also convert a template to new-session mode and verify schedule controls, list
   Run now/next-run, and detail Run now/next-run remain available.
   The mobile preview uses equals with one project; the desktop Templates path selects in with two
   comma-separated projects and verifies that both appear in the saved query.
-  It edits the user prompt through the row menu and the system prompt through
-  the detail page, checks persistence through REST, and reopens the editor. The
+  The gallery variants edit the user prompt through the row menu and the system prompt through
+  the detail page, check persistence through REST, and reopen the editor. The
   preview entry runs at mobile width; the Templates entry runs at desktop width.
 - `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_ten_minute_host_schedule_round_trip`
   covers new-session host creation, nine-minute rejection, reopening, and switching
@@ -194,9 +201,12 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
   keyboard arrows to switch tabs, and use browser back after switching. Check
   that no content overflows, switching tabs keeps the heading aligned, and the
   gallery remains directly clickable.
-- In create and edit setup, expand Advanced, then select Claude Code, Codex, Pi, and a permission-only
-  harness such as Cursor. Check that only supported settings appear, model changes
-  clear unsupported effort choices, and saved selections survive reopening. Repeat
+- In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
+  harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
+  expand it to check that only supported settings appear, model changes
+  clear unsupported effort choices, and saved selections survive reopening. A new
+  automation starts Claude on Auto and Codex on Approve for me, because nobody
+  approves an unattended run; choosing Default saves no override. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
 - With a provider catalog, create an automation from New automation or a template,
   choose the sandbox and a repository, save, and reopen Edit. Change the repository,

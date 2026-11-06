@@ -36,7 +36,12 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 
 import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
 import { useSession } from "./useSession";
-import { useCanEdit, useGrantPermission, useRevokePermission } from "./usePermissions";
+import {
+  useCanEdit,
+  useCanStartSideChat,
+  useGrantPermission,
+  useRevokePermission,
+} from "./usePermissions";
 
 const useConversationsMock = vi.mocked(useConversations);
 const useSessionMock = vi.mocked(useSession);
@@ -143,6 +148,29 @@ describe("useCanEdit — safe defaults", () => {
     // sidebar settles. derivePermissionLevel returns null → permissive.
     setHooks({ session: null, sessionLoading: false, conversations: undefined });
     expect(renderHook(() => useCanEdit("conv_1")).result.current).toBe(true);
+  });
+});
+
+describe("useCanStartSideChat", () => {
+  it.each([null, 4])("waits for the server before offering creation (level: %s)", (level) => {
+    setHooks({ session: null, sessionLoading: true });
+    expect(renderHook(() => useCanStartSideChat("conv_1", level)).result.current).toBe(false);
+  });
+  it("follows the server, even against an admin's owner level", () => {
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: false } });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 4)).result.current).toBe(false);
+
+    setHooks({ session: { ...makeSession(2), sideChatAllowed: true } });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 2)).result.current).toBe(true);
+  });
+
+  it("falls back to the owner level when the server doesn't say", () => {
+    setHooks({ session: makeSession(4) });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 4)).result.current).toBe(true);
+    expect(renderHook(() => useCanStartSideChat("conv_1", 3)).result.current).toBe(false);
+    // Single-user mode resolves no level and treats the viewer as the owner.
+    setHooks({ session: null });
+    expect(renderHook(() => useCanStartSideChat("conv_1", null)).result.current).toBe(true);
   });
 });
 

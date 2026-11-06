@@ -360,7 +360,7 @@ describe("header, prompt, configuration", () => {
     ["codex-native", "default", "Agent default"],
     ["cursor-native", "default", "Agent default"],
     ["antigravity-native", "default", "Agent default"],
-    ["native-codex", "read-only", "Read only"],
+    ["native-codex", "read-only", "Read Only"],
     ["cursor-native", "auto-review", "Auto-review"],
     ["antigravity-native", "skip", "Skip permissions"],
     ["codex-native", "future-mode", "future-mode"],
@@ -1044,6 +1044,36 @@ describe("run history", () => {
     // Tooltip reads "Running".
     fireEvent.focus(icon);
     await waitFor(() => expect(screen.getAllByText("Running").length).toBeGreaterThan(0));
+  });
+
+  it("keeps spinning for a SUCCEEDED run whose session is still running", async () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_live", conversationStatus: "running" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    const icon = within(row).getByTestId("run-status-icon");
+    expect(icon).toHaveAttribute("data-run-icon", "session-running");
+    expect(icon.getAttribute("class") ?? "").toContain("animate-spin");
+    expect(within(row).queryByTestId("run-status-dot")).toBeNull();
+    expect(within(row).getByTestId("run-status-label")).toHaveTextContent("Session running");
+    fireEvent.focus(icon);
+    await waitFor(() =>
+      expect(screen.getAllByText("Session still running").length).toBeGreaterThan(0),
+    );
+  });
+
+  it("shows Completed once the succeeded run's session is idle", () => {
+    setTask(task());
+    setRuns([
+      run({ status: "succeeded", conversationId: "conv_done", conversationStatus: "idle" }),
+    ]);
+    renderPage();
+    const row = screen.getByTestId("task-detail-run");
+    expect(within(row).queryByTestId("run-status-icon")).toBeNull();
+    expect(within(row).queryByTestId("run-status-label")).toBeNull();
+    expect(within(row).getByTestId("run-status-dot")).toHaveAttribute("data-run-icon", "read");
   });
 
   it("a RUNNING run with a conversationId renders a clickable link", () => {
