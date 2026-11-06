@@ -14,8 +14,8 @@ browser only and reset when the pull request gets a new head.
   narrow screens), a toolbar button opens the filter above the list.
 - `find`: **Find in changes** bar over the fetched patch. Toggles for match case and
   regular expression. Status reads `k of N`, with `+` after N at the 10,000-match
-  cap, `No results`, or `Invalid`. Opening the bar seeds the first match at or below
-  the top of the viewport. Enter and Shift+Enter step through matches and wrap at the
+  cap, `No results`, or `Invalid`. Opening the bar selects the first match in the file at
+  the top of the viewport or a later file, wrapping to the first match if neither has one. Enter and Shift+Enter step through matches and wrap at the
   ends. Matches on file paths scroll to the file header. Escape or **Close find** closes the bar and keeps the query.
   Shows `+M in hidden files` with **Show** when matches sit in files the filters hide.
 - `copy-path`: Copies the repo-relative current path. Renamed files also get **Copy
