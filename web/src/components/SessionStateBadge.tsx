@@ -24,8 +24,11 @@ interface Visual {
 function describe(state: SessionState): Visual {
   switch (state.kind) {
     case "awaiting": {
-      const tooltip =
-        state.count === 1 ? "1 approval prompt waiting" : `${state.count} approval prompts waiting`;
+      const tooltip = state.terminalReason
+        ? `Waiting for you in the agent's terminal (${state.terminalReason})`
+        : state.count === 1
+          ? "1 approval prompt waiting"
+          : `${state.count} approval prompts waiting`;
       return {
         kind: state.kind,
         ariaLabel: tooltip,
@@ -37,13 +40,15 @@ function describe(state: SessionState): Visual {
         ),
       };
     }
-    case "running":
+    case "running": {
+      const tooltip = state.background ? "Working in the background" : "Session running";
       return {
         kind: state.kind,
-        ariaLabel: "Session running",
-        tooltip: "Session running",
+        ariaLabel: tooltip,
+        tooltip,
         render: () => <RunningDot className="size-3" />,
       };
+    }
     case "starting":
       // Same spinner as running — the session is coming up, not yet working.
       return {
