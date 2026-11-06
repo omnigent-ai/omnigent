@@ -90,9 +90,12 @@ adds native niceties:
   > the `dictation` extra and models installed (`GET /v1/info` reports
   > `dictation_available`), a take streams audio to `WS /v1/dictation/stream`
   > and is transcribed on the server — no cloud, no Chrome dependency. See
-  > `designs/server-dictation.md`. Without the server extra the desktop app
-  > offers no mic button at all: with no working Web Speech backend, a button
-  > there could only fail with "Voice input isn't available on this device."
+  > `designs/server-dictation.md`. Without the server extra, macOS builds hand
+  > the mic to macOS Dictation (the Edit > Start Dictation… action, via
+  > `omnigent:start-system-dictation`), which types into the focused message
+  > box. Windows and Linux builds offer no mic button at all: with no working
+  > Web Speech backend, a button there could only fail with "Voice input isn't
+  > available on this device."
 
 ## How it works (zero UI duplication)
 

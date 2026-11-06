@@ -150,6 +150,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Quit once the page's prompt has confirmed; `dontAskAgain` turns that prompt off. */
   confirmQuit: (options) =>
     ipcRenderer.invoke("omnigent:confirm-quit", { dontAskAgain: options?.dontAskAgain === true }),
+  // macOS ships system Dictation; elsewhere the composer mic needs server dictation.
+  ...(process.platform === "darwin"
+    ? {
+        /** Start macOS Dictation in the focused field. Resolves whether it started. */
+        startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
+      }
+    : {}),
   /** The "Show Omnigent from anywhere" shortcut (off by default). */
   getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
   /**

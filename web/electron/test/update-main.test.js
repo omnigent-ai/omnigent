@@ -50,6 +50,7 @@ function loadMainHarness({
     windowCloses: 0,
     webContentsFocuses: 0,
     globalShortcuts: [],
+    firstResponderActions: [],
   };
 
   const sender = {
@@ -133,6 +134,7 @@ function loadMainHarness({
     Menu: {
       buildFromTemplate: (template) => ({ template }),
       setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
+      sendActionToFirstResponder: (action) => calls.firstResponderActions.push(action),
     },
     Notification: { isSupported: () => false },
     clipboard: {},
@@ -862,6 +864,45 @@ describe("close-window request", () => {
       false,
     );
     assert.equal(harness.calls.windowCloses, 0);
+  });
+});
+
+describe("system dictation request", () => {
+  it("starts macOS Dictation in the page's focused field", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      true,
+    );
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(harness.calls.firstResponderActions, ["startDictation:"]);
+  });
+
+  it("refuses a page off the pinned server", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.unpinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("does nothing off macOS", async (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
   });
 });
 

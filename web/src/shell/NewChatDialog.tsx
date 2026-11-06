@@ -7464,6 +7464,7 @@ export function NewChatLandingScreen() {
                         voiceSnapshotRef.current = message;
                       }}
                       onVoiceDiscard={() => setMessage(voiceSnapshotRef.current)}
+                      inputRef={textareaRef}
                       onTranscript={dictation.appendFinal}
                       onInterim={dictation.replaceInterim}
                     />

@@ -4890,6 +4890,19 @@ function registerIpc() {
     return true;
   });
 
+  // Composer mic on macOS when the server has no dictation: the same action as
+  // Edit > Start Dictation…, which types into the focused field. The page has
+  // focused its message box; focusing the page too takes native focus back
+  // from an embedded browser view.
+  ipcMain.handle("omnigent:start-system-dictation", (event) => {
+    if (process.platform !== "darwin" || !isPinnedOriginSender(event)) return false;
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || BrowserWindow.getFocusedWindow() !== win) return false;
+    win.webContents.focus();
+    Menu.sendActionToFirstResponder("startDictation:");
+    return true;
+  });
+
   // Settings → "Show Omnigent from anywhere" (opt-in, system-wide shortcut).
   ipcMain.handle("omnigent:get-global-shortcut", (event) => {
     if (!isPinnedOriginSender(event)) {

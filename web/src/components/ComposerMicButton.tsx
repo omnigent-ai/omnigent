@@ -6,10 +6,10 @@ import { showToast } from "@/components/ui/toast";
 import { useVoiceDictationHotkey, VOICE_DICTATION_KEYS } from "@/hooks/useVoiceDictationHotkey";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { DictationBusyError, DictationSession } from "@/lib/dictation";
-import { isElectronShell } from "@/lib/nativeBridge";
+import { isElectronShell, startSystemDictation, supportsSystemDictation } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 import { Loader2Icon, MicIcon, SquareIcon } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 
 // Local-only types; speech-input.tsx already augments Window globally.
 interface SpeechRecognitionLike {
@@ -94,6 +94,10 @@ export interface ComposerMicButtonProps {
   /** Called when a take starts or ends listening; while listening, Enter and Esc
    *  belong to dictation. */
   onListeningChange?: (listening: boolean) => void;
+  /** The composer's text box. macOS Dictation types into the focused field, so
+   *  the desktop app's macOS fallback focuses this first; without it there is no
+   *  fallback. */
+  inputRef?: RefObject<HTMLTextAreaElement | null>;
 }
 
 /** getUserMedia permission failures, distinct from transport failures. */
@@ -111,15 +115,24 @@ export const ComposerMicButton = ({
   onVoiceStart,
   onVoiceDiscard,
   onListeningChange,
+  inputRef,
 }: ComposerMicButtonProps) => {
   // Web Speech is primary wherever its constructor exists; a take that dies with
   // "network" falls back to the server for that take only (see handleError).
-  // Electron has the constructor but never a backend, so there only the server can serve.
+  // Electron has the constructor but never a backend, so there only the server can serve,
+  // and on macOS a server without dictation hands the take to macOS Dictation.
   const [Ctor] = useState(getRecognitionCtor);
   const electron = isElectronShell();
+  const [systemDictationBridge] = useState(supportsSystemDictation);
   const serverInfo = useServerInfo();
   const serverAvailable = serverInfo !== "loading" && serverInfo.dictation_available;
-  const canDictate = serverAvailable || (Ctor !== null && !electron);
+  const systemDictation =
+    electron &&
+    systemDictationBridge &&
+    inputRef !== undefined &&
+    serverInfo !== "loading" &&
+    !serverAvailable;
+  const canDictate = serverAvailable || (Ctor !== null && !electron) || systemDictation;
   // Mirrored into a ref so the mount-time recognition handlers (closed
   // over [Ctor, lang]) see the current probe result.
   const serverAvailableRef = useRef(serverAvailable);
@@ -445,6 +458,18 @@ export const ComposerMicButton = ({
   }, [reportError]);
   toggleServerRef.current = toggleServer;
 
+  // macOS owns this take: its own indicator shows listening, and its text
+  // reaches the composer as typing, so none of the take state above is used.
+  const startMacDictation = useCallback(() => {
+    const input = inputRef?.current;
+    if (!input) return;
+    input.focus();
+    void startSystemDictation().then((started) => {
+      if (started) setError(null);
+      else reportError("Voice input isn't available on this device.");
+    });
+  }, [inputRef, reportError]);
+
   const toggle = useCallback(() => {
     // An active (or starting) server take is owned by the server path,
     // whichever mode started it.
@@ -453,9 +478,10 @@ export const ComposerMicButton = ({
       return;
     }
     // Electron's SpeechRecognition has no backend, so a Web Speech take there
-    // always fails: go straight to the server instead.
+    // always fails: go straight to the server, else to macOS Dictation.
     if (!Ctor || electron) {
       if (serverAvailable) void toggleServer();
+      else if (systemDictation) startMacDictation();
       return;
     }
     // Guard against rapid clicks landing before start/end event fires.
@@ -471,7 +497,15 @@ export const ComposerMicButton = ({
       // user can try again, and let the next event reconcile state.
       transitionRef.current = false;
     }
-  }, [isListening, Ctor, electron, serverAvailable, toggleServer]);
+  }, [
+    isListening,
+    Ctor,
+    electron,
+    serverAvailable,
+    systemDictation,
+    startMacDictation,
+    toggleServer,
+  ]);
 
   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
   // only while a dictation path can run and the composer isn't disabled, so

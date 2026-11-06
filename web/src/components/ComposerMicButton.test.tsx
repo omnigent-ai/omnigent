@@ -24,6 +24,7 @@ import type { DictationSessionEvents } from "@/lib/dictation";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
+import { useRef } from "react";
 import { ComposerMicButton } from "./ComposerMicButton";
 
 /** Hovers the mic button and returns the tooltip it opens. */
@@ -458,17 +459,46 @@ async function clickMic() {
   });
 }
 
-/** Run `body` with the Electron preload bridge present, as the desktop shell exposes it. */
-async function inElectronShell(body: () => Promise<void> | void) {
+/**
+ * Run `body` with the Electron preload bridge present, as the desktop shell
+ * exposes it; `bridge` adds shell methods (the macOS shell's startSystemDictation).
+ */
+async function inElectronShell(
+  body: () => Promise<void> | void,
+  bridge: Record<string, unknown> = {},
+) {
   const w = window as unknown as Record<string, unknown>;
   const previous = w.omnigentDesktop;
-  w.omnigentDesktop = { kind: "electron" };
+  w.omnigentDesktop = { kind: "electron", ...bridge };
   try {
     await body();
   } finally {
     if (previous === undefined) delete w.omnigentDesktop;
     else w.omnigentDesktop = previous;
   }
+}
+
+/** A message box plus its mic, wired the way the desktop composers wire them. */
+function MacDesktopComposer({
+  info,
+  enableHotkey = false,
+  withInput = true,
+}: {
+  info: ServerInfo | "loading";
+  enableHotkey?: boolean;
+  withInput?: boolean;
+}) {
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  return (
+    <CapabilitiesContext.Provider value={info}>
+      <textarea aria-label="Message" ref={inputRef} />
+      <ComposerMicButton
+        onTranscript={vi.fn()}
+        enableHotkey={enableHotkey}
+        inputRef={withInput ? inputRef : undefined}
+      />
+    </CapabilitiesContext.Provider>
+  );
 }
 
 /** The platform's dictation chord: ⌘⌥V on macOS, Ctrl+Alt+V elsewhere. */
@@ -792,6 +822,89 @@ describe("ComposerMicButton (server dictation)", () => {
       expect(constructSpy).not.toHaveBeenCalled();
       expect(startSpy).not.toHaveBeenCalled();
     });
+  });
+
+  it("on macOS without server dictation, hands the take to macOS Dictation in the message box", async () => {
+    const startSystemDictation = vi.fn(async () => true);
+    await inElectronShell(
+      async () => {
+        render(<MacDesktopComposer info={NO_DICTATION_INFO} enableHotkey />);
+        const message = screen.getByRole("textbox", { name: "Message" });
+        expect(message).not.toHaveFocus();
+
+        await clickMic();
+        // macOS Dictation types into the focused field, so the message box
+        // takes focus before the shell starts it.
+        expect(message).toHaveFocus();
+        expect(startSystemDictation).toHaveBeenCalledTimes(1);
+
+        const chord = dictationChord();
+        await act(async () => {
+          window.dispatchEvent(chord);
+        });
+        expect(chord.defaultPrevented).toBe(true);
+        expect(startSystemDictation).toHaveBeenCalledTimes(2);
+
+        // macOS owns the take: no in-app take, listening state, or error.
+        expect(sessionStartMock).not.toHaveBeenCalled();
+        expect(startSpy).not.toHaveBeenCalled();
+        expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+          "aria-pressed",
+          "false",
+        );
+        expect(showToastMock).not.toHaveBeenCalled();
+      },
+      { startSystemDictation },
+    );
+  });
+
+  it("on macOS, prefers server dictation over macOS Dictation", async () => {
+    const startSystemDictation = vi.fn(async () => true);
+    await inElectronShell(
+      async () => {
+        render(<MacDesktopComposer info={DICTATION_INFO} />);
+        await clickMic();
+        expect(sessionStartMock).toHaveBeenCalledTimes(1);
+        expect(startSystemDictation).not.toHaveBeenCalled();
+      },
+      { startSystemDictation },
+    );
+  });
+
+  it("on macOS, offers the fallback only once the server reports no dictation", async () => {
+    const startSystemDictation = vi.fn(async () => true);
+    await inElectronShell(
+      () => {
+        const { rerender } = render(<MacDesktopComposer info="loading" />);
+        // The server may still turn out to dictate; offer nothing until it answers.
+        expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
+        rerender(<MacDesktopComposer info={NO_DICTATION_INFO} />);
+        expect(screen.getByRole("button", { name: "Voice dictation" })).toBeInTheDocument();
+      },
+      { startSystemDictation },
+    );
+  });
+
+  it("on macOS, reports when the shell can't start macOS Dictation", async () => {
+    const startSystemDictation = vi.fn(async () => false);
+    await inElectronShell(
+      async () => {
+        render(<MacDesktopComposer info={NO_DICTATION_INFO} />);
+        await clickMic();
+        expect(showToastMock).toHaveBeenCalledWith("Voice input isn't available on this device.");
+      },
+      { startSystemDictation },
+    );
+  });
+
+  it("on macOS, offers no fallback without a message box to type into", async () => {
+    await inElectronShell(
+      () => {
+        render(<MacDesktopComposer info={NO_DICTATION_INFO} withInput={false} />);
+        expect(screen.queryByRole("button", { name: "Voice dictation" })).toBeNull();
+      },
+      { startSystemDictation: vi.fn(async () => true) },
+    );
   });
 
   it("Enter while listening ends the server take via stop (keeps the tail)", async () => {

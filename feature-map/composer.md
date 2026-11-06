@@ -179,7 +179,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   terminal or code editor. While listening, Enter keeps the dictated text and
   Escape discards it. The button is absent when neither the browser nor the
   server can transcribe; the desktop app's browser engine cannot, so there the
-  button appears only when the connected server advertises dictation.
+  button uses the connected server's dictation. Without it, the button starts
+  macOS Dictation in the message box on a Mac and is absent elsewhere.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers. The
   Inbox reply box follows the same shortcut.
@@ -289,8 +290,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   a Retry link.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it. In the
-  desktop app the button appears only when the connected server has dictation
-  enabled. A side chat's composer ("Ask a side question...") shows the same
+  desktop app the button uses the connected server's dictation; without it, a
+  Mac opens macOS Dictation in the message box, and other platforms show no
+  button. A side chat's composer ("Ask a side question...") shows the same
   button under the same rule; the shortcut belongs to the main composer.
 - Send while the agent is working to queue a message, then steer it.
 - With the in-session message box empty, press Up to recall a previous prompt
@@ -738,7 +740,9 @@ Other connection providers alone do not enable the managed MCP picker.
   server. Manually, for the in-session, new-session and side-chat composers:
   connect the desktop app to a default `omnigent server` (`/v1/info` reports
   `dictation_available: false`) and expect no mic and ⌘/Ctrl+Alt+V to do
-  nothing; restart the server with
+  nothing on Windows or Linux; on a Mac expect the mic, and clicking it or
+  pressing ⌘⌥V to open macOS Dictation with the message box focused, then the
+  spoken text in it. Restart the server with
   `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
   state on click, and the fake transcript in the message box.
 - **`send-shortcut`:**
@@ -923,7 +927,8 @@ Other connection providers alone do not enable the managed MCP picker.
   when unavailable or the browser speech service fails. Audio still comes from
   the client device; choosing a remote host does not change the microphone.
   Denying microphone permission must not start a fallback recording.
-  The desktop app uses only the server and hides the button without it. A
+  The desktop app uses the server, falls back to macOS Dictation on a Mac,
+  and hides the button elsewhere. A
   verification instance without a transcription engine depends on browser
   support; a missing microphone there does not prove that dictation is
   unavailable on a configured server.
