@@ -1,5 +1,9 @@
 import { SidebarDataContext } from "./useSidebarData";
-import { PINNED_CONVERSATIONS_KEY, type PinnedConversationsResult } from "./useConversations";
+import {
+  type Conversation,
+  PINNED_CONVERSATIONS_KEY,
+  type PinnedConversationsResult,
+} from "./useConversations";
 // App-level wiring for the `WS /v1/sessions/updates` push stream.
 //
 // Mounted once near the app root. It:
@@ -38,6 +42,7 @@ import {
   nullsToUndefined,
   PROJECT_LABEL_KEY,
   removeIdsFromPages,
+  settleOpenSessionRow,
   unmarkRecentlyCreated,
 } from "@/lib/sessionListCache";
 import { createListReconcileScheduler } from "@/lib/listReconcileScheduler";
@@ -169,6 +174,9 @@ function applyItemsToCache(
       .filter((row) => !row.archived);
     return changed ? { ...previous, conversations } : previous;
   });
+  // The open session's fetched sidebar row sits outside every list, so a remote
+  // change (archive, rename, an approval) reaches it only here.
+  for (const item of itemsById.values()) settleOpenSessionRow(queryClient, item.id, item);
   return {
     // Sub-agent children are watched for their tree views, but no session list
     // ever holds them, so their absence is not a sign of a new session.
@@ -421,6 +429,14 @@ export function SessionUpdatesProvider({ children }: { children: ReactNode }) {
                   }
                 : previous,
           );
+          // The open session's fetched sidebar row sits outside every list. Cancel
+          // its request first so a late response can't bring the row back.
+          for (const id of frame.ids) {
+            const backfillKey = ["conversation-backfill", id];
+            if (queryClient.getQueryState(backfillKey) === undefined) continue;
+            void queryClient.cancelQueries({ queryKey: backfillKey, exact: true });
+            queryClient.setQueryData<Conversation | null>(backfillKey, null);
+          }
           if (removeIdsFromCache(queryClient, frame.ids)) scheduleInvalidate();
           return;
         case "snapshot":

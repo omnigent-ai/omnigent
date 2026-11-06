@@ -7690,6 +7690,28 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(rows.find((c) => c.id === "conv_other")?.status).toBe("idle");
     });
 
+    it("patches the open session's fetched sidebar row outside the loaded pages", () => {
+      client.setQueryData(["conversation-backfill", "conv_old"], conv("conv_old", "idle"));
+      handleSessionEvent({ type: "session_status", conversationId: "conv_old", status: "running" });
+      expect(client.getQueryData<Conversation>(["conversation-backfill", "conv_old"])?.status).toBe(
+        "running",
+      );
+    });
+
+    it("leaves the fetched sidebar row untouched when its status hasn't changed", () => {
+      const backfillKey = ["conversation-backfill", "conv_old"];
+      client.setQueryData(backfillKey, conv("conv_old", "running"));
+      const backfillWrites = vi.fn();
+      const unsubscribe = client.getQueryCache().subscribe((event) => {
+        if (event.type === "updated" && event.query.queryKey[0] === "conversation-backfill") {
+          backfillWrites();
+        }
+      });
+      handleSessionEvent({ type: "session_status", conversationId: "conv_old", status: "running" });
+      unsubscribe();
+      expect(backfillWrites).not.toHaveBeenCalled();
+    });
+
     it("collapses live 'waiting' to the list's 'running' (server-list parity)", () => {
       // GET /v1/sessions maps running/waiting → "running"; the live patch must
       // match so the badge agrees with the next poll instead of flapping.
