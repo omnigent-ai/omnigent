@@ -38,7 +38,7 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 }
 ```
 
-`permission_mode` uses the selected native harness's vocabulary: Claude Code (for example, `acceptEdits`), Codex (`default`, `ask-for-approval`, `approve-for-me`, `read-only`, `full-access`, `bypass`), Cursor (`default`, `auto-review`, `plan`, `ask`, `yolo`), Antigravity (`default`, `skip`), or Devin (`normal`, `accept-edits`, `smart`, `dangerous`). Omitting it uses the agent default; for Codex that is Codex's own default, which asks before escalations and Omnigent tool calls. The web dialog starts a new automation on Claude Code's `auto` or Codex's `approve-for-me`. Saving an explicit override requires the server to resolve the agent's harness; if the bundle is unavailable, the save is rejected and can be retried once it is available. Automations are unattended, so prompting modes can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
+`permission_mode` uses the selected native harness's vocabulary: Claude Code (for example, `acceptEdits`), Codex (`default`, `ask-for-approval`, `approve-for-me`, `read-only`), Cursor (`default`, `auto-review`, `plan`, `ask`, `yolo`), Antigravity (`default`, `skip`), or Devin (`normal`, `accept-edits`, `smart`, `dangerous`). Omitting it uses the agent default; for Codex that is Codex's own default, which asks before escalations and Omnigent tool calls. The web dialog starts a new automation on Claude Code's `auto` or Codex's `approve-for-me`. Saving an explicit override requires the server to resolve the agent's harness; if the bundle is unavailable, the save is rejected and can be retried once it is available. Automations are unattended, so prompting modes can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
@@ -86,6 +86,8 @@ require interactive approval before persisting future work. Review the agent,
 prompt, host and permission settings in that request. This also applies when
 the call inherits defaults. Direct changes you make in the UI or REST API keep
 their existing authorization rules.
+
+**New automation** starts with **Trigger type: Schedule**. Choose **Jira**, **Slack**, **GitHub**, or **Linear** in the same form to set up matching-item triggers; gallery templates preselect their integration. Choosing a type for the first time carries over your instructions. Switching back restores that type's draft until the dialog closes, including schedule settings and custom prompt edits. Integration choices require the same server capabilities as the template gallery. Existing automations keep their current editor.
 
 New automations default to the **Omnigent Automation** project, which is created or reused when you save. Choose another project or remove the selection to opt out. Run sessions and their workers inherit the project, keeping automated work together in the sidebar. Existing automations keep their selected project.
 

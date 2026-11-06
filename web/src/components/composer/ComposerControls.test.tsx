@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import {
   ComposerHostTrigger,
   ComposerWorkspaceBar,
@@ -128,7 +129,7 @@ describe("shared composer controls", () => {
     );
     const trigger = screen.getByRole("button", { name: "Codex configuration" });
     expect(trigger).toHaveTextContent("GPT-5.6-Sol");
-    expect(trigger).toHaveClass("w-auto");
+    expect(trigger).toHaveClass("w-auto", "shrink");
     expect(trigger).toHaveClass("px-2", "py-0", "border-0", "leading-5", "md:min-h-7");
     expect(trigger).not.toHaveClass("pr-0");
     expect(trigger).not.toHaveClass("max-w-[7.25rem]", "md:max-w-40");
@@ -173,6 +174,26 @@ describe("shared composer controls", () => {
     expect(screen.queryByLabelText("Model change pending")).toBeNull();
     fireEvent.click(trigger);
     expect(onClick).toHaveBeenCalledOnce();
+  });
+
+  it("shows the cycle chord in the permission chip tooltip when it is bound", async () => {
+    const { unmount } = render(
+      <ComposerPermissionPicker
+        label="Permission mode"
+        value="Plan"
+        options={[{ value: "plan", label: "Plan" }]}
+        shortcut={[SHIFT_KEY, "Tab"]}
+        onSelect={vi.fn()}
+      />,
+    );
+    fireEvent.pointerMove(screen.getByRole("button", { name: "Permission mode: Plan" }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent("Permission mode: Plan");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([SHIFT_KEY, "Tab"]);
+    unmount();
   });
 
   it("dispatches permission selections through the caller's handler", () => {

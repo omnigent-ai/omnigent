@@ -333,6 +333,18 @@ describe("resolveServerInfo session_fork_workspaces", () => {
   });
 });
 
+describe("resolveServerInfo session_claude_sdk_clear", () => {
+  it.each([
+    [true, true],
+    [false, false],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ session_claude_sdk_clear: advertised });
+    expect(parsed.session_claude_sdk_clear).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_event_types", () => {
   it.each([
     [undefined, []],

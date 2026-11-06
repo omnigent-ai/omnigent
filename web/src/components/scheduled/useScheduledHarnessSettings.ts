@@ -17,6 +17,7 @@ import {
 import {
   CODEX_NATIVE_REVIEWER_MODE_VALUES,
   nativePermissionOptions,
+  UNATTENDED_DISALLOWED_PERMISSION_MODES,
 } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
@@ -125,9 +126,10 @@ export function useScheduledHarnessSettings(
   const permissions = supportsHarnessPermissions
     ? nativePermissionOptions(harness).filter(
         (option) =>
-          codexReviewerModes ||
-          harness !== "codex-native" ||
-          !CODEX_NATIVE_REVIEWER_MODE_VALUES.has(option.value),
+          !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(option.value) &&
+          (codexReviewerModes ||
+            harness !== "codex-native" ||
+            !CODEX_NATIVE_REVIEWER_MODE_VALUES.has(option.value)),
       )
     : [];
   const loading = sandbox ? sandboxModels.isLoading : hostModels.isLoading;

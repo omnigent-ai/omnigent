@@ -260,6 +260,21 @@ export const CODEX_NATIVE_BYPASS_APPROVAL_OPTION: NativeHarnessMode = {
   args: [],
 };
 
+/**
+ * Modes automations cannot use: a scheduled run has nobody to answer a prompt,
+ * so it needs an approval gate. Mirrors UNATTENDED_DISALLOWED_PERMISSION_MODES
+ * in omnigent/native/permission_modes.py.
+ */
+export const UNATTENDED_DISALLOWED_PERMISSION_MODES: ReadonlySet<string> = new Set([
+  "bypassPermissions",
+  "dontAsk",
+  "full-access",
+  "bypass",
+  "yolo",
+  "skip",
+  "dangerous",
+]);
+
 /** Codex presets that pin `approvals_reviewer`; automations need server support for them. */
 export const CODEX_NATIVE_REVIEWER_MODE_VALUES: ReadonlySet<string> = new Set([
   "ask-for-approval",
