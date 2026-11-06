@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import re
+from itertools import pairwise
 
 import pytest
 from playwright.sync_api import Locator, Page, expect
 
+from tests.browser_ui.chat._geometry_helpers import open_live
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
     message_item,
@@ -107,9 +109,14 @@ def test_touch_screens_reveal_timestamps_and_pending_steering(
     page.wait_for_function(f"element => ({opacity})(element) >= 0.39", arg=notice.element_handle())
     assert notice.evaluate(opacity) >= 0.39
     footer = notice.locator("..")
-    pending_timestamp = footer.get_by_test_id("message-timestamp")
-    notice_box = notice.bounding_box()
-    timestamp_box = pending_timestamp.bounding_box()
+    # Read both boxes in one frame while the pending bubble animates into place.
+    notice_box, timestamp_box = footer.evaluate(
+        """footer => {
+          const bounds = testId => footer.querySelector(`[data-testid="${testId}"]`)
+            ?.getBoundingClientRect().toJSON();
+          return [bounds('message-awaiting-agent'), bounds('message-timestamp')];
+        }"""
+    )
     assert notice_box is not None and timestamp_box is not None
     assert notice_box["y"] == pytest.approx(timestamp_box["y"], abs=1)
     assert notice_box["x"] + notice_box["width"] <= timestamp_box["x"] + 1
@@ -173,6 +180,90 @@ def test_bare_idle_clears_the_live_working_indicator(
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
+
+
+# Each painted frame's top of the matching paragraph, read after the app's resize observers.
+_TRACK_PARAGRAPH_TOPS = """(text) => {
+    window.__paragraphTops = [];
+    const record = () => {
+        const paragraph = [...document.querySelectorAll('[role="log"] p')]
+            .find((element) => element.textContent.includes(text));
+        if (paragraph) window.__paragraphTops.push(paragraph.getBoundingClientRect().top);
+    };
+    const sample = () => {
+        const observer = new ResizeObserver(() => {
+            observer.disconnect();
+            record();
+        });
+        observer.observe(document.body);
+        requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+}"""
+
+
+def test_turn_end_eases_a_transcript_at_its_end_down(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The Working row eases closed when the turn ends, so the transcript doesn't drop.
+
+    Removing the row at once moved a transcript scrolled to its end down by the
+    row's height and gap (38px) in one frame.
+    """
+    chat = chat_session_contract
+    response_id = "turn-end"
+    earlier = []
+    for index in range(6):
+        earlier += [
+            message_item(f"earlier-user-{index}", "user", "A question?", response_id=f"r{index}"),
+            message_item(
+                f"earlier-answer-{index}",
+                "assistant",
+                "An earlier answer long enough to fill the screen. " * 6,
+                response_id=f"r{index}",
+            ),
+        ]
+    user = message_item("turn-end-user", "user", "One more question?", response_id=response_id)
+    chat.set_items(list(reversed([*earlier, user])))
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    text = "The reply's only paragraph ends here."
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": f"{text}\n"}})
+    expect(page.locator('[role="log"] p', has_text="only paragraph")).to_be_visible(timeout=10_000)
+    page.wait_for_timeout(500)
+    page.evaluate(_TRACK_PARAGRAPH_TOPS, "only paragraph")
+    page.wait_for_function("() => window.__paragraphTops.length >= 5")
+    row = page.get_by_test_id("working-indicator").bounding_box()
+    assert row
+
+    answer = message_item("turn-end-answer", "assistant", text, response_id=response_id)
+    chat.emit({"event": "response.output_item.done", "data": {"item": answer}})
+    chat.emit(
+        {
+            "event": "response.completed",
+            "data": {"id": response_id, "status": "completed", "output": []},
+        }
+    )
+    chat.emit_idle(response_id)
+    expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=10_000)
+    # Sample the frame that paints the row's removal.
+    page.evaluate(
+        "() => new Promise((done) => requestAnimationFrame(() => requestAnimationFrame(done)))"
+    )
+
+    tops = page.evaluate("() => window.__paragraphTops")
+    steps = [round(after - before, 1) for before, after in pairwise(tops) if after != before]
+    assert sum(steps) > 20, f"the transcript didn't move when the turn ended: {steps}"
+    assert len(steps) >= 3, f"the transcript dropped in {len(steps)} frame(s): {steps}"
+    assert max(steps) < 0.9 * row["height"], f"one frame moved it by the row's height: {steps}"
 
 
 # Pauses the indicator's animations and steps them through 3.4s, recording what moves.

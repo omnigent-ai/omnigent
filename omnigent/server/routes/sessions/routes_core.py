@@ -95,6 +95,9 @@ from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
 from omnigent.server.routes._auth_helpers import (
+    is_session_owner as _is_session_owner,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -1007,6 +1010,23 @@ def register_core_routes(
             )
         return runner_id, launch_failed
 
+    async def side_chat_allowed(
+        user_id: str | None, session_id: str, conversation: Conversation | None = None
+    ) -> bool:
+        """Whether *user_id* may start side chats in a session: its root's owner only."""
+        if auth_provider is None or permission_store is None:
+            return True
+        conv = conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        return conv is not None and await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            conv,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        )
+
     @router.post(
         "/sessions/orchestrated",
         status_code=201,
@@ -1534,6 +1554,7 @@ def register_core_routes(
             spec,
             user_id,
             conversation_store,
+            model_override=parsed_metadata.model_override,
         )
         from omnigent.models.model_catalog import spec_harness
         from omnigent.server.routes._session_harness_readiness import (
@@ -1586,6 +1607,7 @@ def register_core_routes(
                 result.session_id,
                 result.agent_id,
                 runner_router,
+                conversation_store=conversation_store,
             )
         # Grant the creator ownership BEFORE scheduling the managed
         # launch, mirroring the JSON path: a managed-guard failure
@@ -1818,7 +1840,7 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
@@ -1836,6 +1858,10 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(
+            user_id, session_id, access.conversation
+        )
+        return snapshot
 
     @router.get(
         "/sessions/{session_id}/labels",
@@ -3915,7 +3941,7 @@ def register_core_routes(
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
         # items read — it dominated this response's size and build time.
-        return await _get_session_snapshot(
+        snapshot = await _get_session_snapshot(
             conversation_store,
             session_id,
             level,
@@ -3928,6 +3954,8 @@ def register_core_routes(
             viewer_id=user_id,
             request=request,
         )
+        snapshot.side_chat_allowed = await side_chat_allowed(user_id, session_id)
+        return snapshot
 
     # ── POST /sessions/{source_id}/fork ─────────────────────────
 
@@ -4001,7 +4029,8 @@ def register_core_routes(
         :raises OmnigentError: 404 if *source_id* does not exist or
             ``body.agent_id`` names no agent; 403/404 if the caller
             lacks read access on the source, or on the session that
-            owns a session-scoped ``body.agent_id``; 400 if the source
+            owns a session-scoped ``body.agent_id``; 403 for a side chat
+            unless the caller owns the source's root session; 400 if the source
             has no agent binding, ``body.up_to_response_id`` names
             no response in the source session, or a managed fork asks
             for a sandbox this server has not configured; 409 if
@@ -4055,6 +4084,16 @@ def register_core_routes(
                     f"Session not found: {source_id!r}",
                     code=ErrorCode.NOT_FOUND,
                 )
+        if body.side_chat and not await asyncio.to_thread(
+            _is_session_owner,
+            user_id,
+            source,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ):
+            raise OmnigentError(
+                "Only the session's owner can start a side chat", code=ErrorCode.FORBIDDEN
+            )
         if source.agent_id is None:
             raise OmnigentError(
                 "Source session has no agent binding — cannot fork.",
@@ -4519,6 +4558,7 @@ def register_core_routes(
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                side_chat_parent_id=source.id if body.side_chat else None,
             )
         except LookupError as exc:
             await drop_unused_copy()
@@ -4654,7 +4694,7 @@ def register_core_routes(
             order="desc",
         )
         level = await _get_permission_level(user_id, new_conv.id, permission_store)
-        return _build_session_response(
+        response = _build_session_response(
             new_conv,
             list(reversed(fork_items.data)),
             "idle",
@@ -4662,6 +4702,8 @@ def register_core_routes(
             last_task_error=None,
             agent_name=base_agent.name,
         )
+        response.side_chat_allowed = await side_chat_allowed(user_id, new_conv.id, new_conv)
+        return response
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────
     # Placeholder: in-place agent switching was retired and will return with a

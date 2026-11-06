@@ -405,6 +405,28 @@ describe("prompt-first automation setup", () => {
     });
   });
 
+  it("clears a saved approval-skipping mode when editing only the instructions", async () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({
+          agentId: "ag_claude_native",
+          permissionMode: "bypassPermissions",
+        })}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Also summarize CI failures" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      prompt: "Also summarize CI failures",
+      permissionMode: null,
+    });
+  });
+
   it("keeps saved names and overrides when editing instructions with Advanced collapsed", async () => {
     render(
       <CreateScheduledTaskDialog
@@ -981,7 +1003,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
         onOpenChange={vi.fn()}
         editingTask={scheduledTask({
           agentId: "ag_claude_native",
-          permissionMode: "bypassPermissions",
+          permissionMode: "acceptEdits",
         })}
       />,
     );
@@ -991,7 +1013,7 @@ describe("CreateScheduledTaskDialog edit mode", () => {
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     const { input } = updateMutateAsync.mock.calls[0][0];
     expect(input).not.toHaveProperty("agentId");
-    expect(input.permissionMode).toBe("bypassPermissions");
+    expect(input.permissionMode).toBe("acceptEdits");
   });
 
   it.each(["Every day", "Every hour", "Custom schedule"])(
@@ -1971,6 +1993,16 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     ).toBeInTheDocument();
   });
 
+  it("does not offer permission modes that skip approval", async () => {
+    renderDialog();
+
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+
+    expect(await screen.findByRole("option", { name: "Auto" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Bypass permissions" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Don't ask" })).not.toBeInTheDocument();
+  });
+
   it("sends the selected model + effort on create for a capable agent", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
@@ -2146,6 +2178,46 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
         for (const field of ["modelOverride", "reasoningEffort", "permissionMode", "sessionId"]) {
           expect(input).not.toHaveProperty(field);
         }
+      }
+    },
+  );
+
+  it.each([
+    ["bypassPermissions", { permissionMode: null }],
+    ["acceptEdits", {}],
+  ])(
+    "on a continued-session edit, clears only a refused %s override",
+    async (savedMode, expectedPermission) => {
+      render(
+        <CapabilitiesProvider
+          info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_session_modes: true }}
+        >
+          <CreateScheduledTaskDialog
+            open
+            onOpenChange={vi.fn()}
+            editingTask={scheduledTask({
+              agentId: "ag_claude_native",
+              sessionMode: "continue",
+              sessionId: "conv_1",
+              modelOverride: "opus",
+              reasoningEffort: "high",
+              permissionMode: savedMode,
+            })}
+          />
+        </CapabilitiesProvider>,
+      );
+      expect(screen.getByTestId("task-permission-trigger")).toBeDisabled();
+      fireEvent.change(screen.getByLabelText("Instructions"), { target: { value: "Keep going" } });
+      fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+      await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+      const { input } = updateMutateAsync.mock.calls[0][0];
+      expect(input).toMatchObject({ prompt: "Keep going", ...expectedPermission });
+      // The session binding and the session's own model settings are left alone.
+      expect(input).not.toHaveProperty("sessionId");
+      expect(input).not.toHaveProperty("modelOverride");
+      expect(input).not.toHaveProperty("reasoningEffort");
+      if (!("permissionMode" in expectedPermission)) {
+        expect(input).not.toHaveProperty("permissionMode");
       }
     },
   );
@@ -3845,16 +3917,19 @@ describe("editing template prompts", () => {
     );
   });
 
-  it("requires expansion and Edit, saves both prompts, and resets on reopening", async () => {
-    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
-    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />);
+  it("requires expansion and Edit and preserves empty-system validation across collapse", () => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ prompt: original })}
+      />,
+      { expandAdvanced: false },
+    );
     const toggle = screen.getByRole("button", { name: "System prompt" });
     fireEvent.click(toggle);
     expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    const systemPrompt =
-      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
-      "\n";
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "  \n" },
     });
@@ -3866,10 +3941,26 @@ describe("editing template prompts", () => {
     fireEvent.click(toggle);
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
-      target: { value: systemPrompt },
+      target: { value: splitTriggerPrompt(original).systemPrompt },
     });
     expect(screen.queryByText(/System prompt can't be empty/)).not.toBeInTheDocument();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeEnabled();
+  });
+
+  it("saves both prompts and reopens with the system editor collapsed", async () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+      expandAdvanced: false,
+    });
+    const toggle = screen.getByRole("button", { name: "System prompt" });
+    fireEvent.click(toggle);
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    const systemPrompt =
+      splitTriggerPrompt(original).systemPrompt!.replace('project = "ENG"', 'project = "OPS"') +
+      "\n";
+    fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
+      target: { value: systemPrompt },
+    });
     fireEvent.change(screen.getByLabelText("Your prompt"), { target: { value: "Fix it." } });
     fireEvent.click(toggle);
     fireEvent.click(toggle);
@@ -3891,21 +3982,31 @@ describe("editing template prompts", () => {
     fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
     expect(screen.queryByRole("textbox", { name: "System prompt" })).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
+  });
+
+  it("discards unsaved system edits when cancelled and reopened", () => {
+    const props = { onOpenChange: vi.fn(), editingTask: scheduledTask({ prompt: original }) };
+    const { rerender } = render(<CreateScheduledTaskDialog open {...props} />, {
+      expandAdvanced: false,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
     fireEvent.change(screen.getByRole("textbox", { name: "System prompt" }), {
       target: { value: "Unsaved edit" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(props.onOpenChange).toHaveBeenLastCalledWith(false);
-    expect(updateMutateAsync).toHaveBeenCalledTimes(1);
+    expect(updateMutateAsync).not.toHaveBeenCalled();
     rerender(<CreateScheduledTaskDialog open={false} {...props} />);
-    rerender(
-      <CreateScheduledTaskDialog open {...props} editingTask={scheduledTask({ prompt: saved })} />,
-    );
-    expect(screen.getByLabelText("Your prompt")).toHaveValue("Fix it.");
+    rerender(<CreateScheduledTaskDialog open {...props} />);
+    expect(screen.getByLabelText("Your prompt")).toHaveValue("Triage the ticket.");
     fireEvent.click(screen.getByRole("button", { name: "System prompt" }));
     expect(screen.queryByText("Unsaved edit")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Edit system prompt" }));
-    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(systemPrompt);
+    expect(screen.getByRole("textbox", { name: "System prompt" })).toHaveValue(
+      splitTriggerPrompt(original).systemPrompt,
+    );
   });
 });
 
@@ -4091,7 +4192,8 @@ describe("automation harness settings", () => {
     ["pi-native", true, true, false],
     ["devin-native", true, true, true],
     ["cursor-native", false, false, true],
-    ["antigravity-native", false, false, true],
+    // Antigravity's only non-default mode skips approval, which automations cannot use.
+    ["antigravity-native", false, false, false],
     ["opencode-native", false, false, false],
   ])("shows independent settings for %s", (harness, model, effort, permission) => {
     mockHarness(harness);
@@ -4100,6 +4202,27 @@ describe("automation harness settings", () => {
     expect(!!screen.queryByTestId("task-effort-trigger")).toBe(effort);
     expect(!!screen.queryByTestId("task-permission-trigger")).toBe(permission);
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
+  });
+
+  it("clears Antigravity's saved skip mode, which has no picker, on edit", async () => {
+    mockHarness("antigravity-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: "selected-agent", permissionMode: "skip" })}
+      />,
+    );
+    expect(screen.queryByTestId("task-permission-trigger")).toBeNull();
+    fireEvent.change(screen.getByLabelText("Instructions"), {
+      target: { value: "Review again" },
+    });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({
+      prompt: "Review again",
+      permissionMode: null,
+    });
   });
 
   it("creates Codex settings and resets an effort the next model cannot support", async () => {

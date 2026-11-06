@@ -16,7 +16,9 @@ import {
   Loader2Icon,
   MonitorCloudIcon,
 } from "lucide-react";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -111,7 +113,7 @@ export const ComposerWorkspaceTrigger = forwardRef<
       content={tooltip}
       // The wrapper is the bar's flex item, so it carries the width cap.
       className="max-w-[calc(50%-0.25rem)]"
-      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all"
+      contentClassName="max-w-[min(36rem,calc(100vw-2rem))] break-all max-md:hidden"
     >
       <button
         ref={ref}
@@ -181,20 +183,33 @@ export const ComposerHostTrigger = forwardRef<
     label: string;
     status?: HostStatusDotStatus;
     cloud?: boolean;
+    appearance?: "composer" | "header";
     testIdPrefix?: string;
   }
 >(function ComposerHostTrigger(
-  { label, status, cloud = false, testIdPrefix = "composer", className, ...props },
+  {
+    label,
+    status,
+    cloud = false,
+    appearance = "composer",
+    testIdPrefix = "composer",
+    className,
+    ...props
+  },
   ref,
 ) {
   const Icon = cloud ? MonitorCloudIcon : LaptopIcon;
+  const Trigger = appearance === "header" ? MobileHeaderButton : "button";
   return (
-    <button
+    <Trigger
+      {...(appearance === "header" ? { glass: false } : {})}
       ref={ref}
       type="button"
       aria-label={label}
       className={cn(
         "flex h-8 mobile-touch-target w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
+        appearance === "header" &&
+          "max-md:data-[state=open]:bg-transparent max-md:focus:bg-transparent max-md:focus-visible:ring-0",
         className,
       )}
       {...props}
@@ -205,9 +220,12 @@ export const ComposerHostTrigger = forwardRef<
             <HostStatusDot status={status} testId={`${testIdPrefix}-host-status`} />
           </span>
         )}
-        <Icon className="size-4 shrink-0" data-testid={`${testIdPrefix}-host-icon`} />
+        <Icon
+          className={cn("size-4 shrink-0", appearance === "header" && "size-5")}
+          data-testid={`${testIdPrefix}-host-icon`}
+        />
       </span>
-    </button>
+    </Trigger>
   );
 });
 
@@ -222,6 +240,7 @@ export function ComposerPermissionPicker({
   iconOnly = false,
   loading = false,
   interactiveWhileLoading = false,
+  shortcut,
   onSelect,
   testIdPrefix = "composer",
   openNonce = 0,
@@ -238,6 +257,8 @@ export function ComposerPermissionPicker({
   iconOnly?: boolean;
   loading?: boolean;
   interactiveWhileLoading?: boolean;
+  /** Key chord shown in the hover tooltip; omit when the chord is unbound. */
+  shortcut?: readonly string[];
   onSelect: (value: string) => void;
   testIdPrefix?: string;
   /** Opens the menu each time this changes to a new nonzero value. */
@@ -253,31 +274,44 @@ export function ComposerPermissionPicker({
   }, [openNonce, inert]);
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild disabled={inert}>
-        <button
-          type="button"
-          disabled={inert}
-          aria-busy={loading || undefined}
-          className={cn(
-            "flex h-8 mobile-touch-target mobile-app:h-auto min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
-            loading && "disabled:opacity-100",
-          )}
-          aria-label={`${label}: ${value}`}
-          title={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
-          data-testid={`${testIdPrefix}-permission-chip`}
-          data-permission-concept={permissionModeConcept(harness, selectedValue)}
-        >
-          <HandIcon className="size-3 shrink-0" />
-          {!iconOnly && (
-            <span
-              className={cn("min-w-0 truncate text-ui font-normal", COMPOSER_COLLAPSED_LABEL_CLASS)}
+      {/* The wrapper takes the hover: a disabled button may not emit pointer events. */}
+      <KeyboardShortcutTooltip
+        label={disabled && disabledReason ? disabledReason : `${label}: ${value}`}
+        keys={shortcut}
+      >
+        <span className="flex min-w-0">
+          <DropdownMenuTrigger asChild disabled={inert}>
+            <button
+              type="button"
+              disabled={inert}
+              aria-busy={loading || undefined}
+              className={cn(
+                "flex h-8 mobile-touch-target mobile-app:h-auto min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:pointer-events-none disabled:cursor-default disabled:opacity-50 md:h-7",
+                loading && "disabled:opacity-100",
+              )}
+              aria-label={`${label}: ${value}`}
+              data-testid={`${testIdPrefix}-permission-chip`}
+              data-composer-action="permission"
+              data-mobile-icon-button
+              data-permission-concept={permissionModeConcept(harness, selectedValue)}
             >
-              {value}
-            </span>
-          )}
-          <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
-        </button>
-      </DropdownMenuTrigger>
+              <HandIcon className="size-3 shrink-0" />
+              {!iconOnly && (
+                <span
+                  data-composer-permission-label
+                  className={cn(
+                    "min-w-0 truncate text-ui font-normal",
+                    COMPOSER_COLLAPSED_LABEL_CLASS,
+                  )}
+                >
+                  {value}
+                </span>
+              )}
+              <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
+            </button>
+          </DropdownMenuTrigger>
+        </span>
+      </KeyboardShortcutTooltip>
       <DropdownMenuContent
         align="start"
         className="w-max min-w-[13.75rem] max-w-[calc(100vw-2rem)]"
@@ -388,6 +422,7 @@ export const ComposerHarnessTrigger = forwardRef<
     icon?: ReactNode;
     testIdPrefix?: string;
     labelClassName?: string;
+    appearance?: "composer" | "header";
   }
 >(function ComposerHarnessTrigger(
   {
@@ -399,13 +434,16 @@ export const ComposerHarnessTrigger = forwardRef<
     pending = false,
     testIdPrefix = "composer",
     labelClassName,
+    appearance = "composer",
     className,
     ...props
   },
   ref,
 ) {
+  const Trigger = appearance === "header" ? MobileHeaderButton : Button;
   return (
-    <Button
+    <Trigger
+      {...(appearance === "header" ? { glass: false } : {})}
       ref={ref}
       type="button"
       variant="ghost"
@@ -441,6 +479,7 @@ export const ComposerHarnessTrigger = forwardRef<
           "inline-flex min-w-0 flex-nowrap items-baseline gap-1",
           icon != null && COMPOSER_COLLAPSED_LABEL_CLASS,
           labelClassName,
+          appearance === "header" && "sr-only",
         )}
         data-testid={`${testIdPrefix}-agent-config-value`}
       >
@@ -462,7 +501,7 @@ export const ComposerHarnessTrigger = forwardRef<
           </span>
         )}
       </span>
-      <ChevronDownIcon className="size-4 shrink-0 opacity-60" />
-    </Button>
+      {appearance !== "header" && <ChevronDownIcon className="size-4 shrink-0 opacity-60" />}
+    </Trigger>
   );
 });
