@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { NewProjectButton } from "./NewProjectButton";
@@ -168,6 +168,37 @@ describe("NewProjectButton", () => {
 
     await waitFor(() => expect(mocks.createProject).toHaveBeenCalledTimes(2));
     expect(mocks.createDirectory).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not finish a dismissed folder submission or clear a reopened modal", async () => {
+    let resolveDirectory: ((path: string) => void) | undefined;
+    mocks.createDirectory.mockReturnValueOnce(
+      new Promise<string>((resolve) => {
+        resolveDirectory = resolve;
+      }),
+    );
+    renderButton();
+
+    fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+    fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+      target: { value: "Garden" },
+    });
+    fireEvent.click(
+      screen.getByRole("checkbox", {
+        name: "Create a folder using the project name",
+      }),
+    );
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+    await waitFor(() => expect(screen.queryByPlaceholderText("Project name…")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "New project" }));
+    expect(screen.getByPlaceholderText("Project name…")).toBeInTheDocument();
+
+    await act(async () => resolveDirectory?.("/Users/me/Garden"));
+
+    expect(mocks.createProject).not.toHaveBeenCalled();
+    expect(screen.getByPlaceholderText("Project name…")).toBeInTheDocument();
   });
 
   it("turns a duplicate folder error into a short actionable message", async () => {

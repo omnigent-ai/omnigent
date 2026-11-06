@@ -1,4 +1,4 @@
-import { type CSSProperties, useEffect, useState } from "react";
+import { type CSSProperties, useEffect, useRef, useState } from "react";
 import { ChevronRightIcon, FolderOpenIcon, PlusIcon, SmilePlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -105,6 +105,7 @@ export function NewProjectButton({
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
   const [createWorkspaceFolder, setCreateWorkspaceFolder] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const submissionGeneration = useRef(0);
   const createProject = useCreateProject();
   const createDirectory = useCreateHostDirectory();
   const isPending = createProject.isPending || createDirectory.isPending;
@@ -119,6 +120,7 @@ export function NewProjectButton({
   const submit = async () => {
     const trimmed = name.trim();
     if (trimmed === "" || isPending) return;
+    const submission = ++submissionGeneration.current;
     setSubmitError(null);
 
     let selectedWorkspace = workspace;
@@ -135,15 +137,18 @@ export function NewProjectButton({
             hostId: dialogHostId,
             path: joinPath("~", trimmed),
           });
+          if (submission !== submissionGeneration.current) return;
           selectedWorkspace = { hostId: dialogHostId, path };
           setCreatedWorkspace({ ...selectedWorkspace, projectName: trimmed });
         } catch (error) {
+          if (submission !== submissionGeneration.current) return;
           setSubmitError(friendlyDirectoryError(error));
           return;
         }
       }
     }
 
+    if (submission !== submissionGeneration.current) return;
     const config: ProjectConfig = {};
     if (icon) config.icon = icon;
     if (selectedWorkspace) {
@@ -154,6 +159,8 @@ export function NewProjectButton({
       { name: trimmed, config: Object.keys(config).length > 0 ? config : undefined },
       {
         onSuccess: (project) => {
+          if (submission !== submissionGeneration.current) return;
+          submissionGeneration.current += 1;
           setOpen(false);
           setName("");
           setIcon(undefined);
@@ -182,6 +189,7 @@ export function NewProjectButton({
             className="text-muted-foreground mobile-touch-target"
             onClick={(e) => {
               e.stopPropagation();
+              submissionGeneration.current += 1;
               setName("");
               setIcon(undefined);
               setDialogHostId(hostId);
@@ -201,6 +209,9 @@ export function NewProjectButton({
       <Dialog
         open={open}
         onOpenChange={(next) => {
+          if (!next) {
+            submissionGeneration.current += 1;
+          }
           setOpen(next);
           if (!next) {
             setEmojiOpen(false);
