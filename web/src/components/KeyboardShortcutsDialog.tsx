@@ -33,6 +33,7 @@ import {
   PIN_SESSION_KEYS,
   sessionNumberShortcutKeys,
   QUIT_KEYS,
+  settingsShortcutKeys,
   SHIFT_KEY,
   SPLIT_TERMINAL_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
@@ -101,7 +102,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
-      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
+      { label: "Open Settings", keys: settingsShortcutKeys(false) },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],
   },
@@ -210,7 +211,12 @@ function shortcutGroupsFor(
         ...group,
         items: [
           { label: "Start a new session", keys: newSessionShortcutKeys(native) },
-          ...group.items,
+          // The desktop menu's Settings item owns ⌘, there.
+          ...group.items.map((item) =>
+            item.label === "Open Settings"
+              ? { ...item, keys: settingsShortcutKeys(desktopCommands) }
+              : item,
+          ),
           ...(desktopCommands ? DESKTOP_COMMAND_SHORTCUTS : []),
         ],
       };
