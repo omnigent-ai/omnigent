@@ -3506,7 +3506,7 @@ requires-dist = [
     { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.180,<1" },
     { name = "e2b", marker = "extra == 'e2b'", specifier = ">=2.26,<3" },
     { name = "fastapi", specifier = ">=0.100,<1" },
-    { name = "filelock", specifier = ">=3.0" },
+    { name = "filelock", specifier = "==4.2.4" },
     { name = "ftfy", specifier = ">=6.0" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1,<2" },
     { name = "google-antigravity", marker = "extra == 'antigravity'", specifier = ">=0.1,<1" },
