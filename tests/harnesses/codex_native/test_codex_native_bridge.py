@@ -18,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     CODEX_APP_SERVER_STOPPED,
     CodexNativeBridgeState,
     cancel_pending_mcp_startup,
+    claim_codex_automatic_input,
     clear_active_turn_id_if_matches,
     clear_bridge_state,
     codex_home_for_bridge_dir,
@@ -41,6 +42,9 @@ from omnigent.harnesses.codex_native.bridge import (
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
+    record_codex_automatic_input_receipt,
+    record_codex_interrupt,
+    settle_codex_automatic_input,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -163,6 +167,438 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+
+
+@pytest.mark.parametrize("active_turn_id", [None, "turn_source"])
+def test_codex_interrupt_is_durable_even_while_idle(
+    tmp_path: Path, active_turn_id: str | None
+) -> None:
+    """Every Stop advances the owner generation before any native RPC wait."""
+    _seed_active_turn(tmp_path, active_turn_id)
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+
+    fenced = record_codex_interrupt(tmp_path, expected=observed)
+
+    assert fenced is not None
+    assert fenced.interrupt_generation == 1
+    assert fenced.interrupted_turn_id == active_turn_id
+    assert read_bridge_state(tmp_path) == fenced
+
+
+@pytest.mark.parametrize("changed_owner", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_codex_interrupt_cannot_fence_a_transferred_owner(
+    tmp_path: Path, changed_owner: str
+) -> None:
+    """A delayed Stop cannot mark or interrupt a replacement bridge owner."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_source")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    successor = replace(
+        observed,
+        session_id=("replacement" if changed_owner == "session_id" else observed.session_id),
+        thread_id=("replacement" if changed_owner == "thread_id" else observed.thread_id),
+        socket_path=("replacement" if changed_owner == "socket_path" else observed.socket_path),
+        codex_home=("replacement" if changed_owner == "codex_home" else observed.codex_home),
+    )
+    write_bridge_state(tmp_path, successor)
+
+    assert record_codex_interrupt(tmp_path, expected=observed) is None
+    assert read_bridge_state(tmp_path) == successor
+
+
+@pytest.mark.parametrize("changed_owner", ["session_id", "thread_id", "socket_path", "codex_home"])
+def test_owner_scoped_clear_cannot_mutate_a_transferred_bridge(
+    tmp_path: Path, changed_owner: str
+) -> None:
+    """Delayed reconciliation cannot clear a successor that reused a turn id."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "reused-turn-id")
+    observed = read_bridge_state(tmp_path)
+    assert observed is not None
+    successor = replace(
+        observed,
+        session_id=("replacement" if changed_owner == "session_id" else observed.session_id),
+        thread_id=("replacement" if changed_owner == "thread_id" else observed.thread_id),
+        socket_path=("replacement" if changed_owner == "socket_path" else observed.socket_path),
+        codex_home=("replacement" if changed_owner == "codex_home" else observed.codex_home),
+    )
+    write_bridge_state(tmp_path, successor)
+    callbacks: list[bool] = []
+
+    assert not clear_active_turn_id_if_matches(
+        tmp_path,
+        "reused-turn-id",
+        expected_owner=observed,
+        on_cleared=lambda: callbacks.append(True),
+    )
+    assert read_bridge_state(tmp_path) == successor
+    assert callbacks == []
+
+
+def test_same_owner_state_publication_preserves_stop_and_automatic_input(
+    tmp_path: Path,
+) -> None:
+    """A stale app-server state write cannot erase newer control metadata."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claimed = claim_codex_automatic_input(
+        tmp_path, source, client_message_id="automatic-client-id"
+    )
+    assert claimed is not None
+    stopped = record_codex_interrupt(tmp_path, expected=claimed)
+    assert stopped is not None
+
+    write_bridge_state(tmp_path, source)
+
+    persisted = read_bridge_state(tmp_path)
+    assert persisted is not None
+    assert persisted.interrupt_generation == 1
+    assert persisted.interrupted_turn_id == "turn_source"
+    assert persisted.automatic_input_source_turn_id == "turn_source"
+    assert persisted.automatic_input_client_message_id == "automatic-client-id"
+
+
+def test_automatic_input_receipt_requires_exact_owner_and_client_id(tmp_path: Path) -> None:
+    """Literal text and a turn id are insufficient without the native id echo."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert claim_codex_automatic_input(tmp_path, source, client_message_id="automatic-client-id")
+
+    for overrides in (
+        {"session_id": "other-session"},
+        {"thread_id": "other-thread"},
+        {"turn_id": "turn_source"},
+        {"client_message_id": "authored-identical-text"},
+    ):
+        arguments = {
+            "session_id": source.session_id,
+            "thread_id": source.thread_id,
+            "turn_id": "turn_automatic",
+            "client_message_id": "automatic-client-id",
+            **overrides,
+        }
+        assert record_codex_automatic_input_receipt(tmp_path, **arguments) is None
+
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="turn_automatic",
+        client_message_id="automatic-client-id",
+    )
+    assert received is not None
+    assert received.automatic_input_turn_id == "turn_automatic"
+    # Replay is idempotent; a different turn cannot take the receipt later.
+    assert (
+        record_codex_automatic_input_receipt(
+            tmp_path,
+            session_id=source.session_id,
+            thread_id=source.thread_id,
+            turn_id="turn_automatic",
+            client_message_id="automatic-client-id",
+        )
+        == received
+    )
+    assert (
+        record_codex_automatic_input_receipt(
+            tmp_path,
+            session_id=source.session_id,
+            thread_id=source.thread_id,
+            turn_id="turn_foreign",
+            client_message_id="automatic-client-id",
+        )
+        is None
+    )
+
+
+def test_stop_generation_blocks_claim_and_marks_a_late_receipt(tmp_path: Path) -> None:
+    """Stop wins both before a request and while its native receipt is delayed."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert record_codex_interrupt(tmp_path, expected=source) is not None
+    assert claim_codex_automatic_input(tmp_path, source, client_message_id="too-late") is None
+
+    # Fresh state: claim first, then Stop while turn/start lacks a receipt.
+    clear_bridge_state(tmp_path)
+    _seed_active_turn(tmp_path, "turn_next")
+    next_source = read_bridge_state(tmp_path)
+    assert next_source is not None
+    claimed = claim_codex_automatic_input(
+        tmp_path, next_source, client_message_id="delayed-receipt"
+    )
+    assert claimed is not None
+    stopped = record_codex_interrupt(tmp_path, expected=claimed)
+    assert stopped is not None and stopped.interrupted_turn_id == "turn_next"
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=next_source.session_id,
+        thread_id=next_source.thread_id,
+        turn_id="turn_after_stop",
+        client_message_id="delayed-receipt",
+    )
+    assert received is not None
+    assert codex_native_bridge.codex_automatic_input_was_interrupted(received)
+
+
+def test_delayed_same_owner_publication_cannot_erase_a_newer_receipt(tmp_path: Path) -> None:
+    """A stale claimed snapshot cannot regress an exact native receipt to pending."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claimed = claim_codex_automatic_input(
+        tmp_path, source, client_message_id="automatic-client-id"
+    )
+    assert claimed is not None
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="turn_automatic",
+        client_message_id="automatic-client-id",
+    )
+    assert received is not None
+
+    write_bridge_state(tmp_path, claimed)
+
+    assert read_bridge_state(tmp_path) == received
+
+
+def test_delayed_claim_cannot_resurrect_after_owner_matched_settlement(tmp_path: Path) -> None:
+    """A durable settlement tombstone wins over a delayed pre-settlement writer."""
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claimed = claim_codex_automatic_input(
+        tmp_path, source, client_message_id="automatic-client-id"
+    )
+    assert claimed is not None
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="turn_automatic",
+        client_message_id="automatic-client-id",
+    )
+    assert received is not None
+    settled = settle_codex_automatic_input(tmp_path, expected=received, outcome="completed")
+    assert settled is not None
+
+    write_bridge_state(tmp_path, claimed)
+
+    assert read_bridge_state(tmp_path) == settled
+
+
+@pytest.mark.parametrize("deadline", [0, -1, True, float("inf"), float("nan")])
+def test_automatic_claim_rejects_invalid_deadline(tmp_path: Path, deadline: float) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert (
+        claim_codex_automatic_input(
+            tmp_path,
+            source,
+            client_message_id="exact",
+            deadline=deadline,
+        )
+        is None
+    )
+    assert read_bridge_state(tmp_path) == source
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "session_id",
+        "thread_id",
+        "socket_path",
+        "codex_home",
+        "automatic_input_client_message_id",
+        "automatic_input_source_turn_id",
+    ],
+)
+def test_automatic_settlement_requires_original_owner_and_claim(
+    tmp_path: Path, change: str
+) -> None:
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    mismatched = replace(claim, **{change: "foreign"})
+    assert settle_codex_automatic_input(tmp_path, expected=mismatched, outcome="uncertain") is None
+    assert read_bridge_state(tmp_path) == claim
+
+
+@pytest.mark.parametrize("newer_turn", [False, True])
+def test_automatic_receipt_cannot_adopt_after_newer_turn_ran_to_idle(
+    tmp_path: Path,
+    newer_turn: bool,
+) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    if newer_turn:
+        update_active_turn_id(tmp_path, "manual")
+        update_active_turn_id(tmp_path, None)
+    proof = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="automatic",
+        client_message_id="exact",
+    )
+    assert proof is not None
+    accepted = settle_codex_automatic_input(tmp_path, expected=claim, outcome="accepted")
+    assert (accepted is None) is newer_turn
+
+
+def test_automatic_settlement_cannot_regress_or_rearm_automatic_turn(tmp_path: Path) -> None:
+    _seed_active_turn(tmp_path, "source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    claim = claim_codex_automatic_input(tmp_path, source, client_message_id="exact")
+    assert claim is not None
+    proof = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="automatic",
+        client_message_id="exact",
+    )
+    assert proof is not None
+    accepted = settle_codex_automatic_input(tmp_path, expected=claim, outcome="accepted")
+    assert accepted is not None
+    assert settle_codex_automatic_input(tmp_path, expected=accepted, outcome="uncertain") is None
+    completed = settle_codex_automatic_input(tmp_path, expected=accepted, outcome="completed")
+    assert completed is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "automatic", expected_owner=completed)
+    settled = read_bridge_state(tmp_path)
+    write_bridge_state(tmp_path, accepted)
+    assert read_bridge_state(tmp_path) == settled
+    assert settle_codex_automatic_input(tmp_path, expected=claim, outcome="uncertain") is None
+    assert claim_codex_automatic_input(tmp_path, completed, client_message_id="repeat") is None
+    update_active_turn_id(tmp_path, "manual")
+    manual = read_bridge_state(tmp_path)
+    assert manual is not None
+    assert claim_codex_automatic_input(tmp_path, manual, client_message_id="fresh") is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("automatic_input_outcome", "unknown"),
+        ("automatic_input_outcome", 5),
+        ("automatic_input_outcome", ""),
+        ("automatic_input_outcome", []),
+        ("automatic_input_deadline", True),
+        ("automatic_input_deadline", -1),
+        ("automatic_input_deadline", "never"),
+        ("automatic_input_deadline", float("inf")),
+        ("turn_generation", -1),
+        ("turn_generation", True),
+        ("automatic_input_turn_generation", -1),
+        ("automatic_input_turn_generation", True),
+    ],
+)
+def test_invalid_automatic_lifecycle_metadata_fails_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    _seed_active_turn(tmp_path, "source")
+    path = tmp_path / "state.json"
+    payload = json.loads(path.read_text())
+    payload[field] = value
+    path.write_text(json.dumps(payload))
+    assert read_bridge_state(tmp_path) is None
+    assert codex_native_bridge.read_bridge_state_result(tmp_path).status == "invalid_state"
+
+
+@pytest.mark.parametrize("conflict", ["claim", "receipt"])
+def test_same_owner_automatic_input_conflict_keeps_the_persisted_claim(
+    tmp_path: Path, conflict: str
+) -> None:
+    """A conflicting delayed writer cannot replace delivery identity or its receipt."""
+    from dataclasses import replace
+
+    _seed_active_turn(tmp_path, "turn_source")
+    source = read_bridge_state(tmp_path)
+    assert source is not None
+    assert claim_codex_automatic_input(tmp_path, source, client_message_id="automatic-client-id")
+    received = record_codex_automatic_input_receipt(
+        tmp_path,
+        session_id=source.session_id,
+        thread_id=source.thread_id,
+        turn_id="turn_automatic",
+        client_message_id="automatic-client-id",
+    )
+    assert received is not None
+    conflicting = (
+        replace(
+            received,
+            automatic_input_source_turn_id="other-source",
+            automatic_input_client_message_id="other-client",
+            automatic_input_turn_id=None,
+        )
+        if conflict == "claim"
+        else replace(received, automatic_input_turn_id="other-turn")
+    )
+
+    write_bridge_state(tmp_path, conflicting)
+
+    assert read_bridge_state(tmp_path) == received
+
+
+def test_delayed_source_cannot_claim_after_a_newer_turn_completed(tmp_path: Path) -> None:
+    """A→B→idle under one owner rejects A's delayed automatic-input claim."""
+    _seed_active_turn(tmp_path, "turn_a")
+    observed_a = read_bridge_state(tmp_path)
+    assert observed_a is not None
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+    update_active_turn_id(tmp_path, "turn_b")
+    assert clear_active_turn_id_if_matches(tmp_path, "turn_b")
+
+    assert claim_codex_automatic_input(tmp_path, observed_a, client_message_id="delayed-a") is None
+    current = read_bridge_state(tmp_path)
+    assert current is not None
+    assert current.active_turn_id is None
+    assert current.automatic_input_source_turn_id is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("interrupt_generation", -1),
+        ("interrupt_generation", True),
+        ("interrupted_turn_id", ""),
+        ("interrupted_turn_id", "turn-without-generation"),
+        ("automatic_input_source_turn_id", "source-without-client"),
+        ("automatic_input_client_message_id", "client-without-source"),
+        ("automatic_input_owner_scope", ["incomplete"]),
+        ("automatic_input_turn_id", "turn-without-claim"),
+    ],
+)
+def test_invalid_control_metadata_fails_closed(tmp_path: Path, field: str, value: object) -> None:
+    """Corrupt owner metadata cannot silently restore an automatic request."""
+    _seed_active_turn(tmp_path, "turn_source")
+    state_file = tmp_path / "state.json"
+    payload = json.loads(state_file.read_text())
+    payload[field] = value
+    state_file.write_text(json.dumps(payload))
+
+    assert read_bridge_state(tmp_path) is None
+    assert codex_native_bridge.read_bridge_state_result(tmp_path).status == "invalid_state"
 
 
 @pytest.mark.parametrize("native_turn", [None, "turn_agent", "turn_shell"])
