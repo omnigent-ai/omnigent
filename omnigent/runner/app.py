@@ -1596,6 +1596,12 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
+    # Sessions whose Claude pane reports a background shell still running after
+    # its turn ended. Real work: it keeps the runner and its sandbox up, but only
+    # while that session's native pane exists, so a lost "stopped" edge cannot
+    # pin either.
+    _sessions_with_background_shell: set[str] = set()
+
     def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
             return True
@@ -1622,6 +1628,8 @@ def create_runner_app(
                 ):
                     continue
                 session_ids.add(session_id)
+                if session_id in _sessions_with_background_shell:
+                    return True
                 if _native_pane_shows_live_work(
                     terminals, session_id, name, include_pane_activity=include_pane_activity
                 ):
@@ -1883,6 +1891,10 @@ def create_runner_app(
     )
 
     def _publish_session_background(session_id: str, running: bool) -> None:
+        if running:
+            _sessions_with_background_shell.add(session_id)
+        else:
+            _sessions_with_background_shell.discard(session_id)
         background_reports.report(session_id, running)
 
     resource_registry.set_session_background_publisher(_publish_session_background)

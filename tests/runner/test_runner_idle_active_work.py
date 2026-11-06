@@ -672,7 +672,8 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+    "evidence",
+    ["permission_prompt", "background_shell", "pane_output", "pane_input", "no_evidence"],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
@@ -750,8 +751,20 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             publish = app.state.session_resource_registry._session_status_publisher
             publish(conv_id, "running", None)
             publish(conv_id, "idle", None)
+            background = app.state.session_resource_registry._session_background_publisher
+            if evidence == "background_shell":
+                # Claude reports ``shell`` (idle) while a background command it
+                # started outlives the turn; that command is still agent work.
+                background(conv_id, True)
             assert app.state.native_pane_status[conv_id] == "idle"
             assert app.state.has_active_work() is (evidence != "no_evidence")
             # Sandbox keepalive counts agent work only: recent pane input or output
-            # also comes from someone viewing the pane, so only the prompt counts.
-            assert app.state.has_sandbox_work() is (evidence == "permission_prompt")
+            # also comes from someone viewing the pane, so only the prompt and a
+            # background shell count.
+            assert app.state.has_sandbox_work() is (
+                evidence in ("permission_prompt", "background_shell")
+            )
+            if evidence == "background_shell":
+                background(conv_id, False)
+                assert app.state.has_active_work() is False
+                assert app.state.has_sandbox_work() is False
