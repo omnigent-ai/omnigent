@@ -3087,6 +3087,52 @@ async def test_a_sandbox_continue_tasks_first_run_uses_the_tasks_own_host(
 
 
 @pytest.mark.asyncio
+async def test_a_sandbox_task_whose_session_was_deleted_starts_a_new_one_on_its_own_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the session gone, no earlier workspace is known, so the sandbox host the task
+    left behind is relaunched under the task's own host id."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY, ManagedLaunchTracker
+    from omnigent.server.routes import sessions
+
+    task = _sandbox_continue_task(session_id="conv_prev", last_run_conversation_id="conv_prev")
+    own = continued_sandbox_host_id(task.id, task.workspace_id)
+    existing = _FakeHost(own, "local", sandbox_provider="agent_sandbox")
+
+    async def launch(**kwargs: Any) -> None:
+        kwargs["tracker"].finish(kwargs["session_id"])
+
+    managed_launch = AsyncMock(side_effect=launch)
+    monkeypatch.setattr(sessions, "_run_managed_launch", managed_launch)
+    conv_store = _ExistingConversationStore()  # conv_prev was deleted
+    store = FakeScheduledTaskStore(rows={"task_1": task})
+    on_fire = build_on_fire(
+        _deps(
+            store,
+            conversation_store=conv_store,
+            host_store=FakeHostStore({own: existing}),
+            sandbox_config=_managed_sandbox_config(),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=FakeStartupInputs(),
+        )
+    )
+
+    await on_fire(0, "task_1")
+    await _drain()
+    await _drain_managed_launches()
+
+    assert store.released == [(task.id, "conv_prev")]
+    [(task_id, new_session_id)] = store.adopted
+    assert task_id == task.id
+    assert new_session_id != "conv_prev"
+    [call] = managed_launch.await_args_list
+    assert call.kwargs["host_id"] == own
+    assert call.kwargs["relaunch_host"] is existing
+    assert conv_store.created[0]["labels"][REQUESTED_HOST_ID_LABEL_KEY] == own
+    assert [run["status"] for run in store.runs] == ["running"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("repository", [None, "https://github.com/example/runtime"])
 async def test_a_new_session_joins_the_tasks_sandbox_in_an_earlier_sessions_workspace(
     monkeypatch: pytest.MonkeyPatch,

@@ -2266,8 +2266,9 @@ def test_release_session_clears_only_the_session_it_was_given(
     assert store.release_session(task.id, _uid("c1")) is False
     assert store.release_session(_uid("missing"), _uid("c1")) is False
 
-    # A released task takes a new session like a first run.
-    assert store.adopt_session(task.id, _uid("c2"), snapshot=after) == "adopted"
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
 
     # A deleted task releases nothing.
     store.delete(task.id)
