@@ -6,12 +6,14 @@ import json
 import os
 import signal
 import sys
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 from omnigent.errors import HarnessTransportClosedError
+from omnigent.inner import codex_executor as codex_executor_module
 from omnigent.inner.codex_executor import (
     CodexExecutor,
     _CodexAppServerSession,
@@ -617,21 +619,31 @@ async def test_cancelled_native_close_kills_and_reaps_sigterm_ignoring_child(
         await session.close()
 
 
+@pytest.mark.parametrize("explaining", [False, True])
 @pytest.mark.parametrize("activity, malformed", [(False, False), (True, False), (False, True)])
 async def test_stdin_failure_after_reader_eof_preserves_typed_replay_safety(
     activity: bool,
     malformed: bool,
+    explaining: bool,
 ) -> None:
     session, stream = _session()
     sending = asyncio.Event()
     release = asyncio.Event()
+    diagnosed = asyncio.Event()
 
     async def fail_drain() -> None:
         sending.set()
         await release.wait()
         raise BrokenPipeError("stdin closed")
 
+    async def slow_startup_exit_detail(detail: str) -> str:
+        await diagnosed.wait()
+        return f"{detail}; explained"
+
     session._proc.stdin.drain = fail_drain
+    if explaining:
+        session._explain_startup_exit = True
+        session._startup_exit_detail = slow_startup_exit_detail
     request = asyncio.create_task(session._request("turn/start", {}))
     await sending.wait()
     if activity:
@@ -646,13 +658,60 @@ async def test_stdin_failure_after_reader_eof_preserves_typed_replay_safety(
     if malformed:
         stream.feed_data(b"[]\n")
     stream.feed_eof()
-    await session._reader_loop()
-    release.set()
+    if explaining and not malformed:
+        # The send fails while the reader is still explaining the EOF it saw.
+        reader = asyncio.create_task(session._reader_loop())
+        while session._startup_exit_explained is None:
+            await asyncio.sleep(0)
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not request.done()
+        diagnosed.set()
+        await reader
+    else:
+        await session._reader_loop()
+        release.set()
     with pytest.raises(HarnessTransportClosedError) as caught:
         await request
     assert caught.value is session._transport_error
     assert caught.value.replay_safe is (not activity and not malformed)
+    if explaining and not malformed:
+        assert str(caught.value) == "Codex app-server closed stdout; explained"
     assert not session._pending_requests
+
+
+async def test_late_startup_exit_explanation_still_reports_typed_eof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(codex_executor_module, "_STARTUP_EXIT_EXPLAIN_TIMEOUT_SECONDS", 0.05)
+    session, stream = _session()
+    never = asyncio.Event()
+
+    async def fail_drain() -> None:
+        await asyncio.sleep(0)
+        raise BrokenPipeError("stdin closed")
+
+    async def stuck_startup_exit_detail(detail: str) -> str:
+        await never.wait()
+        return detail
+
+    session._proc.stdin.drain = fail_drain
+    session._explain_startup_exit = True
+    session._startup_exit_detail = stuck_startup_exit_detail
+    stream.feed_eof()
+    reader = asyncio.create_task(session._reader_loop())
+    while session._startup_exit_explained is None:
+        await asyncio.sleep(0)
+    try:
+        with pytest.raises(HarnessTransportClosedError) as caught:
+            await session._request("initialize", {})
+        assert str(caught.value) == "Codex app-server closed stdout"
+        assert caught.value.replay_safe is True
+    finally:
+        reader.cancel()
+        with suppress(asyncio.CancelledError):
+            await reader
 
 
 @pytest.mark.parametrize("eof", [False, True])

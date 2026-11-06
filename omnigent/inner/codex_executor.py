@@ -182,12 +182,12 @@ _WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS = 12.0
 _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
-# Bounds on explaining an app-server that exits before ``initialize`` returns:
-# how long to wait for its stderr and exit status, how long the follow-up
-# ``codex debug models`` config check may run, and how much of each stderr line
-# the surfaced error keeps.
+# Limits for pre-initialize exit diagnostics.
 _STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS = 2.0
 _STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS = 10.0
+_STARTUP_EXIT_EXPLAIN_TIMEOUT_SECONDS = (
+    _STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS + _STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS + 2.0
+)
 _STARTUP_EXIT_STDERR_LINE_LIMIT = 500
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
@@ -625,10 +625,43 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
     return match.group(1) if match is not None else None
 
 
-async def _codex_config_check_error(
+@dataclass(frozen=True)
+class _StartupConfigCheck:
+    """The app-server launch inputs ``codex debug models`` must reproduce."""
+
+    codex_path: str
+    config_overrides: tuple[str, ...]
+    env: Mapping[str, str]
+    cwd: str
+
+
+def _startup_config_check(
+    *,
+    sandboxed: bool,
+    signer_backed: bool,
     codex_path: str,
     config_overrides: Sequence[str],
     env: Mapping[str, str],
+    cwd: str,
+) -> _StartupConfigCheck | None:
+    """
+    Return the inputs for a startup-exit config check, if one may run.
+
+    The check runs outside any worker sandbox, so a sandboxed or signer-backed
+    worker, whose config may only be loaded inside that containment, gets none.
+    """
+    if sandboxed or signer_backed:
+        return None
+    return _StartupConfigCheck(
+        codex_path=codex_path,
+        config_overrides=tuple(config_overrides),
+        env=dict(env),
+        cwd=cwd,
+    )
+
+
+async def _codex_config_check_error(
+    check: _StartupConfigCheck,
     *,
     timeout: float = _STARTUP_CONFIG_CHECK_TIMEOUT_SECONDS,
 ) -> str | None:
@@ -641,18 +674,16 @@ async def _codex_config_check_error(
     loads the same config and prints the original error, e.g. an unsupported
     key or an unreadable ``model_catalog_json``.
 
-    :param codex_path: The codex binary the app-server ran, e.g.
-        ``"/usr/local/bin/codex"``.
-    :param config_overrides: The app-server's ``-c`` overrides, e.g.
-        ``['model_provider="example"']``.
-    :param env: The app-server's environment, including its ``CODEX_HOME``.
+    :param check: The app-server's codex binary, ``-c`` overrides,
+        environment (including its ``CODEX_HOME``) and working directory.
     :param timeout: Seconds to wait before giving up.
     :returns: The first ``Error:`` line from a failed check, e.g.
         ``"Error: No such file or directory (os error 2)"``, or ``None`` when
         the check passes, prints no error line, or cannot run.
+    :raises asyncio.CancelledError: When cancelled; the check is killed first.
     """
-    argv = [codex_path, "debug", "models"]
-    for override in config_overrides:
+    argv = [check.codex_path, "debug", "models"]
+    for override in check.config_overrides:
         argv.extend(["-c", override])
     try:
         proc = await _create_subprocess_exec(
@@ -660,21 +691,21 @@ async def _codex_config_check_error(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=check.env,
+            cwd=check.cwd,
         )
     except OSError:
         return None
     try:
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except BaseException as exc:
-        # Also on cancellation: a session closing mid-check must not leave
-        # the check running.
         with suppress(ProcessLookupError):
             proc.kill()
         with suppress(Exception):
             await asyncio.wait_for(proc.wait(), timeout=1)
         close_subprocess_transport(proc)
-        if isinstance(exc, TimeoutError):
+        if isinstance(exc, Exception):
+            # Timeouts and pipe errors only cost the supplementary detail.
             return None
         raise
     if proc.returncode == 0:
@@ -2997,12 +3028,11 @@ class _CodexAppServerSession:
         self._default_effort: str | None = None
         self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
-        # Set by a real worker launch, so an exit before ``initialize``
-        # returns is reported with its exit status and stderr. The config
-        # check is the unsandboxed launch's codex path, ``-c`` overrides and
-        # environment, for ``codex debug models``.
+        # Retain launch inputs for unsandboxed startup-exit diagnostics.
         self._explain_startup_exit = False
-        self._startup_config_check: tuple[str, list[str], dict[str, str]] | None = None
+        self._startup_config_check: _StartupConfigCheck | None = None
+        # Set while the reader explains a startup exit it has already seen.
+        self._startup_exit_explained: asyncio.Event | None = None
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
         # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
@@ -3062,6 +3092,7 @@ class _CodexAppServerSession:
             await asyncio.shield(cleanup_task)
         self._closing = False
         self._transport_error = None
+        self._startup_exit_explained = None
         self._native_progress_observed = False
         self._reader_started_turn = None
         self._reader_completed_turn = None
@@ -3286,12 +3317,13 @@ class _CodexAppServerSession:
                 if liveness_read_fd is not None:
                     os.close(liveness_read_fd)
             self._explain_startup_exit = True
-            # A sandboxed or signer-backed worker's config is only safe to load
-            # inside that containment, so it gets no out-of-sandbox check.
-            self._startup_config_check = (
-                None
-                if self._worker_launch.sandboxed or self._signer is not None
-                else (self._codex_path, list(self._codex_config_overrides), dict(proc_env))
+            self._startup_config_check = _startup_config_check(
+                sandboxed=self._worker_launch.sandboxed,
+                signer_backed=self._signer is not None,
+                codex_path=self._codex_path,
+                config_overrides=self._codex_config_overrides,
+                env=proc_env,
+                cwd=str(self._cwd or os.getcwd()),
             )
             self._reader_task = asyncio.create_task(self._reader_loop())
             self._stderr_task = asyncio.create_task(self._stderr_loop())
@@ -4512,6 +4544,8 @@ class _CodexAppServerSession:
                     }
                 )
             except Exception as exc:
+                if self._transport_error is None:
+                    await self._await_startup_exit_explanation()
                 if self._transport_error is not None:
                     raise self._transport_error from exc
                 raise
@@ -4634,8 +4668,15 @@ class _CodexAppServerSession:
                 await self._events.put(message)
             detail = "Codex app-server closed stdout"
             if self._explain_startup_exit and not self._started and not self._closing:
-                detail = await self._startup_exit_detail(detail)
-            self._note_transport_closed(detail, clean_eof=True)
+                explained = asyncio.Event()
+                self._startup_exit_explained = explained
+                try:
+                    detail = await self._startup_exit_detail(detail)
+                    self._note_transport_closed(detail, clean_eof=True)
+                finally:
+                    explained.set()
+            else:
+                self._note_transport_closed(detail, clean_eof=True)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — reader loop logs and exits on any unexpected error  # pragma: no cover - defensive
@@ -4660,14 +4701,25 @@ class _CodexAppServerSession:
             startup; stderr: Error: Model provider `example` not found; codex
             config check: Error: No such file or directory (os error 2)"``.
         """
+        parts = [detail]
+        try:
+            await self._collect_startup_exit_detail(parts)
+        except Exception as exc:  # noqa: BLE001 — the detail is best effort; the EOF stands
+            logger.debug("could not explain the Codex app-server startup exit: %s", exc)
+        message = "; ".join(parts)
+        logger.warning("%s", message)
+        return message
+
+    async def _collect_startup_exit_detail(self, parts: list[str]) -> None:
         proc = self._proc
         stderr_task = self._stderr_task
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS
         if stderr_task is not None:
-            await asyncio.wait({stderr_task}, timeout=_STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS)
+            await asyncio.wait({stderr_task}, timeout=max(0.0, deadline - loop.time()))
         if proc is not None and proc.returncode is None:
             with suppress(TimeoutError):
-                await asyncio.wait_for(proc.wait(), timeout=_STARTUP_EXIT_DRAIN_TIMEOUT_SECONDS)
-        parts = [detail]
+                await asyncio.wait_for(proc.wait(), timeout=max(0.0, deadline - loop.time()))
         if proc is not None and proc.returncode is not None:
             parts.append(f"exited with code {proc.returncode} during startup")
         # Codex prefixes its fatal message with ``Error:``; keep only those
@@ -4680,13 +4732,26 @@ class _CodexAppServerSession:
         if stderr_tail:
             parts.append(f"stderr: {' | '.join(stderr_tail)}")
         if self._startup_config_check is not None:
-            codex_path, overrides, env = self._startup_config_check
-            config_error = await _codex_config_check_error(codex_path, overrides, env)
+            config_error = await _codex_config_check_error(self._startup_config_check)
             if config_error is not None and config_error not in stderr_tail:
                 parts.append(f"codex config check: {config_error}")
-        message = "; ".join(parts)
-        logger.warning("%s", message)
-        return message
+
+    async def _await_startup_exit_explanation(self) -> None:
+        """
+        Let a startup exit the reader is explaining settle a failed send.
+
+        A send can fail on the exited worker's closed stdin while the reader
+        still gathers diagnostics; the send must then report the same typed,
+        replay-classified transport loss, not a raw pipe error.
+        """
+        explained = self._startup_exit_explained
+        if explained is None:
+            return
+        with suppress(TimeoutError):
+            await asyncio.wait_for(explained.wait(), timeout=_STARTUP_EXIT_EXPLAIN_TIMEOUT_SECONDS)
+        if self._transport_error is None:
+            # The explanation is late; the reader has seen EOF, so report it now.
+            self._note_transport_closed("Codex app-server closed stdout", clean_eof=True)
 
     async def _stderr_loop(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
