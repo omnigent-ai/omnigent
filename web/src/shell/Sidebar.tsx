@@ -1994,11 +1994,9 @@ function ConversationList({
     () => conversationsQuery.data?.pages.flatMap((page) => page.data) ?? [],
     [conversationsQuery.data],
   );
-  // The open session is always listed, so opening one from search reveals it
-  // here: an archived one (with its Unarchive control) or one older than the
-  // loaded pages is added from its own fetch until a list page carries it.
-  // Only once the first page has loaded: a row added before it would sit alone at
-  // the top, then move down into place without being scrolled into view.
+  // Always list the open session (archived, or older than the loaded pages) from
+  // its own row until a list page carries it. Wait for the first page, or the row
+  // sits alone at the top, then moves down without being scrolled into view.
   const openSessionMissing =
     activeRootSessionId !== null &&
     !conversationsQuery.isLoading &&
