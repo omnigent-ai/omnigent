@@ -883,7 +883,7 @@ describe("login redirect", () => {
 
 describe("isSignInExpired", () => {
   const redirected = { ok: false, status: 0, type: "opaqueredirect", headers: new Headers() };
-  const loginPage = {
+  const maintenancePage = {
     ok: true,
     status: 200,
     type: "basic",
@@ -894,7 +894,6 @@ describe("isSignInExpired", () => {
     ["a redirect to a login page", redirected],
     ["a 401", { ok: false, status: 401, type: "basic", headers: new Headers() }],
     ["a 403", { ok: false, status: 403, type: "basic", headers: new Headers() }],
-    ["a 200 login page", loginPage],
   ])(
     "reports an expired sign-in for %s, probing without following redirects",
     async (_label, answer) => {
@@ -912,6 +911,7 @@ describe("isSignInExpired", () => {
   it.each([
     ["a network failure", new TypeError("Failed to fetch")],
     ["a JSON answer", mockJsonResponse({ user_id: "alice" })],
+    ["a 200 maintenance page", maintenancePage],
   ])("reads %s as not expired, so the caller keeps retrying", async (_label, answer) => {
     if (answer instanceof Error) fetchMock.mockRejectedValueOnce(answer);
     else fetchMock.mockResolvedValueOnce(answer);

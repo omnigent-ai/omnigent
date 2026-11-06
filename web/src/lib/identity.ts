@@ -721,9 +721,10 @@ const SIGN_IN_PROBE_PATH = "/v1/me";
 
 /**
  * Whether the sign-in has expired, judged from one request that does not follow
- * redirects. A redirect to a login page, a 401/403, or a 200 HTML page means a
- * retry cannot renew the sign-in. A failed probe says nothing, so it reads as not
- * expired and the caller keeps retrying.
+ * redirects. A redirect to a login page or a 401/403 means a retry cannot renew the
+ * sign-in. The edge answers an invalid session with a redirect, never an HTML 200,
+ * so a 200 (such as a maintenance page) reads as not expired. A failed probe also
+ * reads as not expired, and the caller keeps retrying.
  */
 export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
   try {
@@ -732,8 +733,7 @@ export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
       cache: "no-store",
       signal,
     });
-    if (res.type === "opaqueredirect" || res.status === 401 || res.status === 403) return true;
-    return res.ok && (res.headers.get("content-type") ?? "").toLowerCase().includes("text/html");
+    return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
   } catch {
     return false;
   }
