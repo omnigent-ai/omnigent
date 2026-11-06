@@ -11,7 +11,7 @@ import type { SandboxProfile } from "./sandboxProfilesApi";
 // helpers below convert at the boundary so callers never see raw
 // wire fields.
 
-import type { ConversationItem } from "./conversationItems";
+import { isMessageItem, type ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
@@ -974,6 +974,130 @@ export async function forkSession(
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/** A user prompt `/rewind` can return to. */
+export interface RewindPrompt {
+  /** The prompt's item id, e.g. "msg_abc". */
+  itemId: string;
+  /** Its text, joined from the prompt's text parts. */
+  text: string;
+  /** Epoch seconds, when the server recorded it. */
+  createdAt?: number;
+}
+
+/** Message pages `/rewind` reads per request for prompts. */
+const REWIND_PROMPT_PAGES = 5;
+const REWIND_PROMPT_PAGE_SIZE = 200;
+
+/** A batch of `/rewind` prompts, newest first. */
+export interface RewindPromptsPage {
+  prompts: RewindPrompt[];
+  /** Pass back as `after` to read older prompts; `null` once none remain. */
+  olderCursor: string | null;
+}
+
+/**
+ * List a session's user prompts, newest first, for the `/rewind` picker.
+ *
+ * Reads message items only (`GET /v1/sessions/{id}/items?type=message`, which
+ * servers advertising `session_rewind` support) and skips hidden context
+ * messages. Reads at most {@link REWIND_PROMPT_PAGES} pages per call; the
+ * returned cursor continues with older ones.
+ *
+ * @param sessionId - Session to read, e.g. "conv_abc".
+ * @param signal - Aborts the requests when the picker closes.
+ * @param after - An `olderCursor` from the previous batch; omit for the newest.
+ */
+export async function fetchRewindPrompts(
+  sessionId: string,
+  signal?: AbortSignal,
+  after: string | null = null,
+): Promise<RewindPromptsPage> {
+  const prompts: RewindPrompt[] = [];
+  let cursor = after;
+  // Each page needs the previous page's cursor.
+  /* oxlint-disable no-await-in-loop */
+  for (let page = 0; page < REWIND_PROMPT_PAGES; page++) {
+    const params = new URLSearchParams({
+      limit: String(REWIND_PROMPT_PAGE_SIZE),
+      order: "desc",
+      type: "message",
+    });
+    if (cursor) params.set("after", cursor);
+    const res = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+      { signal },
+    );
+    const body = await readJsonOrThrow<SessionItemsResponseWire>(res);
+    for (const item of body.data) {
+      if (!isMessageItem(item) || item.role !== "user" || item.is_meta) continue;
+      const text = item.content
+        .flatMap((part) => (part.type === "input_text" ? [part.text] : []))
+        .join("\n");
+      prompts.push({ itemId: item.id, text, createdAt: item.created_at });
+    }
+    if (!body.has_more || body.last_id == null) return { prompts, olderCursor: null };
+    cursor = body.last_id;
+  }
+  /* oxlint-enable no-await-in-loop */
+  return { prompts, olderCursor: cursor };
+}
+
+/** A file the chosen `/rewind` prompt attached, as the rewound session holds it. */
+export interface RewindAttachment {
+  /** The prompt's content block type. */
+  type: "input_file" | "input_image";
+  /** The rewound session's copy of the file, e.g. "file_abc"; absent for an inline image. */
+  fileId?: string;
+  /** An image the prompt carried inline, as a `data:image/...` URI, with no stored file. */
+  imageUrl?: string;
+  /** The attachment's name, e.g. "diagram.png". */
+  filename: string;
+}
+
+/**
+ * Rewind a Claude session to just before one of its prompts:
+ * `POST /v1/sessions/{id}/rewind`.
+ *
+ * The server forks the history before the prompt onto the same host and
+ * runner and links the source to the fork; the caller opens the fork and puts
+ * `prompt` back in its composer.
+ *
+ * @param sessionId - Session to rewind, e.g. "conv_abc".
+ * @param itemId - The user prompt to return to, e.g. "msg_abc".
+ * @returns The rewound session's id, the prompt's text and its attachments
+ *   (empty from servers that return none).
+ */
+export async function rewindSession(
+  sessionId: string,
+  itemId: string,
+): Promise<{ sessionId: string; prompt: string; attachments: RewindAttachment[] }> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/rewind`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ item_id: itemId }),
+  });
+  const body = await readJsonOrThrow<{
+    session_id: string;
+    prompt: string;
+    attachments?: {
+      type: RewindAttachment["type"];
+      file_id?: string | null;
+      image_url?: string | null;
+      filename: string;
+    }[];
+  }>(res);
+  return {
+    sessionId: body.session_id,
+    prompt: body.prompt,
+    attachments: (body.attachments ?? []).map((attachment) => ({
+      type: attachment.type,
+      ...(attachment.file_id ? { fileId: attachment.file_id } : {}),
+      ...(attachment.image_url ? { imageUrl: attachment.image_url } : {}),
+      filename: attachment.filename,
+    })),
+  };
 }
 
 /**

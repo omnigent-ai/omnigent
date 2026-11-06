@@ -2,7 +2,7 @@
 
 These need a real logged-in ``claude`` CLI (the SDK harness drives it) but none
 of claude-native's terminal prerequisites, so they have their own opt-in.
-Shared host and session helpers live in ``test_host_claude_native_fork_e2e``::
+Shared host and session helpers live in ``_claude_host_support``::
 
     OMNIGENT_E2E_CLAUDE_SDK=1 \\
     .venv/bin/python -m pytest tests/e2e/test_host_claude_sdk_e2e.py \\
@@ -19,16 +19,21 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.e2e._claude_host_support import (
+    _builtin_agent_id,
+    _host_daemon,
+    _placement,
+    _plant_code_words,
+    _prompt_item_id,
+    _recall_code_words,
+    _rewind,
+    _send_user_message,
+    _wait_until_idle,
+)
 from tests.e2e.test_host_claude_native_e2e import (
     _assistant_text,
     _online_host_id,
     _poll_for_assistant_marker,
-)
-from tests.e2e.test_host_claude_native_fork_e2e import (
-    _builtin_agent_id,
-    _host_daemon,
-    _send_user_message,
-    _wait_until_idle,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -139,3 +144,39 @@ def test_clear_claude_sdk_continues_empty_on_the_same_host(
             http_client, session_id=source_id, marker=word, timeout=240.0
         )
         assert word in recalled, recalled
+
+
+def test_rewind_claude_sdk_keeps_only_the_earlier_turns(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    claude-sdk ``/rewind`` keeps only the turns before the chosen prompt.
+
+    The SDK replays the Omnigent transcript into a fresh client, so the
+    model's recall shows exactly which history the rewound session carries.
+    """
+    workspace = tmp_path / "rewind_sdk_ws"
+    workspace.mkdir()
+    kept = f"KEPTWORD_{uuid.uuid4().hex[:6].upper()}"
+    dropped = f"DROPWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _host_daemon(tmp_path, live_server):
+        host_id = _online_host_id(http_client, timeout=30.0)
+        source_id = _create_sdk_session_on_host(http_client, host_id=host_id, workspace=workspace)
+        _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
+
+        rewind = _rewind(
+            http_client,
+            source_id=source_id,
+            item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
+        )
+        assert dropped in rewind.prompt
+        assert rewind.placed["runner_id"] is not None, rewind.placed
+        assert _placement(rewind.rewound) == _placement(rewind.placed)
+        assert _placement(rewind.source) == (None, *_placement(rewind.placed)[1:])
+        assert any(f"/c/{rewind.rewound_id}" in text for text in rewind.source_notices)
+        rewound_id = rewind.rewound_id
+        reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
+        assert dropped not in reply, f"rewound claude-sdk session recalled {dropped!r}: {reply!r}"

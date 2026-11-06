@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import signal
 import subprocess
 import time
 import uuid
@@ -51,7 +50,17 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests._helpers.polling import poll_until
+from tests.e2e._claude_host_support import (
+    _builtin_agent_id,
+    _host_daemon,
+    _launch_runner,
+    _placement,
+    _plant_code_words,
+    _prompt_item_id,
+    _recall_code_words,
+    _rewind,
+    _send_user_message,
+)
 from tests.e2e.conftest import (
     _CLAUDE_CODER_DIR,
     configure_mock_llm,
@@ -65,7 +74,6 @@ from tests.e2e.test_host_claude_native_e2e import (
     _claude_native_agent_id,
     _online_host_id,
     _poll_for_assistant_marker,
-    _spawn_host_daemon,
     _workspace_trusted_in_claude_config,
 )
 
@@ -151,26 +159,6 @@ def _create_native_session(
     )
     resp.raise_for_status()
     return str(resp.json()["id"])
-
-
-def _send_user_message(client: httpx.Client, *, session_id: str, text: str) -> None:
-    """
-    Inject a user message into a claude-native session.
-
-    :param client: HTTP client pointed at the test server.
-    :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
-    :param text: The message body to type into Claude's terminal.
-    :returns: None.
-    """
-    resp = client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
-        },
-        timeout=30.0,
-    )
-    resp.raise_for_status()
 
 
 def _wait_for_external_session_id(client: httpx.Client, *, session_id: str, timeout: float) -> str:
@@ -263,76 +251,6 @@ def _fork_session(
     )
     resp.raise_for_status()
     return str(resp.json()["id"])
-
-
-def _builtin_agent_id(client: httpx.Client, name: str) -> str:
-    """
-    Return the id of a built-in agent by name from ``GET /v1/agents``.
-
-    :param client: HTTP client pointed at the test server.
-    :param name: Built-in agent name, e.g. ``"sdk-chat-builtin"``.
-    :returns: The agent id.
-    :raises AssertionError: If no built-in with that name is registered.
-    """
-    resp = client.get("/v1/agents")
-    resp.raise_for_status()
-    for agent in resp.json()["data"]:
-        if agent["name"] == name:
-            return str(agent["id"])
-    raise AssertionError(f"built-in agent {name!r} not registered on the server")
-
-
-def _launch_runner(
-    client: httpx.Client,
-    *,
-    host_id: str,
-    session_id: str,
-    workspace: Path,
-    git: dict[str, str] | None = None,
-) -> dict[str, object]:
-    """
-    Bind a clone to a host by launching a runner (the resume step).
-
-    Mirrors the directory-picker's ``POST /v1/hosts/{id}/runners`` call.
-    When *git* is set the host creates a worktree off *workspace* and the
-    runner starts there instead.
-
-    :param client: HTTP client pointed at the test server.
-    :param host_id: The online host's id.
-    :param session_id: The clone's session id to bind.
-    :param workspace: Source repo / working directory on the host.
-    :param git: Optional ``{"branch_name": ...}`` worktree block. ``None``
-        binds *workspace* directly (same-dir resume).
-    :returns: The launch response JSON.
-    """
-    body: dict[str, object] = {"session_id": session_id, "workspace": str(workspace)}
-    if git is not None:
-        body["git"] = git
-    resp = client.post(f"/v1/hosts/{host_id}/runners", json=body, timeout=120.0)
-    resp.raise_for_status()
-    return dict(resp.json())
-
-
-@contextmanager
-def _host_daemon(tmp_path: Path, live_server: str) -> Iterator[None]:
-    """
-    Spawn an ``omnigent connect`` daemon for the test's duration.
-
-    :param tmp_path: Per-test temp dir for the daemon log.
-    :param live_server: Test server URL the daemon registers with.
-    :returns: Iterator yielding once the daemon is spawned; SIGTERM'd on
-        exit.
-    """
-    daemon = _spawn_host_daemon(tmp_path=tmp_path, live_server=live_server)
-    try:
-        yield
-    finally:
-        daemon.send_signal(signal.SIGTERM)
-        try:
-            daemon.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            daemon.kill()
-            daemon.wait()
 
 
 def _run_fork_resume_history_check(
@@ -890,11 +808,49 @@ def test_fork_native_source_into_sdk_carries_history(
             )
 
 
-def _wait_until_idle(client: httpx.Client, *, session_id: str) -> None:
-    """Wait for *session_id*'s turn to end; the turn-end edge can trail the reply."""
-    poll_until(
-        lambda: (
-            client.get(f"/v1/sessions/{session_id}", timeout=30.0).json()["status"] != "running"
-        ),
-        timeout_s=60.0,
-    )
+def test_rewind_claude_native_resumes_only_the_earlier_history(
+    live_server: str,
+    http_client: httpx.Client,
+    tmp_path: Path,
+) -> None:
+    """
+    ``/rewind`` in a claude-native session resumes Claude without the later turns.
+
+    The truncated fork drops the source's native-session directive, so the
+    runner rebuilds Claude's transcript from the kept items. A regression
+    that resumed the source's full transcript would let Claude recall the
+    dropped code word; one that launched fresh would forget the kept one.
+    """
+    workspace = tmp_path / "rewind_native_ws"
+    workspace.mkdir()
+    kept = f"KEPTWORD_{uuid.uuid4().hex[:6].upper()}"
+    dropped = f"DROPWORD_{uuid.uuid4().hex[:6].upper()}"
+
+    with _workspaces_trusted_in_claude_config([workspace]):
+        with _host_daemon(tmp_path, live_server):
+            host_id = _online_host_id(http_client, timeout=30.0)
+            agent_id = _claude_native_agent_id(http_client)
+            source_id = _create_native_session(
+                http_client, agent_id=agent_id, host_id=host_id, workspace=workspace
+            )
+            _plant_code_words(http_client, session_id=source_id, words=[kept, dropped])
+            _wait_for_external_session_id(http_client, session_id=source_id, timeout=60.0)
+
+            rewind = _rewind(
+                http_client,
+                source_id=source_id,
+                item_id=_prompt_item_id(http_client, session_id=source_id, fragment=dropped),
+            )
+            assert dropped in rewind.prompt
+            # The fork takes the source's placement; the source keeps its host
+            # and workspace to resume on, but not the runner.
+            assert rewind.placed["runner_id"] is not None, rewind.placed
+            assert _placement(rewind.rewound) == _placement(rewind.placed)
+            assert _placement(rewind.source) == (None, *_placement(rewind.placed)[1:])
+            assert any(f"/c/{rewind.rewound_id}" in text for text in rewind.source_notices)
+            rewound_id = rewind.rewound_id
+
+            reply = _recall_code_words(http_client, session_id=rewound_id, expected=kept)
+            assert dropped not in reply, (
+                f"rewound claude-native session recalled the dropped word {dropped!r}: {reply!r}"
+            )

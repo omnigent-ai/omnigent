@@ -6012,6 +6012,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             # copied items instead.
             if source_ext_session and not truncated and resume_source_native_session:
                 fork_labels[FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY] = source_ext_session
+            elif truncated or not resume_source_native_session:
+                # A directive the source inherited from its own fork source
+                # would resume that ancestor's full transcript instead.
+                fork_labels.pop(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY, None)
             # When the fork binds a native target, mark it so the runner
             # rebuilds the native transcript (clone the source's native
             # transcript when same-family, else build from the copied

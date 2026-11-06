@@ -394,8 +394,10 @@ tooltip gives the state's age once that's over five minutes old. Sessions the se
 hasn't imported yet fill in as it imports them.
 On mobile, the top-left hamburger opens the sidebar from the board or a selected
 session. Back to canvas returns to the selected project. A Canvas session link
-opens the same layout directly. If a session is replaced, for example after `/clear`,
-its replacement stays beside the same board.
+opens the same layout directly. If a session is replaced, for example after `/clear` or `/rewind`,
+its replacement opens beside the same board, keeping the board's query and
+replacing the old session in history. After `/rewind` its composer holds the
+chosen prompt and attachments, as outside Canvas.
 The plus button starts a new session in the selected canvas. After sending,
 the new session opens beside that board; on narrow screens, Back to canvas
 returns to it. Reloading a temporary session before creation finishes returns to

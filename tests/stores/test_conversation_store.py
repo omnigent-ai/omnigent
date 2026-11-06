@@ -6371,6 +6371,43 @@ def test_fork_conversation_truncated_drops_external_session_directive(
     assert fork.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1"
 
 
+@pytest.mark.parametrize("cutoff", ["up_to_response_id", "before_item_id"])
+def test_truncated_fork_of_a_fork_drops_inherited_native_directive(
+    conversation_store: SqlAlchemyConversationStore,
+    agent_store: SqlAlchemyAgentStore,
+    cutoff: str,
+) -> None:
+    """Truncating a fork drops the native directive it inherited from its own source.
+
+    Fork A into B, then truncate B: an inherited directive naming A's native
+    session would make the runner clone A's full transcript, bringing back
+    the turns the truncation discarded.
+    """
+    from omnigent.stores.conversation_store import FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY
+
+    agent_store.create(
+        agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910",
+        name="fork-of-fork-trunc",
+        bundle_location="9d1f0e2c3b4a49588f7e6d5c4b3a2910/fakehash",
+    )
+    chat_a = conversation_store.create_conversation(agent_id="9d1f0e2c3b4a49588f7e6d5c4b3a2910")
+    conversation_store.set_external_session_id(chat_a.id, "claude-uuid-a")
+    _append_three_responses(conversation_store, chat_a.id)
+    chat_b = conversation_store.fork_conversation(chat_a.id)
+    assert chat_b.labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY) == "claude-uuid-a"
+    conversation_store.set_external_session_id(chat_b.id, "claude-uuid-b")
+
+    second_prompt_id = conversation_store.list_items(chat_b.id).data[2].id
+    cutoff_kwargs = (
+        {"up_to_response_id": "resp_001"}
+        if cutoff == "up_to_response_id"
+        else {"before_item_id": second_prompt_id}
+    )
+    truncated = conversation_store.fork_conversation(chat_b.id, **cutoff_kwargs)
+
+    assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in truncated.labels, truncated.labels
+
+
 def test_fork_conversation_cross_family_drops_external_session_directive(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
@@ -6474,6 +6511,7 @@ def test_fork_conversation_up_to_unknown_response_raises(
 def test_fork_conversation_before_item_drops_the_item_and_later_history(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,
+    db_uri: str,
 ) -> None:
     """``before_item_id`` copies only the items positioned before that item.
 
@@ -6505,6 +6543,20 @@ def test_fork_conversation_before_item_drops_the_item_and_later_history(
     fork = conversation_store.fork_conversation(source.id, before_item_id=second_prompt.id)
     assert fork_texts(fork.id) == ["Q1", "A1"]
     assert FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY not in fork.labels
+
+    # A rewind continues the source in place: the cutoff holds, and the fork
+    # is born on the source's host.
+    HostStore(db_uri).upsert_on_connect("f" * 32, "laptop", RESERVED_USER_LOCAL)
+    conversation_store.set_host_id(source.id, "f" * 32, "/work/repo", "main")
+    rewound = conversation_store.fork_conversation(
+        source.id, before_item_id=second_prompt.id, continue_source=True
+    )
+    assert fork_texts(rewound.id) == ["Q1", "A1"]
+    assert (rewound.host_id, rewound.workspace, rewound.git_branch) == (
+        "f" * 32,
+        "/work/repo",
+        "main",
+    )
 
     first = conversation_store.fork_conversation(source.id, before_item_id=first_prompt.id)
     assert fork_texts(first.id) == []

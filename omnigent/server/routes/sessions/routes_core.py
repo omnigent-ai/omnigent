@@ -6,9 +6,10 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import re
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -44,6 +45,7 @@ from omnigent.entities import (
     StoredFile,
     synthesize_conversation_title,
 )
+from omnigent.entities.conversation import MessageData
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
@@ -52,6 +54,7 @@ from omnigent.harnesses.codex_native.timeouts import (
 )
 from omnigent.models.model_override import validate_model_override
 from omnigent.native._native_supersession import supersession_notice_text
+from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -129,6 +132,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
     _EXTERNAL_CONVERSATION_ITEM_TYPE,
+    _FORK_HISTORY_NATIVE_HARNESSES,
     _logger,
     get_server_runner_router,
     set_server_runner_router,
@@ -155,6 +159,7 @@ from omnigent.server.routes._sessions.helpers import (
     _LiveSettingsChange,
     _multipart_missing_detail,
     _native_coding_agent_for_agent,
+    _native_coding_agent_for_session,
     _note_settings_write,
     _notify_runner_of_bundled_child,
     _parse_session_create_metadata,
@@ -232,6 +237,9 @@ from omnigent.server.schemas import (
     SessionProjectSummary,
     SessionPullRequestSummary,
     SessionResponse,
+    SessionRewindAttachment,
+    SessionRewindRequest,
+    SessionRewindResponse,
     SupersessionReason,
     UpdateSessionRequest,
 )
@@ -267,7 +275,14 @@ from omnigent.util.reasoning_effort import (
 from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
+from omnigent.util.uuid import uuid_to_bytes
 from omnigent.version import VERSION
+
+# Harnesses whose sessions offer ``/rewind``.
+_REWIND_HARNESSES = frozenset({"claude-sdk", "claude-native"})
+
+# An image a prompt carries inline rather than as a stored file.
+_INLINE_IMAGE_URL = re.compile(r"^data:image/[\w.+-]+;base64,", re.IGNORECASE)
 
 # Continues a claude-sdk session in a fresh session on ``/clear`` once the
 # release callback has freed its client; returns the new session's id.
@@ -283,6 +298,8 @@ def _require_attachment_compatible_history(
     file_store: FileStore | None,
     *,
     up_to_response_id: str | None = None,
+    before_item_id: str | None = None,
+    target_harness: str | None = None,
 ) -> str | None:
     """Reject a target that cannot replay files in the retained transcript.
 
@@ -291,17 +308,26 @@ def _require_attachment_compatible_history(
     :param conversation_store: Store containing the ordered source history.
     :param file_store: Store containing authoritative attachment filenames.
     :param up_to_response_id: Inclusive fork cutoff, or all history when absent.
+    :param before_item_id: Exclusive cutoff, e.g. ``"msg_abc"``.
+    :param target_harness: The harness the target runs when it isn't the
+        agent's declared one, e.g. a continuation's ``"claude-native"`` override.
     :returns: A retained filesystem attachment's name, or ``None``.
     :raises OmnigentError: If the target cannot open a referenced attachment.
     """
     from omnigent.inner.native_attachments import FILESYSTEM_ATTACHMENT_HARNESSES
 
     filename = _filesystem_attachment_in_history(
-        session_id, conversation_store, file_store, up_to_response_id=up_to_response_id
+        session_id,
+        conversation_store,
+        file_store,
+        up_to_response_id=up_to_response_id,
+        before_item_id=before_item_id,
     )
     if filename is not None:
-        native = _native_coding_agent_for_agent(target_agent)
-        if native is None or native.harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
+        if target_harness is None:
+            native = _native_coding_agent_for_agent(target_agent)
+            target_harness = native.harness if native is not None else None
+        if target_harness not in FILESYSTEM_ATTACHMENT_HARNESSES:
             raise OmnigentError(
                 f"This history includes '{filename}', which requires "
                 "Claude Code or Codex. Choose one of those harnesses, "
@@ -4055,6 +4081,8 @@ def register_core_routes(
         continue_source: bool = False,
         fork_id: str | None = None,
         validate_only: bool = False,
+        copied_files: dict[str, str] | None = None,
+        kept_title: str | None = None,
     ) -> SessionResponse | None:
         """Fork *source_id* as :func:`fork_session` documents.
 
@@ -4073,6 +4101,11 @@ def register_core_routes(
             remove it by id even if this call fails part-way.
         :param validate_only: Run every check that could refuse the fork, then
             return ``None`` without creating anything.
+        :param copied_files: Filled with each source file id and the id of the
+            fork's copy, e.g. ``{"file_src": "file_fork"}``.
+        :param kept_title: An already-stored title the fork keeps as is, in
+            place of ``body.title``, which a caller writes and is size-limited;
+            ``""`` leaves the fork untitled.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(
@@ -4193,14 +4226,33 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
 
-        await asyncio.to_thread(
-            _require_attachment_compatible_history,
-            source_id,
-            base_agent,
-            conversation_store,
-            file_store,
-            up_to_response_id=body.up_to_response_id,
-        )
+        # A continuation keeps running the source's effective harness, which a
+        # per-session override or a native wrapper label can make native while
+        # the agent declares otherwise.
+        continuation_harness: str | None = None
+        if continue_source:
+            wrapped = native_coding_agent_for_wrapper_label(
+                source.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+            )
+            continuation_harness = (
+                wrapped.harness
+                if wrapped is not None
+                else await asyncio.to_thread(
+                    _resolve_harness, source, agent_store=agent_store, agent_cache=agent_cache
+                )
+            )
+        # A fork that keeps no history has no attachments to replay.
+        if copy_history:
+            await asyncio.to_thread(
+                _require_attachment_compatible_history,
+                source_id,
+                base_agent,
+                conversation_store,
+                file_store,
+                up_to_response_id=body.up_to_response_id,
+                before_item_id=before_item_id,
+                target_harness=continuation_harness,
+            )
 
         # Cross-user forks copy the agent (bundle under the copy's id) so its owner
         # can never change code in the caller's sessions; same-user forks share it.
@@ -4376,6 +4428,8 @@ def register_core_routes(
         carry_history_into_native = target_is_cursor or await asyncio.to_thread(
             _agent_carries_native_fork_history, base_agent
         )
+        if continue_source and not carry_history_into_native:
+            carry_history_into_native = continuation_harness in _FORK_HISTORY_NATIVE_HARNESSES
         # The source's native session id is only resumable by a target in the
         # SAME provider family — a Claude target can't clone a Codex rollout.
         # Cross-family, the store must skip the fork-source directive so the
@@ -4481,6 +4535,8 @@ def register_core_routes(
                 if not files_page.has_more or not files_page.data:
                     break
                 files_after = files_page.last_id
+            if copied_files is not None:
+                copied_files.update(fork_file_id_map)
 
             from omnigent.inner.native_attachments import uses_filesystem_delivery
 
@@ -4524,7 +4580,7 @@ def register_core_routes(
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
                 source_id,
-                title=body.title,
+                title=body.title if kept_title is None else kept_title,
                 agent_id=fork_agent_id,
                 cloned_agent_name=base_agent.name if clone_location else None,
                 cloned_agent_bundle_location=clone_location,
@@ -4744,6 +4800,7 @@ def register_core_routes(
         reason: SupersessionReason,
         prepare: Callable[[], Awaitable[None]] | None = None,
         copy_history: bool = True,
+        copied_files: dict[str, str] | None = None,
     ) -> str:
         """
         Continue *source* in a fork on the same placement, superseding it.
@@ -4768,6 +4825,8 @@ def register_core_routes(
             the fork exists, e.g. to free the source's live client.
         :param copy_history: ``False`` starts the fork empty, with none of the
             source's items or files; *before_item_id* must then be ``None``.
+        :param copied_files: Filled with each source file id and the id of
+            the fork's copy.
         :returns: The fork's session id.
         :raises OmnigentError: When the caller does not own *source*, it is a
             sub-agent, a side chat or running a turn, or no runner or host can take the fork;
@@ -4840,8 +4899,9 @@ def register_core_routes(
                 )
                 if not runner_online and not host_bound:
                     raise runner_offline
-                fork_request = SessionForkRequest(title=title)
+                fork_request = SessionForkRequest()
                 fork_options: dict[str, Any] = {
+                    "kept_title": title,
                     "before_item_id": before_item_id,
                     "keep_sandbox_labels": True,
                     "copy_history": copy_history,
@@ -4874,7 +4934,12 @@ def register_core_routes(
                 runner_dispatched = False
                 try:
                     fork = await _fork_session(
-                        request, source.id, fork_request, fork_id=fork_id, **fork_options
+                        request,
+                        source.id,
+                        fork_request,
+                        fork_id=fork_id,
+                        copied_files=copied_files,
+                        **fork_options,
                     )
                     assert fork is not None
                     # The same conversation continues there, and every live viewer
@@ -5059,5 +5124,163 @@ def register_core_routes(
             # meanwhile stay behind too.
             copy_history=False,
         )
+
+    # ── POST /sessions/{session_id}/rewind ──────────────────────
+
+    @router.post("/sessions/{session_id}/rewind", response_model=SessionRewindResponse)
+    async def rewind_session(
+        request: Request,
+        session_id: str,
+        body: SessionRewindRequest,
+    ) -> SessionRewindResponse:
+        """
+        Rewind a Claude session to just before one of its prompts.
+
+        Forks the session with the history before ``body.item_id`` onto the
+        same host, workspace and runner, links the source to the fork, and
+        redirects live viewers there. The source keeps its full history. A
+        claude-native fork rebuilds Claude's transcript from the kept items.
+        Advertised by ``GET /v1/info`` ``session_rewind``.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session to rewind, e.g. ``"conv_abc123"``.
+        :param body: The prompt to rewind to.
+        :returns: The new session id and the chosen prompt's text.
+        :raises OmnigentError: 400 for a harness without ``/rewind``, an item
+            that is not one of the session's prompts, a sub-agent, or a
+            running turn; 403/404 when the caller does not own the session;
+            503 when neither its runner nor its host can take the fork.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conv is None:
+            raise _session_not_found()
+        harness = await asyncio.to_thread(
+            _resolve_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+        )
+        native = _native_coding_agent_for_session(conv)
+        if harness not in _REWIND_HARNESSES and (
+            native is None or native.harness not in _REWIND_HARNESSES
+        ):
+            raise OmnigentError(
+                "/rewind is not available for this session type.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        prompt = await asyncio.to_thread(_rewind_prompt, conv.id, body.item_id)
+        copied_files: dict[str, str] = {}
+        new_session_id = await _continue_session_in_fork(
+            request,
+            conv,
+            before_item_id=body.item_id,
+            command="/rewind",
+            # The rewound chat keeps its name.
+            title=conv.title or "",
+            notice=lambda new_id: supersession_notice_text(
+                new_id,
+                outcome="This conversation was rewound with `/rewind`.",
+                link_text="the rewound chat",
+            ),
+            reason="rewind",
+            copied_files=copied_files,
+        )
+        # The rewound session already exists, so a failed lookup costs only
+        # the attachments the composer would have restored.
+        try:
+            attachments = await asyncio.to_thread(
+                _rewind_attachments, new_session_id, copied_files, prompt.content
+            )
+        except Exception:
+            _logger.warning(
+                "Failed to look up the rewound prompt's attachments; "
+                "old_session=%s new_session=%s",
+                conv.id,
+                new_session_id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            attachments = []
+        return SessionRewindResponse(
+            session_id=new_session_id,
+            prompt="\n".join(
+                part["text"]
+                for part in prompt.content
+                if part.get("type") == "input_text" and isinstance(part.get("text"), str)
+            ),
+            attachments=attachments,
+        )
+
+    def _rewind_prompt(session_id: str, item_id: str) -> MessageData:
+        """
+        Return *session_id*'s user prompt *item_id*.
+
+        :raises OmnigentError: 400 when the item is not a user prompt there.
+        """
+        not_a_prompt = OmnigentError(
+            "/rewind needs one of this session's prompts.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+        try:
+            uuid_to_bytes(item_id)
+        except ValueError as exc:
+            raise not_a_prompt from exc
+        item = conversation_store.get_item(session_id, item_id)
+        # Hidden context (``is_meta``), e.g. a loaded skill's body, isn't a
+        # prompt the user wrote, so the picker doesn't list it either.
+        if (
+            item is None
+            or not isinstance(item.data, MessageData)
+            or item.data.role != "user"
+            or item.data.is_meta
+        ):
+            raise not_a_prompt
+        return item.data
+
+    def _rewind_attachments(
+        fork_id: str, copied_files: Mapping[str, str], content: list[dict[str, Any]]
+    ) -> list[SessionRewindAttachment]:
+        """
+        Return the files *content* attached, as the fork's copies of them.
+
+        An image carried inline as a ``data:image/...`` URI, with no stored
+        file, comes back as that URI for the client to upload on send.
+        Attachments whose file the fork holds no copy of are left out.
+
+        :param fork_id: The fork continuing the rewound session.
+        :param copied_files: Each source file id and the id of the fork's copy.
+        :param content: The prompt's content blocks.
+        """
+        attachments: list[SessionRewindAttachment] = []
+        for part in content:
+            block_type, file_id = part.get("type"), part.get("file_id")
+            if block_type not in ("input_file", "input_image"):
+                continue
+            if not isinstance(file_id, str):
+                image_url, filename = part.get("image_url"), part.get("filename")
+                if block_type == "input_image" and _INLINE_IMAGE_URL.match(
+                    image_url if isinstance(image_url, str) else ""
+                ):
+                    attachments.append(
+                        SessionRewindAttachment(
+                            type="input_image",
+                            image_url=image_url,
+                            filename=filename if isinstance(filename, str) else "image",
+                        )
+                    )
+                continue
+            copy_id = copied_files.get(file_id)
+            if file_store is None or copy_id is None:
+                continue
+            copy = file_store.get(copy_id, session_id=fork_id)
+            if copy is None:
+                continue
+            attachments.append(
+                SessionRewindAttachment(type=block_type, file_id=copy.id, filename=copy.filename)
+            )
+        return attachments
 
     return clear_session_into_fresh_session

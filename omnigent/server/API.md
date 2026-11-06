@@ -1368,6 +1368,51 @@ shape as `GET /v1/sessions/{id}` — with status `"idle"` and all
 copied items in chronological order. Clients must bind a runner
 before opening the fork's SSE stream or posting events.
 
+### Rewind Session
+
+```
+POST /v1/sessions/{session_id}/rewind
+Content-Type: application/json
+
+{"item_id": "msg_abc123"}
+
+200 OK — {"session_id": "conv_new", "prompt": "<the prompt's text>",
+  "attachments": [{"type": "input_image", "file_id": "file_new",
+  "filename": "diagram.png"}]}
+
+400 Bad Request — the session's harness is not claude-sdk or
+  claude-native, item_id is not one of its user prompts, it is a
+  sub-agent or side-chat session, a turn is running or a message is
+  still reaching its runner, or the kept history has a file the
+  session's harness cannot open
+400 Bad Request, code `wrong_replica` — its runner is connected to
+  another server replica; retry so the request reaches that replica
+403/404 — the caller does not own the session
+409 Conflict — the session is already moving to a new session (a
+  /clear or /rewind in progress), or its host went away during the
+  rewind; retry once it settles
+503 Service Unavailable — neither its runner nor its host can take
+  the new session
+```
+
+Continues a Claude session from just before one of its prompts. The
+server forks the session with only the items positioned before
+`item_id` (rewinding to the first prompt keeps none), binds the fork to
+the source's host, workspace and live runner (host only when the runner
+is offline, so the next message relaunches it there), and keeps the
+source's title, labels, model, effort and launch arguments. A
+claude-native fork rebuilds Claude's transcript from the kept items.
+The source keeps its full history and gets a notice linking to the fork;
+live viewers follow via `session.superseded` with `reason: "rewind"`.
+Clients put `prompt` back in the composer, with `attachments`: the
+prompt's files as the fork's own copies (a fork copies every source
+file), readable from the fork's `resources/files/{file_id}/content`. An
+image the prompt carried inline (no stored file, e.g. after an import)
+comes back as its `image_url` data URI instead, with `file_id: null`, for
+the client to upload on send. Rewinding never rolls back files on disk. `GET /v1/info` reports
+`session_rewind: true`, which also means
+`GET /v1/sessions/{id}/items?type=message` filters items by type.
+
 ### Read Fork Repository Branch Suggestions
 
 `GET /v1/sessions/{session_id}/resources/repository-branches` requires session

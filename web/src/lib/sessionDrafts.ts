@@ -8,6 +8,12 @@ export interface SessionDraft extends ComposerDraft {
 const SESSION_DRAFTS_KEY = "omnigent.sessionDrafts";
 const listeners = new Set<() => void>();
 const retiredDraftIds = new Set<string>();
+// How many times this tab has written each id's draft, emptied ones included.
+const draftRevisions = new Map<string, number>();
+
+function noteDraftWrite(conversationId: string): void {
+  draftRevisions.set(conversationId, (draftRevisions.get(conversationId) ?? 0) + 1);
+}
 
 function loadDraftsFromStorage(): Map<string, SessionDraft> {
   if (typeof window === "undefined") return new Map();
@@ -64,6 +70,7 @@ export function getSessionDraft(conversationId: string): SessionDraft | undefine
 
 export function setSessionDraft(conversationId: string, draft: SessionDraft): void {
   if (retiredDraftIds.has(conversationId)) return;
+  noteDraftWrite(conversationId);
   if (draft.text === "" && draft.files.length === 0) {
     sessionDrafts.delete(conversationId);
   } else {
@@ -109,10 +116,27 @@ export function promoteSessionDraft(
 ): SessionDraft | undefined {
   const draft = retireSessionDraft(temporaryConversationId);
   if (draft === undefined) return undefined;
+  noteDraftWrite(conversationId);
   sessionDrafts.set(conversationId, draft);
   saveDraftsToStorage();
   notifyListeners();
   return draft;
+}
+
+/**
+ * Whether this tab has written *conversationId*'s draft, even one the user
+ * then emptied, as opposed to never having touched it.
+ */
+export function sessionDraftWasWritten(conversationId: string): boolean {
+  return draftRevisions.has(conversationId);
+}
+
+/**
+ * How many times this tab has written *conversationId*'s draft; an unchanged
+ * count means nothing has written it since.
+ */
+export function sessionDraftRevision(conversationId: string): number {
+  return draftRevisions.get(conversationId) ?? 0;
 }
 
 export function hasSessionDraft(conversationId: string): boolean {
@@ -151,6 +175,7 @@ export function useSessionDraftIds(enabled = true): string {
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
   retiredDraftIds.clear();
+  draftRevisions.clear();
   saveDraftsToStorage();
   notifyListeners();
 }

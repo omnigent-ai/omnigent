@@ -2977,6 +2977,58 @@ class SessionForkRequest(_SandboxProfileSelection):
         return self
 
 
+class SessionRewindRequest(BaseModel):
+    """
+    Request body for ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param item_id: The session's user prompt to rewind to, e.g.
+        ``"msg_abc123"``. The new session keeps only the history before it.
+    """
+
+    item_id: str = Field(min_length=1, max_length=256)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class SessionRewindAttachment(BaseModel):
+    """
+    A file the chosen ``/rewind`` prompt attached, as the rewound session holds it.
+
+    Exactly one of *file_id* and *image_url* is set.
+
+    :param type: The prompt's content block type, ``"input_file"`` or
+        ``"input_image"``.
+    :param file_id: The rewound session's copy of the file, e.g. ``"file_abc"``;
+        read it from ``/v1/sessions/{session_id}/resources/files/{file_id}``.
+    :param image_url: An image the prompt carried inline instead of as a stored
+        file, as a ``data:image/...`` URI (e.g. from a session imported from
+        another harness); the client uploads it on send like any attachment.
+    :param filename: The attachment's name, e.g. ``"diagram.png"``.
+    """
+
+    type: Literal["input_file", "input_image"]
+    file_id: str | None = None
+    image_url: str | None = None
+    filename: str
+
+
+class SessionRewindResponse(BaseModel):
+    """
+    Result of ``POST /v1/sessions/{session_id}/rewind``.
+
+    :param session_id: The rewound session that continues the work, e.g.
+        ``"conv_new"``. The source session gets a notice linking to it.
+    :param prompt: Text of the chosen prompt, for the client to put back in
+        the composer, e.g. ``"Add a test for the parser"``.
+    :param attachments: The prompt's attachments, in prompt order, for the
+        client to put back in the composer; empty when it had none.
+    """
+
+    session_id: str
+    prompt: str
+    attachments: list[SessionRewindAttachment] = Field(default_factory=list)
+
+
 class ReadStatePutRequest(BaseModel):
     """
     Request body for ``PUT /v1/sessions/{session_id}/read-state``.
@@ -4155,7 +4207,7 @@ class SessionCreatedEvent(_SSEEventBase):
 
 
 # Why a session's work moved to another session (``session.superseded``).
-SupersessionReason = Literal["clear"]
+SupersessionReason = Literal["clear", "rewind"]
 
 
 class SessionSupersededEvent(_SSEEventBase):
@@ -4187,9 +4239,8 @@ class SessionSupersededEvent(_SSEEventBase):
         event rides the stream of, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to follow to, e.g.
         ``"conv_new"``.
-    :param reason: Why the session was superseded. Currently always
-        ``"clear"`` (a Claude Code ``/clear``); kept as a field so the
-        client can branch on future supersession causes.
+    :param reason: Why the session was superseded: ``"clear"`` (a
+        ``/clear``) or ``"rewind"`` (a ``/rewind`` onto a truncated fork).
     """
 
     type: Literal["session.superseded"]
