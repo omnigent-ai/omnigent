@@ -82,6 +82,8 @@ const state = vi.hoisted(() => ({
   serveable: undefined as boolean | undefined,
 }));
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   const original = await importOriginal<typeof UsePullRequestsModule>();
   return {
@@ -208,6 +210,7 @@ import {
   LARGE_DIFF_THRESHOLD,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { viewedStorageKey } from "@/lib/pullRequestViewed";
 
 const FORGE_DISPLAY = {
   id: "example_forge",
@@ -268,6 +271,16 @@ function renderChanges() {
   const r = renderPanel();
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
   return r;
+}
+
+/**
+ * Sidebar rows and section toggles by name. A file's copy and overflow buttons carry the
+ * path in their labels and the overflow trigger reports aria-expanded, so skip labeled buttons.
+ */
+function fileRowButtons(name: RegExp) {
+  return screen
+    .getAllByRole("button", { name })
+    .filter((button) => !button.hasAttribute("aria-label"));
 }
 
 /** Render, then switch to the Comments tab (see renderChanges). */
@@ -1291,6 +1304,101 @@ describe("PullRequestPanel", () => {
     assertColors();
   });
 
+  it("interleaves commits and force pushes with comments without inflating their count", () => {
+    const keyWarnings = watchKeyWarnings();
+    state.info!.data!.pr!.comments = [
+      { author: "reviewer", body: "Please update", created_at: "2026-09-05T08:00:00Z", url: null },
+      { author: "reviewer", body: "Looks good", created_at: "2026-09-05T10:00:00Z", url: null },
+      { author: null, body: "Undated comment", created_at: null, url: null },
+    ];
+    state.info!.data!.pr!.timeline_events = [
+      {
+        id: "push-1",
+        kind: "force_push",
+        author: "octocat",
+        created_at: "2026-09-05T09:00:00Z",
+        sha: "bbbbbbb222222",
+        previous_sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/commit/bbbbbbb222222",
+      },
+      {
+        id: "commit-1",
+        kind: "commit",
+        author: "octocat",
+        created_at: "2026-09-05T07:00:00Z",
+        sha: "aaaaaaa111111",
+        url: "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+        message: "Add the feature",
+      },
+    ];
+    const view = renderComments();
+    const rows = screen.getAllByRole("listitem");
+    expect(rows).toHaveLength(5);
+    expect(rows[0]).toHaveTextContent("octocatcommittedaaaaaaa");
+    expect(rows[0]).toHaveTextContent("Add the feature");
+    expect(rows[1]).toHaveTextContent("Please update");
+    expect(rows[2]).toHaveTextContent("octocatforce-pushedfrom aaaaaaatobbbbbbb");
+    expect(rows[3]).toHaveTextContent("Looks good");
+    expect(rows[4]).toHaveTextContent("Undated comment");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute("dateTime", "2026-09-05T09:00:00Z");
+    expect(rows[2]!.querySelector("time")).toHaveAttribute(
+      "title",
+      expect.stringContaining("2026"),
+    );
+    expect(screen.getByRole("link", { name: "Open commit aaaaaaa on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/6000/commits/aaaaaaa111111",
+    );
+    expect(screen.getByRole("link", { name: "Open commit bbbbbbb on GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/commit/bbbbbbb222222",
+    );
+    expect(screen.getByRole("tab", { name: "Comments 3" })).toBeInTheDocument();
+    state.info!.data!.pr!.timeline_events.push({
+      id: "commit-2",
+      kind: "commit",
+      author: "octocat",
+      created_at: "2026-09-05T08:30:00Z",
+      sha: "ccccccc333333",
+      url: null,
+      message: "Address review",
+    });
+    view.rerender(<PullRequestPanel conversationId="conv_1" />);
+    expect(screen.getByText("Looks good").closest("li")).toBe(rows[3]);
+    expect(screen.getByText("Address review")).toBeInTheDocument();
+    expect(keyWarnings()).toEqual([]);
+  });
+
+  it.each(["https://example.com/pr/6000", "javascript:alert(1)", "data:text/html,unsafe"])(
+    "keeps incomplete history visible and validates its link: %s",
+    (prUrl) => {
+      state.info!.data!.pr!.url = prUrl;
+      state.info!.data!.pr!.timeline_events = [
+        {
+          id: "push-1",
+          kind: "force_push",
+          author: null,
+          created_at: null,
+          sha: null,
+          url: null,
+        },
+      ];
+      state.info!.data!.pr!.timeline_partial = true;
+      renderComments();
+      expect(screen.getByRole("listitem")).toHaveTextContent("unknownforce-pushedthe branch");
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Some commit and push history is unavailable.",
+      );
+      if (prUrl.startsWith("https://")) {
+        expect(screen.getByRole("link", { name: "View on GitHub" })).toHaveAttribute("href", prUrl);
+      } else {
+        expect(screen.queryByRole("link", { name: "View on GitHub" })).toBeNull();
+      }
+      expect(screen.queryByText("No comments yet.")).toBeNull();
+      expect(screen.getByRole("tab", { name: "Comments" })).toBeInTheDocument();
+    },
+  );
+
   it("shows empty states when the PR has no body or comments", () => {
     // The default fixture carries neither a body nor comments.
     renderPanel();
@@ -1388,6 +1496,28 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("Checks")).toBeNull();
   });
 
+  it("keys viewed marks by the selected PR's identity and pinned head", async () => {
+    const url = state.info!.data!.pr!.url;
+    const selected = {
+      url,
+      host: "example.com",
+      repository: "acme/app",
+      number: 6000,
+      relationship: "created" as const,
+    };
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.selected_pr_url = url;
+    state.info!.data!.prs = [selected];
+    // The list's head is pinned, so the mock carries it as an extra field.
+    Object.assign(state.changes!.data!, { head_sha: "head" });
+    state.diff = { ...state.diff!, head_sha: "head" };
+    renderChanges();
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
+    expect(localStorage.getItem(key)).toContain("hello.py");
+  });
+
   it("stacks a diff section per changed file", async () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
@@ -1413,6 +1543,27 @@ describe("PullRequestPanel", () => {
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
+  it("collapses a jumped-to file from its header and keeps collapse across tabs", async () => {
+    renderChanges();
+    await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Collapse all diffs" })).toBeInTheDocument();
+    // The jump expanded the file only temporarily; one header click closes it again.
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
+    await screen.findAllByTestId("diff");
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
+  });
+
   it("collapses a file's diff when its section header is clicked", async () => {
     renderChanges();
     expect(await screen.findAllByTestId("diff")).toHaveLength(2);
@@ -1432,18 +1583,26 @@ describe("PullRequestPanel", () => {
     // The same button now offers the inverse action.
     fireEvent.click(screen.getByRole("button", { name: "Expand all diffs" }));
     expect(screen.getAllByTestId("diff")).toHaveLength(2);
+
+    // A file revealed by a jump counts as expanded, and collapse all closes it.
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    fireEvent.click(screen.getAllByRole("button", { name: /app\.ts/ })[0]);
+    expect(screen.getAllByTestId("diff")).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(screen.queryAllByTestId("diff")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Expand all diffs" })).toBeInTheDocument();
   });
 
   it("hides and shows the file sidebar from the toolbar", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
     // hello.py appears as a sidebar jump row and as a section header.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
     // Sidebar gone → only the section header remains.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
   });
 
   it("toggles the diff layout between unified and split", async () => {
@@ -1489,10 +1648,10 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const folder = await screen.findByRole("button", { name: "omnigent/runner" });
     // Before collapse: the sidebar leaf + the diff section header both match.
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(2);
     fireEvent.click(folder);
     // After collapse: only the diff section header remains (sidebar leaf gone).
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(1);
   });
 
   it("shows a pure rename as a note with an old → new header", async () => {
