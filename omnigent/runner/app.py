@@ -1813,6 +1813,7 @@ def create_runner_app(
         blocked_on: str | None = None,
         *,
         failure_detail: str | None = None,
+        inferred: bool = False,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
         if status == "failed":
@@ -1845,6 +1846,8 @@ def create_runner_app(
                     event["failure_context"] = context
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
+        if inferred:
+            event["inferred"] = True
         _publish_event(session_id, event)
 
     resource_registry.set_session_status_publisher(_publish_session_status)

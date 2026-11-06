@@ -1042,12 +1042,14 @@ async def _observe_native_with_real_poller(
     program_status_path: Path | None = None,
     instance: TerminalInstance | None = None,
     published: list[tuple[str, str | None]] | None = None,
+    inferred_edges: list[tuple[str, str | None]] | None = None,
     background_publisher: Callable[[str, bool], None] | None = None,
 ) -> tuple[Callable[[], None], list[str], SessionResourceRegistry, Path]:
     """Observe a Claude terminal with a real poller and caller-written status file.
 
     :param instance: Terminal to observe; a fresh test terminal when ``None``.
     :param published: Collects each published ``(status, blocked_on)`` edge.
+    :param inferred_edges: Collects the edges among them published as pane-inferred.
     """
     config_dir = tmp_path / "claude"
     status_file = config_dir / "sessions" / "123.json"
@@ -1070,10 +1072,14 @@ async def _observe_native_with_real_poller(
     monkeypatch.setattr(instance, "pane_pid_sync", lambda: 123)
     statuses: list[str] = []
 
-    def _publish(_sid: str, status: str, reason: str | None = None) -> None:
+    def _publish(
+        _sid: str, status: str, reason: str | None = None, *, inferred: bool = False
+    ) -> None:
         statuses.append(status)
         if published is not None:
             published.append((status, reason))
+        if inferred_edges is not None and inferred:
+            inferred_edges.append((status, reason))
 
     registry.set_session_status_publisher(_publish)
     if background_publisher is not None:
@@ -1637,10 +1643,12 @@ class _HiddenInputBoxSession:
         registry: SessionResourceRegistry,
         status_file: Path,
         published: list[tuple[str, str | None]],
+        inferred_edges: list[tuple[str, str | None]],
         clock: dict[str, float],
     ) -> None:
         self.registry = registry
         self.published = published
+        self.inferred_edges = inferred_edges
         self._tick = tick
         self._instance = instance
         self._status_file = status_file
@@ -1684,10 +1692,18 @@ async def _hidden_input_box_session(
         monkeypatch.setattr(claude_bridge, "claude_pane_input_box_shown", probe)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     published: list[tuple[str, str | None]] = []
+    inferred_edges: list[tuple[str, str | None]] = []
     on_tick, _statuses, registry, status_file = await _observe_native_with_real_poller(
-        tmp_path, monkeypatch, session_id, instance=instance, published=published
+        tmp_path,
+        monkeypatch,
+        session_id,
+        instance=instance,
+        published=published,
+        inferred_edges=inferred_edges,
     )
-    return _HiddenInputBoxSession(on_tick, instance, registry, status_file, published, clock)
+    return _HiddenInputBoxSession(
+        on_tick, instance, registry, status_file, published, inferred_edges, clock
+    )
 
 
 @pytest.mark.asyncio
@@ -1732,6 +1748,10 @@ async def test_running_turn_with_hidden_input_box_points_chat_at_terminal(
     await session.tick_at(161.0, _CLAUDE_WORKING_PANE)
     assert published[-1] == ("running", waiting_for)
     assert session.registry.session_turn_is_active("conv_hidden_input_box")
+    # Only pane-inferred edges are marked, so the server never lets them reopen a turn.
+    assert session.inferred_edges == (
+        [("running", "terminal prompt"), ("running", None)] if waiting_for is None else []
+    )
 
 
 @pytest.mark.asyncio

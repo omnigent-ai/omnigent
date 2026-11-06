@@ -1786,6 +1786,82 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_status", ["idle", "failed", "running"])
+@pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
+async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
+    monkeypatch: pytest.MonkeyPatch, server_status: str, blocked_on: str | None
+) -> None:
+    """
+    A pane-inferred edge cannot reopen a turn a hook already closed.
+
+    The server publishes a Stop or StopFailure hook's status before forwarding
+    it to the runner, so the runner can still infer a reason in that gap.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    edge: dict[str, object] = {"type": "session.status", "status": "running", "inferred": True}
+    if blocked_on is not None:
+        edge["blocked_on"] = blocked_on
+    fake_runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(edge)}\n\n"], gate)
+    store = _RecordingLabelStore(live_status=server_status)
+    session_id = "e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7"
+    if server_status == "failed":
+        store.set_labels(
+            session_id,
+            {
+                sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "agent_error",
+                sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "prior failure",
+            },
+        )
+    sessions_module._session_status_cache[session_id] = server_status
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_inferred_reason",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        statuses = []
+        while not collector.queue.empty():
+            statuses.append(await collector.queue.get())
+        running_reasons = [e.get("blocked_on") for e in statuses if e.get("status") == "running"]
+        if server_status == "running":
+            assert running_reasons == [blocked_on]
+        else:
+            assert running_reasons == [], f"a {server_status} turn was reopened; saw {statuses}"
+            assert sessions_module._session_status_cache.get(session_id) == server_status
+        if server_status == "failed":
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None and persisted["code"] == "agent_error"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RegisteredRunnerHttpErrorClient:
     """Fake runner client whose transport says the runner is present but every stream open fails.
 

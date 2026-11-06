@@ -599,6 +599,30 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_only_pane_inferred_status_is_marked_inferred() -> None:
+    """The server checks this mark before an edge may reopen a turn."""
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.conftest import _runner_client
+
+    conv_id = "conv_native_inferred_reason"
+    app = await _native_app_with_session(conv_id)
+    publish = app.state.session_resource_registry._session_status_publisher
+    assert publish is not None
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        publish(conv_id, "running", "dialog open")
+        publish(conv_id, "running", "terminal prompt", inferred=True)
+        queue = _session_event_queues_ref[conv_id]
+        events = [queue.get_nowait() for _ in range(queue.qsize())]
+    assert [
+        (event["blocked_on"], event.get("inferred"))
+        for event in events
+        if event.get("type") == "session.status" and "blocked_on" in event
+    ] == [("dialog open", None), ("terminal prompt", True)]
+
+
+@pytest.mark.asyncio
 async def test_required_native_terminal_exit_releases_idle_pin() -> None:
     """A required terminal that dies after delivery cannot leave the runner pinned."""
     from omnigent.runner.resource_registry import TerminalExitEvent, TerminalLifecycle

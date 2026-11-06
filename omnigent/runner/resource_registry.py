@@ -24,7 +24,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from cachetools import TTLCache
 
@@ -162,6 +162,19 @@ NATIVE_TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt"
 _HIDDEN_INPUT_BOX_ALERT_SECONDS = 15.0
 _TERMINAL_EXIT_OUTPUT_MAX_LINES = 40
 _TERMINAL_EXIT_OUTPUT_MAX_CHARS = 4000
+
+
+class SessionStatusPublisher(Protocol):
+    """
+    Publish a session status edge on the event loop.
+
+    ``inferred`` marks a reason read from the pane rather than reported by the
+    harness, so the server lets it annotate a running turn but never reopen one.
+    """
+
+    def __call__(
+        self, session_id: str, status: str, blocked_on: str | None, /, *, inferred: bool = False
+    ) -> None: ...
 
 
 class TerminalLifecycle(Enum):
@@ -591,7 +604,7 @@ class SessionResourceRegistry:
         # working status that replaces the hook-based ``UserPromptSubmit``
         # → running / ``Stop`` → idle bracketing. Set by the runner via
         # :meth:`set_session_status_publisher`.
-        self._session_status_publisher: Callable[[str, str, str | None], None] | None = None
+        self._session_status_publisher: SessionStatusPublisher | None = None
         self._session_failure_publisher: Callable[[str, str], None] | None = None
         # Optional callback ``(session_id, running) -> None`` invoked on the
         # event loop when a claude-native session's background shells start
@@ -661,10 +674,7 @@ class SessionResourceRegistry:
         """
         self._terminal_activity_publisher = publisher
 
-    def set_session_status_publisher(
-        self,
-        publisher: Callable[[str, str, str | None], None],
-    ) -> None:
+    def set_session_status_publisher(self, publisher: SessionStatusPublisher) -> None:
         """Install the PTY-activity-derived session-status publisher.
 
         The runner passes a callback that publishes a ``session.status``
@@ -678,7 +688,8 @@ class SessionResourceRegistry:
         :param publisher: Callable ``(session_id, status, blocked_on) ->
             None`` where *status* is ``"running"`` or ``"idle"`` and
             *blocked_on* is a short reason the agent is parked on a dialog
-            (e.g. ``"permission prompt"``), or ``None``.
+            (e.g. ``"permission prompt"``), or ``None``. Edges inferred from
+            the pane also pass ``inferred=True``.
         """
         self._session_status_publisher = publisher
 
@@ -1853,8 +1864,12 @@ class SessionResourceRegistry:
 
             def deliver() -> None:
                 # Completion, failure or a reported reason may land while this is queued.
-                if self._inferred_status_edge_is_current(session_id, claimed, turn):
-                    _publish_status_if_current("running", blocked_on)
+                if (
+                    status_publisher is not None
+                    and _owns_terminal()
+                    and self._inferred_status_edge_is_current(session_id, claimed, turn)
+                ):
+                    status_publisher(session_id, "running", blocked_on, inferred=True)
 
             loop.call_soon_threadsafe(deliver)
 

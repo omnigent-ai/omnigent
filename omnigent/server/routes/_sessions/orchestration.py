@@ -9400,6 +9400,15 @@ async def _relay_runner_stream_once(
 
                     _record_native_input_lifecycle(session_id, event)
 
+                    # A pane-inferred reason annotates a running turn; it must not reopen
+                    # one a hook closed before its completion reached the runner.
+                    if (
+                        evt_type == "session.status"
+                        and event.get("inferred") is True
+                        and _session_status_cache.get(session_id) != "running"
+                    ):
+                        continue
+
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"
                     ):
