@@ -178,7 +178,7 @@ function friendlyCloneError(error: unknown): string {
 
 const NO_COMMANDS: PaletteCommand[] = [];
 
-const UNMARKED: ProjectAppearance = { icon: null, color: null };
+const UNMARKED: ProjectAppearance = { icon: null, lucideIcon: null, color: null };
 
 /**
  * "New project" control in the Projects group header. Opens a dialog that

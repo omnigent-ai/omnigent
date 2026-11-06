@@ -6505,6 +6505,9 @@ class SessionProjectSummary(BaseModel):
         so the sidebar falls back to the default folder glyph.
     :param muted: Whether the owner muted notifications for every session in
         the project, read from its ``config``; ``False`` for a label-only folder.
+    :param lucide_icon: The project's chosen lucide-react icon name (e.g.
+        ``"FlaskConical"``), read from its ``config``; ``None`` when unset or
+        for a label-only folder. The web UI draws it in ``color``.
     :param color: The project's chosen color (a web theme palette id), read
         from its ``config``; ``None`` when unset or for a label-only folder.
     """
@@ -6513,6 +6516,7 @@ class SessionProjectSummary(BaseModel):
     name: str
     icon: str | None = None
     muted: bool = False
+    lucide_icon: str | None = None
     color: str | None = None
 
 

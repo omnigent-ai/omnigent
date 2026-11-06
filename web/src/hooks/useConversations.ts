@@ -2444,6 +2444,9 @@ export interface ProjectSummary {
   icon?: string | null;
   /** Whether the viewer muted every session in the project (`config.muted`). */
   muted?: boolean;
+  /** Chosen lucide-react icon name, or null/absent for the folder glyph.
+      Sourced from the project's `config.lucide_icon`. */
+  lucide_icon?: string | null;
   /** Chosen color (a theme palette id), or null/absent for the muted folder.
       Sourced from the project's `config.color`. */
   color?: string | null;
@@ -3338,6 +3341,7 @@ export function useUpdateProjectConfig() {
           id: project.id,
           name: project.name,
           icon: project.config?.icon,
+          lucide_icon: project.config?.lucide_icon,
           color: project.config?.color,
           muted: project.config?.muted === true,
         };
