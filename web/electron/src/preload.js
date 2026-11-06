@@ -18,14 +18,30 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 // Native window controls stay in window pixels while the page zooms.
 if (process.platform === "darwin") {
+  const setFullScreenAttribute = (fullScreen) => {
+    document.documentElement.toggleAttribute("data-electron-full-screen", fullScreen === true);
+  };
   const syncTitlebarZoom = () => {
     document.documentElement.style.setProperty(
       "--omnigent-electron-zoom",
       String(webFrame.getZoomFactor()),
     );
   };
-  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      syncTitlebarZoom();
+      void ipcRenderer
+        .invoke("omnigent:is-full-screen")
+        .then(setFullScreenAttribute)
+        .catch(() => {});
+    },
+    { once: true },
+  );
   window.addEventListener("resize", syncTitlebarZoom);
+  ipcRenderer.on("omnigent:full-screen-changed", (_event, fullScreen) => {
+    setFullScreenAttribute(fullScreen);
+  });
 }
 
 // Collapse the update states the in-page UpdateBanner renders on
