@@ -278,13 +278,21 @@ async def test_session_event_sends_report_work_dispatched(
     dispatched: list[str] = []
     reg = TunnelRegistry(on_work_dispatched=dispatched.append)
     reg.register("r1", _NoopWS(), _hello())
+    frame_sent = asyncio.Event()
+    send_text = reg.send_text
+
+    async def _send_text(*args: object, **kwargs: object) -> None:
+        await send_text(*args, **kwargs)  # type: ignore[arg-type]
+        frame_sent.set()
+
+    reg.send_text = _send_text  # type: ignore[method-assign]
     task = asyncio.create_task(
         WSTunnelTransport(reg, "r1").handle_async_request(_make_request(method, path))
     )
     try:
-        async with asyncio.timeout(1):
-            while not (session := reg.get("r1")) or not session.in_flight:
-                await asyncio.sleep(0.001)
+        # The hook runs right after the request frame is handed to the tunnel.
+        await asyncio.wait_for(frame_sent.wait(), timeout=1)
+        await asyncio.sleep(0)
         assert dispatched == (["r1"] if reported else [])
     finally:
         task.cancel()

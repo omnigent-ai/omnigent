@@ -2064,8 +2064,19 @@ async def _run_tunnel_from_env() -> None:
                 extra={"session_id": runner_primary_session_id()},
             )
             direct_attach_listener = None
+
+    def _has_sandbox_work() -> bool:
+        """Return whether the runner is doing agent work, ignoring pane viewing.
+
+        :returns: ``True`` while a turn, dispatch or native turn is active.
+        """
+        callback = getattr(app.state, "has_sandbox_work", None)
+        if not callable(callback):
+            return _has_active_work()
+        return event_dispatcher.has_pending or bool(callback())
+
     # The server extends a managed sandbox only while pongs report busy.
-    pong_busy = RunnerBusyCheck(_has_active_work, _last_work_progress)
+    pong_busy = RunnerBusyCheck(_has_sandbox_work, _last_work_progress)
     tunnel_task = asyncio.create_task(
         serve_tunnel(
             cast("_ASGIApp", app),  # FastAPI is ASGI-compatible; cast narrows for mypy

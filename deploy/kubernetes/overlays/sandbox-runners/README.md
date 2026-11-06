@@ -278,7 +278,9 @@ sandbox stays warm (its runner alive, so follow-ups are instant) after its runne
 stops doing work. The server keeps renewing the sandbox while the runner reports
 work and for `keep_warm_s` after that; once it stops, the pod suspends a short
 window later (~5 min), so a sandbox is reclaimed roughly `keep_warm_s` after the
-agent goes quiet. Just viewing a session does not keep it warm:
+agent goes quiet. Only agent work counts: viewing a session or terminal, or a
+command left running in a plain shell terminal with no agent turn, does not keep
+it warm:
 
 ```yaml
 sandbox:

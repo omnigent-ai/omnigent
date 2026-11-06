@@ -1043,6 +1043,8 @@ async def _keepalive_loop(runner_id: str) -> None:
     :param runner_id: Runner whose bound sandbox to keep warm.
     :returns: None (runs until cancelled).
     """
+    # A new tunnel may belong to a different runner build; it reports afresh.
+    managed_host_keepalive.forget_reports(runner_id)
     while True:
         try:
             managed_host_keepalive.touch(runner_id)

@@ -752,3 +752,6 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             publish(conv_id, "idle", None)
             assert app.state.native_pane_status[conv_id] == "idle"
             assert app.state.has_active_work() is (evidence != "no_evidence")
+            # Sandbox keepalive counts agent work only: recent pane input or output
+            # also comes from someone viewing the pane, so only the prompt counts.
+            assert app.state.has_sandbox_work() is (evidence == "permission_prompt")

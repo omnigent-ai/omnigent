@@ -96,6 +96,10 @@ _last_busy_at: dict[str, float] = {}
 # runner_id -> its provider's keep_warm_after_work_s, cached with the cadence.
 # custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
 _runner_warm_grace_s: dict[str, float] = {}
+# runner_id -> monotonic seconds of its latest busy report, busy or idle. An idle
+# reporting runner is no longer refreshed, so pruning must also look at this.
+# custom-lint: disable-next=workspace-scoped-cache -- keyed by runner_id
+_last_report_at: dict[str, float] = {}
 
 
 def configure(
@@ -155,6 +159,7 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
         return
     was_busy = _last_pong_busy.get(runner_id)
     _last_pong_busy[runner_id] = busy
+    _last_report_at[runner_id] = time.monotonic()
     if not busy:
         _busy_since_kept.setdefault(runner_id, False)
         return
@@ -162,6 +167,18 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
     _last_busy_at[runner_id] = time.monotonic()
     if was_busy is False:
         touch(runner_id, force=True)
+
+
+def forget_reports(runner_id: str) -> None:
+    """Drop *runner_id*'s busy-report state when a new tunnel connects.
+
+    A different runner build can reconnect under the same id; until it reports,
+    it gets the tunnel-lifetime refreshes of a runner that never reports.
+
+    :param runner_id: Runner whose tunnel just connected.
+    """
+    for state in (_last_pong_busy, _busy_since_kept, _last_busy_at, _last_report_at):
+        state.pop(runner_id, None)
 
 
 def record_work_dispatched(runner_id: str) -> None:
@@ -242,13 +259,19 @@ def _within_warm_grace(runner_id: str, now: float) -> bool:
 def _prune_throttle(now: float) -> None:
     """Drop throttle entries older than two slow intervals (their runners are gone)."""
     cutoff = now - 2 * resolve_managed_keepalive_interval_s()
-    for runner_id in [rid for rid, seen in _last_kept.items() if seen < cutoff]:
+    # A connected idle runner keeps reporting but is no longer refreshed, so a
+    # runner is stale only when neither its refresh nor its reports are recent.
+    stale = [
+        rid
+        for rid in set(_last_kept) | set(_last_report_at)
+        if max(_last_kept.get(rid, float("-inf")), _last_report_at.get(rid, float("-inf")))
+        < cutoff
+    ]
+    for runner_id in stale:
         _last_kept.pop(runner_id, None)
         _runner_interval_s.pop(runner_id, None)
-        _last_pong_busy.pop(runner_id, None)
-        _busy_since_kept.pop(runner_id, None)
-        _last_busy_at.pop(runner_id, None)
         _runner_warm_grace_s.pop(runner_id, None)
+        forget_reports(runner_id)
 
 
 def _keep_alive_for_runner(runner_id: str) -> None:

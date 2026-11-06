@@ -1564,7 +1564,9 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
-    def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
+    def _native_pane_shows_live_work(
+        terminals: Any, session_id: str, terminal_name: str, *, include_pane_activity: bool = True
+    ) -> bool:
         """Whether a native pane shows the live work the pane reaper spares it for.
 
         A pane parked on a permission prompt is quiet and can read ``idle``, and a
@@ -1574,14 +1576,19 @@ def create_runner_app(
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
         :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
-        :returns: ``True`` when a permission hook is parked or the pane shows recent
-            input or output.
+        :param include_pane_activity: Whether recent pane input or output counts.
+            Viewing a pane (attach, resize, a redraw) produces both, so callers
+            asking about agent work rather than pane liveness pass ``False``.
+        :returns: ``True`` when a permission hook is parked or, with
+            *include_pane_activity*, the pane shows recent input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
         if approval_wait_is_fresh(session_id):
             return True
+        if not include_pane_activity:
+            return False
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
             return False
@@ -1589,7 +1596,7 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
-    def _has_active_work() -> bool:
+    def _has_active_work(*, include_pane_activity: bool = True) -> bool:
         if _active_turns:
             return True
         if _claude_prompt_waiters:
@@ -1615,7 +1622,9 @@ def create_runner_app(
                 ):
                     continue
                 session_ids.add(session_id)
-                if _native_pane_shows_live_work(terminals, session_id, name):
+                if _native_pane_shows_live_work(
+                    terminals, session_id, name, include_pane_activity=include_pane_activity
+                ):
                     return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
@@ -1635,6 +1644,10 @@ def create_runner_app(
         return is_native_harness(_session_harness_name(session_id))
 
     app.state.has_active_work = _has_active_work
+    # Agent work only, for keeping a managed sandbox awake: a native pane's recent
+    # input or output also comes from someone just viewing it. A prompt typed into
+    # the pane still counts once the harness reports its turn in flight.
+    app.state.has_sandbox_work = lambda: _has_active_work(include_pane_activity=False)
 
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):

@@ -369,6 +369,7 @@ class _BusyGate:
             "_busy_since_kept",
             "_last_busy_at",
             "_runner_warm_grace_s",
+            "_last_report_at",
         ):
             monkeypatch.setattr(managed_host_keepalive, name, {})
         monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
@@ -514,3 +515,27 @@ def test_runner_stays_warm_for_its_grace_after_the_last_busy_report(
     gate.tick()  # t=2200: idle, but within the grace
     gate.tick()  # t=2800: grace over
     assert gate.submitted == ["r1", "r1", "r1"]
+
+
+def test_pruning_preserves_live_idle_reporting_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An idle reporting runner is no longer refreshed, so its refresh time goes
+    # stale while its pongs keep coming; pruning must not turn it back into a
+    # never-reporting runner that gets refreshed.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", False)
+    gate.now += 5000.0
+    managed_host_keepalive.record_pong("r1", False)  # still connected and reporting
+    managed_host_keepalive._prune_throttle(gate.now)
+    managed_host_keepalive.touch("r1")
+    assert gate.submitted == ["r1"]
+
+
+def test_a_new_tunnel_starts_without_the_previous_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A runner that does not report may reconnect under the same id.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.forget_reports("r1")
+    gate.tick()
+    assert gate.submitted == ["r1", "r1"]
