@@ -369,13 +369,19 @@ async def test_message_naming_its_delivery_settles_only_that_input(
     conv = store.create_conversation(title="Test", labels={"omnigent.wrapper": "codex-native"})
     older = pending_inputs.record(
         conv.id,
-        [{"type": "input_text", "text": "fix the bug"}],
+        [
+            {"type": "input_file", "file_id": "file_log", "filename": "build.log"},
+            {"type": "input_text", "text": "fix the bug"},
+        ],
+        created_by="bob@example.com",
         stable_id="a" * 32,
         background_titles_enabled=False,
     )
+    steered_file = {"type": "input_file", "file_id": "file_notes", "filename": "notes.md"}
     steered = pending_inputs.record(
         conv.id,
-        [{"type": "input_text", "text": "also update the docs"}],
+        [steered_file, {"type": "input_text", "text": "also update the docs"}],
+        created_by="alice@example.com",
         stable_id="b" * 32,
         background_titles_enabled=False,
     )
@@ -400,6 +406,12 @@ async def test_message_naming_its_delivery_settles_only_that_input(
     assert record.attributes["match_method"] == "delivery_attempt_id"
     assert record.attributes["item_id"] == item_id
     assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(conv.id)] == [older]
+    saved = {item.id: item for item in store.list_items(conv.id).data}[item_id]
+    assert saved.created_by == "alice@example.com"
+    assert saved.data.content == [
+        steered_file,
+        {"type": "input_text", "text": "also update the docs"},
+    ]
     pending_inputs.resolve(conv.id, older)
 
 
