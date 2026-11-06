@@ -62,12 +62,14 @@ def session_created(
     *,
     agent_id: str | None = None,
     harness: str | None = None,
+    created_by_session_id: str | None = None,
 ) -> None:
     """Publish the request-to-session link immediately after persistence.
 
     ``parent_session_id`` is the spawning parent for a sub-agent child (``None``
     for a top-level session); logging it on the creation row is what lets a
     debug-log query join a child back to its parent session.
+    ``created_by_session_id`` links an independent worker to its creator.
     """
     set_current_session_id(session_id)
     set_current_runner_id(runner_id)
@@ -81,6 +83,7 @@ def session_created(
             agent_id=agent_id,
             session_kind="sub_agent" if parent_session_id else "default",
             parent_session_id=parent_session_id,
+            created_by_session_id=created_by_session_id,
             creation_kind=current_request_audit_attrs().get("creation_kind", "unknown"),
             **harness_attributes(harness, source="create_selection"),
         ),
