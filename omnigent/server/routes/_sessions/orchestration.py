@@ -12343,6 +12343,7 @@ async def _create_session_from_existing_agent(
         parent_session_id=body.parent_session_id,
         agent_id=conv.agent_id,
         harness=selected_harness,
+        created_by_session_id=created_by_session_id,
     )
     telemetry.set_session_id(conv.id)
 
