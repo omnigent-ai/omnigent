@@ -33,6 +33,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlScheduledTask,
+    SqlScheduledTaskPermission,
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
@@ -81,6 +82,18 @@ def _revoke_durable_authority(session: Session, user_id: str, *, now: int) -> No
     as tombstones instead of being dropped.
     """
     workspace_id = current_workspace_id()
+    session.execute(
+        delete(SqlScheduledTaskPermission).where(
+            SqlScheduledTaskPermission.workspace_id == workspace_id,
+            (SqlScheduledTaskPermission.user_id == user_id)
+            | SqlScheduledTaskPermission.scheduled_task_id.in_(
+                select(SqlScheduledTask.id).where(
+                    SqlScheduledTask.workspace_id == workspace_id,
+                    SqlScheduledTask.user_id == user_id,
+                )
+            ),
+        )
+    )
     session.execute(
         delete(SqlUserDailyCost).where(
             SqlUserDailyCost.workspace_id == workspace_id,

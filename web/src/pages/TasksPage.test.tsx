@@ -14,6 +14,22 @@ import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { showToast } from "@/components/ui/toast";
 
+vi.mock("@/components/scheduled/SharedAutomations", () => ({
+  SharedAutomations: ({
+    sharedTaskId,
+    onCopied,
+  }: {
+    sharedTaskId: string | null;
+    onCopied: () => void;
+  }) => (
+    <div data-testid="shared-automations" data-task-id={sharedTaskId}>
+      <button type="button" onClick={onCopied}>
+        Copy shared task
+      </button>
+    </div>
+  ),
+}));
+
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
 vi.mock("@/hooks/useViewerId", () => ({ useViewerId: vi.fn() }));
@@ -171,6 +187,10 @@ function renderPage(
         <RoutingProvider value={basenamedRouting(basename)}>
           <Routes>
             <Route path={`${basename}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${basename}/tasks/shared/:sharedTaskId`}
+              element={<TasksPage key="shared" sharedOnly />}
+            />
             <Route
               path={`${basename}/tasks/templates`}
               element={<TasksPage key="templates" templatesOnly />}
@@ -469,6 +489,22 @@ describe("New automation entry", () => {
 });
 
 describe("automation view navigation", () => {
+  it("tracks tab changes from a shared deep link", () => {
+    renderPage("/tasks/shared/source", "/embed", { ...TRIGGER_INFO, scheduled_task_sharing: true });
+    selectView("Templates");
+    expect(screen.getByRole("tab", { name: "Templates" })).toHaveAttribute("aria-selected", "true");
+    expect(analytics.mock.calls.filter(([event]) => event.type === "value_change")).toEqual([
+      [
+        {
+          type: "value_change",
+          componentId: "tasks.view",
+          componentKind: "tabs",
+          value: "templates",
+        },
+      ],
+    ]);
+  });
+
   it("reports one analytics event per tab change, including pointer focus activation", () => {
     setTasks([]);
     renderPage();
@@ -756,4 +792,20 @@ describe("trigger templates", () => {
     expect(screen.getByText("No automations yet")).toBeVisible();
     expect(screen.queryByTestId("tasks-suggestions")).not.toBeInTheDocument();
   });
+});
+
+it("opens a managed shared-task link and returns copies to Your automations", async () => {
+  renderPage("/tasks/shared/source", "/embed", { ...TRIGGER_INFO, scheduled_task_sharing: true });
+  expect(screen.getByRole("tab", { name: "Shared automations" })).toHaveAttribute(
+    "aria-selected",
+    "true",
+  );
+  expect(screen.getByTestId("shared-automations")).toHaveAttribute("data-task-id", "source");
+  fireEvent.click(screen.getByRole("button", { name: "Copy shared task" }));
+  await waitFor(() =>
+    expect(screen.getByRole("tab", { name: "Your automations" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    ),
+  );
 });

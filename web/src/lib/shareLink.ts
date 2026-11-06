@@ -16,7 +16,14 @@ export function getShareableSessionLink(
   sessionId: string,
   rebasePath: (path: string) => string,
 ): string {
-  const path = rebasePath(`/c/${sessionId}`);
+  return getShareableLink(`/c/${sessionId}`, rebasePath);
+}
+
+export function getShareableLink(
+  relativePath: string,
+  rebasePath: (path: string) => string,
+): string {
+  const path = rebasePath(relativePath);
   const transform = getOmnigentTransformShareLink();
   return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
 }

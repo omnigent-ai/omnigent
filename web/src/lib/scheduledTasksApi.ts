@@ -11,6 +11,7 @@
 
 import { authenticatedFetch } from "./identity";
 import { startTimedInteraction } from "./analyticsEmit";
+import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 
 export const RANDOM_WORKTREE_BASE_REF = "HEAD";
 
@@ -37,6 +38,11 @@ export type ScheduledTaskRunStatus =
  * the DB column is `user_id`; it's surfaced here as `ownerUserId`.
  */
 export interface ScheduledTask {
+  /** Custom agent available through the share; copied only when the task is created. */
+  sharedAgent?: AvailableAgent;
+  agentName?: string | null;
+  hostName?: string | null;
+  projectName?: string | null;
   id: string;
   name: string;
   prompt: string;
@@ -57,6 +63,7 @@ export interface ScheduledTask {
    * `--permission-mode` launch arg from it at fire time.
    */
   permissionMode: string | null;
+  maxCostUsd?: number | null;
   /** `"continue"` sends every run's prompt into `sessionId` instead of a new session. */
   sessionMode: ScheduledTaskSessionMode;
   /** The session a `"continue"` task sends to; `null` until its first run creates one. */
@@ -141,6 +148,7 @@ export type AutomationTemplateId = (typeof AUTOMATION_TEMPLATE_IDS)[number];
 
 /** Body for `POST /v1/scheduled-tasks`. */
 export interface CreateScheduledTaskInput {
+  sharedTaskId?: string;
   /** Diagnostic creation attribution, sent as headers for older-server compatibility. */
   templateId?: AutomationTemplateId;
   name: string;
@@ -152,6 +160,7 @@ export interface CreateScheduledTaskInput {
   reasoningEffort?: string | null;
   /** Harness-specific permission or execution mode; omit for the agent default. */
   permissionMode?: string | null;
+  maxCostUsd?: number | null;
   /** `"continue"` keeps one session across runs; omit for a new session per run. */
   sessionMode?: ScheduledTaskSessionMode;
   /** Host directory (requires hostId), or a repository URL for a sandbox. */
@@ -209,6 +218,10 @@ export interface UpdateScheduledTaskInput {
 
 /** Wire shape of a task row (snake_case), matching `_to_response`. */
 interface ScheduledTaskWire {
+  shared_agent?: Pick<AvailableAgent, "id" | "name" | "description" | "harness" | "skills"> | null;
+  agent_name?: string | null;
+  host_name?: string | null;
+  project_name?: string | null;
   id: string;
   name: string;
   prompt: string;
@@ -221,6 +234,7 @@ interface ScheduledTaskWire {
   model_override: string | null;
   reasoning_effort: string | null;
   permission_mode: string | null;
+  max_cost_usd?: number | null;
   session_mode?: ScheduledTaskSessionMode;
   session_id?: string | null;
   workspace: string | null;
@@ -296,6 +310,16 @@ async function readJsonOrThrow<T>(res: Response): Promise<T> {
 
 function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
   return {
+    ...(wire.shared_agent
+      ? {
+          sharedAgent: {
+            ...wire.shared_agent,
+            display_name: wire.shared_agent.name,
+            builtin: false,
+            shared: true as const,
+          },
+        }
+      : {}),
     id: wire.id,
     name: wire.name,
     prompt: wire.prompt,
@@ -308,6 +332,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     modelOverride: wire.model_override,
     reasoningEffort: wire.reasoning_effort,
     permissionMode: wire.permission_mode,
+    maxCostUsd: wire.max_cost_usd ?? null,
     sessionMode: wire.session_mode ?? "new",
     sessionId: wire.session_id ?? null,
     workspace: wire.workspace,
@@ -379,12 +404,14 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
   if (input.modelOverride != null) body.model_override = input.modelOverride;
   if (input.reasoningEffort != null) body.reasoning_effort = input.reasoningEffort;
   if (input.permissionMode != null) body.permission_mode = input.permissionMode;
+  if (input.maxCostUsd != null) body.max_cost_usd = input.maxCostUsd;
   if (input.sessionMode !== undefined) body.session_mode = input.sessionMode;
   if (input.baseBranch !== undefined) body.base_branch = input.baseBranch;
   if (input.workspace != null) body.workspace = input.workspace;
   if (input.hostId != null) body.host_id = input.hostId;
   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
   if (input.projectId != null) body.project_id = input.projectId;
+  if (input.sharedTaskId !== undefined) body.shared_task_id = input.sharedTaskId;
   const templateId = input.templateId ?? "custom";
   const interaction = startTimedInteraction("create_scheduled_task", undefined, templateId);
   try {
@@ -511,4 +538,81 @@ export async function listAutomationFailures(after: string | null): Promise<Auto
     next_cursor: string | null;
   }>(response);
   return { data: page.data.map(failureFromWire), nextCursor: page.next_cursor };
+}
+
+/** Shared definitions carry no runtime state, session IDs, or run history. */
+function sharedTaskFromWire(wire: ScheduledTaskWire): ScheduledTask {
+  return {
+    ...taskFromWire({
+      ...wire,
+      state: "active",
+      session_id: null,
+      last_run_at: null,
+      last_run_status: null,
+      last_run_conversation_id: null,
+      next_run_at: null,
+      created_at: 0,
+      updated_at: 0,
+    }),
+    agentName: wire.agent_name,
+    hostName: wire.host_name,
+    projectName: wire.project_name,
+  };
+}
+
+export async function listSharedScheduledTasks(): Promise<ScheduledTask[]> {
+  const res = await authenticatedFetch("/v1/scheduled-tasks/shared");
+  const body = await readJsonOrThrow<{ scheduled_tasks: ScheduledTaskWire[] }>(res);
+  return body.scheduled_tasks.map(sharedTaskFromWire);
+}
+
+export async function getSharedScheduledTask(id: string): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/shared/${encodeURIComponent(id)}`);
+  return sharedTaskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
+}
+
+export async function listScheduledTaskRecipients(id: string): Promise<string[]> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/permissions`);
+  return (await readJsonOrThrow<{ user_ids: string[] }>(res)).user_ids;
+}
+
+export async function shareScheduledTask(id: string, userId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/permissions`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId }),
+    },
+  );
+  await readJsonOrThrow(res);
+}
+
+export async function unshareScheduledTask(id: string, userId: string): Promise<void> {
+  const res = await authenticatedFetch(
+    `/v1/scheduled-tasks/${encodeURIComponent(id)}/permissions/${encodeURIComponent(userId)}`,
+    { method: "DELETE" },
+  );
+  await readJsonOrThrow(res);
+}
+
+export function scheduledTaskCopyInput(task: ScheduledTask): CreateScheduledTaskInput {
+  return {
+    sharedTaskId: task.id,
+    name: task.name,
+    prompt: task.prompt,
+    rrule: task.rrule,
+    timezone: task.timezone,
+    agentId: task.agentId,
+    modelOverride: task.modelOverride,
+    reasoningEffort: task.reasoningEffort,
+    permissionMode: task.permissionMode,
+    maxCostUsd: task.maxCostUsd,
+    sessionMode: task.sessionMode,
+    executionTarget: task.executionTarget,
+    hostId: task.hostId,
+    workspace: task.workspace,
+    baseBranch: task.baseBranch,
+    projectId: task.projectId,
+  };
 }

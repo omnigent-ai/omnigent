@@ -5,6 +5,25 @@ also previewed below Your automations, including when automations already exist.
 Selecting a template opens the creation modal with its integration settings ready
 to customize.
 
+## Sharing and copying
+
+On a multi-user deployment advertising automation sharing, open an automation's
+menu or detail page and choose Share. Add a registered recipient. In that person's
+account, open **Shared automations** beside Templates, expand View configuration,
+and choose Copy. Compatible settings create an enabled task in Your automations;
+unavailable settings open the creation dialog for replacement. The shared source
+has no run, edit, pause, or delete controls. Remove the recipient and refresh their
+shared list: the original disappears, while any copy remains independently owned.
+For an automation using the sharer's own custom agent, copying also creates a recipient-owned
+bundle snapshot. Keep that agent selected when resolving a host mismatch; canceling
+creates neither a task nor an agent. Edit or delete the owner's agent and confirm
+the recipient's agent and automation remain unchanged.
+An agent owned by someone else still requires normal agent/session access.
+
+`tests/server/integration/test_scheduled_tasks_routes.py` covers authorization,
+revocation, and independent copies. `SharedAutomations.test.tsx` and
+`ShareScheduledTaskDialog.test.tsx` cover the two copy paths and named-person UI.
+
 ## Sub-features
 
 - `views`: tabs separate existing automations from the template gallery;

@@ -4900,6 +4900,9 @@ def server(
 
     from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.scheduled_task_permission_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskPermissionStore,
+    )
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
         SqlAlchemyScheduledTaskStore,
     )
@@ -4911,6 +4914,7 @@ def server(
     policy_store = SqlAlchemyPolicyStore(db_uri)
     permission_store = SqlAlchemyPermissionStore(db_uri)
     scheduled_task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    scheduled_task_permission_store = SqlAlchemyScheduledTaskPermissionStore(db_uri)
     project_store = SqlAlchemyProjectStore(db_uri)
     preference_store = None
     if authority_id is not None:
@@ -5128,6 +5132,7 @@ def server(
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
+        scheduled_task_permission_store=scheduled_task_permission_store,
         project_store=project_store,
         preference_store=preference_store,
         auth_provider=auth_provider,

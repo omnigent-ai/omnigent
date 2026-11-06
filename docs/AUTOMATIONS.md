@@ -14,6 +14,38 @@ An automation is a saved instruction that fires an agent session on a recurring 
 
 "Automations" is the user-facing name in the web UI. Everywhere else the feature is called a **scheduled task**: the REST paths (`/v1/scheduled-tasks`), the agent tools (`sys_scheduled_task_*`), the database tables (`scheduled_tasks`, `scheduled_task_runs`), and the code. This guide uses whichever name matches the surface being described.
 
+## Sharing and copying
+
+On a multi-user server with automation sharing enabled, choose **Share** from an
+owned automation's menu or detail page and select individual users. Recipients
+see its current definition in **Shared automations**, next to **Templates**.
+They can inspect and copy it; sharing does not grant access to its runs, sessions,
+or owner controls.
+
+**Copy** immediately creates an enabled automation when its settings are available
+to the recipient. Otherwise the creation dialog identifies the settings to replace
+and preserves the remaining configuration. Copies have their own owner, sessions,
+and run history. Removing access or deleting the original does not delete copies.
+
+Custom agents owned by the person sharing are copied with the automation: the recipient owns a separate
+snapshot of the complete agent bundle, including instructions, skills, and bundled
+sub-agents. Later changes to the original agent do not affect that snapshot.
+The copy is created only when saving, after checking that the automation is still
+shared with the recipient. Built-in agents remain shared. Deployments need user-agent
+and artifact storage support; this uses the existing agent schema.
+This includes the sharer's own custom agent used by an existing session, but grants
+no access to that session or its history. If the agent belongs to someone else,
+the recipient still needs normal agent/session access or must choose another agent.
+
+Embedded deployments opt in by passing `scheduled_task_permission_store` to
+`create_app`. The SQL implementation uses `scheduled_task_permissions`, scoped by
+workspace and recipient. Managed deployments must provision that table through
+their schema migration system before injecting the store; the standalone Alembic
+migration does not run against managed databases. Person search and share-link
+routing use the existing host callbacks. The `scheduled_task_sharing` capability
+keeps these controls hidden on deployments that have not enabled the store.
+
+
 ## Creating an automation
 
 There are three surfaces, all writing the same rows.

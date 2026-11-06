@@ -31,6 +31,7 @@ import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/compone
 import { Label } from "@/components/scheduled/Label";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
+import { scheduledTaskCopyAgents } from "./copyScheduledTask";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
 import { TriggerTemplateFields } from "@/components/scheduled/TriggerTemplateFields";
 import {
@@ -92,6 +93,7 @@ import { isValidSandboxRepoUrl, splitSandboxWorkspace } from "@/lib/sandboxRepos
 import { localTimezone } from "@/lib/timezones";
 import { describeSchedule } from "@/lib/scheduleText";
 
+const EMPTY_COPY_ISSUES: string[] = [];
 const PROVIDER_DEFAULT = "provider-default";
 const DEFAULT_AUTOMATION_PROJECT = "Omnigent Automation";
 
@@ -132,6 +134,9 @@ export function CreateScheduledTaskDialog({
   initialTemplateId,
   sessionLink = "",
   editingTask = null,
+  initialTask = null,
+  copyIssues = EMPTY_COPY_ISSUES,
+  allowUnpinnedHost = false,
   onCreated,
 }: {
   open: boolean;
@@ -145,10 +150,17 @@ export function CreateScheduledTaskDialog({
   /** Shareable session URL the trigger prompt links back with; see `SESSION_LINK_ID_PLACEHOLDER`. */
   sessionLink?: string;
   editingTask?: ScheduledTask | null;
+  initialTask?: ScheduledTask | null;
+  copyIssues?: string[];
+  allowUnpinnedHost?: boolean;
   /** Called once after a new automation is created (not after an edit). */
   onCreated?: () => void;
 }) {
-  const { data: agents } = useAvailableAgents({ enabled: open });
+  const { data: availableAgents } = useAvailableAgents({ enabled: open });
+  const agents = useMemo(
+    () => (availableAgents ? scheduledTaskCopyAgents(initialTask, availableAgents) : undefined),
+    [availableAgents, initialTask],
+  );
   const { data: hosts, isPending: hostsPending } = useHosts({ enabled: open });
   const info = useServerInfo();
   const anchoredScheduling = isFeatureEnabled(info, "automations_v2");
@@ -181,6 +193,7 @@ export function CreateScheduledTaskDialog({
   const createMutation = useCreateScheduledTask();
   const updateMutation = useUpdateScheduledTask();
   const isEdit = editingTask !== null;
+  const configuredTask = editingTask ?? initialTask;
   // A task saved from a trigger template keeps its one session on edit too; only
   // the reset below stays, for a session that's broken or stale.
   const editingTemplateTrigger =
@@ -335,15 +348,15 @@ export function CreateScheduledTaskDialog({
   // offer repository selection instead of browsing a connected host.
   const [sandboxMode, setSandboxMode] = useState(false);
   const sandboxWorkspace = sandboxMode ? workspace : "";
-  let savedWorkspace = editingTask?.workspace ?? "";
+  let savedWorkspace = configuredTask?.workspace ?? "";
   if (
-    editingTask?.executionTarget === "managed_sandbox" &&
+    configuredTask?.executionTarget === "managed_sandbox" &&
     !isValidSandboxRepoUrl(splitSandboxWorkspace(savedWorkspace).url)
   ) {
     savedWorkspace = "";
   }
   const savedSandboxWorkspace =
-    editingTask?.executionTarget === "managed_sandbox" ? savedWorkspace : "";
+    configuredTask?.executionTarget === "managed_sandbox" ? savedWorkspace : "";
   // Project by name: null = unchanged; "" = no project.
   const [projectChoice, setProjectChoice] = useState<string | null>(null);
   // Id of the existing project picked, captured at pick time so a later rename
@@ -384,8 +397,8 @@ export function CreateScheduledTaskDialog({
     [anchoredScheduling, subhourSupported, triggerPollMinutes],
   );
   const savedSchedule = useMemo(
-    () => (editingTask ? parseRRuleToScheduleModel(editingTask.rrule) : null),
-    [editingTask],
+    () => (configuredTask ? parseRRuleToScheduleModel(configuredTask.rrule) : null),
+    [configuredTask],
   );
 
   // Seed Name/Prompt on the closed→open transition ONLY. Keying off the
@@ -400,30 +413,34 @@ export function CreateScheduledTaskDialog({
       typeDrafts.current = {};
       setTriggerType(initialTrigger ?? "schedule");
       resetMenus();
-      setAdvancedOpen(false);
+      setAdvancedOpen(initialTask !== null);
       setSystemPromptOpen(false);
       setEditingSystemPrompt(false);
-      const parts = splitTriggerPrompt(editingTask?.prompt ?? initialPrompt ?? "");
+      const parts = splitTriggerPrompt(configuredTask?.prompt ?? initialPrompt ?? "");
       setPrompt(parts.userPrompt);
       setSystemPrompt(parts.systemPrompt);
-      setTimezone(editingTask?.timezone ?? localTimezone());
-      if (editingTask) {
+      setTimezone(configuredTask?.timezone ?? localTimezone());
+      if (configuredTask) {
         const parsedSchedule = savedSchedule;
-        setName(editingTask.name);
-        setPickedAgentId(editingTask.agentId);
+        setName(configuredTask.name);
+        setPickedAgentId(configuredTask.agentId);
         // Prefill the model/effort/permission controls from the loaded task; null → "".
-        setPickedModel(editingTask.modelOverride ?? "");
-        setPickedEffort(editingTask.reasoningEffort ?? "");
-        setPickedPermission(editablePermissionMode(editingTask.permissionMode));
+        setPickedModel(configuredTask.modelOverride ?? "");
+        setPickedEffort(configuredTask.reasoningEffort ?? "");
+        setPickedPermission(editablePermissionMode(configuredTask.permissionMode));
         setSchedule(parsedSchedule ?? DEFAULT_SCHEDULE_MODEL);
         setScheduleUnsupported(parsedSchedule === null);
-        setHostId(editingTask.hostId ?? "");
+        setHostId(configuredTask.hostId ?? "");
         setWorkspace(savedWorkspace);
-        setBaseBranch(editingTask.baseBranch ?? null);
-        setSandboxMode(editingTask.executionTarget === "managed_sandbox");
-        setProjectChoice(null);
-        setPickedProjectId(null);
-        setSessionMode(editingTask.sessionMode);
+        setBaseBranch(configuredTask.baseBranch ?? null);
+        setSandboxMode(configuredTask.executionTarget === "managed_sandbox");
+        setProjectChoice(
+          initialTask
+            ? (projects.find((project) => project.id === initialTask.projectId)?.name ?? "")
+            : null,
+        );
+        setPickedProjectId(initialTask?.projectId ?? null);
+        setSessionMode(configuredTask.sessionMode);
         setStartNewSession(false);
         setTrigger(null);
       } else {
@@ -456,9 +473,11 @@ export function CreateScheduledTaskDialog({
     initialPrompt,
     initialTrigger,
     defaultTriggerSchedule,
-    editingTask,
+    configuredTask,
     savedSchedule,
     savedWorkspace,
+    initialTask,
+    projects,
   ]);
 
   // A new task starts on a server sandbox when one is offered, so it doesn't
@@ -473,7 +492,7 @@ export function CreateScheduledTaskDialog({
   const defaultHostId = hosts?.find((h) => h.status === "online")?.host_id;
   const targetInputsLoaded = !curationPending && !hostsPending;
   useEffect(() => {
-    if (!open || isEdit || !targetInputsLoaded || targetChosenRef.current) return;
+    if (!open || isEdit || initialTask || !targetInputsLoaded || targetChosenRef.current) return;
     if (managedSandboxesEnabled) {
       targetChosenRef.current = true;
       setSandboxMode(true);
@@ -483,7 +502,7 @@ export function CreateScheduledTaskDialog({
       targetChosenRef.current = true;
       setHostId(defaultHostId);
     }
-  }, [open, isEdit, targetInputsLoaded, managedSandboxesEnabled, defaultHostId]);
+  }, [open, isEdit, initialTask, targetInputsLoaded, managedSandboxesEnabled, defaultHostId]);
 
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
@@ -540,11 +559,12 @@ export function CreateScheduledTaskDialog({
     sandboxMode,
     pickedModel,
     open,
+    initialTask?.sharedAgent?.id === effectiveAgentId,
   );
   const supportsModel = harnessSettings.supportsModel;
   const supportsPermission = harnessSettings.permissions.length > 0;
   const newAutomationPermission =
-    !isEdit && !permissionPicked && harnessSettings.harness
+    !isEdit && !initialTask && !permissionPicked && harnessSettings.harness
       ? NEW_AUTOMATION_PERMISSION_MODES[harnessSettings.harness]
       : undefined;
   const permissionChoice =
@@ -576,8 +596,13 @@ export function CreateScheduledTaskDialog({
     if (nextSandbox !== sandboxMode) {
       nextWorkspace = editingTask?.executionTarget === nextTarget ? savedWorkspace : "";
     }
-    setPickedModel(restore ? (editingTask?.modelOverride ?? "") : "");
-    setPickedEffort(restore ? (editingTask?.reasoningEffort ?? "") : "");
+    const preserveCopyOverrides = initialTask !== null && nextSandbox === sandboxMode;
+    setPickedModel(
+      restore ? (editingTask?.modelOverride ?? "") : preserveCopyOverrides ? pickedModel : "",
+    );
+    setPickedEffort(
+      restore ? (editingTask?.reasoningEffort ?? "") : preserveCopyOverrides ? pickedEffort : "",
+    );
     setBaseBranch(
       restore && !nextSandbox && nextWorkspace === savedWorkspace
         ? (editingTask?.baseBranch ?? null)
@@ -717,7 +742,7 @@ export function CreateScheduledTaskDialog({
     (trigger !== null || prompt.trim() !== "") &&
     (systemPrompt === null || systemPrompt.trim() !== "") &&
     (isEdit || effectiveAgentId !== null) &&
-    (isEdit || sandboxMode || hostId !== "") &&
+    (isEdit || sandboxMode || hostId !== "" || (initialTask !== null && allowUnpinnedHost)) &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
     !pollingBlockedReason &&
@@ -807,7 +832,10 @@ export function CreateScheduledTaskDialog({
       let workspacePatch: { workspace?: string | null } = {};
       if (sandboxMode) {
         const hasNewSelection = editingTask === null && selectedWorkspace !== "";
-        if (sandboxRepoCatalog.length > 0 && (workspaceChanged || hasNewSelection)) {
+        if (
+          (sandboxRepoCatalog.length > 0 || initialTask) &&
+          (workspaceChanged || hasNewSelection)
+        ) {
           workspacePatch = { workspace: selectedWorkspace || null };
         }
       } else if (hostId !== "" && selectedWorkspace !== "") {
@@ -816,7 +844,10 @@ export function CreateScheduledTaskDialog({
       const input = {
         name: name.trim(),
         prompt: systemPrompt === null ? effectivePrompt.trim() : effectivePrompt,
-        rrule: buildRRule(schedule),
+        rrule:
+          initialTask && savedSchedule && buildRRule(schedule) === buildRRule(savedSchedule)
+            ? initialTask.rrule
+            : buildRRule(schedule),
         timezone,
         ...(executionTargetChanged ? { executionTarget } : {}),
         ...(worktreesSupported && baseBranch !== (editingTask?.baseBranch ?? null)
@@ -869,10 +900,12 @@ export function CreateScheduledTaskDialog({
         const scheduleTemplateId = initialTrigger ? undefined : initialTemplateId;
         const templateId = triggerType === "schedule" ? scheduleTemplateId : triggerType;
         await createMutation.mutateAsync({
+          ...(initialTask ? { sharedTaskId: initialTask.id } : {}),
           ...(templateId ? { templateId } : {}),
           ...input,
           ...projectInput,
           agentId: effectiveAgentId,
+          ...(initialTask?.maxCostUsd != null ? { maxCostUsd: initialTask.maxCostUsd } : {}),
           // Include an override only when the agent supports model/effort AND the
           // user picked a non-default value; an unselected control is omitted so
           // the create uses the agent's configured defaults.
@@ -921,7 +954,9 @@ export function CreateScheduledTaskDialog({
         onInteractOutside={guardDialogDismiss}
       >
         <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
-          <DialogTitle>{isEdit ? "Edit automation" : "New automation"}</DialogTitle>
+          <DialogTitle>
+            {isEdit ? "Edit automation" : initialTask ? "Copy automation" : "New automation"}
+          </DialogTitle>
           <DialogDescription className="sr-only">
             {triggerMode
               ? "Starts an agent session for each matching item."
@@ -935,6 +970,16 @@ export function CreateScheduledTaskDialog({
           className="flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-6 py-5"
           data-testid="scheduled-task-dialog-body"
         >
+          {initialTask && copyIssues.length > 0 && (
+            <div role="status" className="rounded-lg border border-border bg-muted/40 p-3 text-ui">
+              <p className="font-medium">Choose settings for your copy</p>
+              <ul className="mt-2 list-disc space-y-1 pl-4">
+                {copyIssues.map((issue) => (
+                  <li key={issue}>{issue}</li>
+                ))}
+              </ul>
+            </div>
+          )}
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="task-name">Name</Label>
             <Input
@@ -1114,7 +1159,13 @@ export function CreateScheduledTaskDialog({
                           pickerTriggerClass,
                         )}
                       >
-                        <SelectValue placeholder={isEdit ? UNPINNED_HOST_LABEL : "Pick a host"} />
+                        <SelectValue
+                          placeholder={
+                            isEdit || (initialTask && allowUnpinnedHost)
+                              ? UNPINNED_HOST_LABEL
+                              : "Pick a host"
+                          }
+                        />
                       </SelectTrigger>
                       <SelectContent position="popper" align="end">
                         {(managedSandboxesEnabled || sandboxMode) && (
@@ -1166,7 +1217,9 @@ export function CreateScheduledTaskDialog({
                           hasAgents={selectedAgent !== undefined || agentList.length > 0}
                           loading={curationPending}
                           curatedEntries={
-                            curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                            initialTask?.sharedAgent || curation.restrictToAgentNames.size > 0
+                              ? agentList
+                              : undefined
                           }
                           // Sandboxes provision their own harnesses; host badges only apply to hosts.
                           host={sandboxMode ? undefined : badgeHost}

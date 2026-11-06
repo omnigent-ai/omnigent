@@ -2532,3 +2532,38 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
         float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
     ]
     assert examined and max(examined) <= 51, plans[0]
+
+
+def test_sharing_is_workspace_scoped_and_recipient_generation_bound(db_uri: str) -> None:
+    from omnigent.db.account_authority import account_authority_scope, target_account_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.stores.scheduled_task_permission_store.sqlalchemy_store import (
+        SqlAlchemyScheduledTaskPermissionStore,
+    )
+
+    shares = SqlAlchemyScheduledTaskPermissionStore(db_uri)
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    accounts = SqlAlchemyAccountStore(db_uri)
+    with workspace_scope(11):
+        alice = accounts.create_user_with_password("alice", "password")
+        bob = accounts.create_user_with_password("bob", "password")
+        with account_authority_scope("alice", alice.account_generation):
+            task = tasks.create(
+                _uid("shared"), "Share me", "Hello", "FREQ=DAILY", "alice", _uid("agent"), "UTC"
+            )
+            with target_account_scope("bob", bob.account_generation):
+                shares.grant(task.id, "alice", "bob")
+                shares.grant(task.id, "alice", "bob")
+        assert shares.recipients(task.id) == ["bob"]
+        with account_authority_scope("bob", bob.account_generation):
+            assert shares.shared_task_ids("bob") == [task.id]
+        with account_authority_scope("bob", "different-generation"):
+            assert shares.shared_task_ids("bob") == []
+    with workspace_scope(12):
+        assert shares.recipients(task.id) == []
+        assert shares.shared_task_ids("bob") == []
+        shares.delete_for_task(task.id)
+    with workspace_scope(11):
+        with account_authority_scope("alice", alice.account_generation):
+            accounts.delete_user("bob")
+        assert shares.recipients(task.id) == []

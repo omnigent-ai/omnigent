@@ -208,6 +208,10 @@ function AppRoutes({ basename }: AppProps) {
           />
           <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
+            path={`${prefix}/tasks/shared/:sharedTaskId`}
+            element={<TasksPage key="shared" sharedOnly />}
+          />
+          <Route
             path={`${prefix}/tasks/templates`}
             element={<TasksPage key="templates" templatesOnly />}
           />
