@@ -988,12 +988,14 @@ async def test_saved_input_retains_the_slow_starting_runner(
         assert not delivery.done()
         assert env.conv_store.get_conversation(session_id).runner_id == runner_id
         assert launch.await_count == 0
+        [retained_input] = env.conv_store.list_pending_inputs(session_id)
+        assert retained_input.data.startup_options.runner_wait is not None
         retry = await env.client.post(
             f"/v1/sessions/{session_id}/events",
             json={**_INPUT, "data": {**_INPUT["data"], "stable_id": saved.id}},
         )
         assert retry.status_code == 202, retry.text
-        assert len(env.conv_store.list_pending_inputs(session_id)) == 1
+        assert [item.id for item in env.conv_store.list_pending_inputs(session_id)] == [saved.id]
         assert launch.await_count == 0
 
         if outcome.startswith("host_reconnected"):
