@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -686,6 +687,9 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
         ("turn_a", [], "turn_a", True, "turn_a"),
         ("turn_a", [("completed", "turn_a")], "turn_a", False, None),
         ("turn_a", [("completed", "turn_a"), ("started", "turn_b")], "turn_a", False, "turn_b"),
+        (None, [("rewritten", "session_id")], "turn_a", False, None),
+        (None, [("rewritten", "thread_id")], "turn_a", False, None),
+        (None, [("rewritten", "socket_path")], "turn_a", False, None),
     ],
 )
 def test_acknowledged_turn_keeps_turn_changes_recorded_meanwhile(
@@ -699,11 +703,15 @@ def test_acknowledged_turn_keeps_turn_changes_recorded_meanwhile(
     _seed_active_turn(bridge_dir, sent_turn_id)
     sent_state = read_bridge_state(bridge_dir)
     assert sent_state is not None
-    for event, turn_id in forwarder_events:
+    for event, value in forwarder_events:
         if event == "started":
-            update_active_turn_id(bridge_dir, turn_id)
+            update_active_turn_id(bridge_dir, value)
+        elif event == "completed":
+            assert clear_active_turn_id_if_matches(bridge_dir, value)
         else:
-            assert clear_active_turn_id_if_matches(bridge_dir, turn_id)
+            # Launch, resume and rotation write fresh state with the revision reset.
+            fresh_state = replace(sent_state, **{value: f"{getattr(sent_state, value)}-new"})
+            write_bridge_state(bridge_dir, fresh_state)
 
     assert record_acknowledged_turn_id(bridge_dir, sent_state, acknowledged_turn_id) is recorded
     state = read_bridge_state(bridge_dir)

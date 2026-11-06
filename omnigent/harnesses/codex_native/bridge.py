@@ -1726,13 +1726,15 @@ def record_acknowledged_turn_id(
 
     While the request is in flight the forwarder may record a turn starting or
     ending, and Codex can acknowledge ``turn/start`` on a busy thread with a
-    turn id that never starts. The forwarder's newer state wins in each case.
+    turn id that never starts. The forwarder's newer state wins in each case,
+    as does a relaunch, resume or thread rotation, which resets the revision.
 
     :param bridge_dir: Native Codex bridge directory.
     :param sent_state: Bridge state the request was sent against.
     :param turn_id: Turn id from the response, e.g. ``"turn_abc123"``.
     :returns: ``True`` when bridge state names *turn_id*, ``False`` when it
-        was missing or the active turn changed after *sent_state*.
+        was missing or the session, thread, app-server or active turn changed
+        after *sent_state*.
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
@@ -1741,7 +1743,10 @@ def record_acknowledged_turn_id(
         if state.active_turn_id == turn_id:
             return True
         if (
-            state.active_turn_id != sent_state.active_turn_id
+            state.session_id != sent_state.session_id
+            or state.thread_id != sent_state.thread_id
+            or state.socket_path != sent_state.socket_path
+            or state.active_turn_id != sent_state.active_turn_id
             or state.active_turn_revision != sent_state.active_turn_revision
         ):
             return False
