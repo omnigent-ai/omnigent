@@ -25,10 +25,10 @@ import {
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Label } from "@/components/scheduled/Label";
+import { TemplateNameInput } from "@/components/scheduled/TemplateNameInput";
 import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
 import { useScheduledHarnessSettings } from "./useScheduledHarnessSettings";
 import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
@@ -937,7 +937,7 @@ export function CreateScheduledTaskDialog({
         >
           <div className="flex flex-col gap-1.5">
             <Label htmlFor="task-name">Name</Label>
-            <Input
+            <TemplateNameInput
               id="task-name"
               value={name}
               placeholder="Name this automation"
