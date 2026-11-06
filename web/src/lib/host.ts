@@ -118,6 +118,7 @@ export interface OmnigentHostConfig {
   /**
    * Opt into browser admin mode when this page and HTTP, WebSocket, and media
    * requests share an origin and cookie path. Must match the backend's Set-Cookie path.
+   * The host must forward the identity bootstrap header and its Set-Cookie response.
    */
   adminModeCookiePath?: string;
   /**

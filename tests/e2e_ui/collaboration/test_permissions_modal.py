@@ -367,6 +367,10 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
             record_video_size={"width": 1280, "height": 900},
         ) as member,
     ):
+        page.goto(f"{multi_user_server.public_url}/settings")
+        admin_mode = page.get_by_role("switch", name="Admin mode", exact=True)
+        admin_mode.click()
+        expect(admin_mode).to_be_checked(timeout=30_000)
         page.goto(f"{multi_user_server.public_url}/settings/sharing")
         ceiling = page.get_by_role("combobox", name="Maximum public permission")
         expect(ceiling).to_have_text("Read", timeout=30_000)

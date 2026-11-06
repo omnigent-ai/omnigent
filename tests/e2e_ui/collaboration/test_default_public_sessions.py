@@ -75,6 +75,10 @@ def test_admin_default_public_all_makes_new_sessions_public(
 ) -> None:
     server = default_public_server
     with user_page(browser, headers=_ADMIN_HEADERS) as page:
+        page.goto(f"{server.public_url}/settings")
+        admin_mode = page.get_by_role("switch", name="Admin mode", exact=True)
+        admin_mode.click()
+        expect(admin_mode).to_be_checked(timeout=30_000)
         page.goto(f"{server.public_url}/settings/sharing")
         toggle = page.get_by_role("switch", name=_TOGGLE)
         expect(toggle).not_to_be_checked(timeout=60_000)

@@ -1204,8 +1204,11 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
 
     # Warm the raw access cache before the browser enters ordinary-user mode.
     assert (await auth_client.get(session_url, headers=admin_headers)).status_code == 200
-    auth_client.cookies.set(ADMIN_MODE_COOKIE, "off")
-    identity = (await auth_client.get("/v1/me", headers=admin_headers)).json()
+    identity = (
+        await auth_client.get(
+            "/v1/me", headers={**admin_headers, "X-Omnigent-Admin-Mode": "browser"}
+        )
+    ).json()
     cookie_name = identity["admin_mode_cookie_name"]
     assert cookie_name.startswith(f"{ADMIN_MODE_COOKIE}_")
     assert identity == {
@@ -1215,6 +1218,7 @@ async def test_browser_admin_mode_rechecks_access_without_changing_eligibility(
         "admin_mode_enabled": False,
         "admin_mode_cookie_name": cookie_name,
     }
+    assert auth_client.cookies.get(cookie_name) == "off"
     for path in (session_url, f"{session_url}/permissions", "/v1/sharing"):
         response = await auth_client.get(path, headers=admin_headers)
         assert response.status_code in (403, 404), (path, response.text)

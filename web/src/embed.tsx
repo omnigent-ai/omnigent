@@ -26,7 +26,8 @@ import { IdentityAwareSidebarDataProvider } from "./hooks/useSidebarData";
 
 import { QueryClient, QueryClientProvider, useQueryClient } from "@tanstack/react-query";
 import { APP_QUERY_DEFAULTS } from "./lib/queryRetry";
-import { initializeAdminMode, subscribeAdminModeChanges } from "./lib/adminMode";
+import { initializeAdminMode } from "./lib/adminMode";
+import { AdminModeBoundary } from "./components/AdminModeBoundary";
 import { ThemeProvider } from "./components/theme/ThemeProvider";
 import { useResolvedThemeMode } from "./components/theme/useResolvedThemeMode";
 import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
@@ -233,17 +234,21 @@ function OmnigentProviders({
           <ImageLightboxProvider>
             <RoutingProvider value={routing}>
               <EmbedCapabilitiesProvider>
-                <IdentityAwareSidebarDataProvider
-                  config={{ ...appConfig.sidebar, ...sidebarOverrides }}
-                >
-                  <SessionUpdatesProvider>
-                    <RunnerHealthProvider>
-                      <QueueFlushProvider>
-                        <App basename={basename} />
-                      </QueueFlushProvider>
-                    </RunnerHealthProvider>
-                  </SessionUpdatesProvider>
-                </IdentityAwareSidebarDataProvider>
+                <AdminModeBoundary>
+                  <ExtensionProvider>
+                    <IdentityAwareSidebarDataProvider
+                      config={{ ...appConfig.sidebar, ...sidebarOverrides }}
+                    >
+                      <SessionUpdatesProvider>
+                        <RunnerHealthProvider>
+                          <QueueFlushProvider>
+                            <App basename={basename} />
+                          </QueueFlushProvider>
+                        </RunnerHealthProvider>
+                      </SessionUpdatesProvider>
+                    </IdentityAwareSidebarDataProvider>
+                  </ExtensionProvider>
+                </AdminModeBoundary>
               </EmbedCapabilitiesProvider>
             </RoutingProvider>
           </ImageLightboxProvider>
@@ -282,7 +287,6 @@ export function OmnigentApp({
     initializeAdminMode();
     return null;
   });
-  useEffect(subscribeAdminModeChanges, []);
 
   const routingApi = useMemo<RoutingApi>(() => {
     // Host overrides compose UNDER the basename wrapper: merge the host's
@@ -300,17 +304,15 @@ export function OmnigentApp({
   // reads it back via `useQueryClient()` under this provider.
   return (
     <QueryClientProvider client={queryClient}>
-      <ExtensionProvider>
-        <EmbeddedProvider isDarkMode={isDarkMode}>
-          <ThemeProvider embedded>
-            <OmnigentProviders
-              routing={routingApi}
-              basename={basename}
-              sidebarConfig={sidebarConfig}
-            />
-          </ThemeProvider>
-        </EmbeddedProvider>
-      </ExtensionProvider>
+      <EmbeddedProvider isDarkMode={isDarkMode}>
+        <ThemeProvider embedded>
+          <OmnigentProviders
+            routing={routingApi}
+            basename={basename}
+            sidebarConfig={sidebarConfig}
+          />
+        </ThemeProvider>
+      </EmbeddedProvider>
     </QueryClientProvider>
   );
 }

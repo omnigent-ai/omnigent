@@ -277,7 +277,7 @@ describe("newChatPickerCache", () => {
 
   it.each([
     { preference: "agent", change: () => writeLastAgentId("another-agent") },
-    { preference: "admin mode", change: () => vi.mocked(getAdminMode).mockReturnValue(true) },
+    { preference: "admin mode", change: () => vi.mocked(getAdminMode).mockReturnValue(false) },
     { preference: "harness", change: () => writeLastHarness("a1", "auto-native") },
     { preference: "host", change: () => writeLastHostChoice("another-host") },
     { preference: "provider", change: () => writeLastSandboxProvider("modal") },
@@ -285,7 +285,8 @@ describe("newChatPickerCache", () => {
     { preference: "effort", change: () => writeHarnessOption("claude-native", { effort: "low" }) },
     { preference: "mode", change: () => writeHarnessOption("claude-native", { mode: "plan" }) },
     { preference: "routing", change: () => writeHarnessOption("claude-native", { routing: "on" }) },
-  ])("invalidates a preview after the saved $preference changes", ({ change }) => {
+  ])("invalidates a preview after the saved $preference changes", ({ preference, change }) => {
+    if (preference === "admin mode") vi.mocked(getAdminMode).mockReturnValue(true);
     writeNewChatPickerCache(key, preview);
     change();
     expect(readNewChatPickerCache(key)).toBeNull();
