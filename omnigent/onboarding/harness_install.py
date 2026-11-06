@@ -35,6 +35,7 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -711,9 +712,10 @@ def configured_native_claude_launcher(harness: str) -> harness_startup.HarnessSt
     :param harness: A harness id, e.g. ``"claude-native"``.
     :returns: The launch description when *harness* is native Claude and the
         config runs another command, e.g. one whose ``command`` is ``"isaac"``;
+        a missing outer ``env`` wrapper is reported as the unresolved command.
         ``None`` for other harnesses, the default ``claude``, an
-        ``OMNIGENT_CLAUDE_PATH`` override, a configured ``claude`` path, or an
-        unreadable config.
+        ``OMNIGENT_CLAUDE_PATH`` override, a configured ``claude`` path, an
+        ``env`` wrapper that can't be unwrapped, or an unreadable config.
     """
     if harness not in _NATIVE_CLAUDE_HARNESSES:
         return None
@@ -724,8 +726,12 @@ def configured_native_claude_launcher(harness: str) -> harness_startup.HarnessSt
         startup = harness_startup.describe_harness_startup("claude-native")
     except (OSError, ValueError, yaml.YAMLError):
         return None
-    if startup.command_source != "config" or Path(startup.command).name == "claude":
+    # An ``env`` left here is a wrapper (``-C``, ``-S``, nested) that may still run Claude Code.
+    if startup.command_source != "config" or Path(startup.command).name in {"claude", "env"}:
         return None
+    wrapper = startup.configured_command
+    if wrapper is not None and wrapper != startup.command and resolve_cli_binary(wrapper) is None:
+        return startup.model_copy(update={"command": wrapper, "resolved_path": None})
     return startup
 
 
@@ -752,7 +758,17 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
         return None
     launcher = configured_native_claude_launcher(harness)
     if launcher is not None:
-        return None if launcher.resolved_path is not None else spec
+        if launcher.resolved_path is not None:
+            return None
+        return dataclasses.replace(
+            spec,
+            binary=launcher.command,
+            package=None,
+            install_hint=f"the installer for `{launcher.command}`, which "
+            "harness.claude-native.command runs",
+            min_version=None,
+            max_version_exclusive=None,
+        )
     install_key = _all_harness_name_to_key().get(harness)
     if install_key is not None and harness_cli_installed(install_key):
         return None

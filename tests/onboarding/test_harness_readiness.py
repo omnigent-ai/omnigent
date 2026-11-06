@@ -486,31 +486,82 @@ def _claude_launch_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tu
     return bin_dir, config
 
 
+_ISAAC_LAUNCH = {"command": "isaac", "args": ["--"]}
+_ENV_WRAPPED_ISAAC = {"command": "env", "args": ["ISAAC_LAUNCH_MODE=omni", "isaac", "--"]}
+
+
 @pytest.mark.parametrize(
-    ("entry", "executables", "claude_path", "ready"),
+    ("entry", "executables", "claude_path", "picker_state", "missing_command"),
     [
-        pytest.param({"command": "isaac", "args": ["--"]}, ["isaac"], None, True, id="launcher"),
+        pytest.param(_ISAAC_LAUNCH, {"isaac": None}, None, True, None, id="launcher"),
         pytest.param(
-            {"command": "env", "args": ["ISAAC_LAUNCH_MODE=omni", "isaac", "--"]},
-            ["isaac"],
+            _ENV_WRAPPED_ISAAC,
+            {"env": None, "isaac": None},
             None,
             True,
+            None,
             id="env-wrapped-launcher",
         ),
-        pytest.param({"command": "isaac", "args": ["--"]}, [], None, False, id="launcher-missing"),
+        pytest.param(
+            _ISAAC_LAUNCH, {}, None, HARNESS_BINARY_MISSING, "isaac", id="launcher-missing"
+        ),
+        pytest.param(
+            {"command": "/missing-directory/env", "args": ["isaac"]},
+            {"isaac": None},
+            None,
+            HARNESS_BINARY_MISSING,
+            "/missing-directory/env",
+            id="launcher-wrapper-path-missing",
+        ),
         pytest.param(
             {"command": "env", "args": ["CLAUDE_CONFIG_DIR=/srv/claude", "claude"]},
-            [],
+            {"env": None},
             None,
-            False,
+            HARNESS_BINARY_MISSING,
+            "claude",
             id="env-wrapped-claude",
         ),
-        pytest.param(None, ["isaac"], None, False, id="no-override"),
         pytest.param(
-            {"command": "isaac", "args": ["--"]},
-            ["isaac"],
+            {"command": "env", "args": ["-C", "/tmp", "claude"]},
+            {"env": None},
+            None,
+            HARNESS_BINARY_MISSING,
+            "claude",
+            id="chdir-wrapped-claude",
+        ),
+        pytest.param(
+            {"command": "env", "args": ["-S", "CLAUDE_CONFIG_DIR=/srv/claude claude"]},
+            {"env": None},
+            None,
+            HARNESS_BINARY_MISSING,
+            "claude",
+            id="split-string-wrapped-claude",
+        ),
+        pytest.param(
+            {"command": "env", "args": ["env", "claude"]},
+            {"env": None},
+            None,
+            HARNESS_BINARY_MISSING,
+            "claude",
+            id="nested-env-wrapped-claude",
+        ),
+        pytest.param(
+            {"command": "env", "args": ["-C", "/tmp", "claude"]},
+            {"env": None, "claude": "1.0.0 (Claude Code)"},
+            None,
+            HARNESS_VERSION_TOO_LOW,
+            "claude",
+            id="chdir-wrapped-outdated-claude",
+        ),
+        pytest.param(
+            None, {"isaac": None}, None, HARNESS_BINARY_MISSING, "claude", id="no-override"
+        ),
+        pytest.param(
+            _ISAAC_LAUNCH,
+            {"isaac": None},
             "/missing/claude",
-            False,
+            HARNESS_BINARY_MISSING,
+            "claude",
             id="claude-path-wins",
         ),
     ],
@@ -519,39 +570,42 @@ def test_native_claude_gate_checks_the_configured_launch_command(
     _claude_launch_config: tuple[Path, dict],
     monkeypatch: pytest.MonkeyPatch,
     entry: dict | None,
-    executables: list[str],
+    executables: dict[str, str | None],
     claude_path: str | None,
-    ready: bool,
+    picker_state: bool | str,
+    missing_command: str | None,
 ) -> None:
     """A configured launcher, not ``claude``, gates a native Claude launch.
 
     Isaac's managed config launches native Claude through its own launcher,
     which installs the Claude Code it runs, so a host without ``claude`` on
-    PATH can still start the session. Any launch that runs Claude itself (the
-    default, an ``env`` wrapper around ``claude``, ``OMNIGENT_CLAUDE_PATH``)
-    still needs ``claude``, which is absent here.
+    PATH can still start the session. Any launch that may run Claude itself
+    (the default, an ``env`` wrapper around ``claude``, an ``env`` wrapper that
+    can't be unwrapped, ``OMNIGENT_CLAUDE_PATH``) still needs a supported
+    ``claude``, which is absent or outdated here.
     """
     bin_dir, config = _claude_launch_config
-    for name in executables:
-        _write_fake_executable(bin_dir, name, None)
+    for name, output in executables.items():
+        _write_fake_executable(bin_dir, name, output)
     if entry is not None:
         config["harness"]["claude-native"] = entry
     if claude_path is not None:
         monkeypatch.setenv("OMNIGENT_CLAUDE_PATH", claude_path)
 
     for harness in ("claude-native", "native-claude"):
-        assert harness_is_configured(harness) is ready
+        assert harness_is_configured(harness) is (picker_state is True)
     # Launch frames and sub-agent dispatch name the canonical spelling.
-    assert (hi.missing_harness_cli("claude-native") is None) is ready
+    missing_cli = hi.missing_harness_cli("claude-native")
+    assert (missing_cli.binary if missing_cli is not None else None) == missing_command
     picker = configured_harness_map()
-    assert picker["claude-native"] == (True if ready else HARNESS_BINARY_MISSING)
+    assert picker["claude-native"] == picker_state
     # The SDK harness never runs through the native launcher.
     assert hi.configured_native_claude_launcher("claude-sdk") is None
     hint = hi.harness_setup_hint("claude-native")
-    names_launcher = (
-        entry is not None and claude_path is None and not ready and "isaac" in str(entry)
-    )
-    assert ("`isaac`, the command harness.claude-native.command runs" in hint) is names_launcher
+    names_launcher = missing_command not in (None, "claude")
+    assert (
+        f"`{missing_command}`, the command harness.claude-native.command runs" in hint
+    ) is names_launcher
 
 
 def test_configured_harness_map_covers_all_spellings(
