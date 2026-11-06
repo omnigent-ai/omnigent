@@ -168,10 +168,12 @@ describe("resolveRunnerHost", () => {
     expect(resolveRunnerHost("local", "laptop", hosts)).toEqual({
       hostId: "laptop",
       ambiguous: false,
+      waiting: false,
     });
     expect(resolveRunnerHost("remote", "laptop", hosts)).toEqual({
       hostId: "box",
       ambiguous: false,
+      waiting: false,
     });
   });
 
@@ -179,10 +181,20 @@ describe("resolveRunnerHost", () => {
     expect(resolveRunnerHost("remote", null, [host("a"), host("b")])).toEqual({
       hostId: null,
       ambiguous: true,
+      waiting: false,
     });
+  });
+
+  it("waits while no candidate is online", () => {
     expect(resolveRunnerHost("remote", "laptop", [host("laptop")])).toEqual({
       hostId: null,
       ambiguous: false,
+      waiting: true,
+    });
+    expect(resolveRunnerHost("local", "laptop", [host("laptop", "offline")])).toEqual({
+      hostId: null,
+      ambiguous: false,
+      waiting: true,
     });
   });
 });
