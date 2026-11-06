@@ -88,6 +88,9 @@ class _ProcessLogStreamHandler(logging.StreamHandler[TextIO]):
     _omnigent_process_log_stderr: bool
 
 
+_PROCESS_LOG_MAX_BYTES = 32 * 1024 * 1024
+
+
 class _ProcessLogFileHandler(logging.FileHandler):
     _omnigent_process_log_path: str
 
@@ -97,6 +100,24 @@ class _ProcessLogFileHandler(logging.FileHandler):
             _lock_process_log_writer(Path(self.baseFilename), stream)
             cleanup.pop_all()
             return stream
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # Keep the inode: child stdout/stderr still append through inherited fds.
+        # The next record bounds raw output too, while retaining the full new record.
+        try:
+            if (
+                IS_POSIX
+                and self.stream is not None
+                and os.fstat(self.stream.fileno()).st_size >= _PROCESS_LOG_MAX_BYTES
+            ):
+                self.stream.seek(0)
+                self.stream.truncate()
+                self.stream.write(
+                    "[omnigent] Older process log entries discarded at the size limit.\n"
+                )
+        except OSError:
+            pass  # Logging's normal error handling still applies to the current record.
+        super().emit(record)
 
 
 def process_log_lease_marker(path: Path) -> Path:
