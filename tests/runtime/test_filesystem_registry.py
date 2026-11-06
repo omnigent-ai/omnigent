@@ -16,19 +16,23 @@ import logging
 import os
 import subprocess
 import threading
+import weakref
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 
+from omnigent.runtime import filesystem_registry
 from omnigent.runtime.filesystem_registry import (
     _CURSOR_PLUMBING_PATHS,
     AgentEditFilesystemRegistry,
     GitFilesystemRegistry,
     GitStatusUnavailable,
     MultiRepositoryFilesystemRegistry,
+    _FileEvent,
     _git_timeout_seconds,
     _normalize_path,
     _parse_git_porcelain_line,
@@ -172,22 +176,34 @@ def test_ephemeral_files_are_suppressed(registry: AgentEditFilesystemRegistry) -
 
 def test_created_modified_multiple_times_stays_added(
     registry: AgentEditFilesystemRegistry,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Multiple edits after creation must not degrade the ``"created"`` status."""
+    """Repeated edits retain the creation status and release historical metadata."""
+    events: list[weakref.ReferenceType[_FileEvent]] = []
+
+    def track_event(**fields: Any) -> _FileEvent:
+        event = _FileEvent(**fields)
+        events.append(weakref.ref(event))
+        return event
+
+    monkeypatch.setattr(filesystem_registry, "_FileEvent", track_event)
     conv_id = "conv_test_multi_edit"
     _inject(registry, "notes.md", "created", conv_id)
-    _inject(registry, "notes.md", "modified", conv_id)
-    _inject(registry, "notes.md", "modified", conv_id)
-    _inject(registry, "notes.md", "modified", conv_id)
+    for _ in range(100):
+        _inject(registry, "notes.md", "modified", conv_id)
 
     results = registry.list_changed_files(conv_id, limit=10)
 
     assert len(results) == 1
-    # Three subsequent edits must not degrade the status from "created" to "modified".
+    # Repeated edits must preserve the original creation status.
     assert results[0]["status"] == "created", (
         f"Expected status 'created' after multiple edits to a newly created file, "
         f"got '{results[0]['status']}'."
     )
+    assert sum(event() is not None for event in events) == 1
+    assert registry.get_changed_file(conv_id, "notes.md") == results[0]
+    registry.unregister_conversation(conv_id)
+    assert all(event() is None for event in events)
 
 
 def test_modified_then_deleted_shows_deleted(registry: AgentEditFilesystemRegistry) -> None:
