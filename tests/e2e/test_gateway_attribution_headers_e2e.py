@@ -342,4 +342,4 @@ def test_gateway_headers_reach_real_cli_requests(
     for headers in prompt_requests:
         assert headers[_AGENT_HEADER] == ["claude-code" if coding_cli == "claude" else coding_cli]
         surface = "mobile" if client_surface in ("ios", "android") else client_surface
-        assert headers[_SURFACES_HEADER] == [f"omnigent, omnigent-{surface}, ug"]
+        assert headers[_SURFACES_HEADER] == [f"omnigent-{surface}, ug"]
