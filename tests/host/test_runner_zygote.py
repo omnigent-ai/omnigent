@@ -9,6 +9,7 @@ daemon's Popen fallback are all covered.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import importlib.util
 import json
@@ -22,10 +23,14 @@ import time
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import Mock
 
+import psutil
 import pytest
 
 import omnigent
+from omnigent.host.connect import HostProcess
+from omnigent.host.identity import HostIdentity
 from omnigent.host.runner_zygote import (
     _ZYGOTE_LOST_EXIT_CODE,
     ZygoteManager,
@@ -540,6 +545,120 @@ def test_signal_of_exited_runner_is_a_safe_noop(manager: ZygoteManager, tmp_path
     proc.kill()
 
 
+def test_stop_forked_runner_does_not_wait_for_control_lock(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    """Stopping a runner must not join another forkserver control exchange."""
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    try:
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            with manager._lock:
+                stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+                stopped.result(timeout=2)
+                assert not _proc.process_alive(proc.pid)
+                assert proc.returncode is None
+        assert _wait_exit(proc) == -signal.SIGTERM
+    finally:
+        proc.kill()
+        _wait_exit(proc)
+
+
+@pytest.mark.parametrize("ignore_term", [False, True])
+def test_stop_forked_runner_waits_for_exit_without_consuming_its_status(ignore_term: bool) -> None:
+    """The OS wait must handle zombies and escalate a runner ignoring TERM."""
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import signal, sys; "
+            + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+            + "print('ready', flush=True); sys.stdin.buffer.read()",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline() == b"ready\n"
+        proc = ZygoteRunnerProc(child.pid, ZygoteManager())
+        with ThreadPoolExecutor(max_workers=1) as workers:
+            stopped = workers.submit(HostProcess._stop_runner_proc, proc)
+            stopped.result(timeout=8)
+        assert not _proc.process_alive(child.pid)
+        assert proc.returncode is None
+        assert child.wait(timeout=1) == -(signal.SIGKILL if ignore_term else signal.SIGTERM)
+    finally:
+        child.kill()
+        child.wait(timeout=5)
+        if child.stdin is not None:
+            child.stdin.close()
+        if child.stdout is not None:
+            child.stdout.close()
+
+
+def test_stop_forked_runner_preserves_cached_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    proc = ZygoteRunnerProc(os.getpid(), ZygoteManager())
+    proc.returncode = 7
+    monkeypatch.setattr("psutil.Process.terminate", lambda _self: pytest.fail("already exited"))
+
+    HostProcess._stop_runner_proc(proc)
+
+    assert proc.returncode == 7
+
+
+@pytest.mark.parametrize("already_gone", [False, True], ids=["reused", "gone-before-handle"])
+def test_stop_forked_runner_does_not_signal_a_missing_identity(
+    monkeypatch: pytest.MonkeyPatch, already_gone: bool
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = False
+    process_factory = Mock(return_value=original_process)
+    if already_gone:
+        process_factory.side_effect = psutil.NoSuchProcess(123)
+    monkeypatch.setattr("psutil.Process", process_factory)
+    proc = ZygoteRunnerProc(123, ZygoteManager())
+    process_factory.side_effect = AssertionError("must not recapture a recycled PID")
+
+    HostProcess._stop_runner_proc(proc)
+
+    original_process.terminate.assert_not_called()
+    original_process.kill.assert_not_called()
+    assert proc.returncode is None
+
+
+def test_stop_forked_runner_reports_a_signal_permission_failure(
+    monkeypatch: pytest.MonkeyPatch, managed_child
+) -> None:
+    manager, child = managed_child
+    proc = ZygoteRunnerProc(child.pid, manager)
+    monkeypatch.setattr(
+        "psutil.Process.terminate", Mock(side_effect=psutil.AccessDenied(proc.pid))
+    )
+
+    with pytest.raises(psutil.AccessDenied):
+        HostProcess._stop_runner_proc(proc)
+
+
+@pytest.mark.asyncio
+async def test_abandoned_forked_spawn_consumes_its_exit_status(
+    manager: ZygoteManager, tmp_path: Path
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "runner.log"), str(tmp_path))
+    host = HostProcess(
+        identity=HostIdentity(host_id="host-abandoned", name="test"),
+        server_url="http://localhost:8000",
+    )
+    spawn = asyncio.get_running_loop().create_future()
+    spawn.set_result((proc, tmp_path / "runner.log"))
+    try:
+        await host._stop_abandoned_spawn(spawn)
+        assert proc.returncode == -signal.SIGTERM
+        assert not _proc.process_alive(proc.pid)
+        assert manager.poll(proc.pid) is None
+    finally:
+        proc.kill()
+
+
 def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp_path) -> None:
     """A still-live runner polls as None once the zygote is stopped.
 
@@ -592,6 +711,73 @@ def test_cached_runner_exit_survives_zygote_restart(manager: ZygoteManager, tmp_
     manager.stop()
     manager.start()
     assert proc.poll() == 3
+
+
+@pytest.mark.parametrize("actual_exit", [0, 7, -signal.SIGTERM])
+def test_concurrent_poll_preserves_known_exit(
+    monkeypatch: pytest.MonkeyPatch, actual_exit: int
+) -> None:
+    """A late unavailable-control fallback cannot replace a real exit reply."""
+    monkeypatch.setattr(psutil, "Process", Mock(return_value=Mock()))
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    actual_reply_ready = threading.Event()
+    release_actual_reply = threading.Event()
+    second_poll_ready = threading.Event()
+    release_fallback = threading.Event()
+    poll_lock = getattr(proc, "_poll_lock", threading.Lock())
+    exchanges: list[str] = []
+
+    class ObservePollLock:
+        def __enter__(self):
+            if not poll_lock.acquire(blocking=False):
+                second_poll_ready.set()
+                poll_lock.acquire()
+
+        def __exit__(self, *_exc):
+            poll_lock.release()
+
+    class PausedExitReply(dict):
+        def get(self, key, default=None):
+            # The manager's exchange lock has already been released here.
+            actual_reply_ready.set()
+            assert release_actual_reply.wait(timeout=5)
+            return super().get(key, default)
+
+    def exchange(request, *, zygote_generation=None):
+        with manager._lock:
+            exchanges.append(request["cmd"])
+            if len(exchanges) == 1:
+                return PausedExitReply(returncode=actual_exit)
+            raise ZygoteUnavailable("control lost after the real exit reply")
+
+    def runner_alive(pid):
+        assert pid == 123
+        second_poll_ready.set()
+        assert release_fallback.wait(timeout=5)
+        return False
+
+    # The lock observation and fallback provide the same barrier on old/new code.
+    monkeypatch.setattr(proc, "_poll_lock", ObservePollLock(), raising=False)
+    monkeypatch.setattr(manager, "_exchange", exchange)
+    monkeypatch.setattr(_proc, "process_alive", runner_alive)
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        try:
+            first = workers.submit(proc.poll)
+            assert actual_reply_ready.wait(timeout=5)
+            second = workers.submit(proc.poll)
+            assert second_poll_ready.wait(timeout=5)
+            release_actual_reply.set()
+            assert first.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            release_fallback.set()
+
+            assert second.result(timeout=5) == actual_exit
+            assert proc.returncode == actual_exit
+            assert exchanges == ["poll"]
+        finally:
+            release_actual_reply.set()
+            release_fallback.set()
 
 
 def test_fork_after_stop_raises_unavailable(manager: ZygoteManager, tmp_path) -> None:
@@ -740,6 +926,23 @@ def test_forked_runner_runs_in_the_requested_workspace(manager: ZygoteManager, t
     assert f"cwd={workspace.resolve()}\n" in log.read_text()
 
 
+def test_runner_setup_failure_lands_in_the_runner_log(manager: ZygoteManager, tmp_path) -> None:
+    """A child that fails before the runner starts writes the cause to its own log.
+
+    The host's exit report reads only the runner log, so a setup failure such
+    as a vanished workspace must not leave that log empty.
+
+    :param manager: The started manager fixture.
+    :param tmp_path: Temp dir for the child's log.
+    """
+    log = tmp_path / "runner.log"
+
+    proc = manager.fork_runner(_fork_env(0), str(log), str(tmp_path / "gone"))
+
+    assert _wait_exit(proc) == 1
+    assert "FileNotFoundError" in log.read_text()
+
+
 def test_stale_payload_tty_fd_is_cleared_in_child(manager: ZygoteManager, tmp_path) -> None:
     """A daemon-side OMNIGENT_LOG_TTY_FD in the payload never leaks as-is.
 
@@ -791,6 +994,29 @@ def test_malloc_tuning_is_applied_at_the_zygote_exec(monkeypatch, tmp_path) -> N
 
     assert captured["MALLOC_ARENA_MAX"] == "2"
     assert captured["MALLOC_TRIM_THRESHOLD_"] == "134217728"
+
+
+def test_zygote_exec_starts_its_own_session(monkeypatch, tmp_path) -> None:
+    """The zygote, and so every runner and harness it forks, leaves the daemon's session.
+
+    A hangup of the daemon's terminal would otherwise reach them mid-turn.
+
+    :param monkeypatch: Fixture used to stub the zygote's Popen.
+    :param tmp_path: Temp dir for the zygote log path.
+    """
+    captured: dict[str, object] = {}
+
+    class _FakePopen:
+        pid = 4321
+
+        def __init__(self, argv, env, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    mgr = ZygoteManager(log_path=tmp_path / "zygote.log")
+    mgr._spawn_zygote_process(child_fd=7)
+
+    assert captured["start_new_session"] is True
 
 
 def test_operator_malloc_override_wins_at_the_zygote_exec(monkeypatch, tmp_path) -> None:
