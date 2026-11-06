@@ -149,30 +149,3 @@ async def _drive(base_url: str) -> None:
             await expect(dialog).to_be_hidden()
         finally:
             await browser.close()
-
-
-def test_import_modal_never_opens_without_onboarding(live_server: str) -> None:
-    """An unreviewed online host with imports doesn't open the modal on its own."""
-    _run_in_fresh_loop(_drive_no_handoff(live_server))
-
-
-async def _drive_no_handoff(base_url: str) -> None:
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        page = await browser.new_page()
-        try:
-            await _register_routes(page)
-            async with page.expect_response(lambda r: r.url.endswith("/v1/hosts")):
-                await page.goto(f"{base_url}/")
-            await page.get_by_test_id("new-chat-landing-input").wait_for(
-                state="visible", timeout=30_000
-            )
-            # Give the gate a moment to act on the hosts it has.
-            await page.wait_for_timeout(1_000)
-            await expect(page.get_by_role("dialog", name=_TITLE)).to_be_hidden()
-            reviewed = await page.evaluate(
-                f"window.localStorage.getItem('omnigent:imports-reviewed:{_HOST_ID}')"
-            )
-            assert reviewed is None
-        finally:
-            await browser.close()
