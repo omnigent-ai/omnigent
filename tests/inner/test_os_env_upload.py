@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec
+from omnigent.inner.datamodel import GitSshBinding, OSEnvSandboxSpec, OSEnvSpec, TcpEgressRoute
 from omnigent.inner.os_env import (
     CallerProcessOSEnvironment,
     build_helper_env,
@@ -453,12 +453,14 @@ def test_upload_helper_has_no_network_or_credentials(tmp_path: Path, sandbox_typ
                 type=sandbox_type,
                 write_paths=["."],
                 git_ssh=[binding],
+                tcp_egress=[TcpEgressRoute("db", "db.example.test", 5432)],
             ),
         ),
         additional_read_roots=[Path(__file__).resolve().parents[2]],
     )
     assert isinstance(env, CallerProcessOSEnvironment)
     assert env.sandbox.git_ssh
+    assert env.sandbox.tcp_egress
     helper = UploadHelperClient(env)
     try:
         assert helper.sandbox.allow_network is False
@@ -466,8 +468,11 @@ def test_upload_helper_has_no_network_or_credentials(tmp_path: Path, sandbox_typ
         assert helper.sandbox.credential_proxy is None
         assert helper.sandbox.git_ssh is None
         assert helper.sandbox.git_ssh_socket_path is None
+        assert helper.sandbox.tcp_egress is None
+        assert helper.sandbox.tcp_egress_socket_path is None
         assert helper.call({"op": "probe"})["raw_upload"] is True
         assert helper._git_ssh_broker is None
+        assert helper._tcp_egress_broker is None
     finally:
         helper.close()
         env.close()
