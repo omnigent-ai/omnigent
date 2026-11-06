@@ -13,6 +13,7 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.stores.scheduled_task_store.dispatch import ManualRunRejectedError
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -1572,15 +1573,17 @@ def test_run_now_requests_wait_as_pending_runs_until_claimed(
     task = _due_task(store)
     paused = store.update(task.id, state="paused")
     now = task.created_at + 10
-    first, second = (
-        store.request_manual_run(paused, now=now, trigger_key=key, host_id=paused.host_id)
-        for key in ("manual:first", "manual:second")
+    first = store.request_manual_run(
+        paused, now=now, trigger_key="manual:first", host_id=paused.host_id
     )
     assert (first.status, first.fired_at, first.lease_expires_at) == ("scheduled", None, None)
     assert (first.trigger_key, first.host_id) == ("manual:first", paused.host_id)
-    page = store.list_pending_runs(limit=1)
-    rest = store.list_pending_runs(after=(page[0].workspace_id, page[0].id))
-    assert sorted(run.id for run in [*page, *rest]) == sorted([first.id, second.id])
+    # A repeat request waits behind the first, so repeated clicks cannot queue runs.
+    with pytest.raises(ManualRunRejectedError, match="already waiting"):
+        store.request_manual_run(
+            paused, now=now, trigger_key="manual:second", host_id=paused.host_id
+        )
+    assert [run.id for run in store.list_pending_runs()] == [first.id]
 
     # Run now is a manual override, so a paused task still starts.
     claimed_task, claimed = store.claim_pending_run(first, now=now + 5, lease_seconds=120)
@@ -1591,8 +1594,42 @@ def test_run_now_requests_wait_as_pending_runs_until_claimed(
         now + 125,
     )
     assert store.claim_pending_run(first, now=now + 6, lease_seconds=120) is None
-    assert [run.id for run in store.list_pending_runs()] == [second.id]
+    assert store.list_pending_runs() == []
     assert store.list_expired_starting_runs(now + 125) == [claimed]
+
+    # Once the first request has been claimed, the next one is accepted.
+    second = store.request_manual_run(
+        paused, now=now + 7, trigger_key="manual:second", host_id=paused.host_id
+    )
+    assert [run.id for run in store.list_pending_runs()] == [second.id]
+
+
+def test_run_now_cooldown_rejects_requests_until_it_elapses(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.created_at + 10
+    first = store.request_manual_run(
+        task, now=now, trigger_key="manual:first", host_id=task.host_id, cooldown_seconds=60
+    )
+    store.claim_pending_run(first, now=now + 1, lease_seconds=120)
+    with pytest.raises(ManualRunRejectedError, match="within the last 60 seconds"):
+        store.request_manual_run(
+            task,
+            now=now + 59,
+            trigger_key="manual:second",
+            host_id=task.host_id,
+            cooldown_seconds=60,
+        )
+    accepted = store.request_manual_run(
+        task,
+        now=now + 60,
+        trigger_key="manual:third",
+        host_id=task.host_id,
+        cooldown_seconds=60,
+    )
+    assert accepted is not None
+    assert [run.id for run in store.list_pending_runs()] == [accepted.id]
 
 
 def test_run_now_requests_for_a_deleted_task_never_start(

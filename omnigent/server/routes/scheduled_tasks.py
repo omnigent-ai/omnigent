@@ -52,6 +52,7 @@ from omnigent.server.routes._sessions.helpers import (
 )
 from omnigent.server.routes._sessions.orchestration import _list_status_with_starting
 from omnigent.server.routes.runner_tunnel import _expected_runner_id_from_headers
+from omnigent.server.scheduled.config import DEFAULT_SCHEDULED_TASK_LIMITS, ScheduledTaskLimits
 from omnigent.server.scheduled.harness_settings import (
     validate_scheduled_permission_mode,
     validate_scheduled_permission_support,
@@ -64,6 +65,7 @@ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import AutomationFailure, ScheduledTaskStore
+from omnigent.stores.scheduled_task_store.dispatch import ManualRunRejectedError
 
 _logger = logging.getLogger(__name__)
 
@@ -397,6 +399,7 @@ def create_scheduled_tasks_router(
     project_store: ProjectStore | None = None,
     automations: DeploymentGate = True,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
+    limits: ScheduledTaskLimits = DEFAULT_SCHEDULED_TASK_LIMITS,
 ) -> APIRouter:
     """Build the scheduled-tasks router.
 
@@ -408,6 +411,7 @@ def create_scheduled_tasks_router(
         ``None`` rejects tasks that set a project.
     :param automations: Per-request gate; every route returns 404 while it is off.
     :param liveness_lookup: Shared bulk session liveness; masks stale approval counts.
+    :param limits: Per-owner caps. The owner cap applies only to authenticated owners.
     :param auth_provider: Auth provider used to identify the requesting user.
         ``None`` disables auth (owner resolves to ``"local"``).
     :returns: A configured :class:`APIRouter`.
@@ -416,6 +420,27 @@ def create_scheduled_tasks_router(
     def require_automations() -> None:
         if not deployment_gate_enabled(automations, "automations"):
             raise HTTPException(status_code=404, detail="not found")
+
+    def require_active_task_capacity(owner_id: str | None, *, exclude_task_id: str | None) -> None:
+        """Reject a create or resume beyond the owner's active-task limit.
+
+        The count and the write are separate requests, so concurrent creates can
+        overshoot the limit by the number of requests in flight.
+        """
+        if owner_id is None:
+            return
+        active = sum(
+            1
+            for task in store.list(owner_user_id=owner_id)
+            if task.state == "active" and task.id != exclude_task_id
+        )
+        if active >= limits.max_active_tasks_per_owner:
+            raise OmnigentError(
+                f"This account already has {limits.max_active_tasks_per_owner} active "
+                "automations, the maximum. Pause or delete one before creating or "
+                "resuming another.",
+                code=ErrorCode.QUOTA_EXCEEDED,
+            )
 
     router = APIRouter(dependencies=[Depends(require_automations)])
 
@@ -605,6 +630,9 @@ def create_scheduled_tasks_router(
             auth_provider=auth_provider,
             conversation_store=conversation_store,
             permission_store=permission_store,
+        )
+        require_active_task_capacity(
+            None if owner == RESERVED_USER_LOCAL else owner, exclude_task_id=None
         )
         await _validate_rrule_or_400(body.rrule, body.session_mode, body.execution_target)
         _validate_timezone_or_400(body.timezone)
@@ -911,7 +939,15 @@ def create_scheduled_tasks_router(
                     "scheduled task scheduler is not running",
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
-            run = await scheduler.run_now(task)
+            try:
+                run = await scheduler.run_now(task)
+            except ManualRunRejectedError as exc:
+                code = (
+                    ErrorCode.CONFLICT
+                    if exc.reason == "already_pending"
+                    else ErrorCode.RATE_LIMITED
+                )
+                raise OmnigentError(str(exc), code=code) from exc
             if run is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
             return {"triggered": True, "id": task.id, "run_id": run.id}
@@ -959,6 +995,8 @@ def create_scheduled_tasks_router(
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
+        if body.state == "active" and existing.state != "active":
+            require_active_task_capacity(owner_id, exclude_task_id=existing.id)
         if fields.get("session_mode") is None:
             fields.pop("session_mode", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
