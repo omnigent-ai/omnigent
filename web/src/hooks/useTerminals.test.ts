@@ -29,6 +29,7 @@ import {
   clearDirectAttachCaches,
   directProbeUrl,
   isTerminalLaunching,
+  terminalLaunchMode,
   terminalResourceId,
   terminalsQueryKey,
   resolveInitialAttachUrl,
@@ -452,6 +453,7 @@ describe("useCreateTerminal launch", () => {
     await vi.waitFor(() => expect(requestBody).not.toBe(""));
     expect(JSON.parse(requestBody).session_key).toBe(opened.session);
     expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+    expect(terminalLaunchMode(opened.id)).toBe("attach");
     expect(isTerminalLaunching(opened.id)).toBe(true);
 
     await act(async () => respond(createdResponse(requestBody)));
@@ -483,21 +485,33 @@ describe("useCreateTerminal launch", () => {
     expect(isTerminalLaunching(opened.id)).toBe(false);
   });
 
-  it("waits for the create when runner liveness is unknown (the create may wake it)", async () => {
+  it("opens at once but holds the attach when runner liveness is unknown", async () => {
     runnerOnlineMock.mockReturnValue(undefined);
-    fetchMock.mockImplementationOnce(async (_url: string, init: RequestInit) =>
-      createdResponse(init.body as string),
-    );
+    let respond: (response: Response) => void = () => {};
+    let requestBody = "";
+    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => {
+      requestBody = init.body as string;
+      return new Promise<Response>((resolve) => {
+        respond = resolve;
+      });
+    });
     const onOpen = vi.fn();
-    const { hook, cached } = renderLaunch("conv_sequential");
+    const { hook, cached } = renderLaunch("conv_waking");
 
     act(() => hook.result.current.launch("bash", { onOpen }));
-    expect(onOpen).not.toHaveBeenCalled();
-    expect(cached()).toBeUndefined();
 
-    await vi.waitFor(() => expect(onOpen).toHaveBeenCalledOnce());
+    // The tab opens before the create returns, but the attach waits for it:
+    // the create may be waking the runner.
     const opened = onOpen.mock.calls[0][0] as TerminalInfo;
+    expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
+    expect(terminalLaunchMode(opened.id)).toBe("wait");
     expect(isTerminalLaunching(opened.id)).toBe(false);
+
+    await vi.waitFor(() => expect(requestBody).not.toBe(""));
+    await act(async () => respond(createdResponse(requestBody)));
+
+    await vi.waitFor(() => expect(terminalLaunchMode(opened.id)).toBeNull());
+    expect(onOpen).toHaveBeenCalledOnce();
     expect(cached()?.map((t) => t.id)).toEqual([opened.id]);
   });
 });

@@ -1,12 +1,18 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ComposerPrLink } from "./ComposerPrLink";
 import { COMPOSER_WORKSPACE_COLLAPSED_LABEL_CLASS } from "./ChatComposer";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import type * as OpenLinkInAppModule from "@/lib/openLinkInApp";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 
 vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: vi.fn(() => false) }));
+vi.mock("@/lib/openLinkInApp", async (importOriginal) => ({
+  ...(await importOriginal<typeof OpenLinkInAppModule>()),
+  followLinkWithPopupFallback: vi.fn(),
+}));
 
 afterEach(() => {
   cleanup();
@@ -160,7 +166,8 @@ describe("ComposerPrLink", () => {
     expect(link).not.toHaveAttribute("aria-describedby");
     fireEvent.focus(link);
     const preview = await screen.findByTestId("composer-pr-preview");
-    expect(link).toHaveAttribute("aria-describedby", preview.id);
+    const description = document.getElementById(link.getAttribute("aria-describedby") ?? "");
+    expect(description).toHaveAttribute("role", "tooltip");
     expect(link).toHaveAccessibleDescription(/Merge conflicts.*Merged.*Previously merged work/);
     expect(preview.querySelectorAll("li[data-pr-status]")).toHaveLength(2);
     expect(preview.querySelector("li")).toHaveAttribute("data-pr-status", "conflict");
@@ -171,5 +178,93 @@ describe("ComposerPrLink", () => {
     await waitFor(() => expect(screen.queryByTestId("composer-pr-preview")).toBeNull());
     fireEvent.click(link);
     expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it("links each previewed PR to a new tab beside its title", async () => {
+    const prs: ComposerPullRequest[] = [
+      {
+        url: "https://github.com/example/app/pull/42",
+        host: "github.com",
+        repository: "example/app",
+        number: 42,
+        relationship: "created",
+        title: "Resolve conflicting changes",
+        state: "OPEN",
+        merge_state_status: "DIRTY",
+      },
+      {
+        url: "https://gitlab.com/example/app/-/merge_requests/7",
+        host: "gitlab.com",
+        provider: "gitlab",
+        provider_display: {
+          id: "gitlab",
+          display_name: "GitLab",
+          request_name: "merge request",
+          number_prefix: "!",
+        },
+        repository: "example/app",
+        number: 7,
+        relationship: "created",
+        title: "",
+        state: "MERGED",
+      },
+      {
+        url: "javascript:alert(1)",
+        host: "github.com",
+        repository: "example/app",
+        number: 40,
+        relationship: "created",
+        title: "Untrusted link",
+        state: "OPEN",
+      },
+    ];
+    const onOpen = vi.fn();
+    render(
+      <ComposerPrLink
+        state="ready"
+        prCount={3}
+        prNumber={42}
+        prStatus="conflict"
+        prs={prs}
+        onOpen={onOpen}
+        conversationId="conv_1"
+      />,
+    );
+    const trigger = screen.getByTestId("composer-pr-link");
+    fireEvent.focus(trigger);
+    const preview = await screen.findByTestId("composer-pr-preview");
+    const rows = preview.querySelectorAll("li");
+
+    const titled = within(rows[0]).getByRole("link", { name: "Open example/app #42 in a new tab" });
+    expect(titled).toHaveAttribute("href", "https://github.com/example/app/pull/42");
+    expect(titled).toHaveAttribute("target", "_blank");
+    expect(titled).toHaveAttribute("rel", "noopener noreferrer");
+    expect(titled).toHaveAttribute("title", "Open in new tab");
+    expect(titled.parentElement).toHaveTextContent("Resolve conflicting changes");
+
+    // Without a title the link follows the PR's identity instead.
+    const untitled = within(rows[1]).getByRole("link", {
+      name: "Open example/app !7 in a new tab",
+    });
+    expect(untitled).toHaveAttribute("href", "https://gitlab.com/example/app/-/merge_requests/7");
+    expect(untitled.parentElement).toHaveTextContent("example/app !7");
+
+    expect(within(rows[2]).queryByRole("link")).toBeNull();
+    expect(screen.getAllByTestId("composer-pr-preview-open")).toHaveLength(2);
+    // The screen-reader description stays text: one link per PR, no hidden duplicates.
+    expect(trigger).toHaveAccessibleDescription(
+      "Pull requests: example/app #42, Merge conflicts, Resolve conflicting changes. " +
+        "example/app !7, Merged. example/app #40, Open, Untrusted link",
+    );
+
+    // Clicks share chat's external-link handling for host panes and the in-app browser.
+    fireEvent.click(titled);
+    expect(followLinkWithPopupFallback).toHaveBeenCalledWith(
+      expect.anything(),
+      "https://github.com/example/app/pull/42",
+      "conv_1",
+    );
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(screen.getByTestId("composer-pr-preview")).toBeVisible();
   });
 });

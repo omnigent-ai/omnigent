@@ -1017,8 +1017,12 @@ def test_to_models_config_shape() -> None:
     ]
 
 
-def test_to_models_config_attributes_unity_gateway_providers() -> None:
+def test_to_models_config_attributes_unity_gateway_providers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
     ug_provider: creds._PiProviderPayload = {
         "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
         "apiKey": "!get-token",
@@ -3401,10 +3405,10 @@ def test_launch_renders_config_once(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     renders = 0
     original = creds.PiProviderConfig.to_models_config
 
-    def _counting(self: creds.PiProviderConfig) -> object:
+    def _counting(self: creds.PiProviderConfig, *, client_surface: str | None = None) -> object:
         nonlocal renders
         renders += 1
-        return original(self)
+        return original(self, client_surface=client_surface)
 
     monkeypatch.setattr(creds.PiProviderConfig, "to_models_config", _counting)
 

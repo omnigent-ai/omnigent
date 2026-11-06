@@ -17,7 +17,7 @@ import { FileViewerContext, type OpenFileOptions } from "@/shell/FileViewerConte
 import { toast } from "sonner";
 import * as host from "@/lib/host";
 import { isHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { resolveInitialAttachUrl, watchDirectUpgrade } from "@/lib/terminals";
+import { resolveInitialAttachUrl, setTerminalLaunching, watchDirectUpgrade } from "@/lib/terminals";
 import {
   readTerminalClipboardPreference,
   writeTerminalClipboardPreference,
@@ -220,6 +220,33 @@ describe("control-mode terminal", () => {
     render(<TerminalView sessionId="conv_abc" terminalId="terminal_bash_s1" readOnly />);
     await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
     expect(terminalSessionMock.instances[0].clipboardEnabled).toBe(false);
+  });
+
+  it("holds a new shell's attach until its create returns when the runner may be waking", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-wait1", "wait");
+    render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-wait1" />);
+
+    expect(screen.getByText("Starting shell…")).toBeTruthy();
+    await act(async () => {});
+    expect(terminalSessionMock.instances).toHaveLength(0);
+
+    act(() => setTerminalLaunching("terminal_zsh_u-wait1", null));
+
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+    expect(terminalSessionMock.instances[0].url).not.toContain("await_launch");
+  });
+
+  it("attaches at once with await_launch when the runner is online", async () => {
+    vi.mocked(resolveInitialAttachUrl).mockImplementation(async (_direct, relay) => relay);
+    setTerminalLaunching("terminal_zsh_u-now1", "attach");
+    try {
+      render(<TerminalView sessionId="conv_abc" terminalId="terminal_zsh_u-now1" />);
+      await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+      expect(terminalSessionMock.instances[0].url).toContain("await_launch=true");
+    } finally {
+      setTerminalLaunching("terminal_zsh_u-now1", null);
+    }
   });
 
   it("does not render a legacy selection hint", async () => {

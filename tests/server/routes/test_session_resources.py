@@ -3851,8 +3851,9 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
     fake_runner = _FakeRunnerClient(payload={"object": "list", "data": [], "has_more": False})
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
 
+    params = {"head_sha": "a" * 40, "base_sha": "b" * 40}
     resp = await client.get(
-        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes"
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes", params=params
     )
 
     assert resp.status_code == 200
@@ -3860,6 +3861,7 @@ async def test_github_changes_proxies_to_runner(client: httpx.AsyncClient) -> No
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/changes",
     ) in fake_runner.calls
+    assert params in fake_runner.get_params
 
 
 @pytest.mark.asyncio
@@ -7886,32 +7888,64 @@ async def test_native_dispatch_host_bound_tunnel_drop_forwards_after_runner_reco
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("drops_first", [False, True], ids=["timeout_first", "timeout_on_repeat"])
-async def test_native_dispatch_host_bound_non_tunnel_error_stays_durable(
+@pytest.mark.parametrize("initial_status", ["idle", "running"])
+async def test_native_dispatch_host_bound_readiness_timeout_keeps_input(
     drops_first: bool,
+    initial_status: str,
+    published_stream_events: list[dict[str, Any]],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only a lost tunnel is refused; any other transport error still fails the turn durably."""
+    """A readiness timeout cannot consume input that has not reached the native agent."""
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes import sessions as sessions_module
+
     store = _ConversationStore()
     conv = _host_bound_native_conv(store)
+    monkeypatch.setitem(sessions_module._session_status_cache, conv.id, initial_status)
     terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
-    failures: list[Exception] = [
-        httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
-    ]
+    timeout = httpx.ReadTimeout("read timed out", request=_ensure_request(terminals_path))
+    failures: list[Exception] = [timeout]
     if drops_first:
         failures.insert(0, _tunnel_loss("tunnel_closed", terminals_path))
     client = _FailingEnsureRunnerClient(terminals_path, failures)
     router = _ReconnectWaitRouter(reconnects=True)
 
-    result = await _send_native_message(store, conv, client, router)
+    with pytest.raises(OmnigentError) as exc:
+        await _send_native_message(store, conv, client, router)
 
-    # A tunnel drop waits and repeats the ensure once; a timeout does neither.
+    assert exc.value.code == ErrorCode.RUNNER_UNAVAILABLE
+    assert exc.value.__cause__ is timeout
+    assert "before your message was sent" in exc.value.message
     assert len(router.waits) == int(drops_first)
     ensure_attempts = [("POST", terminals_path)] * len(failures)
     assert [call for call in client.calls if call[0] == "POST"] == ensure_attempts
+    assert store.appended_items == []
+    assert published_stream_events == []
+    assert not pending_inputs.has_pending(conv.id)
+    assert sessions_module._session_status_cache[conv.id] == initial_status
+
+
+@pytest.mark.asyncio
+async def test_native_dispatch_host_bound_non_timeout_failure_stays_durable() -> None:
+    """A transport failure outside the readiness timeout keeps its existing failure."""
+    store = _ConversationStore()
+    conv = _host_bound_native_conv(store)
+    terminals_path = f"/v1/sessions/{conv.id}/resources/terminals"
+    client = _FailingEnsureRunnerClient(
+        terminals_path, [httpx.ReadError("read failed", request=_ensure_request(terminals_path))]
+    )
+    router = _ReconnectWaitRouter(reconnects=True)
+
+    result = await _send_native_message(store, conv, client, router)
+
+    assert router.waits == []
+    assert [call for call in client.calls if call[0] == "POST"] == [("POST", terminals_path)]
     assert result.pending_id is None
-    assert [i.type for i in store.appended_items] == ["message", "error"]
-    error = store.appended_items[1]
-    assert error.data.code == "native_terminal_ensure_failed"
-    assert error.data.message == "Native Claude terminal ensure request failed. read timed out"
+    assert [item.type for item in store.appended_items] == ["message", "error"]
+    assert store.appended_items[1].data.code == "native_terminal_ensure_failed"
+    assert store.appended_items[1].data.message == (
+        "Native Claude terminal ensure request failed. read failed"
+    )
 
 
 @pytest.mark.asyncio
@@ -9923,6 +9957,103 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
         "unconfined": True,
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
     }
+
+
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap", "darwin_seatbelt", "none"])
+@pytest.mark.asyncio
+async def test_offline_environment_reach_does_not_require_server_sandbox(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Remote file metadata uses declared grants without a server-side sandbox."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes.sessions import routes_resources
+
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=".",
+        sandbox=OSEnvSandboxSpec(
+            type=sandbox_type,
+            read_paths=["../reference"],
+            write_paths=["../scratch"],
+            write_files=["../notes.txt"],
+        )
+        if sandbox_type is not None
+        else None,
+    )
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(os_env=spec),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+
+    response = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"]["reachable"] == {
+        "unconfined": sandbox_type == "none",
+        "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}]
+        + (
+            [
+                {"path": "/Users/dev/scratch", "access": "write", "origin": "write_paths"},
+                {"path": "/Users/dev/notes.txt", "access": "write", "origin": "write_files"},
+                {"path": "/Users/dev/reference", "access": "read", "origin": "read_paths"},
+            ]
+            if sandbox_type is not None
+            else []
+        ),
+    }
+
+
+@pytest.mark.parametrize("sandbox_type", [None, "linux_bwrap"])
+@pytest.mark.asyncio
+async def test_offline_confined_browsing_preserves_declared_grants(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_type: str | None,
+) -> None:
+    """Missing server sandbox tools cannot expand the remote browsing grants."""
+    from types import SimpleNamespace
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    monkeypatch.setattr(
+        routes_resources,
+        "_load_agent_spec_for_session",
+        lambda _conv, _store: SimpleNamespace(
+            os_env=OSEnvSpec(
+                type="caller_process",
+                cwd=".",
+                sandbox=OSEnvSandboxSpec(type=sandbox_type, read_paths=["../reference"])
+                if sandbox_type is not None
+                else None,
+            )
+        ),
+    )
+    monkeypatch.setattr("shutil.which", lambda _command: None)
+    requests: list[str] = []
+
+    async def read_from_host(**kwargs: Any) -> dict[str, Any]:
+        requests.append(kwargs["workspace"])
+        return {"object": "list", "data": []}
+
+    monkeypatch.setattr(_host_filesystem, "read_workspace_from_host", read_from_host)
+    prefix = f"/v1/sessions/{_OFFLINE_SESSION}/resources/environments/default/filesystem"
+    allowed_path = "/Users/dev/reference" if sandbox_type is not None else _OFFLINE_WORKSPACE
+    allowed = await offline_env_client.get(f"{prefix}{allowed_path}?base=host")
+    denied = await offline_env_client.get(f"{prefix}/Users/dev/unrelated?base=host")
+
+    assert allowed.status_code == 200, allowed.text
+    assert denied.status_code == 403, denied.text
+    assert requests == [allowed_path]
 
 
 @pytest.mark.asyncio
