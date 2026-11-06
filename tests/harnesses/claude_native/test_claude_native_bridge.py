@@ -5528,7 +5528,7 @@ def test_inject_user_message_raises_when_prompt_never_renders(
         del kwargs
         # Read-only queries (pane capture, liveness probe) are not
         # keystrokes — only writes must be absent on this path.
-        if "capture-pane" in cmd or "list-panes" in cmd:
+        if "capture-pane" in cmd or "display-message" in cmd:
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         send_keys.append(cmd)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -5728,16 +5728,23 @@ def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
     assert tui["enters"] == 2
 
 
+@pytest.mark.parametrize(
+    "replay_captures,recovered_draft",
+    [(8, ""), (25, ""), (8, "unfinished terminal edit")],
+    ids=["composer-returned", "still-replaying", "nonempty-composer"],
+)
 def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    replay_captures: int,
+    recovered_draft: str,
 ) -> None:
     """
     A paste that lands while a resumed TUI is still replaying must not be submitted blind.
 
-    The composer frame is absent when the paste wait ends, so an Enter would submit
-    nothing and report success. Delivery waits for the composer, clears, pastes once
-    more, and presses Enter only after the draft is visible in the input box.
+    The first paste is dropped while replaying; the composer may return before
+    the paste wait ends. Delivery pastes once more and presses Enter only after
+    the draft is visible in the input box.
     """
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
@@ -5746,6 +5753,7 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "time", _VirtualClock())
     bridge_dir = tmp_path / "bridge"
     write_tmux_target(
         bridge_dir,
@@ -5774,9 +5782,9 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         if "capture-pane" in cmd:
             if tui["replaying"]:
                 tui["replay_captures"] += 1
-                if tui["replay_captures"] > 25:
+                if tui["replay_captures"] > replay_captures:
                     tui["replaying"] = False
-                    tui["pane"] = _composer_pane()
+                    tui["pane"] = _composer_pane(recovered_draft)
                 else:
                     return SimpleNamespace(returncode=0, stdout=replay_pane, stderr="")
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
@@ -5795,6 +5803,20 @@ def test_paste_into_a_resuming_tui_waits_for_the_composer_before_any_enter(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
+    if recovered_draft:
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "has_pending_user_prompt",
+            lambda _bridge_dir: tui["pastes"] > 0 and not tui["replaying"],
+        )
+        with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+            inject_user_message(
+                bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8
+            )
+        assert tui["pastes"] == 1
+        assert tui["enter_saw_draft"] == []
+        assert tui["pane"] == _composer_pane(recovered_draft)
+        return
     inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
 
     assert tui["enter_saw_draft"] == [True], (
@@ -11592,18 +11614,15 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     short. The probe gets the shared tmux budget, not a bespoke 1s a
     starved server outlasts.
 
-    An answer carrying no usable flag is inconclusive too. This is why the
-    probe runs ``list-panes`` and not ``display-message``: the latter
-    prints an empty line and still exits 0 for a target it cannot
-    resolve, so "tmux told us nothing" would read as "the pane is dead"
-    and end a healthy slow boot at the base budget.
+    An answer carrying no usable flag is inconclusive too. The conditional
+    format reports an unresolved target explicitly, even though tmux exits 0.
     """
     responses: dict[str, Any] = {}
 
     def fake_run(cmd: list[str], **kwargs: Any) -> SimpleNamespace:
         assert kwargs["timeout"] == claude_native_bridge._TMUX_SEND_TIMEOUT_S
-        assert "list-panes" in cmd
-        assert "#{pane_dead} #{pane_dead_status}" in cmd
+        assert "display-message" in cmd
+        assert "#{?pane_id,#{pane_dead} #{pane_dead_status},missing}" in cmd
         outcome = responses["outcome"]
         if isinstance(outcome, Exception):
             raise outcome
@@ -11622,6 +11641,7 @@ def test_claude_pane_state_distinguishes_dead_pane_from_unanswered_probe(
     assert state(returncode=0, stdout="1 \n") == (False, True, None)
     # A rejected query ends the wait without claiming the process exited.
     assert state(returncode=1, stdout="") == (False, False, None)
+    assert state(returncode=0, stdout="missing\n") == (False, False, None)
     # Answered, but said nothing about the pane.
     assert state(returncode=0, stdout="\n") == (None, False, None)
     assert state(returncode=0, stdout="what\n") == (None, False, None)

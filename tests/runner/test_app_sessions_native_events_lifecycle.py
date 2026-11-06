@@ -1760,6 +1760,9 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
     cfg = tmp_path / "databrickscfg"
     cfg.write_text("[default]\nhost = https://a.example\n[other]\nhost = https://b.example\n")
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    source_home = tmp_path / "source-home"
+    source_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
     monkeypatch.setattr(codex, "_find_codex_cli", lambda: sys.executable)
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
     profile = "default" if case == "default" else "other"
