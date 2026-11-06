@@ -714,3 +714,26 @@ export async function authenticatedFetch(
   }
   return res;
 }
+
+/** Error code for a request answered by a sign-in page instead of the API. */
+export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
+
+// A light authenticated read the SPA already makes at boot. It reaches the same
+// auth edge as the stream and the sends, so its answer speaks for them.
+const SIGN_IN_PROBE_PATH = "/v1/me";
+
+/**
+ * Whether the sign-in has expired, judged from one request that does not follow
+ * redirects. A redirect to a login page, a 401/403, or a 200 HTML page means a
+ * retry cannot renew the sign-in. A failed probe says nothing, so it reads as not
+ * expired and the caller keeps retrying.
+ */
+export async function isSignInExpired(): Promise<boolean> {
+  try {
+    const res = await hostFetch(SIGN_IN_PROBE_PATH, { redirect: "manual", cache: "no-store" });
+    if (res.type === "opaqueredirect" || res.status === 401 || res.status === 403) return true;
+    return res.ok && (res.headers.get("content-type") ?? "").toLowerCase().includes("text/html");
+  } catch {
+    return false;
+  }
+}

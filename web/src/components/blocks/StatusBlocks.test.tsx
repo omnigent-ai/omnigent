@@ -1404,3 +1404,26 @@ describe("ErrorBanner — info level", () => {
     expect(screen.getByTestId("error-headline")).toHaveClass("text-destructive");
   });
 });
+
+describe("ErrorBanner sign-in notice", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reloads the page from its Reload page action", () => {
+    const reload = vi.fn();
+    vi.stubGlobal("location", { reload });
+    render(
+      <ErrorBanner
+        message="Reload the page to sign in again."
+        source=""
+        code="sign_in_expired"
+        title="Your sign-in expired"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Reload page" }));
+
+    expect(reload).toHaveBeenCalledOnce();
+  });
+});

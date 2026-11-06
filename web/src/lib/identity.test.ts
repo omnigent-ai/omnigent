@@ -880,3 +880,43 @@ describe("login redirect", () => {
     expect(hrefWrites).toEqual([]);
   });
 });
+
+describe("isSignInExpired", () => {
+  const redirected = { ok: false, status: 0, type: "opaqueredirect", headers: new Headers() };
+  const loginPage = {
+    ok: true,
+    status: 200,
+    type: "basic",
+    headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+  };
+
+  it.each([
+    ["a redirect to a login page", redirected],
+    ["a 401", { ok: false, status: 401, type: "basic", headers: new Headers() }],
+    ["a 403", { ok: false, status: 403, type: "basic", headers: new Headers() }],
+    ["a 200 login page", loginPage],
+  ])(
+    "reports an expired sign-in for %s, probing without following redirects",
+    async (_label, answer) => {
+      fetchMock.mockResolvedValueOnce(answer);
+      const { isSignInExpired } = await import("./identity");
+
+      await expect(isSignInExpired()).resolves.toBe(true);
+      expect(fetchMock.mock.calls[0]).toEqual([
+        "/v1/me",
+        expect.objectContaining({ redirect: "manual" }),
+      ]);
+    },
+  );
+
+  it.each([
+    ["a network failure", new TypeError("Failed to fetch")],
+    ["a JSON answer", mockJsonResponse({ user_id: "alice" })],
+  ])("reads %s as not expired, so the caller keeps retrying", async (_label, answer) => {
+    if (answer instanceof Error) fetchMock.mockRejectedValueOnce(answer);
+    else fetchMock.mockResolvedValueOnce(answer);
+    const { isSignInExpired } = await import("./identity");
+
+    await expect(isSignInExpired()).resolves.toBe(false);
+  });
+});

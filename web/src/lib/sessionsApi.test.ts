@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ApiError,
   apiErrorFromResponse,
   parseRetryAfterMs,
   approve,
@@ -1690,6 +1691,24 @@ describe("postEvent", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(init.body as string)).toEqual(event);
     expect(out).toEqual({ queued: true, itemId: "ci_123" });
+  });
+
+  it("reports an expired sign-in when the POST is answered with a login page", async () => {
+    // The auth edge's 200 login page: a body that is not JSON, served as text/html.
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: new Headers({ "content-type": "text/html; charset=utf-8" }),
+      json: async () => {
+        throw new SyntaxError("Unexpected token '<'");
+      },
+    });
+
+    const error = await postEvent("conv_abc", { type: "clear", data: {} }).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 401, code: "sign_in_expired" });
   });
 
   it("reads the session a claude-sdk clear continued in", async () => {

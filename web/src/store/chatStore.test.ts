@@ -14961,13 +14961,17 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     );
   });
 
-  // An expired sign-in answers every API read with the login page, not just the stream.
+  // The stream and the API reads answer with the login page, but the sign-in probe
+  // reads JSON. The 60 s give-up is then the fallback, and it shows the connection card.
   it("fails a streaming reply with one connection card after persistent login pages", async () => {
     const response = assistantMessage("resp_unavailable_visible", "Partial reply");
     seedSession("conv_unavailable_visible", [response]);
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
-      return url.includes("/v1/") ? loginPageResponse() : defaultFetchHandler(input, init);
+      const isProbe = url.endsWith("/v1/me");
+      return url.includes("/v1/") && !isProbe
+        ? loginPageResponse()
+        : defaultFetchHandler(input, init);
     });
     const controller = new AbortController();
     useChatStore.setState({
@@ -16825,6 +16829,65 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await vi.advanceTimersByTimeAsync(100_000);
     expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
 
+    controller.abort();
+    await loop;
+  });
+
+  it.each([
+    ["a login page", () => loginPageResponse()],
+    ["a failed connection", () => Promise.reject(new TypeError("Failed to fetch"))],
+  ])(
+    "gives up with a sign-in notice once the probe reports the sign-in expired after %s",
+    async (_answer, answerStream) => {
+      seedSession("conv_expired_probe", []);
+      let opens = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.endsWith("/v1/me")) return mockResponse({}, { ok: false, status: 401 });
+        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+          opens += 1;
+          return answerStream();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({ conversationId: "conv_expired_probe", abortController: controller });
+
+      const loop = startStreamPump("conv_expired_probe", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(10_000);
+      await loop;
+
+      const state = useChatStore.getState();
+      // Stopped on the probe's answer, well before the 60 s login-page window.
+      expect(opens).toBeLessThan(5);
+      expect(state.status).toBe("idle");
+      expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+        expect.objectContaining({
+          code: "sign_in_expired",
+          title: "Your sign-in expired",
+          message: "Reload the page to sign in again.",
+        }),
+      ]);
+    },
+  );
+
+  it("keeps retrying a failed connect while the sign-in probe cannot reach the server", async () => {
+    seedSession("conv_probe_down", []);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.endsWith("/v1/me") || /\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_probe_down", abortController: controller });
+
+    const loop = startStreamPump("conv_probe_down", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(70_000);
+
+    // An unanswered probe is no evidence of an expired sign-in, so no notice appears.
+    expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
     controller.abort();
     await loop;
   });

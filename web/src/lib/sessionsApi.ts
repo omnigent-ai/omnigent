@@ -15,7 +15,7 @@ import type { ConversationItem } from "./conversationItems";
 import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
-import { authenticatedFetch } from "./identity";
+import { authenticatedFetch, SIGN_IN_EXPIRED_CODE } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
@@ -1521,17 +1521,27 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-      session_id?: string;
-    },
-  );
+  const body = (await res.json().catch((error: unknown): never => {
+    // An auth layer's login page answers the POST with a 200 HTML page: an expired
+    // sign-in, not a malformed reply.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+      throw new ApiError(
+        "Your sign-in expired. Reload the page to sign in again.",
+        401,
+        SIGN_IN_EXPIRED_CODE,
+      );
+    }
+    throw error;
+  })) as {
+    queued: boolean;
+    item_id?: string;
+    denied?: boolean;
+    pending_id?: string;
+    recovered?: boolean;
+    recovery?: PostEventResponse["recovery"];
+    session_id?: string;
+  };
+  return postEventResponseFromWire(body);
 }
 
 /**

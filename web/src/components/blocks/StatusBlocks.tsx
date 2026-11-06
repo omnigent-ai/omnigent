@@ -37,6 +37,7 @@ import { shortModelName } from "@/components/CostRoutingControl";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { copyText } from "@/lib/clipboard";
+import { SIGN_IN_EXPIRED_CODE } from "@/lib/identity";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
 import { useForkDialog } from "@/shell/ForkDialogContext";
@@ -284,6 +285,18 @@ function ErrorForkAction({
       </DisabledActionTooltip>
     </div>
   );
+}
+
+/**
+ * Reload the top frame, so a sign-in that expired inside an embed is renewed by
+ * the page that owns it. Falls back to this frame when the top is cross-origin.
+ */
+function reloadTopLevelPage(): void {
+  try {
+    (window.top ?? window).location.reload();
+  } catch {
+    window.location.reload();
+  }
 }
 
 /**
@@ -578,6 +591,21 @@ export function ErrorBanner({
             <XIcon className="size-4" aria-hidden="true" />
           </Button>
         </div>
+        {code === SIGN_IN_EXPIRED_CODE ? (
+          <div className="mx-[4px] mt-[8px] flex">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={(event) => {
+                event.stopPropagation();
+                reloadTopLevelPage();
+              }}
+            >
+              Reload page
+            </Button>
+          </div>
+        ) : null}
         {workspaceMissing ? (
           <ErrorForkAction
             label="Continue in another directory…"
