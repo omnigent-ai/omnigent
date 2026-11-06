@@ -190,6 +190,39 @@ def test_terminal_dialog_pending_without_a_pane_is_false(tmp_path: Path) -> None
     assert claude_native_bridge.terminal_dialog_pending(tmp_path / "missing") is False
 
 
+_MODEL_ACK = "  ⎿  Set model to Opus 5.5 and saved as your default for new sessions"
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (f"❯ /model opus[1m]\n{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", True),
+        (f"❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
+        (f"{_MODEL_ACK}\n❯ /model opus[1m]\n{_RULE}\n❯ \n{_RULE}\n", False),
+        (f"{_MODEL_ACK}\n{_RULE}\n❯ \n{_RULE}\n", False),
+        ("", False),
+    ],
+    ids=["acknowledged", "no-acknowledgement", "older-acknowledgement", "no-echo", "torn"],
+)
+def test_model_switch_acknowledged_reads_the_pane(
+    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, pane: str, expected: bool
+) -> None:
+    """Only an acknowledgement printed under the command's last echo confirms it."""
+    _show(monkeypatch, pane)
+
+    assert (
+        claude_native_bridge.model_switch_acknowledged(bridge_dir, command="/model opus[1m]")
+        is expected
+    )
+
+
+def test_model_switch_acknowledged_without_a_pane_is_false(tmp_path: Path) -> None:
+    assert (
+        claude_native_bridge.model_switch_acknowledged(tmp_path / "missing", command="/model x")
+        is False
+    )
+
+
 def test_the_settings_pre_check_refuses_before_typing(
     bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -49,12 +49,13 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
+import { APPROVE_KEYS, DECLINE_KEYS, useApprovesOnHotkey } from "@/hooks/useApproveHotkey";
 import { useDescendantSession } from "@/hooks/useChildSessions";
 import {
   type AskUserQuestionPayload,
-  castAskUserQuestionPayload,
+  askUserQuestionPayloadOf,
   exitPlanModePlan,
-  parseAskUserQuestionPreview,
 } from "@/lib/askUserQuestion";
 import { askUserQuestionSignature } from "@/lib/askUserQuestionDrafts";
 import { isNativePolicyName, nativeCodingAgentForPolicyName } from "@/lib/nativeCodingAgents";
@@ -290,6 +291,11 @@ interface ApprovalCardProps {
   onSubmit?: SubmitApprovalFn;
   /** Set when the prompt was mirrored up from a sub-agent session. */
   requester?: SubagentRequester | null;
+  /**
+   * Whether keys pressed outside this card drive its question form. Only the
+   * question the chat answers from the keyboard sets this.
+   */
+  keyboardActive?: boolean;
   /** Extra classes for the card container, e.g. to drop its border when embedded. */
   className?: string;
 }
@@ -319,8 +325,13 @@ export function ApprovalCard({
   agyPermission,
   onSubmit,
   requester,
+  keyboardActive,
   className,
 }: ApprovalCardProps) {
+  // Only the prompt that ⌘↵ and Esc act on names them on its buttons.
+  const hotkeyTarget = useApprovesOnHotkey(elicitationId, status === "pending");
+  const approveKeys = hotkeyTarget ? APPROVE_KEYS : undefined;
+  const declineKeys = hotkeyTarget ? DECLINE_KEYS : undefined;
   // In a side-chat pane this resolves to the child id, so the verdict targets
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
@@ -405,8 +416,7 @@ export function ApprovalCard({
   // JSON for backwards compatibility with elicitations published
   // before the structured field was added.
   const askPayload: AskUserQuestionPayload | null = useMemo(
-    () =>
-      castAskUserQuestionPayload(askUserQuestion) ?? parseAskUserQuestionPreview(contentPreview),
+    () => askUserQuestionPayloadOf({ askUserQuestion, contentPreview }),
     [askUserQuestion, contentPreview],
   );
   // Remount the question form when the same elicitation carries new questions.
@@ -508,15 +518,17 @@ export function ApprovalCard({
     : undefined;
   const binaryButtons = (
     <div className={cn("flex flex-wrap gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}>
-      <Button
-        size="sm"
-        className={MOBILE_CHOICE_CLASS}
-        onClick={() => submitBinary("accept")}
-        componentId="approval.approve"
-      >
-        <CheckIcon className="mr-1 size-3.5" />
-        Approve
-      </Button>
+      <KeyboardShortcutTooltip label="Approve" keys={approveKeys}>
+        <Button
+          size="sm"
+          className={MOBILE_CHOICE_CLASS}
+          onClick={() => submitBinary("accept")}
+          componentId="approval.approve"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve
+        </Button>
+      </KeyboardShortcutTooltip>
       {agyPermission?.alwaysAllowPattern && (
         <>
           <Button
@@ -631,16 +643,18 @@ export function ApprovalCard({
           Approve &amp; don't ask again for {rememberTarget}
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-        componentId="approval.reject"
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+          componentId="approval.reject"
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
   const codexCommandButtons = (
@@ -648,15 +662,17 @@ export function ApprovalCard({
       className={cn("flex flex-wrap items-center gap-2 pt-1", MOBILE_CHOICE_LIST_CLASS)}
       data-testid="codex-command-actions"
     >
-      <Button
-        size="sm"
-        className={MOBILE_CHOICE_CLASS}
-        onClick={() => submitBinary("accept")}
-        componentId="approval.approve_command"
-      >
-        <CheckIcon className="mr-1 size-3.5" />
-        Approve
-      </Button>
+      <KeyboardShortcutTooltip label="Approve" keys={approveKeys}>
+        <Button
+          size="sm"
+          className={MOBILE_CHOICE_CLASS}
+          onClick={() => submitBinary("accept")}
+          componentId="approval.approve_command"
+        >
+          <CheckIcon className="mr-1 size-3.5" />
+          Approve
+        </Button>
+      </KeyboardShortcutTooltip>
       {execPolicyAmendment && (
         <Button
           size="sm"
@@ -669,15 +685,17 @@ export function ApprovalCard({
           Approve and remember
         </Button>
       )}
-      <Button
-        size="sm"
-        variant="outline"
-        className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
-        onClick={() => submitBinary("decline")}
-      >
-        <XIcon className="mr-1 size-3.5" />
-        Reject
-      </Button>
+      <KeyboardShortcutTooltip label="Reject" keys={declineKeys}>
+        <Button
+          size="sm"
+          variant="outline"
+          className={cn(MOBILE_CHOICE_CLASS, "mobile-app:mt-2")}
+          onClick={() => submitBinary("decline")}
+        >
+          <XIcon className="mr-1 size-3.5" />
+          Reject
+        </Button>
+      </KeyboardShortcutTooltip>
     </div>
   );
 
@@ -951,6 +969,7 @@ export function ApprovalCard({
               onAcceptAuto={submitAllowAllEdits}
               onAccept={() => submitBinary("accept")}
               onReject={submitPlanRejection}
+              acceptKeys={approveKeys}
             />
           </>
         ) : isAskUserQuestion ? (
@@ -960,6 +979,7 @@ export function ApprovalCard({
             questions={askPayload.questions}
             onSubmit={submitAnswers}
             onReject={() => submitBinary("decline")}
+            keyboardActive={keyboardActive}
           />
         ) : isCodexCommandApproval ? (
           <>
@@ -1051,9 +1071,12 @@ export function ApprovalCard({
 export function ElicitationCard({
   item,
   onSubmit,
+  keyboardActive,
 }: {
   item: Extract<RenderItem, { kind: "elicitation" }>;
   onSubmit?: SubmitApprovalFn;
+  /** Whether keys pressed outside the card drive its question form. */
+  keyboardActive?: boolean;
 }) {
   // A sub-agent's prompt is mirrored into its ancestors' streams with
   // ``targetSessionId`` naming the sub-agent that asked.
@@ -1086,6 +1109,7 @@ export function ElicitationCard({
       agyPermission={item.agyPermission}
       onSubmit={onSubmit}
       requester={requester}
+      keyboardActive={keyboardActive}
     />
   );
 }

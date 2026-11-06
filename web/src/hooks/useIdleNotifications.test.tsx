@@ -4,7 +4,15 @@ import {
   useConversations,
 } from "@/hooks/useConversations";
 
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTestConversations() }));
+// `serverRows` follows the displayed rows unless a test sets the server's own counts.
+const serverRowsOverride = vi.hoisted(() => ({ rows: undefined as Conversation[] | undefined }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => {
+    const loaded = useTestConversations();
+    const displayed = loaded.data?.pages.flatMap((page) => page.data) ?? [];
+    return { ...loaded, serverRows: serverRowsOverride.rows ?? displayed };
+  },
+}));
 import { cleanup, renderHook, act } from "@testing-library/react";
 
 const navigateMock = vi.fn();
@@ -122,6 +130,7 @@ function setWindowFocused(focused: boolean): void {
 }
 
 beforeEach(() => {
+  serverRowsOverride.rows = undefined;
   // Fake only the timers the settle uses, leaving Date/microtasks/etc. real so
   // React's act scheduling and the preview promise keep working.
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
@@ -299,6 +308,21 @@ describe("useIdleNotifications elicitation transitions", () => {
       body: "Agent is asking for your input.",
       tag: "omnigent:session:a",
     });
+  });
+
+  it("does not announce a prompt as new when its answer in flight is rolled back", () => {
+    // The server keeps counting the prompt while the sidebar subtracts the answer.
+    serverRowsOverride.rows = [conv("a", "running", 1)];
+    setConversations([conv("a", "running", 1)]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+    setConversations([conv("a", "running", 0)]);
+    rerender();
+
+    // The POST failed or the hold expired, so the prompt shows again.
+    setConversations([conv("a", "running", 1)]);
+    rerender();
+
+    expect(showMock).not.toHaveBeenCalled();
   });
 
   it("does not notify on a fresh load with already-pending elicitations", () => {

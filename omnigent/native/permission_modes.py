@@ -32,3 +32,21 @@ PERMISSION_LAUNCH_ARGS: dict[str, dict[str, list[str]]] = {
         "dangerous": ["--permission-mode", "dangerous"],
     },
 }
+
+# Modes that would run a scheduled fire without a working approval gate. A
+# scheduled run has nobody to answer a prompt, so the auto classifier is the
+# check that stands in for the user. Claude's ``dontAsk`` denies rather than
+# approves, but it skips that classifier and relies only on pre-approved rules
+# the server cannot see. Each name belongs to one harness, so the set is
+# checked without resolving the agent.
+UNATTENDED_DISALLOWED_PERMISSION_MODES: frozenset[str] = frozenset(
+    {
+        "bypassPermissions",  # claude-native, claude-sdk, acp
+        "dontAsk",  # claude-native
+        "full-access",  # codex-native
+        "bypass",  # codex-native
+        "yolo",  # cursor-native
+        "skip",  # antigravity-native
+        "dangerous",  # devin-native
+    }
+)
