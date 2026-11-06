@@ -155,7 +155,12 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
     :param runner_id: Runner that sent the pong.
     :param busy: The pong's busy report; ``None`` when the runner does not report.
     """
-    if busy is None or _sandbox_config is None or _host_store is None:
+    if _sandbox_config is None or _host_store is None:
+        return
+    if busy is None:
+        # A runner build that does not report took over this id (a reconnect
+        # from an older runner): fall back to tunnel-lifetime refreshes.
+        forget_reports(runner_id)
         return
     was_busy = _last_pong_busy.get(runner_id)
     _last_pong_busy[runner_id] = busy
@@ -170,12 +175,13 @@ def record_pong(runner_id: str, busy: bool | None) -> None:
 
 
 def forget_reports(runner_id: str) -> None:
-    """Drop *runner_id*'s busy-report state when a new tunnel connects.
+    """Drop *runner_id*'s busy-report state, making it a never-reporting runner.
 
-    A different runner build can reconnect under the same id; until it reports,
-    it gets the tunnel-lifetime refreshes of a runner that never reports.
+    Called when its pongs stop carrying ``busy`` and when its throttle entry is
+    pruned. Not on reconnect: a reporting runner that reconnects while idle must
+    stay idle, or every tunnel reconnect would refresh its sandbox.
 
-    :param runner_id: Runner whose tunnel just connected.
+    :param runner_id: Runner whose reports to drop.
     """
     for state in (_last_pong_busy, _busy_since_kept, _last_busy_at, _last_report_at):
         state.pop(runner_id, None)

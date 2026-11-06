@@ -531,11 +531,24 @@ def test_pruning_preserves_live_idle_reporting_state(monkeypatch: pytest.MonkeyP
     assert gate.submitted == ["r1"]
 
 
-def test_a_new_tunnel_starts_without_the_previous_reports(monkeypatch: pytest.MonkeyPatch) -> None:
-    # A runner that does not report may reconnect under the same id.
+def test_an_idle_runner_stays_idle_across_a_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The new tunnel's immediate first touch must not refresh a runner that
+    # reported idle, or every tunnel reconnect would extend its sandbox.
     gate = _BusyGate(monkeypatch)
     managed_host_keepalive.touch("r1")
     managed_host_keepalive.record_pong("r1", False)
-    managed_host_keepalive.forget_reports("r1")
+    gate.now += 900.0
+    managed_host_keepalive.touch("r1")  # reconnect: _keepalive_loop's first touch
+    assert gate.submitted == ["r1"]
+
+
+def test_a_runner_that_stops_reporting_gets_tunnel_lifetime_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An older runner build may reconnect under the same id; its pongs carry no busy.
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.touch("r1")
+    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive.record_pong("r1", None)
     gate.tick()
     assert gate.submitted == ["r1", "r1"]
