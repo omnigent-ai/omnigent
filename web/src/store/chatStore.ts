@@ -1491,10 +1491,41 @@ function sideChatSettingsPending(conversationId: string): boolean {
 const streamEventRevisions = new Map<string, number>();
 // Live turn edges only: a reopened stream's connect replay carries none.
 const streamTurnEdgeRevisions = new Map<string, number>();
+// Edges that settle the turn's response identity (a named response, a turn end or an
+// interrupt). A bare `running` edge leaves a snapshot's active turn in place.
+const streamLifecycleEdgeRevisions = new Map<string, number>();
+// Edges that state the background-task count. A bare PTY edge leaves the count sticky.
+const streamTaskCountEdgeRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => {
   streamEventRevisions.delete(id);
   streamTurnEdgeRevisions.delete(id);
+  streamLifecycleEdgeRevisions.delete(id);
+  streamTaskCountEdgeRevisions.delete(id);
 });
+
+function bumpStreamRevision(revisions: Map<string, number>, conversationId: string): void {
+  revisions.set(conversationId, (revisions.get(conversationId) ?? 0) + 1);
+}
+
+/** Whether a live edge settles the turn: a named response, a turn end, or an interrupt. */
+function settlesTurnLifecycle(event: StreamEvent): boolean {
+  if (event.type === "session_interrupted") return true;
+  return (
+    event.type === "session_status" &&
+    (event.responseId !== undefined ||
+      event.status === "idle" ||
+      event.status === "waiting" ||
+      event.status === "failed")
+  );
+}
+
+/** Whether a live status edge states the background-task count, as its handler applies it. */
+function statesTaskCount(event: StreamEvent): boolean {
+  return (
+    event.type === "session_status" &&
+    (event.backgroundTaskCount !== undefined || event.status === "failed")
+  );
+}
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -5129,10 +5160,13 @@ async function bindStream(
     }
   }
 
+  // Edges the pump delivers from here on are newer than the snapshot fetched below.
+  const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
+  const lifecycleEdgesBeforeFetch = streamLifecycleEdgeRevisions.get(id) ?? 0;
+  const taskCountEdgesBeforeFetch = streamTaskCountEdgeRevisions.get(id) ?? 0;
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction) unless a
   // rebind's pump has taken it over.
-  const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
     releaseOwnedStreamSlot(id, controller),
   );
@@ -5210,6 +5244,10 @@ async function bindStream(
       const snapshotStatusIsCurrent =
         (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch &&
         state.sessionStatus === stateBeforeFetch.sessionStatus;
+      const snapshotLifecycleIsCurrent =
+        (streamLifecycleEdgeRevisions.get(id) ?? 0) === lifecycleEdgesBeforeFetch;
+      const snapshotTaskCountIsCurrent =
+        (streamTaskCountEdgeRevisions.get(id) ?? 0) === taskCountEdgesBeforeFetch;
       const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
       const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
@@ -5356,27 +5394,27 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        // A live turn edge wins over the initial snapshot; metadata and history
-        // still hydrate when that snapshot's lifecycle is already stale.
-        ...(snapshotStatusIsCurrent
+        // A live edge overrides only the snapshot fields it states, so a bare running
+        // edge keeps the snapshot's turn and background-task count.
+        ...(snapshotStatusIsCurrent ? { sessionStatus: session.status, blockedOn: null } : {}),
+        // Opening mid-turn needs the response id whose start edge was missed.
+        ...(snapshotLifecycleIsCurrent &&
+        session.status === "running" &&
+        session.activeResponseId != null &&
+        state.activeResponse?.responseId !== session.activeResponseId
           ? {
-              sessionStatus: session.status,
-              // Opening mid-turn needs the response id whose start edge was missed.
-              ...(session.status === "running" &&
-              session.activeResponseId != null &&
-              state.activeResponse?.responseId !== session.activeResponseId
-                ? {
-                    status: "streaming" as const,
-                    activeResponse: {
-                      responseId: session.activeResponseId,
-                      state: "streaming" as const,
-                      error: null,
-                    },
-                  }
-                : {}),
+              status: "streaming" as const,
+              activeResponse: {
+                responseId: session.activeResponseId,
+                state: "streaming" as const,
+                error: null,
+              },
+            }
+          : {}),
+        ...(snapshotTaskCountIsCurrent
+          ? {
               backgroundTaskCount: session.backgroundTaskCount ?? 0,
               backgroundTasks: session.backgroundTasks ?? [],
-              blockedOn: null,
             }
           : {}),
         // This conversation's own effective effort, which is what a warm switch
@@ -9623,10 +9661,13 @@ async function* tapSessionEvents(
         turnEdge &&
         (event.type !== "session_status" || event.conversationId === conversationId)
       ) {
-        streamTurnEdgeRevisions.set(
-          conversationId,
-          (streamTurnEdgeRevisions.get(conversationId) ?? 0) + 1,
-        );
+        bumpStreamRevision(streamTurnEdgeRevisions, conversationId);
+        if (settlesTurnLifecycle(event)) {
+          bumpStreamRevision(streamLifecycleEdgeRevisions, conversationId);
+        }
+        if (statesTaskCount(event)) {
+          bumpStreamRevision(streamTaskCountEdgeRevisions, conversationId);
+        }
       }
     }
     if (turnEdge) beforeTurnEdge?.();

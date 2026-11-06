@@ -2701,6 +2701,59 @@ describe("chatStore — switchTo", () => {
     expect(state.blocks.some((block) => block.ctx.itemId === history.id)).toBe(true);
   });
 
+  it("keeps the snapshot's running turn and background count through a bare running edge", async () => {
+    const sessionId = "conv_initial_bare_running";
+    const history = userMessage("history", "Existing history");
+    seedSession(sessionId, [history]);
+    const sink = pushableStream();
+    let releaseItems: (() => void) | undefined;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input).split("?")[0];
+      if (path === `/v1/sessions/${sessionId}/stream`) {
+        init?.signal?.addEventListener("abort", () =>
+          sink.error(new DOMException("aborted", "AbortError")),
+        );
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      if (path === `/v1/sessions/${sessionId}/items`) {
+        const response = defaultFetchHandler(input, init);
+        return new Promise<Response>((resolve) => {
+          releaseItems = () => resolve(response);
+        });
+      }
+      if (path === `/v1/sessions/${sessionId}`) {
+        return mockResponse({
+          id: sessionId,
+          agent_id: "agent_xyz",
+          status: "running",
+          active_response_id: "snapshot_turn",
+          background_task_count: 2,
+          created_at: 0,
+          labels: { "omnigent.wrapper": "codex-native-ui" },
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    localStorage.setItem("debug", "1");
+    onTestFinished(() => localStorage.removeItem("debug"));
+    const binding = useChatStore.getState().switchTo(sessionId);
+    await vi.waitFor(() => expect(releaseItems).toBeDefined());
+    // A PTY-activity running edge names neither a response nor a task count.
+    sink.push(sse("session.status", { conversation_id: sessionId, status: "running" }));
+    await vi.waitFor(() =>
+      expect(snapshotSseLog(sessionId).some(({ event }) => event.type === "session_status")).toBe(
+        true,
+      ),
+    );
+    releaseItems!();
+    await binding;
+
+    const state = useChatStore.getState();
+    expect(state.sessionStatus).toBe("running");
+    expect(state.backgroundTaskCount).toBe(2);
+    expect(state.activeResponse).toMatchObject({ responseId: "snapshot_turn", state: "streaming" });
+  });
+
   it("switching to the same conversation is a no-op (blocks preserved, no stream re-open)", async () => {
     const block: AnyBlock = {
       type: "user_message",
