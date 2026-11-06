@@ -211,7 +211,7 @@ def test_runner_resource_attach_await_launch_waits_for_registration(
         terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
-    calls: list[tuple[str, str, bool]] = []
+    calls: list[tuple[str, str, bool, str | None, str | None]] = []
     _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
     lookups = _register_on_first_lookup(
         monkeypatch, registry, "conv_abc", _make_running_instance("zsh", "u-ab12cd", tmp_path)
@@ -225,7 +225,15 @@ def test_runner_resource_attach_await_launch_waits_for_registration(
             ws.receive_bytes()
 
     assert len(lookups) == 2
-    assert calls == [(str(tmp_path / "zsh-u-ab12cd.sock"), "main", False)]
+    assert calls == [
+        (
+            str(tmp_path / "zsh-u-ab12cd.sock"),
+            "main",
+            False,
+            "conv_abc",
+            "terminal_zsh_u-ab12cd",
+        )
+    ]
 
 
 def test_runner_resource_attach_await_launch_times_out_with_4404(
