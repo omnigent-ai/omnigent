@@ -718,3 +718,13 @@ def test_os_env_no_validation_when_absent() -> None:
     result = validate(spec)
     os_env_errors = [e for e in result.errors if e.path.startswith("os_env")]
     assert os_env_errors == [], f"absent os_env should not produce errors, got: {result.errors}"
+
+
+@pytest.mark.parametrize("async_enabled", [True, False])
+def test_shell_yield_requires_inbox_tools(async_enabled: bool) -> None:
+    spec = _minimal_spec(
+        async_enabled=async_enabled,
+        os_env=OSEnvSpec(shell_yield_after=30),
+    )
+    errors = [e for e in validate(spec).errors if e.path == "os_env.shell_yield_after"]
+    assert bool(errors) is not async_enabled

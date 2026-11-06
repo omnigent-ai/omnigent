@@ -959,13 +959,17 @@ def _parse_os_env(
             "sandbox.type=none does not create a scratch tmpdir",
             code=ErrorCode.INVALID_INPUT,
         )
-    return OSEnvSpec(
-        type=str(raw.get("type", "caller_process")),
-        cwd=str(cwd_raw) if cwd_raw is not None else None,
-        sandbox=sandbox,
-        fork=fork,
-        start_in_scratch=start_in_scratch,
-    )
+    try:
+        return OSEnvSpec(
+            type=str(raw.get("type", "caller_process")),
+            cwd=str(cwd_raw) if cwd_raw is not None else None,
+            sandbox=sandbox,
+            fork=fork,
+            start_in_scratch=start_in_scratch,
+            shell_yield_after=raw.get("shell_yield_after"),
+        )
+    except ValueError as exc:
+        raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
 
 
 def _parse_terminals(

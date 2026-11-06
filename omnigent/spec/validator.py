@@ -542,6 +542,9 @@ def _validate_os_env(spec: AgentSpec, result: ValidationResult) -> None:
     if os_env is None:
         return
 
+    if os_env.shell_yield_after is not None and not spec.async_enabled:
+        result.add("os_env.shell_yield_after", "shell_yield_after requires async: true")
+
     fork = bool(getattr(os_env, "fork", False))
     start_in_scratch = bool(getattr(os_env, "start_in_scratch", False))
 
