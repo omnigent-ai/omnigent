@@ -48,6 +48,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -189,6 +190,8 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
 
     monkeypatch.chdir(tmp_path)
     _install_managed_mcp_config(tmp_path, monkeypatch)
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     captured_warnings: list[str] = []
     monkeypatch.setattr(
@@ -208,6 +211,105 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     # The runner recovers the bridge from the settings path, and hooks still load.
     assert Path(args[args.index("--settings") + 1]).parent == bridge_dir
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    # A static relay entry in the managed file reaches this bridge through the env.
+    relay_env = body["spec"]["env"]
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
+    assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    entry_env = claude_native_bridge.managed_mcp_relay_entry()["env"]
+    assert expand_entry_value(entry_env["OMNIGENT_HARNESS_TMP_PARENT"], relay_env) == str(
+        socket_root
+    )
+
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(
+        json.dumps({"mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}}),
+        encoding="utf-8",
+    )
+    captured_warnings.clear()
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+    assert "--mcp-config" not in body["spec"]["args"]
+    assert captured_warnings == []
+
+
+_RELAY_ARGS = [
+    "-I",
+    "-m",
+    "omnigent.harnesses.claude_native.bridge",
+    "serve-mcp",
+    "--bridge-dir",
+    "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+]
+
+
+@pytest.mark.parametrize(
+    ("entry", "configured"),
+    [
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": _RELAY_ARGS}, True, id="documented"
+        ),
+        pytest.param(
+            {
+                "command": "/usr/bin/corp-run",
+                "args": ["${OMNIGENT_MCP_RELAY_PYTHON}", *_RELAY_ARGS],
+            },
+            True,
+            id="wrapper",
+        ),
+        pytest.param(
+            {
+                "command": "/bin/sh",
+                "args": [
+                    "-c",
+                    "exec python -m x serve-mcp --bridge-dir=${OMNIGENT_MCP_RELAY_BRIDGE_DIR}",
+                ],
+            },
+            True,
+            id="shell-wrapper",
+        ),
+        pytest.param(
+            {"command": "/bin/false", "env": {"NOTE": "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"}},
+            False,
+            id="prefix-only-in-env",
+        ),
+        pytest.param(
+            {"command": "/usr/bin/other", "args": ["--dir", "${OMNIGENT_MCP_RELAY_BRIDGE_DIR}"]},
+            False,
+            id="not-the-relay",
+        ),
+        pytest.param(
+            {"url": "https://relay.example/${OMNIGENT_MCP_RELAY_BRIDGE_DIR}/serve-mcp"},
+            False,
+            id="http",
+        ),
+        pytest.param(
+            {"command": "${OMNIGENT_MCP_RELAY_PYTHON}", "args": "serve-mcp"}, False, id="bad-args"
+        ),
+    ],
+)
+def test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: dict[str, object], configured: bool
+) -> None:
+    """Only an entry whose launch reaches serve-mcp with the session's bridge dir counts,
+    so the warning and the tools prompt never rest on an entry that cannot connect."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    _install_managed_mcp_config(tmp_path, monkeypatch)
+    managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
+    managed_file.write_text(json.dumps({"mcpServers": {"omnigent": entry}}), encoding="utf-8")
+
+    assert claude_native_bridge.managed_mcp_relay_configured() is configured
+
+
+def test_documented_managed_relay_entry_matches_the_one_omnigent_reads() -> None:
+    """Operators copy the entry from the docs, so it must be the shape the relay expands."""
+    from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+
+    doc = (Path(__file__).parents[3] / "docs" / "CLAUDE_MANAGED_MCP.md").read_text()
+    documented = json.loads(doc.split("```json\n", 1)[1].split("```", 1)[0])
+    assert documented == {
+        "mcpServers": {"omnigent": claude_native_bridge.managed_mcp_relay_entry()}
+    }
 
 
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:

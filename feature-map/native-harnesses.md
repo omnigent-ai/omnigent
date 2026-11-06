@@ -28,6 +28,13 @@ implements them separately, so a fix for one harness does not reach the others.
   saved selections on edit. Project-settings pickers are unchanged.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
+- `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
+  `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
+  sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
+  the file's `omnigent` relay entry (`docs/CLAUDE_MANAGED_MCP.md`). Without a
+  usable entry the session still launches, without Omnigent's tools, and the
+  launch logs a warning naming the missing entry. claude-sdk applies the same
+  check (see [Composer](./composer.md)).
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
   an Omnigent session behind it.
 - `gateway-attribution`: Unity Gateway requests name the coding agent and the
@@ -187,6 +194,12 @@ check the same authored role is present once. For a custom Pi-native agent,
 `executor.system_prompt_mode: replace` replaces Pi's base prompt. Explicit agent
 instructions remain; these options do not restrict file access or extensions.
 The `omnigent pi` wrapper also appends its own startup instructions.
+
+**Managed MCP config (Claude):** on a disposable machine whose Claude Code
+reads an enterprise `managed-mcp.json` containing the documented `omnigent`
+entry, start a Claude Code session from New Chat and another with
+`omnigent claude`, then ask each to use an Omnigent tool. Remove the entry and
+start another session from each surface.
 
 **Working status:** watch the session's Chat indicator after sending from the
 new-session composer, an existing-session composer, or the agent terminal.
@@ -440,6 +453,24 @@ live external-gateway compatibility remains unverified. See [the gateway
 guide](../docs/native-agy-gateways.md) for live smoke steps.
 The reader/server replay regression is
 `tests/server/integration/test_sessions_external_item_idempotency.py::test_agy_reader_restart_preserves_messages_and_tool_pairs`.
+
+**`claude-managed-mcp-relay`, both Claude native launch paths:** the launch
+environment and the entry check are covered by
+`tests/harnesses/claude_native/test_claude_native.py::test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config`
+(`omnigent claude`),
+`tests/runner/test_app_sessions_native_terminals_autocreate.py::test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_bridge`
+(web launch) and
+`tests/harnesses/claude_native/test_claude_native.py::test_managed_relay_entry_must_launch_serve_mcp_for_the_session_bridge`.
+No browser test drives a native session under a managed file. Manually, in a
+disposable container or VM where Claude Code's managed directory
+(`/etc/claude-code` on Linux, `/Library/Application Support/ClaudeCode` on
+macOS) is writable, deploy the documented entry, start a session from each
+surface, and expect `claude mcp list` in its terminal to report `omnigent`
+connected and an Omnigent tool call such as `sys_session_get_info` to
+succeed. With the entry removed, expect each launch to succeed without
+`mcp__omnigent__*` tools, and the launching process (the runner for web, the
+`omnigent claude` process locally) to log that the relay entry is missing.
+Remove the file afterwards.
 
 Cross-harness journeys:
 
@@ -1272,6 +1303,13 @@ With the default client deadline, cancellation must clear the approval without
 creating the automation. Record the client configuration with the evidence.
 
 ## Gotchas
+
+- An enterprise `managed-mcp.json` applies to every Claude Code process on the
+  machine, whatever its `HOME` or `CLAUDE_CONFIG_DIR`, including other test
+  runs and the developer's own sessions. Drive `claude-managed-mcp-relay` only on
+  a disposable machine, and never overwrite a file an administrator deployed.
+  Outside Omnigent the relay entry's variables are unset, so a hand-started
+  `claude mcp list` reports `omnigent` as failed; that is expected.
 
 - Relay approval waits retain one pending request slot. Vendor clients that do not
   honor MCP progress notifications can still impose their own shorter deadline;

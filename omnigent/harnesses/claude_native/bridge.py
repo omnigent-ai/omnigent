@@ -208,6 +208,22 @@ BRIDGE_PORT_POOL_ENV_VAR = "OMNIGENT_BRIDGE_PORT_POOL"
 # ingress plus one tool relay per session), hence a pool rather than one port.
 DEFAULT_BRIDGE_PORT_POOL: tuple[int, ...] = tuple(range(28700, 28716))
 
+
+def _pinned_temp_parent() -> Path | None:
+    """A pinned ``TMPDIR`` this process may only read, to validate bridges under it.
+
+    Helpers launched for the runner get its ``TMPDIR`` pinned (see
+    :func:`build_mcp_config`), but Python skips a ``TMPDIR`` it can't write, as in a
+    sandboxed relay. New bridges are still allocated under ``tempfile``'s choice; this
+    root only lets the helper recognise the bridge the runner prepared under it.
+    """
+    pinned = os.environ.get("TMPDIR")
+    if not (pinned and os.path.isabs(pinned) and os.path.isdir(pinned)):
+        return None
+    root = _absolute_syntactic_path(Path(pinned))
+    return None if root == _absolute_syntactic_path(_TRUSTED_PARENT) else root
+
+
 # Root for the per-process Claude bridge tree. Namespaced by uid so
 # other Unix users on the same host cannot read the bearer token or
 # pre-create the parent as a symlink to redirect the bridge tree. The
@@ -268,6 +284,23 @@ _PERMISSION_HOOK_FILE = "permission_hook.json"
 _CONTEXT_FILE = "context.json"
 _USER_CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
 _MCP_SERVER_NAME = "omnigent"
+# Read by the static relay entry in an enterprise managed-mcp.json; see
+# docs/CLAUDE_MANAGED_MCP.md.
+MANAGED_MCP_RELAY_PYTHON_ENV = "OMNIGENT_MCP_RELAY_PYTHON"
+MANAGED_MCP_RELAY_BRIDGE_DIR_ENV = "OMNIGENT_MCP_RELAY_BRIDGE_DIR"
+MANAGED_MCP_RELAY_TMPDIR_ENV = "OMNIGENT_MCP_RELAY_TMPDIR"
+# A private directory for serve-mcp's control socket; empty keeps the shared default.
+MANAGED_MCP_RELAY_SOCKET_DIR_ENV = "OMNIGENT_MCP_RELAY_SOCKET_DIR"
+MANAGED_MCP_RELAY_ENV_NAMES = (
+    MANAGED_MCP_RELAY_PYTHON_ENV,
+    MANAGED_MCP_RELAY_BRIDGE_DIR_ENV,
+    MANAGED_MCP_RELAY_TMPDIR_ENV,
+    MANAGED_MCP_RELAY_SOCKET_DIR_ENV,
+)
+MANAGED_MCP_RELAY_MISSING_WARNING = (
+    "Claude Code has an enterprise managed-mcp.json without Omnigent's relay entry; "
+    "starting without Omnigent's MCP tools (see docs/CLAUDE_MANAGED_MCP.md)."
+)
 _MCP_PROTOCOL_VERSION = "2024-11-05"
 # Tools-changed: harness POSTs to the bridge MCP server's localhost
 # control endpoint, which emits ``notifications/tools/list_changed``
@@ -910,6 +943,12 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     router_root = _absolute_syntactic_path(subagent_router_bridge_root())
     if target.is_relative_to(router_root):
         return _absolute_syntactic_path(router_root.parent.parent)
+
+    # A sandboxed helper may only read the TMPDIR the runner pinned for it, and the
+    # bridge the runner prepared sits in that root's uid-scoped tree.
+    pinned = _pinned_temp_parent()
+    if pinned is not None and target.is_relative_to(pinned / f"omnigent-{stable_user_id()}"):
+        return pinned
 
     raise RuntimeError(
         f"bridge dir {target!s} is not under an allowed bridge root "
@@ -1607,7 +1646,7 @@ def acp_mcp_bridge_root() -> Path:
 
 
 def prepare_acp_mcp_bridge_dir() -> Path:
-    """Create a fresh, secure per-relay bridge dir for an ACP harness.
+    """Create a fresh, secure per-relay bridge dir for an ACP harness or claude-sdk.
 
     Returns a unique owner-only directory under :func:`acp_mcp_bridge_root` with
     a minimal token-only ``bridge.json`` — so the shared ``serve-mcp`` serves
@@ -2384,29 +2423,163 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
         :data:`sys.executable`.
     :returns: JSON-serializable Claude MCP config.
     """
-    python = python_executable or sys.executable
     return {
         "mcpServers": {
-            _MCP_SERVER_NAME: {
-                "command": python,
-                "args": [
-                    "-I",
-                    "-m",
-                    "omnigent.harnesses.claude_native.bridge",
-                    "serve-mcp",
-                    "--bridge-dir",
-                    str(bridge_dir),
-                ],
-                "env": {
-                    "PYTHONUNBUFFERED": "1",
-                    # The bridge root is derived from tempfile at import time.
-                    # Keep it aligned with the runner when Claude inherits a
-                    # different TMPDIR from the user's shell.
-                    "TMPDIR": str(_TRUSTED_PARENT),
-                },
-            }
+            _MCP_SERVER_NAME: _serve_mcp_entry(
+                python_executable or sys.executable, str(bridge_dir), str(_TRUSTED_PARENT)
+            )
         }
     }
+
+
+def _serve_mcp_entry(
+    python: str, bridge_dir: str, tmpdir: str, *, socket_dir: str | None = None
+) -> _JsonObject:
+    """One Claude Code MCP server entry that runs ``serve-mcp`` for a bridge directory.
+
+    :param socket_dir: Directory for its control socket, or ``None`` for the shared
+        harness socket root.
+    """
+    from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
+
+    env = {
+        "PYTHONUNBUFFERED": "1",
+        # The bridge root is derived from tempfile at import time. Keep it
+        # aligned with the runner when Claude inherits a different TMPDIR.
+        "TMPDIR": tmpdir,
+    }
+    if socket_dir is not None:
+        env[HARNESS_TMP_PARENT_ENV_VAR] = socket_dir
+    return {
+        "command": python,
+        "args": [
+            "-I",
+            "-m",
+            "omnigent.harnesses.claude_native.bridge",
+            "serve-mcp",
+            "--bridge-dir",
+            bridge_dir,
+        ],
+        "env": env,
+    }
+
+
+def managed_mcp_relay_entry() -> _JsonObject:
+    """The static ``omnigent`` entry an operator adds to Claude Code's ``managed-mcp.json``.
+
+    Claude Code refuses ``--mcp-config`` while that file exists, so this entry stands in
+    for :func:`build_mcp_config`; Claude Code expands each session's values from the
+    environment :func:`managed_mcp_relay_env` sets.
+    """
+    return _serve_mcp_entry(
+        f"${{{MANAGED_MCP_RELAY_PYTHON_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_BRIDGE_DIR_ENV}}}",
+        f"${{{MANAGED_MCP_RELAY_TMPDIR_ENV}}}",
+        # Empty when unset, which leaves serve-mcp on the shared default socket root.
+        socket_dir=f"${{{MANAGED_MCP_RELAY_SOCKET_DIR_ENV}:-}}",
+    )
+
+
+def managed_mcp_relay_env(
+    bridge_dir: Path,
+    *,
+    python_executable: str | None = None,
+    socket_dir: Path | None = None,
+) -> dict[str, str]:
+    """Environment that points :func:`managed_mcp_relay_entry` at one session's bridge.
+
+    :param bridge_dir: Bridge directory ``serve-mcp`` serves.
+    :param python_executable: Python with Omnigent installed; ``None`` uses this one.
+    :param socket_dir: Control-socket directory: a private one a sandbox grants, or
+        the configured harness socket root; ``None`` leaves serve-mcp on the default root.
+    :returns: Claude Code environment, e.g. ``{"OMNIGENT_MCP_RELAY_BRIDGE_DIR": "/tmp/x", ...}``.
+    """
+    return {
+        MANAGED_MCP_RELAY_PYTHON_ENV: python_executable or sys.executable,
+        MANAGED_MCP_RELAY_BRIDGE_DIR_ENV: str(bridge_dir),
+        MANAGED_MCP_RELAY_TMPDIR_ENV: str(_TRUSTED_PARENT),
+        # Set even when empty, so an inherited value can't pick another session's.
+        MANAGED_MCP_RELAY_SOCKET_DIR_ENV: str(socket_dir) if socket_dir is not None else "",
+    }
+
+
+def prepare_relay_socket_dir() -> Path:
+    """Create a short, private control-socket directory for one relay.
+
+    It sits under the harness socket root, kept short because a Unix socket path is
+    capped at 104 bytes on macOS, so a sandbox can grant this one directory rather
+    than the root that holds other sessions' sockets.
+
+    :returns: The new directory, e.g. ``/tmp/omnigent-501/r-1a2b3c4d``.
+    """
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    root = resolve_harness_tmp_parent()
+    root.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_private_dir(root, os.getuid())
+    socket_dir = root / f"r-{secrets.token_hex(4)}"
+    _ensure_private_dir(socket_dir, os.getuid())
+    return socket_dir
+
+
+def claude_terminal_relay_env(
+    bridge_dir: Path, *, python_executable: str | None = None
+) -> dict[str, str]:
+    """Relay environment for a Claude Code terminal, needed only under ``managed-mcp.json``.
+
+    Without that file :func:`augment_claude_args` passes the relay as ``--mcp-config``.
+    The entry sets serve-mcp's socket root from this environment, so it carries the
+    launching environment's root, as serve-mcp would inherit it from ``--mcp-config``.
+    """
+    from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
+
+    if not claude_code_managed_mcp_present():
+        return {}
+    return managed_mcp_relay_env(
+        bridge_dir,
+        python_executable=python_executable,
+        socket_dir=resolve_harness_tmp_parent(),
+    )
+
+
+def managed_mcp_relay_configured() -> bool:
+    """Whether the ``managed-mcp.json`` Claude Code applies has a usable relay entry.
+
+    Both Claude harnesses use this one check, so they agree on whether a session
+    gets Omnigent's tools or the missing-entry warning.
+    """
+    from omnigent.host.mcp_inventory import managed_claude_mcp_config
+
+    _present, servers = managed_claude_mcp_config()
+    return _launches_session_relay(servers.get(_MCP_SERVER_NAME))
+
+
+# ``${VAR}`` or ``${VAR:-default}``, as Claude Code expands managed entries.
+_RELAY_BRIDGE_DIR_REFERENCE = re.compile(
+    r"\$\{" + MANAGED_MCP_RELAY_BRIDGE_DIR_ENV + r"(?::-[^}]*)?\}"
+)
+
+
+def _launches_session_relay(entry: object) -> bool:
+    """Whether a stdio entry runs ``serve-mcp`` for the bridge directory Omnigent sets.
+
+    A wrapper may precede the relay, but ``serve-mcp`` and the bridge directory must
+    appear in its command or arguments; an environment value launches nothing.
+    """
+    if not isinstance(entry, Mapping) or entry.get("type", "stdio") != "stdio":
+        return False
+    command, args, env = entry.get("command"), entry.get("args", []), entry.get("env", {})
+    if not (isinstance(command, str) and command.strip()):
+        return False
+    if not (isinstance(args, list) and all(isinstance(arg, str) for arg in args)):
+        return False
+    if not (isinstance(env, Mapping) and all(isinstance(value, str) for value in env.values())):
+        return False
+    launch = [command, *args]
+    return any("serve-mcp" in part for part in launch) and any(
+        _RELAY_BRIDGE_DIR_REFERENCE.search(part) for part in launch
+    )
 
 
 def _pin_runner_tmpdir(command: str) -> str:
@@ -3007,11 +3180,10 @@ def augment_claude_args(
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
 
     if claude_code_managed_mcp_present():
-        # Claude Code exits at startup on --mcp-config while an enterprise MCP config exists.
-        _logger.warning(
-            "Claude Code has an enterprise managed-mcp.json; launching without "
-            "Omnigent's MCP tools."
-        )
+        # Claude Code exits at startup on --mcp-config while an enterprise MCP config
+        # exists; its relay entry reads the bridge from claude_terminal_relay_env.
+        if not managed_mcp_relay_configured():
+            _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
         args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])

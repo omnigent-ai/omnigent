@@ -164,6 +164,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   inventory every few seconds until the row is connected. In a claude-sdk
   session, the next turn after the row turns connected reaches that server
   without starting a new session. Custom agent servers carry no account state.
+  While the host has an enterprise `managed-mcp.json`, Claude rows are only the
+  servers that file pins (no user or plugin rows), and Claude sessions reach
+  Omnigent's tools only through the file's `omnigent` relay entry
+  (`docs/CLAUDE_MANAGED_MCP.md`).
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -668,6 +672,17 @@ Other connection providers alone do not enable the managed MCP picker.
   server's tool. Covered by
   `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session`
   and, for a reconnect that hangs, `tests/e2e/test_claude_sdk_mcp_reconnect_timeout_e2e.py`.
+  Under an enterprise `managed-mcp.json` carrying the `omnigent` relay entry,
+  `tests/e2e_ui/chat/test_claude_sdk_host_mcp_servers.py::test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools`
+  starts a claude-sdk session, expects only the managed row in `/mcp`, flips it
+  to **Connected** and expects the next turn to use the server. It writes the
+  platform's real managed file, so it runs only with
+  `OMNIGENT_TEST_CLAUDE_MANAGED_MCP=1` on a disposable machine or container
+  where that directory is writable. Its `bwrap` variant gives the agent a
+  `linux_bwrap` sandbox and also needs Bubblewrap on Linux; in a container, run
+  it privileged so bwrap can mount `/proc`. Without the entry, expect the
+  session to start without Omnigent tools and the runner log to name the
+  missing entry.
   Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
   row labels, the Sign in / Signing in… / error renderings and the Settings
   link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
@@ -897,6 +912,9 @@ Other connection providers alone do not enable the managed MCP picker.
 - The Claude and Codex pickers here list the native harnesses' catalogs. A
   `claude-sdk` or `codex` SDK worker has no picker of its own, so don't verify
   its models here: see the smart routing note in the [index](./README.md#not-yet-mapped).
+- An enterprise `managed-mcp.json` affects every Claude Code process on the
+  machine, including other test runs. Don't deploy one on a shared developer
+  machine; the managed `/mcp` journey needs a disposable container or VM.
 - The managed MCP picker uses only the administrator's registry; it does not
   add arbitrary MCP URLs or enable itself from existing GitHub/Databricks
   connections. Bearer-token accounts must be connected in settings first.

@@ -97,6 +97,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
+    claude_terminal_relay_env,
     prepare_bridge_dir,
     read_active_session_id,
     resolve_launch_effort_level,
@@ -7048,7 +7049,10 @@ def _claude_terminal_request(
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
     # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
-    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
+    spec["env"] = {
+        **build_native_claude_terminal_env(claude_config, client_surface="cli"),
+        **claude_terminal_relay_env(bridge_dir),
+    }
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove credentials that override the selected auth and the

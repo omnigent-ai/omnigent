@@ -10,7 +10,6 @@ import itertools
 import json
 import os
 import queue
-import select
 import shlex
 import shutil
 import socket
@@ -28,7 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
-from typing import Any, TextIO
+from typing import Any
 from unittest.mock import Mock
 
 import httpx
@@ -85,6 +84,8 @@ from omnigent.inner.datamodel import (
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
+from tests._helpers.live_server import terminate_process
+from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
 
 
 @pytest.fixture(autouse=True)
@@ -4783,7 +4784,7 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
             + "\n"
         )
         proc.stdin.flush()
-        initialize = _read_json_line(proc.stdout, timeout_s=5.0)
+        initialize = read_json_line(proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
         capabilities = initialize["result"]["capabilities"]
         # Tools/list_changed is still needed for the active-turn relay.
@@ -4794,12 +4795,7 @@ def test_mcp_server_initialize_omits_blocked_channel_capability(
             "experimental", {}
         )
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_write_tmux_target_persists_socket_and_target(tmp_path: Path) -> None:
@@ -7452,11 +7448,11 @@ async def test_channel_server_relays_active_omnigent_tools(
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
-        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        initialize = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
 
         relay = start_tool_relay(
@@ -7475,14 +7471,14 @@ async def test_channel_server_relays_active_omnigent_tools(
             loop=asyncio.get_running_loop(),
         )
         post_tools_changed(bridge_dir, cancelled=threading.Event() if cancellable else None)
-        changed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        changed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert changed["method"] == "notifications/tools/list_changed"
 
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
         )
-        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        listed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         listed_tools = listed["result"]["tools"]
         custom_tools = [tool for tool in listed_tools if tool["name"] == "sys_custom"]
         assert custom_tools == [
@@ -7496,7 +7492,7 @@ async def test_channel_server_relays_active_omnigent_tools(
             }
         ]
 
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -7508,7 +7504,7 @@ async def test_channel_server_relays_active_omnigent_tools(
                 },
             },
         )
-        tool_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        tool_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert tool_result["id"] == 3
         if result_kind == "text":
             text = tool_result["result"]["content"][0]["text"]
@@ -7522,12 +7518,7 @@ async def test_channel_server_relays_active_omnigent_tools(
     finally:
         if relay is not None:
             relay.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 def test_call_relay_tool_returns_mcp_error_on_read_timeout(
@@ -7752,17 +7743,17 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
         )
-        initialize = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        initialize = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert initialize["id"] == 1
 
         # Call the flaky relay tool. Decoding the undecodable response raises
         # UnicodeDecodeError, which escapes _call_relay_tool's except OSError
         # and is caught by the loop's per-request guard.
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -7771,7 +7762,7 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
                 "params": {"name": "sys_flaky", "arguments": {}},
             },
         )
-        call_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        call_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert call_result["id"] == 2
         # The guard reports the uncaught exception as a JSON-RPC -32603
         # ("Internal error") response — NOT a normal MCP error result. This is
@@ -7783,23 +7774,18 @@ async def test_serve_mcp_survives_handler_exception_and_keeps_serving(
         # The decisive assertion: the server is STILL ALIVE and answers the
         # next request. Before the per-request loop guard, the exception above
         # would have exited the process and this read would time out.
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
         )
-        listed = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=5.0)
+        listed = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=5.0)
         assert listed["id"] == 3
         assert "tools" in listed["result"]
     finally:
         httpd.shutdown()
         httpd.server_close()
         server_thread.join(timeout=5.0)
-        proc.terminate()
-        try:
-            proc.wait(timeout=5.0)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5.0)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.parametrize("concurrent_method", ["ping", "tools/call"])
@@ -8420,43 +8406,6 @@ async def test_relay_close_keeps_advertisement_owned_by_newer_relay(
             old_relay.close()
         if new_relay is not None:
             new_relay.close()
-
-
-def _write_json_line(handle: TextIO, payload: dict[str, object]) -> None:
-    """
-    Write one JSON-RPC line to a subprocess stdin stream.
-
-    :param handle: Text stdin handle returned by
-        :class:`subprocess.Popen`.
-    :param payload: JSON-compatible object to write.
-    :returns: None.
-    """
-    handle.write(json.dumps(payload) + "\n")
-    handle.flush()
-
-
-def _read_json_line(handle: TextIO, *, timeout_s: float) -> dict[str, object]:
-    """
-    Read one JSON line from a subprocess stdout stream.
-
-    :param handle: Text stdout handle returned by
-        :class:`subprocess.Popen`.
-    :param timeout_s: Seconds to wait, e.g. ``5.0``.
-    :returns: Parsed JSON object.
-    :raises TimeoutError: If no line is available before the
-        timeout.
-    """
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        ready, _write, _error = select.select([handle], [], [], 0.05)
-        if not ready:
-            continue
-        line = handle.readline()
-        if line:
-            payload = json.loads(line)
-            assert isinstance(payload, dict)
-            return payload
-    raise TimeoutError("subprocess did not emit a JSON line")
 
 
 def test_usage_from_transcript_entry_sums_context_tokens() -> None:
@@ -17151,7 +17100,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
     )
     try:
         assert proc.stdin is not None
-        _write_json_line(
+        write_json_line(
             proc.stdin,
             {
                 "jsonrpc": "2.0",
@@ -17162,7 +17111,7 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         )
         await asyncio.wait_for(waiting.wait(), 8)
         if stop == "notification":
-            _write_json_line(
+            write_json_line(
                 proc.stdin,
                 {
                     "jsonrpc": "2.0",
@@ -17181,22 +17130,17 @@ async def test_relay_mcp_cancellation_releases_pending_approval(
         assert not pending_approvals.resolve("elicit_cancel_relay", True)
         if stop == "notification":
             assert proc.stdout is not None
-            cancelled_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            cancelled_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=3)
             assert cancelled_result["id"] == 51
             assert cancelled_result["result"]["isError"]
-            _write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
-            ping_result = await asyncio.to_thread(_read_json_line, proc.stdout, timeout_s=3)
+            write_json_line(proc.stdin, {"jsonrpc": "2.0", "id": 52, "method": "ping"})
+            ping_result = await asyncio.to_thread(read_json_line, proc.stdout, timeout_s=3)
             assert ping_result == {"jsonrpc": "2.0", "id": 52, "result": {}}
     finally:
         pending_approvals.resolve("elicit_cancel_relay", False)
         if stop != "relay_close":
             relay.close()
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
+        terminate_process(proc, timeout_s=5)
 
 
 @pytest.mark.asyncio
@@ -17256,3 +17200,62 @@ async def test_relay_keeps_high_descriptor_connections_alive(
         release.set()
         await asyncio.wait_for(call, 2)
         relay.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_read_only_pinned_tmpdir_still_allocates_bridges_elsewhere(tmp_path: Path) -> None:
+    """A runner whose ``TMPDIR`` exists but can't be written keeps tempfile's fallback."""
+    pinned = tmp_path / "read-only-tmp"
+    pinned.mkdir()
+    pinned.chmod(0o500)
+    probe = (
+        "from omnigent.harnesses.claude_native import bridge\n"
+        "print(bridge._TRUSTED_PARENT)\n"
+        "print(bridge.prepare_acp_mcp_bridge_dir())\n"
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            env={**os.environ, "TMPDIR": str(pinned)},
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=True,
+        )
+    finally:
+        pinned.chmod(0o700)
+    trusted_parent, bridge_dir = map(Path, completed.stdout.split())
+    assert trusted_parent != pinned
+    assert bridge_dir.is_relative_to(trusted_parent) and bridge_dir.is_dir()
+    shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_a_sandboxed_helper_accepts_the_bridge_under_its_read_only_pinned_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sandboxed relay may only read the ``TMPDIR`` its entry pins, so tempfile falls
+    back elsewhere; the runner's bridge under that pinned root must still validate."""
+    from omnigent._platform import stable_user_id
+    from omnigent.harnesses.claude_native import bridge
+
+    pinned = tmp_path / "runner-tmp"
+    bridge_dir = pinned / f"omnigent-{stable_user_id()}" / "acp-mcp" / "abc123"
+    bridge_dir.mkdir(parents=True, mode=0o700)
+    for directory in (bridge_dir.parent, bridge_dir.parent.parent):
+        directory.chmod(0o700)
+    monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path / "sandbox-scratch")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path / "sandbox-scratch" / "claude-native")
+    with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+        bridge._trusted_parent_for_bridge_dir(bridge_dir)
+
+    monkeypatch.setenv("TMPDIR", f"{pinned}/")
+    pinned.chmod(0o500)
+    try:
+        assert bridge._trusted_parent_for_bridge_dir(bridge_dir) == pinned
+        bridge._ensure_secure_dir(bridge_dir)
+        # Only the uid-scoped tree under it counts, not the whole pinned root.
+        with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
+            bridge._trusted_parent_for_bridge_dir(pinned / "elsewhere")
+    finally:
+        pinned.chmod(0o700)

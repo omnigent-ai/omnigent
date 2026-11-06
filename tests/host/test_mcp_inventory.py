@@ -393,11 +393,13 @@ def test_auth_status_is_fresh_while_the_config_scan_is_cached(
     assert "auth_status" not in inventory.discover()[0]
 
 
-def test_managed_config_servers_are_discovered_and_outrank_user_config(
+def test_a_managed_config_lists_only_the_servers_claude_code_loads(
     home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """An organization's pinned servers are often the ones needing sign-in, so the
-    inventory has to see them; they also win their name against the user's own config."""
+    inventory has to see them. While the file exists Claude Code loads no user, project
+    or plugin server, so those rows would name servers no session can reach."""
+    _write_claude_plugin(home / ".claude")
     _write_managed_mcp(
         tmp_path,
         monkeypatch,
@@ -437,9 +439,25 @@ def test_managed_config_servers_are_discovered_and_outrank_user_config(
             "scope": "user",
             "managed": "true",
         },
-        {"name": "own", "harness": "claude", "transport": "stdio", "scope": "user"},
     ]
     assert _SECRET not in json.dumps(servers)
+
+    # A file that can't be parsed or read still keeps exclusive control, so Claude Code
+    # loads nothing.
+    managed = tmp_path / "managed" / "managed-mcp.json"
+    managed.write_text("not json")
+    assert discover_mcp_servers() == []
+
+    managed.write_text(json.dumps({"mcpServers": {"linear": _stdio()}}))
+    read_text = Path.read_text
+
+    def deny_managed(path: Path, *args: object, **kwargs: object) -> str:
+        if path == managed:
+            raise PermissionError(13, "Permission denied", str(path))
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", deny_managed)
+    assert discover_mcp_servers() == []
 
 
 def test_only_the_first_readable_managed_config_counts(

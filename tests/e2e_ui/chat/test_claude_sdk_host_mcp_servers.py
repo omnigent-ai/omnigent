@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -15,6 +17,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from omnigent.harnesses.claude_native.bridge import managed_mcp_relay_entry
 from tests._helpers.compat import runner_executable
 from tests._helpers.host import isolated_host
 from tests._helpers.live_server import reserve_port
@@ -71,9 +74,14 @@ def _write_auth_status(home: Path, name: str, status: str) -> None:
 
 @contextlib.contextmanager
 def _claude_sdk_session(
-    client: httpx.Client, mock_url: str, name: str, host_id: str, workspace: Path
+    client: httpx.Client,
+    mock_url: str,
+    name: str,
+    host_id: str,
+    workspace: Path,
+    sandbox: str | None = None,
 ) -> Iterator[str]:
-    """Create a claude-sdk session on the host and delete it afterwards."""
+    """Create a claude-sdk session on the host, its CLI in ``sandbox`` if given."""
     yaml_text = (
         f"name: {name}\n"
         "prompt: You are a terse assistant.\n"
@@ -86,6 +94,15 @@ def _claude_sdk_session(
         "    api_key: mock-key\n"
         f"    base_url: {mock_url}\n"
     )
+    if sandbox is not None:
+        yaml_text += (
+            "os_env:\n"
+            "  type: caller_process\n"
+            "  cwd: .\n"
+            "  sandbox:\n"
+            f"    type: {sandbox}\n"
+            "    allow_network: true\n"
+        )
     created = post_session_bundle(
         client.post,
         "/v1/sessions",
@@ -130,25 +147,14 @@ def test_claude_sdk_mcp_panel_lists_host_managed_server_sign_in_state(
     home = tmp_path / "host" / "home"
     (home / ".omnigent").mkdir(parents=True)
     _write_auth_status(home, _MANAGED_SERVER, "sign_in_required")
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    with (
-        httpx.Client(base_url=live_server, timeout=30) as client,
-        isolated_host(
-            tmp_path / "host",
-            live_server,
-            env=_HOST_ENV,
-            config=_host_config(mock_llm_server_url),
-            command=_host_command(live_server, managed),
-            ready=lambda started: started.wait_online(client, timeout=120),
-        ) as host,
-        _claude_sdk_session(
-            client, mock_llm_server_url, f"sdk-mcp-{host.host_id[:8]}", host.host_id, workspace
-        ) as session_id,
-    ):
-        page = request.getfixturevalue("page")
-        _skip_imports_review(page, host.host_id)
-        page.goto(f"{live_server}/c/{session_id}")
+    with _hosted_session_page(
+        request,
+        live_server,
+        mock_llm_server_url,
+        tmp_path,
+        f"sdk-mcp-{uuid.uuid4().hex[:6]}",
+        command=_host_command(live_server, managed),
+    ) as (_client, _session_id, page):
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=60_000)
         composer.fill("/mcp")
@@ -251,6 +257,78 @@ def _wait_reply(page: Page, reply: str) -> None:
     expect(page.locator(_WORKING)).to_have_count(0, timeout=120_000)
 
 
+def _script_two_turns(
+    mock_url: str, uid: str, first_turn: list[dict[str, object]]
+) -> tuple[str, str]:
+    """Script a first turn, then a second that reads the note; returns their prompt tokens."""
+    first, second = f"TURNONE-{uid}", f"TURNTWO-{uid}"
+    second_turn = [
+        {"tool_calls": [{"call_id": f"read-{uid}", "name": _NOTE_TOOL, "arguments": "{}"}]},
+        *[{"text": "turn two finished"}] * 4,
+    ]
+    # Only the session's main model advertises Omnigent tools, so CLI side requests
+    # cannot drain these scripts.
+    for token, responses in ((first, first_turn), (second, second_turn)):
+        configure_mock_llm(
+            mock_url, responses, key=token, match=token, required_tools=[_SESSION_TOOL]
+        )
+    return first, second
+
+
+@contextlib.contextmanager
+def _hosted_session_page(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_url: str,
+    tmp_path: Path,
+    name: str,
+    *,
+    command: list[str] | None = None,
+    sandbox: str | None = None,
+) -> Iterator[tuple[httpx.Client, str, Page]]:
+    """Open a claude-sdk session on an isolated host rooted at ``tmp_path / "host"``."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    with (
+        httpx.Client(base_url=live_server, timeout=30) as client,
+        isolated_host(
+            tmp_path / "host",
+            live_server,
+            env=_HOST_ENV,
+            config=_host_config(mock_url),
+            command=command,
+            ready=lambda started: started.wait_online(client, timeout=120),
+        ) as host,
+        _claude_sdk_session(
+            client, mock_url, name, host.host_id, workspace, sandbox
+        ) as session_id,
+    ):
+        page = request.getfixturevalue("page")
+        _skip_imports_review(page, host.host_id)
+        page.goto(f"{live_server}/c/{session_id}")
+        yield client, session_id, page
+
+
+def _complete_sign_in(gate: _SignInGate, home: Path) -> None:
+    """Sign in once the CLI has been refused, then report it as the sign-in manager would."""
+    # The CLI connects on its own if sign-in completes before its first request.
+    poll_until(lambda: gate.rejected, timeout_s=30)
+    gate.signed_in = True
+    _write_auth_status(home, _USER_SERVER, "connected")
+
+
+def _expect_note_read(client: httpx.Client, session_id: str) -> None:
+    try:
+        poll_until(
+            lambda: (
+                _NOTE_TEXT in json.dumps(client.get(f"/v1/sessions/{session_id}/items").json())
+            ),
+            timeout_s=15,
+        )
+    except AssertionError:
+        pytest.fail("the session never reached the MCP server signed in after it started")
+
+
 @pytest.mark.timeout(900)
 def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
     request: pytest.FixtureRequest,
@@ -261,26 +339,7 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
     if shutil.which("claude") is None:
         pytest.skip("needs the claude CLI")
     uid = uuid.uuid4().hex[:6]
-    first, second = f"TURNONE-{uid}", f"TURNTWO-{uid}"
-    # Only the session's main model advertises Omnigent tools, so CLI side requests
-    # cannot drain these scripts.
-    configure_mock_llm(
-        mock_llm_server_url,
-        [{"text": "ack one"}] * 4,
-        key=first,
-        match=first,
-        required_tools=[_SESSION_TOOL],
-    )
-    configure_mock_llm(
-        mock_llm_server_url,
-        [
-            {"tool_calls": [{"call_id": f"read-{uid}", "name": _NOTE_TOOL, "arguments": "{}"}]},
-            *[{"text": "turn two finished"}] * 4,
-        ],
-        key=second,
-        match=second,
-        required_tools=[_SESSION_TOOL],
-    )
+    first, second = _script_two_turns(mock_llm_server_url, uid, [{"text": "ack one"}] * 4)
     managed = tmp_path / "managed" / "managed-mcp.json"
     managed.parent.mkdir(parents=True)
     home = tmp_path / "host" / "home"
@@ -290,41 +349,114 @@ def test_claude_sdk_session_reaches_mcp_server_signed_in_mid_session(
             json.dumps({"mcpServers": {_USER_SERVER: {"type": "http", "url": gate.url}}})
         )
         _write_auth_status(home, _USER_SERVER, "sign_in_required")
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        with (
-            httpx.Client(base_url=live_server, timeout=30) as client,
-            isolated_host(
-                tmp_path / "host",
-                live_server,
-                env=_HOST_ENV,
-                config=_host_config(mock_llm_server_url),
-                command=_host_command(live_server, managed),
-                ready=lambda started: started.wait_online(client, timeout=120),
-            ) as host,
-            _claude_sdk_session(
-                client, mock_llm_server_url, f"sdk-reconnect-{uid}", host.host_id, workspace
-            ) as session_id,
-        ):
-            page = request.getfixturevalue("page")
-            _skip_imports_review(page, host.host_id)
-            page.goto(f"{live_server}/c/{session_id}")
+        with _hosted_session_page(
+            request,
+            live_server,
+            mock_llm_server_url,
+            tmp_path,
+            f"sdk-reconnect-{uid}",
+            command=_host_command(live_server, managed),
+        ) as (client, session_id, page):
             _send(page, f"Say ack. {first}")
             _wait_reply(page, "ack one")
-
-            # The CLI connects on its own if sign-in completes before its first request.
-            poll_until(lambda: gate.rejected, timeout_s=30)
-            gate.signed_in = True
-            _write_auth_status(home, _USER_SERVER, "connected")
+            _complete_sign_in(gate, home)
             _send(page, f"Read the note. {second}")
             _wait_reply(page, "turn two finished")
-            try:
-                poll_until(
-                    lambda: (
-                        _NOTE_TEXT
-                        in json.dumps(client.get(f"/v1/sessions/{session_id}/items").json())
-                    ),
-                    timeout_s=15,
-                )
-            except AssertionError:
-                pytest.fail("the session never reached the MCP server signed in after it started")
+            _expect_note_read(client, session_id)
+
+
+def _deployable_managed_mcp_path() -> Path:
+    """The platform's real managed-mcp.json, which the CLI reads from no other place."""
+    if os.environ.get("OMNIGENT_TEST_CLAUDE_MANAGED_MCP") != "1":
+        pytest.skip(
+            "deploys a machine-wide managed-mcp.json; set OMNIGENT_TEST_CLAUDE_MANAGED_MCP=1"
+        )
+    # Spelled out: the suite's autouse fixture empties the managed chain in this process.
+    managed_dir = (
+        "/Library/Application Support/ClaudeCode"
+        if sys.platform == "darwin"
+        else "/etc/claude-code"
+    )
+    path = Path(managed_dir) / "managed-mcp.json"
+    if os.path.exists(path):
+        pytest.skip(f"{path} already exists")
+    if not os.access(path.parent, os.W_OK):
+        pytest.skip(f"{path.parent} is not writable")
+    return path
+
+
+@pytest.mark.timeout(900)
+# Under bubblewrap the CLI has a private /tmp and a fixed /etc, so the relay bridge
+# and the managed config reach it only through its own launcher's grants.
+@pytest.mark.parametrize("sandbox", [None, "linux_bwrap"], ids=["unsandboxed", "bwrap"])
+def test_claude_sdk_session_under_managed_mcp_config_keeps_omnigent_tools(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    sandbox: str | None,
+) -> None:
+    if shutil.which("claude") is None:
+        pytest.skip("needs the claude CLI")
+    if sandbox == "linux_bwrap" and (sys.platform != "linux" or not shutil.which("bwrap")):
+        pytest.skip("needs bubblewrap on Linux")
+    managed = _deployable_managed_mcp_path()
+    uid = uuid.uuid4().hex[:6]
+    # Claude Code would refuse to start had the session passed --mcp-config, and a
+    # reply that needs the Omnigent tool proves the relay entry delivered it.
+    first, second = _script_two_turns(
+        mock_llm_server_url,
+        uid,
+        [
+            {"tool_calls": [{"call_id": f"info-{uid}", "name": _SESSION_TOOL, "arguments": "{}"}]},
+            *[{"text": "ack one"}] * 4,
+        ],
+    )
+    home = tmp_path / "host" / "home"
+    (home / ".omnigent").mkdir(parents=True)
+    # Claude Code loads no user server while the managed file exists, so /mcp hides it.
+    (home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"personal": {"type": "http", "url": "https://p.test/mcp"}}})
+    )
+    with _SignInGate() as gate, contextlib.ExitStack() as cleanup:
+        managed.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "omnigent": managed_mcp_relay_entry(),
+                        _USER_SERVER: {"type": "http", "url": gate.url},
+                    }
+                }
+            )
+        )
+        cleanup.callback(managed.unlink)
+        _write_auth_status(home, _USER_SERVER, "sign_in_required")
+        with _hosted_session_page(
+            request,
+            live_server,
+            mock_llm_server_url,
+            tmp_path,
+            f"sdk-managed-{uid}",
+            sandbox=sandbox,
+        ) as (client, session_id, page):
+            _send(page, f"Say ack. {first}")
+            _wait_reply(page, "ack one")
+            items = client.get(f"/v1/sessions/{session_id}/items").json()
+            assert f'"session_id": "{session_id}"' in json.dumps(
+                [item for item in items["data"] if item.get("type") == "function_call_output"]
+            ).replace('\\"', '"')
+
+            page.get_by_label("Message the agent").fill("/mcp")
+            menu = page.get_by_test_id("mcp-server-menu")
+            row = menu.get_by_test_id(f"mcp-server-row-{_USER_SERVER}")
+            expect(row).to_contain_text("Sign-in required", timeout=15_000)
+            expect(menu.get_by_test_id("mcp-server-row-personal")).to_have_count(0)
+            expect(menu.get_by_test_id("mcp-server-row-omnigent")).to_have_count(0)
+
+            _complete_sign_in(gate, home)
+            expect(row).to_contain_text("Connected", timeout=20_000)
+            page.get_by_label("Message the agent").fill("")
+
+            _send(page, f"Read the note. {second}")
+            _wait_reply(page, "turn two finished")
+            _expect_note_read(client, session_id)
