@@ -424,6 +424,18 @@ def test_runner_that_never_reports_busy_keeps_tunnel_lifetime_refreshes(
     assert gate.submitted == ["r1", "r1", "r1"]
 
 
+def test_pruning_drops_a_legacy_runner_gone_before_its_first_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _BusyGate(monkeypatch)
+    managed_host_keepalive.record_pong("r1", None)  # forced refresh, no timestamp
+    managed_host_keepalive._prune_throttle(gate.now + 5000.0)
+    assert managed_host_keepalive._unreporting_runners == set()
+    # Still connected after all: its next pong registers it again.
+    managed_host_keepalive.record_pong("r1", None)
+    assert managed_host_keepalive._unreporting_runners == {"r1"}
+
+
 def test_reconnect_to_a_fresh_replica_does_not_renew_an_expired_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

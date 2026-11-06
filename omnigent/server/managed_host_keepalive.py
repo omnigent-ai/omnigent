@@ -321,6 +321,10 @@ def _prune_throttle(now: float) -> None:
         if max(_last_kept.get(rid, float("-inf")), _last_report_at.get(rid, float("-inf")))
         < cutoff
     ]
+    # A legacy runner's first refresh is forced and leaves no timestamp; one gone
+    # before its first periodic tick has none at all. If it is still connected,
+    # its next pong re-registers it.
+    stale.extend(rid for rid in _unreporting_runners if rid not in _last_kept)
     for runner_id in stale:
         _last_kept.pop(runner_id, None)
         _runner_interval_s.pop(runner_id, None)
