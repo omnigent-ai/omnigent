@@ -466,3 +466,30 @@ async def test_a_terminal_dialog_that_awaits_no_answer_is_reported_at_once(
     assert events[0].undelivered is True
     assert pane.deliveries == 1
     assert pane.polls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_safe_hold_keeps_the_original_input_identity(pane, tmp_path, monkeypatch):
+    from omnigent.native.input_diagnostics import current_input_attributes, input_delivery_scope
+
+    identity = {
+        "input_stable_id": "a" * 32,
+        "pending_id": "pending_" + "a" * 32,
+        "delivery_attempt_id": "b" * 32,
+        "input_enqueued_at_ms": 1700000000000,
+    }
+    observed = []
+    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    inject = pane.inject_user_message
+
+    def record(*args, **kwargs):
+        observed.append(current_input_attributes())
+        inject(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", record)
+    with input_delivery_scope(identity):
+        events = await _run(tmp_path)
+    assert events == [TurnComplete(response=None)]
+    assert observed == [identity, identity]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.kills == 0

@@ -4623,9 +4623,8 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # A terminal-owned draft must be released before this initial paste.
+    _prepare_empty_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
     )
@@ -5219,11 +5218,8 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # Settings must not concatenate with or erase terminal-owned input.
+    _prepare_empty_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
@@ -6566,11 +6562,9 @@ def _restore_occupied_input(
     command. Every one of them documents Escape as its way out ("Esc to
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane. The exception is a shell-mode box
-    holding a typed command, which Escape leaves in shell mode: that command
-    is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste. So is a draft taller than
-    the pane, which scrolls the box's glyph row out of view
-    (:func:`_scrolled_draft_rows`).
+    holding a typed command, which Escape leaves in shell mode: that input
+    remains for its owner (see :func:`_shell_mode_draft`). A draft taller than
+    the pane is likewise preserved (:func:`_scrolled_draft_rows`).
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -6671,22 +6665,15 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif surface == _SCROLLED_DRAFT_SURFACE:
-            # Deleting lines shrinks the box until its glyph row is back on
-            # screen; the keys only edit the draft, so they need no spacing.
-            _logger.info("claude-native: clearing a draft taller than the terminal")
-            delivery_diagnostics.record_restore_action("scrolled_draft_clear")
-            _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
+            # A hidden draft belongs to the terminal user, even when its glyph is clipped.
+            return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
-                # Escape keeps a typed shell command in shell mode, so the
-                # command is cleared instead, as a chat draft is before a paste.
-                _logger.info("claude-native: clearing a shell-mode draft from the input box")
-                delivery_diagnostics.record_restore_action("shell_clear")
-                _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
-            else:
-                _logger.info("claude-native: dismissing %s covering the input box", surface)
-                delivery_diagnostics.record_restore_action("escape")
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+                # A typed shell command is user input; leave it for its owner.
+                return surface
+            _logger.info("claude-native: dismissing %s covering the input box", surface)
+            delivery_diagnostics.record_restore_action("escape")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6890,18 +6877,20 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     return None if scrolled is None else _ComposerBox(scrolled, framed=False)
 
 
-def _composer_reads_clear(box: _ComposerBox | None) -> bool:
-    """
-    Return whether one burst of clearing keys is known to empty *box*.
-
-    True when the capture showed the box whole (both rules on screen) with
-    nothing after its glyph row but blank rows: the burst empties the glyph
-    row, and no hidden line is left for a paste to join.
-
-    :param box: The box :func:`_composer_box` read, or ``None``.
-    :returns: ``True`` when the box reads clear.
-    """
+def _composer_clearing_burst_is_sufficient(box: _ComposerBox | None) -> bool:
+    """Preserve the existing recovery cleanup test for an already attempted paste."""
     return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+
+
+def _composer_reads_clear(box: _ComposerBox | None) -> bool:
+    """Return whether a full frame shows an empty chat prompt and blank rows."""
+    return (
+        box is not None
+        and box.framed
+        and bool(box.rows)
+        and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+        and not any(row.strip() for row in box.rows[1:])
+    )
 
 
 def _first_non_blank(lines: list[str], start: int, end: int) -> int:
@@ -6934,6 +6923,14 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     if any(_CLAUDE_PROMPT_GLYPH in line for line in lines):
         return None
     return rows
+
+
+def _prepare_empty_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
+    """Refocus after observing an empty composer."""
+    _require_clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    _require_clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    _send_composer_clear_keys(socket_path, tmux_target, rows=1)
 
 
 def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
@@ -6983,7 +6980,7 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
-        settled = _composer_reads_clear(box)
+        settled = _composer_clearing_burst_is_sufficient(box)
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             if not repainted and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
                 repainted, round_no = True, 0
@@ -7004,6 +7001,43 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
             _send_composer_clear_keys(socket_path, tmux_target, rows=len(box.rows))
             if settled:
                 return
+        round_no += 1
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _require_clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
+    """Require a readable empty composer without modifying an unknown draft.
+
+    Re-read transient captures and request one repaint before refusing. A
+    clipped box can be retried at a usable height by the injection wrapper;
+    neither this check nor that retry may erase the person's input.
+    """
+    repainted = False
+    round_no = 0
+    while True:
+        _check_injection_cancelled()
+        pane = _capture_pane(socket_path, tmux_target)
+        box = _composer_box(pane)
+        # Blank rows after the glyph row hold nothing a paste could join.
+        settled = _composer_reads_clear(box)
+        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
+            delivery_diagnostics.record_composer_not_cleared(
+                pane=pane,
+                rows=None if box is None else box.rows,
+                framed=box is not None and box.framed,
+                rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+            )
+            raise ClaudeComposerNotCleared(
+                "Claude Code's input box could not be verified clear, so nothing was sent. "
+                "Open the terminal, expand it and clear the input box, then retry."
+            )
+        if settled:
+            return
         round_no += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 

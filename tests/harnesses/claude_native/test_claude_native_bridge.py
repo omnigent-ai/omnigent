@@ -4997,7 +4997,9 @@ def test_paste_file_is_removed_when_payload_write_fails(
         claude_native_bridge.tempfile, "NamedTemporaryFile", failing_temporary_file
     )
     monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", lambda _bridge_dir: False)
-    monkeypatch.setattr(claude_native_bridge, "_clear_composer", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        claude_native_bridge, "_prepare_empty_composer", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
 
     with pytest.raises(OSError) as caught:
@@ -12163,6 +12165,9 @@ class _VirtualClock:
 def _fake_tmux(
     monkeypatch: pytest.MonkeyPatch,
     panes: list[str],
+    *,
+    staged_pane: str | None = None,
+    submitted_panes: list[str] | None = None,
 ) -> list[list[str]]:
     """
     Patch tmux so sends are recorded and captures walk *panes*.
@@ -12173,10 +12178,17 @@ def _fake_tmux(
     """
     sends: list[list[str]] = []
     frames = list(panes)
+    phase = "before_input"
 
     def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        nonlocal frames, phase
         del socket_path
         sends.append(list(args))
+        if staged_pane is not None:
+            if args[0] == "send-keys" and "-l" in args and args[-1].startswith("/"):
+                phase, frames = "staged", [staged_pane]
+            elif args[-1] == "Enter" and phase == "staged":
+                phase, frames = "submitted", list(submitted_panes or [_IDLE_PANE])
 
     def _fake_capture(socket_path: str, tmux_target: str) -> str:
         del socket_path, tmux_target
@@ -12235,6 +12247,19 @@ class _EditableComposer:
             "\x1b[117;5u": self._kill_to_line_start,
             "\x1b[97;5u": self._move_to_line_start,
         }
+
+    def clear_from_terminal(self) -> None:
+        """The terminal owner explicitly clears its draft with the CLI editing keys."""
+        count = 2 * (self.text.count("\n") + 1) + 2
+        self._run_tmux(
+            "terminal-owner",
+            "send-keys",
+            "-l",
+            "-t",
+            "main",
+            "\x1b[107;5u" * count + "\x1b[117;5u" * count,
+        )
+        assert self.text == ""
 
     def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Route the bridge's tmux calls to this box."""
@@ -12350,6 +12375,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
+    composer.clear_from_terminal()
 
     inject_user_message(bridge_dir, content="hello from the web")
 
@@ -12381,6 +12407,7 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
+    composer.clear_from_terminal()
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
 
@@ -12457,6 +12484,15 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         unavailable_clear_captures=unavailable_clear_captures,
     )
     composer.install(monkeypatch)
+    if unavailable_clear_captures == 1:
+        composer.clear_from_terminal()
+    guard = claude_native_bridge._prepare_empty_composer
+
+    def unreadable_during_guard(*args: Any, **kwargs: Any) -> None:
+        composer._clearing_started = True
+        guard(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_prepare_empty_composer", unreadable_during_guard)
 
     if unavailable_clear_captures > 1:
         with pytest.raises(
@@ -12508,6 +12544,7 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
     bridge_dir = _picker_bridge_dir(tmp_path)
     composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
     composer.install(monkeypatch)
+    composer.clear_from_terminal()
 
     inject(bridge_dir)
 
@@ -12529,6 +12566,7 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
     """A tiny pane can hide the closing rule even after every draft line was cleared."""
     composer = _EditableComposer(draft, cursor=min(cursor, len(draft)), visible_rows=1)
     composer.install(monkeypatch)
+    composer.clear_from_terminal()
     if stale_frame:
         capture = composer._capture_pane
 
@@ -12641,6 +12679,12 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
         assert composer.submitted == []
         assert not any(args[0] in {"load-buffer", "paste-buffer"} for args in operations)
     else:
+        if scenario == "hidden-draft":
+            with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+                inject()
+            assert composer.text == draft
+            assert composer.submitted == []
+            composer.clear_from_terminal()
         inject()
         assert [text.strip() for text in composer.submitted] == [
             "/effort high" if slash else "hello from the web"
@@ -12723,6 +12767,12 @@ def test_output_printed_over_the_input_box_is_repainted_before_refusing(
         assert message not in composer.text
         assert composer.submitted == []
     else:
+        if draft:
+            with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+                inject()
+            assert composer.text == draft
+            assert composer.submitted == []
+            composer.clear_from_terminal()
         inject()
         assert [text.strip() for text in composer.submitted] == [message]
     assert len(repaints) == 1
@@ -12914,16 +12964,9 @@ def test_a_model_switch_types_the_argument_form_and_confirms(
     dialog = "  Switch model?\n  This will invalidate the prompt cache.\n"
     sends = _fake_tmux(
         monkeypatch,
-        # Idle at the occupied-input check, then the typed command
-        # renders, the submit pops the dialog, the accept clears it —
-        # one capture per delivery stage.
-        [
-            _IDLE_PANE,
-            _composer_pane("/model databricks-claude-sonnet-5"),
-            dialog,
-            dialog,
-            _IDLE_PANE,
-        ],
+        [_IDLE_PANE],
+        staged_pane=_composer_pane("/model databricks-claude-sonnet-5"),
+        submitted_panes=[dialog, dialog, _IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(
@@ -13314,7 +13357,12 @@ def test_a_slash_command_stuck_in_the_composer_fails_loud(
     the authoritative fallback — an honest failure, not a silent divergence.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    _fake_tmux(monkeypatch, [_composer_pane("/effort high")])
+    _fake_tmux(
+        monkeypatch,
+        [_IDLE_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_composer_pane("/effort high")],
+    )
 
     with pytest.raises(RuntimeError, match="was not delivered"):
         claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -13410,7 +13458,9 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [_IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        [_IDLE_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(
@@ -13578,9 +13628,7 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
     # Nothing was typed, so the executor can hold the message until the box frees.
     assert refused.value.surface == "shell mode"
     tails = [args[-1] for args in sends]
-    assert tails and all(
-        not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
-    ), f"Only the clearing keys may be sent; got {tails}."
+    assert tails == [], f"A terminal-owned shell draft must receive no edit keys; got {tails}."
 
 
 _MCP_APPROVAL_DIALOG_PANE = """\
@@ -14084,16 +14132,9 @@ def test_inject_slash_command_restores_an_occupied_input_box_first(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        # Search up at the occupied-input check and again at the
-        # re-confirmation, idle after the Escape, then the typed command
-        # renders and the submit clears it.
-        [
-            occupied_pane,
-            occupied_pane,
-            _IDLE_PANE,
-            _composer_pane("/effort high"),
-            _IDLE_PANE,
-        ],
+        [occupied_pane, occupied_pane, _IDLE_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -14421,13 +14462,9 @@ def test_a_torn_frame_after_a_hinted_surface_does_not_refuse_the_slash_command(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [
-            _MODEL_PICKER_PANE,
-            "● Working on it",
-            _IDLE_PANE,
-            _composer_pane("/effort high"),
-            _IDLE_PANE,
-        ],
+        [_MODEL_PICKER_PANE, "● Working on it", _IDLE_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -14459,7 +14496,9 @@ def test_a_lowercase_or_wrapped_escape_hint_still_marks_a_surface_dismissible(
     pane = _MODEL_PICKER_PANE.replace("Esc to cancel", hint)
     sends = _fake_tmux(
         monkeypatch,
-        [pane, pane, _IDLE_PANE, _composer_pane("/compact"), _IDLE_PANE],
+        [pane, pane, _IDLE_PANE],
+        staged_pane=_composer_pane("/compact"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/compact")
@@ -14562,7 +14601,12 @@ def test_inject_slash_command_confirms_a_surface_before_refusing_under_a_tiny_ca
     floored at two polls, so the transient is re-read and the command goes in.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    sends = _fake_tmux(monkeypatch, [_SHELL_MODE_PANE, _READY_PANE])
+    sends = _fake_tmux(
+        monkeypatch,
+        [_SHELL_MODE_PANE, _READY_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
+    )
 
     claude_native_bridge.inject_slash_command(
         bridge_dir, command="/effort high", ready_timeout_s=0.0
@@ -14662,8 +14706,9 @@ def test_a_single_frame_without_a_composer_does_not_draw_an_escape(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        # One composer-less frame, then the live input box again.
-        ["● Working on it", _IDLE_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        ["● Working on it", _IDLE_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -14688,7 +14733,9 @@ def test_the_shortcuts_panel_is_not_treated_as_an_occupied_input(
     bridge_dir = _picker_bridge_dir(tmp_path)
     sends = _fake_tmux(
         monkeypatch,
-        [_SHORTCUTS_PANEL_PANE, _composer_pane("/effort high"), _IDLE_PANE],
+        [_SHORTCUTS_PANEL_PANE],
+        staged_pane=_composer_pane("/effort high"),
+        submitted_panes=[_IDLE_PANE],
     )
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
