@@ -1596,6 +1596,21 @@ def create_runner_app(
             return True
         return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
 
+    def _native_role_panes() -> list[tuple[str, str]]:
+        """Native-role terminal panes as ``(session_id, pane name)``, read on each call."""
+        terminals = resource_registry.terminal_registry
+        if terminals is None:
+            return []
+        return [
+            (session_id, name)
+            for session_id, name, _ in terminals.native_panes()
+            if is_native_harness(
+                resource_registry.terminal_resource_role(
+                    session_id, terminal_resource_id(name, "main")
+                )
+            )
+        ]
+
     def _has_active_work() -> bool:
         if _active_turns:
             return True
@@ -1613,17 +1628,10 @@ def create_runner_app(
         # Terminal ensure can start native work before any harness or web turn.
         # Read current resources so deleting a terminal also retires this pin.
         terminals = resource_registry.terminal_registry
-        if terminals is not None:
-            for session_id, name, _ in terminals.native_panes():
-                if not is_native_harness(
-                    resource_registry.terminal_resource_role(
-                        session_id, terminal_resource_id(name, "main")
-                    )
-                ):
-                    continue
-                session_ids.add(session_id)
-                if _native_pane_shows_live_work(terminals, session_id, name):
-                    return True
+        for session_id, name in _native_role_panes():
+            session_ids.add(session_id)
+            if terminals is not None and _native_pane_shows_live_work(terminals, session_id, name):
+                return True
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):
@@ -1649,6 +1657,8 @@ def create_runner_app(
         if _active_turns or _claude_prompt_waiters:
             return True
         session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        # Terminal ensure can start native work with no cache entry (see _has_active_work).
+        session_ids.update(session_id for session_id, _name in _native_role_panes())
         if process_manager is not None and any(
             process_manager.has_active_turn(session_id) for session_id in session_ids
         ):

@@ -478,6 +478,7 @@ async def test_terminal_only_native_work_idle_accounting(
                 assert app.state.has_active_work() is False
                 return
             assert app.state.has_active_work() is True
+            assert app.state.has_turn_in_flight() is True
 
             async def release() -> None:
                 if settle in {"idle", "failed"}:
@@ -491,6 +492,7 @@ async def test_terminal_only_native_work_idle_accounting(
                     assert terminals.get(conv_id, "claude", "main") is None
                     publish(conv_id, status, None)
                 assert app.state.has_active_work() is False
+                assert app.state.has_turn_in_flight() is False
 
             await _assert_monitor_blocked_then_shuts_down(
                 has_active_work=app.state.has_active_work, release=release
