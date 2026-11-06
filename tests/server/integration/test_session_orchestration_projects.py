@@ -58,16 +58,8 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
     )
 
 
-async def _start_worker(
-    auth_client, auth_app, db_uri, monkeypatch, source, *, body: dict | None = None
-) -> str:
-    """Start a managed worker from ``source``.
-
-    With no ``body`` this runs the real ``sys_session_create`` tool; with one it
-    posts that body to the orchestrated create route the tool uses, which lets a
-    test name a project the tool itself can't.
-    """
-    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+async def _start_worker(auth_client, auth_app, db_uri, monkeypatch, source) -> str:
+    """Start a managed worker through the real ``sys_session_create`` tool."""
     from omnigent.server.routes.sessions import routes_core
 
     auth_client.headers.update(_bind_runner(db_uri, source["id"]))
@@ -79,27 +71,18 @@ async def _start_worker(
 
     monkeypatch.setattr(routes_core, "_run_managed_launch", launch)
     try:
-        if body is None:
-            result = json.loads(
-                await execute_tool(
-                    tool_name="sys_session_create",
-                    arguments=json.dumps(
-                        {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
-                    ),
-                    server_client=auth_client,
-                    conversation_id=source["id"],
-                )
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": source["agent_id"], "placement": "managed", "message": "Go"}
+                ),
+                server_client=auth_client,
+                conversation_id=source["id"],
             )
-            assert "error" not in result, result
-            worker_id = result["conversation_id"]
-        else:
-            response = await auth_client.post(
-                "/v1/sessions/orchestrated",
-                headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
-                json={"agent_id": source["agent_id"], "host_type": "managed", **body},
-            )
-            assert response.status_code == 201, response.text
-            worker_id = response.json()["id"]
+        )
+        assert "error" not in result, result
+        worker_id = result["conversation_id"]
         await asyncio.wait_for(launched.wait(), timeout=2)
     finally:
         await auth_app.state.startup_inputs.shutdown()

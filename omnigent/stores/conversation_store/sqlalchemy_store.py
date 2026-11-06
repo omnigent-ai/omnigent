@@ -2109,6 +2109,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .values(project_id=project_id)
                 )
                 if not cast(_RowCountResult, result).rowcount:
+                    if (
+                        session.get(
+                            SqlConversationMetadata, (current_workspace_id(), conversation_id)
+                        )
+                        is None
+                    ):
+                        return False
                     raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
                 return True
 

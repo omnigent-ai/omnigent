@@ -7727,11 +7727,22 @@ def test_set_conversation_project_files_and_unfiles(
     )
 
 
+@pytest.mark.parametrize("history_exists", [False, True])
 def test_set_conversation_project_unknown_session_returns_false(
     conversation_store: SqlAlchemyConversationStore,
+    history_exists: bool,
 ) -> None:
-    """Filing a non-existent session updates nothing and returns ``False``."""
-    result = conversation_store.set_conversation_project("f" * 32, "b" * 32)
+    """Filing a session without metadata updates nothing and returns ``False``."""
+    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+
+    session_id = "f" * 32
+    if history_exists:
+        conversation_store.create_conversation(conversation_id=session_id)
+        with Session(conversation_store._engine) as session:
+            metadata = session.get(SqlConversationMetadata, (current_workspace_id(), session_id))
+            session.delete(metadata)
+            session.commit()
+    result = conversation_store.set_conversation_project(session_id, "b" * 32)
     assert result is False
 
 
