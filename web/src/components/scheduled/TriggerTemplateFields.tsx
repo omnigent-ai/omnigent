@@ -25,6 +25,7 @@ import {
   triggerEvent,
   triggerOperatorLabel,
   triggerScope,
+  triggerScopeEntries,
   triggerServiceName,
   VALUELESS_OPERATORS,
   withTriggerEvent,
@@ -65,6 +66,7 @@ export function TriggerTemplateFields({
   const { authorAction } = triggerEvent(source, fields.event);
   const scope = triggerScope(source, fields.event);
   const conditionFields = triggerConditionFields(source, fields.event);
+  const scopeEntries = triggerScopeEntries(source, fields);
   const instructionsTooLong = fields.instructions.trim().length > MAX_INSTRUCTIONS_CHARS;
 
   function setCondition(index: number, next: TriggerCondition) {
@@ -177,7 +179,7 @@ export function TriggerTemplateFields({
             </span>
           </div>
 
-          {scope.isGroup && fields.scope.trim() !== "" && !fields.scope.includes(",") && (
+          {scope.isGroup && scopeEntries.length > 0 && scopeEntries.length < 2 && (
             <p className="pl-6 text-sm text-muted-foreground" data-testid="task-trigger-group-hint">
               List at least two people. For one person, choose Direct message received.
             </p>

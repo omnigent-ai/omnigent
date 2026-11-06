@@ -372,11 +372,13 @@ export function withTriggerEvent(
   // "#" scopes name channels and "@" scopes name people; the rest share one kind.
   const sameScope = before.prefix === after.prefix;
   const visible = new Set(triggerConditionFields(source, eventId).map((field) => field.id));
+  let scopeOperator = sameScope ? fields.scopeOperator : "is";
+  if (after.isGroup) scopeOperator = "in";
   return {
     ...fields,
     event: eventId,
     scope: sameScope ? fields.scope : "",
-    scopeOperator: after.isGroup ? "in" : sameScope ? fields.scopeOperator : "is",
+    scopeOperator,
     conditions: fields.conditions.filter((c) => visible.has(c.field)),
   };
 }
@@ -589,13 +591,26 @@ export function splitJqlOrderBy(jql: string): { where: string; orderBy: string }
 export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSource): boolean {
   const instructions = fields.instructions.trim();
   const isGroup = source !== undefined && triggerScope(source, fields.event).isGroup;
+  const entries =
+    source === undefined ? scopeList(fields.scope) : triggerScopeEntries(source, fields);
   return (
-    scopeList(fields.scope).length >= (isGroup ? 2 : 1) &&
+    entries.length >= (isGroup ? 2 : 1) &&
     (isGroup || fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
   );
+}
+
+/**
+ * The scope's entries with the event's prefix stripped; Slack people are rendered
+ * and deduplicated, so `"alice, @Alice"` is one person.
+ */
+export function triggerScopeEntries(source: TriggerSource, fields: TriggerFields): string[] {
+  const { prefix } = triggerScope(source, fields.event);
+  return prefix === "@"
+    ? slackPeople(fields.scope)
+    : scopeList(stripScopePrefix(fields.scope, prefix));
 }
 
 /** The comma-separated entries of a scope field, e.g. `"ES, OPS"` → `["ES", "OPS"]`. */
@@ -693,11 +708,17 @@ export function slackChannels(scope: string): string {
     .join(", ");
 }
 
-/** Slack people as `@handle`, keeping IDs and emails bare. */
+/** Slack people as `@handle`, keeping IDs and emails bare; repeats are dropped, ignoring case. */
 export function slackPeople(scope: string): string[] {
-  return scopeList(stripScopePrefix(scope, "@")).map((person) =>
-    SLACK_ID.test(person) || person.includes("@") ? person : `@${person}`,
-  );
+  const seen = new Set<string>();
+  const people: string[] = [];
+  for (const entry of scopeList(stripScopePrefix(scope, "@"))) {
+    const person = SLACK_ID.test(entry) || entry.includes("@") ? entry : `@${entry}`;
+    if (seen.has(person.toLowerCase())) continue;
+    seen.add(person.toLowerCase());
+    people.push(person);
+  }
+  return people;
 }
 
 /** Words joined as a list, e.g. `["a", "b", "c"]` → `"a, b and c"`. */
@@ -858,7 +879,7 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
         ...slack,
         watch: () => `Watch: new Slack messages in your group DM with ${joinAnd(people)}${watched}`,
         search: () =>
-          `${slackFindPeople(people)} Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count. If any name has no match, or there's no such group DM, skip to your reply and say so. Read the top-level messages posted in it since that time, oldest first. Your own messages and replies inside a thread don't start a new session.` +
+          `${slackFindPeople(people)} Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count. If any name has no match, the names resolve to fewer than two people besides you, or there's no such group DM, skip to your reply and say so. Read the top-level messages posted in it since that time, oldest first. Your own messages and replies inside a thread don't start a new session.` +
           (only || " Every other top-level message counts.") +
           slackCantRead("your group DMs"),
         details: "the group DM's channel ID, the author, the message text and permalink",

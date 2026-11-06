@@ -257,7 +257,7 @@ describe("Slack DM triggers", () => {
     expect(stripScopePrefix("@alice, bob", "#")).toBe("@alice, bob");
     expect(stripScopePrefix("ES, OPS", "")).toBe("ES, OPS");
     expect(slackChannels("eng-support, #bugs, C0123ABCD")).toBe("#eng-support, #bugs, C0123ABCD");
-    expect(slackPeople("alice, @bob, U0123ABCD, carol@example.com")).toEqual([
+    expect(slackPeople("alice, @bob, U0123ABCD, carol@example.com, Alice")).toEqual([
       "@alice",
       "@bob",
       "U0123ABCD",
@@ -270,6 +270,11 @@ describe("Slack DM triggers", () => {
       triggerFieldsComplete(slack({ event: "group_dm", scope, scopeOperator: "is" }), "slack");
     expect(groupOf("alice")).toBe(false);
     expect(groupOf("alice, bob")).toBe(true);
+    // Repeats name one person, and a bare prefix names no one.
+    expect(groupOf("alice, @Alice")).toBe(false);
+    expect(groupOf("@, @")).toBe(false);
+    expect(triggerFieldsComplete(slack({ event: "dm", scope: "@" }), "slack")).toBe(false);
+    expect(triggerFieldsComplete(slack({ scope: "#" }), "slack")).toBe(false);
     expect(triggerFieldsComplete(slack({ event: "dm", scope: "alice" }), "slack")).toBe(true);
   });
 
@@ -332,6 +337,7 @@ describe("Slack DM triggers", () => {
       "Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count.",
     );
     expect(prompt).toContain("Every other top-level message counts.");
+    expect(prompt).toContain("the names resolve to fewer than two people besides you");
     expect(prompt).toContain("that can read your group DMs.");
   });
 

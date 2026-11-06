@@ -3584,6 +3584,12 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     type("task-trigger-instructions", "Answer the question.");
     expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
     expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    // A trailing comma or a repeated name still lists one person.
+    for (const scope of ["alice,", "alice, @Alice"]) {
+      type("task-trigger-scope", scope);
+      expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    }
     type("task-trigger-scope", "alice, @bob");
     expect(screen.getByTestId("task-trigger-scope")).toHaveValue("alice, bob");
 
