@@ -1,10 +1,10 @@
 """Desktop-only pinned-session hotkeys: Cmd/Ctrl+digit jumps to a pinned row.
 
 The sidebar binds ``Cmd+1..9/0`` (``Ctrl`` on Win/Linux) to the first ten
-pinned sessions in render order — 1–9 to the first nine, 0 to the tenth
-(``usePinnedSessionHotkeys``). It is **desktop-only**: a browser tab
-reserves ``Cmd/Ctrl+digit`` for native tab-switching, so the hook is inert
-outside the Electron shell (gated on ``isNativeShell()`` ->
+sessions it lists, in render order, so pinned rows take the first slots —
+1–9 to the first nine, 0 to the tenth (``useSessionNumberHotkeys``). It is
+**desktop-only**: a browser tab reserves ``Cmd/Ctrl+digit`` for native
+tab-switching, so the hook is inert outside the Electron shell (gated on ``isNativeShell()`` ->
 ``window.omnigentDesktop.kind === "electron"`` — see
 ``web/src/lib/nativeBridge.ts``).
 
@@ -16,7 +16,7 @@ feature-detection-stubbing pattern ``test_idle_notifications.py`` uses for
 the OS-notification path. With the stub in place the SPA believes it is
 under the desktop shell, so the keydown handler routes.
 
-These drive the real chain the ``usePinnedSessionHotkeys`` unit tests mock
+These drive the real chain the ``useSessionNumberHotkeys`` unit tests mock
 out: the live ``GET /v1/sessions`` list -> ``useConversations`` -> the
 Pinned section peel -> the window keydown handler -> a client-side
 navigation to ``/c/{id}``. A regression in the shell gate, the digit->slot
@@ -111,7 +111,7 @@ def _pinned_slot_ids(page: Page) -> list[str]:
     """Return the pinned conversation ids in sidebar render order.
 
     The Nth entry (0-based) is the row the hotkey jumps to with digit
-    ``PINNED_HOTKEY_DIGITS[N]`` (1..9 then 0). Reading the live DOM order
+    ``SESSION_HOTKEY_DIGITS[N]`` (1..9 then 0). Reading the live DOM order
     rather than assuming an insertion order keeps the digit->slot assertions
     honest to what the user actually sees.
 

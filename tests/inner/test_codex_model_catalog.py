@@ -65,6 +65,16 @@ def test_the_added_entry_carries_the_clone_sources_fields() -> None:
     assert glm["upgrade"] is None
 
 
+def test_the_added_entry_does_not_inherit_image_input_from_the_clone() -> None:
+    extended = extended_model_catalog(_catalog(input_modalities=["text", "image"]))
+
+    assert extended is not None
+    glm = next(m for m in extended["models"] if m["slug"] == _GLM_SLUG)
+    clone = next(m for m in extended["models"] if m["slug"] == "gpt-5.6-luna")
+    assert glm["input_modalities"] == ["text"]
+    assert clone["input_modalities"] == ["text", "image"]
+
+
 def test_the_added_entry_declares_only_the_efforts_glm_accepts() -> None:
     # Codex refuses a pairing outside the ladder ("Reasoning effort `xhigh` is
     # not supported for model `system.ai.glm-5-2`"), and applies the default

@@ -674,7 +674,12 @@ class WorkspaceReader:
         )
 
     def github_changes(
-        self, session_id: str | None = None, pr_url: str | None = None
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+        base_sha: str | None = None,
     ) -> _WorkspacePayload:
         """The selected PR's changed files."""
         return cast(
@@ -683,6 +688,8 @@ class WorkspaceReader:
                 str(self._root),
                 session_id=session_id,
                 pr_url=pr_url,
+                head_sha=head_sha,
+                base_sha=base_sha,
             ),
         )
 
@@ -728,6 +735,42 @@ class WorkspaceReader:
                 pr_url=pr_url,
                 head_sha=head_sha,
                 base_sha=base_sha,
+            ),
+        )
+
+    def github_commits(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        head_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """The selected PR's commits at the displayed head."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_commits(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                head_sha=head_sha,
+            ),
+        )
+
+    def github_commit_diff(
+        self,
+        session_id: str | None = None,
+        pr_url: str | None = None,
+        *,
+        commit_sha: str | None = None,
+    ) -> _WorkspacePayload:
+        """One commit's unified diff patch from the selected PR."""
+        return cast(
+            "_WorkspacePayload",
+            pr_resource.pr_commit_diff(
+                str(self._root),
+                session_id=session_id,
+                pr_url=pr_url,
+                commit_sha=commit_sha,
             ),
         )
 
