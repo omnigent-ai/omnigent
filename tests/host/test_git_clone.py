@@ -7,6 +7,7 @@ that bare repository so the accepted-URL check stays in force without network.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -153,6 +154,29 @@ def test_existing_unrelated_folder_is_a_conflict_and_untouched(
     assert (taken / "notes.txt").read_text() == "mine"
 
 
+def test_folder_created_after_the_check_is_a_conflict_and_untouched(
+    remote: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A folder another process makes while the clone starts is never cleaned up."""
+    destination = tmp_path / "code" / "widgets"
+    real_makedirs = os.makedirs
+
+    def _makedirs_then_race(path: str, exist_ok: bool = False) -> None:
+        real_makedirs(path, exist_ok=exist_ok)
+        destination.mkdir()
+        (destination / "notes.txt").write_text("mine")
+
+    monkeypatch.setattr(git_clone.os, "makedirs", _makedirs_then_race)
+
+    with pytest.raises(CloneError, match="already exists") as raised:
+        clone_repository(
+            url=_URL, parent_directory=str(destination.parent), directory_name="widgets"
+        )
+
+    assert raised.value.conflict is True
+    assert (destination / "notes.txt").read_text() == "mine"
+
+
 def test_subfolder_of_another_checkout_is_a_conflict(remote: Path, tmp_path: Path) -> None:
     """A plain folder inside a checkout of the remote is not that checkout's root."""
     outer = clone_repository(url=_URL, parent_directory=str(tmp_path), directory_name="widgets")
@@ -215,7 +239,7 @@ def test_timeout_removes_partial_checkout(tmp_path: Path, monkeypatch: pytest.Mo
     """A clone killed at its budget does not leave a half-written folder."""
 
     def _slow_git(args: list[str], *, timeout_s: float) -> subprocess.CompletedProcess[str]:
-        Path(args[-1]).mkdir()
+        (Path(args[-1]) / "partial.pack").write_text("half")
         raise subprocess.TimeoutExpired(cmd="git clone", timeout=timeout_s)
 
     monkeypatch.setattr(git_clone, "_run_git", _slow_git)

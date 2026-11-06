@@ -127,11 +127,12 @@ describe("NewProjectButton clone section", () => {
     ]);
   });
 
-  it("creates no project when the clone fails, and clears the error when collapsed", async () => {
-    fetchMock.mockResolvedValue(
-      new Response(JSON.stringify({ detail: "/Users/me/widgets already exists." }), {
-        status: 409,
-      }),
+  it("creates no project when the clone fails, and clears the error on edit or collapse", async () => {
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ detail: "/Users/me/widgets already exists." }), {
+          status: 409,
+        }),
     );
     const { onCreated } = renderButton();
 
@@ -148,6 +149,15 @@ describe("NewProjectButton clone section", () => {
     expect(requestsTo(fetchMock, "/v1/projects")).toEqual([]);
     expect(onCreated).not.toHaveBeenCalled();
 
+    fireEvent.change(screen.getByTestId("clone-repository-parent"), {
+      target: { value: "/Users/me/code" },
+    });
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-project-clone-error")).not.toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("new-project-confirm"));
+    expect(await screen.findByTestId("new-project-clone-error")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("new-project-clone-toggle"));
     expect(screen.queryByTestId("new-project-clone-error")).not.toBeInTheDocument();
   });

@@ -31,10 +31,8 @@ _PROBE_TIMEOUT_S: float = 30.0
 # How long to wait for a killed git to be reaped before giving up on it.
 _REAP_TIMEOUT_S: float = 5.0
 
-# Mirrors the server's accepted repository URL forms. Checked again here so a
-# frame can never smuggle a git transport such as ``ext::`` or a local path.
-# A leading ``-`` in the host would reach ssh as an option, and git reads a
-# ``/`` before the ``:`` as a local path rather than an ssh host.
+# Re-checks the server's URL forms so a frame can't reach ``ext::`` or a local
+# path. A leading ``-`` would reach ssh as an option; git reads ``/`` before ``:`` as a path.
 _ACCEPTED_URL = re.compile(
     r"^(?:https://[^\s@/#-][^\s@/#]*/[^\s@#]+|git@[^\s@:#/-][^\s@:#/]*:[^\s@#]+)$"
 )
@@ -280,14 +278,26 @@ def clone_repository(
             os.makedirs(parent, exist_ok=True)
         except OSError as exc:
             raise CloneError(f"could not create {parent}: {exc.strerror or exc}") from exc
+        # Creating the folder first proves it is ours, so the failure cleanup below
+        # can't delete one another process made after the check above.
+        try:
+            os.mkdir(destination)
+        except FileExistsError as exc:
+            raise CloneError(
+                f"{destination} already exists. Choose another folder, or open it "
+                "with Open folder.",
+                conflict=True,
+            ) from exc
+        except OSError as exc:
+            raise CloneError(f"could not create {destination}: {exc.strerror or exc}") from exc
 
         try:
             completed = _run_git(["clone", "--", url, destination], timeout_s=timeout_s)
         except FileNotFoundError as exc:
+            os.rmdir(destination)
             raise CloneError("git is not installed on this host") from exc
         except subprocess.TimeoutExpired as exc:
-            # A killed git leaves its partial checkout behind; the path was
-            # free when the claim began, so everything there is ours.
+            # A killed git leaves its partial checkout behind in our folder.
             shutil.rmtree(destination, ignore_errors=True)
             raise CloneError(f"git clone timed out after {timeout_s:.0f}s") from exc
         if completed.returncode != 0:

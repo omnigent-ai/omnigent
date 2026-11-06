@@ -210,11 +210,8 @@ function NewProjectForm({
           </PopoverTrigger>
           <PopoverContent
             align="start"
-            // Publish the collision-aware available viewport height (Radix
-            // exposes it as a CSS var), capped at the picker's natural size,
-            // so the .emoji-picker-popover rule in index.css shrinks
-            // emoji-mart to fit — it then scrolls its grid internally
-            // instead of clipping on short screens.
+            // Cap emoji-mart at Radix's available viewport height (read by the
+            // .emoji-picker-popover rule) so short screens scroll instead of clip.
             collisionPadding={8}
             style={
               {
@@ -223,10 +220,8 @@ function NewProjectForm({
               } as CSSProperties
             }
             className="emoji-picker-popover flex max-h-[var(--radix-popover-content-available-height)] w-auto flex-col overflow-hidden p-0"
-            // The Dialog's scroll lock (react-remove-scroll) preventDefaults
-            // wheel events over the picker — it can't see emoji-mart's scroll
-            // region inside shadow DOM. Stop the wheel from reaching the
-            // document-level lock so the grid scrolls.
+            // The Dialog's scroll lock can't see emoji-mart's shadow-DOM grid, so
+            // keep wheel events from reaching it.
             onWheel={(e) => e.stopPropagation()}
             onInteractOutside={() => setEmojiOpen(false)}
           >
@@ -335,7 +330,10 @@ function NewProjectForm({
                   cloneRepository.reset();
                 }}
                 parentDirectory={cloneParent}
-                onParentDirectoryChange={setCloneParentDraft}
+                onParentDirectoryChange={(parent) => {
+                  setCloneParentDraft(parent);
+                  cloneRepository.reset();
+                }}
                 onSubmit={() => void submit()}
                 disabled={pending}
               />
