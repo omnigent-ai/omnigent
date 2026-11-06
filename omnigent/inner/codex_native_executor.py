@@ -9,6 +9,7 @@ import contextlib
 import json
 import logging
 import os
+import subprocess
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
@@ -103,7 +104,7 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
-_COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
+_COMPACTION_WAIT_TIMEOUT_SECONDS = float("inf")
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
@@ -606,7 +607,7 @@ async def _steer_codex_turn(
 # Bound reconciliation after shell submission before releasing the injection lock.
 _SHELL_TURN_WAIT_SECONDS = 2.0
 _SHELL_TURN_POLL_SECONDS = 0.25
-_SHELL_COMPLETION_WAIT_SECONDS = 60.0
+_SHELL_COMPLETION_WAIT_SECONDS = float("inf")
 _SHELL_RECONCILIATION_RPC_SECONDS = 2.0
 _CODEX_SHELL_WAIT_FAILURE = CodexStartupFailure(
     message="Codex has not confirmed that the shell command finished, "
@@ -1016,7 +1017,7 @@ class CodexNativeExecutor(Executor):
                         "turn/interrupt",
                         {"threadId": state.thread_id, "turnId": ""},
                     )
-                except Exception:  # the local cancel above already took effect.
+                except (OSError, RuntimeError, ValueError, TypeError, subprocess.SubprocessError):
                     _logger.warning("Codex native MCP startup interrupt failed", exc_info=True)
                 _logger.info("Codex native MCP startup cancelled: %s", ", ".join(pending))
             if state.active_turn_id is not None:
