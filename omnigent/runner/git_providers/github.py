@@ -12,6 +12,8 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from omnigent.runner.git_providers import (
+    BranchPullRequest,
+    BranchWrite,
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
@@ -339,6 +341,20 @@ class GitHubPullRequests:
     ) -> tuple[list[PullRequestRef], bool] | None:
         """Read GitHub's pull request MCP tools and the ``write_api_call`` proxy."""
         return github_observer.mcp_prs(tool_name, arguments, result)
+
+    def branch_prs(self, host: str, repository: str, branch: str) -> list[BranchPullRequest]:
+        """Return the open PRs whose head is *branch* of *repository*."""
+        from omnigent.runner.git_providers import github_push
+
+        return github_push.branch_prs(host, repository, branch)
+
+    def shell_branch_writes(self, segments: Sequence[ShellSegment]) -> list[BranchWrite]:
+        """Return the branches that ``gh api`` content and ref writes update."""
+        return github_observer.shell_branch_writes(segments)
+
+    def mcp_branch_writes(self, tool_name: str, arguments: dict[str, object]) -> list[BranchWrite]:
+        """Return the branches that GitHub's file-writing MCP tools update."""
+        return github_observer.mcp_branch_writes(tool_name, arguments)
 
 
 PULL_REQUESTS: PullRequestFacet = GitHubPullRequests()

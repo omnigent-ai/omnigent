@@ -3,17 +3,30 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
-from omnigent.runner import github_resource, pr_observer
+from omnigent.runner import github_resource, pr_observer, pushed_branches
 from omnigent.runner.git_providers import github_push
 from omnigent.runner.git_providers.github_push import push_operation, pushed_prs
-from omnigent.runner.pr_observer import _shell_segments, observe_tool_completion
+from omnigent.runner.pr_observer import (
+    _shell_segments,
+    observe_hook,
+    observe_tool_completion,
+    recheck_pending,
+)
 from omnigent.runner.session_prs import SessionPrRegistry
+from tests._helpers.github_remote import git, github_checkout
 
 PR_URL = "https://github.com/upstream/project/pull/42"
 PUSH_OUTPUT = (
@@ -285,3 +298,438 @@ def test_serialized_shell_envelope_reaches_the_push_lookup_decoded(
         )
     entries = SessionPrRegistry("conv_push").list()
     assert [(entry.url, entry.relationship) for entry in entries] == [(PR_URL, "worked_on")]
+
+
+CHECKOUT_REPO = "contributor/project"
+CHECKOUT_PR_URL = f"https://github.com/{CHECKOUT_REPO}/pull/42"
+CHECKOUT_PR = {
+    "number": 42,
+    "state": "open",
+    "html_url": CHECKOUT_PR_URL,
+    "head": {"ref": "topic", "repo": {"full_name": CHECKOUT_REPO}},
+    "base": {"repo": {"full_name": CHECKOUT_REPO}},
+}
+# The PR write prints nothing, so only the checkout names its repository.
+GH = """#!/bin/sh
+[ "$1" = api ] && echo '{"content": {"path": "notes.txt"}, "commit": {"sha": "cccc"}}'
+exit 0
+"""
+
+
+def _github(args: list[str], **_: object) -> tuple[int, str, str]:
+    if args[-1] == f"repos/{CHECKOUT_REPO}/commits/topic/pulls":
+        return 0, json.dumps([CHECKOUT_PR]), ""
+    if args[-1] == f"repos/{CHECKOUT_REPO}/pulls/42":
+        return 0, json.dumps(CHECKOUT_PR), ""
+    return 1, "", "not found"
+
+
+@pytest.fixture
+def observed_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=_github))
+    return "conv_write"
+
+
+@pytest.mark.parametrize("harness", ["sys_os_shell", "claude_native", "codex_native"])
+@pytest.mark.parametrize(
+    "write",
+    [
+        pytest.param("git push origin HEAD:topic", id="literal-push"),
+        pytest.param("git pp 2>&1 | grep -v Bloom | tail -15", id="alias-with-pipe"),
+        pytest.param("make push", id="make-wrapper"),
+        pytest.param("git push origin HEAD:topic 2>&1", id="redirected-push"),
+        pytest.param("git push -q -u origin topic", id="quiet-push"),
+        pytest.param("gh pr ready 42", id="pr-ready-without-repo"),
+        pytest.param(
+            f"gh api -X PUT repos/{CHECKOUT_REPO}/contents/notes.txt"
+            " -f message='Update notes' -f content=bm90ZXMK -f branch=topic",
+            id="gh-api-contents-write",
+        ),
+    ],
+)
+def test_branch_write_in_a_github_checkout_tracks_its_open_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    observed_session: str,
+    harness: str,
+    write: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("config", "alias.pp", "push origin HEAD", cwd=worktree)
+    (worktree / "Makefile").write_text("push:\n\tgit push origin HEAD\n")
+    git("add", "Makefile", cwd=worktree)
+    git("commit", "-qm", "Add push target", cwd=worktree)
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (binary / "gh").write_text(GH)
+    (binary / "gh").chmod(0o755)
+    command = f"cd {shlex.quote(str(worktree))} && {write}"
+    completed = subprocess.run(
+        ["/bin/sh", "-c", command],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        env={**os.environ, "PATH": f"{binary}{os.pathsep}{os.environ['PATH']}"},
+    )
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        if harness == "sys_os_shell":
+            observe_tool_completion(
+                observed_session,
+                tool_name="sys_os_shell",
+                arguments={"command": command},
+                result=json.dumps(
+                    {
+                        "stdout": completed.stdout,
+                        "stderr": completed.stderr,
+                        "exit_code": completed.returncode,
+                    }
+                ),
+                call_id="write",
+            )
+        else:
+            claude = harness == "claude_native"
+            observe_hook(
+                observed_session,
+                {
+                    "hook_event_name": "PostToolUse",
+                    "cwd": str(workspace),
+                    "tool_use_id": "write",
+                    "tool_name": "Bash" if claude else "exec_command",
+                    "tool_input": {"command" if claude else "cmd": command},
+                    "tool_response": (
+                        {
+                            "stdout": completed.stdout + completed.stderr,
+                            "stderr": "",
+                            "interrupted": False,
+                            "isImage": False,
+                            "noOutputExpected": False,
+                        }
+                        if claude
+                        else {
+                            "stdout": completed.stdout,
+                            "stderr": completed.stderr,
+                            "exit_code": completed.returncode,
+                        }
+                    ),
+                },
+            )
+    entries = SessionPrRegistry(observed_session).list()
+    assert [(entry.url, entry.relationship) for entry in entries] == [
+        (CHECKOUT_PR_URL, "worked_on")
+    ]
+
+
+PUSH_FILES = {
+    "owner": "contributor",
+    "repo": "project",
+    "branch": "topic",
+    "files": [{"path": "notes.txt", "content": "notes\n"}],
+    "message": "Update notes",
+}
+PUSHED_REF = {"ref": "refs/heads/topic", "object": {"sha": "e" * 40, "type": "commit"}}
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments,result",
+    [
+        pytest.param("github__push_files", PUSH_FILES, json.dumps(PUSHED_REF), id="push-files"),
+        pytest.param(
+            "mcp__github__push_files",
+            PUSH_FILES,
+            {"content": [{"type": "text", "text": json.dumps(PUSHED_REF)}]},
+            id="claude-push-files",
+        ),
+        pytest.param(
+            "github__create_or_update_file",
+            {
+                "owner": "contributor",
+                "repo": "project",
+                "branch": "topic",
+                "path": "notes.txt",
+                "content": "notes\n",
+                "message": "Update notes",
+            },
+            json.dumps({"content": {"path": "notes.txt"}, "commit": {"sha": "c" * 40}}),
+            id="create-or-update-file",
+        ),
+    ],
+)
+def test_mcp_branch_write_tracks_its_open_pr(
+    monkeypatch: pytest.MonkeyPatch,
+    observed_session: str,
+    tool_name: str,
+    arguments: dict[str, object],
+    result: object,
+) -> None:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            observed_session,
+            tool_name=tool_name,
+            arguments=arguments,
+            result=result,
+            call_id="write",
+        )
+    entries = SessionPrRegistry(observed_session).list()
+    assert [(entry.url, entry.relationship) for entry in entries] == [
+        (CHECKOUT_PR_URL, "worked_on")
+    ]
+
+
+UPSTREAM_PR_URL = "https://github.com/upstream/project/pull/7"
+
+
+@dataclass
+class _Forge:
+    """GitHub's answers by API endpoint, and the endpoints the observer asked for."""
+
+    responses: dict[str, object] = field(default_factory=dict)
+    lookups: list[str] = field(default_factory=list)
+
+    def gh(self, args: list[str], **_: object) -> tuple[int, str, str]:
+        self.lookups.append(args[-1])
+        if args[-1] in self.responses:
+            return 0, json.dumps(self.responses[args[-1]]), ""
+        return 1, "", "not found"
+
+
+@pytest.fixture
+def forge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Forge:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pr_observer, "_pushes", pushed_branches.SessionPushes())
+    stub = _Forge()
+    monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=stub.gh))
+    return stub
+
+
+def _branch_pr(url: str, repository: str, branch: str, created_at: str) -> dict[str, object]:
+    return {
+        "state": "open",
+        "html_url": url,
+        "created_at": created_at,
+        "head": {"ref": branch, "repo": {"full_name": repository}},
+    }
+
+
+def _observe_shell(
+    monkeypatch: pytest.MonkeyPatch,
+    session_id: str,
+    command: str,
+    result: dict[str, object],
+    **options: object,
+) -> None:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            session_id,
+            tool_name="sys_os_shell",
+            arguments={"command": command},
+            result=json.dumps(result),
+            call_id=uuid.uuid4().hex,
+            **options,
+        )
+
+
+def _run_and_observe(
+    monkeypatch: pytest.MonkeyPatch, session_id: str, command: str, cwd: Path
+) -> None:
+    """Run *command* in *cwd* like ``sys_os_shell`` and observe it with its time window."""
+    started_at = time.time()
+    completed = subprocess.run(
+        ["/bin/sh", "-c", command], cwd=cwd, capture_output=True, text=True, timeout=60
+    )
+    result = {
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "exit_code": completed.returncode,
+        "cwd": str(cwd),
+    }
+    _observe_shell(monkeypatch, session_id, command, result, started_at=started_at)
+
+
+def _tracked(session_id: str) -> list[tuple[str, str]]:
+    return [(entry.url, entry.relationship) for entry in SessionPrRegistry(session_id).list()]
+
+
+def test_push_without_upstream_to_a_fork_tracks_the_upstream_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    remotes = tmp_path / "github"
+    github_checkout(worktree, remotes, "upstream/project", "main")
+    git("init", "-q", "--bare", str(remotes / f"{CHECKOUT_REPO}.git"))
+    git("remote", "add", "fork", f"git@github.com:{CHECKOUT_REPO}.git", cwd=worktree)
+    git("checkout", "-qb", "topic", cwd=worktree)
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+        _branch_pr(UPSTREAM_PR_URL, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")
+    ]
+    _run_and_observe(monkeypatch, "conv_fork", "git push fork topic 2>&1 | tail -1", worktree)
+    assert git("rev-parse", "topic", cwd=remotes / f"{CHECKOUT_REPO}.git") == git(
+        "rev-parse", "HEAD", cwd=worktree
+    )
+    assert _tracked("conv_fork") == [(UPSTREAM_PR_URL, "worked_on")]
+
+
+@pytest.mark.parametrize(
+    "created_at,relationship",
+    [
+        pytest.param(None, "created", id="opened-during-the-call"),
+        pytest.param("2020-01-01T00:00:00Z", "worked_on", id="opened-earlier"),
+    ],
+)
+def test_pr_opened_during_the_pushing_call_counts_as_created(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forge: _Forge,
+    created_at: str | None,
+    relationship: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    opened = created_at or datetime.now(UTC).isoformat()
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+        _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", opened)
+    ]
+    _run_and_observe(monkeypatch, "conv_created", "git push -q", worktree)
+    assert _tracked("conv_created") == [(CHECKOUT_PR_URL, relationship)]
+
+
+@pytest.mark.parametrize(
+    "command,rejects",
+    [
+        pytest.param("git push --dry-run origin HEAD:topic", False, id="dry-run"),
+        pytest.param("git push origin HEAD:topic 2>&1 | tail -3", True, id="rejected"),
+        pytest.param("{elsewhere} && git status --short", False, id="other-worktree-pushes"),
+        pytest.param(
+            "git fetch -q origin review && git checkout -q --track origin/review",
+            False,
+            id="pr-checkout",
+        ),
+    ],
+)
+def test_call_that_pushes_no_head_of_its_checkouts_looks_up_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, command: str, rejects: bool
+) -> None:
+    worktree = tmp_path / "worktree"
+    remote = github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    if rejects:
+        (remote / "hooks" / "pre-receive").write_text("#!/bin/sh\nexit 1\n")
+        (remote / "hooks" / "pre-receive").chmod(0o755)
+    other = tmp_path / "other"
+    git("worktree", "add", "-qb", "other", str(other), cwd=worktree)
+    git("commit", "-q", "--allow-empty", "-m", "Elsewhere", cwd=other)
+    # Stands in for another agent pushing from a sibling worktree during the call.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_text(f"#!/bin/sh\ngit -C {shlex.quote(str(other))} push -q origin other\n")
+    elsewhere.chmod(0o755)
+    review = git(
+        "-c", "user.name=Reviewer", "-c", "user.email=reviewer@example.com",
+        "commit-tree", "-p", "topic", "-m", "Review", "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        cwd=remote,
+    )  # fmt: skip
+    git("update-ref", "refs/heads/review", review, cwd=remote)
+    command = command.format(elsewhere=shlex.quote(str(elsewhere)))
+    _run_and_observe(monkeypatch, "conv_quiet", command, worktree)
+    _run_and_observe(monkeypatch, "conv_quiet", "ls", worktree)
+    if "elsewhere" in command:
+        assert git("rev-parse", "origin/other", cwd=other) == git("rev-parse", "HEAD", cwd=other)
+    assert forge.lookups == []
+    assert _tracked("conv_quiet") == []
+
+
+@pytest.mark.parametrize("later", ["next-call", "turn-end"])
+def test_pushed_branch_without_a_pr_is_rechecked_later(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, later: str
+) -> None:
+    if later == "next-call":
+        monkeypatch.setattr(pushed_branches, "RECHECK_INTERVAL_S", 0.0)
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    _run_and_observe(monkeypatch, "conv_late", "git push -q", worktree)
+    assert _tracked("conv_late") == []
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+        _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")
+    ]
+    if later == "next-call":
+        _run_and_observe(monkeypatch, "conv_late", "ls", worktree)
+    else:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+            recheck_pending("conv_late")
+    assert _tracked("conv_late") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+@pytest.mark.parametrize(
+    "resolved,repository",
+    [
+        pytest.param(None, "upstream/project", id="upstream-remote"),
+        pytest.param("base", CHECKOUT_REPO, id="gh-resolved-default"),
+    ],
+)
+def test_numbered_pr_write_without_repo_uses_the_checkout_base_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forge: _Forge,
+    resolved: str | None,
+    repository: str,
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("remote", "add", "upstream", "git@github.com:upstream/project.git", cwd=worktree)
+    if resolved:
+        git("config", "remote.origin.gh-resolved", resolved, cwd=worktree)
+    url = f"https://github.com/{repository}/pull/42"
+    forge.responses[f"repos/{repository}/pulls/42"] = {**CHECKOUT_PR, "html_url": url}
+    result = {"stdout": "", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
+    _observe_shell(monkeypatch, "conv_ready", "gh pr ready 42", result)
+    assert _tracked("conv_ready") == [(url, "worked_on")]
+
+
+@pytest.mark.parametrize(
+    "visible,reports_cwd,tracked",
+    [
+        pytest.param(True, True, False, id="readable-checkout"),
+        pytest.param(False, True, True, id="copy-on-write-workspace"),
+        pytest.param(True, False, True, id="unknown-directory"),
+    ],
+)
+def test_push_output_is_read_only_where_the_checkout_is_not(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forge: _Forge,
+    visible: bool,
+    reports_cwd: bool,
+    tracked: bool,
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
+    url = f"https://github.com/{CHECKOUT_REPO}.git"
+    # A push to a URL that matches no remote updates no remote-tracking ref.
+    command = f"git push {url} HEAD:topic"
+    result: dict[str, object] = {
+        "stdout": "",
+        "stderr": f"To {url}\n   abc1234..def5678  HEAD -> topic\n",
+        "exit_code": 0,
+    }
+    if reports_cwd:
+        result["cwd"] = str(worktree)
+    _observe_shell(
+        monkeypatch,
+        "conv_output",
+        command,
+        result,
+        started_at=time.time(),
+        repository_visible=visible,
+    )
+    assert _tracked("conv_output") == ([(CHECKOUT_PR_URL, "worked_on")] if tracked else [])

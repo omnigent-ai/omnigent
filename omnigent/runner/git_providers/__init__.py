@@ -257,11 +257,14 @@ class ShellSegment:
         drops those prefixes. Never empty.
     :ivar output_eligible: False when redirection, piping, or background execution
         prevents assigning the shared output to this invocation.
+    :ivar cwd: The absolute directory the segment runs in, after the command's
+        earlier ``cd`` segments, or ``None`` when the observer cannot tell.
     """
 
     raw_tokens: tuple[str, ...]
     invocation_tokens: tuple[str, ...]
     output_eligible: bool = True
+    cwd: str | None = None
 
 
 @dataclass(frozen=True)
@@ -287,6 +290,8 @@ class ShellPrOp:
         Takes precedence over ``parse_output`` and generic extraction.
     :ivar resolve_result: Optional lookup for identities absent from command output.
         Runs in the background after success, separately from immediate PR operations.
+    :ivar push_output: ``resolve_result`` reads ``git push`` status output. The
+        observer runs it only when it cannot read the pushed checkout's own state.
     """
 
     tracks: bool
@@ -296,6 +301,56 @@ class ShellPrOp:
     parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
     parse_result: Callable[[object], Sequence[PullRequestRef]] | None = None
     resolve_result: Callable[[object], Sequence[PullRequestRef]] | None = None
+    push_output: bool = False
+
+
+@dataclass(frozen=True)
+class BranchWrite:
+    """A branch that a tool call updated through the forge's API instead of ``git push``.
+
+    :ivar host: The forge host, e.g. ``"github.com"``.
+    :ivar repository: The repository's ``owner/name``.
+    :ivar branch: The branch name, without ``refs/heads/``.
+    """
+
+    host: str
+    repository: str
+    branch: str
+
+
+@dataclass(frozen=True)
+class BranchPullRequest:
+    """An open PR whose head is a given branch.
+
+    :ivar reference: The PR.
+    :ivar created_at: When the PR was opened, as a Unix timestamp, or ``None`` when unknown.
+    """
+
+    reference: PullRequestRef
+    created_at: float | None
+
+
+@runtime_checkable
+class BranchPullRequestsFacet(Protocol):
+    """Optional support for finding the PRs of branches that tool calls pushed.
+
+    The observer reads pushed branches from git's own state, so this works however
+    the push was run. It also asks for branches updated through the forge's API.
+    """
+
+    def branch_prs(self, host: str, repository: str, branch: str) -> Sequence[BranchPullRequest]:
+        """Return the open PRs whose head is *branch* of *repository*. Blocks; may raise."""
+        ...
+
+    def shell_branch_writes(self, segments: Sequence[ShellSegment]) -> Sequence[BranchWrite]:
+        """Return the branches that the segments' forge API commands update."""
+        ...
+
+    def mcp_branch_writes(
+        self, tool_name: str, arguments: dict[str, object]
+    ) -> Sequence[BranchWrite]:
+        """Return the branches that a call of one of the provider's MCP tools updates."""
+        ...
 
 
 @runtime_checkable

@@ -8,14 +8,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from pathlib import PurePath
 
-from omnigent.git_providers import load_facet, providers
+from omnigent.git_providers import load_facet, providers, resolve_remote
 from omnigent.policies.builtins._shell import (
     HEREDOC_DELIMITER,
     MAX_SHELL_NESTING,
@@ -24,8 +27,15 @@ from omnigent.policies.builtins._shell import (
     skip_command_substitution,
     unwrap_shell_command,
 )
-from omnigent.runner import pr_reports
-from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
+from omnigent.runner import pr_reports, pushed_branches
+from omnigent.runner.git_providers import (
+    BranchPullRequest,
+    BranchPullRequestsFacet,
+    BranchWrite,
+    PullRequestFacet,
+    ShellPrOp,
+    ShellSegment,
+)
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
 
@@ -36,6 +46,9 @@ _failed_providers_lock = threading.Lock()
 _lookup_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-observer")
 _pending_lookups: set[tuple[str, str]] = set()
 _pending_lookups_lock = threading.Lock()
+_pushes = pushed_branches.SessionPushes()
+# The forge stamps a PR's creation time; the runner's clock may lag it.
+_CLOCK_SKEW_S = 120.0
 
 
 def _failed(result: object) -> bool:
@@ -274,11 +287,12 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
-def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
+def _shell_segments(command: str, depth: int = 0, *, tolerant: bool = False) -> list[ShellSegment]:
     """Split a command into simple commands, unwrapping nested shell strings in place.
 
     A command with ``||`` or one that cannot be lexed has no segments, since
-    which of its commands ran is unknown.
+    which of its commands ran is unknown. *tolerant* splits at ``||`` too, for
+    callers that only need the commands that may have run.
     """
     if depth > MAX_SHELL_NESTING:
         return []
@@ -291,7 +305,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     output_eligible = not redirected
     try:
         for token in lexer:
-            if token == "||":
+            if token == "||" and not tolerant:
                 return []
             if token and all(char in ";&|\n" for char in token):
                 if token.strip(";\n") not in {"", "&&"}:
@@ -307,7 +321,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            nested = _shell_segments(inner, depth + 1)
+            nested = _shell_segments(inner, depth + 1, tolerant=tolerant)
             if not nested:
                 output_eligible = False
             found.extend(nested)
@@ -375,6 +389,36 @@ class _ProviderFacet:
             _log_provider_failure(self.provider_id, "mcp_prs")
             return None
 
+    def branch_prs(self, host: str, repository: str, branch: str) -> list[BranchPullRequest]:
+        """Return the open PRs of a branch, or none when the provider cannot look them up."""
+        if not isinstance(self.facet, BranchPullRequestsFacet):
+            return []
+        try:
+            return list(self.facet.branch_prs(host, repository, branch))
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "branch_prs")
+            return []
+
+    def shell_branch_writes(self, segments: Sequence[ShellSegment]) -> list[BranchWrite]:
+        """Return the branches the segments update through the provider's API."""
+        if not isinstance(self.facet, BranchPullRequestsFacet):
+            return []
+        try:
+            return list(self.facet.shell_branch_writes(segments))
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "shell_branch_writes")
+            return []
+
+    def mcp_branch_writes(self, tool_name: str, arguments: dict[str, object]) -> list[BranchWrite]:
+        """Return the branches an MCP tool call updates through the provider's API."""
+        if not isinstance(self.facet, BranchPullRequestsFacet):
+            return []
+        try:
+            return list(self.facet.mcp_branch_writes(tool_name, arguments))
+        except Exception:  # noqa: BLE001 — one provider's bug must not hide the others' PRs
+            _log_provider_failure(self.provider_id, "mcp_branch_writes")
+            return []
+
 
 def _facets() -> list[_ProviderFacet]:
     """Load each provider's pull request facet, in registration order.
@@ -416,15 +460,26 @@ def _object_pr(obj: dict[str, object], facets: list[_ProviderFacet]) -> PullRequ
     return None
 
 
-def _shell_operations(
-    tool_name: str, arguments: dict[str, object], facets: list[_ProviderFacet]
-) -> list[tuple[str, ShellPrOp]]:
+def _shell_command(tool_name: str, arguments: dict[str, object]) -> str | None:
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
-        return []
+        return None
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
-        return []
-    segments = _shell_segments(command)
+        return None
+    return command
+
+
+def _shell_operations(
+    tool_name: str,
+    arguments: dict[str, object],
+    facets: list[_ProviderFacet],
+    segments: Sequence[ShellSegment] | None = None,
+) -> list[tuple[str, ShellPrOp]]:
+    if segments is None:
+        command = _shell_command(tool_name, arguments)
+        if command is None:
+            return []
+        segments = _shell_segments(command)
     return [
         (facet.provider_id, op) for facet in facets for op in facet.shell_pr_operations(segments)
     ]
@@ -537,6 +592,125 @@ def _record_resolved_prs(
             _pending_lookups.discard((session_id, observation_id))
 
 
+def _start_directory(arguments: dict[str, object], result: object, cwd: str | None) -> str | None:
+    """Return the absolute directory a shell call started in, when the call says."""
+    reported = result.get("cwd") if isinstance(result, dict) else None
+    argument = arguments.get("cwd")
+    directory = next(
+        (value for value in (reported, argument, cwd) if isinstance(value, str) and value), None
+    )
+    workdir = arguments.get("workdir")
+    if isinstance(workdir, str) and workdir:
+        directory = os.path.join(directory, workdir) if directory else workdir
+    return os.path.normpath(directory) if directory and os.path.isabs(directory) else None
+
+
+def _scan_pushes(
+    session_id: str,
+    segments: Sequence[ShellSegment],
+    directories: Sequence[str],
+    started_at: float | None,
+    finished_at: float,
+) -> tuple[list[pushed_branches.BranchKey], tuple[float, float], bool]:
+    """Read the branches a shell call pushed from the checkouts it touched.
+
+    :returns: The newly pushed branches, the call's time window, and whether a
+        ``git`` command ran where the observer cannot read the checkout.
+    """
+    checkouts = {directory: pushed_branches.checkout(directory) for directory in directories}
+    hidden = any(
+        PurePath(segment.invocation_tokens[0]).name == "git"
+        and checkouts.get(pushed_branches.git_directory(segment) or "") is None
+        for segment in segments
+    )
+    own = {item.toplevel: item for item in checkouts.values() if item is not None}
+    touched = list(own.values())
+    for toplevel in _pushes.remember(session_id, own):
+        if toplevel not in own and (item := pushed_branches.checkout(toplevel)):
+            touched.append(item)
+    since = _pushes.window(session_id, started_at, finished_at)
+    keys: list[pushed_branches.BranchKey] = []
+    for push in pushed_branches.pushed_branches(touched, since, finished_at):
+        remote = resolve_remote(push.url)
+        if remote is None:
+            continue
+        key = (remote.provider, remote.host, remote.repository, push.branch)
+        if _pushes.claim(session_id, (push.repository, *key, push.sha)):
+            keys.append(key)
+    return keys, (since, finished_at), hidden
+
+
+def _record_branch_prs(
+    session_id: str,
+    facets: Sequence[_ProviderFacet],
+    keys: Sequence[pushed_branches.BranchKey],
+    source: str,
+    *,
+    window: tuple[float, float] | None = None,
+    recheck: bool = False,
+) -> None:
+    """Record the open PRs of branches the session updated, and recheck those without one.
+
+    A PR opened inside *window*, the updating call's, counts as created by it.
+    """
+    by_provider = {facet.provider_id: facet for facet in facets}
+    for key in keys:
+        provider_id, host, repository, branch = key
+        facet = by_provider.get(provider_id)
+        if facet is None:
+            continue
+        try:
+            found = [
+                pr
+                for pr in facet.branch_prs(host, repository, branch)
+                if pr.reference.provider == provider_id
+            ]
+            if not found:
+                if not recheck:
+                    _pushes.add_pending(session_id, key, time.time())
+                continue
+            _pushes.resolved(session_id, key)
+            created = {
+                pr.reference.url
+                for pr in found
+                if window is not None
+                and pr.created_at is not None
+                and window[0] - pushed_branches.WINDOW_SLACK_S
+                <= pr.created_at
+                <= window[1] + _CLOCK_SKEW_S
+            }
+            registry = SessionPrRegistry(session_id)
+            for relationship, references in (
+                ("created", [pr.reference for pr in found if pr.reference.url in created]),
+                ("worked_on", [pr.reference for pr in found if pr.reference.url not in created]),
+            ):
+                registry.record(references, relationship=relationship, source=source)
+            pr_reports.notify(session_id)
+        except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution
+            _log_provider_failure(provider_id, "branch_prs")
+
+
+def _recheck(
+    session_id: str, facets: Sequence[_ProviderFacet], now: float, *, force: bool = False
+) -> None:
+    if keys := _pushes.due(session_id, now, force=force):
+        _lookup_pool.submit(
+            _record_branch_prs, session_id, facets, keys, "branch_recheck", recheck=True
+        )
+
+
+def recheck_pending(session_id: str) -> None:
+    """Look up the session's pushed branches that had no PR yet, e.g. as a turn ends."""
+    if not session_id:
+        return
+    try:
+        _recheck(session_id, _facets(), time.time(), force=True)
+    except Exception:
+        _logger.warning(
+            "Failed to recheck pushed branches", extra={"session_id": session_id}, exc_info=True
+        )
+
+
 def observe_tool_completion(
     session_id: str,
     *,
@@ -546,10 +720,20 @@ def observe_tool_completion(
     call_id: str = "",
     source: str = "tool",
     successful: bool = True,
+    cwd: str | None = None,
+    started_at: float | None = None,
+    repository_visible: bool = True,
 ) -> None:
-    """Best-effort observer; failures never change execution or tool results."""
+    """Best-effort observer; failures never change execution or tool results.
+
+    :param cwd: The directory a shell call started in, when its result does not say.
+    :param started_at: When the call started, as a Unix timestamp, when known.
+    :param repository_visible: Whether the runner sees the call's writes to its checkouts.
+        Pushes are read from git's own state when it does, else from ``git push`` output.
+    """
     if not successful or not session_id:
         return
+    finished_at = time.time()
     try:
         references, created = extract_prs(tool_name, arguments, result)
         SessionPrRegistry(session_id).record(
@@ -561,11 +745,30 @@ def observe_tool_completion(
         if references:
             pr_reports.notify(session_id)
         shell_result = _shell_result(tool_name, result)
-        if not _failed(shell_result):
+        failed = _failed(shell_result)
+        facets = _facets()
+        command = _shell_command(tool_name, arguments)
+        segments: list[ShellSegment] = []
+        pushed: list[pushed_branches.BranchKey] = []
+        window: tuple[float, float] | None = None
+        hidden = True
+        if command is not None:
+            strict = _shell_segments(command)
+            annotated, directories = pushed_branches.with_directories(
+                strict or _shell_segments(command, tolerant=True),
+                _start_directory(arguments, shell_result, cwd),
+            )
+            segments = annotated if strict else []
+            if repository_visible:
+                # git's state shows a push even when the command's exit status hides it.
+                pushed, window, hidden = _scan_pushes(
+                    session_id, annotated, directories, started_at, finished_at
+                )
+        if command is not None and not failed:
             for index, (provider_id, op) in enumerate(
-                _shell_operations(tool_name, arguments, _facets())
+                _shell_operations(tool_name, arguments, facets, segments)
             ):
-                if op.resolve_result is None:
+                if op.resolve_result is None or (op.push_output and not hidden):
                     continue
                 observation_id = observation_key(
                     f"{source}:{provider_id}:{index}:resolved",
@@ -592,6 +795,26 @@ def observe_tool_completion(
                     with _pending_lookups_lock:
                         _pending_lookups.discard(key)
                     raise
+        if pushed:
+            _lookup_pool.submit(
+                _record_branch_prs, session_id, facets, pushed, source, window=window
+            )
+        writes = (
+            []
+            if failed
+            else [
+                (facet.provider_id, write.host, write.repository, write.branch)
+                for facet in facets
+                for write in (
+                    facet.shell_branch_writes(segments)
+                    if command is not None
+                    else facet.mcp_branch_writes(tool_name, arguments)
+                )
+            ]
+        )
+        if writes:
+            _lookup_pool.submit(_record_branch_prs, session_id, facets, writes, source)
+        _recheck(session_id, facets, finished_at)
     except Exception:
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
@@ -605,7 +828,7 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
     name, arguments = payload.get("tool_name"), payload.get("tool_input")
     if not isinstance(name, str) or not isinstance(arguments, dict):
         return
-    call_id = payload.get("tool_use_id")
+    call_id, cwd = payload.get("tool_use_id"), payload.get("cwd")
     observe_tool_completion(
         session_id,
         tool_name=name,
@@ -613,4 +836,5 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
         result=payload.get("tool_response", payload.get("tool_output")),
         call_id=call_id if isinstance(call_id, str) else "",
         source="native_hook",
+        cwd=cwd if isinstance(cwd, str) else None,
     )

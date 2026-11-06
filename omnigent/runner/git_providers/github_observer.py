@@ -13,8 +13,10 @@ import re
 from collections import Counter
 from collections.abc import Sequence
 from pathlib import PurePath
+from urllib.parse import unquote
 
-from omnigent.runner.git_providers import ShellPrOp, ShellSegment
+from omnigent.git_providers import resolve_remote
+from omnigent.runner.git_providers import BranchWrite, ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -51,6 +53,9 @@ _WRITE_API_OPERATIONS = {
     "pulls.update": "update_pull_request",
     "pulls.merge": "merge_pull_request",
 }
+_MCP_BRANCH_WRITES = {"push_files", "create_or_update_file", "delete_file"}
+# gh picks the base repository among remotes in this order, then config order.
+_GH_REMOTE_ORDER = {"upstream": 0, "github": 1, "origin": 2}
 
 
 def _flag(tokens: list[str], *names: str, last: bool = False) -> str | None:
@@ -527,8 +532,9 @@ def _graphql_prs(
 def _gh_arguments(segment: ShellSegment) -> list[str] | None:
     """Return the arguments of a ``gh`` segment, or ``None`` for another program.
 
-    Leading ``-R`` / ``--repo`` options move after the subcommand's arguments, and a
-    ``GH_HOST`` assignment becomes ``--hostname``, so the rules read both as flags.
+    Leading ``-R`` / ``--repo`` options move after the subcommand's arguments, and
+    ``GH_REPO`` and ``GH_HOST`` assignments become ``--repo`` and ``--hostname``, so
+    the rules read them as flags. An explicit flag comes first, so it wins.
     """
     if PurePath(segment.invocation_tokens[0]).name != "gh":
         return None
@@ -545,7 +551,75 @@ def _gh_arguments(segment: ShellSegment) -> list[str] | None:
     host = next((t.split("=", 1)[1] for t in segment.raw_tokens if t.startswith("GH_HOST=")), None)
     if host:
         prefix.extend(["--hostname", host])
+    repository = next(
+        (t.split("=", 1)[1] for t in segment.raw_tokens if t.startswith("GH_REPO=")), None
+    )
+    if repository:
+        prefix.extend(["--repo", repository])
     return [*args, *prefix]
+
+
+def _checkout_repository(cwd: str) -> tuple[str, str] | None:
+    """Return the ``(host, owner/name)`` that gh uses as the base repository in *cwd*.
+
+    Mirrors gh without a prompt: a ``remote.<name>.gh-resolved`` default wins,
+    else the first GitHub remote named ``upstream``, ``github``, or ``origin``,
+    else the first other one.
+    """
+    from omnigent.runner import github_resource
+
+    code, output = github_resource._git_run(cwd)(
+        ["config", "-z", "--get-regexp", r"^remote\..*\.(url|gh-resolved)$"]
+    )
+    if code != 0:
+        return None
+    urls: dict[str, str] = {}
+    resolved: dict[str, str] = {}
+    for entry in output.split("\0"):
+        key, _, value = entry.partition("\n")
+        name, _, setting = key.removeprefix("remote.").rpartition(".")
+        if key.startswith("remote.") and setting == "url":
+            urls.setdefault(name, value)
+        elif key.startswith("remote.") and setting == "gh-resolved":
+            resolved[name] = value
+    remotes = [
+        (name, remote)
+        for name, url in urls.items()
+        if (remote := resolve_remote(url)) is not None and remote.provider == "github"
+    ]
+    remotes.sort(key=lambda item: _GH_REMOTE_ORDER.get(item[0].lower(), len(_GH_REMOTE_ORDER)))
+    for name, remote in remotes:
+        if resolved.get(name) == "base":
+            return remote.host, remote.repository
+        if re.fullmatch(r"[^/\s]+/[^/\s]+", resolved.get(name, "")):
+            return remote.host, resolved[name]
+    return (remotes[0][1].host, remotes[0][1].repository) if remotes else None
+
+
+def _checkout_pr(cwd: str, number: int, result: object) -> list[PullRequestRef]:
+    del result
+    repository = _checkout_repository(cwd)
+    target = _target(repository[1], number, repository[0]) if repository else None
+    return [target] if target else []
+
+
+def _checkout_pr_operation(tokens: list[str], cwd: str | None) -> ShellPrOp | None:
+    """Resolve a numbered ``gh pr`` write without ``--repo`` from its checkout, like gh does."""
+    if (
+        cwd is None
+        or tokens[0] != "pr"
+        or not _tracks_pr(tokens)
+        or _flag(tokens, "--repo", "-R") is not None
+        or (number := _command_number(tokens)) is None
+    ):
+        return None
+    return ShellPrOp(
+        tracks=True,
+        creates=False,
+        target=None,
+        content_only=True,
+        resolve_result=functools.partial(_checkout_pr, cwd, number),
+    )
 
 
 def _graphql_setup(segment: ShellSegment) -> bool:
@@ -594,6 +668,7 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
     known stdout producers and a stream without redirects or pipes.
     """
     commands: list[tuple[list[str], str | None, str]] = []
+    checkout_ops: list[ShellPrOp] = []
     for segment in segments:
         tokens = _gh_arguments(segment)
         if not tokens or tokens[0] not in {"pr", "api"}:
@@ -601,6 +676,8 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         field = _graphql_create_field(tokens)
         projection = (_flag(tokens, "--jq", "-q", last=True) or "").strip()
         commands.append((tokens, field, projection))
+        if op := _checkout_pr_operation(tokens, segment.cwd):
+            checkout_ops.append(op)
     output_eligible = not any(field for _, field, _ in commands) or _graphql_output_eligible(
         segments
     )
@@ -664,9 +741,55 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
                 ),
             )
         )
+    ops.extend(checkout_ops)
     if push := push_operation(segments):
         ops.append(push)
     return ops
+
+
+def shell_branch_writes(segments: Sequence[ShellSegment]) -> list[BranchWrite]:
+    """Return the branches that ``gh api`` contents and git ref writes update."""
+    writes: list[BranchWrite] = []
+    for segment in segments:
+        tokens = _gh_arguments(segment)
+        if not tokens or tokens[0] != "api":
+            continue
+        method = _api_method(tokens)
+        endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0].strip("/")
+        host = _flag(tokens, "--hostname") or "github.com"
+        branch = None
+        if match := re.fullmatch(r"repos/([^/]+/[^/]+)/contents/.+", endpoint):
+            branch = _api_field(tokens, "branch") if method in {"PUT", "DELETE"} else None
+        elif match := re.fullmatch(r"repos/([^/]+/[^/]+)/git/refs/heads/(.+)", endpoint):
+            branch = unquote(match[2]) if method == "PATCH" else None
+        elif match := re.fullmatch(r"repos/([^/]+/[^/]+)/git/refs", endpoint):
+            ref = _api_field(tokens, "ref") if method == "POST" else None
+            branch = (
+                ref.removeprefix("refs/heads/") if ref and ref.startswith("refs/heads/") else None
+            )
+        if match and branch:
+            writes.append(BranchWrite(host, match[1], branch))
+    return writes
+
+
+def mcp_branch_writes(tool_name: str, arguments: dict[str, object]) -> list[BranchWrite]:
+    """Return the branch that a GitHub MCP file or push tool updates."""
+    name = tool_name.rsplit("__", 1)[-1].removeprefix("github_")
+    owner, repo, branch = arguments.get("owner"), arguments.get("repo"), arguments.get("branch")
+    host = arguments.get("hostname", arguments.get("host"))
+    if (
+        name not in _MCP_BRANCH_WRITES
+        or not isinstance(owner, str)
+        or not isinstance(repo, str)
+        or not isinstance(branch, str)
+        or not owner
+        or not repo
+        or not branch
+    ):
+        return []
+    return [
+        BranchWrite(host if isinstance(host, str) else "github.com", f"{owner}/{repo}", branch)
+    ]
 
 
 def _mcp_prs(

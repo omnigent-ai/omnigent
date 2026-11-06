@@ -24,6 +24,7 @@ retain configuration, fault injection and behavioral assertions.
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |
 | Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
 | Codex home with rollouts, `history_base` lineage and thread store | `CodexRollout`, `write_codex_thread_store` in [codex_rollout.py](codex_rollout.py) | [Codex import history](../e2e/test_host_import_codex_history_e2e.py) |
+| Checkout whose `git@github.com` origin is a local bare repository | `github_checkout`, `git` in [github_remote.py](github_remote.py) | [PR tab after a push](../e2e_ui/github/test_pr_tracking_after_push.py), [push observer](../runner/test_github_push.py) |
 
 ## Session inputs stay explicit
 

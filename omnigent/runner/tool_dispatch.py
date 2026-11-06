@@ -28,6 +28,7 @@ import mimetypes
 import os
 import re
 import tempfile
+import time
 import uuid
 import weakref
 from collections.abc import Awaitable, Callable, Mapping
@@ -7023,6 +7024,7 @@ async def execute_tool(
                 "use sys_os_* tools and an inherited terminal for filesystem operations"
             }
         )
+    started_at = time.time()
     try:
         if mcp_manager is not None:
             # All MCP tool calls are routed through the AP server's
@@ -7287,6 +7289,8 @@ async def execute_tool(
             result=output,
             successful=not output.startswith("Error:"),
             source="runner_shell",
+            started_at=started_at,
+            repository_visible=not disposable,
         )
     return output
 

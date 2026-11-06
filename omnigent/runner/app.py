@@ -4176,6 +4176,9 @@ def create_runner_app(
         sign_in_hold: bool = False,
         cancelled: bool = False,
     ) -> None:
+        from omnigent.runner.pr_observer import recheck_pending
+
+        recheck_pending(conv_id)
         # Harness children record PRs without a server client; report them as the turn ends.
         pr_reports.notify(conv_id)
         # Stale-finalizer guard: when owner_response_id no longer matches the live response,
@@ -7496,6 +7499,9 @@ def create_runner_app(
                     terminal_status = "cancelled"
                     output = recovered_entry.output
             if status in ("idle", "failed"):
+                from omnigent.runner.pr_observer import recheck_pending
+
+                recheck_pending(conversation_id)
                 pr_reports.notify(conversation_id)
             if status in ("running", "waiting", "idle", "failed"):
                 # Forwarders report these edges straight to the server, so record

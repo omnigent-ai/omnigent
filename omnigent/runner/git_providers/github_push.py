@@ -1,4 +1,4 @@
-"""Resolve existing GitHub PRs from successful git push status output."""
+"""Find the open GitHub PRs of pushed branches, and read pushes from git status output."""
 
 from __future__ import annotations
 
@@ -8,12 +8,13 @@ import re
 import tempfile
 import time
 from collections.abc import Sequence
+from datetime import datetime
 from pathlib import PurePath
 from urllib.parse import quote
 
 from omnigent.git_providers import resolve_remote
 from omnigent.policies.builtins.github import _git_subcommand_index
-from omnigent.runner.git_providers import ShellPrOp, ShellSegment
+from omnigent.runner.git_providers import BranchPullRequest, ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -26,7 +27,6 @@ _PORCELAIN_UPDATE = re.compile(
     r"(?:[0-9a-f]{4,64}\.\.\.?[0-9a-f]{4,64}|\[new branch\])"
     r"(?: \(forced update\))?\s*$"
 )
-# ponytail: quiet pushes need native remote/ref metadata before they can be tracked.
 _PUSH_FLAGS = frozenset(
     {
         "--all",
@@ -106,6 +106,7 @@ def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
         target=None,
         content_only=True,
         resolve_result=functools.partial(pushed_prs, tuple(segments)),
+        push_output=True,
     )
 
 
@@ -154,33 +155,52 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
         for host, repository, branch in targets:
             if time.monotonic() >= deadline:
                 break
-            endpoint = f"repos/{repository}/commits/{quote(branch, safe='')}/pulls"
-            code, output, _ = github_resource._gh(
-                ["api", "--hostname", host, endpoint], cwd=tempfile.gettempdir(), timeout=5.0
-            )
-            if code != 0:
-                continue
-            try:
-                rows = json.loads(output)
-            except ValueError:
-                continue
-            if not isinstance(rows, list):
-                continue
-            for row in rows:
-                if not isinstance(row, dict) or row.get("state") != "open":
-                    continue
-                head = row.get("head")
-                if not isinstance(head, dict):
-                    continue
-                head_repo = head.get("repo")
-                full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
-                if (
-                    isinstance(full_name, str)
-                    and full_name.lower() == repository.lower()
-                    and head.get("ref") == branch
-                    and (reference := pr_reference(row.get("html_url"))) is not None
-                    and reference.provider == "github"
-                    and reference.host == host
-                ):
-                    references[reference.url] = reference
+            for pr in branch_prs(host, repository, branch):
+                references[pr.reference.url] = pr.reference
     return list(references.values())
+
+
+def branch_prs(host: str, repository: str, branch: str) -> list[BranchPullRequest]:
+    """Return the open PRs whose head is *branch* of *repository*, a fork's included."""
+    from omnigent.runner import github_resource
+
+    endpoint = f"repos/{repository}/commits/{quote(branch, safe='')}/pulls"
+    code, output, _ = github_resource._gh(
+        ["api", "--hostname", host, endpoint], cwd=tempfile.gettempdir(), timeout=5.0
+    )
+    if code != 0:
+        return []
+    try:
+        rows = json.loads(output)
+    except ValueError:
+        return []
+    if not isinstance(rows, list):
+        return []
+    found: list[BranchPullRequest] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("state") != "open":
+            continue
+        head = row.get("head")
+        if not isinstance(head, dict):
+            continue
+        head_repo = head.get("repo")
+        full_name = head_repo.get("full_name") if isinstance(head_repo, dict) else None
+        if (
+            isinstance(full_name, str)
+            and full_name.lower() == repository.lower()
+            and head.get("ref") == branch
+            and (reference := pr_reference(row.get("html_url"))) is not None
+            and reference.provider == "github"
+            and reference.host == host
+        ):
+            found.append(BranchPullRequest(reference, _timestamp(row.get("created_at"))))
+    return found
+
+
+def _timestamp(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None

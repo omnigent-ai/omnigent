@@ -235,7 +235,7 @@ class ExecutorAdapter(HarnessApp):
         # reload. Dispatched calls never reach this — their ToolCallComplete
         # short-circuits — so it is observed-only.
         self._observed_tool_calls: dict[str, tuple[str, str]] = {}
-        self._pr_tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._pr_tool_calls: dict[str, tuple[str, dict[str, Any], float | None]] = {}
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -1117,7 +1117,13 @@ class ExecutorAdapter(HarnessApp):
             if tool_use_id is not None and event.metadata.get("internally_executed") is not True:
                 self._pending_mcp_call_ids.append(tool_use_id)
             call_id = tool_use_id or f"call_{uuid.uuid4().hex[:12]}"
-            self._pr_tool_calls[call_id] = (event.name, event.args or {})
+            # A completed-only emission arrives after the call ran, so its start is unknown.
+            started_at = (
+                self._pr_tool_calls.get(call_id, (None, None, None))[2]
+                if event.metadata.get("observed_call_completed") is True
+                else time.time()
+            )
+            self._pr_tool_calls[call_id] = (event.name, event.args or {}, started_at)
             bare_name = _strip_mcp_tool_prefix(event.name)
             arguments_json = _serialize_args(event.args)
             if event.metadata.get("observed_call_completed") is True:
@@ -1182,6 +1188,7 @@ class ExecutorAdapter(HarnessApp):
                         successful=event.status == "success",
                         call_id=call_id,
                         source="sdk",
+                        started_at=pr_call[2],
                     )
             if observed is not None:
                 observed_name, observed_args = observed
@@ -1213,6 +1220,10 @@ class ExecutorAdapter(HarnessApp):
         elif isinstance(event, TurnComplete):
             if event.response is not None:
                 pass
+            if ctx.session_id:
+                from omnigent.runner.pr_observer import recheck_pending
+
+                recheck_pending(ctx.session_id)
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage

@@ -69,8 +69,23 @@ if args[:1] == ["api"] and len(args) > 1 and re.fullmatch(
     row = {"number": pr["number"], "state": "open", "html_url": pr["url"],
            "base": {"repo": {"full_name": repo}}}
     finish(0, json.dumps([row]))
+if args[:1] == ["api"] and args[-1] == f"repos/{repo}/commits/{pr['headRefName']}/pulls":
+    row = {"number": pr["number"], "state": "open", "html_url": pr["url"],
+           "head": {"ref": pr["headRefName"], "repo": {"full_name": repo}},
+           "base": {"repo": {"full_name": repo}}}
+    finish(0, json.dumps([row]))
 if args[:1] == ["api"] and args[-1].startswith(f"repos/{repo}/pulls/{pr['number']}/files"):
     finish(0, "[[]]" if "--slurp" in args else "[]")
+if args[:2] == ["pr", "ready"] and args[2:] == [str(pr["number"])]:
+    finish(0, err=f'✓ Pull request {repo}#{pr["number"]} is marked as "ready for review"')
+contents = [arg for arg in args if arg.startswith(f"repos/{repo}/contents/")]
+if args[:1] == ["api"] and contents and "PUT" in args:
+    path = contents[0].split("/contents/", 1)[1]
+    sha = "c" * 40
+    finish(0, json.dumps({
+        "content": {"name": path.rsplit("/", 1)[-1], "path": path, "sha": "d" * 40},
+        "commit": {"sha": sha, "html_url": f"https://github.com/{repo}/commit/{sha}"},
+    }))
 finish(1, err="gh shim: unexpected command " + json.dumps(args))
 """
 
@@ -133,9 +148,14 @@ def stack_env(binary: Path, runtime: Path, model_url: str) -> dict[str, str]:
     return env
 
 
-def create_session(base_url: str, runner_id: str, workspace: Path) -> str:
-    """A runner-bound single-agent session whose workspace is ``workspace``."""
-    model = f"pr-checks-{uuid.uuid4().hex[:8]}"
+def create_session(
+    base_url: str, runner_id: str, workspace: Path, *, model: str | None = None, tools: str = ""
+) -> str:
+    """A runner-bound single-agent session whose workspace is ``workspace``.
+
+    ``model`` keys the session's mock-LLM queue; ``tools`` is an optional ``tools:`` YAML block.
+    """
+    model = model or f"pr-checks-{uuid.uuid4().hex[:8]}"
     spec = f"""name: pr-checks
 prompt: Run the requested shell command and report completion.
 executor:
@@ -146,7 +166,7 @@ os_env:
   cwd: .
   sandbox:
     type: none
-"""
+{tools}"""
     response = post_session_bundle(
         httpx.post,
         f"{base_url}/v1/sessions",
