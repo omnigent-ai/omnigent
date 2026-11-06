@@ -1707,23 +1707,55 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
-        # An accepted steer often returns the turn already saved here. Rewriting
-        # it can fail on a full disk after Codex has accepted the message.
-        if state is None or (
-            state.active_turn_id == active_turn_id
-            and (active_turn_id is not None or state.active_shell_turn_id is None)
-        ):
-            return
-        _write_bridge_state_unlocked(
-            bridge_dir,
-            replace(
-                state,
-                active_turn_id=active_turn_id,
-                active_shell_turn_id=(
-                    active_turn_id if state.active_shell_turn_id == active_turn_id else None
-                ),
+        if state is not None:
+            _replace_active_turn_id_unlocked(bridge_dir, state, active_turn_id)
+
+
+def record_acknowledged_turn_id(
+    bridge_dir: Path, expected_turn_id: str | None, turn_id: str
+) -> bool:
+    """
+    Record the turn a ``turn/start`` or ``turn/steer`` response acknowledged.
+
+    The forwarder may record a newer ``turn/started`` while the request is in
+    flight, and Codex can acknowledge ``turn/start`` on a busy thread with a
+    turn id that never starts. The forwarder's turn stays active in both cases.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param expected_turn_id: Active turn id the request was sent against, or
+        ``None`` for ``turn/start``.
+    :param turn_id: Turn id from the response, e.g. ``"turn_abc123"``.
+    :returns: ``True`` when bridge state names *turn_id*, ``False`` when it
+        was missing or already names another turn.
+    """
+    with _bridge_state_lock(bridge_dir):
+        state = read_bridge_state(bridge_dir)
+        if state is None or state.active_turn_id not in (expected_turn_id, turn_id):
+            return False
+        _replace_active_turn_id_unlocked(bridge_dir, state, turn_id)
+        return True
+
+
+def _replace_active_turn_id_unlocked(
+    bridge_dir: Path, state: CodexNativeBridgeState, active_turn_id: str | None
+) -> None:
+    """Set the active turn id while the caller holds the bridge state lock."""
+    # An accepted steer often returns the turn already saved here. Rewriting
+    # it can fail on a full disk after Codex has accepted the message.
+    if state.active_turn_id == active_turn_id and (
+        active_turn_id is not None or state.active_shell_turn_id is None
+    ):
+        return
+    _write_bridge_state_unlocked(
+        bridge_dir,
+        replace(
+            state,
+            active_turn_id=active_turn_id,
+            active_shell_turn_id=(
+                active_turn_id if state.active_shell_turn_id == active_turn_id else None
             ),
-        )
+        ),
+    )
 
 
 def mark_shell_command_pending(

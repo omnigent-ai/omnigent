@@ -12,9 +12,13 @@ from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
 from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
+from omnigent.inner.codex_native_executor import CodexNativeExecutor
+from omnigent.inner.executor import TurnComplete
 from tests.harnesses.codex_native.session._support import (
+    _agent_message_delta_event,
     _agent_message_event,
     _completed_event,
+    _expected_delta_data,
     _FakeCodexAppServerClient,
     _forwarder_context,
     _recording_forwarder_client,
@@ -251,6 +255,76 @@ def test_forwarder_posts_agent_item_after_stale_terminal_event(tmp_path: Path) -
         for payload in posted
         if payload["type"] == "external_conversation_item"
     ] == ["new response"]
+
+
+def test_web_turn_start_racing_a_native_turn_keeps_that_turn_mirrored(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A web send that races a native turn start keeps that turn's output and end.
+
+    Codex 0.142 acknowledges ``turn/start`` on a busy thread with a turn id that
+    never starts; the web input joins the running turn instead.
+    """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        """Drive the web executor and the forwarder through one bridge directory."""
+        async with _recording_forwarder_client(posted) as client:
+            coalescer = codex_native_forwarder._OutputTextDeltaCoalescer(
+                client, "conv_123", flush_interval_seconds=60.0, flush_char_threshold=1000
+            )
+
+            async def forward(event: dict[str, Any]) -> None:
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    delta_coalescer=coalescer,
+                )
+
+            class _BusyThreadClient(_FakeCodexAppServerClient):
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    super().__init__()
+
+                async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+                    assert method == "turn/start", method
+                    await forward(_started_event("turn_native"))
+                    return {"result": {"turn": {"id": "turn_unstarted", "status": "inProgress"}}}
+
+            monkeypatch.setattr(
+                "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+                _BusyThreadClient,
+            )
+            executor = CodexNativeExecutor(bridge_dir=tmp_path)
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": [{"type": "input_text", "text": "web"}]}],
+                    [],
+                    "",
+                )
+            ]
+            assert [type(event) for event in events] == [TurnComplete]
+
+            await forward(_agent_message_delta_event("turn_native", "item_agent", "reply"))
+            await forward(_completed_event("turn_native"))
+            await coalescer.close()
+
+    asyncio.run(run())
+
+    assert [
+        payload["data"] for payload in posted if payload["type"] == "external_output_text_delta"
+    ] == [_expected_delta_data("reply", "turn_native", "item_agent")]
+    assert [
+        payload["data"]["status"]
+        for payload in posted
+        if payload["type"] == "external_session_status"
+    ] == ["running", "idle"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 def test_forwarder_posts_user_message_on_assistant_item_started(tmp_path: Path) -> None:

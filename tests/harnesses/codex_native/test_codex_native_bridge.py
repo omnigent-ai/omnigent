@@ -38,6 +38,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_home_config_model,
     read_mcp_startup,
     read_policy_hook_config,
+    record_acknowledged_turn_id,
     record_app_server_stopped,
     record_certificate_failure,
     record_child_usage_baseline,
@@ -666,6 +667,35 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
             update_active_turn_id(bridge_dir, next_turn_id)
         assert raised.value.errno == errno.ENOSPC
     assert read_bridge_state(bridge_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "expected_turn_id", "acknowledged_turn_id", "recorded", "active_after"),
+    [
+        (None, None, "turn_a", True, "turn_a"),
+        ("turn_a", None, "turn_a", True, "turn_a"),
+        ("turn_native", None, "turn_unstarted", False, "turn_native"),
+        ("turn_a", "turn_a", "turn_a", True, "turn_a"),
+        (None, "turn_a", "turn_a", False, None),
+        ("turn_b", "turn_a", "turn_a", False, "turn_b"),
+    ],
+)
+def test_acknowledged_turn_does_not_replace_a_turn_recorded_meanwhile(
+    bridge_dir: Path,
+    active_turn_id: str | None,
+    expected_turn_id: str | None,
+    acknowledged_turn_id: str,
+    recorded: bool,
+    active_after: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+
+    assert (
+        record_acknowledged_turn_id(bridge_dir, expected_turn_id, acknowledged_turn_id) is recorded
+    )
+    state = read_bridge_state(bridge_dir)
+    assert state is not None
+    assert state.active_turn_id == active_after
 
 
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
