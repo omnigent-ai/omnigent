@@ -29,6 +29,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._helpers.stdio_jsonrpc import read_json_line, stop_process, write_json_line
 
 
@@ -3891,23 +3892,12 @@ async def test_mcp_servers_signed_in_mid_session_reconnect_before_the_next_turn(
         close.assert_awaited_with(third)
 
 
-def _expand_entry_value(value: str, env: dict[str, str]) -> str:
-    """Expand ``${VAR}`` and ``${VAR:-default}`` as Claude Code does for an MCP entry."""
-    import re
-
-    return re.sub(
-        r"\$\{(\w+)(?::-([^}]*))?\}",
-        lambda match: env.get(match.group(1)) or match.group(2) or "",
-        value,
-    )
-
-
 def _serve_mcp_round_trip(entry: dict[str, object], env: dict[str, str], tool: str) -> list[dict]:
     """Run a Claude Code MCP entry as Claude Code would, expanding ``${VAR}``s from ``env``."""
     import subprocess
 
     def expand(value: str) -> str:
-        return _expand_entry_value(value, env)
+        return expand_entry_value(value, env)
 
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
@@ -4376,7 +4366,7 @@ def test_seatbelt_relay_answers_with_its_control_socket_dir_still_uncreated(
         env = {**os.environ, **relay.env}
 
         def expand(value: str) -> str:
-            return _expand_entry_value(value, env)
+            return expand_entry_value(value, env)
 
         child = subprocess.Popen(
             [

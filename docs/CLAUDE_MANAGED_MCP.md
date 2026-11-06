@@ -48,7 +48,7 @@ Merge this into the file's `mcpServers` and keep the organization's other server
 | `OMNIGENT_MCP_RELAY_PYTHON` | The Python interpreter that runs Omnigent. |
 | `OMNIGENT_MCP_RELAY_BRIDGE_DIR` | The session's private relay directory, which also holds the relay's access token. |
 | `OMNIGENT_MCP_RELAY_TMPDIR` | The temporary directory Omnigent's relay directories live under. |
-| `OMNIGENT_MCP_RELAY_SOCKET_DIR` | A private directory for the relay's control socket, so a sandboxed session can grant it without sharing the socket root. Empty means the default root. |
+| `OMNIGENT_MCP_RELAY_SOCKET_DIR` | Where the relay's control socket goes. claude-sdk sessions get a private directory, so a sandbox can grant it without sharing the socket root. claude-native sessions get the configured harness socket root (`OMNIGENT_HARNESS_TMP_PARENT`). Empty means the default root. |
 
 An entry deployed before `OMNIGENT_HARNESS_TMP_PARENT` was added still works
 for unsandboxed sessions. A claude-sdk session in a macOS Seatbelt sandbox

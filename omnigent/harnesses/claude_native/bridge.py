@@ -2483,8 +2483,8 @@ def managed_mcp_relay_env(
 
     :param bridge_dir: Bridge directory ``serve-mcp`` serves.
     :param python_executable: Python with Omnigent installed; ``None`` uses this one.
-    :param socket_dir: Private control-socket directory, e.g. one a sandbox grants;
-        ``None`` leaves serve-mcp on the shared harness socket root.
+    :param socket_dir: Control-socket directory: a private one a sandbox grants, or
+        the configured harness socket root; ``None`` leaves serve-mcp on the default root.
     :returns: Claude Code environment, e.g. ``{"OMNIGENT_MCP_RELAY_BRIDGE_DIR": "/tmp/x", ...}``.
     """
     return {
@@ -2521,12 +2521,19 @@ def claude_terminal_relay_env(
     """Relay environment for a Claude Code terminal, needed only under ``managed-mcp.json``.
 
     Without that file :func:`augment_claude_args` passes the relay as ``--mcp-config``.
+    The entry sets serve-mcp's socket root from this environment, so it carries the
+    launching environment's root, as serve-mcp would inherit it from ``--mcp-config``.
     """
     from omnigent.onboarding.ambient import claude_code_managed_mcp_present
+    from omnigent.runtime.harnesses.paths import resolve_harness_tmp_parent
 
     if not claude_code_managed_mcp_present():
         return {}
-    return managed_mcp_relay_env(bridge_dir, python_executable=python_executable)
+    return managed_mcp_relay_env(
+        bridge_dir,
+        python_executable=python_executable,
+        socket_dir=resolve_harness_tmp_parent(),
+    )
 
 
 def managed_mcp_relay_configured() -> bool:

@@ -48,6 +48,7 @@ from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
 )
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._image_fixtures import (
     _TINY_CMYK_JPEG_BASE64,
     _TINY_GIF_BASE64,
@@ -189,6 +190,8 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
 
     monkeypatch.chdir(tmp_path)
     _install_managed_mcp_config(tmp_path, monkeypatch)
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
     bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
     captured_warnings: list[str] = []
     monkeypatch.setattr(
@@ -212,6 +215,11 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     relay_env = body["spec"]["env"]
     assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV] == str(bridge_dir)
     assert relay_env[claude_native_bridge.MANAGED_MCP_RELAY_PYTHON_ENV] == sys.executable
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    entry_env = claude_native_bridge.managed_mcp_relay_entry()["env"]
+    assert expand_entry_value(entry_env["OMNIGENT_HARNESS_TMP_PARENT"], relay_env) == str(
+        socket_root
+    )
 
     managed_file = tmp_path / "etc-claude-code" / "managed-mcp.json"
     managed_file.write_text(

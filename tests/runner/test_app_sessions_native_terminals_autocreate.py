@@ -81,6 +81,7 @@ from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.managed_mcp import expand_entry_value
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
 from tests.budgets import budget
@@ -2560,6 +2561,8 @@ async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_b
     )
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    socket_root = tmp_path / "harness-sockets"
+    monkeypatch.setenv("OMNIGENT_HARNESS_TMP_PARENT", str(socket_root))
     monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridge")
     monkeypatch.setattr(
@@ -2595,6 +2598,10 @@ async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_b
     bridge_dir = Path(spec.env[claude_native_bridge.MANAGED_MCP_RELAY_BRIDGE_DIR_ENV])
     assert (bridge_dir / "bridge.json").is_file()
     assert spec.env[claude_native_bridge.MANAGED_MCP_RELAY_TMPDIR_ENV] == str(tmp_path)
+    # serve-mcp keeps the operator's harness socket root once Claude expands the entry.
+    assert expand_entry_value(relay_entry["env"]["OMNIGENT_HARNESS_TMP_PARENT"], spec.env) == str(
+        socket_root
+    )
 
 
 @pytest.mark.asyncio
