@@ -30,7 +30,7 @@ import re
 import tempfile
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -65,6 +65,8 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
+from omnigent.policies.builtins.safety import scheduled_task_review_error
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -117,6 +119,7 @@ from omnigent.tools.builtins.timer import (
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.reasoning_effort import validate_effort_for_harness
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -1875,36 +1878,6 @@ def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
     return raw_effort
 
 
-def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
-    """
-    Validate *effort* against the child harness's declared effort family.
-
-    A harness whose family is ``NONE`` has no effort plumbing, and an
-    unrecognized one cannot be checked at all — the caller asked for this
-    explicitly, so reject rather than accept-and-drop. (Delivery of a
-    persisted effort takes the opposite tack and filters quietly; see the
-    reasoning guard in :mod:`omnigent.runner.app`.)
-
-    :param effort: Requested effort, e.g. ``"high"``.
-    :param harness: Resolved child harness, e.g. ``"claude-native"``.
-    :returns: The canonical effort that harness accepts.
-    :raises ValueError: If the harness supports no effort override, or
-        the value falls outside its vocabulary.
-    """
-    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
-
-    canonical = canonicalize_harness(harness) if harness is not None else None
-    supported = efforts_for_harness(harness)
-    if not supported:
-        raise ValueError(
-            f"harness {canonical or harness or 'unknown'!r} does not support "
-            "a reasoning-effort override"
-        )
-    validated = validate_effort(effort, canonical or harness or "unknown", supported)
-    assert validated is not None
-    return validated
-
-
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -2901,7 +2874,7 @@ async def _execute_subagent_tool(
                 effort_source = f"sub-agent {sub_agent_name!r} spec"
         if effective_effort is not None:
             try:
-                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                create_body["reasoning_effort"] = validate_effort_for_harness(
                     effective_effort,
                     child_harness,
                 )
@@ -3327,6 +3300,31 @@ async def _send_to_existing_session(
     )
 
 
+# sys_session_create argument -> session-create field, shared by the JSON
+# (agent_id) and multipart (config_path) creates so neither drops one.
+_SESSION_CREATE_FIELDS = (
+    ("title", "title"),
+    ("model", "model_override"),
+    ("reasoning_effort", "reasoning_effort"),
+)
+
+
+def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
+    """
+    Map ``sys_session_create`` arguments to the per-session create fields.
+
+    :param args: Tool arguments, e.g. ``{"model": "databricks-glm-5-2"}``.
+    :returns: The non-empty string fields under their create names, e.g.
+        ``{"model_override": "databricks-glm-5-2"}``.
+    """
+    fields: _JsonObject = {}
+    for arg_name, field_name in _SESSION_CREATE_FIELDS:
+        value = args.get(arg_name)
+        if isinstance(value, str) and value:
+            fields[field_name] = value
+    return fields
+
+
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
@@ -3365,13 +3363,10 @@ def _build_session_create_body(
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
+        **_session_create_fields(
+            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+        ),
     }
-    if isinstance(title, str) and title:
-        body["title"] = title
-    if isinstance(model, str) and model:
-        body["model_override"] = model
-    if isinstance(reasoning_effort, str) and reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -3478,7 +3473,8 @@ async def _execute_session_create(
     Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
-        ``config_path`` required, ``title`` / ``message`` optional.
+        ``config_path`` required, ``title`` / ``message`` / ``model`` /
+        ``reasoning_effort`` optional in both modes.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -3529,18 +3525,6 @@ async def _execute_session_create(
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
-        # The multipart create carries only the config bundle, so an effort
-        # passed here would never reach the child. Refuse instead of dropping it.
-        if args.get("reasoning_effort") is not None:
-            return json.dumps(
-                {
-                    "error": (
-                        "sys_session_create 'reasoning_effort' is supported only "
-                        "with 'agent_id'; the 'config_path' create cannot carry "
-                        "it. Set the effort in the config you upload instead."
-                    )
-                }
-            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -3784,6 +3768,73 @@ async def _post_child_first_message(
     return None
 
 
+async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Refuse a config_path ``model`` the server cannot store.
+
+    Servers that predate ``session_bundle_model_override`` in ``GET /v1/info``
+    reject the field with a bare 400; name the cause instead, and never drop
+    the model, which would run the child on the bundle's own.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``None`` when the server accepts the field; a JSON error otherwise.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        supported = info.json().get("session_bundle_model_override") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"sys_session_create could not check server support: {exc}"})
+    if supported:
+        return None
+    return json.dumps(
+        {
+            "error": "server_too_old",
+            "detail": (
+                "This server cannot set 'model' on a config_path child. Set "
+                "executor.model in the config, create the child by agent_id, "
+                "or upgrade the server."
+            ),
+        }
+    )
+
+
+def _config_path_effort_for_harness(bundle_bytes: bytes, effort: str) -> str:
+    """
+    Check a config_path ``reasoning_effort`` against the bundled child's harness.
+
+    A known harness with no effort plumbing, or an effort outside its
+    vocabulary, is refused instead of stored and dropped at every turn;
+    aliases fold to the harness's canonical value. A harness the registry
+    cannot classify (e.g. the runtime default) passes through, and launch
+    filters it. The check lives at the tool boundary, not the multipart
+    endpoint, so direct HTTP creates keep their shared-vocabulary rules.
+
+    :param bundle_bytes: The gzipped bundle about to be uploaded.
+    :param effort: The requested effort, e.g. ``"high"``.
+    :returns: The effort to send, e.g. ``"xhigh"`` for ``"ultra"`` on codex.
+    :raises ValueError: If the bundle's harness cannot use the effort.
+    """
+    from omnigent.models.model_catalog import spec_harness
+    from omnigent.spec import load
+    from omnigent.util.reasoning_effort import efforts_for_harness
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spec = load(
+                bundle_bytes,
+                dest=Path(tmpdir) / "agent",
+                expand_env=False,
+                enforce_handler_allowlist=True,
+            )
+    except Exception:  # noqa: BLE001 — the server reports an invalid bundle itself.
+        return effort
+    harness = spec_harness(spec)
+    if efforts_for_harness(harness) is None:
+        return effort
+    return validate_effort_for_harness(effort, harness)
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: _JsonObject,
@@ -3805,7 +3856,8 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title``, ``model``
+        (sent as ``model_override``) and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -3828,10 +3880,25 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: _JsonObject = {"parent_session_id": conversation_id}
-    title = args.get("title")
-    if isinstance(title, str) and title:
-        metadata["title"] = title
+    for arg_name in ("model", "reasoning_effort"):
+        if args.get(arg_name) is not None and not isinstance(args.get(arg_name), str):
+            return json.dumps({"error": f"sys_session_create '{arg_name}' must be a string"})
+    metadata: _JsonObject = {
+        "parent_session_id": conversation_id,
+        **_session_create_fields(args),
+    }
+    effort = metadata.get("reasoning_effort")
+    if isinstance(effort, str):
+        try:
+            metadata["reasoning_effort"] = await asyncio.to_thread(
+                _config_path_effort_for_harness, bundle_bytes, effort
+            )
+        except ValueError as exc:
+            return json.dumps({"error": f"sys_session_create invalid 'reasoning_effort': {exc}"})
+    if "model_override" in metadata:
+        unsupported = await _bundle_model_override_unsupported(server_client)
+        if unsupported is not None:
+            return unsupported
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -3873,8 +3940,8 @@ async def _session_create_from_config_path(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title`` /
-        ``message``.
+    :param args: Parsed tool arguments; optional ``title``, ``message``,
+        ``model`` and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param publish_event: SSE publish callback for ``session.created``.
@@ -4883,6 +4950,7 @@ async def _execute_scheduled_task_tool(
     arguments: str,
     *,
     server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
 ) -> str:
     """
     Runner-local handler for the ``sys_scheduled_task_*`` family.
@@ -4897,6 +4965,7 @@ async def _execute_scheduled_task_tool(
     :param arguments: JSON-encoded arguments string from the LLM.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
+    :param conversation_id: Session whose approved tool call is being dispatched.
     :returns: Tool output JSON string.
     """
     if server_client is None:
@@ -4905,6 +4974,13 @@ async def _execute_scheduled_task_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    if tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update"):
+        action = "create" if tool_name == "sys_scheduled_task_create" else "update"
+        error = scheduled_task_review_error(args, action=action)
+        if error:
+            return json.dumps({"error": f"{tool_name}: {error}"})
     if "project_name" in args and "project_id" in args:
         return json.dumps({"error": f"{tool_name}: set project_id or project_name, not both"})
     raw_project_name = args.get("project_name")
@@ -4915,6 +4991,9 @@ async def _execute_scheduled_task_tool(
     project_name = raw_project_name if isinstance(raw_project_name, str) else None
     wants_project = tool_name in ("sys_scheduled_task_create", "sys_scheduled_task_update") and (
         "project_name" in args or "project_id" in args
+    )
+    mutation_headers = (
+        {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id is not None else None
     )
 
     try:
@@ -4939,7 +5018,12 @@ async def _execute_scheduled_task_tool(
                 return refusal
             if project_name is not None:
                 payload["project_id"] = await _project_id_for_name(server_client, project_name)
-            resp = await server_client.post("/v1/scheduled-tasks", json=payload, timeout=30.0)
+            resp = await server_client.post(
+                "/v1/scheduled-tasks",
+                json=payload,
+                timeout=30.0,
+                headers={**(mutation_headers or {}), "x-omnigent-automation-source": "agent"},
+            )
         elif tool_name in ("sys_scheduled_task_update", "sys_scheduled_task_delete"):
             task_id = args.get("scheduled_task_id")
             if not task_id:
@@ -4969,7 +5053,9 @@ async def _execute_scheduled_task_tool(
                             server_client, project_name
                         )
                 if resp is None:
-                    resp = await server_client.patch(task_url, json=payload, timeout=30.0)
+                    resp = await server_client.patch(
+                        task_url, json=payload, headers=mutation_headers, timeout=30.0
+                    )
         else:  # pragma: no cover — routing guarantees a known name
             return json.dumps({"error": f"unknown scheduled-task tool {tool_name!r}"})
     except Exception as exc:  # noqa: BLE001
@@ -7161,6 +7247,7 @@ async def execute_tool(
                 tool_name,
                 arguments,
                 server_client=server_client,
+                conversation_id=conversation_id,
             )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
@@ -7497,6 +7584,35 @@ def _effective_runner_os_env_spec(
     return OSEnvSpec(type="caller_process", cwd=cwd)
 
 
+async def _read_os_env_text(os_env: OSEnvironment, path: str) -> str | None:
+    """Return *path*'s complete UTF-8 text within the read cap, keeping its line endings.
+
+    A one-byte probe skips binary files before their content is read.
+
+    :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
+        the current tool dispatch — reused to avoid opening a second connection.
+    :param path: Path argument forwarded from the tool call, e.g. ``"src/foo.py"``.
+    :returns: The text, or ``None`` when the file is missing, binary, too large
+        to read whole, or unreadable.
+    """
+    from omnigent.runner.environment_filesystem import _MAX_READ_BYTES
+
+    try:
+        probe = await os_env.read(path=path, offset=1, limit=None, max_bytes=1)
+        if not isinstance(probe, dict) or probe.get("encoding") != "utf-8":
+            return None
+        existing = await os_env.read(path=path, offset=1, limit=None, max_bytes=_MAX_READ_BYTES)
+    except Exception:  # noqa: BLE001
+        return None  # file does not exist yet or unreadable
+    if (
+        isinstance(existing, dict)
+        and existing.get("encoding") == "utf-8"
+        and not existing.get("truncated")
+    ):
+        return cast("str", existing["content"])
+    return None
+
+
 async def _seed_os_env_snapshot(
     os_env: OSEnvironment,
     path: str,
@@ -7508,8 +7624,9 @@ async def _seed_os_env_snapshot(
     Reads the file via *os_env* and passes the content to
     :meth:`~omnigent.runtime.filesystem_registry.FilesystemRegistry.seed_snapshot`
     so the before/after diff endpoint can show the original content.
-    Silently skips when the file does not yet exist (new-file creates have no
-    baseline) or when any other read error occurs.
+    A file without complete text (see :func:`_read_os_env_text`) seeds no
+    snapshot and an unknown original, since a partial or binary original
+    cannot tell when a write restores it.
 
     :param os_env: The :class:`~omnigent.inner.os_env.OSEnvironment` used for
         the current tool dispatch — reused to avoid opening a second connection.
@@ -7517,14 +7634,8 @@ async def _seed_os_env_snapshot(
     :param filesystem_registry: Registry that stores the snapshot.
     :param conversation_id: Session scope for the snapshot, e.g. ``"conv_abc123"``.
     """
-    try:
-        existing = await os_env.read(path=path, offset=1, limit=None)
-        if isinstance(existing, dict) and "content" in existing:
-            filesystem_registry.seed_snapshot(
-                path, existing["content"], session_id=conversation_id
-            )
-    except Exception:  # noqa: BLE001
-        pass  # file does not exist yet or unreadable — no baseline to capture
+    original = await _read_os_env_text(os_env, path)
+    filesystem_registry.seed_snapshot(path, original, session_id=conversation_id)
 
 
 async def _execute_os_env_tool(
@@ -7615,7 +7726,9 @@ async def _execute_os_env_tool(
                 # previously exist, {"created": False} for an overwrite.
                 was_created = isinstance(result, dict) and result.get("created") is True
                 status = "created" if was_created else "modified"
-                filesystem_registry.record_change(_path, status, conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, status, conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsEditTool.name():
             _path = cast("str", args.get("path", ""))
             if filesystem_registry is not None and conversation_id is not None:
@@ -7627,7 +7740,9 @@ async def _execute_os_env_tool(
                 edits=cast("list[dict[str, str]] | None", args.get("edits")),
             )
             if filesystem_registry is not None and conversation_id is not None:
-                filesystem_registry.record_change(_path, "modified", conversation_id)
+                await filesystem_registry.record_tracked_change(
+                    _path, "modified", conversation_id, lambda: _read_os_env_text(os_env, _path)
+                )
         elif tool_name == SysOsShellTool.name():
             result = await os_env.shell(
                 command=cast("str", args.get("command", "")),
@@ -8335,11 +8450,23 @@ def _format_async_task_item(payload: _JsonObject) -> str:
         title = payload.get("title", "")
         target = f"{agent}:{title}" if title else str(agent)
         if status == "completed":
+            # A confirmed completion can overturn an optimistic cancellation the
+            # parent was already told about; note the correction so the earlier
+            # cancelled line is not read as a contradiction.
+            corrected = (
+                ", superseding its earlier cancelled notice"
+                if payload.get("corrected_status") == "cancelled"
+                else ""
+            )
             if not has_output:
                 return (
-                    f"[System: sub-agent task {handle_id} completed — {target} produced no output]"
+                    f"[System: sub-agent task {handle_id} completed — {target} "
+                    f"produced no output{corrected}]"
                 )
-            return f"[System: sub-agent task {handle_id} completed — {target} returned: {output}]"
+            return (
+                f"[System: sub-agent task {handle_id} completed — {target} "
+                f"returned: {output}{corrected}]"
+            )
         if status == "failed":
             return f"[System: sub-agent task {handle_id} failed — {target} error: {output}]"
         if status == "cancelled":

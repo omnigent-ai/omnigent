@@ -36,7 +36,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
 from omnigent.process_logging import redact_log_text
 from omnigent.runner.identity import strip_runner_auth_secrets
-from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
+from omnigent.util.tmux_compat import tmux_unavailable_reason
 
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
@@ -840,25 +840,9 @@ class TmuxUnavailableError(OmnigentError, RuntimeError):
 
 def _require_supported_tmux() -> None:
     """Fail before terminal setup when tmux is missing, unknown, or too old."""
-    tmux = shutil.which("tmux")
-    if tmux is None:
-        raise TmuxUnavailableError(
-            "tmux is not installed or not on PATH. Native terminals need tmux "
-            f"{MIN_TMUX_VERSION_HINT} or newer: install it (macOS: `brew install tmux`), "
-            "or restart the Omnigent host from a shell where `tmux -V` works."
-        )
-    version = tmux_version(tmux)
-    if version is None:
-        raise TmuxUnavailableError(
-            "Could not determine the installed tmux version; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
-    if version < MIN_TMUX_VERSION:
-        detected = f"{version[0]}.{version[1]}"
-        raise TmuxUnavailableError(
-            f"tmux {detected} is too old; managed terminals require "
-            f"tmux {MIN_TMUX_VERSION_HINT} or newer"
-        )
+    reason = tmux_unavailable_reason()
+    if reason is not None:
+        raise TmuxUnavailableError(reason)
 
 
 def _process_alive(pid: int) -> bool:
