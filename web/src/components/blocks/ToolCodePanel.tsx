@@ -165,9 +165,17 @@ interface OutputPreview {
 }
 
 export function getOutputPreview(output: string, expanded = false): OutputPreview {
-  const lines = output.length === 0 ? [] : output.split("\n");
-  const lineCount = lines.length;
   const charCount = output.length;
+  let lineCount = charCount === 0 ? 0 : 1;
+  let previewEnd = charCount;
+  for (
+    let newline = output.indexOf("\n");
+    newline !== -1;
+    newline = output.indexOf("\n", newline + 1)
+  ) {
+    if (lineCount === OUTPUT_PREVIEW_LINE_LIMIT) previewEnd = newline;
+    lineCount += 1;
+  }
 
   if (
     expanded ||
@@ -185,10 +193,7 @@ export function getOutputPreview(output: string, expanded = false): OutputPrevie
     };
   }
 
-  let text =
-    lineCount > OUTPUT_PREVIEW_LINE_LIMIT
-      ? lines.slice(0, OUTPUT_PREVIEW_LINE_LIMIT).join("\n")
-      : output;
+  let text = output.slice(0, previewEnd);
 
   if (text.length > OUTPUT_PREVIEW_CHAR_LIMIT) {
     text = text.slice(0, OUTPUT_PREVIEW_CHAR_LIMIT).trimEnd();
@@ -226,7 +231,10 @@ export function OutputSection({
   const [isExpanded, setIsExpanded] = useState(false);
 
   const collapsedPreview = useMemo(() => getOutputPreview(output), [output]);
-  const preview = useMemo(() => getOutputPreview(output, isExpanded), [output, isExpanded]);
+  const preview = useMemo(
+    () => (isExpanded ? getOutputPreview(output, true) : collapsedPreview),
+    [output, isExpanded, collapsedPreview],
+  );
   const canExpand = collapsedPreview.isTruncated;
 
   return (

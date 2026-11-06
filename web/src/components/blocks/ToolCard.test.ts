@@ -80,6 +80,24 @@ describe("formatToolDuration", () => {
 });
 
 describe("getOutputPreview", () => {
+  it.each([
+    { output: "", lineCount: 0 },
+    { output: "first\n", lineCount: 2 },
+    { output: "\n\n", lineCount: 3 },
+    { output: "first\r\nsecond", lineCount: 2 },
+  ])("preserves line counts for $output", ({ output, lineCount }) => {
+    expect(getOutputPreview(output)).toEqual({
+      text: output,
+      isTruncated: false,
+      lineCount,
+      charCount: output.length,
+      shownLineCount: lineCount,
+      shownCharCount: output.length,
+      hiddenLineCount: 0,
+      hiddenCharCount: 0,
+    });
+  });
+
   it("keeps short output intact", () => {
     const preview = getOutputPreview("first\nsecond");
 
@@ -110,6 +128,38 @@ describe("getOutputPreview", () => {
     expect(collapsed.shownCharCount).toBe(12_000);
     expect(expanded.text).toBe(output);
     expect(expanded.isTruncated).toBe(false);
+  });
+
+  it("keeps an exact 80-line output intact, including its trailing empty line", () => {
+    const output = "line\n".repeat(79);
+    const preview = getOutputPreview(output);
+
+    expect(preview.text).toBe(output);
+    expect(preview.isTruncated).toBe(false);
+    expect(preview.lineCount).toBe(80);
+  });
+
+  it("counts a large log while keeping only its first 80 lines in the preview", () => {
+    const output = "tool output\n".repeat(100_000);
+    const preview = getOutputPreview(output);
+
+    expect(preview.text).toBe("tool output\n".repeat(79) + "tool output");
+    expect(preview.lineCount).toBe(100_001);
+    expect(preview.shownLineCount).toBe(80);
+    expect(preview.hiddenLineCount).toBe(99_921);
+    expect(preview.hiddenCharCount).toBe(output.length - preview.text.length);
+    expect(getOutputPreview(output, true).text).toBe(output);
+  });
+
+  it("applies the character limit before the line limit and trims the cut boundary", () => {
+    const output = "x".repeat(11_998) + " \nremaining\n".repeat(85);
+    const preview = getOutputPreview(output);
+
+    expect(preview.text).toBe("x".repeat(11_998));
+    expect(preview.shownCharCount).toBe(11_998);
+    expect(preview.shownLineCount).toBe(1);
+    expect(preview.hiddenLineCount).toBe(170);
+    expect(preview.hiddenCharCount).toBe(output.length - 11_998);
   });
 });
 
