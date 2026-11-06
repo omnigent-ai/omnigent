@@ -3144,12 +3144,11 @@ async def _persist_external_conversation_item_unlocked(
     uncertain_pending: list[pending_inputs.DrainedInput] = []
     held_older: list[pending_inputs.DrainedInput] = []
     if drains_pending_inputs and item.type == "message" and isinstance(item.data, MessageData):
-        # Match the mirror to its entry by text: a pasted message the TUI never
-        # recorded leaves a stale head entry, and draining by position would
-        # hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
-        # Skipped older entries are persisted as undelivered. A miss falls back
-        # to the oldest entry, except for Kiro, whose prompt text is exact, and
-        # a message naming its delivery, which settles only that entry.
+        # Match the mirror to the delivery it names, else by text: a pasted message
+        # the TUI never recorded leaves a stale head entry, and draining by position
+        # would hand it to THIS message (see ``omnigent.runtime.pending_inputs``).
+        # Skipped older entries are persisted as undelivered. A text miss falls back
+        # to the oldest entry, except for Kiro, whose prompt text is exact.
         text = _message_text(item.data.content) or ""
         agent_message_candidate = body.data.get("agent_message_candidate") is True
         native_agent = _native_coding_agent_for_session(conv)

@@ -222,6 +222,9 @@ _CODEX_THREAD_GOAL_METHODS = frozenset(
 # The goal is read while the subscription holds the session's delivery scope, so
 # an unanswered read must not hold back the session's live posts.
 _THREAD_GOAL_READ_TIMEOUT_SECONDS = 5.0
+# Steer recovery reads the transcript ahead of the session's live posts, so an
+# unanswered read must not hold them back; a later read retries the steer.
+_STEER_RECOVERY_READ_TIMEOUT_SECONDS = 10.0
 _EXTERNAL_BACKGROUND_WORK_TYPE = "external_background_work"
 # Goal states that stop the goal, mapped to the failure the sidebar shows.
 _GOAL_STOPPED_FAILURE_OUTPUT = {
@@ -7540,8 +7543,9 @@ async def _post_missed_steers(
         return False
     try:
         # Unlike a resume snapshot, a read keeps native ids for in-progress turns.
-        response = await codex_client.request(
-            "thread/read", {"threadId": thread_id, "includeTurns": True}
+        response = await asyncio.wait_for(
+            codex_client.request("thread/read", {"threadId": thread_id, "includeTurns": True}),
+            timeout=_STEER_RECOVERY_READ_TIMEOUT_SECONDS,
         )
     except asyncio.CancelledError:
         raise

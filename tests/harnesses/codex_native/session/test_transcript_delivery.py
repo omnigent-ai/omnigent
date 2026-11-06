@@ -622,7 +622,7 @@ def _run_steered_turn(
     steer_in_transcript: bool = True,
     late_steer_reply: bool = False,
     live_follow_up_steer: bool = False,
-    during_read: Callable[[], None] | None = None,
+    during_read: Callable[[], Awaitable[None]] | None = None,
 ) -> list[str]:
     """
     Run one turn that a web send steers, returning posts and forwarder reads in order.
@@ -635,7 +635,7 @@ def _run_steered_turn(
     :param steer_in_transcript: Whether Codex's transcript holds the steer.
     :param late_steer_reply: Whether the turn ends before the steer's reply arrives.
     :param live_follow_up_steer: Whether a second web steer, seen live, follows the first.
-    :param during_read: Called while each transcript read is in flight.
+    :param during_read: Awaited while each transcript read is in flight.
     :returns: Transcript summary, e.g. ``["user: fix the bug", "status: idle"]``.
     """
     _write_forwarder_bridge(bridge_dir, active_turn_id="turn_123")
@@ -663,7 +663,7 @@ def _run_steered_turn(
     async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
         posted.append({"type": "codex_request", "data": {"method": method}})
         if during_read is not None:
-            during_read()
+            await during_read()
         return await read_thread(method, params)
 
     fake_client.request = request  # type: ignore[method-assign]
@@ -822,7 +822,7 @@ def test_forwarder_backs_off_reads_for_steer_missing_from_transcript(tmp_path: P
 def test_forwarder_keeps_steer_recorded_under_new_turn_during_read(tmp_path: Path) -> None:
     """A steer the executor re-records under a later turn while its ended turn is read stays."""
 
-    def record_under_next_turn() -> None:
+    async def record_under_next_turn() -> None:
         record_sent_steer(
             tmp_path,
             thread_id="thread_123",
@@ -842,6 +842,43 @@ def test_forwarder_keeps_steer_recorded_under_new_turn_during_read(tmp_path: Pat
     assert read_sent_steers(tmp_path, thread_id="thread_123") == [
         SentSteer("turn_456", _STEER_CLIENT_ID)
     ]
+
+
+def test_forwarder_keeps_posting_while_steer_read_goes_unanswered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A transcript read Codex never answers gives up without holding back live posts.
+
+    The steer stays recorded, and the turn-end read mirrors it.
+    """
+    monkeypatch.setattr(codex_native_forwarder, "_STEER_RECOVERY_READ_TIMEOUT_SECONDS", 0.01)
+    reads_started = 0
+
+    async def leave_first_read_unanswered() -> None:
+        nonlocal reads_started
+        reads_started += 1
+        if reads_started == 1:
+            await asyncio.Event().wait()
+
+    transcript = _run_steered_turn(
+        tmp_path,
+        live_steer_copy=False,
+        replies_after_steer=3,
+        during_read=leave_first_read_unanswered,
+    )
+
+    assert transcript == [
+        "user: fix the bug",
+        "assistant: reply 1",
+        _TRANSCRIPT_READ,
+        "assistant: reply 2",
+        "assistant: reply 3",
+        _TRANSCRIPT_READ,
+        _RECOVERED_STEER,
+        "status: idle",
+    ]
+    assert read_sent_steers(tmp_path, thread_id="thread_123") == []
 
 
 @pytest.mark.parametrize(
