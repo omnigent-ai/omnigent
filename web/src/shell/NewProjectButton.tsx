@@ -25,6 +25,16 @@ interface WorkspaceSelection {
   path: string;
 }
 
+function isSinglePathComponent(name: string): boolean {
+  return (
+    name !== "." &&
+    name !== ".." &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0")
+  );
+}
+
 function friendlyDirectoryError(error: unknown): string {
   const message = error instanceof Error ? error.message.toLowerCase() : "";
   if (message.includes("already exists")) {
@@ -125,6 +135,10 @@ export function NewProjectButton({
 
     let selectedWorkspace = workspace;
     if (createWorkspaceFolder) {
+      if (!isSinglePathComponent(trimmed)) {
+        setSubmitError("Use a project name without slashes or dot segments to create a folder.");
+        return;
+      }
       if (dialogHostId === null) {
         setSubmitError("Connect a host before creating a working directory.");
         return;

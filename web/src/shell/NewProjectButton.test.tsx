@@ -140,6 +140,30 @@ describe("NewProjectButton", () => {
     );
   });
 
+  it.each(["../garden", "Client/Acme", "Client\\Acme", ".."])(
+    "does not create a folder from the path-like project name %s",
+    (projectName) => {
+      renderButton();
+
+      fireEvent.click(screen.getByRole("button", { name: /Working directory/ }));
+      fireEvent.change(screen.getByPlaceholderText("Project name…"), {
+        target: { value: projectName },
+      });
+      fireEvent.click(
+        screen.getByRole("checkbox", {
+          name: "Create a folder using the project name",
+        }),
+      );
+      fireEvent.click(screen.getByTestId("new-project-confirm"));
+
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "Use a project name without slashes or dot segments to create a folder.",
+      );
+      expect(mocks.createDirectory).not.toHaveBeenCalled();
+      expect(mocks.createProject).not.toHaveBeenCalled();
+    },
+  );
+
   it("reuses a created folder when project creation is retried", async () => {
     let projectAttempts = 0;
     mocks.createProject.mockImplementation(
