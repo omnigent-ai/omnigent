@@ -123,11 +123,11 @@ def test_new_shell_launches_and_opens(page: Page, terminal_session: tuple[str, s
 def test_new_shell_attaches_while_create_in_flight(
     page: Page, terminal_session: tuple[str, str]
 ) -> None:
-    """A new shell's attach opens before its create returns, then connects.
+    """A new shell's attach opens before its create returns, then carries output.
 
     The create POST is held in the browser, so the attach (flagged
     ``await_launch``) reaches the runner before the launch does; releasing
-    the POST must still end in a connected shell.
+    the POST must end with that same connection delivering the shell's output.
     """
     base_url, session_id = terminal_session
     held: list[Route] = []
@@ -143,17 +143,25 @@ def test_new_shell_attaches_while_create_in_flight(
     ) as attach:
         _open_new_shell(page)
     assert "await_launch=true" in attach.value.url
+    frames: list[object] = []
+    attach.value.on("framereceived", lambda payload: frames.append(payload))
     # Route handlers only run while Playwright waits, so wait through it.
     deadline = time.monotonic() + 10
     while not held and time.monotonic() < deadline:
         page.wait_for_timeout(50)
     assert len(held) == 1, "create POST never sent"
+    assert frames == [], "terminal output arrived before the shell was created"
 
     held[0].continue_()
     rail = page.get_by_role("complementary", name="Workspace")
     expect(rail.get_by_test_id("terminal-view").last).to_have_attribute(
         "data-state", "connected", timeout=20_000
     )
+    # The early connection carries the shell's output once it exists.
+    deadline = time.monotonic() + 20
+    while not frames and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert frames, "the early attach never received terminal output"
 
 
 def test_new_shell_accepts_typed_command(page: Page, terminal_session: tuple[str, str]) -> None:

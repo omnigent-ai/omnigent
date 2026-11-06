@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -154,6 +153,36 @@ def test_runner_resource_attach_unknown_terminal_closes_4404(tmp_path: Path) -> 
     assert exc_info.value.code == 4404
 
 
+def _register_on_first_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    registry: TerminalRegistry,
+    conversation_id: str,
+    instance: TerminalInstance | None,
+) -> list[str]:
+    """Make the launch wait's lookup miss once, registering *instance* as it does.
+
+    The route's own lookup has already missed by then, so the attach is known
+    to take the wait branch. ``None`` never registers anything.
+
+    :returns: Terminal ids the wait looked up, one entry per lookup.
+    """
+    from omnigent.entities import session_resources
+
+    real = session_resources.resolve_terminal_entry_by_resource_id
+    lookups: list[str] = []
+
+    def lookup(session_id: str, terminal_id: str, terminal_registry: object) -> object:
+        lookups.append(terminal_id)
+        if len(lookups) == 1:
+            if instance is not None:
+                _seed_registry(registry, conversation_id, instance)
+            return None
+        return real(session_id, terminal_id, terminal_registry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_resources, "resolve_terminal_entry_by_resource_id", lookup)
+    return lookups
+
+
 def test_runner_resource_attach_await_launch_waits_for_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -166,21 +195,18 @@ def test_runner_resource_attach_await_launch_waits_for_registration(
     )
     calls: list[tuple[str, str, bool]] = []
     _patch_control_attach(monkeypatch, lambda *args: calls.append(args))
-    launch = threading.Timer(
-        0.2,
-        _seed_registry,
-        args=(registry, "conv_abc", _make_running_instance("zsh", "u-ab12cd", tmp_path)),
+    lookups = _register_on_first_lookup(
+        monkeypatch, registry, "conv_abc", _make_running_instance("zsh", "u-ab12cd", tmp_path)
     )
 
-    launch.start()
     with pytest.raises(RuntimeError, match="bridge stopped"):
         with TestClient(app).websocket_connect(
             "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach"
             "?await_launch=true"
         ) as ws:
             ws.receive_bytes()
-    launch.join()
 
+    assert len(lookups) == 2
     assert calls == [(str(tmp_path / "zsh-u-ab12cd.sock"), "main", False)]
 
 
@@ -193,10 +219,12 @@ def test_runner_resource_attach_await_launch_times_out_with_4404(
         "omnigent.entities.session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S",
         0.1,
     )
+    registry = TerminalRegistry()
     app = create_runner_app(
-        terminal_registry=TerminalRegistry(),
+        terminal_registry=registry,
         server_client=NullServerClient(),  # type: ignore[arg-type]
     )
+    lookups = _register_on_first_lookup(monkeypatch, registry, "conv_abc", None)
 
     with TestClient(app).websocket_connect(
         "/v1/sessions/conv_abc/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
@@ -205,6 +233,8 @@ def test_runner_resource_attach_await_launch_times_out_with_4404(
             ws.receive_bytes()
 
     assert exc_info.value.code == 4404
+    # It waited (repeated lookups) rather than refusing at once.
+    assert len(lookups) > 1
 
 
 def test_runner_resource_attach_defunct_terminal_closes_4404(tmp_path: Path) -> None:

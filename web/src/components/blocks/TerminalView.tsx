@@ -60,6 +60,7 @@ import {
   resolveTerminalWorkspaceFileLink,
   TerminalSession,
   terminalTheme,
+  WS_CLOSE_TERMINAL_NOT_FOUND,
   WS_CLOSE_WRONG_REPLICA,
 } from "./TerminalSession";
 
@@ -539,10 +540,10 @@ export function TerminalView({
 
   // A new shell whose create may be waking the runner opens its tab at once
   // but attaches only once the create returns.
-  const waitingForCreate = useSyncExternalStore(
-    subscribeTerminalLaunches,
-    () => terminalLaunchMode(terminalId) === "wait",
+  const launchMode = useSyncExternalStore(subscribeTerminalLaunches, () =>
+    terminalLaunchMode(terminalId),
   );
+  const waitingForCreate = launchMode === "wait";
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -673,6 +674,26 @@ export function TerminalView({
 
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  // An early attach can be refused (4404) before its own create registers the
+  // terminal: an older runner ignores ``await_launch``, or the launch outlasted
+  // the server's wait. Re-dial once that create succeeds; a 4404 outside a
+  // launch stays a deliberate close.
+  const previousLaunchModeRef = useRef(launchMode);
+  useEffect(() => {
+    const previous = previousLaunchModeRef.current;
+    previousLaunchModeRef.current = launchMode;
+    if (previous !== "attach" || launchMode !== null) return;
+    const current = stateRef.current;
+    if (current.kind !== "closed" || current.code !== WS_CLOSE_TERMINAL_NOT_FOUND) return;
+    reconnectAttemptsRef.current = 0;
+    disposeActiveSession();
+    setConnectAttempt((attempt) => attempt + 1);
+  }, [launchMode, disposeActiveSession]);
+  const refusedDuringLaunch =
+    launchMode === "attach" &&
+    state.kind === "closed" &&
+    state.code === WS_CLOSE_TERMINAL_NOT_FOUND;
   const previousResumeGeneration = useRef(resumeGeneration);
   useEffect(() => {
     if (previousResumeGeneration.current === resumeGeneration) return;
@@ -824,8 +845,8 @@ export function TerminalView({
         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
         {state.kind !== "connected" && (
           <StatusOverlay
-            state={state}
-            startingShell={waitingForCreate}
+            state={refusedDuringLaunch ? { kind: "connecting" } : state}
+            startingShell={waitingForCreate || refusedDuringLaunch}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
             resumeTarget={resumeTarget}

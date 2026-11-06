@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from typing import Any
@@ -836,18 +835,29 @@ async def test_attach_terminal_local_fallback_await_launch_waits_for_registratio
         "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
         fake_control,
     )
-    launch = threading.Timer(
-        0.2,
-        _seed_registry,
-        args=(server_registry, "conv_local_wait", [_make_running_instance("zsh", "u1", tmp_path)]),
-    )
+    from omnigent.entities import session_resources
 
-    launch.start()
+    real_lookup = session_resources.resolve_terminal_entry_by_resource_id
+    lookups: list[str] = []
+
+    def lookup(session_id: str, terminal_id: str, terminal_registry: object) -> object:
+        # The route's own lookup misses and registers the terminal, as a
+        # launch finishing just after the attach arrived would.
+        lookups.append(terminal_id)
+        if len(lookups) == 1:
+            _seed_registry(
+                server_registry, "conv_local_wait", [_make_running_instance("zsh", "u1", tmp_path)]
+            )
+            return None
+        return real_lookup(session_id, terminal_id, terminal_registry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_resources, "resolve_terminal_entry_by_resource_id", lookup)
+
     with TestClient(app).websocket_connect(
         "/v1/sessions/conv_local_wait/resources/terminals/terminal_zsh_u1/attach?await_launch=true"
     ) as ws:
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
-    launch.join()
 
     assert calls == [str(tmp_path / "zsh-u1.sock")]
+    assert len(lookups) == 2

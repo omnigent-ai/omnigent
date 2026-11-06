@@ -299,6 +299,31 @@ export function isTerminalLaunching(terminalId: string): boolean {
   return launchingTerminals.get(terminalId) === "attach";
 }
 
+/** Launching terminals the user closed before their create returned. */
+const closedDuringLaunch = new Set<string>();
+
+/**
+ * Record a close of *terminalId* while its create is still in flight.
+ *
+ * :returns: ``true`` when the terminal is launching, so the caller skips the
+ *     DELETE; the launch deletes the terminal once its create returns.
+ */
+export function requestCloseDuringLaunch(terminalId: string): boolean {
+  if (!launchingTerminals.has(terminalId)) return false;
+  closedDuringLaunch.add(terminalId);
+  return true;
+}
+
+/** Whether the user closed *terminalId* before its create returned. */
+export function isClosedDuringLaunch(terminalId: string): boolean {
+  return closedDuringLaunch.has(terminalId);
+}
+
+/** Forget a close recorded by {@link requestCloseDuringLaunch}. */
+export function clearClosedDuringLaunch(terminalId: string): void {
+  closedDuringLaunch.delete(terminalId);
+}
+
 /** Subscribe to launch-state changes (for ``useSyncExternalStore``). */
 export function subscribeTerminalLaunches(listener: () => void): () => void {
   launchListeners.add(listener);
