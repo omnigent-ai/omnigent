@@ -515,8 +515,8 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
     # commandcode-native wraps the resident `cmd` TUI. Command Code has no
     # PermissionRequest hook, so policy ASK is bridged through a generated
     # per-session mod (onPermissionRequest) while PreToolUse covers DENY.
-    # streaming is declared True by convention pending a live bench run; the
-    # JSONL forwarder tails per-turn-committed entries.
+    # streaming=False is LIVE-VERIFIED: the forwarder tails per-turn-committed
+    # JSONL entries and the TUI emits no token-level deltas (bench: 0 deltas).
     "commandcode-native": _C(
         _IM.NATIVE_TUI,
         _EL.HOOK,
@@ -526,7 +526,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         _AU.OWN_AUTH,
         subagents=False,
         interrupt=True,
-        streaming=True,
+        streaming=False,
         fork_history=_FH.NONE,
         shell_tool_name="shell_command",
         shell_tool_prompt=_SHELL_PROMPT,
