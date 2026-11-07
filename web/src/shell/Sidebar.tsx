@@ -2684,8 +2684,10 @@ function ConversationList({
         expandProject(action.project);
         return;
       }
+      // Which half of the pinned row the pointer is in; only rows not yet in the pin order use it.
+      const below = event.collisions?.[0]?.data?.below === true;
       if (action.kind === "reorder-pin") {
-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId, below);
         if (writes.length > 0) reorderPins(writes);
         return;
       }
@@ -2697,8 +2699,12 @@ function ConversationList({
         // Pin into the dropped-on slot (below a row from its lower half), else after the
         // last pin when the server stores pin order. The new pin goes through the toggle
         // (cap / ownership checks); once it's accepted, renumbered neighbours follow.
-        const below = !action.targetId || event.collisions?.[0]?.data?.below === true;
-        const writes = pinOrderWrites(sections.pinned, dragged.id, pinTargetId, below);
+        const writes = pinOrderWrites(
+          sections.pinned,
+          dragged.id,
+          pinTargetId,
+          !action.targetId || below,
+        );
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
         // Chain on this call's own promise: per-call mutate callbacks are dropped

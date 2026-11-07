@@ -206,6 +206,26 @@ describe("dropping an unpinned session onto a pinned row", () => {
     },
   );
 
+  it("moves a local pin outside the pin order to the side of the row it's dropped on", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    // A not-yet-migrated pin shown without its pinned family's representative.
+    const family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "500" };
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["conv_c"]));
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage([conv("conv_c", { family }), conv("conv_d")]),
+    );
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b", {
+      offsetY: ROW_HEIGHT / 4,
+      whileOver: () =>
+        expect(screen.getByTestId("pin-order-insertion")).toHaveAttribute("style", "bottom: 0px;"),
+    });
+
+    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_c", pinnedAt: 2001 }]);
+    expect(mocks.pinFn).not.toHaveBeenCalled();
+  });
+
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {
     mocks.pinFn.mockRejectedValue(new Error("You can pin up to 30 sessions."));
     renderSidebar();

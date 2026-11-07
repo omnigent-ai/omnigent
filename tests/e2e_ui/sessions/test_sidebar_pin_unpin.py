@@ -346,6 +346,8 @@ def test_drag_reorders_pinned_sessions(
     assert pin_info.value.ok, pin_info.value.status
     expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
+    page.reload()
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
     order = _pinned_session_order(page)
     assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), order
 
