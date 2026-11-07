@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
-import type * as mathMarkdownModule from "@/components/ai-elements/mathMarkdown";
+import type * as rehypeSlugModule from "rehype-slug";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -15,11 +15,17 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
-vi.mock("@/components/ai-elements/mathMarkdown", async (importOriginal) => {
-  const actual = await importOriginal<typeof mathMarkdownModule>();
+const slugRuns = vi.hoisted(() => ({ count: 0 }));
+vi.mock("rehype-slug", async (importOriginal) => {
+  const actual = await importOriginal<typeof rehypeSlugModule>();
   return {
-    ...actual,
-    normalizeExplicitMathDelimiters: vi.fn(actual.normalizeExplicitMathDelimiters),
+    default: (...args: Parameters<typeof actual.default>) => {
+      const transform = actual.default(...args);
+      return (...transformArgs: Parameters<typeof transform>) => {
+        slugRuns.count += 1;
+        return transform(...transformArgs);
+      };
+    },
   };
 });
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
@@ -1317,20 +1323,21 @@ describe("large Markdown source fallback", () => {
 });
 
 it("does not re-parse the Markdown preview when only unrelated props change", async () => {
-  const { normalizeExplicitMathDelimiters } = await import("@/components/ai-elements/mathMarkdown");
-  vi.mocked(normalizeExplicitMathDelimiters).mockClear();
+  slugRuns.count = 0;
   const opts = { viewMode: "preview" } as const;
   const view = render(viewerElement("# Stable", true, "notes.md", opts));
   expect(await screen.findByRole("heading", { name: "Stable" })).toBeVisible();
+  const parsesAfterMount = slugRuns.count;
+  expect(parsesAfterMount).toBeGreaterThan(0);
   view.rerender(viewerElement("# Stable", true, "notes.md", { ...opts, mediaActive: false }));
   view.rerender(viewerElement("# Stable", false, "notes.md", opts));
-  expect(normalizeExplicitMathDelimiters).toHaveBeenCalledTimes(1);
+  expect(slugRuns.count).toBe(parsesAfterMount);
   expect(document.querySelector(".markdown-preview")?.className).not.toContain(
     "content-visibility",
   );
   view.rerender(viewerElement("# Changed", true, "notes.md", opts));
   expect(await screen.findByRole("heading", { name: "Changed" })).toBeVisible();
-  expect(normalizeExplicitMathDelimiters).toHaveBeenCalledTimes(2);
+  expect(slugRuns.count).toBeGreaterThan(parsesAfterMount);
 });
 
 describe("CodeViewer refresh failures", () => {
