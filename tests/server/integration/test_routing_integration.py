@@ -343,6 +343,54 @@ async def test_the_subagent_relay_falls_back_to_the_judge_off_the_gateway(
     assert decisions[-1].data.router_source == "oss-llm"
 
 
+@pytest.mark.parametrize("harness", ["claude-sdk", "pi"])
+async def test_route_subagent_hook_splits_router_source_from_the_static_table_off_gateway(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """Off the gateway, the route-subagent hook keeps a subscription-only SDK/Pi
+    spawn's router source but withholds the unreachable ``databricks-*`` static
+    table: ``gateway_backed`` stays ``True`` while ``allow_static_fallback`` is
+    ``False``. The host's report names only the native families; ``claude-sdk``
+    and ``pi`` are absent, so neither is proven off the gateway, yet the host is."""
+    from omnigent.runner.subagent_routing import SubagentRouteDecision
+
+    parent, _child, _conv_store = await _parent_and_child(
+        client, db_uri, agent_name=f"routing-subagent-off-gateway-{harness}"
+    )
+    off_gateway = _host_reporting_gateway(
+        {
+            "claude-native": False,
+            "native-claude": False,
+            "codex": False,
+            "codex-native": False,
+            "native-codex": False,
+        }
+    )
+    captured: dict[str, Any] = {}
+
+    async def _spy(session_id: str, req: Any, **kwargs: Any) -> SubagentRouteDecision:
+        captured["gateway_backed"] = kwargs.get("gateway_backed")
+        captured["allow_static_fallback"] = kwargs.get("allow_static_fallback")
+        return SubagentRouteDecision(action="allow", rationale="spy")
+
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps()),
+        patch.object(
+            orchestration_module, "_session_routing_host", AsyncMock(return_value=off_gateway)
+        ),
+        patch.object(subagent_routing, "resolve_subagent_route", _spy),
+    ):
+        resp = await client.post(
+            f"/v1/sessions/{parent['id']}/hooks/route-subagent",
+            json={"harness": harness, "task_name": "code-reviewer", "prompt": "review the auth"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured == {"gateway_backed": True, "allow_static_fallback": False}, captured
+
+
 async def test_native_subagent_relay_persists_decision_and_joins_child_row(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -2232,3 +2280,138 @@ async def test_an_auto_harness_outage_leaves_the_route_once_label_unclaimed(
     assert routed is not None
     assert routed.model_override == GPT_MODEL
     assert routed.labels.get(ROUTING_DECISION_LABEL_KEY)
+
+
+# ── Off-gateway host: the static table is never a turn candidate ────
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "pi"])
+async def test_an_off_gateway_host_never_offers_the_static_table_to_a_turn(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """An off-gateway host must decline a turn, not pin an unservable ``databricks-*`` id.
+    Its report names only Claude/Codex (all ``False``); ``claude-sdk``/``pi`` are absent."""
+    from omnigent.server import smart_routing as smart_routing_module
+
+    agent = await create_test_agent(
+        client,
+        name=f"routing-off-gateway-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert created.status_code == 201, created.text
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(created.json()["id"])
+    assert conv is not None
+
+    off_gateway = _host_reporting_gateway(
+        {
+            "claude-native": False,
+            "native-claude": False,
+            "codex": False,
+            "codex-native": False,
+            "native-codex": False,
+        }
+    )
+    judge = FakeRoutingClient(
+        RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness=harness)
+    )
+
+    async def _empty_catalog(*_args: Any, **_kwargs: Any) -> dict[str, list[str]]:
+        return {"self": []}
+
+    body = SessionEventInput(
+        type="message",
+        data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    )
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)),
+        patch.object(
+            orchestration_module, "_session_routing_host", AsyncMock(return_value=off_gateway)
+        ),
+        patch.object(smart_routing_module, "fetch_runner_models", _empty_catalog),
+    ):
+        async with echo_runner_client() as runner_client:
+            item_id = await orchestration_module._forward_event_to_runner(
+                conv.id, conv, body, conv_store, runner_client
+            )
+
+    # The decline is not a block: the prompt is still persisted and forwarded,
+    # it just carries no ``databricks-*`` pin.
+    assert item_id, item_id
+    assert judge.offered == [], judge.offered
+    decisions = _routing_decisions(conv_store, conv.id)
+    assert decisions == [], [d.data for d in decisions]
+    refreshed = conv_store.get_conversation(conv.id)
+    assert refreshed is not None
+    assert refreshed.model_override is None, refreshed.model_override
+
+
+@pytest.mark.parametrize("harness", ["claude-sdk", "pi"])
+async def test_the_route_turn_hook_declines_the_static_table_off_gateway(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    harness: str,
+) -> None:
+    """The first-prompt hook is the composer path's HTTP sibling: off the gateway
+    a subscription-only SDK/Pi prompt is allowed through unrouted, never pinned to
+    an unreachable ``databricks-*`` id. The host reports only Claude/Codex (all
+    ``False``); ``claude-sdk``/``pi`` are absent, so the static table is withheld
+    even though the built-in judge would gladly offer one. No runner is bound, so
+    the live catalog is empty — the static table is the only other source."""
+    agent = await create_test_agent(
+        client,
+        name=f"routing-turn-off-gateway-{harness}",
+        executor={"type": "omnigent", "config": {"harness": harness}},
+        include_llm=False,
+    )
+    created = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "cost_control_mode_override": "on"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    off_gateway = _host_reporting_gateway(
+        {
+            "claude-native": False,
+            "native-claude": False,
+            "codex": False,
+            "codex-native": False,
+            "native-codex": False,
+        }
+    )
+    judge = FakeRoutingClient(
+        RoutingResult(model="databricks-claude-haiku-4-5", rationale="cheap", harness=harness)
+    )
+
+    with (
+        patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=judge)),
+        patch.object(
+            orchestration_module, "_session_routing_host", AsyncMock(return_value=off_gateway)
+        ),
+    ):
+        route = await client.post(
+            f"/v1/sessions/{session_id}/hooks/route-turn",
+            json={"harness": harness, "prompt": "hi"},
+        )
+
+    assert route.status_code == 200, route.text
+    payload = route.json()
+    assert payload["action"] == "allow", payload
+    assert not payload.get("model"), payload
+    assert judge.offered == [], judge.offered
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    # A decline chip may be recorded (routing was on but no candidate was
+    # reachable), but nothing is routed: no model is pinned and the route-once
+    # label stays unclaimed, so the next prompt is free to ask again.
+    refreshed = conv_store.get_conversation(session_id)
+    assert refreshed is not None
+    assert refreshed.model_override is None, refreshed.model_override
+    assert not refreshed.labels.get(ROUTING_DECISION_LABEL_KEY)
