@@ -648,6 +648,7 @@ def mark_subagent_work_terminal(
     status: str,
     output: str | None,
     only_if_work_id: str | None = None,
+    confirmed_cancellation: bool = False,
 ) -> _SubagentDeliveryAck:
     """
     Mark a sub-agent dispatch terminal and notify the parent inbox.
@@ -670,6 +671,10 @@ def mark_subagent_work_terminal(
         entry is still that dispatch. A delayed op (an interrupt's grace-timer
         cancel) bound to the dispatch it was raised for is dropped when a newer
         send has replaced the entry, so an old timer never cancels new work.
+    :param confirmed_cancellation: Set by a verified hard-kill (e.g. a native
+        stop handler), rather than an optimistic grace-timer cancel. Overrides
+        the "``cancelled`` must not downgrade a recorded completion" guard
+        below, since the kill is confirmed, not merely requested.
     :returns: Delivery acknowledgement for this terminal report.
     :raises ValueError: If ``status`` is not terminal.
     """
@@ -734,18 +739,23 @@ def mark_subagent_work_terminal(
             )
         # A late stop_session-driven "cancelled" must not downgrade an
         # already-recorded "completed"/"failed" still awaiting delivery, and a
-        # trailing quiescence "completed" must not launder a recorded "failed".
-        keep_recorded = (status == "cancelled" and entry.status != "cancelled") or (
-            status == "completed" and entry.status == "failed"
-        )
+        # trailing quiescence "completed" must not launder a recorded "failed" —
+        # unless the cancel is itself confirmed by a verified hard-kill.
+        keep_recorded = (
+            status == "cancelled" and entry.status != "cancelled" and not confirmed_cancellation
+        ) or (status == "completed" and entry.status == "failed")
         if not keep_recorded:
             entry.status = status
             entry.output = output
             entry.completed_at = time.time()
+            if status == "cancelled" and confirmed_cancellation:
+                entry.cancellation_confirmed = True
         return _deliver_subagent_completion(entry)
     entry.status = status
     entry.output = output
     entry.completed_at = time.time()
+    if status == "cancelled" and confirmed_cancellation:
+        entry.cancellation_confirmed = True
     return _deliver_subagent_completion(entry)
 
 

@@ -76,6 +76,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_cancellation: bool = False,
     ) -> _FakeAck:
         if only_if_work_id is not None and only_if_work_id != captured["current_work_id"]:
             # A newer dispatch replaced the entry: drop the delayed op untouched.
@@ -88,6 +89,7 @@ def _make_runner(**overrides: Any) -> tuple[NativeInterruptRunner, dict[str, Any
                 "status": status,
                 "output": output,
                 "only_if_work_id": only_if_work_id,
+                "confirmed_cancellation": confirmed_cancellation,
             }
         )
         return _FakeAck()
@@ -529,6 +531,7 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_c", "cancelled", None)]
+    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -608,6 +611,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
+    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -776,11 +780,15 @@ async def test_antigravity_interrupt_waiting_step_denies_via_interaction_bridge(
         ),
     )
 
-    escape_calls: list[Any] = []
+    call_order: list[str] = []
+
+    tui_calls: list[Any] = []
     monkeypatch.setattr(
         agy_bridge,
         "send_interaction_keys_via_tui",
-        lambda bridge_dir, *keys: escape_calls.append((bridge_dir, keys)),
+        lambda bridge_dir, *keys: (call_order.append("tui"), tui_calls.append((bridge_dir, keys)))[
+            1
+        ],
     )
     monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
     monkeypatch.setattr(
@@ -799,6 +807,7 @@ async def test_antigravity_interrupt_waiting_step_denies_via_interaction_bridge(
         step_index: int,
         payload: dict[str, Any],
     ) -> None:
+        call_order.append("deny")
         deliver_calls.append(
             {
                 "port": port,
@@ -815,7 +824,11 @@ async def test_antigravity_interrupt_waiting_step_denies_via_interaction_bridge(
     monkeypatch.setattr(
         agy_rpc,
         "cancel_cascade_steps",
-        lambda port, cascade_id: (cancel_calls.append((port, cascade_id)), False)[1],
+        lambda port, cascade_id: (
+            call_order.append("cancel"),
+            cancel_calls.append((port, cascade_id)),
+            False,
+        )[2],
     )
 
     runner, captured = _make_runner()
@@ -831,10 +844,60 @@ async def test_antigravity_interrupt_waiting_step_denies_via_interaction_bridge(
             "payload": {"permission": {"allow": False}},
         }
     ]
+    # Some agy versions leave the attended TUI prompt open after RPC delivery;
+    # the decline keys dismiss it, mirroring bridge_interaction.
+    assert tui_calls == [("dir/bid-agy", ("4", "Enter"))]
     # The denial may resume the cascade into a running turn; best-effort
-    # cancel that too, but only AFTER the denial, never in place of it.
+    # cancel that too, but only AFTER the denial and TUI dismissal.
     assert cancel_calls == [(52548, "cascade-1")]
-    assert escape_calls == []  # never the primary action on a WAITING prompt
+    assert call_order == ["deny", "tui", "cancel"]
+    assert captured["wakes"] == []
+    assert runner.take_pending_interrupt("conv_agy")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_antigravity_interrupt_waiting_step_tui_dismissal_failure_still_returns_204(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed best-effort TUI dismissal never undoes the already-confirmed RPC deny."""
+    import omnigent.harnesses.antigravity_native.bridge as agy_bridge
+    import omnigent.harnesses.antigravity_native.rpc as agy_rpc
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    _patch_antigravity_bridge_id(monkeypatch, interrupt_mod)
+    monkeypatch.setattr(agy_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(
+        agy_bridge,
+        "read_bridge_state",
+        lambda bridge_dir: SimpleNamespace(
+            session_id="conv_agy", conversation_id="cascade-1", active_turn_id=None
+        ),
+    )
+
+    def _boom(bridge_dir: Any, *keys: str) -> None:
+        raise RuntimeError("the agy terminal is no longer running (the TUI exited)")
+
+    monkeypatch.setattr(agy_bridge, "send_interaction_keys_via_tui", _boom)
+    monkeypatch.setattr(agy_rpc, "resolve_language_server_port", lambda cascade_id: 52548)
+    monkeypatch.setattr(
+        agy_rpc,
+        "get_trajectory_steps",
+        lambda port, cascade_id: [_agy_waiting_permission_step()],
+    )
+    monkeypatch.setattr(agy_rpc, "handle_user_interaction", lambda *a, **kw: None)
+    cancel_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        agy_rpc,
+        "cancel_cascade_steps",
+        lambda port, cascade_id: (cancel_calls.append((port, cascade_id)), False)[1],
+    )
+
+    runner, captured = _make_runner()
+    resp = await runner.interrupt("antigravity-native", "conv_agy")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    # The denial already succeeded over RPC; a flaky TUI must not turn that into a 503.
+    assert cancel_calls == [(52548, "cascade-1")]
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_agy")[0] is True
 
@@ -1036,6 +1099,7 @@ async def test_antigravity_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_agy", "cancelled", None)]
+    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio

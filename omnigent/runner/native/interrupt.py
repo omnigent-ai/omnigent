@@ -90,6 +90,7 @@ class MarkSubagentTerminalAndWake(Protocol):
         status: str,
         output: str | None,
         only_if_work_id: str | None = None,
+        confirmed_cancellation: bool = False,
     ) -> SubagentDeliveryAck:
         raise NotImplementedError
 
@@ -608,6 +609,42 @@ class NativeInterruptRunner:
             self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
+    async def _finalize_confirmed_stop(
+        self, conv_id: str, *, display_name: str, cancel_auto_forwarder: bool
+    ) -> Response:
+        """Tear down a session after its hard-kill is confirmed and report ``cancelled``.
+
+        Shared tail for every stop handler that kills a vendor process directly
+        (``_uniform_stop``, ``_claude_stop``, ``_antigravity_stop``):
+        ``confirmed_cancellation=True`` tells the delivery seam the kill is
+        verified, not merely requested, so it is never overturned by a later
+        completion report racing the teardown.
+        """
+        await self._teardown_session_terminals(conv_id)
+        if cancel_auto_forwarder:
+            await _cancel_auto_forwarder_task(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output=None,
+            confirmed_cancellation=True,
+        )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "%s-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                display_name,
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
+
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
         module = importlib.import_module(spec.module)
         try:
@@ -626,28 +663,9 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context=spec.context),
                 },
             )
-        await self._teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        # The kill is confirmed, so this ``cancelled`` is truthful and settles
-        # any interrupt still waiting on its outcome.
-        self.clear_pending_interrupt(conv_id)
-        delivery_ack = self._mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output=None,
+        return await self._finalize_confirmed_stop(
+            conv_id, display_name=spec.display_name, cancel_auto_forwarder=True
         )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
-        ):
-            self._logger.warning(
-                "%s-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                spec.display_name,
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
 
     async def _claude_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
@@ -699,52 +717,13 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context="claude-native stop"),
                 },
             )
-        await self._teardown_session_terminals(conv_id)
-        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        # The kill is confirmed, so this ``cancelled`` is truthful and settles
-        # any interrupt still waiting on its outcome.
-        self.clear_pending_interrupt(conv_id)
-        delivery_ack = self._mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output=None,
+        return await self._finalize_confirmed_stop(
+            conv_id, display_name="Claude", cancel_auto_forwarder=False
         )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
-        ):
-            self._logger.warning(
-                "Claude-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
 
     async def _antigravity_interrupt(self, conv_id: str) -> Response:
-        """Cancel the in-flight agy turn, routing by WAITING vs. RUNNING state.
-
-        ``CancelCascadeSteps`` only stops a RUNNING cascade: on a step WAITING
-        for a user interaction (``agy_permission`` / ``ask_question``) agy
-        accepts the call (HTTP < 400) but the WAITING step never transitions —
-        live-verified, see :meth:`omnigent.inner.antigravity_native_executor.
-        AntigravityNativeExecutor.interrupt_session`'s note. So this reads the
-        freshest trajectory steps first and, when one is WAITING, resolves it
-        as a DENY through the same interaction-delivery primitive the
-        interaction bridge uses
-        (:func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction`
-        + :func:`omnigent.server.routes._antigravity_elicitation.to_interaction_payload`,
-        see :mod:`omnigent.harnesses.antigravity_native.interactions`), then
-        best-effort cancels any cascade the denial resumes running. Only a
-        genuinely RUNNING cascade (no WAITING step) uses ``CancelCascadeSteps``
-        directly
-        (:func:`omnigent.harnesses.antigravity_native.rpc.cancel_cascade_steps`,
-        also used by ``AntigravityNativeExecutor.interrupt_session``). The TUI's
-        own cancel key (``Escape``, matching agy's "esc to cancel" footer) via
-        :func:`omnigent.harnesses.antigravity_native.bridge.send_interaction_keys_via_tui`
-        is used only as a last resort — before agy mints its real conversation
-        id, while no connect-RPC port can be resolved, when the step snapshot
-        can't be read, or when a RUNNING cascade's own cancel RPC fails — never
-        as the primary action on a WAITING permission prompt.
+        """Deny a pending interaction before cancelling the cascade; Escape is
+        only a last-resort fallback when connect-RPC control is unavailable.
         """
         from omnigent.harnesses.antigravity_native.bridge import (
             bridge_dir_for_bridge_id,
@@ -760,7 +739,10 @@ class NativeInterruptRunner:
             resolve_language_server_port,
         )
         from omnigent.harnesses.antigravity_native.steps import pending_interaction
-        from omnigent.server.routes._antigravity_elicitation import to_interaction_payload
+        from omnigent.server.routes._antigravity_elicitation import (
+            to_interaction_payload,
+            to_tui_selection_keys,
+        )
         from omnigent.server.schemas import ElicitationResult
 
         bridge_id = await _antigravity_native_bridge_id_for_session(
@@ -813,10 +795,21 @@ class NativeInterruptRunner:
                                 ),
                             },
                         )
-                    # The denial may resume the cascade into a running turn
-                    # (e.g. agy keeps going after a declined tool); best-effort
-                    # stop that too. cancel_cascade_steps fails open (False),
-                    # so this never masks the already-confirmed denial above.
+                    # Some agy versions leave the attended TUI prompt open after
+                    # RPC delivery; dismiss it best-effort, same as bridge_interaction.
+                    keys = to_tui_selection_keys(
+                        waiting["kind"], ElicitationResult(action="decline"), waiting["spec"]
+                    )
+                    if keys:
+                        try:
+                            await asyncio.to_thread(
+                                send_interaction_keys_via_tui, bridge_dir, *keys
+                            )
+                        except RuntimeError as exc:
+                            self._logger.warning(
+                                "agy interrupt: TUI prompt dismissal failed: %r", exc
+                            )
+                    # Denial may resume the cascade; best-effort cancel (never masks the denial).
                     await asyncio.to_thread(cancel_cascade_steps, port, cascade_id)
                     self._defer_parent_wake_after_native_interrupt(conv_id)
                     return Response(status_code=204)
@@ -843,18 +836,7 @@ class NativeInterruptRunner:
         return Response(status_code=204)
 
     async def _antigravity_stop(self, conv_id: str) -> Response:
-        """Hard-stop agy by killing its tmux session; mirrors claude/cursor stop.
-
-        Cancelling the session's registered reader task
-        (:func:`~omnigent.runner.native.orchestration._cancel_auto_forwarder_task`,
-        the same call :meth:`_uniform_stop` makes for its harnesses) stops the
-        in-flight ``antigravity-elicitation-request`` long-poll a pending
-        ``agy_permission``/``ask_question`` interaction is parked on
-        (:func:`omnigent.harnesses.antigravity_native.interactions.bridge_interaction`),
-        so a child killed while WAITING on one does not leave it dangling —
-        the same mechanism every ``_UNIFORM_STOP`` harness relies on; there is
-        no separate per-harness elicitation-cancel step to mirror beyond that.
-        """
+        """Kill the agy tmux session, cancel its reader, and publish cancellation."""
         from omnigent.harnesses.antigravity_native.bridge import (
             bridge_dir_for_bridge_id,
             kill_session,
@@ -877,27 +859,9 @@ class NativeInterruptRunner:
                     ),
                 },
             )
-        await self._teardown_session_terminals(conv_id)
-        await _cancel_auto_forwarder_task(conv_id)
-        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        # The kill is confirmed, so this ``cancelled`` is truthful and settles
-        # any interrupt still waiting on its outcome.
-        self.clear_pending_interrupt(conv_id)
-        delivery_ack = self._mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output=None,
+        return await self._finalize_confirmed_stop(
+            conv_id, display_name="Antigravity", cancel_auto_forwarder=True
         )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
-        ):
-            self._logger.warning(
-                "Antigravity-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.codex_native.app_server import (
