@@ -3407,7 +3407,10 @@ def _project_argument_error(args: _JsonObject, placement: str) -> str | None:
 
 
 async def _add_named_project(
-    body: _JsonObject, args: _JsonObject, server_client: httpx.AsyncClient
+    body: _JsonObject,
+    args: _JsonObject,
+    server_client: httpx.AsyncClient,
+    server_info: _JsonObject,
 ) -> str | None:
     """
     Add the project a checked ``sys_session_create`` call names to its create body.
@@ -3418,11 +3421,20 @@ async def _add_named_project(
     :param body: The orchestrated create body to update.
     :param args: Arguments that passed :func:`_project_argument_error`.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :returns: A JSON error when the project name can't be resolved, else ``None``.
+    :param server_info: The server's ``GET /v1/info`` payload.
+    :returns: A JSON error when the project name can't be used, else ``None``.
     """
     project_name = args.get("project_name")
     if project_name is None:
         return None
+    # The server keeps a nested agent in its source session's project; refuse before creating one.
+    if server_info.get("sibling_sessions") is True:
+        return json.dumps(
+            {
+                "error": "This server keeps nested agents in this session's project, so it "
+                "does not accept project_name; omit it. No session was created."
+            }
+        )
     try:
         project_id = await _project_id_for_name(server_client, str(project_name))
     except (httpx.HTTPError, ValueError) as exc:
@@ -3674,10 +3686,12 @@ async def _execute_session_create(
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
         host_id = None
-        if placement == "managed":
+        info_data: _JsonObject = {}
+        if placement == "managed" or args.get("project_name") is not None:
             info = await server_client.get("/v1/info")
             info.raise_for_status()
             info_data = info.json()
+        if placement == "managed":
             if (
                 info_data.get("sibling_sessions") is True
                 and info_data.get("sibling_session_destinations") == "current_host"
@@ -3703,7 +3717,7 @@ async def _execute_session_create(
             if host_id is not None:
                 body["host_id"] = host_id
                 unconfirmed_creation["host_id"] = host_id
-        project_error = await _add_named_project(body, args, server_client)
+        project_error = await _add_named_project(body, args, server_client, info_data)
         if project_error is not None:
             return project_error
         create_requested = True

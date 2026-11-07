@@ -770,9 +770,8 @@ async def test_independent_create_files_a_named_project(placement, named_by):
     # The handle's project name is read by id after the create.
     name_read = ("GET", f"/v1/projects/{_PROJECT_ID}")
     assert calls == [*lookup, ("POST", "/v1/sessions/orchestrated"), name_read]
-    if placement == "managed":
-        # The project is resolved after the managed capability read.
-        assert requests[0].url.path == "/v1/info"
+    # The project is resolved after the capability read.
+    assert requests[0].url.path == "/v1/info"
     create = next(r for r in requests if r.url.path == "/v1/sessions/orchestrated")
     body = json.loads(create.content)
     assert body["agent_id"] == "worker"
@@ -859,6 +858,45 @@ async def test_a_refused_managed_create_resolves_no_project():
         )
     assert "sandbox profile support" in result["error"]
     # The project is resolved last, so this refusal creates no project.
+    assert [r.url.path for r in requests] == ["/v1/info"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize(
+    ("info", "error"),
+    [
+        ({"sibling_sessions": True}, "does not accept project_name"),
+        (500, "sys_session_create failed"),
+    ],
+    ids=["nested_agents", "unreadable_info"],
+)
+async def test_project_name_needs_a_server_without_nested_agents(placement, info, error):
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v1/info":
+            if info == 500:
+                return httpx.Response(500)
+            return httpx.Response(200, json={**info, "sibling_session_destinations": "any_host"})
+        return httpx.Response(201, json={"id": uuid4().hex})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "project_name": "Triage"}
+                ),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+    assert error in result.get("error", ""), result
+    # No project is found or created, and no session is sent.
     assert [r.url.path for r in requests] == ["/v1/info"]
 
 

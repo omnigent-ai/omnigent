@@ -137,6 +137,10 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
 
 
 _DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER = {"workspace": "/project-default", "git": {"base": "main"}}
+# A nested agent stays in its source session's project, so project_name applies only without them.
+_STANDALONE_ONLY = pytest.mark.parametrize(
+    "orchestration_environment", [False], ids=["standalone"], indirect=True
+)
 
 
 @pytest.mark.parametrize("filed", [True, False])
@@ -236,6 +240,7 @@ async def test_worker_project_override_requires_standalone_mode(
     assert SqlAlchemyConversationStore(db_uri).get_conversation(source["id"]).family_id is None
 
 
+@_STANDALONE_ONLY
 async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -270,6 +275,7 @@ async def test_the_tool_files_a_worker_in_a_named_project_without_its_defaults(
     assert info["project_name"] == "Elsewhere"
 
 
+@_STANDALONE_ONLY
 async def test_a_name_only_another_user_has_gets_a_new_project(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -294,6 +300,7 @@ async def test_a_name_only_another_user_has_gets_a_new_project(
     assert alices is not None and alices.name == "Bob's work"
 
 
+@_STANDALONE_ONLY
 async def test_same_host_worker_in_a_named_project_starts_no_worktree(
     auth_client, auth_app, db_uri, monkeypatch
 ):
@@ -342,3 +349,31 @@ async def test_same_host_worker_in_a_named_project_starts_no_worktree(
     assert worker.project_id == named
     assert worker.workspace == "/original"
     assert worker.git_branch is None
+
+
+@pytest.mark.parametrize("orchestration_environment", [True], ids=["nested"], indirect=True)
+async def test_the_tool_refuses_project_name_for_nested_agents(auth_client, db_uri):
+    auth_client.headers["X-Forwarded-Email"] = "alice"
+    source = await _create_session_as(auth_client, "", "alice")
+    auth_client.headers.update(_bind_runner(db_uri, source["id"]))
+
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps(
+                {
+                    "agent_id": source["agent_id"],
+                    "placement": "managed",
+                    "message": "Go",
+                    "project_name": "New work",
+                }
+            ),
+            server_client=auth_client,
+            conversation_id=source["id"],
+        )
+    )
+
+    assert "does not accept project_name" in result.get("error", ""), result
+    # The refusal comes before the lookup, so no empty project is left behind.
+    projects = SqlAlchemyProjectStore(db_uri).list(user_id="alice")
+    assert "New work" not in [project.name for project in projects]
