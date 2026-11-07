@@ -439,6 +439,36 @@ def launcher_install_prompt(screen: str | None) -> bool:
     return bool(lines) and _INSTALL_PROMPT.search(" ".join(lines[-3:])) is not None
 
 
+# The launcher's banners for a pinned-version update and for an automatic
+# install of a missing Claude Code; either may wrap in a narrow pane.
+_INSTALL_BANNER = re.compile(
+    r"\bUpdating\s+Claude\s+Code\s+from\b"
+    r"|\bNo\s+Claude\s+Code\s+installation\s+found;\s+installing\s+it\s+now\b",
+    re.IGNORECASE,
+)
+_LAUNCHER_EXIT_BOX = re.compile(r"\bexited with code \d+\b", re.IGNORECASE)
+
+
+def launcher_install_in_progress(screen: str | None) -> bool:
+    """Whether a launcher is still installing or updating Claude Code before it runs.
+
+    The banner stays on screen while the version downloads and installs, which
+    can outlast a readiness budget. Once the launcher moved on to a failed
+    start (an exit box after the banner), the install is over.
+
+    :param screen: ANSI-stripped terminal screen text, or ``None``.
+    :returns: ``True`` for an install or update banner with no exit box after it.
+    """
+    if not screen:
+        return False
+    banner = None
+    for match in _INSTALL_BANNER.finditer(screen):
+        banner = match.end()
+    if banner is None:
+        return False
+    return _LAUNCHER_EXIT_BOX.search(screen, banner) is None
+
+
 def sign_in_next_step(agent: str) -> str:
     """Phrase the next step for a card whose harness is waiting on a launcher sign-in.
 

@@ -86,6 +86,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
 from omnigent.harnesses.diagnostics import (
     SIGN_IN_RESEND_STEP,
     detect_sign_in_prompt,
+    launcher_install_in_progress,
     launcher_install_prompt,
     launcher_password_prompt,
     sign_in_next_step,
@@ -6431,7 +6432,9 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
     The dialogs :func:`_terminal_dialog_headline` names (a settings error, an
     exit confirmation, an MCP approval) have no web card; the person answers
     them in the embedded terminal. A launcher's unanswered installation
-    confirmation, printed before Claude Code runs, is answered there too.
+    confirmation, printed before Claude Code runs, is answered there too, and
+    a launcher still installing or updating Claude Code holds the terminal the
+    same way.
 
     :param bridge_dir: The session's native bridge directory.
     :returns: ``True`` while such a dialog is on screen; ``False`` once it
@@ -6444,7 +6447,11 @@ def terminal_dialog_pending(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
     pane = _capture_pane(socket_path, target)
-    return _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane)
+    if _terminal_dialog_headline(pane) is not None or launcher_install_prompt(pane):
+        return True
+    # The launcher's install or update banner stays on screen until Claude Code
+    # redraws the pane; a rendered input box means the launch is past it.
+    return launcher_install_in_progress(pane) and not _claude_prompt_rendered(pane)
 
 
 # Claude Code echoes a ``/model`` command, then prints this acknowledgement
@@ -7423,8 +7430,9 @@ def _wait_for_claude_prompt_ready(
         out the budget, so the person can answer the dialog in the embedded
         terminal and resend; the pane is left alive.
         A launcher password prompt on two consecutive polls is reported the
-        same way; an installation prompt is reported as awaiting an answer,
-        so the delivery holds the message for it.
+        same way; an installation prompt, or a launcher still installing or
+        updating Claude Code, is reported as awaiting an answer, so the
+        delivery holds the message for it.
     :raises ClaudeSignInPending: If a launcher sign-in prompt (an address to
         open, often with a device code) holds the pane on two consecutive
         polls. Raised within a poll interval with the link attached, so the
@@ -7464,6 +7472,7 @@ def _wait_for_claude_prompt_ready(
     waited_on_sign_in = False
     waited_on_password = False
     waited_on_install = False
+    waited_on_install_banner = False
     # Poll at least once even at timeout_s=0: a single readiness check is
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
@@ -7542,6 +7551,17 @@ def _wait_for_claude_prompt_ready(
                 awaits_answer=True,
             )
         waited_on_install = at_install_prompt
+        # A launcher installing or updating Claude Code before it runs can outlast
+        # the budget; the message waits for it instead of the pane being reaped.
+        installing = launcher_install_in_progress(pane)
+        if installing and waited_on_install_banner:
+            raise ClaudeTerminalDialog(
+                "Claude Code's launch command is still installing Claude Code in its "
+                "terminal, so the message was not delivered. Wait for the install to "
+                "finish, then resend your message." + _format_terminal_failure_tail(pane),
+                awaits_answer=True,
+            )
+        waited_on_install_banner = installing
         # A launcher sign-in prompt printed before Claude Code runs: an address
         # to open, often with a device code. Real when the same address shows
         # on two consecutive polls. Fail now with the link rather than wait out
