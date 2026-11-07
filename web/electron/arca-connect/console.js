@@ -75,6 +75,15 @@ window.arcaConnect.onStarted(({ login, command }) => {
 let term = null;
 let fitAddon = null;
 
+function isCopyShortcut(event) {
+  return (
+    (event.ctrlKey || event.metaKey) &&
+    !event.altKey &&
+    !event.shiftKey &&
+    event.key?.toLowerCase() === "c"
+  );
+}
+
 function ensureTerminal() {
   if (term !== null) return term;
   term = new window.Terminal({
@@ -86,6 +95,8 @@ function ensureTerminal() {
   });
   fitAddon = new window.FitAddon.FitAddon();
   term.loadAddon(fitAddon);
+  // xterm turns Ctrl+C into ^C and cancels the keydown; let a selection copy instead.
+  term.attachCustomKeyEventHandler((event) => !(isCopyShortcut(event) && term.hasSelection()));
   term.open(terminalEl);
   fitAddon.fit();
   window.addEventListener("resize", () => fitAddon.fit());

@@ -38,6 +38,7 @@ const { arcaTarget } = require("./arcaIdentity");
  *   commandLine: (serverUrl: string) => string,
  *   startLogin: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaLogin>,
  *   loginCommandLine: (serverUrl: string) => string,
+ *   attachContextMenu: (win: import("electron").BrowserWindow) => void,
  *   log?: (message: string) => void,
  * }} deps
  * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
@@ -51,6 +52,7 @@ function createArcaConnectFlow({
   commandLine,
   startLogin,
   loginCommandLine,
+  attachContextMenu,
   log = () => {},
 }) {
   /**
@@ -148,6 +150,7 @@ function createArcaConnectFlow({
           sandbox: true,
         },
       });
+      attachContextMenu(win);
 
       // Captured now: webContents is unreadable after the window is destroyed,
       // and the closed handler needs the id to unregister the console.
