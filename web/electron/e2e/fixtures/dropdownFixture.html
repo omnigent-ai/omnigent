@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Deploy stage dropdown fixture</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 16px 20px;
+        background: #f4f6fa;
+        color: #17243a;
+        font: 14px system-ui;
+      }
+      h1 {
+        margin: 0 0 12px;
+        font-size: 20px;
+      }
+      label,
+      .field-label {
+        display: block;
+        margin: 12px 0 5px;
+        font-size: 13px;
+      }
+      select,
+      .custom-control,
+      .radix-trigger {
+        box-sizing: border-box;
+        width: 260px;
+        height: 36px;
+        padding: 0 10px;
+        border: 1px solid #b8c3d4;
+        border-radius: 6px;
+        background: white;
+        color: #17243a;
+        font: 14px system-ui;
+      }
+      .custom-select {
+        position: relative;
+        width: 260px;
+      }
+      .custom-control {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        cursor: default;
+      }
+      .custom-control[data-open="true"] {
+        border-color: #345ddd;
+        box-shadow: 0 0 0 2px #345ddd55;
+      }
+      .custom-value {
+        color: #5b6880;
+      }
+      .custom-control input {
+        flex: 1;
+        min-width: 4px;
+        border: 0;
+        outline: 0;
+        background: transparent;
+        font: 14px system-ui;
+      }
+      .custom-menu,
+      .radix-content {
+        z-index: 2;
+        box-sizing: border-box;
+        width: 260px;
+        border: 1px solid #b8c3d4;
+        border-radius: 6px;
+        background: white;
+        box-shadow: 0 6px 16px #17243a33;
+      }
+      .custom-menu {
+        position: absolute;
+        top: 40px;
+        left: 0;
+      }
+      .custom-menu [role="option"],
+      .radix-item {
+        padding: 8px 10px;
+        outline: 0;
+      }
+      .custom-menu [role="option"]:hover,
+      .radix-item[data-highlighted] {
+        background: #e6ecfb;
+      }
+      .radix-trigger {
+        display: flex;
+        align-items: center;
+        text-align: left;
+      }
+      output {
+        display: block;
+        margin-top: 16px;
+        padding: 8px 10px;
+        border-radius: 6px;
+        background: #e3e8f1;
+        font-size: 13px;
+      }
+      #event-log {
+        margin-top: 10px;
+        font:
+          12px ui-monospace,
+          monospace;
+        color: #3d4a61;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

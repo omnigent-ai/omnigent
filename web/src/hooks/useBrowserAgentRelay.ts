@@ -9,7 +9,7 @@
  *  desktop build that predates the `browser*` bridge is treated as unsupported,
  *  so the relay never claims an action it couldn't fulfill. */
 import { useEffect } from "react";
-import { buildBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
+import { buildLegacyBrowserActionScript } from "../../electron/src/browserActionScript.mjs";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import {
@@ -103,7 +103,7 @@ async function performAction(
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
   if (desktop.browserExecute) {
-    const script = buildBrowserActionScript(action, args);
+    const script = buildLegacyBrowserActionScript(action, args);
     return opts
       ? desktop.browserExecute(conversationId, script, opts)
       : desktop.browserExecute(conversationId, script);
