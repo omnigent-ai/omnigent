@@ -40,11 +40,13 @@ from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
+    import subprocess
+
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.mcp_manager import RunnerMcpManager
     from omnigent.runner.resource_registry import SessionResourceRegistry
-    from omnigent.runtime.filesystem_registry import FilesystemRegistry
+    from omnigent.runtime.filesystem_registry import FilesystemRegistry, GitCommandRunner
     from omnigent.spec.types import AgentSpec, SkillSpec
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -7296,8 +7298,33 @@ async def execute_tool(
             successful=not output.startswith("Error:"),
             source="runner_shell",
             cwd=str(runner_workspace) if runner_workspace else None,
+            git_runner=_session_git_runner(resource_registry, conversation_id, agent_spec),
         )
     return output
+
+
+def _session_git_runner(
+    resource_registry: SessionResourceRegistry | None,
+    conversation_id: str,
+    agent_spec: AgentSpec | None,
+) -> GitCommandRunner:
+    """Run Git reads in the session's environment, as the changes panel does.
+
+    The shell ran under that environment's sandbox, so the PR push scan may read
+    only the checkouts the shell could. Without a registry there is no environment
+    to ask, so the reads are refused rather than run unconfined.
+    """
+
+    def run_git(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        if resource_registry is None:
+            raise OSError("No session environment for Git reads")
+        from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+
+        return resource_registry.resolve_environment(
+            conversation_id, DEFAULT_ENVIRONMENT_ID, agent_spec
+        ).run_git(argv, cwd, timeout)
+
+    return run_git
 
 
 # Per-session leading-edge throttle for changed-files invalidation

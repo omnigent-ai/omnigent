@@ -1174,6 +1174,18 @@ def _copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(str(src), str(dst), symlinks=True)
 
 
+def _is_git_metadata_read(args: list[str]) -> bool:
+    """Whether *args* is a read-only ref or remote query, as the PR push scan makes."""
+    command, rest = args[0], args[1:]
+    if command in {"rev-parse", "for-each-ref"}:
+        return True
+    if command == "reflog":
+        return rest[:1] == ["show"]
+    if command == "remote":
+        return not rest or (len(rest) == 3 and rest[:2] == ["get-url", "--push"])
+    return False
+
+
 def _handle_helper_request(
     *,
     request: OpRequest,
@@ -1190,7 +1202,7 @@ def _handle_helper_request(
             not isinstance(args, list)
             or not args
             or not all(isinstance(arg, str) for arg in args)
-            or args[0] not in {"status", "diff", "show"}
+            or (args[0] not in {"status", "diff", "show"} and not _is_git_metadata_read(args))
             or not isinstance(target, str)
             or not isinstance(timeout, (int, float))
             or timeout <= 0
@@ -1201,6 +1213,9 @@ def _handle_helper_request(
             _assert_within_reach(cwd, sandbox, git_cwd, need_write=False)
             _assert_read_allowed(sandbox, git_cwd, cwd)
             options = ["--no-ext-diff", "--no-textconv"] if args[0] == "diff" else []
+            metadata = _is_git_metadata_read(args)
+            # Ref reads must not run a signature verifier or fetch a missing object.
+            local_only = ["-c", "log.showSignature=false", "-c", "protocol.allow=never"]
             argv = [
                 "git",
                 "--no-optional-locks",
@@ -1208,11 +1223,14 @@ def _handle_helper_request(
                 "core.fsmonitor=false",
                 "-c",
                 "diff.autoRefreshIndex=false",
+                *(local_only if metadata else []),
                 args[0],
                 *options,
                 *args[1:],
             ]
             git_env = _anchored_git_env()
+            if metadata:
+                git_env["GIT_NO_LAZY_FETCH"] = "1"
             if args[0] == "show":
                 # Baseline reads distinguish missing HEAD paths from other Git failures.
                 git_env["LC_ALL"] = "C"

@@ -617,3 +617,91 @@ def test_reflog_read_does_not_fetch_a_missing_object(
     assert not marker.exists()
     push_reflog.recent_pushes([str(work)])
     assert not marker.exists()
+
+
+def test_reflog_scan_reads_through_the_session_git_runner(
+    checkout: tuple[Path, Path],
+) -> None:
+    remote, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    reads: list[list[str]] = []
+
+    def allowed(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        reads.append(argv)
+        return subprocess.run(["git", *argv], cwd=cwd, capture_output=True, timeout=timeout)
+
+    def refused(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        raise OSError(f"{cwd} is outside the sandbox")
+
+    # A sandbox that refuses the checkout hides its pushes from the scan.
+    with push_reflog.git_runner(refused):
+        assert push_reflog.recent_pushes([str(work)]) == []
+    with push_reflog.git_runner(allowed):
+        pushes = push_reflog.recent_pushes([str(work)])
+    assert [(push.url, push.branch) for push in pushes] == [(str(remote), "feature/topic")]
+    assert reads and all(
+        argv[0] in {"rev-parse", "for-each-ref", "reflog", "remote"} for argv in reads
+    )
+
+
+@pytest.mark.parametrize("has_registry", [True, False])
+async def test_runner_shell_dispatch_scans_through_the_session_environment(
+    monkeypatch: pytest.MonkeyPatch, has_registry: bool
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    async def shell(*_args: object, **_kwargs: object) -> str:
+        return json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"})
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", shell)
+    monkeypatch.setattr(
+        pr_observer, "observe_tool_completion", lambda *_a, **kw: observed.update(kw)
+    )
+    environment = Mock()
+    environment.run_git.return_value = subprocess.CompletedProcess(["git"], 0, b"", b"")
+    registry = Mock()
+    registry.resolve_environment.return_value = environment
+    await tool_dispatch.execute_tool(
+        tool_name="sys_os_shell",
+        arguments=json.dumps({"command": "./push.sh"}),
+        conversation_id="conv_sandboxed",
+        agent_spec=None,
+        resource_registry=registry if has_registry else None,
+    )
+    run_git = observed["git_runner"]
+    assert callable(run_git)
+    if has_registry:
+        run_git(["remote"], Path("/repo"), 5.0)
+        environment.run_git.assert_called_once_with(["remote"], Path("/repo"), 5.0)
+    else:
+        with pytest.raises(OSError):
+            run_git(["remote"], Path("/repo"), 5.0)
+
+
+def test_sandboxed_scan_finds_pushes_only_inside_the_workspace(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+
+    remote, work = checkout
+    outside = tmp_path / "outside"
+    _git("clone", "-q", str(remote), str(outside), cwd=tmp_path)
+    _git("push", "-q", "origin", "HEAD:feature/inside", cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "outside", cwd=outside)
+    _git("push", "-q", "origin", "HEAD:feature/outside", cwd=outside)
+    environment = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(work),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=[], write_paths=["."]),
+        )
+    )
+    assert environment is not None
+    try:
+        with push_reflog.git_runner(environment.run_git):
+            pushes = push_reflog.recent_pushes([str(outside), str(work)])
+    finally:
+        environment.close()
+    assert [(push.url, push.branch) for push in pushes] == [(str(remote), "feature/inside")]

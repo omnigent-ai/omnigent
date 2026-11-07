@@ -26,9 +26,10 @@ from omnigent.policies.builtins._shell import (
     unwrap_shell_command,
 )
 from omnigent.runner import pr_reports
-from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
+from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment, push_reflog
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
+from omnigent.runtime.filesystem_registry import GitCommandRunner
 
 _logger = logging.getLogger(__name__)
 # Ids of the providers that already failed once in this process.
@@ -579,9 +580,11 @@ def _record_resolved_prs(
     source: str,
     observation_id: str,
     created: bool = False,
+    git_runner: GitCommandRunner | None = None,
 ) -> None:
     try:
-        references = [ref for ref in resolve(result) if ref.provider == provider_id]
+        with push_reflog.git_runner(git_runner):
+            references = [ref for ref in resolve(result) if ref.provider == provider_id]
         # Identical calls (same command, output and cwd) can push different branches;
         # keying on what they found keeps the second from being dropped as a replay.
         found = ",".join(sorted(ref.url for ref in references))
@@ -609,10 +612,13 @@ def observe_tool_completion(
     source: str = "tool",
     successful: bool = True,
     cwd: str | None = None,
+    git_runner: GitCommandRunner | None = None,
 ) -> None:
     """Best-effort observer; failures never change execution or tool results.
 
     *cwd* is the directory a shell call started in, when the caller knows it.
+    *git_runner* runs the push scan's Git reads in the environment the shell ran
+    in, so a sandbox limits them as it limited the shell.
     """
     if not successful or not session_id:
         return
@@ -658,6 +664,7 @@ def observe_tool_completion(
                         source,
                         observation_id,
                         op.creates,
+                        git_runner,
                     )
                 except Exception:
                     with _pending_lookups_lock:

@@ -16,16 +16,18 @@ also reports that push.
 
 from __future__ import annotations
 
+import contextlib
 import re
 import subprocess
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
-from omnigent.runtime.filesystem_registry import _anchored_git_env
+from omnigent.runtime.filesystem_registry import GitCommandRunner, _anchored_git_env
 
 # A call that only reports when it finished looks this far back for its push.
 RECENT_PUSH_SECONDS = 300.0
@@ -36,7 +38,36 @@ _reported_lock = threading.Lock()
 _MAX_REPORTED = 1024
 
 
+# How the scan runs git: in the environment the shell ran in, when the caller has one.
+_git_runner: ContextVar[GitCommandRunner | None] = ContextVar(
+    "push_reflog_git_runner", default=None
+)
+
+
+@contextlib.contextmanager
+def git_runner(runner: GitCommandRunner | None) -> Iterator[None]:
+    """Run this thread's scans through *runner*, e.g. a sandboxed session's Git reads.
+
+    A sandbox then decides which checkouts the scan may read, as it does for the shell.
+    ``None`` keeps the default: git run directly by this process.
+    """
+    token = _git_runner.set(runner)
+    try:
+        yield
+    finally:
+        _git_runner.reset(token)
+
+
 def _git(directory: str, *argv: str) -> str | None:
+    runner = _git_runner.get()
+    if runner is not None:
+        try:
+            completed = runner(list(argv), Path(directory), _GIT_TIMEOUT_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        return completed.stdout.decode("utf-8", errors="replace")
     # The checkout's config is agent-writable, so keep it from running programs here,
     # including a partial clone's fetch of a missing object: these reads stay local.
     try:
@@ -95,7 +126,8 @@ def recent_pushes(directories: Iterable[str]) -> list[RecentPush]:
     found: list[RecentPush] = []
     checked: set[tuple[str, str]] = set()
     for directory in dict.fromkeys(directories):
-        if not Path(directory).is_dir():
+        # A sandbox sees paths its own way, so only the direct runner pre-checks them.
+        if _git_runner.get() is None and not Path(directory).is_dir():
             continue
         lines = (_git(directory, "rev-parse", "--git-common-dir", "HEAD") or "").splitlines()
         if len(lines) != 2:
