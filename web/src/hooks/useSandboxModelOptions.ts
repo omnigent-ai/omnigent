@@ -110,6 +110,14 @@ export function previewUsesProviderDefault(preview: SandboxModelOptions): boolea
   );
 }
 
+/** A settled, successful preview says the agent shares running sessions' saved catalog. */
+export function previewSharesSessionCatalog(preview: {
+  data?: SandboxModelOptions;
+  error?: unknown;
+}): boolean {
+  return preview.data !== undefined && !preview.error && previewUsesProviderDefault(preview.data);
+}
+
 /** Whether a sandbox agent runs on the provider's default inference, per the server's preview. */
 export function useSandboxAgentUsesProviderDefault(
   provider: string | null,
@@ -118,11 +126,11 @@ export function useSandboxAgentUsesProviderDefault(
   enabled: boolean,
 ): boolean {
   const active = enabled && provider !== null && harness !== null && agentId !== null;
-  const { data, isError } = useQuery({
+  const preview = useQuery({
     ...sandboxModelOptionsQuery(provider ?? "", harness ?? "", agentId, getCurrentUserId()),
     enabled: active,
   });
-  return active && !isError && data !== undefined && previewUsesProviderDefault(data);
+  return active && previewSharesSessionCatalog(preview);
 }
 
 /** Preview a launching sandbox's provider catalog until the session is bound to a host. */
@@ -144,18 +152,19 @@ export function useSandboxLaunchModelOptions(
     provider !== null &&
     info !== "loading" &&
     info.sandbox_provider_capabilities?.[provider]?.default_models === true;
-  const { data } = useSandboxModelOptions(
+  const preview = useSandboxModelOptions(
     provider,
     harness,
     agentId,
     getCurrentUserId(),
     enabled && offered,
   );
+  const data = preview.data;
   // Match the new-session picker: a running session's saved catalog wins.
   const saved = useSavedSandboxSessionCatalog(enabled && offered ? provider : null, harness);
   if (!enabled || !offered || data === undefined) return undefined;
   const previewModels = data.status === "ready" ? data.models : undefined;
-  return previewUsesProviderDefault(data) ? (saved ?? previewModels) : previewModels;
+  return previewSharesSessionCatalog(preview) ? (saved ?? previewModels) : previewModels;
 }
 
 export interface SandboxPreviewEntry {

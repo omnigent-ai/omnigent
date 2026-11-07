@@ -307,7 +307,7 @@ import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
-  previewUsesProviderDefault,
+  previewSharesSessionCatalog,
   sandboxModelOptionsKey,
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
@@ -3500,9 +3500,7 @@ function NewChatLandingContent({
   );
   // Only agents that use the provider default share the running sessions' catalog.
   const sandboxSessionCatalog =
-    sandboxDefaultModelsEnabled &&
-    sandboxModels.data !== undefined &&
-    previewUsesProviderDefault(sandboxModels.data)
+    sandboxDefaultModelsEnabled && previewSharesSessionCatalog(sandboxModels)
       ? savedSandboxCatalog
       : undefined;
   const sandboxInferenceConfigured =
@@ -6384,6 +6382,7 @@ function NewChatLandingContent({
         if (sandboxSelected) {
           const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
           markSandboxLaunch(created.id, {
+            model: normalizedModelOverride ?? null,
             modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
           });
         }

@@ -8373,7 +8373,7 @@ async function refetchRunnerBackedSessionState(
   if (currentState === null) return;
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
-    markLiveSessionCatalog(conversationId);
+    markLiveSessionCatalog(conversationId, session.codexModelOptions ?? []);
   }
   // A delayed catalog only hydrates this session's runner-backed state.
   const statePatch: Partial<ConversationState> =

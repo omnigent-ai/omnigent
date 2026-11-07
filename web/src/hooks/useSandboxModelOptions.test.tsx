@@ -437,6 +437,26 @@ describe("useSandboxLaunchModelOptions", () => {
     expect(result.current).toBeUndefined();
   });
 
+  it("drops a running session's saved catalog once a preview refresh fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      writeModelCatalogCache(
+        sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
+        [{ id: "opus", displayName: "Opus" }],
+        false,
+      );
+      serve();
+      const { result } = render();
+      await waitFor(() => expect(result.current?.map((row) => row.id)).toEqual(["opus"]));
+      fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+      await act(() => vi.advanceTimersByTimeAsync(15_000));
+      // The failed refresh keeps the last good preview rows, not the shared catalog.
+      await waitFor(() => expect(result.current).toEqual(previewRows));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("recovers a launch's rows after an unavailable preview or a failed request", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {

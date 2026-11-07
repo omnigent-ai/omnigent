@@ -112,10 +112,16 @@ describe("sandbox session catalog hooks", () => {
 
   function renderCheck(
     harness = "codex-native",
-    { launched = true, live = true, enabled = true, modelLabel = null as string | null } = {},
+    {
+      launched = true,
+      live = true,
+      enabled = true,
+      launchModel = "gpt-5" as string | null,
+      modelLabel = null as string | null,
+    } = {},
   ) {
-    if (launched) markSandboxLaunch(sessionId, { modelLabel });
-    if (live) markLiveSessionCatalog(sessionId);
+    if (launched) markSandboxLaunch(sessionId, { model: launchModel, modelLabel });
+    if (live) markLiveSessionCatalog(sessionId, []);
     return renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
         useSandboxLaunchSelectionCheck(sessionId, harness, models, enabled),
@@ -137,6 +143,19 @@ describe("sandbox session catalog hooks", () => {
     // Later catalog refreshes do not recheck the user's in-session choices.
     rerender({ models: [...codexModels] });
     expect(setModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the current model when the user switched after launch", async () => {
+    const { rerender } = renderCheck("codex-native", {
+      launchModel: "gpt-4o",
+      modelLabel: "GPT-4o",
+    });
+    rerender({ models: codexModels });
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith(
+        "gpt-5 isn't available in this sandbox. Using the default model.",
+      ),
+    );
   });
 
   it("keeps an effort picked while the model reset is pending", async () => {
@@ -259,25 +278,43 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
-  it("saves only a non-empty session catalog under the provider and harness", () => {
-    const key = sandboxSessionCatalogKey("arclet", "codex-native");
-    const { rerender } = renderHook(
-      ({ models, enabled }: { models: NativeModelOption[]; enabled: boolean }) =>
-        useRememberSandboxSessionCatalog("arclet", "codex-native", models, enabled),
-      { initialProps: { models: [] as NativeModelOption[], enabled: true } },
+  function renderRemember(rememberedSessionId: string, enabled = true) {
+    return renderHook(
+      ({ active }: { active: boolean }) =>
+        useRememberSandboxSessionCatalog("arclet", "codex-native", rememberedSessionId, active),
+      { initialProps: { active: enabled } },
     );
+  }
+
+  it("saves each catalog the runner reports once, under the provider and harness", () => {
+    const key = sandboxSessionCatalogKey("arclet", "codex-native");
+    const { rerender } = renderRemember(sessionId, false);
+    act(() => markLiveSessionCatalog(sessionId, []));
+    act(() => markLiveSessionCatalog(sessionId, codexModels));
     expect(readModelCatalogCache(key)).toBeNull();
-    rerender({ models: codexModels, enabled: false });
-    expect(readModelCatalogCache(key)).toBeNull();
-    rerender({ models: codexModels, enabled: true });
+    rerender({ active: true });
     expect(readModelCatalogCache(key)?.models).toEqual(codexModels);
-    // A refetch with the same rows leaves the entry alone.
+    // A repeated report with the same rows leaves the entry alone.
     const stored = localStorage.getItem(key!);
     const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
-    rerender({ models: [...codexModels], enabled: true });
+    act(() => markLiveSessionCatalog(sessionId, [...codexModels]));
     expect(localStorage.getItem(key!)).toBe(stored);
-    rerender({ models: [codexModels[0]], enabled: true });
+    act(() => markLiveSessionCatalog(sessionId, [codexModels[0]]));
     expect(readModelCatalogCache(key)?.models).toEqual([codexModels[0]]);
+    clock.mockRestore();
+  });
+
+  it("never republishes a reopened session's snapshot over a newer report", () => {
+    const key = sandboxSessionCatalogKey("arclet", "codex-native");
+    act(() => markLiveSessionCatalog(sessionId, codexModels));
+    renderRemember(sessionId).unmount();
+    act(() => markLiveSessionCatalog("conv_newer", [codexModels[0]]));
+    renderRemember("conv_newer").unmount();
+    const stored = localStorage.getItem(key!);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 2 * 24 * 60 * 60 * 1000);
+    // Reopening the first session only rehydrates its snapshot; nothing new was reported.
+    renderRemember(sessionId);
+    expect(localStorage.getItem(key!)).toBe(stored);
     clock.mockRestore();
   });
 
@@ -286,9 +323,8 @@ describe("sandbox session catalog hooks", () => {
     try {
       const reader = renderHook(() => useSavedSandboxSessionCatalog("arclet", "codex-native"));
       expect(reader.result.current).toBeUndefined();
-      renderHook(() =>
-        useRememberSandboxSessionCatalog("arclet", "codex-native", codexModels, true),
-      );
+      act(() => markLiveSessionCatalog(sessionId, codexModels));
+      renderRemember(sessionId);
       expect(reader.result.current).toEqual(codexModels);
       act(() => vi.advanceTimersByTime(SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1_000));
       expect(reader.result.current).toBeUndefined();

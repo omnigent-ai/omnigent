@@ -13403,11 +13403,12 @@ describe("managed sandbox gateway preview", () => {
   });
 
   it.each([
-    ["failed", undefined, new Error("Gateway down")],
-    ["reports the agent's own inference", { ...catalog, configured: true }, null],
+    ["failed", undefined, new Error("Gateway down"), false],
+    ["failed to refresh", catalog, new Error("Gateway down"), false],
+    ["reports the agent's own inference", { ...catalog, configured: true }, null, true],
   ])(
-    "keeps a running session's saved catalog from an agent whose discovery %s",
-    async (_label, data, error) => {
+    "withholds a running session's saved catalog from an agent whose discovery %s",
+    async (_label, data, error, showsAgentModels) => {
       getCurrentUserIdMock.mockReturnValue("alice");
       const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
       writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native"), [luna], false);
@@ -13424,9 +13425,9 @@ describe("managed sandbox gateway preview", () => {
       selectAgent("a2");
       openAgentModels("a2");
       expect(screen.queryByTestId(`new-chat-landing-agent-model-${luna.id}`)).toBeNull();
-      expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`) !== null).toBe(
-        data !== undefined,
-      );
+      const agentRow = screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`);
+      if (showsAgentModels) expect(agentRow).toBeInTheDocument();
+      else expect(agentRow).toBeNull();
       closeMenu();
       const { body } = await submitAndReadBody();
       expect(body.agent_id).toBe("a2");

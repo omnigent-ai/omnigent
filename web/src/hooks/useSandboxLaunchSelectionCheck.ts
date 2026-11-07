@@ -80,8 +80,10 @@ export function useSandboxLaunchSelectionCheck(
     if (harness === null || models.length === 0 || !hasLiveSessionCatalog(sessionId)) return;
     const launch = takeSandboxLaunch(sessionId);
     if (launch === null) return;
+    // The launch label names the current model only if the user hasn't switched since.
+    const modelLabel = launch.model === model ? launch.modelLabel : null;
     const resets = launchSelectionResets(harness, models, model, effort);
-    if (launchSelectionNotice(resets, model, effort) === null) return;
+    if (!resets.model && !resets.effort) return;
     const stillActive = () => useChatStore.getState().conversationId === sessionId;
     // A notice for a session the user left waits until they return to it.
     const notify = (notice: LaunchNotice) =>
@@ -90,7 +92,7 @@ export function useSandboxLaunchSelectionCheck(
       { model: resets.model, effort: false },
       model,
       effort,
-      launch.modelLabel,
+      modelLabel,
     );
     let modelWasReset = false;
     void (async () => {
@@ -114,7 +116,7 @@ export function useSandboxLaunchSelectionCheck(
           { model: resets.model, effort: clearEffort },
           model,
           effort,
-          launch.modelLabel,
+          modelLabel,
         );
         if (notice !== null) notify({ kind: "info", text: notice });
       } catch {

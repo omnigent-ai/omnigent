@@ -7,6 +7,11 @@ import {
   sandboxSessionCatalogKey,
   writeModelCatalogCache,
 } from "@/lib/modelCatalogCache";
+import {
+  claimLiveCatalog,
+  subscribeToLiveCatalogs,
+  unsavedLiveCatalog,
+} from "@/lib/sandboxSessionProvenance";
 import type { NativeModelOption } from "@/lib/types";
 
 const savedCatalogListeners = new Set<() => void>();
@@ -66,16 +71,21 @@ export function useSavedSandboxSessionCatalog(
   return saved.models;
 }
 
-/** Save a managed-sandbox session's own catalog; never pass a launch preview. */
+/** Save the catalog a managed-sandbox session's runner reported, once per report. */
 export function useRememberSandboxSessionCatalog(
   provider: string | null,
   harness: string | null,
-  models: readonly NativeModelOption[],
+  sessionId: string | null,
   enabled: boolean,
 ) {
   const key = sandboxSessionCatalogKey(provider, harness);
+  const models = useSyncExternalStore(subscribeToLiveCatalogs, () =>
+    sessionId === null ? null : unsavedLiveCatalog(sessionId),
+  );
   useEffect(() => {
-    if (!enabled || models.length === 0 || key === null) return;
+    if (!enabled || models === null || key === null || sessionId === null) return;
+    claimLiveCatalog(sessionId, models);
+    if (models.length === 0) return;
     const text = readModelCatalogCacheText(key);
     const saved = parseModelCatalogCache(text, SANDBOX_SESSION_CATALOG_MAX_AGE_MS);
     const unchanged =
@@ -86,5 +96,5 @@ export function useRememberSandboxSessionCatalog(
     if (unchanged) return;
     writeModelCatalogCache(key, models, false);
     savedCatalogsChanged();
-  }, [enabled, key, models]);
+  }, [enabled, key, models, sessionId]);
 }

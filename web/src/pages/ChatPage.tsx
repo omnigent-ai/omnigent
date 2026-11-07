@@ -973,7 +973,7 @@ export function ChatPage() {
   useRememberSandboxSessionCatalog(
     sessionSandboxProvider,
     sandboxPreviewHarness,
-    sessionModelOptions,
+    activeSession?.id ?? null,
     liveSessionCatalog && agentUsesProviderDefault,
   );
   useSandboxLaunchSelectionCheck(
