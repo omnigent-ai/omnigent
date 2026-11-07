@@ -43,12 +43,7 @@ export function modelCatalogCacheKey(
   return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
 }
 
-/**
- * Key for the catalog a running managed-sandbox session reported for a harness.
- *
- * The new-session picker reads it as a hint before the sandbox exists, so it is
- * scoped by sandbox provider and harness rather than by agent.
- */
+/** Key for a running sandbox session's catalog, scoped by provider and harness, not agent. */
 export function sandboxSessionCatalogKey(
   provider: string | null,
   harness: string | null,

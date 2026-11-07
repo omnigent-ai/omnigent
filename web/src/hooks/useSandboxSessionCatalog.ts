@@ -32,12 +32,7 @@ export function useSavedSandboxSessionCatalog(
   );
 }
 
-/**
- * Save the catalog a managed-sandbox session's runner reported.
- *
- * Pass only the session's own catalog, never a launch preview, so the
- * new-session picker learns what the running harness actually offers.
- */
+/** Save a managed-sandbox session's own catalog; never pass a launch preview. */
 export function useRememberSandboxSessionCatalog(
   provider: string | null,
   harness: string | null,

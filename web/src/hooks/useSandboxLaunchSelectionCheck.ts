@@ -42,10 +42,7 @@ export function launchSelectionNotice(
   return null;
 }
 
-/**
- * Once a sandbox this page watched launching reports its catalog, replace a
- * launch model or effort it cannot run with the harness default.
- */
+/** After a watched sandbox launch, reset a model or effort its catalog lacks. */
 export function useSandboxLaunchSelectionCheck(
   sessionId: string | null,
   sandboxStatus: SandboxStatus | null,
