@@ -1632,6 +1632,157 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_app_server_progress_warning_distinguishes_notifications_and_work(self):
+        async def _scenario(progress: str) -> None:
+            import omnigent.inner.codex_executor as codex_executor_module
+
+            clock = SimpleNamespace(now=0.0)
+            notification = {
+                "method": "account/rateLimits/updated",
+                "params": {"private": "credential-must-not-be-logged"},
+            }
+            events = [(float(tick), notification) for tick in range(1, 8)]
+            if progress == "reasoning":
+                for index in (0, 2, 4, 6):
+                    events[index] = (
+                        events[index][0],
+                        {
+                            "method": "item/reasoning/textDelta",
+                            "params": {"turnId": "turn-1", "delta": "private reasoning"},
+                        },
+                    )
+            elif progress in ("command", "command_output"):
+                events[0] = (
+                    1.0,
+                    {
+                        "method": "item/started",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "command-1",
+                                "type": "commandExecution",
+                                "command": "private-command-must-not-be-logged",
+                                "cwd": "/private-workspace",
+                                "status": "inProgress",
+                            },
+                        },
+                    },
+                )
+                if progress == "command_output":
+                    for index in (2, 4, 6):
+                        events[index] = (
+                            events[index][0],
+                            {
+                                "method": "item/commandExecution/outputDelta",
+                                "params": {"turnId": "turn-1", "delta": "private output"},
+                            },
+                        )
+            elif progress == "tool_result":
+                events[0] = (
+                    1.0,
+                    {
+                        "id": 1,
+                        "method": "item/tool/call",
+                        "params": {"turnId": "turn-1", "callId": "tool-1", "tool": "read_file"},
+                    },
+                )
+            else:
+                events[1] = (
+                    2.0,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {"type": "userMessage", "text": "private steering"},
+                        },
+                    },
+                )
+                events[2] = (
+                    3.0,
+                    {
+                        "method": "item/started",
+                        "params": {"turnId": "turn-1", "item": {"type": "userMessage"}},
+                    },
+                )
+                events[3] = (
+                    4.0,
+                    {
+                        "method": "item/reasoning/textDelta",
+                        "params": {"turnId": "other-turn", "delta": "unrelated reasoning"},
+                    },
+                )
+            events.append(
+                (
+                    8.0,
+                    {
+                        "method": "item/completed",
+                        "params": {
+                            "turnId": "turn-1",
+                            "item": {
+                                "id": "final-1",
+                                "type": "agentMessage",
+                                "text": "done",
+                                "phase": "final_answer",
+                            },
+                        },
+                    },
+                )
+            )
+
+            class TimedEvents(asyncio.Queue):
+                async def get(self):
+                    await asyncio.sleep(0)
+                    clock.now, message = events.pop(0)
+                    return message
+
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session._events = TimedEvents()
+            session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+            session._execute_dynamic_tool = AsyncMock(return_value={"error": "private-tool-error"})
+            session._send_response = AsyncMock()
+            with (
+                patch.object(
+                    codex_executor_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+                ),
+                patch.object(codex_executor_module, "_TURN_EVENT_WARN_SECONDS", 3.0),
+                patch.object(codex_executor_module.logger, "warning") as warning,
+            ):
+                output = [
+                    event
+                    async for event in session.run_turn(
+                        messages=[{"role": "user", "content": "hi"}],
+                        tools=[],
+                        system_prompt="",
+                        model=CODEX_DEFAULT_MODEL,
+                        cwd=".",
+                        sandbox="workspace-write",
+                    )
+                ]
+            self.assertTrue(any(isinstance(event, TurnComplete) for event in output))
+            if progress in ("reasoning", "command_output"):
+                warning.assert_not_called()
+            else:
+                self.assertTrue(warning.called, "notification traffic hid the idle turn")
+                diagnostics = str(warning.call_args_list)
+                for private in (
+                    "credential-must-not-be-logged",
+                    "private-command-must-not-be-logged",
+                    "private steering",
+                    "private-tool-error",
+                ):
+                    self.assertNotIn(private, diagnostics)
+                if progress == "command":
+                    self.assertIn("command-1", diagnostics)
+
+        for progress in ("notifications", "reasoning", "command", "command_output", "tool_result"):
+            with self.subTest(progress=progress):
+                _run(_scenario(progress))
+
     def test_app_server_run_turn_finishes_on_final_answer_item_without_turn_completed(self):
         async def _t():
             session = _CodexAppServerSession(
