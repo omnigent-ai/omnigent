@@ -22,15 +22,15 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 from omnigent.runtime.filesystem_registry import _anchored_git_env
 
 # A call that only reports when it finished looks this far back for its push.
 RECENT_PUSH_SECONDS = 300.0
-_MAX_DIRECTORIES = 4
 _GIT_TIMEOUT_SECONDS = 5.0
-# Pushes already reported, so later calls in the same checkout do not look them up again.
+# Pushes whose PRs were looked up, so later calls in the same checkout skip them.
 _reported: OrderedDict[tuple[str, str, str, int], None] = OrderedDict()
 _reported_lock = threading.Lock()
 _MAX_REPORTED = 1024
@@ -63,25 +63,35 @@ def _git(directory: str, *argv: str) -> str | None:
     return completed.stdout.decode("utf-8", errors="replace")
 
 
-def _claim(push: tuple[str, str, str, int]) -> bool:
+@dataclass(frozen=True)
+class RecentPush:
+    """A branch pushed from a checkout.
+
+    :ivar url: The remote's push URL.
+    :ivar branch: The pushed branch.
+    :ivar key: Identifies this push for :func:`mark_reported`.
+    """
+
+    url: str
+    branch: str
+    key: tuple[str, str, str, int]
+
+
+def mark_reported(keys: Iterable[tuple[str, str, str, int]]) -> None:
+    """Stop returning these pushes once their PRs were looked up."""
     with _reported_lock:
-        if push in _reported:
-            return False
-        _reported[push] = None
+        for key in keys:
+            _reported[key] = None
         while len(_reported) > _MAX_REPORTED:
             _reported.popitem(last=False)
-        return True
 
 
-def recent_pushes(directories: Iterable[str]) -> list[tuple[str, str]]:
-    """Return ``(push URL, branch)`` for branches recently pushed from *directories*.
-
-    Each push is returned once per process.
-    """
+def recent_pushes(directories: Iterable[str]) -> list[RecentPush]:
+    """Return the branches recently pushed from *directories* and not yet reported."""
     now = time.time()
-    found: list[tuple[str, str]] = []
+    found: list[RecentPush] = []
     checked: set[tuple[str, str]] = set()
-    for directory in list(dict.fromkeys(directories))[:_MAX_DIRECTORIES]:
+    for directory in dict.fromkeys(directories):
         if not Path(directory).is_dir():
             continue
         lines = (_git(directory, "rev-parse", "--git-common-dir", "HEAD") or "").splitlines()
@@ -125,7 +135,11 @@ def recent_pushes(directories: Iterable[str]) -> list[tuple[str, str]]:
             )
             if remote is None:
                 continue
+            key = (common_dir, ref, head, int(match[1]))
+            with _reported_lock:
+                if key in _reported:
+                    continue
             url = (_git(directory, "remote", "get-url", "--push", remote) or "").strip()
-            if url and _claim((common_dir, ref, head, int(match[1]))):
-                found.append((url, ref.removeprefix(f"refs/remotes/{remote}/")))
+            if url:
+                found.append(RecentPush(url, ref.removeprefix(f"refs/remotes/{remote}/"), key))
     return found

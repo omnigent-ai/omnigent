@@ -303,6 +303,13 @@ def _git(*argv: str, cwd: Path) -> str:
     ).stdout
 
 
+def _report(directories: list[str]) -> list[tuple[str, str]]:
+    """Return ``(url, branch)`` for recent pushes, marking them reported as a lookup would."""
+    pushes = push_reflog.recent_pushes(directories)
+    push_reflog.mark_reported(push.key for push in pushes)
+    return [(push.url, push.branch) for push in pushes]
+
+
 @pytest.fixture
 def checkout(tmp_path: Path) -> tuple[Path, Path]:
     """A checkout on branch ``local`` whose ``origin`` is a local bare repository."""
@@ -329,9 +336,9 @@ def test_reflog_reports_pushes_the_output_cannot_show(
     _git("config", "alias.shipit", "push origin HEAD:feature/topic", cwd=work)
     (work / "push.sh").write_text("git push origin HEAD:feature/topic\n")
     subprocess.run(command, shell=True, cwd=work, check=True, capture_output=True)
-    assert push_reflog.recent_pushes([str(work)]) == [(str(remote), "feature/topic")]
+    assert _report([str(work)]) == [(str(remote), "feature/topic")]
     # A later call in the same checkout does not report the push again.
-    assert push_reflog.recent_pushes([str(work)]) == []
+    assert _report([str(work)]) == []
 
 
 def test_reflog_ignores_pushes_this_checkout_did_not_make(
@@ -339,13 +346,13 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
 ) -> None:
     remote, work = checkout
     _git("push", "-q", "--dry-run", "origin", "HEAD:feature/dry-run", cwd=work)
-    assert push_reflog.recent_pushes([str(work)]) == []
+    assert _report([str(work)]) == []
     # Another worktree of the same repository pushes a different commit.
     other = work.parent / "other"
     _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
     _git("commit", "-q", "--allow-empty", "-m", "other", cwd=other)
     _git("push", "-q", "origin", "HEAD:feature/other", cwd=other)
-    assert push_reflog.recent_pushes([str(work)]) == []
+    assert _report([str(work)]) == []
     # Checking out someone else's pushed branch only fetches it.
     clone = work.parent / "clone"
     _git("clone", "-q", str(remote), str(clone), cwd=work.parent)
@@ -353,13 +360,13 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
     _git("push", "-q", "origin", "HEAD:feature/theirs", cwd=clone)
     _git("fetch", "-q", "origin", cwd=work)
     _git("checkout", "-q", "origin/feature/theirs", cwd=work)
-    assert push_reflog.recent_pushes([str(work)]) == []
+    assert _report([str(work)]) == []
     # A push made long before the call is not this call's.
     _git("checkout", "-q", "local", cwd=work)
     _git("push", "-q", "origin", "HEAD:feature/old", cwd=work)
     later = push_reflog.time.time() + push_reflog.RECENT_PUSH_SECONDS + 60
     monkeypatch.setattr(push_reflog.time, "time", lambda: later)
-    assert push_reflog.recent_pushes([str(work)]) == []
+    assert _report([str(work)]) == []
 
 
 @pytest.fixture
@@ -368,9 +375,13 @@ def checked_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     checked: list[str] = []
 
-    def recent_pushes(candidates: object) -> list[tuple[str, str]]:
+    def recent_pushes(candidates: object) -> list[push_reflog.RecentPush]:
         checked.extend(candidates)  # type: ignore[call-overload]
-        return [("git@github.com:contributor/project.git", "feature/topic")]
+        return [
+            push_reflog.RecentPush(
+                "git@github.com:contributor/project.git", "feature/topic", ("repo", "ref", "x", 0)
+            )
+        ]
 
     monkeypatch.setattr(github_push, "recent_pushes", recent_pushes)
     row = {
@@ -473,10 +484,10 @@ def test_reflog_reports_distinct_pushes_to_one_branch_in_the_same_second(
     # Git stamps reflog entries with the committer date, so both land in one second.
     monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(push_reflog.time.time())} +0000")
     _git("push", "-q", "origin", "HEAD:feature/shared", cwd=work)
-    assert push_reflog.recent_pushes([str(work)]) == [(str(remote), "feature/shared")]
+    assert _report([str(work)]) == [(str(remote), "feature/shared")]
     _git("push", "-q", "--force", "origin", "HEAD:feature/shared", cwd=other)
-    assert push_reflog.recent_pushes([str(other)]) == [(str(remote), "feature/shared")]
-    assert push_reflog.recent_pushes([str(other)]) == []
+    assert _report([str(other)]) == [(str(remote), "feature/shared")]
+    assert _report([str(other)]) == []
 
 
 def test_identical_runner_shell_calls_record_each_pushed_branch(
@@ -484,7 +495,12 @@ def test_identical_runner_shell_calls_record_each_pushed_branch(
 ) -> None:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     url = "git@github.com:contributor/project.git"
-    pushes = iter([[(url, "feature/a")], [(url, "feature/b")]])
+    pushes = iter(
+        [
+            [push_reflog.RecentPush(url, "feature/a", ("repo", "a", "x", 0))],
+            [push_reflog.RecentPush(url, "feature/b", ("repo", "b", "y", 0))],
+        ]
+    )
     monkeypatch.setattr(github_push, "recent_pushes", lambda _directories: next(pushes))
     urls = {
         branch: f"https://github.com/contributor/project/pull/{number}"
@@ -541,5 +557,39 @@ def test_reflog_read_does_not_run_a_configured_signature_verifier(
     _git("push", "-q", "origin", "HEAD:feature/signed", cwd=work)
     _git("config", "log.showSignature", "true", cwd=work)
     _git("config", "gpg.program", str(verifier), cwd=work)
-    assert push_reflog.recent_pushes([str(work)]) == [(str(remote), "feature/signed")]
+    assert _report([str(work)]) == [(str(remote), "feature/signed")]
     assert not marker.exists()
+
+
+def test_failed_lookup_leaves_the_push_for_a_later_call(
+    checkout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    # Report the push as going to GitHub; the push itself went to the local remote.
+    _git("config", "remote.origin.pushurl", "git@github.com:contributor/project.git", cwd=work)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    gh = Mock(side_effect=[(1, "", "unavailable"), (0, json.dumps([row]), "")])
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    segments = pr_observer._with_directories(_shell_segments("./push.sh"), str(work))
+    result = {"stdout": "", "stderr": "", "exit_code": 0}
+    assert pushed_prs(segments, result) == []
+    assert [reference.url for reference in pushed_prs(segments, result)] == [PR_URL]
+    assert pushed_prs(segments, result) == []
+    assert gh.call_count == 2
+
+
+def test_reflog_checks_every_directory_the_command_ran_in(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    remote, work = checkout
+    elsewhere = [tmp_path / name for name in "abcd"]
+    for directory in elsewhere:
+        directory.mkdir()
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    directories = [*map(str, elsewhere), str(work)]
+    assert _report(directories) == [(str(remote), "feature/topic")]

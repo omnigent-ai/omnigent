@@ -14,7 +14,7 @@ from urllib.parse import quote
 from omnigent.git_providers import resolve_remote
 from omnigent.policies.builtins.github import _git_subcommand_index
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
-from omnigent.runner.git_providers.push_reflog import recent_pushes
+from omnigent.runner.git_providers.push_reflog import mark_reported, recent_pushes
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -121,11 +121,17 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
     if _failed(result):
         return []
     targets = dict.fromkeys(_output_targets(segments, result))
-    for url, branch in recent_pushes(segment.cwd for segment in segments if segment.cwd):
-        remote = resolve_remote(url)
+    pushes: dict[tuple[str, str, str], list[tuple[str, str, str, int]]] = {}
+    for push in recent_pushes(segment.cwd for segment in segments if segment.cwd):
+        remote = resolve_remote(push.url)
         if remote is not None and remote.provider == "github":
-            targets[(remote.host, remote.repository, branch)] = None
-    return _open_prs(targets)
+            target = (remote.host, remote.repository, push.branch)
+            targets[target] = None
+            pushes.setdefault(target, []).append(push.key)
+    references, looked_up = _open_prs(targets)
+    # A failed or skipped lookup leaves the push for the next shell call to retry.
+    mark_reported(key for target in looked_up for key in pushes.get(target, []))
+    return references
 
 
 def _output_targets(
@@ -169,11 +175,17 @@ def _output_targets(
     return list(targets)
 
 
-def _open_prs(targets: Iterable[tuple[str, str, str]]) -> list[PullRequestRef]:
-    """Return the open PRs whose head is each ``(host, repository, branch)``."""
+def _open_prs(
+    targets: Iterable[tuple[str, str, str]],
+) -> tuple[list[PullRequestRef], set[tuple[str, str, str]]]:
+    """Return the open PRs whose head is each ``(host, repository, branch)``.
+
+    Also returns the targets GitHub answered for, whether or not they have a PR.
+    """
     from omnigent.runner import github_resource
 
     references: dict[str, PullRequestRef] = {}
+    answered: set[tuple[str, str, str]] = set()
     deadline = time.monotonic() + 5.0
     with github_resource._gh_deadline_scope(deadline):
         for host, repository, branch in targets:
@@ -191,6 +203,7 @@ def _open_prs(targets: Iterable[tuple[str, str, str]]) -> list[PullRequestRef]:
                 continue
             if not isinstance(rows, list):
                 continue
+            answered.add((host, repository, branch))
             for row in rows:
                 if not isinstance(row, dict) or row.get("state") != "open":
                     continue
@@ -208,4 +221,4 @@ def _open_prs(targets: Iterable[tuple[str, str, str]]) -> list[PullRequestRef]:
                     and reference.host == host
                 ):
                     references[reference.url] = reference
-    return list(references.values())
+    return list(references.values()), answered
