@@ -989,18 +989,18 @@ export function ChatPage() {
     hostOnline: reconnectHostOnline,
     isOwner: isOwnerLevel(permissionLevel),
   });
-  // Opening an asleep sandbox's session presses Reconnect host for the user.
+  // Opening an asleep sandbox's session presses Reconnect host for the user. The
+  // snapshot's launch stage counts too: the chat store may not have loaded it yet.
+  const autoWakeLaunch = sandboxStatus ?? activeSession?.sandboxStatus ?? null;
   const sandboxAutoWakeAllowed: boolean | null =
     !sessionConvId || !activeSession || liveness.kind === "unknown"
       ? null
       : canAutoWakeSandbox({
           asleep: liveness.kind === "host_asleep",
-          launching: sandboxLaunching,
+          launching: autoWakeLaunch !== null && autoWakeLaunch.stage !== "failed",
           canEdit: isEditorLevel(permissionLevel),
           status: activeSession.status,
-          // A failed sandbox launch keeps its card and Reconnect host, with no task error.
-          failed: Boolean(activeSession.lastTaskError) || sandboxStatus?.stage === "failed",
-          // retry_session would deliver a message still marked Not delivered.
+          failed: Boolean(activeSession.lastTaskError) || autoWakeLaunch?.stage === "failed",
           undelivered: (activeSession.failedInputs?.length ?? 0) > 0,
         });
   useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());

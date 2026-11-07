@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
+import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { onRunnerHealthPolled, refreshRunnerHealth } from "@/hooks/useRunnerHealth";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
@@ -130,6 +131,13 @@ async function requestSandboxWake(sessionId: string, wake: SandboxWake): Promise
   }
 }
 
+/** The sessions whose wakes wait for their host, as a stable key for the poll registration. */
+function awaitingOnlineKey(): string {
+  const ids: string[] = [];
+  for (const [id, wake] of sandboxWakes) if (wake.phase === "awaiting_online") ids.push(id);
+  return ids.sort().join("\n");
+}
+
 /** The running wake of *sessionId*'s sandbox, if any. */
 export function useSandboxWakePhase(
   sessionId: string | null | undefined,
@@ -168,6 +176,14 @@ export function useSessionReconnect({
   const [canReconnectThisMachine, setCanReconnectThisMachine] = useState(false);
   const [canReconnectArca, setCanReconnectArca] = useState(false);
   const sandboxWake = useSandboxWakePhase(sessionId);
+  // Keep sessions with a wake waiting on their host in the health poll, even when
+  // another session is shown, so the wake ends once that host is seen online.
+  const awaitingKey = useSyncExternalStore(subscribeSandboxWakes, awaitingOnlineKey);
+  const awaitingSessions = useMemo(
+    () => (awaitingKey ? awaitingKey.split("\n").map((id) => ({ id })) : []),
+    [awaitingKey],
+  );
+  useRunnerHealthRegistration(awaitingSessions);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   // The open session's launch stage, compared against its value at the wake's click.
   // `undefined` while the store still holds another session (just after a

@@ -27,6 +27,14 @@ import {
   useSessionReconnect,
 } from "./useSessionReconnect";
 
+const polledSessions = vi.hoisted(() => ({ current: [] as { id: string }[] }));
+vi.mock("@/hooks/RunnerHealthProvider", () => ({
+  useRunnerHealthRegistration: (sessions: { id: string }[]) => {
+    polledSessions.current = sessions;
+    return new Map();
+  },
+}));
+
 const healthPollListeners = vi.hoisted(
   () => new Set<(liveness: Map<string, SessionLiveness>, scheduled: boolean) => void>(),
 );
@@ -1016,11 +1024,14 @@ describe("useSessionReconnect", () => {
       hostId: "other-host",
       hostOnline: false,
     });
+    // The off-screen session stays in the health poll while its wake waits.
+    expect(polledSessions.current).toEqual([{ id: "session" }]);
     act(() => {
       for (const listener of healthPollListeners) {
         listener(new Map([["session", { host_online: true } as SessionLiveness]]), true);
       }
     });
+    expect(polledSessions.current).toEqual([]);
     // The host later sleeps again; returning starts a fresh wake instead of joining a stale one.
     rerender({ ...asleepSandbox, hostOnline: false });
     expect(result.current.sandboxStarting).toBe(false);

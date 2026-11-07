@@ -10,10 +10,9 @@ export const SANDBOX_AUTO_WAKE_DWELL_MS = 1_000;
 const wakeRequests = new Set<(sessionId: string) => void>();
 
 /**
- * Whether opening a session may wake its asleep sandbox: only an idle session
- * with no error, no undelivered input and no launch already running, so the
- * wake (the same `retry_session` as Reconnect host) has no interrupted turn or
- * failed input to resume or deliver. Anything else keeps its Resume or error card.
+ * Whether opening a session may wake its asleep sandbox. The wake is Reconnect
+ * host's `retry_session`, so it must not resume failed work or redeliver
+ * undelivered input; such sessions keep their Resume or error card.
  */
 export function canAutoWakeSandbox({
   asleep,
