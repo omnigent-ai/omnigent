@@ -68,6 +68,9 @@ Additional requirements:
 - Automatic session cleanup must retain compute while any session is bound,
   including stopped/archived sessions, unrelated forks and admitted launches.
   Cleanup must not revoke a replacement generation's credentials.
+- Admins choose where **Add nested agent** may run: only the clicked session's host;
+  that host or a fresh managed sandbox; or any available host (the default).
+  The UI uses these plain labels and does not expose family/sibling terminology.
 
 ## Implementation
 
@@ -116,6 +119,12 @@ The composer waits for source metadata before initializing its host selection,
 so normal asynchronous defaults cannot replace the source sandbox. Drafts and
 picker caches are scoped to the clicked source. Normal model, agent, repository,
 profile and workspace controls are reused.
+
+The destination policy reuses the file-backed server-admin settings path and
+requires no database migration. The server enforces it before family admission
+for both JSON and uploaded-agent creates. Uploaded agents bind and launch on the
+chosen host in the create request. Later host launches recheck the same policy;
+failed launches restore the prior host so a restricted session can retry. MCP rejects disallowed fresh-sandbox placement before reserving a host.
 
 The default-off `sibling_sessions` release feature controls both the `/v1/info`
 capability and server creation authorization. Enable it with
@@ -181,6 +190,9 @@ fresh compute; it cannot recover uncommitted files from a destroyed filesystem.
   mobile long-press/header menus open the same fresh-conversation composer.
   Reloads retain nesting and project/pin membership. Real subagent presentation
   stays separate.
+- Every destination-policy mode filters the composer and is enforced for direct
+  API and MCP creates; changing the setting takes effect without a migration or
+  server restart.
 
 ## Verification
 

@@ -63,6 +63,7 @@ import { useHostWorktrees } from "@/hooks/useHostWorktrees";
 import type { HostWorktree } from "@/hooks/useHostWorktrees";
 import { NewChatLandingScreen, resetLandingDraft } from "./NewChatDialog";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { setOmnigentHostConfig } from "@/lib/host";
 
 // A project-driven visit (`?project=` resolved to a first-class project id)
 // creates the session WITH `project_id`: the server files it atomically and
@@ -330,6 +331,7 @@ async function submitAndReadBody(
 }
 
 beforeEach(() => {
+  setOmnigentHostConfig({});
   vi.clearAllMocks();
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
@@ -796,6 +798,71 @@ describe("NewChatLandingScreen nested agent creation", () => {
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+    },
+  );
+});
+
+describe("NewChatLandingScreen Add Agent destinations", () => {
+  it.each([
+    ["current_host", false, false],
+    ["current_host_or_new_sandbox", false, true],
+    ["any_host", true, true],
+  ] as const)(
+    "%s controls connected-host and new-sandbox choices",
+    async (policy, showsOtherHost, showsSandbox) => {
+      setOmnigentHostConfig({ docsLinks: { newSandbox: "Set up managed sandboxes" } });
+      searchParams = new URLSearchParams("sibling=source");
+      vi.mocked(useHosts).mockReturnValue({
+        data: [host(), host({ host_id: "host_2", name: "build-server" })],
+      } as ReturnType<typeof useHosts>);
+      renderLanding({
+        sibling_sessions: true,
+        sibling_session_destinations: policy,
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+      });
+
+      await screen.findByRole("heading", { name: "Add nested agent" });
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      expect(screen.getByTestId("new-chat-landing-host-host_1")).toBeInTheDocument();
+      expect(screen.queryByTestId("new-chat-landing-host-host_2") !== null).toBe(showsOtherHost);
+      expect(screen.queryByTestId("new-chat-landing-sandbox-option") !== null).toBe(showsSandbox);
+      expect(screen.queryByTestId("new-chat-landing-sandbox-option-disabled")).toBeNull();
+      expect(screen.queryByTestId("new-chat-landing-connect-host") !== null).toBe(showsOtherHost);
+    },
+  );
+
+  it.each([false, true])(
+    "clamps a sandbox after a policy change (restored draft=%s)",
+    async (restore) => {
+      searchParams = new URLSearchParams("sibling=source");
+      const first = renderLanding({
+        sibling_sessions: true,
+        sibling_session_destinations: "any_host",
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+      });
+      await screen.findByRole("heading", { name: "Add nested agent" });
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+      if (restore) {
+        first.unmount();
+        renderLanding({
+          sibling_sessions: true,
+          sibling_session_destinations: "current_host",
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "modal",
+        });
+        await screen.findByRole("heading", { name: "Add nested agent" });
+      } else {
+        first.client.setQueryData(["sharing", "sibling-destinations"], "current_host");
+      }
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("alpha"),
+      );
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      expect(screen.queryByTestId("new-chat-landing-sandbox-option")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-host-host_1")).toBeInTheDocument();
     },
   );
 });

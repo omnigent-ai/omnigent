@@ -5301,14 +5301,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                     previous.git_branch,
                     previous.runner_id,
                 )
-            if previous_host is not None and previous_host.deleted_at is not None:
-                return False
-            meta.host_id, meta.workspace, meta.git_branch = (
-                previous.host_id,
-                previous.workspace,
-                previous.git_branch,
-            )
-            _bind_runner(meta, previous.runner_id)
+            if previous.host_id is not None and (
+                previous_host is None or previous_host.deleted_at is not None
+            ):
+                # A removed source host cannot be restored; leave the session
+                # unbound so a failed transfer can be retried.
+                meta.host_id = meta.workspace = meta.git_branch = None
+                _bind_runner(meta, None)
+            else:
+                meta.host_id, meta.workspace, meta.git_branch = (
+                    previous.host_id,
+                    previous.workspace,
+                    previous.git_branch,
+                )
+                _bind_runner(meta, previous.runner_id)
             # Split databases retain the accepted reference if metadata rolls back;
             # deleting it first could leave a live binding without its profile.
             if previous.profile_snapshot is None and self._conv_engine is self._engine:

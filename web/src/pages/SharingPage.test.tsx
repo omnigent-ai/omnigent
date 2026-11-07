@@ -53,6 +53,13 @@ function state(overrides: Partial<SharingState> = {}): SharingState {
     default_public_sessions_options: ["off", "sandbox", "all"],
     peer_session_messaging_enabled: true,
     peer_session_messaging_editable: true,
+    sibling_session_destinations: "any_host",
+    sibling_session_destinations_editable: true,
+    sibling_session_destinations_options: [
+      "current_host",
+      "current_host_or_new_sandbox",
+      "any_host",
+    ],
     ...overrides,
   };
 }
