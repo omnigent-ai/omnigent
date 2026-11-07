@@ -1,0 +1,12 @@
+{
+  "id": "demo-tests-failed",
+  "kind": "gate_result",
+  "node_id": "implement",
+  "candidate_id": "implement-1",
+  "gate_id": "tests",
+  "outcome": {
+    "passed": false,
+    "detail": "SIMULATED failure: repair the missing edge case.",
+    "evidence": "simulation://checks/implement-1"
+  }
+}

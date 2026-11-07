@@ -1,0 +1,12 @@
+{
+  "id": "demo-tests-passed",
+  "kind": "gate_result",
+  "node_id": "implement",
+  "candidate_id": "implement-2",
+  "gate_id": "tests",
+  "outcome": {
+    "passed": true,
+    "detail": "SIMULATED pass: the repaired revision meets the acceptance criteria.",
+    "evidence": "simulation://checks/implement-2"
+  }
+}

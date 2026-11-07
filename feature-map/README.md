@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Dynamic workflows](./dynamic-workflows.md) covers opt-in DAG execution, outcomes,
+  validation, repair, and checkpoint recovery through the experimental module CLI.
+
 - [Automation failure visibility](./automation-failures.md) covers failed-run card
   warnings, Inbox surfacing, session deduplication and browser-local dismissal.
 
