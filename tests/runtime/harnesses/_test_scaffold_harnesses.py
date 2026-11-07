@@ -73,6 +73,14 @@ class _UsageHarness(HarnessApp):
             "context_tokens": 5_700,
             "cache_read_input_tokens": 8_000,
             "cache_creation_input_tokens": 2_000,
+            "pricing_requests": [
+                {
+                    "input_tokens": 10_300,
+                    "cache_read_input_tokens": 8_000,
+                    "output_tokens": 500,
+                    "request_input_tokens": 18_300,
+                }
+            ],
         }
         ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="usage"))
 

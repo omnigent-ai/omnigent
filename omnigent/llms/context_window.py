@@ -202,6 +202,8 @@ class ModelPricing:
     output_per_token: float
     cache_read_per_token: float | None = None
     cache_write_per_token: float | None = None
+    # Strict input thresholds and whole-request rates, ordered by threshold.
+    long_context: tuple[tuple[int, ModelPricing], ...] = ()
 
 
 def fetch_model_pricing(model: str) -> ModelPricing | None:
@@ -225,6 +227,22 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
         if info.input_price is None or info.output_price is None:
             return None
         return ModelPricing(
+            long_context=tuple(
+                (
+                    tier.threshold_tokens,
+                    ModelPricing(
+                        tier.input_price / 1_000_000,
+                        tier.output_price / 1_000_000,
+                        tier.cache_read_price / 1_000_000
+                        if tier.cache_read_price is not None
+                        else None,
+                        tier.cache_write_price / 1_000_000
+                        if tier.cache_write_price is not None
+                        else None,
+                    ),
+                )
+                for tier in info.long_context
+            ),
             input_per_token=float(info.input_price) / 1_000_000,
             output_per_token=float(info.output_price) / 1_000_000,
             cache_read_per_token=(
@@ -277,9 +295,21 @@ def compute_llm_cost(usage: dict[str, Any], pricing: ModelPricing) -> float:
         non-cached portion — see note above. Example:
         ``{"input_tokens": 1200, "output_tokens": 300,
         "cache_read_input_tokens": 5000}``.
+    ``request_input_tokens`` explicitly identifies a single request's full input
+    (including cache). Only then can catalog long-context tiers apply, strictly
+    above their threshold and to the whole request. Aggregated/historical usage
+    without this field retains the flat estimate; it cannot recover request tiers.
+
     :param pricing: Per-token prices for the model.
     :returns: Cost in USD for the tokens in *usage*.
     """
+    # Aggregated usage cannot select a request tier. Only adapters that retain
+    # a verified request boundary supply this inclusive input count.
+    request_input = usage.get("request_input_tokens")
+    if type(request_input) is int:
+        for threshold, tier in pricing.long_context:
+            if request_input > threshold:
+                pricing = tier
     input_tokens = usage.get("input_tokens") or 0
     output_tokens = usage.get("output_tokens") or 0
     cache_read = usage.get("cache_read_input_tokens") or 0
