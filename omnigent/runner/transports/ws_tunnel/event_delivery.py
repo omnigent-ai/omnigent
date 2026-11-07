@@ -81,6 +81,11 @@ class RunnerEventDispatcher:
         """
         return self._last_dispatch_at
 
+    @property
+    def is_connected(self) -> bool:
+        """Whether a server tunnel is currently open, whatever its event support."""
+        return self._state != "disconnected"
+
     def _set_state(self, state: str) -> None:
         self._state = state
         changed = self._state_changed
