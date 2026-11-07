@@ -544,6 +544,16 @@ For a single agent turn that calls one tool and one LLM:
 The trace ID is the hex suffix of the response ID, so you can search
 for a specific request in MLflow by stripping the `resp_` prefix.
 
+#### Which model and effort a turn ran with
+
+`gen_ai.request.model` is what the turn asked for. A turn on the default
+model or effort also records what actually ran, on its agent span:
+`gen_ai.response.model`, `omnigent.model.source`,
+`omnigent.reasoning_effort.requested`, `omnigent.reasoning_effort` and
+`omnigent.reasoning_effort.source`. See
+[Model and effort attributes](../designs/OBSERVABILITY.md#14-model-and-effort-attributes)
+for their meaning and which harnesses report them.
+
 ### Verified end-to-end
 
 Emitted a synthetic trace from a local Python script (using the same
