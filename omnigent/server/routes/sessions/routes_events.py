@@ -3721,6 +3721,7 @@ def register_events_routes(
                 conversation_store,
                 initializer=initializer,
                 suppress_recovery_turn=True,
+                refuse_rejection=True,
                 trigger="web_message",
             )
         await _ensure_runner_relay_ready(

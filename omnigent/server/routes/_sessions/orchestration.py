@@ -5998,6 +5998,7 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
+    refuse_rejection: bool = False,
     trigger: str = "session_ensure",
 ) -> bool:
     """
@@ -6049,6 +6050,9 @@ async def _ensure_runner_session_initialized(
         finishes.
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
+    :param refuse_rejection: Raise ``runner_unavailable`` when the runner
+        answers the handshake with an error status, so the caller does not
+        forward a message into a session the runner did not set up.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -6087,6 +6091,12 @@ async def _ensure_runner_session_initialized(
         if not runner_inference_verified(conv, resp):
             raise OmnigentError(
                 "The runner did not accept this session's saved inference configuration",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        if refuse_rejection and resp.status_code >= 400:
+            raise OmnigentError(
+                "The runner could not set up this session, so the message was not "
+                f"sent: {_runner_reject_detail(resp)}",
                 code=ErrorCode.RUNNER_UNAVAILABLE,
             )
         # httpx only raises on transport errors; a 4xx/5xx means create_session

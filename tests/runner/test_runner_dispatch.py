@@ -2459,6 +2459,62 @@ async def test_runner_failed_status_carries_setup_error_message(
     assert error["code"]
 
 
+@pytest.mark.asyncio
+async def test_background_turn_fails_setup_when_spec_cannot_be_resolved(
+    pinned_runner_log: Path,
+) -> None:
+    """A turn whose spec cannot load fails setup as undelivered, never reaching dispatch.
+
+    :param pinned_runner_log: The log path the client-safe detail must name.
+    """
+    conv = "conv_turn_spec_resolve_fails"
+    stable_id = "3c9e1f7a5b2d4c6e8a0f1b3d5c7e9a2b"
+    resolver_calls: list[str] = []
+
+    async def _failing_spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        resolver_calls.append(agent_id)
+        raise httpx.ConnectError("server at internal-host unreachable")
+
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(_FakeHarnessClient([]))),
+        spec_resolver=_failing_spec_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_test_client(app) as http:
+        response = await http.post(
+            f"/v1/sessions/{conv}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "ag_claude_native",
+                "model": "x",
+                "content": [{"role": "user", "content": "hi"}],
+                "stable_id": stable_id,
+                "input_stable_id": stable_id,
+            },
+        )
+        assert response.status_code == 202
+        await _await_bg_turn_task(conv)
+        events = await _drain_turn_events(
+            app.state.session_event_queues, conv, until_status="failed", timeout=2.0
+        )
+
+    [undelivered] = [event for event in events if event.get("type") == "response.failed"]
+    assert undelivered["input_stable_id"] == stable_id
+    assert undelivered["response"]["error"]["undelivered"] is True
+    [failed] = [
+        event
+        for event in events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+    assert failed["error"]["message"] == (
+        "turn setup failed: Could not load the agent spec (ConnectError). "
+        f"Request failed on the runner; see the runner log for details: {pinned_runner_log}"
+    )
+    # Dispatch would resolve the spec a second time to pick a harness.
+    assert resolver_calls == ["ag_claude_native"]
+
+
 # ── Harness-stream failure → terminal session.status ────
 
 
