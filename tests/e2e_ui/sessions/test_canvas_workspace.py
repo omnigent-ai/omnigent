@@ -74,7 +74,14 @@ def test_canvas_controls_clear_the_macos_titlebar(
     expand = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(expand).to_have_count(1)
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
-    for control in (expand, heading) if width < 768 else (heading,):
+    home_name = re.compile(r"\bhome\b", re.IGNORECASE)
+    home = (
+        page.get_by_role("link", name=home_name)
+        .or_(page.get_by_role("button", name=home_name))
+        .filter(visible=True)
+    )
+    expect(home).to_have_count(1)
+    for control in (expand, heading, home) if width < 768 else (heading, home):
         bounds = control.bounding_box()
         assert bounds is not None and bounds["y"] >= titlebar_bottom, (
             f"Canvas control overlaps the native titlebar: {bounds}, bottom={titlebar_bottom}"
@@ -117,6 +124,9 @@ def test_canvas_controls_clear_the_macos_titlebar(
     assert bounds is not None and bounds["y"] >= titlebar_bottom
     restore.click()
     expect(heading).to_be_visible()
+    home.click()
+    expect(page).to_have_url(f"{base_url}/")
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
 
 
 def test_canvas_keeps_board_drafts_and_sidebar_while_switching_sessions(

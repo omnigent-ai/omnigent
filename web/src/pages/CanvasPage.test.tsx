@@ -381,7 +381,7 @@ describe("CanvasPage", () => {
     expect(screen.getByText("No sessions in Legacy")).toBeInTheDocument();
   });
 
-  it("opens a session on one click and starts new sessions in the active project", () => {
+  it("opens a session on one click, starts new sessions in the active project, and goes home", () => {
     vi.mocked(conversationsHook.useProjects).mockReturnValue(projectsStub(PROJECTS));
     vi.mocked(canvasSessions.useCanvasSessions).mockReturnValue(
       sessionsStub([conversation("conv_1", 1, { project_id: "proj_a" })]),
@@ -396,6 +396,12 @@ describe("CanvasPage", () => {
     fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
     fireEvent.click(screen.getByTestId("canvas-new-session"));
     expect(screen.getByTestId("location")).toHaveTextContent("/?canvas=proj_a&project=Alpha");
+    cleanup();
+
+    renderPage();
+    fireEvent.click(screen.getByRole("tab", { name: "Alpha" }));
+    fireEvent.click(screen.getByRole("link", { name: "Home" }));
+    expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
     cleanup();
 
     renderPage();
