@@ -390,7 +390,7 @@ forwards the standard harness credential vars to its runners:
 | `ANTHROPIC_API_KEY` | Claude models on the Anthropic API |
 | `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL` | Anthropic-compatible gateways (LiteLLM, Bedrock/Vertex bridges, corporate proxies) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | claude-code with a Claude **subscription** (no API key) |
-| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | OpenAI or any OpenAI-compatible endpoint (OpenRouter, vLLM, Ollama, …) |
+| `OPENAI_API_KEY` / `OPENAI_BASE_URL` | OpenAI or any OpenAI-compatible endpoint (OpenRouter, vLLM, Ollama, llama-server, …) |
 | `CODEX_ACCESS_TOKEN` | codex with a ChatGPT Business/Enterprise workspace |
 | `GEMINI_API_KEY` | Gemini on the Google AI API |
 
