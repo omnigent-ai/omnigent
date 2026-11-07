@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import shlex
+import socket
 import subprocess
+import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -14,7 +17,9 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import click
 import httpx
 import pytest
+import yaml
 
+from omnigent.host.identity import HostIdentity, load_or_create_host_identity
 from omnigent.onboarding.sandboxes import bootstrap as bootstrap_mod
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
@@ -780,6 +785,32 @@ def test_connect_sets_host_name_before_connecting() -> None:
     name_entry = next(entry for entry in launcher.log if entry.startswith("run:python3"))
     foreground_entry = next(entry for entry in launcher.log if entry.startswith("foreground:"))
     assert launcher.log.index(name_entry) < launcher.log.index(foreground_entry)
+
+
+def test_chosen_host_name_survives_a_different_sandbox_hostname(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An IP-shaped ``--host-name`` is kept, not mistaken for a stale generated name."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    launcher = _FakeLauncher()
+    connect_sandbox_host(
+        launcher,
+        "sb-1",
+        server_url="https://app.example.com",
+        host_name="ip-10-90-45-193",
+    )
+    _python, flag, script = shlex.split(launcher.run_commands[0])
+    subprocess.run(
+        [sys.executable, flag, script], env={**os.environ, "HOME": str(tmp_path)}, check=True
+    )
+    config_path = tmp_path / ".omnigent" / "config.yaml"
+    host_id = yaml.safe_load(config_path.read_text())["host"]["host_id"]
+    monkeypatch.setattr(socket, "gethostname", lambda: "ip-10-90-37-46")
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity == HostIdentity(host_id=host_id, name="ip-10-90-45-193")
 
 
 def test_connect_raises_on_nonzero_exit() -> None:

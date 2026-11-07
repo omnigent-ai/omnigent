@@ -11,6 +11,7 @@ import yaml
 
 from omnigent.host.identity import (
     HOST_SLICE_KEY_ENABLED_ENV_VAR,
+    HostIdentity,
     export_configured_slice_key,
     host_identity_env_override_active,
     load_host_identity_if_present,
@@ -185,6 +186,139 @@ def test_name_only_config_host_id_stable_across_calls(tmp_path: Path) -> None:
     assert first.name == second.name == "my-custom-host"
 
 
+def test_hostname_derived_name_follows_hostname_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-provisioned box's generated name follows its new hostname; host_id persists."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump({"server": "http://example.com"}))
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-a")
+    first = load_or_create_host_identity(config_path)
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
+    second = load_or_create_host_identity(config_path)
+
+    assert first.name == "devbox-a"
+    assert second == HostIdentity(host_id=first.host_id, name="devbox-b", stored_name="devbox-a")
+    data = yaml.safe_load(config_path.read_text())
+    assert data["host"]["name"] == "devbox-a"
+    assert data["server"] == "http://example.com"
+    assert load_or_create_host_identity(config_path) == second
+
+
+def test_user_renamed_host_keeps_name_after_hostname_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name the user wrote over the generated one is never replaced."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-a")
+    load_or_create_host_identity(config_path)
+    data = yaml.safe_load(config_path.read_text())
+    data["host"]["name"] = "my-box"
+    config_path.write_text(yaml.safe_dump(data))
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
+
+    assert load_or_create_host_identity(config_path).name == "my-box"
+
+
+@pytest.mark.parametrize(
+    ("saved_name", "hostname", "expected_name"),
+    [
+        ("ip-10-90-45-193", "ip-10-90-37-46", "ip-10-90-37-46"),
+        (
+            "ip-10-90-45-193.us-west-2.compute.internal",
+            "ip-10-90-37-46.us-west-2.compute.internal",
+            "ip-10-90-37-46.us-west-2.compute.internal",
+        ),
+        ("ip-10-90-45-193", "dev-laptop", "dev-laptop"),
+        ("my-laptop", "ip-10-90-37-46", "my-laptop"),
+        ("ip-10-90-37-46-dev", "ip-10-90-18-185", "ip-10-90-37-46-dev"),
+        ("ip-999-999-999-999", "ip-10-90-18-185", "ip-999-999-999-999"),
+    ],
+)
+def test_legacy_config_regenerates_only_a_stale_ec2_hostname_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    saved_name: str,
+    hostname: str,
+    expected_name: str,
+) -> None:
+    """Without a recorded source, only a stale EC2 private-IP name is regenerated."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"host": {"host_id": "d6d0ccebce7b4b706d21e23696bb462a", "name": saved_name}}
+        )
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: hostname)
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity == HostIdentity(
+        host_id="d6d0ccebce7b4b706d21e23696bb462a",
+        name=expected_name,
+        stored_name=saved_name if expected_name != saved_name else None,
+    )
+    assert yaml.safe_load(config_path.read_text())["host"]["name"] == saved_name
+
+
+def test_legacy_config_name_matching_hostname_follows_later_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy name equal to the hostname is recorded as generated, so it follows renames."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"host": {"host_id": "d6d0ccebce7b4b706d21e23696bb462a", "name": "devbox-a"}}
+        )
+    )
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-a")
+    assert load_or_create_host_identity(config_path).name == "devbox-a"
+
+    monkeypatch.setattr(socket, "gethostname", lambda: "devbox-b")
+
+    assert load_or_create_host_identity(config_path) == HostIdentity(
+        host_id="d6d0ccebce7b4b706d21e23696bb462a", name="devbox-b", stored_name="devbox-a"
+    )
+
+
+def test_name_refresh_survives_an_unwritable_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only config still yields the current hostname and is left unchanged."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    original = yaml.safe_dump(
+        {"host": {"host_id": "d6d0ccebce7b4b706d21e23696bb462a", "name": "ip-10-90-45-193"}}
+    )
+    config_path.write_text(original)
+    monkeypatch.setattr(socket, "gethostname", lambda: "ip-10-90-37-46")
+
+    def _read_only(*_args: object, **_kwargs: object) -> tuple[int, str]:
+        raise PermissionError("read-only file system")
+
+    monkeypatch.setattr("omnigent.host.identity.tempfile.mkstemp", _read_only)
+
+    identity = load_or_create_host_identity(config_path)
+
+    assert identity == HostIdentity(
+        host_id="d6d0ccebce7b4b706d21e23696bb462a",
+        name="ip-10-90-37-46",
+        stored_name="ip-10-90-45-193",
+    )
+    assert config_path.read_text() == original
+
+
 def test_env_override_returns_identity_without_touching_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -302,6 +436,22 @@ def test_config_non_uuid_host_id_raises_actionable(tmp_path: Path) -> None:
     assert "not-a-uuid" in msg
 
 
+def test_malformed_previous_host_id_is_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A malformed previous host id only loses the rotation hint; the host still starts."""
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {"host": {"host_id": "a" * 32, "name": "my-laptop", "previous_host_id": "not-a-uuid"}}
+        )
+    )
+
+    assert load_or_create_host_identity(config_path).previous_host_id is None
+
+
 def test_if_present_env_non_uuid_host_id_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     """The read-only sibling is TOLERANT: a malformed env host_id yields None, not
     a raise. This path is the passive slice-key fallback every request's header
@@ -351,6 +501,7 @@ def test_reset_host_id_mints_fresh_id_and_keeps_name(tmp_path: Path) -> None:
 
     cfg = yaml.safe_load(config_path.read_text())
     assert cfg["host"]["host_id"] == new_id
+    assert cfg["host"]["previous_host_id"] == old_id
     assert cfg["host"]["name"] == "my-laptop", "reset must not clobber the host name"
     assert cfg["server"] == "https://example.databricksapps.com", (
         "reset must not touch unrelated config keys"
@@ -373,7 +524,7 @@ def test_reset_host_id_without_existing_identity_creates_one(tmp_path: Path) -> 
 def test_reset_host_id_next_load_returns_the_new_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """After a reset, the normal load path picks up the fresh id."""
+    """After a reset, the normal load path picks up the fresh id and the one it replaced."""
     # The load path honors the managed-host env override; clear it so the
     # test reads the file identity regardless of the ambient environment.
     monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
@@ -386,6 +537,7 @@ def test_reset_host_id_next_load_returns_the_new_identity(
 
     assert after.host_id == new_id
     assert after.host_id != before.host_id
+    assert after.previous_host_id == before.host_id
     assert after.name == before.name
 
 
