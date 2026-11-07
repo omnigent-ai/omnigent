@@ -307,6 +307,7 @@ import { CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY } from "@/lib/codexPlanMode";
 import { fetchHosts, useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
 import {
   previewIsUnsupported,
+  previewUsesProviderDefault,
   sandboxModelOptionsKey,
   useSandboxModelOptions,
   useSandboxUnsupportedAgents,
@@ -3497,7 +3498,13 @@ function NewChatLandingContent({
     sandboxDefaultModelsOffered ? previewSandboxProvider : null,
     previewHarness,
   );
-  const sandboxSessionCatalog = sandboxDefaultModelsEnabled ? savedSandboxCatalog : undefined;
+  // Only agents that use the provider default share the running sessions' catalog.
+  const sandboxSessionCatalog =
+    sandboxDefaultModelsEnabled &&
+    sandboxModels.data !== undefined &&
+    previewUsesProviderDefault(sandboxModels.data)
+      ? savedSandboxCatalog
+      : undefined;
   const sandboxInferenceConfigured =
     sandboxPreviewEnabled && sandboxModels.data?.configured === true;
   const sandboxHasModelCatalog = sandboxInferenceConfigured || sandboxDefaultModelsEnabled;
@@ -6374,7 +6381,12 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
-        if (sandboxSelected) markSandboxLaunch(created.id);
+        if (sandboxSelected) {
+          const launchedRow = sandboxCatalog?.find((row) => row.id === normalizedModelOverride);
+          markSandboxLaunch(created.id, {
+            modelLabel: launchedRow ? nativeModelLabel(launchedRow) : null,
+          });
+        }
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this

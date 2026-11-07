@@ -128,4 +128,14 @@ it("keeps running-session catalogs apart from agent previews and for a week", ()
   vi.setSystemTime(now + SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1);
   expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)).toBeNull();
   expect(sandboxSessionCatalogKey(null, "codex-native")).toBeNull();
+  vi.mocked(getCurrentUserId).mockReturnValue("bob");
+  expect(sandboxSessionCatalogKey("company", "codex-native")).not.toBe(sessionKey);
+  vi.mocked(getCurrentUserId).mockReturnValue("alice");
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
+  expect(sandboxSessionCatalogKey("company", "codex-native")).not.toBe(sessionKey);
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue(null);
+  expect(sandboxSessionCatalogKey("company", "codex-native")).toBeNull();
+  vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-a");
+  vi.mocked(getCurrentUserId).mockReturnValue(null);
+  expect(sandboxSessionCatalogKey("company", "codex-native")).toBeNull();
 });

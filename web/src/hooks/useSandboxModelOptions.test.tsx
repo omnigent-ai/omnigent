@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
+import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
 import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
@@ -36,6 +37,7 @@ const catalog = {
 
 afterEach(() => {
   cleanup();
+  localStorage.clear();
   fetchMock.mockReset();
   vi.restoreAllMocks();
 });
@@ -123,25 +125,34 @@ describe("useSandboxAgentUsesProviderDefault", () => {
     ["a configured inference binding", catalog, false],
   ])("answers for %s", async (_label, preview, expected) => {
     fetchMock.mockResolvedValue(new Response(JSON.stringify(preview)));
-    const { result } = renderHook(
-      () => useSandboxAgentUsesProviderDefault("agent_sandbox", "claude-native", "ag_1", true),
-      { wrapper: wrapper() },
-    );
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await waitFor(() => expect(result.current).toBe(expected));
+    const { result } = renderEligibility();
+    await waitFor(() => expect(result.current.preview.isSuccess).toBe(true));
+    expect(result.current.usesDefault).toBe(expected);
   });
 
   it("says no until the preview loads and when it fails", async () => {
     fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
-    const { result } = renderHook(
-      () => useSandboxAgentUsesProviderDefault("agent_sandbox", "claude-native", "ag_1", true),
+    const { result } = renderEligibility();
+    expect(result.current.usesDefault).toBe(false);
+    await waitFor(() => expect(result.current.preview.isError).toBe(true));
+    expect(result.current.usesDefault).toBe(false);
+  });
+
+  /** Render the answer beside the preview query it reads, so tests can wait for it to settle. */
+  function renderEligibility() {
+    return renderHook(
+      () => ({
+        usesDefault: useSandboxAgentUsesProviderDefault(
+          "agent_sandbox",
+          "claude-native",
+          "ag_1",
+          true,
+        ),
+        preview: useSandboxModelOptions("agent_sandbox", "claude-native", "ag_1", "alice", true),
+      }),
       { wrapper: wrapper() },
     );
-    expect(result.current).toBe(false);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await act(async () => {});
-    expect(result.current).toBe(false);
-  });
+  }
 });
 
 describe("useSandboxUnsupportedAgents", () => {
@@ -391,6 +402,40 @@ describe("useSandboxLaunchModelOptions", () => {
       expect(result.current).toBeUndefined();
     },
   );
+
+  it.each([
+    ["a provider-default preview", ready, ["opus"]],
+    [
+      "a configured inference binding",
+      { ...ready, configured: true },
+      ["gateway/opus", "gateway/gpt"],
+    ],
+    ["an agent with its own provider", { ...ready, models: [], status: "unconfigured" }, undefined],
+  ])("uses a running session's saved catalog only for %s", async (_label, preview, expected) => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    serve(preview);
+    const { client, result } = render();
+    const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
+    await waitFor(() => expect(client.getQueryData(key)).toEqual(preview));
+    expect(result.current?.map((row) => row.id)).toEqual(expected);
+  });
+
+  it("ignores a running session's saved catalog while the preview has failed", async () => {
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("agent_sandbox", "claude-native"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+    const { client, result } = render();
+    const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
+    await waitFor(() => expect(client.getQueryState(key)?.status).toBe("error"));
+    expect(result.current).toBeUndefined();
+  });
 
   it("recovers a launch's rows after an unavailable preview or a failed request", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });

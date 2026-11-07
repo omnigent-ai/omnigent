@@ -1,6 +1,5 @@
 // Per-tab facts about where a session's settings and catalog came from.
 const liveCatalogSessions = new Set<string>();
-const sandboxLaunchesToCheck = new Set<string>();
 
 /** The session's runner reported its model catalog while this tab was listening. */
 export function markLiveSessionCatalog(sessionId: string): void {
@@ -11,14 +10,23 @@ export function hasLiveSessionCatalog(sessionId: string): boolean {
   return liveCatalogSessions.has(sessionId);
 }
 
-/** This tab created the managed-sandbox session, so its launch choices await a check. */
-export function markSandboxLaunch(sessionId: string): void {
-  sandboxLaunchesToCheck.add(sessionId);
+export interface SandboxLaunch {
+  /** Display name of the model picked at launch, when the picker had one. */
+  modelLabel: string | null;
 }
 
-/** Claim a pending launch check; returns false when none is pending. */
-export function takeSandboxLaunch(sessionId: string): boolean {
-  return sandboxLaunchesToCheck.delete(sessionId);
+const sandboxLaunchesToCheck = new Map<string, SandboxLaunch>();
+
+/** This tab created the managed-sandbox session, so its launch choices await a check. */
+export function markSandboxLaunch(sessionId: string, launch: SandboxLaunch): void {
+  sandboxLaunchesToCheck.set(sessionId, launch);
+}
+
+/** Claim a pending launch check; returns null when none is pending. */
+export function takeSandboxLaunch(sessionId: string): SandboxLaunch | null {
+  const launch = sandboxLaunchesToCheck.get(sessionId) ?? null;
+  sandboxLaunchesToCheck.delete(sessionId);
+  return launch;
 }
 
 export interface LaunchNotice {

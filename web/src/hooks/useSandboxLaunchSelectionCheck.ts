@@ -47,9 +47,10 @@ export function launchSelectionNotice(
   resets: LaunchSelectionResets,
   model: string | null,
   effort: string | null,
+  modelLabel: string | null = null,
 ): string | null {
   if (resets.model) {
-    return `${model} isn't available in this sandbox. Using the default model${resets.effort ? " and effort" : ""}.`;
+    return `${modelLabel ?? model} isn't available in this sandbox. Using the default model${resets.effort ? " and effort" : ""}.`;
   }
   if (resets.effort && effort) {
     return `${normalizeEffortLabel(effort)} effort isn't available for this model in this sandbox. Using the default effort.`;
@@ -77,7 +78,8 @@ export function useSandboxLaunchSelectionCheck(
     for (const notice of takeLaunchNotices(sessionId)) showLaunchNotice(notice);
     // A snapshot's persisted catalog may be stale, so only the runner's own report is checked.
     if (harness === null || models.length === 0 || !hasLiveSessionCatalog(sessionId)) return;
-    if (!takeSandboxLaunch(sessionId)) return;
+    const launch = takeSandboxLaunch(sessionId);
+    if (launch === null) return;
     const resets = launchSelectionResets(harness, models, model, effort);
     if (launchSelectionNotice(resets, model, effort) === null) return;
     const stillActive = () => useChatStore.getState().conversationId === sessionId;
@@ -88,6 +90,7 @@ export function useSandboxLaunchSelectionCheck(
       { model: resets.model, effort: false },
       model,
       effort,
+      launch.modelLabel,
     );
     let modelWasReset = false;
     void (async () => {
@@ -100,7 +103,7 @@ export function useSandboxLaunchSelectionCheck(
         if (resets.effort && !stillActive()) {
           if (modelNotice !== null)
             deferLaunchNotice(sessionId, { kind: "info", text: modelNotice });
-          markSandboxLaunch(sessionId);
+          markSandboxLaunch(sessionId, launch);
           return;
         }
         // An effort picked while the model reset was pending wins.
@@ -111,13 +114,15 @@ export function useSandboxLaunchSelectionCheck(
           { model: resets.model, effort: clearEffort },
           model,
           effort,
+          launch.modelLabel,
         );
         if (notice !== null) notify({ kind: "info", text: notice });
       } catch {
         if (modelWasReset && modelNotice !== null) notify({ kind: "info", text: modelNotice });
-        const text = modelWasReset
-          ? "Couldn't switch to the sandbox's default effort."
-          : "Couldn't switch to the sandbox's default model settings.";
+        const text =
+          resets.model && !modelWasReset
+            ? "Couldn't switch to the sandbox's default model settings."
+            : "Couldn't switch to the sandbox's default effort.";
         notify({ kind: "error", text });
       }
     })();

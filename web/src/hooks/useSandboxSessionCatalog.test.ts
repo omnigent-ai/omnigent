@@ -112,9 +112,9 @@ describe("sandbox session catalog hooks", () => {
 
   function renderCheck(
     harness = "codex-native",
-    { launched = true, live = true, enabled = true } = {},
+    { launched = true, live = true, enabled = true, modelLabel = null as string | null } = {},
   ) {
-    if (launched) markSandboxLaunch(sessionId);
+    if (launched) markSandboxLaunch(sessionId, { modelLabel });
     if (live) markLiveSessionCatalog(sessionId);
     return renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
@@ -124,12 +124,12 @@ describe("sandbox session catalog hooks", () => {
   }
 
   it("resets unavailable launch choices once the launched session reports its catalog", async () => {
-    const { rerender } = renderCheck();
+    const { rerender } = renderCheck("codex-native", { modelLabel: "GPT-5" });
     expect(setModel).not.toHaveBeenCalled();
     rerender({ models: codexModels });
     await waitFor(() =>
       expect(toast.info).toHaveBeenCalledWith(
-        "gpt-5 isn't available in this sandbox. Using the default model.",
+        "GPT-5 isn't available in this sandbox. Using the default model.",
       ),
     );
     expect(setModel).toHaveBeenCalledWith(null);
@@ -211,6 +211,29 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).toHaveBeenCalledExactlyOnceWith(
       "gpt-5 isn't available in this sandbox. Using the default model.",
     );
+  });
+
+  it("names the effort when the model needed no change and the effort reset fails", async () => {
+    useChatStore.setState({ sessionModelOverride: "opus" });
+    setEffort.mockRejectedValueOnce(new Error("refused"));
+    const { rerender } = renderCheck("claude-native");
+    rerender({ models: claudeModels });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't switch to the sandbox's default effort."),
+    );
+    expect(setModel).not.toHaveBeenCalled();
+  });
+
+  it("leaves later choices alone after a launch the sandbox supports", async () => {
+    useChatStore.setState({ sessionModelOverride: "opus", sessionReasoningEffort: null });
+    const { rerender } = renderCheck("claude-native");
+    rerender({ models: claudeModels });
+    await act(async () => {});
+    act(() => useChatStore.setState({ sessionModelOverride: "gpt-5" }));
+    rerender({ models: [...claudeModels] });
+    await act(async () => {});
+    expect(setModel).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
   });
 
   it("reports a reset the server refused", async () => {

@@ -13402,6 +13402,38 @@ describe("managed sandbox gateway preview", () => {
     });
   });
 
+  it.each([
+    ["failed", undefined, new Error("Gateway down")],
+    ["reports the agent's own inference", { ...catalog, configured: true }, null],
+  ])(
+    "keeps a running session's saved catalog from an agent whose discovery %s",
+    async (_label, data, error) => {
+      getCurrentUserIdMock.mockReturnValue("alice");
+      const luna = { id: "gpt-6-luna", displayName: "GPT 6 Luna" };
+      writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native"), [luna], false);
+      vi.mocked(useSandboxModelOptions).mockReturnValue({
+        data,
+        isLoading: false,
+        error,
+      } as unknown as ReturnType<typeof useSandboxModelOptions>);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderGatewaySandbox();
+      selectAgent("a2");
+      openAgentModels("a2");
+      expect(screen.queryByTestId(`new-chat-landing-agent-model-${luna.id}`)).toBeNull();
+      expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`) !== null).toBe(
+        data !== undefined,
+      );
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.agent_id).toBe("a2");
+      expect(body.model_override).not.toBe(luna.id);
+    },
+  );
+
   it("drops an effort unsupported by the newly selected model", async () => {
     const glm = {
       id: "system.ai.glm-5-2",

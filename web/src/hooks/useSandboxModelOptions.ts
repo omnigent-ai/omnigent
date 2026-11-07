@@ -153,9 +153,9 @@ export function useSandboxLaunchModelOptions(
   );
   // Match the new-session picker: a running session's saved catalog wins.
   const saved = useSavedSandboxSessionCatalog(enabled && offered ? provider : null, harness);
-  if (!enabled || !offered || data?.status === "unconfigured" || data?.status === "unsupported")
-    return undefined;
-  return saved ?? (data?.status === "ready" ? data.models : undefined);
+  if (!enabled || !offered || data === undefined) return undefined;
+  const previewModels = data.status === "ready" ? data.models : undefined;
+  return previewUsesProviderDefault(data) ? (saved ?? previewModels) : previewModels;
 }
 
 export interface SandboxPreviewEntry {

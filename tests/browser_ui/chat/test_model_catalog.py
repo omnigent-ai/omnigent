@@ -603,7 +603,7 @@ def test_launch_pick_missing_from_the_sandbox_resets_to_default(
 
     expect(
         page.get_by_text(
-            "gateway/sonnet isn't available in this sandbox. Using the default model."
+            "Sonnet via gateway isn't available in this sandbox. Using the default model."
         )
     ).to_be_visible()
     # "default" is the clear alias; Claude Code's effort ladder fits every model.
