@@ -906,6 +906,8 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    # Set when the CLI's wrapper grants the credentials file: its identity at start.
+    sandboxed_credentials: tuple[int, int] | None = None
     # Host-reported account state of each Claude MCP server when last checked.
     mcp_auth: dict[str, str] = field(default_factory=dict)
 
@@ -1518,13 +1520,32 @@ def _claude_internal_write_roots() -> list[pathlib.Path]:
     return roots
 
 
+def _claude_credentials_file() -> pathlib.Path:
+    """The file holding the Claude CLI's OAuth sign-in on Linux."""
+    return pathlib.Path.home() / ".claude" / ".credentials.json"
+
+
+def _claude_credentials_identity() -> tuple[int, int]:
+    """Identify the credentials file, ``(0, 0)`` when it is absent.
+
+    A Claude CLI saves the file by renaming a new copy over it, which gives it
+    a new inode, so a changed identity means some process replaced it.
+
+    :returns: ``(st_dev, st_ino)`` of the file, or ``(0, 0)``.
+    """
+    try:
+        info = _claude_credentials_file().stat()
+    except OSError:
+        return (0, 0)
+    return (info.st_dev, info.st_ino)
+
+
 def _claude_internal_write_files() -> list[pathlib.Path]:
     """Exact files the Claude CLI updates outside its writable roots."""
 
-    # .credentials.json holds the Claude CLI's OAuth token on Linux.
     candidates = [
         pathlib.Path.home() / ".claude.json",
-        pathlib.Path.home() / ".claude" / ".credentials.json",
+        _claude_credentials_file(),
     ]
     return [path for path in candidates if path.exists()]
 
@@ -1944,6 +1965,8 @@ class ClaudeSDKExecutor(Executor):
         # The bundled CLI may be older and send beta flags that the
         # Databricks gateway doesn't support.
         self._cli_wrapper_path: str | None = None
+        # The wrapper's bwrap grant covers the credentials file only if it exists now.
+        self._wrapper_grants_credentials = _claude_credentials_file().exists()
         self._cli_path: str | None = _find_system_claude()
         if self._cli_path:
             if self._os_env_spec is not None:
@@ -2087,6 +2110,10 @@ class ClaudeSDKExecutor(Executor):
 
             options.stderr = _tee_stderr
             client = sdk.ClaudeSDKClient(options)
+            # A restarted CLI binds the credentials file as it is now; see _credentials_replaced.
+            sandboxed_credentials = (
+                _claude_credentials_identity() if self._cli_bind_mounts_credentials() else None
+            )
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2166,6 +2193,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                sandboxed_credentials=sandboxed_credentials,
                 mcp_auth=mcp_auth,
             )
             self._clients[session_key] = state
@@ -2258,6 +2286,31 @@ class ClaudeSDKExecutor(Executor):
         task = asyncio.create_task(self._force_close_client(state.client))
         self._cancel_close_tasks.add(task)
         task.add_done_callback(self._cancel_close_tasks.discard)
+
+    def _cli_bind_mounts_credentials(self) -> bool:
+        """Whether this CLI's wrapper binds its credentials file, by path, under bwrap.
+
+        A file created after the wrapper was built is not granted to it, so a
+        restarted CLI could not bind it; only a granted file is tracked.
+        """
+        return (
+            self._cli_wrapper_path is not None
+            and self._wrapper_grants_credentials
+            and sys.platform == "linux"
+        )
+
+    def _credentials_replaced(self, state: _ClaudeClientState) -> bool:
+        """Whether a sandboxed CLI's credentials file was replaced after it started.
+
+        bwrap binds the file it saw at launch. Once another Claude process saves
+        a refreshed sign-in (a new file renamed over the old one), that bind is
+        gone and the path is read-only inside the sandbox, so this CLI can't save
+        its own refresh and a rotated refresh token is lost. A new CLI binds the
+        current file.
+        """
+        if state.sandboxed_credentials is None:
+            return False
+        return _claude_credentials_identity() != state.sandboxed_credentials
 
     async def _evict_terminated_client(self, session_key: str) -> None:
         """Discard a cached client after its CLI child exits."""
@@ -2914,7 +2967,14 @@ class ClaudeSDKExecutor(Executor):
             # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
             # holds the prompt. Rebuild with history for conversational turns, but let
             # /compact operate on the existing client's context.
-            rebuild = state.effort != reasoning_effort
+            credentials_replaced = self._credentials_replaced(state)
+            rebuild = state.effort != reasoning_effort or credentials_replaced
+            if credentials_replaced:
+                logger.info(
+                    "Claude credentials file was replaced since the sandboxed CLI for "
+                    "session %s started; restarting the CLI so it can save refreshed sign-ins.",
+                    session_key,
+                )
             if not rebuild:
                 try:
                     rebuild = not await self._reconnect_signed_in_mcp_servers(state)
