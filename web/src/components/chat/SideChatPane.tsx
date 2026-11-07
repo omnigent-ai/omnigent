@@ -39,6 +39,7 @@ import {
   type ComposerKeyIntent,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { ComposerContextRing, contextUsedPercent } from "@/components/composer/ComposerContextRing";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -502,6 +503,20 @@ export function SideChatPane({
         )}
       </div>
     </ConversationScopeContext.Provider>
+  );
+}
+
+/**
+ * The side chat's own context ring, shown only when its usage differs from the
+ * main chat's ring beside it (a fresh fork shares the parent's context).
+ */
+function SideChatContextRing({ childId }: { childId: string }) {
+  const { contextWindow, tokensUsed } = useConversationEntryState(childId);
+  const mainUsedPercent = useChatStore((s) => contextUsedPercent(s.contextWindow, s.tokensUsed));
+  const usedPercent = contextUsedPercent(contextWindow, tokensUsed);
+  if (usedPercent === null || usedPercent === mainUsedPercent) return null;
+  return (
+    <ComposerContextRing contextWindow={contextWindow} tokensUsed={tokensUsed} className="mx-1" />
   );
 }
 
@@ -1126,6 +1141,7 @@ function SideChatComposer({
           ),
           trailing: (
             <>
+              {!fullSession && !pending && <SideChatContextRing childId={childId} />}
               {!fullSession && settingsSession?.id && (
                 <SideChatSettings
                   key={childId}
