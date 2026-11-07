@@ -750,9 +750,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     path from the session's changes; edits and deletes from a shell are not
     tracked.
 
-    Each session maintains its own event list so changes are naturally isolated
-    between sessions.  Events are not persisted; they are lost on server restart
-    and the Files panel will appear empty after a restart.
+    Per-path changes are isolated between sessions. Events are not persisted;
+    the Files panel will appear empty after a restart.
 
     :param watch_path: The directory to track, e.g. ``Path("/home/user/project")``.
     """
@@ -763,8 +762,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         :param watch_path: The workspace directory to use as root.
         """
         super().__init__(watch_path)
-        # Per-session ordered event lists: session_id → [_FileEvent, ...]
-        self._session_events: dict[str, list[_FileEvent]] = {}
+        # Only the first operation and latest metadata affect a path's change.
+        self._session_changes: dict[str, dict[str, tuple[str, _FileEvent]]] = {}
         self._lock = threading.Lock()
         # Per-path snapshots: normalized path → file content captured just
         # before the first write/edit operation on that path this session.
@@ -791,9 +790,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
     ) -> None:
         """Record a file change made by the agent via a tool call.
 
-        Appends a :class:`_FileEvent` to the session's event list.  The file
-        is stat-ed at record time to capture size and mtime; stat errors are
-        silently suppressed (e.g. for deleted files).
+        Updates the path's latest :class:`_FileEvent`, retaining its first
+        operation. The file is stat-ed at record time to capture size and mtime;
+        stat errors are silently suppressed (e.g. for deleted files).
 
         Ephemeral process artifacts (see :data:`_EPHEMERAL_PATTERNS`) are
         silently ignored.
@@ -836,7 +835,9 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             generations = self._change_generations.setdefault(session_id, {})
             generations[norm] = generations.get(norm, 0) + 1
-            self._session_events.setdefault(session_id, []).append(fe)
+            changes = self._session_changes.setdefault(session_id, {})
+            first_operation = changes[norm][0] if norm in changes else operation
+            changes[norm] = (first_operation, fe)
 
     def revert_generation(self, path: str, *, session_id: str) -> int | None:
         norm = _normalize_path(path, self._cwd)
@@ -856,8 +857,7 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         with self._lock:
             if self._change_generations.get(session_id, {}).get(norm, 0) != generation:
                 return
-            events = self._session_events.get(session_id, [])
-            events[:] = [event for event in events if event.path != norm]
+            self._session_changes.get(session_id, {}).pop(norm, None)
 
     def forget_original(self, path: str, *, session_id: str) -> None:
         norm = _normalize_path(path, self._cwd)
@@ -873,20 +873,18 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         if original is None:
             return None
         with self._lock:
-            first = next(
-                (e.operation for e in self._session_events.get(session_id, []) if e.path == norm),
-                None,
-            )
+            change = self._session_changes.get(session_id, {}).get(norm)
+            first = change[0] if change is not None else None
         return None if first == "created" else original
 
     def unregister_conversation(self, conversation_id: str) -> None:
-        """Drop the event list and evict any snapshot entries for *conversation_id*.
+        """Drop the changes and evict any snapshot entries for *conversation_id*.
 
         :param conversation_id: The conversation to remove,
             e.g. ``"conv_abc123"``.
         """
         with self._lock:
-            self._session_events.pop(conversation_id, None)
+            self._session_changes.pop(conversation_id, None)
             self._change_generations.pop(conversation_id, None)
         with self._snapshots_lock:
             self._session_originals.pop(conversation_id, None)
@@ -909,34 +907,17 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         self, conversation_id: str, *, limit: int, excluded_roots: Collection[str] = ()
     ) -> list[dict[str, Any]]:
         with self._lock:
-            events = list(self._session_events.get(conversation_id, []))
-        # Track the first and last operation seen per path so that
-        # sequences like deleted→created are resolved correctly.
-        first_op: dict[str, str] = {}
-        last_op: dict[str, str] = {}
+            changes = list(self._session_changes.get(conversation_id, {}).values())
         by_path: dict[str, _FileEvent] = {}
-        for e in events:
-            if "" in excluded_roots or e.path.split("/", 1)[0] in excluded_roots:
+        for first_operation, event in changes:
+            if "" in excluded_roots or event.path.split("/", 1)[0] in excluded_roots:
                 continue
-            # Ephemeral artifacts are filtered here as a second line of defence
-            # (events injected without record_change, e.g. in tests). Harness
-            # plumbing is hidden only at read time so the raw event is kept.
-            if _is_ephemeral(e.path) or _is_harness_plumbing(e.path):
+            # Harness plumbing is hidden only at read time.
+            if _is_ephemeral(event.path) or _is_harness_plumbing(event.path):
                 continue
-            # Events are appended chronologically, so the last write wins for
-            # metadata (bytes, modified_at) without any timestamp comparison.
-            if e.path not in first_op:
-                first_op[e.path] = e.operation
-            last_op[e.path] = e.operation
-            by_path[e.path] = e
-        # Stamp each retained event with the correct net operation.
-        # _net_operation returns None for files created and deleted within the
-        # same session; they never existed before and are gone now, so hide them.
-        by_path = {
-            path: dataclasses.replace(event, operation=op)
-            for path, event in by_path.items()
-            if (op := _net_operation(first_op[path], last_op[path])) is not None
-        }
+            operation = _net_operation(first_operation, event.operation)
+            if operation is not None:
+                by_path[event.path] = dataclasses.replace(event, operation=operation)
         records = sorted(
             by_path.values(),
             key=lambda e: (e.modified_at or 0, e.path),
@@ -957,8 +938,8 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
 
         Equivalent to scanning :meth:`list_changed_files` for a specific path
         but avoids the 10 000-record cap and the O(N-files) linear scan in the
-        caller.  The inner loop is O(E) where E is the total number of events
-        for this session — typically much smaller than all changed files.
+        caller. The path lookup takes constant time regardless of the number
+        of earlier edits in this session.
 
         :param session_id: The conversation to query, e.g. ``"conv_abc123"``.
         :param path: Path relative to the workspace root, e.g.
@@ -973,13 +954,11 @@ class AgentEditFilesystemRegistry(FilesystemRegistry):
         if _is_ephemeral(norm) or _is_harness_plumbing(norm):
             return None
         with self._lock:
-            events = [e for e in self._session_events.get(session_id, []) if e.path == norm]
-        if not events:
+            change = self._session_changes.get(session_id, {}).get(norm)
+        if change is None:
             return None
-        first_op = events[0].operation
-        last_op = events[-1].operation
-        last_event = events[-1]
-        op = _net_operation(first_op, last_op)
+        first_operation, last_event = change
+        op = _net_operation(first_operation, last_event.operation)
         if op is None:
             return None
         return {
