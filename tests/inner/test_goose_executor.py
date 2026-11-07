@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner.executor import (
     ExecutorError,
     TextChunk,
@@ -1573,3 +1574,29 @@ def test_create_app_returns_fastapi() -> None:
     from omnigent.inner import goose_harness
 
     assert isinstance(goose_harness.create_app(), FastAPI)
+
+
+@pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.asyncio
+async def test_prompt_includes_input_item_metadata(input_item_id) -> None:
+    """Every ACP prompt names the initiating item or explicitly sends null."""
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._proc = MagicMock(returncode=None)
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    messages = [{"role": "user", "content": "current"}]
+    if input_item_id is not None:
+        messages[-1]["input_item_id"] = input_item_id
+    events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["method"] == "session/prompt"
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}

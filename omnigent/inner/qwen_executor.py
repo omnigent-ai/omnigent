@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Protocol, TypeAlias
 
 from omnigent.inner import _proc
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner._acp_omnigent_mcp import OmnigentAcpMcp
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
@@ -1341,6 +1342,9 @@ class QwenExecutor(Executor):
         # below so we know whether to replay history into this turn.
         fresh_session = not self._system_prompt_sent
 
+        candidate_id = messages[-1].get("input_item_id") if messages else None
+        input_item_id = candidate_id if isinstance(candidate_id, str) else None
+
         # Build the prompt payload from the most recent user message.
         user_text = ""
         image_blocks: list[_AcpJsonObject] = []
@@ -1421,6 +1425,7 @@ class QwenExecutor(Executor):
             "params": {
                 "sessionId": session_id,
                 "prompt": prompt_blocks,
+                "_meta": {_META_INPUT_ITEM_ID: input_item_id},
             },
         }
         await self._send(prompt_request)

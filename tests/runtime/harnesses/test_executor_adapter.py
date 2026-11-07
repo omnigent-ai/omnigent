@@ -1333,6 +1333,24 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+@pytest.mark.parametrize("has_output", [False, True], ids=["tool-call", "tool-call-and-output"])
+def test_translate_input_to_messages_tool_resume_has_no_input_item_id(has_output) -> None:
+    """A tool tail must not reuse the user ID when the agent produced no text."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    history = [
+        {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+        {"type": "function_call", "name": "read", "call_id": "call_1", "arguments": "{}"},
+    ]
+    if has_output:
+        history.append({"type": "function_call_output", "call_id": "call_1", "output": "done"})
+
+    messages = _translate_input_to_messages(history)
+
+    assert messages == [{"role": "user", "content": "old"}]
+    assert "input_item_id" not in messages[-1]
+
+
 def test_translate_input_to_messages_carries_tool_history() -> None:
     """
     Tool items are dropped unless the executor opts in. Opted in, each call appears
