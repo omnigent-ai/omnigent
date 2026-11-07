@@ -1096,13 +1096,37 @@ def _api_reason(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
+# The apiserver authorizer's refusal: ``User "<name>" cannot <verb> resource ...``.
+_AUTHORIZATION_DENIAL_RE = re.compile(r'User "[^"]*" cannot ')
+
+
+def _is_authorization_denial(exc: Exception) -> bool:
+    """
+    Whether a 403 is an RBAC refusal rather than a quota or admission rejection.
+
+    ResourceQuota, Pod Security and webhook denials are also 403 but carry
+    their own message; a 403 with no body cannot be told apart, so it counts.
+
+    :param exc: The raised ``ApiException`` / urllib3 ``HTTPError``.
+    :returns: ``True`` when the error points at missing Role permissions.
+    """
+    if getattr(exc, "status", None) != 403:
+        return False
+    body = getattr(exc, "body", None)
+    if not body:
+        return True
+    return _AUTHORIZATION_DENIAL_RE.search(str(body).replace('\\"', '"')) is not None
+
+
 def _format_api_error(action: str, name: str, exc: k8s_client.ApiException) -> str:
     """
     Build a launcher-contract message for a Kubernetes ``ApiException``.
 
-    Includes the HTTP reason and any response body, and adds an RBAC pointer on
-    403 (the usual cause: the server ServiceAccount lacks the sandbox-manager
-    Role) — the single most common misconfiguration of this provider.
+    Includes the HTTP reason and any response body, and adds an RBAC pointer
+    when the apiserver refused the action for lack of permission (the server
+    ServiceAccount lacks the sandbox-manager Role) — the single most common
+    misconfiguration of this provider. Other 403s, such as an exhausted
+    ResourceQuota, are reported as themselves.
 
     :param action: What was attempted, e.g. ``"create sandbox pod"``.
     :param name: The object the action targeted.
@@ -1114,7 +1138,7 @@ def _format_api_error(action: str, name: str, exc: k8s_client.ApiException) -> s
     body = getattr(exc, "body", None)
     if body:
         message += f" ({body})"
-    if getattr(exc, "status", None) == 403:
+    if _is_authorization_denial(exc):
         message += (
             " — the server ServiceAccount likely lacks the sandbox-manager Role "
             "(jobs, pods, secrets); apply "
@@ -1728,7 +1752,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         except (ApiException, HTTPError) as exc:
             hint = (
                 " (grant `patch` on `secrets` to the server's sandbox Role)"
-                if getattr(exc, "status", None) == 403
+                if _is_authorization_denial(exc)
                 else ""
             )
             _logger.warning(

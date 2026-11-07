@@ -17,15 +17,17 @@ forwarded for graceful shutdown.
 
 The launch token is delivered through a **per-Job Kubernetes Secret** referenced
 by the Pod's `secretKeyRef` — it never enters the Pod spec, a command line, or
-an audit log. The launcher creates that Secret at provision and deletes it
-alongside the Job at terminate.
+an audit log. The launcher creates that Secret at provision, then makes the Job
+(or Sandbox) its owner so Kubernetes deletes it with the workload, including a
+Job that expires on its own. Terminate also deletes it.
 
 Because the host is **never started by `exec`-ing into an already-running
 container**, this provider needs **no `pods/exec` grant** — and avoids the
 exec-into-running-container class of runtime issues entirely. The server SA's
 rights are the minimum the launcher calls: create/get/delete Jobs,
 list/get Pods (to poll the Job's child), get `pods/log` (start-failure
-diagnostics only), create/delete Secrets (the per-Job token), and list events.
+diagnostics only), create/patch/delete Secrets (the per-Job token; `patch`
+sets its owner), and list events.
 
 ## Two-namespace, least-blast-radius design
 
@@ -409,8 +411,13 @@ config inside the runner Pod.
 - **Inspect a stuck launch:** `kubectl describe pod <pod> -n omnigent-sandboxes`
   and `kubectl logs <pod> -n omnigent-sandboxes -c host` (or `-c workspace-prep`
   for the clone step).
-- **403 on launch:** the server SA is missing the Role — re-apply this overlay
-  and confirm the cross-namespace RoleBinding subject namespace is `omnigent`.
+- **403 `User "…" cannot …` on launch:** the server SA is missing the Role —
+  re-apply this overlay and confirm the cross-namespace RoleBinding subject
+  namespace is `omnigent`.
+- **403 `exceeded quota` on launch:** a ResourceQuota in the runner namespace is
+  full. Token Secrets created before the Role granted `patch` on `secrets` have
+  no owner, so Secrets of Jobs that expired on their own stay until you delete
+  them.
 - **Runner Pod stuck in `CreateContainerConfigError`:** the `secret_name` Secret
   (`omnigent-creds`) doesn't exist in the runner namespace — its `envFrom` is
   non-optional, so the Pod can't start. Create it (see [Apply](#apply)).
