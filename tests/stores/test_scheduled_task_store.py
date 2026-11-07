@@ -56,6 +56,7 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        mcp_services=("github", "linear"),
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
@@ -75,6 +76,7 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.mcp_services == ("github", "linear")
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
@@ -870,6 +872,34 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.model_override == "opus"
     assert updated.reasoning_effort == "high"
     assert updated.permission_mode == "acceptEdits"
+
+
+def test_update_mcp_services_replaces_clears_and_keeps(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A tuple replaces the services, ``()`` clears them, and omission keeps them."""
+    store.create(
+        scheduled_task_id=_uid("st_mcp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        mcp_services=("github",),
+    )
+    kept = store.update(_uid("st_mcp"), name="renamed")
+    assert kept is not None
+    assert kept.mcp_services == ("github",)
+    replaced = store.update(_uid("st_mcp"), mcp_services=("slack", "linear"))
+    assert replaced is not None
+    assert replaced.mcp_services == ("slack", "linear")
+    cleared = store.update(_uid("st_mcp"), mcp_services=())
+    assert cleared is not None
+    assert cleared.mcp_services == ()
+    fetched = store.get(_uid("st_mcp"))
+    assert fetched is not None
+    assert fetched.mcp_services == ()
 
 
 def test_update_last_run_conversation_id_can_be_cleared_to_null(

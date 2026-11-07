@@ -87,6 +87,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         assert columns[name]["nullable"] is (name != "created_at")
     assert columns["session_mode"]["nullable"] is False
     assert columns["session_id"]["nullable"] is True
+    assert columns["mcp_services"]["nullable"] is True
     cols = set(columns)
     assert cols == {
         "workspace_id",
@@ -100,6 +101,7 @@ def test_scheduled_tasks_columns(db_engine: Engine) -> None:
         "model_override",
         "reasoning_effort",
         "permission_mode",
+        "mcp_services",
         "max_cost_usd",
         "workspace",
         "base_branch",

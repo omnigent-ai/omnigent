@@ -201,6 +201,29 @@ OAuth connection failures return to the UI as sign-in errors, with the storage-l
 diagnosis in the server log. A refresh response that omits a refresh token or returns
 null keeps the existing refresh token.
 
+## Sessions the server creates
+
+Two kinds of session are created for an owner rather than from the composer,
+and both start with a saved selection:
+
+- **Scheduled tasks** accept `mcp_services` on `POST /v1/scheduled-tasks` and
+  `PATCH /v1/scheduled-tasks/{id}` (and the `sys_scheduled_task_*` tools). The
+  list is checked against the owner's access when it is saved, stored on the
+  task, and stamped as `omnigent.mcp_service.<id>` labels on every session the
+  task creates. `[]` clears it. Changing it makes a continue task's next run
+  start a new session, as other session settings do.
+- **Workers** a session starts through `sys_session_create` inherit that
+  session's selection when the request selects none of its own. If a service
+  is no longer available to the owner, or its name collides with a custom
+  server in the worker's agent, the worker starts without the inherited
+  selection.
+
+A deployment that records selections differently passes its own
+[`SessionMcpSelection`](../omnigent/server/session_mcp_selection.py) with
+`create_app(session_mcp_selection=...)`. It validates a list when an owner saves
+it, turns a list into labels, and reads a list back from labels; the default,
+`RegistryMcpSelection`, uses the registry labels above.
+
 ## Gateway requests and policy context
 
 `POST /v1/mcp/{service_id}` is the per-service JSON-RPC endpoint. Use
@@ -329,6 +352,7 @@ does not implement an on-behalf-of exchange.
 | [`McpPolicyAdapter`](../omnigent/server/mcp_policy_adapter.py) | Resolves trusted session context and applies existing policies around either backend. |
 | [`ConnectionHooks`, `create_connection_router`](../omnigent/server/routes/connections_base.py) | Existing provider protocol and shared OAuth route factory. `McpOAuthHooks` implements the MCP flow. |
 | [`AuthProvider`](../omnigent/server/auth.py) | Existing identity abstraction; inject with `create_app(auth_provider=...)`. |
+| [`SessionMcpSelection`, `RegistryMcpSelection`](../omnigent/server/session_mcp_selection.py) | How scheduled-task fires and workers record their MCP services; inject with `create_app(session_mcp_selection=...)`. |
 | [`CredentialStore`](../omnigent/stores/credential_store/sqlalchemy_store.py) | Existing encrypted grant persistence. The resolver owns refresh/exchange, the store owns persistence. |
 
 ### Execution extension point
