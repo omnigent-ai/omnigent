@@ -159,8 +159,12 @@ export function useSessionReconnect({
   const sandboxWake = useSandboxWakePhase(sessionId);
   const inFlight = useRef<{ progressToast?: string | number } | null>(null);
   // The open session's launch stage, compared against its value at the wake's click.
-  const launch = useChatStore((s) => (s.conversationId === sessionId ? s.sandboxStatus : null));
-  const launchInProgress = launch !== null && !isSandboxLaunchStopped(launch);
+  // `undefined` while the store still holds another session (just after a
+  // switch): this session's stage isn't known then, which isn't "no stage".
+  const launch = useChatStore((s) =>
+    s.conversationId === sessionId ? s.sandboxStatus : undefined,
+  );
+  const launchInProgress = launch != null && !isSandboxLaunchStopped(launch);
   useEffect(() => {
     if (!sessionId) return;
     shownSessions.set(sessionId, (shownSessions.get(sessionId) ?? 0) + 1);
@@ -291,7 +295,7 @@ export function useSessionReconnect({
   // wake; one reported since then does, even if it repeats the old one.
   useEffect(() => {
     const wake = sessionId ? sandboxWakes.get(sessionId) : undefined;
-    if (!sessionId || sandboxWake === null || !wake) return;
+    if (!sessionId || sandboxWake === null || !wake || launch === undefined) return;
     if (launchKey(launch) !== wake.launch) wake.stageChanged = true;
     if (wake.stageChanged && isSandboxLaunchStopped(launch)) endSandboxWake(sessionId, wake);
   }, [sandboxWake, launch, sessionId]);

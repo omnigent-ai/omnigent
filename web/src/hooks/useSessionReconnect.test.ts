@@ -808,6 +808,37 @@ describe("useSessionReconnect", () => {
   const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
   const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
 
+  it.each([approve, timedOut])(
+    "keeps a pending wake started on a $stage stage when its session is shown again",
+    async (stopped) => {
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      useChatStore.setState({ conversationId: "session", sandboxStatus: stopped });
+      const { result, rerender } = renderHook(useSessionReconnect, {
+        initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
+      });
+      await act(async () => {
+        void result.current.reconnect();
+      });
+      useChatStore.setState({ conversationId: "other-session", sandboxStatus: null });
+      rerender({
+        ...asleepSandbox,
+        sessionId: "other-session",
+        hostId: "other-host",
+        hostOnline: false,
+      });
+      // Back on the session while the store still holds the other one...
+      rerender({ ...asleepSandbox, hostOnline: false });
+      // ...then it catches up with the same stopped stage.
+      act(() => useChatStore.setState({ conversationId: "session", sandboxStatus: stopped }));
+      expect(result.current.sandboxStarting).toBe(true);
+      await act(async () => {
+        void startSandboxWake("session");
+      });
+      expect(retrySession).toHaveBeenCalledOnce();
+    },
+  );
+
   it.each([
     ["a user action", timedOut, [approve]],
     ["the same failure again", timedOut, [{ stage: "provisioning" }, timedOut]],
