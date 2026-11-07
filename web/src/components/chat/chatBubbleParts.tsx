@@ -19,7 +19,6 @@ import {
   CheckIcon,
   CopyIcon,
   FileTextIcon,
-  FolderIcon,
   Link2Icon,
   Loader2Icon,
   SplitIcon,
@@ -60,13 +59,8 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
-import {
-  extractSessionMentions,
-  mentionItemPath,
-  stripSessionMentionMarkers,
-  type MentionItem,
-} from "@/lib/composerMentions";
-import { SessionMentionChip } from "@/components/composer/ComposerMentionChips";
+import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
+import { mentionPillMarkdown } from "@/lib/mentionPills";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -108,11 +102,6 @@ import {
   type TranscriptScrollbarDragDetail,
 } from "@/pages/TranscriptScrollbar";
 
-// Matches both wordings the native executors emit: "[Attached: <path>]"
-// (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
-// is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
-
 const COLLAPSE_THRESHOLD = 12000;
 
 // Slice a string by threshold and remove corrupted symbols
@@ -124,10 +113,17 @@ function sliceByCodePoint(str: string, limit: number): string {
 // value and UserBubble reads it, so the gate lives in one place.
 export const SessionSharedContext = createContext(false);
 
+/** A user message's text for reading and copying: mention markers become ``@name``. */
 export function extractUserText(content: MessageContentBlock[]): string {
-  return stripSessionMentionMarkers(stripAutomationContext(joinTextBlocks(content)))
-    .replace(ATTACHED_RE, "")
-    .trimEnd();
+  return readableSentText(stripAutomationContext(joinTextBlocks(content))).trimEnd();
+}
+
+/** A user message's text for rendering: mention markers become inline pills. */
+function userMarkdownText(content: MessageContentBlock[]): string {
+  return replaceSentMentions(
+    stripAutomationContext(joinTextBlocks(content)),
+    mentionPillMarkdown,
+  ).trimEnd();
 }
 
 function joinTextBlocks(content: MessageContentBlock[]): string {
@@ -135,48 +131,6 @@ function joinTextBlocks(content: MessageContentBlock[]): string {
     .filter(isTextBlock)
     .map((c) => c.text)
     .join("");
-}
-
-// An absolute filesystem path in any form a native executor might materialize
-// an upload to: POSIX ("/…"), Windows drive ("C:\…" or "C:/…"), or UNC
-// ("\\host\share"). Workspace "@"-mention paths are always relative, so this
-// reliably tells a materialized upload apart from a tagged workspace file
-// regardless of the host OS the runner happens to be on.
-function isAbsolutePath(p: string): boolean {
-  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(p);
-}
-
-/**
- * Pull the paths out of the "[Attached: …]" markers an "@"-mention adds to a
- * user message, so the bubble can show what was attached (the marker text
- * itself is stripped from the rendered text by {@link extractUserText}). A
- * trailing "/" marks a folder. Returns [] for ordinary messages.
- */
-function extractAttachedPaths(content: MessageContentBlock[]): MentionItem[] {
-  const text = content
-    .filter(isTextBlock)
-    .map((c) => c.text)
-    .join("");
-  const out: MentionItem[] = [];
-  for (const m of text.matchAll(ATTACHED_RE)) {
-    const raw = m[1].trim();
-    if (!raw) continue;
-    // Absolute path → a materialized upload, already shown via its file block.
-    if (isAbsolutePath(raw)) continue;
-    // Split a trailing ":start-end" line span back out so the chip can show
-    // it without truncation (it's the whole point of a partial-file attach).
-    const range = /^(.*):(\d+)-(\d+)$/.exec(raw);
-    if (range) {
-      out.push({
-        path: range[1],
-        isDir: false,
-        lineRange: { start: Number(range[2]), end: Number(range[3]) },
-      });
-    } else {
-      out.push({ path: raw.replace(/\/$/, ""), isDir: raw.endsWith("/") });
-    }
-  }
-  return out;
 }
 
 /** Joins all `kind: "text"` items into a single markdown string for copying. */
@@ -963,13 +917,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const fileChips = bubble.content.filter(
     (c): c is Extract<MessageContentBlock, { type: "input_file" }> => c.type === "input_file",
   );
-  // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
-  // markers (no input_file block), so surface them as chips.
-  const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
-  // "@"-tagged sessions ride in as "[Session: …]" markers; show them as chips.
-  const mentionedSessions = isShellCommand
-    ? []
-    : extractSessionMentions(joinTextBlocks(bubble.content));
+  // "@"-tagged files and sessions ride in as text markers; render them as
+  // inline pills where they sit in the sentence.
+  const renderedText = isShellCommand ? text : userMarkdownText(bubble.content);
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -982,17 +932,14 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   );
   // Collapse long prompts by default to avoid expensive Markdown parsing and
   // a large DOM for text the user hasn't asked to read yet.
-  const isLong = text.length > COLLAPSE_THRESHOLD;
+  const isLong = renderedText.length > COLLAPSE_THRESHOLD;
   const [isCollapsed, setIsCollapsed] = useState(isLong);
-  const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
+  const visibleText = isCollapsed
+    ? sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD)
+    : renderedText;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
-  if (
-    images.length === 0 &&
-    fileChips.length === 0 &&
-    mentionedChips.length === 0 &&
-    mentionedSessions.length === 0
-  ) {
+  if (images.length === 0 && fileChips.length === 0) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
@@ -1081,10 +1028,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 })}
               </div>
             )}
-            {(text ||
-              fileChips.length > 0 ||
-              mentionedChips.length > 0 ||
-              mentionedSessions.length > 0) && (
+            {(text || fileChips.length > 0) && (
               <MessageContent
                 data-testid="user-message-content"
                 className={flashing ? "animate-message-highlight" : undefined}
@@ -1106,39 +1050,6 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         />
                       ),
                     )}
-                  </div>
-                )}
-                {mentionedSessions.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {mentionedSessions.map((session) => (
-                      <SessionMentionChip key={`session:${session.id}`} session={session} />
-                    ))}
-                  </div>
-                )}
-                {/* "@"-mentioned workspace files/folders (delivered as text markers) */}
-                {mentionedChips.length > 0 && (
-                  <div className="flex flex-wrap gap-1.5">
-                    {mentionedChips.map((item) => (
-                      <span
-                        key={mentionItemPath(item)}
-                        className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
-                      >
-                        {item.isDir ? (
-                          <FolderIcon className="size-3 shrink-0" />
-                        ) : (
-                          <FileTextIcon className="size-3 shrink-0" />
-                        )}
-                        <span className="max-w-[180px] truncate" title={mentionItemPath(item)}>
-                          @{item.path}
-                          {item.isDir ? "/" : ""}
-                        </span>
-                        {item.lineRange && (
-                          <span className="shrink-0">
-                            :{item.lineRange.start}-{item.lineRange.end}
-                          </span>
-                        )}
-                      </span>
-                    ))}
                   </div>
                 )}
                 {/* Render user text as markdown, matching the assistant bubble.

@@ -1,4 +1,4 @@
-import { buildMentionPreamble } from "@/lib/composerMentions";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   clearOptimisticTitles,
@@ -29,11 +29,11 @@ describe("synthesizeOptimisticTitle", () => {
     );
   });
 
-  it("drops tagged-session lines so markers never become the title", () => {
-    const preamble = buildMentionPreamble([], null, [
-      { id: "s_1", title: "Fix CI", isSubagent: false },
-    ]);
-    expect(synthesizeOptimisticTitle(`${preamble}compare these`)).toBe("compare these");
+  it("reads inline mention markers as @names and drops the session hint", () => {
+    const sent =
+      'compare [Session: "Fix CI" id=s_1 subagent=no] with [Attached: src/a.ts]' +
+      `\n\n${SESSION_MENTION_HINT}`;
+    expect(synthesizeOptimisticTitle(sent)).toBe("compare @Fix CI with @src/a.ts");
   });
 
   it("returns null when no usable text remains", () => {

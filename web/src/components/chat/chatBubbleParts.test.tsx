@@ -3,7 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
-import { buildMentionPreamble } from "@/lib/composerMentions";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -222,26 +222,35 @@ describe("message navigation highlight", () => {
   });
 });
 
-describe("UserBubble session mentions", () => {
-  it("shows tagged sessions as chips and hides the markers", () => {
-    const preamble = buildMentionPreamble([], null, [
-      { id: "s_child", title: "auth", isSubagent: true },
-      { id: "s_alpha", title: "Alpha planning", isSubagent: false },
-    ]);
+describe("UserBubble inline mentions", () => {
+  it("renders tagged sessions and files as pills in the sentence", () => {
+    const text =
+      'Ask [Session: "auth" id=s_child subagent=yes] to compare [Attached: src/a.ts] ' +
+      `with [Session: "Alpha *planning*" id=s_alpha subagent=no].\n\n${SESSION_MENTION_HINT}`;
     render(
-      <BubbleView
-        bubble={{
-          kind: "user",
-          itemId: "user_sessions",
-          content: [{ type: "input_text", text: `${preamble}summarize both` }],
-        }}
-        isLastAssistant={false}
-      />,
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_mentions",
+            content: [{ type: "input_text", text }],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
     );
 
-    const chips = screen.getAllByTestId("session-mention-chip").map((chip) => chip.textContent);
-    expect(chips).toEqual(["@auth", "@Alpha planning"]);
-    expect(screen.getByText("summarize both")).toBeInTheDocument();
+    const pills = screen.getAllByTestId("mention-pill");
+    expect(pills.map((pill) => pill.textContent)).toEqual([
+      "@auth",
+      "@src/a.ts",
+      "@Alpha *planning*",
+    ]);
+    // Session pills open the tagged session; the pill sits inside the paragraph.
+    expect(pills[0]).toHaveAttribute("href", "/c/s_child");
+    expect(pills[0].closest("p")?.textContent).toBe(
+      "Ask @auth to compare @src/a.ts with @Alpha *planning*.",
+    );
     expect(screen.queryByText(/Tagged sessions/)).not.toBeInTheDocument();
   });
 });
@@ -251,14 +260,16 @@ describe("UserBubble literal text", () => {
     "keeps indented bullets as siblings after stripping %j",
     (preamble) => {
       render(
-        <BubbleView
-          bubble={{
-            kind: "user",
-            itemId: "user_list",
-            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
-          }}
-          isLastAssistant={false}
-        />,
+        <QueryClientProvider client={new QueryClient()}>
+          <BubbleView
+            bubble={{
+              kind: "user",
+              itemId: "user_list",
+              content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+            }}
+            isLastAssistant={false}
+          />
+        </QueryClientProvider>,
       );
 
       expect(screen.getAllByRole("list")).toHaveLength(1);

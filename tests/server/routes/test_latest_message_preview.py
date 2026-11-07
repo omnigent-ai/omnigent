@@ -19,20 +19,19 @@ def _message(role: str, block_type: str, text: str) -> ConversationItem:
     )
 
 
-def test_preview_drops_tagged_session_lines_from_user_text() -> None:
+def test_preview_reads_inline_mentions_as_names() -> None:
     text = (
-        '[Session: "Fix CI" id=s_1 subagent=no]\n'
-        "[Tagged sessions: read with sys_session_get_history]\n\n"
-        "compare with that run"
+        'compare [Session: "Fix CI" id=s_1 subagent=no] with that run\n\n'
+        "[Tagged sessions: read with sys_session_get_history]"
     )
     assert _latest_message_preview([_message("user", "input_text", text)]) == (
-        "compare with that run"
+        "compare @Fix CI with that run"
     )
 
 
-def test_preview_skips_a_message_that_is_only_tagged_sessions() -> None:
+def test_preview_skips_a_message_that_is_only_the_session_hint() -> None:
     items = [
-        _message("user", "input_text", '[Session: "Fix CI" id=s_1 subagent=no]'),
+        _message("user", "input_text", "[Tagged sessions: read with sys_session_get_history]"),
         _message("assistant", "output_text", "done"),
     ]
     assert _latest_message_preview(items) == "done"

@@ -30,24 +30,35 @@ _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
 
-# Lines the web composer prepends for "@"-tagged sessions: one marker per
-# session plus a tool hint. Keep in sync with sessionMentionMarker and
-# SESSION_MENTION_HINT in web/src/lib/composerMentions.ts.
-_SESSION_MENTION_LINE_RE = re.compile(
-    r'^(?:\[Session: ".*" id=\S+ subagent=(?:yes|no)\]|\[Tagged sessions:[^\]]*\])$'
+# Markers the web composer puts inline for "@"-tagged sessions and files, plus
+# the one tool hint a tagged session adds. Keep in sync with
+# sessionMentionMarker, SESSION_MENTION_HINT and readableSentText in
+# web/src/lib/composerMentions.ts.
+_SESSION_MENTION_HINT_RE = re.compile(r"\[Tagged sessions:[^\]]*\]")
+_SESSION_MENTION_MARKER_RE = re.compile(
+    r'\[Session: "([^"\]]*)" id=[A-Za-z0-9_:-]+ subagent=(?:yes|no)\]'
 )
+_INLINE_ATTACHED_RE = re.compile(r"\[Attached(?: file)?:\s*([^\]]*)\]")
+_ABSOLUTE_PATH_RE = re.compile(r"^(?:/|[A-Za-z]:[\\/]|\\\\)")
 
 
-def strip_session_mention_lines(text: str) -> str:
+def _readable_attached(match: re.Match[str]) -> str:
+    path = match.group(1).strip()
+    # Absolute paths are materialized uploads, already shown as file blocks.
+    return "" if not path or _ABSOLUTE_PATH_RE.match(path) else f"@{path}"
+
+
+def humanize_mention_markers(text: str) -> str:
     """
-    Drop the composer's tagged-session marker and hint lines from ``text``.
+    Rewrite composer mention markers in ``text`` as ``@name``, dropping the hint.
 
-    :param text: Message text, e.g. ``'[Session: "Fix CI" id=s1 subagent=no]\\nhi'``.
-    :returns: The remaining lines, e.g. ``"hi"``.
+    :param text: Message text, e.g.
+        ``'Ask [Session: "Fix CI" id=s1 subagent=no] about [Attached: a.py]'``.
+    :returns: Readable text, e.g. ``"Ask @Fix CI about @a.py"``.
     """
-    return "\n".join(
-        line for line in text.splitlines() if not _SESSION_MENTION_LINE_RE.match(line.strip())
-    )
+    text = _SESSION_MENTION_HINT_RE.sub("", text)
+    text = _SESSION_MENTION_MARKER_RE.sub(lambda match: f"@{match.group(1)}", text)
+    return _INLINE_ATTACHED_RE.sub(_readable_attached, text)
 
 
 # Generated titles stay compact by default, while explicit user formats and
@@ -411,9 +422,9 @@ def synthesize_conversation_title(
 
     Non-text blocks (``input_image``, ``input_file``) are skipped, and
     lines matching the native executors' attachment path markers
-    (:data:`_ATTACHMENT_MARKER_RE`) and the composer's tagged-session lines
-    (:data:`_SESSION_MENTION_LINE_RE`) are dropped so neither leaks into
-    the title.
+    (:data:`_ATTACHMENT_MARKER_RE`) are dropped so temp-file paths never
+    leak into the title, and inline composer mention markers read as
+    ``@name`` (:func:`humanize_mention_markers`).
 
     :param content: Message content blocks, e.g.
         ``[{"type": "input_text", "text": "Hello"}]``.
@@ -427,8 +438,8 @@ def synthesize_conversation_title(
             text = block.get("text")
             if isinstance(text, str):
                 kept_lines = [
-                    line
-                    for line in strip_session_mention_lines(text).splitlines()
+                    humanize_mention_markers(line)
+                    for line in text.splitlines()
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
                 ]
                 parts.append("\n".join(kept_lines))

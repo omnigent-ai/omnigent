@@ -177,6 +177,16 @@ function type(text: string) {
   fireEvent.change(textarea(), { target: { value: text, selectionStart: text.length } });
 }
 
+/** Append `text` to the draft with the caret at the end. */
+function append(text: string) {
+  type(textarea().value + text);
+}
+
+/** Tokens the composer mirror currently paints as pills. */
+function tokens() {
+  return screen.queryAllByTestId("composer-mention-token").map((token) => token.textContent);
+}
+
 function renderWithTooltips(ui: ReactElement) {
   return render(<TooltipProvider>{ui}</TooltipProvider>);
 }
@@ -303,7 +313,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
 
     fireEvent.keyDown(textarea(), { key: "Tab", shiftKey: true });
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(textarea().value).toBe("@src/ ");
     expect(setMode).not.toHaveBeenCalled();
 
     // Attaching a folder closes the menu, so the next press cycles the mode.
@@ -322,14 +332,16 @@ describe("Composer @-file-mention browser (native sessions)", () => {
 
     // Now inside src: nested files appear.
     fireEvent.click(screen.getByTitle("Attach server.ts"));
-    expect(screen.getByText("@src/server.ts")).toBeInTheDocument();
+    // The token lands in the sentence and the mirror paints it as a pill.
+    expect(textarea().value).toBe("@src/server.ts ");
+    expect(tokens()).toEqual(["@src/server.ts"]);
 
-    type("explain this");
+    append("explain this");
     fireEvent.submit(textarea().closest("form")!);
 
-    // The WHY: the agent reads the on-disk nested file from this exact marker.
-    // No File is uploaded (second arg undefined).
-    expect(onSend).toHaveBeenCalledWith("[Attached: src/server.ts]\n\nexplain this", undefined);
+    // The WHY: the agent reads the on-disk nested file from this exact marker,
+    // in place in the sentence. No File is uploaded (second arg undefined).
+    expect(onSend).toHaveBeenCalledWith("[Attached: src/server.ts] explain this", undefined);
   });
 
   it("attaches a whole folder as a single trailing-slash marker", () => {
@@ -338,33 +350,33 @@ describe("Composer @-file-mention browser (native sessions)", () => {
 
     type("@src");
     fireEvent.click(screen.getByLabelText("Attach whole folder src"));
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@src/"]);
 
-    type("review the module");
+    append("review the module");
     fireEvent.submit(textarea().closest("form")!);
 
     // A folder is delivered with a trailing "/" so the agent opens the dir.
-    expect(onSend).toHaveBeenCalledWith("[Attached: src/]\n\nreview the module", undefined);
+    expect(onSend).toHaveBeenCalledWith("[Attached: src/] review the module", undefined);
   });
 
   it.each([
-    ["claude-native", "[Attached: src/server.ts]\n\ngo"],
-    ["pi-native", "[Attached: src/server.ts]\n\ngo"],
-    ["cursor-native", "[Attached: src/server.ts]\n\ngo"],
-    ["codex-native", "[Attached file: src/server.ts]\n\ngo"],
+    ["claude-native", "check [Attached: src/server.ts] now"],
+    ["pi-native", "check [Attached: src/server.ts] now"],
+    ["cursor-native", "check [Attached: src/server.ts] now"],
+    ["codex-native", "check [Attached file: src/server.ts] now"],
   ])("delivers the harness-correct marker on %s", (harness, expected) => {
     useChatStore.setState({ sessionHarness: harness });
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
-    type("@src");
+    type("check @src");
     fireEvent.click(screen.getByTitle("Open src"));
     fireEvent.click(screen.getByTitle("Attach server.ts"));
-    type("go");
+    append("now");
     fireEvent.submit(textarea().closest("form")!);
     expect(onSend).toHaveBeenCalledWith(expected, undefined);
   });
 
-  it("drains a file-viewer 'Attach to agent' line range into a chip and marker", () => {
+  it("drains a file-viewer 'Attach to agent' line range into an inline token and marker", () => {
     const onSend = vi.fn();
     // Simulate the file viewer's button having queued a line span.
     useChatStore.setState({
@@ -374,20 +386,18 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     });
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
 
-    // The composer drained the queue into a chip showing the path + lines
-    // (the line span renders in its own node so it never truncates away)...
-    expect(screen.getByText("@bob-max-gain/docker-compose.yml")).toBeInTheDocument();
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
+    // The composer drained the queue into a token with the path + lines...
+    expect(tokens()).toEqual(["@bob-max-gain/docker-compose.yml:2-9"]);
     // ...and the store queue was cleared so it can't double-apply.
     expect(useChatStore.getState().pendingComposerAttachments).toEqual([]);
 
-    type("explain this service");
+    append("explain this service");
     fireEvent.submit(textarea().closest("form")!);
 
     // Delivered as "path:start-end" inside the marker so the agent reads
     // exactly those lines.
     expect(onSend).toHaveBeenCalledWith(
-      "[Attached: bob-max-gain/docker-compose.yml:2-9]\n\nexplain this service",
+      "[Attached: bob-max-gain/docker-compose.yml:2-9] explain this service",
       undefined,
     );
   });
@@ -421,7 +431,7 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // Row 0 (src, folders-first) is preselected; move to row 1 (readme.md).
     fireEvent.keyDown(ta, { key: "ArrowDown" });
     fireEvent.keyDown(ta, { key: "Enter" });
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@readme.md"]);
   });
 
   it("ArrowUp from the top row wraps to the last row", () => {
@@ -430,28 +440,27 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     // From row 0, ArrowUp wraps to the last row (readme.md), not -1.
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@readme.md"]);
   });
 
   it("Enter on a directory row drills in rather than attaching", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
     // Row 0 is the "src" folder: Enter must open it (reveal nested files), and
-    // must NOT produce a chip — drilling is navigation, not attachment. (The
-    // token becomes "@src/" in the textarea; a chip would instead surface a
-    // "Remove src" button, which must be absent.)
+    // must NOT tag it — drilling is navigation, not attachment, so the typed
+    // "@src/" stays plain text with no pill.
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
-    expect(screen.queryByLabelText("Remove src")).not.toBeInTheDocument();
+    expect(tokens()).toEqual([]);
   });
 
   it("Tab attaches the highlighted folder as a whole-directory unit", () => {
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
-    // Tab on the "src" folder attaches it as a unit (trailing-slash chip),
+    // Tab on the "src" folder attaches it as a unit (trailing-slash token),
     // distinct from Enter's drill-in.
     fireEvent.keyDown(textarea(), { key: "Tab" });
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@src/"]);
   });
 
   it("Escape closes the mention menu", () => {
@@ -462,28 +471,42 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
   });
 
-  // ── Chip lifecycle + dedup (M8, M2) ──────────────────────────────────────
+  // ── Token lifecycle + dedup (M8, M2) ─────────────────────────────────────
 
-  it("removes a tagged chip when its ✕ is clicked", () => {
-    renderWithTooltips(<Composer {...composerProps()} />);
-    type("@");
+  it("Backspace at a token's end deletes the whole token and untags it", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("see @");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
-    expect(screen.getByText("@readme.md")).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("Remove readme.md"));
-    expect(screen.queryByText("@readme.md")).not.toBeInTheDocument();
+    // Caret just after the token (before the auto-inserted space).
+    type("see @readme.md");
+    fireEvent.keyDown(textarea(), { key: "Backspace" });
+    expect(textarea().value).toBe("see ");
+    expect(tokens()).toEqual([]);
+    append("it");
+    fireEvent.submit(textarea().closest("form")!);
+    // Deleting the token untags the file, so no marker is sent.
+    expect(onSend).toHaveBeenCalledWith("see it", undefined);
   });
 
-  it("dedups re-attaching the same file via '@' to a single chip", () => {
-    renderWithTooltips(<Composer {...composerProps()} />);
+  it("dedups re-attaching the same file via '@' to one tag", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
     type("@");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
-    type("@");
+    append("and @");
     fireEvent.click(screen.getByTitle("Attach readme.md"));
-    // Same path + dir-ness + (no) range → same identity key → one chip.
-    expect(screen.getAllByText("@readme.md")).toHaveLength(1);
+    // Same path + dir-ness + (no) range → same identity key → one tag, and
+    // each occurrence of its token becomes the marker.
+    expect(tokens()).toEqual(["@readme.md", "@readme.md"]);
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith(
+      "[Attached: readme.md] and [Attached: readme.md]",
+      undefined,
+    );
   });
 
-  it("keeps two distinct line ranges of the same file as separate chips", () => {
+  it("keeps two distinct line ranges of the same file as separate tokens", () => {
     // WHY (M2): the dedup key is path + dir-ness + line range, NOT path alone.
     // A path-only key would silently drop the second range — but two ranges of
     // one file are genuinely distinct attachments the agent should receive.
@@ -494,12 +517,10 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       ],
     });
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(screen.getAllByText("@a.ts")).toHaveLength(2);
-    expect(screen.getByText(":2-9")).toBeInTheDocument();
-    expect(screen.getByText(":20-30")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@a.ts:2-9", "@a.ts:20-30"]);
   });
 
-  it("collapses identical queued attachments to one chip on drain", () => {
+  it("collapses identical queued attachments to one token on drain", () => {
     // The store dedups on insert, but the drain must also dedup within a batch
     // (and against already-tagged chips) so a duplicated queue can't double up.
     useChatStore.setState({
@@ -509,14 +530,14 @@ describe("Composer @-file-mention browser (native sessions)", () => {
       ],
     });
     renderWithTooltips(<Composer {...composerProps()} />);
-    expect(screen.getAllByText(":2-9")).toHaveLength(1);
+    expect(textarea().value).toBe("@a.ts:2-9 ");
   });
 
   // ── Dismissal + loading feedback (M3, M1, M6) ─────────────────────────────
 
   it("dismisses the menu when the textarea loses focus", () => {
     // WHY (M3): the menu's visibility derives from the caret on change; without
-    // a blur dismiss it lingers when the user clicks a chip ✕ or another field.
+    // a blur dismiss it lingers when the user clicks another field.
     renderWithTooltips(<Composer {...composerProps()} />);
     type("@");
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
@@ -603,21 +624,20 @@ describe("Composer @-session mentions", () => {
     expect(sessions.searchedQueries).toEqual([]);
   });
 
-  it("delivers tagged sessions as markers plus the tool hint", () => {
+  it("delivers tagged sessions as inline markers plus one tool hint", () => {
     const onSend = vi.fn();
     renderWithTooltips(<Composer {...composerProps({ onSend })} />);
-    type("@");
+    type("Ask @");
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    type("@alpha");
+    append("to compare with @alpha");
     fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
-    expect(screen.getAllByTestId("session-mention-chip")).toHaveLength(2);
+    expect(textarea().value).toBe("Ask @auth to compare with @Alpha planning ");
+    expect(tokens()).toEqual(["@auth", "@Alpha planning"]);
 
-    type("summarize both");
     fireEvent.submit(textarea().closest("form")!);
     expect(onSend).toHaveBeenCalledWith(
-      '[Session: "auth" id=s_child subagent=yes]\n' +
-        '[Session: "Alpha planning" id=s_alpha subagent=no]\n' +
-        `${SESSION_MENTION_HINT}\n\nsummarize both`,
+      'Ask [Session: "auth" id=s_child subagent=yes] to compare with ' +
+        `[Session: "Alpha planning" id=s_alpha subagent=no]\n\n${SESSION_MENTION_HINT}`,
       undefined,
     );
   });
@@ -640,7 +660,7 @@ describe("Composer @-session mentions", () => {
     for (let i = 0; i < 3; i++) fireEvent.keyDown(textarea(), { key: "ArrowDown" });
     expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
     fireEvent.keyDown(textarea(), { key: "Tab" });
-    expect(screen.getByText("@src/")).toBeInTheDocument();
+    expect(tokens()).toEqual(["@src/"]);
   });
 
   it("matches no session for a path-shaped token", () => {

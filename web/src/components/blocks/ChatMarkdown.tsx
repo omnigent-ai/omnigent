@@ -12,7 +12,14 @@
 
 import type React from "react";
 import { useMemo } from "react";
-import { CopyIcon, GitPullRequestIcon } from "lucide-react";
+import {
+  BotIcon,
+  CopyIcon,
+  FileTextIcon,
+  FolderIcon,
+  GitPullRequestIcon,
+  MessageSquareIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
@@ -38,6 +45,7 @@ import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
+import { parseMentionPillTitle } from "@/lib/mentionPills";
 import {
   useFileViewer,
   useFileViewerConversationId,
@@ -515,10 +523,68 @@ function ZoomableMarkdownImage({
 
 // Stable module-level override map so MessageResponse's shallow prop compare
 // never sees a new `components` identity and re-parses needlessly.
+const MENTION_PILL_CLASS =
+  "inline-flex max-w-full items-center gap-1 rounded-md border border-border bg-background/60 px-1.5 align-baseline text-[0.95em] leading-snug text-foreground no-underline hover:bg-accent";
+
+/** A tagged file in a sent message; opens it like a workspace file link. */
+function FileMentionPill({
+  path,
+  isDir,
+  children,
+}: {
+  path: string;
+  isDir: boolean;
+  children: React.ReactNode;
+}) {
+  const { open } = useWorkspaceFileOpener(path, true);
+  const Icon = isDir ? FolderIcon : FileTextIcon;
+  return (
+    <button
+      type="button"
+      data-testid="mention-pill"
+      className={MENTION_PILL_CLASS}
+      title={path}
+      onClick={(event) => {
+        event.stopPropagation();
+        open?.();
+      }}
+    >
+      <Icon className="size-3 shrink-0 text-muted-foreground" />
+      <span className="truncate">{children}</span>
+    </button>
+  );
+}
+
+/** Links rendered as mention pills when their title carries the mention sentinel. */
+function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
+  const target = parseMentionPillTitle(props.title);
+  if (!target) return <WorkspaceFileLink {...props} />;
+  if (target.kind === "file") {
+    return (
+      <FileMentionPill path={target.path} isDir={target.isDir}>
+        {props.children}
+      </FileMentionPill>
+    );
+  }
+  const Icon = target.isSubagent ? BotIcon : MessageSquareIcon;
+  return (
+    <a
+      data-testid="mention-pill"
+      href={withBasePath(`/c/${encodeURIComponent(target.id)}`)}
+      className={MENTION_PILL_CLASS}
+      title={target.isSubagent ? "Subagent" : "Session"}
+      onClick={(event) => event.stopPropagation()}
+    >
+      <Icon className="size-3 shrink-0 text-muted-foreground" />
+      <span className="truncate">{props.children}</span>
+    </a>
+  );
+}
+
 const FILE_PATH_AWARE_COMPONENTS = {
   inlineCode: WorkspacePathInlineCode,
   img: ZoomableMarkdownImage,
-  a: WorkspaceFileLink,
+  a: MarkdownLink,
 };
 
 // How often the live (growing) assistant bubble re-parses its markdown. The

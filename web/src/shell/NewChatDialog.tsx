@@ -57,7 +57,12 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  ComposerMirror,
+  MIRRORED_TEXTAREA_CLASS,
+  renderMentionTokens,
+  useComposerMirrorAlignment,
+} from "@/components/composer/MentionTokenOverlay";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -377,7 +382,11 @@ import {
   useSessionMentionEntries,
 } from "@/hooks/useSessionMentionEntries";
 import {
-  buildMentionPreamble,
+  composerInlineMentions,
+  expandMentionTokens,
+  findMentionTokens,
+  presentMentions,
+  withSessionMentionHint,
   detectMentionAt,
   type MentionState,
   parseMentionToken,
@@ -5243,6 +5252,7 @@ function NewChatLandingContent({
     currentSessionId: null,
   });
   const mentionOpen = mentionEntries.length > 0 || sessionEntries.length > 0;
+  const mirrorRef = useRef<HTMLDivElement>(null);
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5258,10 +5268,10 @@ function NewChatLandingContent({
     mentionedItems,
     attachMention,
     openMentionDir,
-    removeMentionedItem,
     mentionedSessions,
     attachSession,
-    removeMentionedSession,
+    mentionTokens,
+    handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
@@ -5273,6 +5283,8 @@ function NewChatLandingContent({
     setText: setMessage,
     textareaRef,
   });
+  const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
+  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -6001,9 +6013,14 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const initialPrompt =
-        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null, mentionedSessions) +
-        sanitizeInitialPrompt(message);
+      const liveMentions = presentMentions(
+        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        [message],
+      );
+      const initialPrompt = withSessionMentionHint(
+        expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
+        liveMentions.some((m) => m.marker.startsWith("[Session: ")),
+      );
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
       // selects which CLI bridge the runner launches — the values are the
@@ -7103,6 +7120,10 @@ function NewChatLandingContent({
               input={{
                 ref: textareaRef,
                 value: message,
+                className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
+                onScroll: (e) => {
+                  if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
+                },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
                   slashCompletion.onSelectionChange(e.target);
@@ -7136,6 +7157,7 @@ function NewChatLandingContent({
                   // mutually exclusive with the slash menu (a token can't be both)
                   // and takes priority over submission.
                   if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
+                  if (handleTokenBackspace(e)) return;
 
                   // Slash-completion menu keys (shared useSlashCompletion) —
                   // navigate, complete, or dismiss; takes priority over
@@ -7158,6 +7180,11 @@ function NewChatLandingContent({
                 "data-testid": "new-chat-landing-input",
               }}
               slots={{
+                inputBackdrop: mentionTokensShown && (
+                  <ComposerMirror ref={mirrorRef}>
+                    {renderMentionTokens(message, mentionTokens)}
+                  </ComposerMirror>
+                ),
                 beforeInput: (
                   <>
                     {/* Skill suggestions — floats above the composer box. */}
@@ -7222,15 +7249,6 @@ function NewChatLandingContent({
                           e.target.value = "";
                         }
                       }}
-                    />
-                    {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-                delivered as an "[Attached: <path>]" marker prepended to the
-                first message at create time. */}
-                    <ComposerMentionChips
-                      items={mentionedItems}
-                      onRemove={removeMentionedItem}
-                      sessions={mentionedSessions}
-                      onRemoveSession={removeMentionedSession}
                     />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />

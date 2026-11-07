@@ -7,10 +7,12 @@
 
 import { useSyncExternalStore } from "react";
 
-// Keep in sync with _ATTACHMENT_MARKER_RE in omnigent/entities/conversation.py
-// and the preamble buildMentionPreamble emits in composerMentions.ts.
+import { readableSentText } from "@/lib/composerMentions";
+
+// Keep in sync with _ATTACHMENT_MARKER_RE in omnigent/entities/conversation.py:
+// whole-line upload markers are dropped; inline composer mentions read as @name.
 const ATTACHMENT_MARKER_RE =
-  /^(?:\[Attached(?: file)?: .+\]|\[Attachment [^\]]+ could not be loaded\]|\[Session: ".*" id=\S+ subagent=(?:yes|no)\]|\[Tagged sessions:[^\]]*\])$/;
+  /^(?:\[Attached(?: file)?: .+\]|\[Attachment [^\]]+ could not be loaded\])$/;
 
 // Same default limit as synthesize_conversation_title.
 export const OPTIMISTIC_TITLE_LIMIT = 60;
@@ -24,7 +26,10 @@ export function synthesizeOptimisticTitle(
   text: string,
   limit: number = OPTIMISTIC_TITLE_LIMIT,
 ): string | null {
-  const keptLines = text.split("\n").filter((line) => !ATTACHMENT_MARKER_RE.test(line.trim()));
+  const keptLines = text
+    .split("\n")
+    .filter((line) => !ATTACHMENT_MARKER_RE.test(line.trim()))
+    .map(readableSentText);
   const collapsed = keptLines.join(" ").split(/\s+/).filter(Boolean).join(" ");
   if (!collapsed) return null;
   // Code points, not UTF-16 units, so the cap matches Python's len() and

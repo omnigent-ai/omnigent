@@ -1,10 +1,13 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
 import {
+  fileMentionToken,
+  mentionTokenAtCaret,
   NO_SESSION_MENTIONS,
   type MentionItem,
   type MentionState,
   type SessionMention,
+  sessionMentionToken,
 } from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
@@ -38,16 +41,18 @@ export interface MentionBrowser {
   mentionOpen: boolean;
   mentionedItems: MentionItem[];
   setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>>;
-  /** Attach a file (isDir=false) or whole folder (isDir=true) as a chip. */
+  /** Tag a file (isDir=false) or whole folder (isDir=true) as an inline token. */
   attachMention: (path: string, isDir: boolean) => void;
   /** Drill into a folder: rewrite the token to ``@<dir>/`` and keep browsing. */
   openMentionDir: (path: string) => void;
-  removeMentionedItem: (index: number) => void;
   mentionedSessions: SessionMention[];
   setMentionedSessions: React.Dispatch<React.SetStateAction<SessionMention[]>>;
-  /** Tag a session as a chip, replacing the typed token. */
+  /** Tag a session, replacing the typed ``@query`` with its token. */
   attachSession: (session: SessionMention) => void;
-  removeMentionedSession: (index: number) => void;
+  /** Tokens of everything tagged so far, for highlighting and Backspace. */
+  mentionTokens: string[];
+  /** Backspace at or inside a token deletes it whole; returns true when it did. */
+  handleTokenBackspace: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
   /** Handle a key event for the open menu; returns true when it consumed it. */
   handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
   /** Dismiss the menu (e.g. on blur). */
@@ -95,28 +100,47 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
-  // Remove the typed token and put the caret back where it started.
-  const consumeToken = (active: MentionState) => {
-    setText(text.slice(0, active.start) + text.slice(active.end));
-    setMention(null);
-    setMentionIndex(-1);
+  const mentionTokens = [
+    ...mentionedItems.map(fileMentionToken),
+    ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),
+  ];
+
+  const placeCaret = (caret: number) =>
     queueMicrotask(() => {
       const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(active.start, active.start);
+      if (ta) ta.setSelectionRange(caret, caret);
       ta?.focus();
     });
+
+  // Swap the typed "@query" for the token plus one space, caret after it.
+  const insertToken = (active: MentionState, token: string) => {
+    const after = text.slice(active.end);
+    const gap = /^\s/.test(after) ? "" : " ";
+    setText(text.slice(0, active.start) + token + gap + after);
+    setMention(null);
+    setMentionIndex(-1);
+    placeCaret(active.start + token.length + 1);
   };
 
   const attachSession = (session: SessionMention) => {
     if (!mention) return;
-    setMentionedSessions((prev) =>
-      prev.some((it) => it.id === session.id) ? prev : [...prev, session],
-    );
-    consumeToken(mention);
+    const existing = mentionedSessions.find((it) => it.id === session.id);
+    const token = existing?.token ?? sessionMentionToken(session, mentionTokens);
+    if (!existing) setMentionedSessions((prev) => [...prev, { ...session, token }]);
+    insertToken(mention, token);
   };
 
-  const removeMentionedSession = (index: number) =>
-    setMentionedSessions((prev) => prev.filter((_, i) => i !== index));
+  const handleTokenBackspace = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    if (e.key !== "Backspace" || e.altKey || e.metaKey || e.ctrlKey) return false;
+    const ta = e.currentTarget;
+    if (ta.selectionStart !== ta.selectionEnd) return false;
+    const range = mentionTokenAtCaret(text, ta.selectionStart, mentionTokens);
+    if (!range) return false;
+    e.preventDefault();
+    setText(text.slice(0, range.start) + text.slice(range.end));
+    placeCaret(range.start);
+    return true;
+  };
 
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
@@ -128,7 +152,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionedItems((prev) =>
       prev.some((it) => composerAttachmentKey(it) === itemKey) ? prev : [...prev, item],
     );
-    consumeToken(mention);
+    insertToken(mention, fileMentionToken(item));
   };
 
   const openMentionDir = (path: string) => {
@@ -145,9 +169,6 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
       ta?.focus();
     });
   };
-
-  const removeMentionedItem = (index: number) =>
-    setMentionedItems((prev) => prev.filter((_, i) => i !== index));
 
   const dismiss = () => {
     if (!mention) return;
@@ -205,11 +226,11 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionedItems,
     attachMention,
     openMentionDir,
-    removeMentionedItem,
     mentionedSessions,
     setMentionedSessions,
     attachSession,
-    removeMentionedSession,
+    mentionTokens,
+    handleTokenBackspace,
     handleKeyDown,
     dismiss,
   };

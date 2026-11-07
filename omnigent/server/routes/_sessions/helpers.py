@@ -60,8 +60,8 @@ from omnigent.entities import (
 )
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
+    humanize_mention_markers,
     parse_item_data,
-    strip_session_mention_lines,
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import (
@@ -11440,7 +11440,7 @@ def _latest_message_preview(
             block_type = block.get("type")
             text = block.get("text")
             if block_type == "input_text" and isinstance(text, str):
-                parts.append(strip_session_mention_lines(text))
+                parts.append(humanize_mention_markers(text))
             elif block_type == "output_text" and isinstance(text, str):
                 parts.append(text)
         collapsed = " ".join(" ".join(parts).split())

@@ -10492,15 +10492,17 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
     expect(screen.queryByTitle("Tag session Old")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
-    expect(screen.getByTestId("session-mention-chip").textContent).toBe("@Alpha planning");
+    expect((input() as HTMLTextAreaElement).value).toBe("@Alpha planning ");
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@Alpha planning");
 
-    fireEvent.change(input(), { target: { value: "continue it", selectionStart: 11 } });
+    const draft = "@Alpha planning continue it";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
     expect((payload as { text: string }).text).toMatch(
-      /^\[Session: "Alpha planning" id=s_alpha subagent=no\]\n\[Tagged sessions:[^\]]*\]\n\ncontinue it$/,
+      /^\[Session: "Alpha planning" id=s_alpha subagent=no\] continue it\n\n\[Tagged sessions:[^\]]*\]$/,
     );
   });
 
@@ -10519,10 +10521,11 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Attach cli.py")).not.toBeInTheDocument();
     fireEvent.click(screen.getByTitle("Open omnigent"));
     fireEvent.click(screen.getByTitle("Attach cli.py"));
-    // The chip shows the workspace-relative path, not the host-absolute one.
-    expect(screen.getByText("@omnigent/cli.py")).toBeInTheDocument();
+    // The token is the workspace-relative path, not the host-absolute one.
+    expect((input() as HTMLTextAreaElement).value).toBe("@omnigent/cli.py ");
 
-    fireEvent.change(input(), { target: { value: "explain this", selectionStart: 12 } });
+    const draft = "@omnigent/cli.py explain this";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     // The contract: the first message carries "[Attached: <relpath>]" so the
@@ -10530,7 +10533,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     // the "/Users/corey/repo/…" absolute path the host filesystem returned.
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py]\n\nexplain this");
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/cli.py] explain this");
   });
 
   it("suppresses stale parent rows while a drilled directory is still loading", async () => {
@@ -10584,23 +10587,25 @@ describe("NewChatLandingScreen @-file-mention", () => {
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     // The folder row's "+" button attaches the directory as a unit.
     fireEvent.click(screen.getByLabelText("Attach whole folder omnigent"));
-    expect(screen.getByText("@omnigent/")).toBeInTheDocument();
+    expect(screen.getByTestId("composer-mention-token").textContent).toBe("@omnigent/");
 
-    fireEvent.change(input(), { target: { value: "review it", selectionStart: 9 } });
+    const draft = "@omnigent/ review it";
+    fireEvent.change(input(), { target: { value: draft, selectionStart: draft.length } });
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
 
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
-    expect((payload as { text: string }).text).toBe("[Attached: omnigent/]\n\nreview it");
+    expect((payload as { text: string }).text).toBe("[Attached: omnigent/] review it");
   });
 
-  it("removes a tagged chip when its ✕ is clicked", () => {
+  it("deletes a tagged token whole on Backspace", () => {
     renderLanding();
     fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
     fireEvent.click(screen.getByTitle("Attach README.md"));
-    expect(screen.getByText("@README.md")).toBeInTheDocument();
-    fireEvent.click(screen.getByLabelText("Remove README.md"));
-    expect(screen.queryByText("@README.md")).not.toBeInTheDocument();
+    fireEvent.change(input(), { target: { value: "@README.md", selectionStart: 10 } });
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect((input() as HTMLTextAreaElement).value).toBe("");
+    expect(screen.queryByTestId("composer-mention-token")).not.toBeInTheDocument();
   });
 });
 

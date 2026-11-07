@@ -43,7 +43,12 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
+import {
+  ComposerMirror,
+  MIRRORED_TEXTAREA_CLASS,
+  renderMentionTokens,
+  useComposerMirrorAlignment,
+} from "@/components/composer/MentionTokenOverlay";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
 import { SubagentTaskIndicator } from "@/components/composer/SubagentTaskIndicator";
@@ -130,7 +135,12 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { DEVIN_NATIVE_PERMISSION_MODES } from "@/lib/nativeHarnessModes";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
-  buildMentionPreamble,
+  composerInlineMentions,
+  expandMentionTokens,
+  fileMentionToken,
+  findMentionTokens,
+  presentMentions,
+  withSessionMentionHint,
   detectMentionAt,
   type MentionItem,
   mentionMarkerFor,
@@ -3030,23 +3040,7 @@ function ComposerImpl(
     files.length === 0 &&
     hasCommandPrefix &&
     splitSlashCommand(value, slashCommandNames) !== null;
-  // Pin the overlay to the textarea's own box: the input area also holds the inline
-  // textarea's line-box descent, which would cut the overlay's scroll range short.
-  useLayoutEffect(() => {
-    const overlay = backdropRef.current;
-    const textarea = tailTextareaRef.current;
-    if (!overlay || !textarea) return;
-    const align = () => {
-      overlay.style.top = `${textarea.offsetTop}px`;
-      overlay.style.height = `${textarea.offsetHeight}px`;
-      overlay.scrollTop = textarea.scrollTop;
-    };
-    align();
-    if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(align);
-    observer.observe(textarea);
-    return () => observer.disconnect();
-  }, [composerIsCommand]);
+
   const toggleCodexPlanMode = async () => {
     if (planModeBusy) return;
     setCommandError(null);
@@ -3134,11 +3128,11 @@ function ComposerImpl(
     setMentionedItems,
     attachMention,
     openMentionDir,
-    removeMentionedItem,
     mentionedSessions,
     setMentionedSessions,
     attachSession,
-    removeMentionedSession,
+    mentionTokens,
+    handleTokenBackspace,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
@@ -3156,7 +3150,17 @@ function ComposerImpl(
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
-  const hasMentions = mentionedItems.length > 0 || mentionedSessions.length > 0;
+  // Tagged items whose token is still in the draft; deleting a token untags it.
+  const liveMentions = presentMentions(
+    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
+    [draft.text, ...draft.quotes.map((quote) => quote.before)],
+  );
+  const hasMentions = liveMentions.length > 0;
+  // One mirror paints both the slash-command tint and inline mention pills.
+  const mentionTokensShown =
+    draft.quotes.length === 0 && findMentionTokens(draft.text, mentionTokens).length > 0;
+  const mirrorActive = composerIsCommand || mentionTokensShown;
+  useComposerMirrorAlignment(backdropRef, tailTextareaRef, mirrorActive);
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
   const showInterruptButton =
     isWorking &&
@@ -3184,6 +3188,15 @@ function ComposerImpl(
       }
       return fresh.length > 0 ? [...prev, ...fresh] : prev;
     });
+    // Each attachment lands as an inline token at the end of the draft.
+    const tokens = [...new Set(pendingComposerAttachments.map(fileMentionToken))];
+    editText(null, (prev) => {
+      const missing = tokens.filter((token) => findMentionTokens(prev, [token]).length === 0);
+      if (missing.length === 0) return prev;
+      const gap = prev === "" || /\s$/.test(prev) ? "" : " ";
+      return `${prev}${gap}${missing.join(" ")} `;
+    });
+    dirtyRef.current = true;
     useChatStore.getState().clearPendingComposerAttachments();
     textareaRef.current?.focus();
     // Defense-in-depth against the cross-session leak: if the composer unmounts
@@ -3193,7 +3206,7 @@ function ComposerImpl(
     // resets the queue, but this closes the non-switch unmount paths too.
     return () => useChatStore.getState().clearPendingComposerAttachments();
     // setMentionedItems is a stable useState setter (from useMentionBrowser).
-  }, [pendingComposerAttachments, setMentionedItems]);
+  }, [pendingComposerAttachments, setMentionedItems, editText]);
 
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
@@ -3897,13 +3910,12 @@ function ComposerImpl(
     }
 
     setCommandError(null);
-    // Prepend each "@"-tagged path as an attachment marker on its own line —
-    // the same format the native executors emit for attachments and that
-    // title-seeding strips (_ATTACHMENT_MARKER_RE). Wording is harness-aware
-    // (codex says "Attached file:"). Folders carry a trailing "/" so the
-    // agent knows to open the directory. The native vendor reads the on-disk
-    // workspace file/folder from this marker; no upload happens.
-    const mentionPreamble = buildMentionPreamble(mentionedItems, sessionHarness, mentionedSessions);
+    // Each "@" token becomes its marker where it sits in the sentence: files as
+    // the harness's "[Attached: <path>]" wording (the vendor reads the on-disk
+    // path; no upload), sessions as "[Session: …]". A tagged session also adds
+    // one tool hint at the end.
+    const tagsSessions = liveMentions.some((m) => m.marker.startsWith("[Session: "));
+    const expand = (text: string) => expandMentionTokens(text, liveMentions);
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3914,14 +3926,13 @@ function ComposerImpl(
       // Preserve authored whitespace and quote provenance, including mention markers.
       const outgoing = {
         ...draft,
-        quotes: draft.quotes.map((quote, index) =>
-          index === 0 ? { ...quote, before: mentionPreamble + quote.before } : quote,
-        ),
+        text: withSessionMentionHint(expand(draft.text), tagsSessions),
+        quotes: draft.quotes.map((quote) => ({ ...quote, before: expand(quote.before) })),
       };
       onSend(serializeReplyDraft(outgoing), sendFiles, snapshotReplyDraft(outgoing));
     } else {
       const message = isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
-      onSend(mentionPreamble + message, sendFiles);
+      onSend(withSessionMentionHint(expand(message), tagsSessions), sendFiles);
     }
     dirtyRef.current = true;
     clearComposerAfterSend(resetNativeInputSession);
@@ -3986,6 +3997,7 @@ function ComposerImpl(
     // exclusive with the slash menu below (a mention token can't also read as a
     // "/"-command). Takes priority over history recall and submission.
     if (!shouldPreferSendOverCompletion && handleMentionKeyDown(e)) return;
+    if (handleTokenBackspace(e)) return;
 
     // Slash-completion menu keys (shared useSlashCompletion) — dismiss,
     // navigate, or complete; takes priority over history recall and
@@ -4249,7 +4261,7 @@ function ComposerImpl(
             draft.quotes.length > 0 && "max-h-none overflow-y-hidden",
             // Hand glyph painting to the overlay while a command is drafted;
             // the caret stays visible via caret-foreground.
-            composerIsCommand && "text-transparent caret-foreground",
+            mirrorActive && MIRRORED_TEXTAREA_CLASS,
           ),
         }}
         slots={{
@@ -4369,25 +4381,22 @@ function ComposerImpl(
             matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
-          inputBackdrop: composerIsCommand && (
-            <div
-              ref={backdropRef}
-              aria-hidden
-              data-testid="composer-highlight-overlay"
-              className="composer-input-text pointer-events-none absolute inset-x-0 overflow-hidden whitespace-pre-wrap break-words px-3 text-ui text-foreground max-md:px-4"
-            >
+          inputBackdrop: mirrorActive && (
+            <ComposerMirror ref={backdropRef}>
               {(() => {
-                const split = splitSlashCommand(value, slashCommandNames);
-                if (!split) return value;
+                const split = composerIsCommand
+                  ? splitSlashCommand(value, slashCommandNames)
+                  : null;
+                if (!split) return renderMentionTokens(value, mentionTokens);
                 return (
                   <>
                     {split.before}
                     <span className="text-brand-accent">{split.token}</span>
-                    {split.after}
+                    {renderMentionTokens(split.after, mentionTokens)}
                   </>
                 );
               })()}
-            </div>
+            </ComposerMirror>
           ),
           attachments: (
             <>
@@ -4397,16 +4406,6 @@ function ComposerImpl(
               {attachmentError !== null && (
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
-              {/* "@"-mention chips — one per tagged workspace file/folder. Each is
-            delivered as a "[Attached: <path>]" marker at send time. Ranged
-            spans (from "Attach to agent") show their line range. */}
-              <ComposerMentionChips
-                items={mentionedItems}
-                onRemove={removeMentionedItem}
-                sessions={mentionedSessions}
-                onRemoveSession={removeMentionedSession}
-                showLineRange
-              />
               {/* Inline slash-command feedback: errors and /help output */}
               {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
             </>

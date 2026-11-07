@@ -127,24 +127,6 @@ export function rankMentionEntries<T extends { name: string; type: string }>(
     .slice(0, cap);
 }
 
-/**
- * Assemble the attachment preamble prepended to an outgoing message: one
- * harness-aware marker per tagged item, on its own line, terminated by a blank
- * line. Returns ``""`` when nothing is tagged.
- */
-export function buildMentionPreamble(
-  items: MentionItem[],
-  harness: string | null,
-  sessions: SessionMention[] = [],
-): string {
-  const lines = [
-    ...sessions.map(sessionMentionMarker),
-    ...(sessions.length > 0 ? [SESSION_MENTION_HINT] : []),
-    ...items.map((it) => mentionMarkerFor(harness, mentionItemPath(it))),
-  ];
-  return lines.length === 0 ? "" : lines.join("\n") + "\n\n";
-}
-
 /** Another Omnigent session tagged through the composer's ``@`` menu. */
 export interface SessionMention {
   /** Session id the agent passes to the ``sys_session_*`` tools. */
@@ -153,14 +135,16 @@ export interface SessionMention {
   title: string;
   /** True for a sub-agent spawned by the current session. */
   isSubagent: boolean;
+  /** Composer token once tagged, e.g. ``"@Fix CI"``; see :func:`sessionMentionToken`. */
+  token?: string;
 }
 
 /**
  * One line telling the agent how to act on tagged sessions. ``sys_session_send``
- * exists only for agents that can spawn, hence the fallback. Parsers key on
- * the ``[Tagged sessions:`` prefix only, so the wording can be tuned freely. It rides in the
- * message itself because native TUI harnesses never see framework prompt
- * text. Keep in sync with ``_SESSION_MENTION_LINE_RE`` in
+ * exists only for agents that can spawn, hence the fallback. Parsers key on the
+ * ``[Tagged sessions:`` prefix only, so the wording can be tuned freely. It
+ * rides in the message because native TUI harnesses never see framework prompt
+ * text. Keep in sync with ``_SESSION_MENTION_HINT_RE`` in
  * ``omnigent/entities/conversation.py``.
  */
 export const SESSION_MENTION_HINT =
@@ -171,30 +155,156 @@ export const SESSION_MENTION_HINT =
 // Characters that would break the bracketed, quoted marker shape.
 const SESSION_TITLE_UNSAFE_RE = /["[\]\r\n]+/g;
 
-/** Marker line for one tagged session, e.g. ``[Session: "Fix CI" id=abc subagent=no]``. */
+function cleanSessionTitle(title: string): string {
+  return title.replace(SESSION_TITLE_UNSAFE_RE, " ").replace(/\s+/g, " ").trim();
+}
+
+/** Inline marker for one tagged session, e.g. ``[Session: "Fix CI" id=abc subagent=no]``. */
 export function sessionMentionMarker(session: SessionMention): string {
-  const title = session.title.replace(SESSION_TITLE_UNSAFE_RE, " ").replace(/\s+/g, " ").trim();
+  const title = cleanSessionTitle(session.title);
   return `[Session: "${title}" id=${session.id} subagent=${session.isSubagent ? "yes" : "no"}]`;
 }
 
-// Parses the markers ``sessionMentionMarker`` emits (and the hint line), with
-// their trailing line breaks, so a sent bubble can show chips instead.
-const SESSION_MARKER_RE =
-  /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\][ \t]*(?:\r?\n)*/g;
-const SESSION_HINT_LINE_RE = /\[Tagged sessions:[^\]]*\][ \t]*(?:\r?\n)*/g;
-
-/** Sessions tagged in a sent message's text, in marker order. */
-export function extractSessionMentions(text: string): SessionMention[] {
-  return [...text.matchAll(SESSION_MARKER_RE)].map((m) => ({
-    title: m[1],
-    id: m[2],
-    isSubagent: m[3] === "yes",
-  }));
+/** Composer token for a tagged file or folder, e.g. ``@src/``, ``@a.ts:3-9``. */
+export function fileMentionToken(item: MentionItem): string {
+  return `@${mentionItemPath(item)}`;
 }
 
-/** Remove session markers and the hint line from a sent message's text. */
-export function stripSessionMentionMarkers(text: string): string {
-  return text.replace(SESSION_MARKER_RE, "").replace(SESSION_HINT_LINE_RE, "");
+/**
+ * Composer token for a tagged session, e.g. ``@Fix CI``. A title already used
+ * by another tagged token gets a short id suffix, so each token maps to one
+ * session.
+ */
+export function sessionMentionToken(session: SessionMention, taken: readonly string[]): string {
+  const base = `@${cleanSessionTitle(session.title) || "Untitled session"}`;
+  return taken.includes(base) ? `${base} (${session.id.slice(0, 6)})` : base;
+}
+
+/** A token in composer text and the marker it becomes when the message is sent. */
+export interface InlineMention {
+  token: string;
+  marker: string;
+}
+
+/** Tokens and markers for everything tagged in a composer. */
+export function composerInlineMentions(
+  items: readonly MentionItem[],
+  sessions: readonly SessionMention[],
+  harness: string | null,
+): InlineMention[] {
+  return [
+    ...items.map((item) => ({
+      token: fileMentionToken(item),
+      marker: mentionMarkerFor(harness, mentionItemPath(item)),
+    })),
+    ...sessions.map((session) => ({
+      token: session.token ?? `@${cleanSessionTitle(session.title)}`,
+      marker: sessionMentionMarker(session),
+    })),
+  ];
+}
+
+// A token must start a word and end at whitespace, punctuation or the text end.
+const TOKEN_END_RE = /[\s.,;:!?)\]}'"]/;
+
+/** Where a known token sits in composer text. */
+export interface MentionTokenRange {
+  start: number;
+  end: number;
+  token: string;
+}
+
+/**
+ * Non-overlapping occurrences of ``tokens`` in ``text``, in text order. Longer
+ * tokens win, so ``@src/a.ts:3-9`` is not read as ``@src/a.ts``.
+ */
+export function findMentionTokens(text: string, tokens: readonly string[]): MentionTokenRange[] {
+  const ranges: MentionTokenRange[] = [];
+  const byLength = [...new Set(tokens)].filter(Boolean).sort((a, b) => b.length - a.length);
+  for (const token of byLength) {
+    for (let at = text.indexOf(token); at >= 0; at = text.indexOf(token, at + 1)) {
+      const end = at + token.length;
+      if (at > 0 && !/\s/.test(text[at - 1])) continue;
+      if (end < text.length && !TOKEN_END_RE.test(text[end])) continue;
+      if (ranges.some((r) => at < r.end && end > r.start)) continue;
+      ranges.push({ start: at, end, token });
+    }
+  }
+  return ranges.sort((a, b) => a.start - b.start);
+}
+
+/** Token the caret is at the end of, or inside, so Backspace removes it whole. */
+export function mentionTokenAtCaret(
+  text: string,
+  caret: number,
+  tokens: readonly string[],
+): MentionTokenRange | null {
+  return findMentionTokens(text, tokens).find((r) => caret > r.start && caret <= r.end) ?? null;
+}
+
+/** Mentions whose token still appears in any of ``texts``; deleted tokens drop out. */
+export function presentMentions<T extends InlineMention>(
+  mentions: readonly T[],
+  texts: readonly string[],
+): T[] {
+  return mentions.filter((m) => texts.some((t) => findMentionTokens(t, [m.token]).length > 0));
+}
+
+/** Replace each token in ``text`` with its marker, in place. */
+export function expandMentionTokens(text: string, mentions: readonly InlineMention[]): string {
+  const markerFor = new Map(mentions.map((m) => [m.token, m.marker]));
+  let out = text;
+  for (const range of findMentionTokens(text, [...markerFor.keys()]).reverse()) {
+    out = out.slice(0, range.start) + markerFor.get(range.token) + out.slice(range.end);
+  }
+  return out;
+}
+
+/** Append the tool hint once when the message tags any session. */
+export function withSessionMentionHint(text: string, tagsSessions: boolean): string {
+  return tagsSessions ? `${text.trimEnd()}\n\n${SESSION_MENTION_HINT}` : text;
+}
+
+/** A mention found in a sent message. */
+export type SentMention =
+  | { kind: "session"; id: string; title: string; isSubagent: boolean }
+  | { kind: "file"; path: string };
+
+// An absolute filesystem path (POSIX, Windows drive or UNC). Composer file
+// mentions are workspace-relative, so an absolute marker is a native executor's
+// materialized upload, which the bubble already shows as a file block.
+export function isAbsolutePath(path: string): boolean {
+  return /^(\/|[A-Za-z]:[\\/]|\\\\)/.test(path);
+}
+
+const SENT_SESSION_RE = /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\]/g;
+const SENT_ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]([ \t]*(?:\r?\n)*)/g;
+const SENT_HINT_RE = /(?:\r?\n)*[ \t]*\[Tagged sessions:[^\]]*\][ \t]*/g;
+
+/**
+ * Rewrite the markers in a sent message with ``render``: drops the tool hint,
+ * drops absolute-path upload markers, and passes each session or relative file
+ * marker to ``render`` for its replacement text.
+ */
+export function replaceSentMentions(
+  text: string,
+  render: (mention: SentMention) => string,
+): string {
+  return text
+    .replace(SENT_HINT_RE, "")
+    .replace(SENT_SESSION_RE, (_m, title: string, id: string, sub: string) =>
+      render({ kind: "session", id, title, isSubagent: sub === "yes" }),
+    )
+    .replace(SENT_ATTACHED_RE, (_m, raw: string, trail: string) => {
+      const path = raw.trim();
+      if (!path || isAbsolutePath(path)) return "";
+      return render({ kind: "file", path }) + trail;
+    });
+}
+
+/** Sent-message text for reading and copying: markers become ``@name``. */
+export function readableSentText(text: string): string {
+  return replaceSentMentions(text, (m) => (m.kind === "session" ? `@${m.title}` : `@${m.path}`));
 }
 
 /** Shared empty list, so default props keep a stable reference. */
