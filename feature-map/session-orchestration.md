@@ -1,9 +1,12 @@
 # Session orchestration
 
 An agent in a session that is private or shared read-only can send work to
-another session owned by the same user, then read its status/history. It can also create private top-level
-workers on its host or a new managed sandbox. This is enabled by default, with
-`-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
+another session owned by the same user, then read its status/history. It can also create private sibling
+workers grouped in the left sidebar on its host or a new managed sandbox when
+`sibling_sessions` is enabled in `OMNIGENT_FEATURES`; otherwise workers appear
+as standalone sessions. Peer messaging is enabled
+by default; `-session_orchestration` is its server kill switch and also blocks
+MCP independent creation.
 
 ## Sub-features
 
@@ -22,9 +25,26 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   creates, even if an enable is also listed, and hides the Automations page's
   trigger templates (`/v1/info` reports `features.session_orchestration`). Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
+- `messaging-control`: Settings → Sharing → Agent messaging controls new peer
+  sends immediately and persists across restarts. `-peer_session_messaging` in
+  the server's `OMNIGENT_FEATURES` also refuses them and locks the admin switch;
+  in the host/runner environment it hides the tool and refuses calls locally.
+  Neither side can override a disable on the other. Child messaging and already
+  accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
-  Managed creation uses the server's configured default sandbox provider.
+  With `sibling_sessions` enabled they share one sidebar family and do not appear
+  as child agents; with it disabled they remain standalone.
+  Managed creation uses the server's configured default sandbox provider. A
+  sibling stays in its creator's project; a different requested project or an
+  unavailable source project is rejected before creation. Project defaults do
+  not override the worker's agent or placement.
+- `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
+  agents to the current host, the current host or a fresh managed sandbox, or
+  any available host. The server enforces the same choice for the composer,
+  uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
+  relaunches retain the prior host so restricted sessions can retry. Any available host is the
+  behavior-preserving default.
 - `sharing`: sharing the sender with edit (or higher) access, including public
   edit, blocks subsequent sends and independent creates. Read-only grants,
   including public read and default-public sessions, do not: viewers cannot add
@@ -37,7 +57,7 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
   kept session starts one worker per match (`docs/AUTOMATIONS.md`).
-- `refusal`: disabled flag, another owner, edit-shared sender or wrong runner binding
+- `refusal`: disabled orchestration, another owner, edit-shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
   acknowledgements are uncertain and must not auto-retry. After uncertain
@@ -45,6 +65,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 
 ## How to get to it (user POV)
 
+- As an admin on desktop or mobile web, open Settings → Sharing → Agent
+  messaging, or `/settings/sharing`, and toggle **Message other sessions**.
 - In an SDK session's Chat, ask the agent to send a task using
   `sys_session_message`, then inspect the destination's history.
 - In a native session's Chat or agent terminal, ask for the same operation;
@@ -57,21 +79,25 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - Use the existing Share dialog to share the sender or receiver, then repeat.
   A read-only share of the sender keeps both tools working; an edit share
   refuses them.
+- As an admin, open Settings → Admin → General and change **Nested agent destinations**.
+  Open **Add nested agent** from a session and inspect its host picker, then try the
+  same disallowed destination through the API or MCP.
 - Open an independent worker in Chat or Terminal and follow its "Created by"
   link. On mobile web, the same link is in the header. Ask the manager to list
   its sessions and match `created_by_session_id` to its own session ID.
-- On Automations, pick a *Jira tickets*, *Slack messages*, or *GitHub issues*
+- On Automations, pick a _Jira tickets_, _Slack messages_, or _GitHub issues_
   card from suggestions on **Your automations** or the **Templates** tab at
   `/tasks?view=templates`. Suggestions appear below saved automations or the
   empty-state message with All selected and search cleared. The old
   `/tasks/templates` URL redirects to the Templates tab.
-  Pick a template, fill in the trigger builder, and save: the hourly automation's kept session starts one worker per new match
+  Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
-  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_hourly_manager_task`.
+  `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
 
 ## Driving it with the repro environment
 
-Preconditions: use an isolated test server with the default feature settings.
+Preconditions: use an isolated test server with `OMNIGENT_FEATURES=sibling_sessions`
+for nested creation journeys; peer messaging and standalone creation use the default settings.
 Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Internal deployments
@@ -87,7 +113,7 @@ contract is covered by `tests/server/integration/test_session_orchestration.py`;
 the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
 
 - Own environment: `uv run --no-sync pytest
-  tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
+tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
   host, server, SDK and Codex processes with a scripted model. It submits chat
   requests over HTTP and checks send, history reads, same-host creation, and
   sharing refusal. It also checks that unconfigured managed creation gives a clear
@@ -98,7 +124,7 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   It also fires an owner-created schedule through the real server/host and checks
   that the resulting worker cannot message a peer or create an independent worker.
 - Component integration: `uv run --no-sync pytest
-  tests/server/integration/test_session_orchestration.py --reruns 0` checks the
+tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   authenticated routes, ownership stores, refusal matrix and managed request /
   durable startup contract with simulated provisioning. It covers default provider
   selection for OSS and embedding configurations. Runner tests cover an absent
@@ -111,7 +137,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   uncertainty without retrying creation. Queue tests check refusal before saving
   and replay after sharing. Scheduled-origin tests cover sends and
   creates from a scheduled run, its full fork after schedule-history deletion,
-  and its children.
+  and its children. Off/on/off request-scoped flag changes verify that MCP and
+  the orchestration endpoint create private standalone roots when nesting is off
+  and siblings when on; explicit sibling requests still refuse while off.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager read-only and repeat: the task must still arrive.
@@ -120,12 +148,25 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   Append `-session_orchestration` to the isolated server's feature settings and
   restart it, then repeat from a private manager: expect a disabled error, no new
   task and no independent worker. Read history/info to confirm reads still work.
+- For `messaging-control`, turn the admin switch off, reload, and confirm a new
+  peer send is refused. Turn it back on and confirm delivery resumes. Check that
+  child work and a task accepted before disabling still finish. With the server
+  flag disabled, the switch stays off and unavailable; with only the runner flag
+  disabled, a new SDK/native session omits `sys_session_message`. Restart the
+  affected server or host/runner after environment changes. Component coverage is
+  in `web/src/pages/SharingPage.test.tsx`, `tests/tools/test_manager.py`,
+  `tests/runner/test_session_orchestration.py`, and
+  `tests/server/integration/test_session_orchestration.py`; persisted settings and
+  storage failures are covered by `tests/server/routes/test_sessions_sharing_mode.py`.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
+- Admin/UI component tests cover all three destination modes; server integration
+  tests cover the matching current/other/managed/unbound admission matrix, and
+  runner tests cover MCP refusal before creation.
 
 ## Gotchas
 
-- "Created by" records origin only: workers remain top-level and have their own
+- "Created by" records origin only: workers remain independent and have their own
   permissions and lifecycle. Sharing a worker does not share its creator; the
   opaque creator ID remains in worker metadata, but the UI resolves its title
   through a separate authorized read. Forks drop the creator label. Older
@@ -151,6 +192,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
+- A fresh managed sandbox is distinct from reusing an existing managed host.
+  Even the most permissive setting offers only the clicked session's existing
+  managed host; another family's managed host remains unavailable.
 - A receiver shared with edit access can continue working but cannot message
   back while shared that way. A read-only share does not stop it.
 - Privacy checks govern these tools. They do not confine arbitrary code holding
@@ -197,8 +241,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   [why the messaging tools remain separate](../docs/session-messaging-tool-boundary.md).
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
-  retains its existing `spawn` advertisement gate. No schema migration or
-  per-owner settings page is needed.
+  retains its existing `spawn` advertisement gate. Deploy the sibling-session
+  schema before the application; peer messaging needs no schema migration.
   V1 treats eligible private agents as delegates across the owner's sessions.
   Unlike sharing, messaging does not grant another user access, but untrusted
   content can still influence an agent to steer other owned sessions. Enabling

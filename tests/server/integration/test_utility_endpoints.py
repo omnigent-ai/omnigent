@@ -94,13 +94,14 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "canvas": False,
         "arca_shutdown_warnings": False,
         "import_review": False,
-        "custom_agents_settings_ui": False,
-        "sidebar_grouping_ui": False,
+        "custom_agents_settings_ui": True,
+        "sidebar_grouping_ui": True,
         "workspace_content_search": False,
         "grid_sessions_display_ui": False,
         "automations_v2": False,
         "splittable_terminal_view_ui": False,
         "session_orchestration": True,
+        "sibling_sessions": False,
         "codex_plan_at_launch": True,
     }
     # Compatibility field for frontend builds predating the nested map.
@@ -116,6 +117,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["session_search_scope"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.
     assert data["scheduled_task_session_modes"] is True
+    assert data["scheduled_task_subhour"] is True
+    assert data["automation_trigger_poll_minutes"] == 10
     assert data["scheduled_task_harness_settings"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
@@ -125,6 +128,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Browser-posted despite its prefix; runner-only events stay unadvertised.
     assert "external_btw_dismiss" in data["session_event_types"]
     assert "external_output_text_delta" not in data["session_event_types"]
+    # Gates the web's claude-sdk /clear, which older servers list "clear" without.
+    assert data["session_claude_sdk_clear"] is True
     # This app wires no project store, so automations cannot take a project.
     assert data["scheduled_task_projects"] is False
     # This app wires no scheduled-task store, so it has no automations to offer.
@@ -143,6 +148,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
     del data["session_event_types"]
     assert ServerInfoResponse.model_validate(data).session_event_types == []
+    del data["session_claude_sdk_clear"]
+    assert ServerInfoResponse.model_validate(data).session_claude_sdk_clear is False
     del data["automations_enabled"]
     assert ServerInfoResponse.model_validate(data).automations_enabled is False
 
