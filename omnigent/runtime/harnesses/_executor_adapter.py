@@ -86,7 +86,6 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # starving the reap (subprocess-backed executors terminate only in close/close_session).
 # _INTERRUPT_SLICE_S must exceed _PiRpcSession.close()'s inner 2.0s process.wait() so the
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
-INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
@@ -670,7 +669,7 @@ class ExecutorAdapter(HarnessApp):
             return closed
 
         try:
-            return await asyncio.wait_for(_reap(), timeout=INTERRUPT_TIMEOUT_S)
+            return await asyncio.wait_for(_reap(), timeout=executor.close_timeout())
         except Exception:
             _logger.exception("abandoned executor teardown failed or timed out")
             return False
@@ -716,7 +715,7 @@ class ExecutorAdapter(HarnessApp):
                         await exc.close()
 
                 with contextlib.suppress(Exception):
-                    await asyncio.wait_for(_close(), timeout=INTERRUPT_TIMEOUT_S)
+                    await asyncio.wait_for(_close(), timeout=executor.close_timeout())
         finally:
             self._resyncing = False
 
