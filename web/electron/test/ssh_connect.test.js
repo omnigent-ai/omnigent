@@ -159,7 +159,14 @@ describe("loginScript on a real shell", () => {
             return true;
           }
           const stat = `/proc/${pid}/stat`;
-          return fs.existsSync(stat) && / Z /.test(fs.readFileSync(stat, "utf8"));
+          if (!fs.existsSync(stat)) return false;
+          try {
+            return / Z /.test(fs.readFileSync(stat, "utf8"));
+          } catch (error) {
+            // Reaped between the existence check and the read.
+            if (error.code === "ENOENT") return true;
+            throw error;
+          }
         };
         for (let waited = 0; waited < 3000 && !pids.every(stopped); waited += 50) {
           // Polling is sequential by design.

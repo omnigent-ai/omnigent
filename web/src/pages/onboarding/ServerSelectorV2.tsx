@@ -37,7 +37,17 @@ import { CliInstallStep } from "@/pages/onboarding/CliInstallStep";
  */
 export interface ConnectResult {
   error?: string;
+  errorMessage?: string;
+  errorAction?: string;
   cancelled?: boolean;
+}
+
+/** Result of a setup operation; `error` remains the combined legacy message. */
+export interface SetupResult {
+  ok: boolean;
+  error?: string;
+  errorMessage?: string;
+  errorAction?: string;
 }
 
 /** What an in-flight connect is waiting on: browser sign-in, or the server page. */
@@ -94,14 +104,14 @@ export interface ServerSelectorV2Setup {
   /** Start (or reuse) the local server, then connect to it. Resolves the
    *  outcome so the terminal step can show ready/failed (on success the window
    *  navigates away, so it resolves only on failure in practice). */
-  onStartLocal: () => Promise<{ ok: boolean; error?: string }>;
+  onStartLocal: () => Promise<SetupResult>;
   /** Subscribe to the local server's startup log lines while it boots; returns
    *  an unsubscribe. Absent on older shells / browser preview → the terminal
    *  step shows the coarse phases only. */
   onSetupLog?: (cb: (line: string) => void) => () => void;
   /** Install the omnigent CLI (macOS). Present only when the CLI is missing and
    *  the shell supports it; absent → the install step is skipped. */
-  onInstallCli?: () => Promise<{ ok: boolean; error?: string }>;
+  onInstallCli?: () => Promise<SetupResult>;
   /** Subscribe to the CLI installer's output lines; returns an unsubscribe. */
   onInstallLog?: (cb: (line: string) => void) => () => void;
   /** Runners the "Where do you work today?" step offers for `url`, and whether
@@ -109,7 +119,7 @@ export interface ServerSelectorV2Setup {
   getRunnerOptions?: (url: string) => Promise<{ remote: boolean; bundledCli?: boolean }>;
   /** Connect the picked runner to `url` before opening it. Absent → the runner
    *  step just opens the server. */
-  onConnectRunner?: (url: string, runner: Runner) => Promise<{ ok: boolean; error?: string }>;
+  onConnectRunner?: (url: string, runner: Runner) => Promise<SetupResult>;
   /** Subscribe to onConnectRunner's output lines; returns an unsubscribe. */
   onRunnerLog?: (cb: (line: string) => void) => () => void;
   /** Remove a recent server from the saved list, if the shell supports it. */
@@ -292,7 +302,12 @@ export function ServerSelectorV2({ setup }: { setup: ServerSelectorV2Setup }) {
   const connectInTerminal = async (url: string) => {
     const result = await connectToServer(url);
     if (result.cancelled) return { ok: false, error: "Connection cancelled." };
-    return { ok: result.error === undefined, error: result.error };
+    return {
+      ok: result.error === undefined,
+      error: result.error,
+      errorMessage: result.errorMessage,
+      errorAction: result.errorAction,
+    };
   };
   // Checked at run time (Retry re-checks): a picked local install that's up opens
   // that exact URL; one that's down starts like "Get started locally".
