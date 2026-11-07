@@ -30,6 +30,7 @@ const {
   launchDesktop,
   saveRecording,
 } = require("./desktopHarness");
+const { OVERLAY_MIN_HEIGHT } = require("../src/update_overlay");
 
 const deps = desktopDepsAvailable();
 const RECORD_DIR = path.join(__dirname, "recordings", "desktop-update-window");
@@ -208,22 +209,26 @@ describe(
         // 5. The macOS first-mouse option and the existing click-through state
         //    must leave real card controls actionable. Dismiss through
         //    Playwright's Electron input path, then require the React card to
-        //    disappear and the shell window to collapse back to its 1px sliver.
+        //    disappear and the shell window to collapse back to its sliver.
         await overlayPage.getByRole("button", { name: "Dismiss" }).click();
         await overlayPage.getByText("is available").waitFor({ state: "hidden", timeout: 5_000 });
         let collapsedHeight = overlayWindows[0].bounds.height;
         /* oxlint-disable no-await-in-loop */
-        for (let i = 0; i < 50 && collapsedHeight !== 1; i++) {
+        for (let i = 0; i < 50 && collapsedHeight !== OVERLAY_MIN_HEIGHT; i++) {
           collapsedHeight = await electronApp.evaluate(({ BrowserWindow }) => {
             const overlay = BrowserWindow.getAllWindows().find((w) =>
               w.webContents.getURL().includes("update-overlay"),
             );
             return overlay?.getBounds().height ?? 0;
           });
-          if (collapsedHeight !== 1) await window.waitForTimeout(100);
+          if (collapsedHeight !== OVERLAY_MIN_HEIGHT) await window.waitForTimeout(100);
         }
         /* oxlint-enable no-await-in-loop */
-        assert.equal(collapsedHeight, 1, "Dismiss did not collapse the update prompt");
+        assert.equal(
+          collapsedHeight,
+          OVERLAY_MIN_HEIGHT,
+          "Dismiss did not collapse the update prompt",
+        );
       } finally {
         // Close FIRST (flushes the videos), then name the clips — the failing
         // path (the reproduction) must still produce the before-fix footage.
