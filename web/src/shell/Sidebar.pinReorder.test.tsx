@@ -41,6 +41,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
+import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
 
 const ROW_HEIGHT = 30;
 
@@ -54,6 +55,17 @@ function stubRowRects() {
     const index = rows.indexOf(this);
     if (index < 0) return new DOMRect(0, 0, 0, 0);
     return new DOMRect(0, index * ROW_HEIGHT, 200, ROW_HEIGHT);
+  });
+}
+
+// The Pinned zone reaches 12px below its last pin, over the dragged row (never a target).
+function stubPinZoneRect(pinnedRows: number) {
+  const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+  vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+    if (this.matches('[data-testid="sidebar-pin-drop-zone"]')) {
+      return new DOMRect(0, 0, 200, pinnedRows * ROW_HEIGHT + 12);
+    }
+    return rowRect.call(this);
   });
 }
 
@@ -101,6 +113,7 @@ beforeEach(() => {
 afterEach(async () => {
   fireEvent.mouseUp(document);
   cleanup();
+  localStorage.clear();
   await new Promise((resolve) => {
     setTimeout(resolve, 50);
   });
@@ -160,14 +173,7 @@ describe("dropping an unpinned session onto a pinned row", () => {
     const last = Date.now() + 60_000;
     mocks.pinned[1].labels = { "omnigent.pinned": String(last) };
     mocks.pinFn.mockResolvedValue({});
-    // The Pinned zone reaches 12px below the last pin, over the dragged row (never a target).
-    const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
-    vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
-      if (this.matches('[data-testid="sidebar-pin-drop-zone"]')) {
-        return new DOMRect(0, 0, 200, 2 * ROW_HEIGHT + 12);
-      }
-      return rowRect.call(this);
-    });
+    stubPinZoneRect(2);
     renderSidebar();
 
     await dropOnto("conv_c", "conv_b", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
@@ -240,12 +246,19 @@ describe("dropping an unpinned session onto a pinned row", () => {
   it("offers no pinned-row reordering when the server can't store pins", async () => {
     mocks.filterHonored = false;
     mocks.pinFn.mockResolvedValue({});
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["conv_d"]));
+    stubPinZoneRect(3);
     renderSidebar();
 
     await dropOnto("conv_b", "conv_a", { expectTarget: false });
-
-    expect(mocks.reorderPins).not.toHaveBeenCalled();
     expect(mocks.pinFn).not.toHaveBeenCalled();
+    // Released below the label-less local pin, it pins through the plain toggle.
+    await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({ id: "conv_c", pinned: true }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
   it("disables the other rows' pin buttons while a pin is saving", async () => {

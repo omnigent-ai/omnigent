@@ -2689,14 +2689,14 @@ function ConversationList({
         if (writes.length > 0) reorderPins(writes);
         return;
       }
-      const pinTargetId =
-        action.kind === "pin"
-          ? (action.targetId ?? sections.pinned.filter(isPinOrderUnit).at(-1)?.id)
-          : undefined;
+      const lastPinId = pinReorderEnabled
+        ? sections.pinned.filter(isPinOrderUnit).at(-1)?.id
+        : undefined;
+      const pinTargetId = action.kind === "pin" ? (action.targetId ?? lastPinId) : undefined;
       if (action.kind === "pin" && pinTargetId) {
         // Pin into the dropped-on slot (below a row from its lower half), else after the
-        // last pin. The new pin goes through the toggle (cap / ownership checks); only
-        // once it's accepted are any renumbered neighbours rewritten through the batch.
+        // last pin when the server stores pin order. The new pin goes through the toggle
+        // (cap / ownership checks); once it's accepted, renumbered neighbours follow.
         const below = !action.targetId || event.collisions?.[0]?.data?.below === true;
         const writes = pinOrderWrites(sections.pinned, dragged.id, pinTargetId, below);
         const pin = writes.find((w) => w.id === dragged.id);
@@ -2736,6 +2736,7 @@ function ConversationList({
       saveOrder,
       sections.pinned,
       pinAt,
+      pinReorderEnabled,
       reorderPins,
       reorderSessions,
     ],
