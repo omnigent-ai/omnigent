@@ -13,6 +13,7 @@ from playwright.sync_api import Locator, Page, Route, expect
 from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
 from tests.browser_ui.chat.session_contract import (
     ChatSessionContract,
+    list_payload,
     message_item,
     tool_call_items,
 )
@@ -38,6 +39,80 @@ _INVALID_MERMAID = (
     "    Note over A,B: proceed once; do not call Save\n"
     "    A=>B: again\n```"
 )
+_LONG_LABEL_MERMAID = """\
+```mermaid
+flowchart LR
+  subgraph nonprod["Dev / staging account"]
+    G["dev-aws-…-general1-vector-aggregator-role"]
+    S["us-west-2-vector-aggregator-role (SMK)"]
+  end
+  subgraph audit["aws-audit (prod)"]
+    W["MeterletK8sSecflowLogsWriterDev"]
+    R["MeterletK8sSecflowLogsWriterDev-us-west-2"]
+  end
+  G -- AssumeRole --> W
+  S -- AssumeRole --> R
+  W -. "matches carve-out: no alert" .-> OK(("✓"))
+  R -. "target ARN not in carve-out: alert" .-> SOC(("SA ticket"))
+```"""
+# Text of every Mermaid label whose laid-out lines spill outside its foreignObject box.
+_CLIPPED_MERMAID_LABELS = """svg => [...svg.querySelectorAll('foreignObject')].flatMap(label => {
+    const box = label.getBoundingClientRect();
+    const range = document.createRange();
+    range.selectNodeContents(label);
+    const clipped = [...range.getClientRects()].some(line => line.width && line.height && (
+        line.left < box.left - 1 || line.right > box.right + 1
+        || line.top < box.top - 1 || line.bottom > box.bottom + 1
+    ));
+    return clipped ? [label.textContent.trim()] : [];
+})"""
+_STREAMED_MERMAID_LINES = [
+    "flowchart TD\n",
+    "  A[Start] --> B[Read the config]\n",
+    "  B --> C{Is it valid?}\n",
+    "  C -->|yes| D[Run the job]\n",
+    "  C -->|no| E[Report the error]\n",
+]
+# Per painted frame: whether the diagram's source and the diagram show, and the shown one's height.
+_SAMPLE_DIAGRAM_FRAMES = """() => {
+    window.__diagramFrames = [];
+    const shown = (element) => !!element && element.checkVisibility({ visibilityProperty: true });
+    const record = () => {
+        const log = document.querySelector('[role="log"]');
+        const source = [...log.querySelectorAll('[data-streamdown="code-block"]')]
+            .find((block) => block.textContent.includes("flowchart TD"));
+        const diagram = log.querySelector('[data-streamdown="mermaid-block"]');
+        const visible = shown(diagram) ? diagram : shown(source) ? source : null;
+        window.__diagramFrames.push({
+            source: shown(source),
+            diagram: shown(diagram),
+            drawn: shown(log.querySelector('svg[id^="mermaid-"]')),
+            height: visible ? Math.round(visible.getBoundingClientRect().height) : null,
+        });
+    };
+    // Read layout after the app's resize observers have run, as the frame paints.
+    const sample = () => {
+        const observer = new ResizeObserver(() => {
+            observer.disconnect();
+            record();
+        });
+        observer.observe(document.body);
+        requestAnimationFrame(sample);
+    };
+    requestAnimationFrame(sample);
+}"""
+_POINTER_CONTEXTS = [
+    pytest.param(
+        True,
+        marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        id="touch",
+    ),
+    pytest.param(
+        False,
+        marks=pytest.mark.browser_context_args(has_touch=False, is_mobile=False),
+        id="mouse",
+    ),
+]
 
 
 def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
@@ -51,6 +126,135 @@ def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
             )
         ]
     )
+
+
+@pytest.mark.parametrize(
+    "saved_size", [None, 11, 13, 18], ids=["unset", "small", "saved-13", "large"]
+)
+@pytest.mark.parametrize("touch", _POINTER_CONTEXTS)
+def test_message_font_size_survives_rotation_and_reload(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    saved_size: int | None,
+    touch: bool,
+) -> None:
+    """Built message CSS follows the interface size through rotation and reload."""
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item(
+                "font-assistant",
+                "assistant",
+                "Assistant prose with `inline code`.\n\n- A list item\n\n"
+                "##### A small heading\n\n```text\ncode sample\n```",
+                response_id="font-turn",
+            ),
+            message_item("font-user", "user", "User prose.", response_id="font-turn"),
+        ]
+    )
+    viewports = (
+        [(390, 844), (844, 390), (390, 844)] if touch else [(767, 844), (768, 844), (1280, 844)]
+    )
+    page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
+    page.goto(chat.url)
+    if saved_size is not None:
+        # Seed once, so reload cannot repair an accidentally changed preference.
+        page.evaluate(
+            "size => localStorage.setItem('omnigent:ui-font-size', String(size))", saved_size
+        )
+        page.reload()
+
+    assistant = page.get_by_test_id("assistant-text-section")
+    prose = [page.locator('[data-role="user"] p'), assistant.locator("p").first]
+    prose.extend([assistant.locator("li"), assistant.locator('[data-streamdown="heading-5"]')])
+    for width, height in viewports:
+        page.set_viewport_size({"width": width, "height": height})
+        for reload in (False, True):
+            if reload:
+                page.reload()
+            assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
+            interface_px = saved_size if saved_size is not None else (15 if width < 768 else 14)
+            message_px = interface_px
+            for element in prose:
+                expect(element).to_have_css("font-size", f"{message_px}px")
+            expect(prose[1]).to_have_css("line-height", f"{message_px * 1.8:g}px")
+            for selector in ('[data-streamdown="inline-code"]', _CODE_BODY):
+                expect(assistant.locator(selector)).to_have_css(
+                    "font-size", f"{message_px * 0.875:g}px"
+                )
+            expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
+                "font-size", f"{interface_px}px"
+            )
+            assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") == (
+                None if saved_size is None else str(saved_size)
+            )
+
+
+@pytest.mark.parametrize("touch", _POINTER_CONTEXTS)
+def test_large_message_fallback_keeps_message_font_size(
+    page: Page, chat_session_contract: ChatSessionContract, touch: bool
+) -> None:
+    """Message fallbacks follow the mobile body tier and desktop caption tier."""
+    text = "Long prose. " * 5_000 + "VISIBLE_FALLBACK_TAIL"
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item("large-assistant", "assistant", text, response_id="large-turn"),
+            message_item("large-user", "user", text, response_id="large-turn"),
+        ]
+    )
+    viewports = [(390, 844), (844, 390)] if touch else [(1280, 844)]
+    page.set_viewport_size({"width": viewports[0][0], "height": viewports[0][1]})
+    page.goto(chat.url)
+    page.get_by_role("button", name=re.compile(r"^Show full prompt")).click()
+    for width, height in viewports:
+        page.set_viewport_size({"width": width, "height": height})
+        assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
+        for scope in ('[data-role="user"]', '[data-testid="assistant-text-section"]'):
+            fallback = page.locator(f"{scope} .whitespace-pre-wrap.break-all")
+            expect(fallback).to_contain_text("VISIBLE_FALLBACK_TAIL")
+            expected_px = (15 if width < 768 else 14) if touch else 13
+            expect(fallback).to_have_css("font-size", f"{expected_px}px")
+
+
+@pytest.mark.only_browser("chromium")
+@pytest.mark.browser_context_args(has_touch=False, is_mobile=False)
+def test_custom_browser_font_default_matches_rendered_sizes_and_settings(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """A larger browser default moves the rem breakpoint for both CSS and Settings."""
+    initial_size = page.evaluate("parseInt(getComputedStyle(document.documentElement).fontSize)")
+    cdp = page.context.new_cdp_session(page)
+    try:
+        cdp.send("Page.setFontSizes", {"fontSizes": {"standard": 20}})
+        assert page.evaluate("getComputedStyle(document.documentElement).fontSize") == "20px"
+        chat = chat_session_contract
+        chat.set_items(
+            [
+                message_item(
+                    "custom-assistant", "assistant", "Assistant prose.", response_id="custom"
+                ),
+                message_item("custom-user", "user", "User prose.", response_id="custom"),
+            ]
+        )
+        page.set_viewport_size({"width": 800, "height": 844})
+        page.goto(chat.url)
+        assert not page.evaluate("matchMedia('(min-width: 48rem)').matches")
+        assert not page.evaluate("matchMedia('(pointer: coarse)').matches")
+        for selector in ('[data-role="user"] p', '[data-testid="assistant-text-section"] p'):
+            expect(page.locator(selector)).to_have_css("font-size", "15px")
+        expect(page.get_by_role("textbox", name="Message the agent", exact=True)).to_have_css(
+            "font-size", "15px"
+        )
+        page.goto(f"{chat.contract.base_url}/settings/appearance")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_value("15")
+        expect(page.get_by_test_id("ui-font-size-input")).to_have_css("font-size", "15px")
+        assert page.evaluate("localStorage.getItem('omnigent:ui-font-size')") is None
+    finally:
+        try:
+            cdp.send("Page.setFontSizes", {"fontSizes": {"standard": initial_size}})
+        finally:
+            cdp.detach()
 
 
 def _position_code_block(block: Locator) -> None:
@@ -167,17 +371,17 @@ def test_mermaid_fence_loads_its_chunk_and_renders_svg(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """The built SPA serves Mermaid's lazy chunk and renders a real diagram."""
+    """The built SPA serves Mermaid's lazy chunk and renders every label inside its box."""
     chat = chat_session_contract
-    _seed_assistant_message(
-        chat,
-        "```mermaid\nflowchart LR\n  A[Client] --> B[Server]\n```",
-    )
+    _seed_assistant_message(chat, _LONG_LABEL_MERMAID)
     page.goto(chat.url)
 
     block = page.locator('[data-streamdown="mermaid-block"]').first
     expect(block).to_be_visible(timeout=20_000)
-    expect(block.locator("svg[aria-roledescription]")).to_be_visible(timeout=20_000)
+    diagram = block.locator("svg[aria-roledescription]")
+    expect(diagram).to_be_visible(timeout=20_000)
+    page.evaluate("() => document.fonts.ready")
+    assert diagram.evaluate(_CLIPPED_MERMAID_LABELS) == []
 
 
 @pytest.mark.parametrize("diagram", ["semicolons", "separators", "invalid"])
@@ -225,6 +429,57 @@ def test_mermaid_recovery_uses_the_real_browser_renderer(
         )
         expect(escaped).to_contain_text("one semicolon escaped as #59; (first on line 3)")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
+
+
+def test_streaming_mermaid_shows_its_source_until_the_diagram_draws(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A Mermaid fence streams as code, and its diagram replaces the code once, already drawn.
+
+    Drawing each partial source moved the text around it on every update, and an
+    empty box and a spinner showed before each first drawing.
+    """
+    chat = chat_session_contract
+    response_id = "streamed-diagram"
+    user = message_item("streamed-diagram-user", "user", "Draw the flow.", response_id=response_id)
+    chat.set_items([user])
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": "Here is the flow:\n\n"}})
+    expect(page.locator('[role="log"] p', has_text="Here is the flow")).to_be_visible(
+        timeout=10_000
+    )
+    page.evaluate(_SAMPLE_DIAGRAM_FRAMES)
+    for delta in ["```mermaid\n", *_STREAMED_MERMAID_LINES, "```\n\nThat's the flow.\n"]:
+        chat.emit({"event": "response.output_text.delta", "data": {"delta": delta}})
+        page.wait_for_timeout(300)
+    expect(page.locator('[role="log"] svg[id^="mermaid-"]')).to_be_visible(timeout=10_000)
+    page.wait_for_timeout(300)
+
+    frames = page.evaluate("() => window.__diagramFrames")
+    early = [frame["height"] for frame in frames if frame["diagram"] and not frame["drawn"]]
+    assert not early, f"the diagram's box showed before it drew: {early}"
+    shown = [frame for frame in frames if frame["source"] or frame["drawn"]]
+    assert shown, "neither the source nor the diagram showed"
+    after_first = frames[frames.index(shown[0]) :]
+    assert all(frame["source"] or frame["drawn"] for frame in after_first), (
+        "a frame showed neither the source nor the diagram"
+    )
+    kinds = [frame["diagram"] for frame in shown]
+    assert kinds == sorted(kinds), "the source showed again after the diagram"
+    source = [frame["height"] for frame in shown if not frame["diagram"]]
+    diagram = [frame["height"] for frame in shown if frame["diagram"]]
+    grew = len(set(source)) > 1 and source == sorted(source)
+    assert grew, f"the source didn't grow as it streamed: {source}"
+    assert max(diagram) - min(diagram) <= 1, f"the diagram changed size once shown: {diagram}"
 
 
 @pytest.mark.parametrize("activation", ["click", "keyboard"])
@@ -562,6 +817,68 @@ def test_worked_fold_forms_without_jolting_the_answer(
     )
 
 
+def test_streamed_reply_stays_mounted_as_its_turn_commits_and_ends(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A streamed reply keeps its elements, and the reader's selection, through its turn.
+
+    The relay commits the tool call that closed the text, then stamps the text's id,
+    and the turn ends and folds its trace. None of these may rebuild the reply's markdown.
+    """
+    chat = chat_session_contract
+    response_id = "mounted-reply"
+    text = "I'll read the file first. The names are stored one per line."
+    user = message_item("mounted-reply-user", "user", "Read the file.", response_id=response_id)
+    first = message_item("mounted-reply-text", "assistant", text, response_id=response_id)
+    call, output = tool_call_items(
+        "call-mounted-reply",
+        "shell",
+        {"command": "cat names.txt"},
+        "ada\n",
+        response_id=response_id,
+    )
+    chat.set_items([user])
+    chat.update_session(status="running")
+    open_live(page, chat)
+    chat.emit_busy(response_id)
+    chat.emit(
+        {
+            "event": "response.created",
+            "data": {"id": response_id, "status": "in_progress", "output": []},
+        }
+    )
+    # The stream holds back a trailing partial word, so match the words already shown.
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": text}})
+    first_paragraph = page.locator('[role="log"] p', has_text="stored one per")
+    expect(first_paragraph).to_be_visible(timeout=10_000)
+    first_paragraph.evaluate("(p) => { window.__first = p; getSelection().selectAllChildren(p); }")
+
+    for item in (call, first, output):
+        chat.emit({"event": "response.output_item.done", "data": {"item": item}})
+    answer = "Done. There are two names in the file."
+    chat.emit({"event": "response.output_text.delta", "data": {"delta": answer}})
+    last_paragraph = page.locator('[role="log"] p', has_text="two names in")
+    expect(last_paragraph).to_be_visible(timeout=10_000)
+    last_paragraph.evaluate("(p) => { window.__last = p; }")
+    chat.emit(
+        {
+            "event": "response.completed",
+            "data": {"id": response_id, "status": "completed", "output": []},
+        }
+    )
+    chat.emit_idle(response_id)
+    expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=10_000)
+    expect(page.get_by_test_id("turn-worked-fold")).to_have_count(1, timeout=15_000)
+    expect(page.locator(".turn-fold-content")).to_be_hidden(timeout=15_000)
+
+    assert first_paragraph.evaluate("(p) => p === window.__first"), "the first message was rebuilt"
+    assert last_paragraph.evaluate("(p) => p === window.__last"), "the answer was rebuilt"
+    assert page.evaluate(
+        "() => !getSelection().isCollapsed && getSelection().containsNode(window.__first, true)"
+    ), "the reader's selection was cleared"
+
+
 _ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"
 _PR_ERROR = "Error: 422 Validation Failed: A pull request already exists"
 _ISSUE_DESCRIPTION = (
@@ -570,9 +887,11 @@ _ISSUE_DESCRIPTION = (
     "1. Show added and removed line counts.\n2. Show display names for MCP servers."
 )
 
+_LONG_TOOL_PATH = "/workspace/" + "long_directory/" * 12 + "notes.md"
+
 
 def _seed_tool_calls(chat: ChatSessionContract) -> None:
-    """One settled turn: a plan update, an MCP lookup, and a failing MCP call."""
+    """One settled turn with a plan, MCP outcomes, a long read and a counted edit."""
     response_id = "tool-rows-response"
     issue = {
         "id": "OMNI-12243",
@@ -612,6 +931,24 @@ def _seed_tool_calls(chat: ChatSessionContract) -> None:
             _PR_ERROR,
             response_id=response_id,
         ),
+        *tool_call_items(
+            "call-read",
+            "Read",
+            {"file_path": _LONG_TOOL_PATH},
+            "# File opened from a tool row",
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-long-edit",
+            "Edit",
+            {
+                "file_path": _LONG_TOOL_PATH,
+                "old_string": "old line\n",
+                "new_string": "new line\nsecond line\n",
+            },
+            f"The file {_LONG_TOOL_PATH} has been updated successfully.",
+            response_id=response_id,
+        ),
         message_item(
             "tool-rows-assistant", "assistant", "The PR already exists.", response_id=response_id
         ),
@@ -619,15 +956,41 @@ def _seed_tool_calls(chat: ChatSessionContract) -> None:
     chat.set_items(list(reversed(chronological)))
 
 
-@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+@pytest.mark.parametrize(
+    ("width", "app_kind"),
+    [
+        pytest.param(1280, None, id="desktop"),
+        pytest.param(390, None, id="mobile-browser"),
+        pytest.param(
+            320,
+            "android",
+            id="android-app-320",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+        pytest.param(
+            390,
+            "ios",
+            id="ios-app-390",
+            marks=pytest.mark.browser_context_args(has_touch=True, is_mobile=True),
+        ),
+    ],
+)
 def test_tool_rows_read_as_actions_with_their_outcome(
     page: Page,
     chat_session_contract: ChatSessionContract,
     width: int,
+    app_kind: str | None,
 ) -> None:
     """Tool rows show a humanized title and MCP server, with details behind the expand."""
     chat = chat_session_contract
     _seed_tool_calls(chat)
+    environment_api = f"/v1/sessions/{chat.session_id}/resources/environments/default"
+    chat.contract.json(environment_api, {"metadata": {"root": "/browser-workspace"}})
+    for resource in ("changes", "filesystem"):
+        chat.contract.json(f"{environment_api}/{resource}", list_payload([]))
+    chat.contract.json(f"/v1/sessions/{chat.session_id}/comments", [])
+    if app_kind:
+        page.add_init_script(f"window.omnigentNative = {json.dumps({'kind': app_kind})}")
     page.set_viewport_size({"width": width, "height": 844})
     page.goto(chat.url)
 
@@ -635,7 +998,7 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     worked = page.get_by_role("button", name=re.compile(r"^Worked"))
     expect(worked).to_have_attribute("aria-expanded", "false")
     worked.click()
-    page.get_by_text("Called 3 tools", exact=True).click()
+    page.get_by_text("Read 1 file, edited 1 file, called 3 other tools", exact=True).click()
 
     plan = page.get_by_role("button", name=re.compile(r"^Manage todo list"))
     expect(plan).to_contain_text("write · 2 items")
@@ -705,6 +1068,57 @@ def test_tool_rows_read_as_actions_with_their_outcome(
         "codes => codes.map(code => getComputedStyle(code).fontSize)"
     )
     assert set(code_sizes) == {label_size}, (label_size, code_sizes)
+
+    issue.click()
+    read = page.get_by_role("button", name=f"Read {_LONG_TOOL_PATH}", exact=True)
+    edit = page.get_by_role("button", name=re.compile(r"^Edit "))
+    counts = edit.get_by_test_id("tool-line-counts")
+    expect(counts).to_have_text("+2 -1")
+    for row in (read, edit):
+        link = row.get_by_role("link", name=_LONG_TOOL_PATH, exact=True)
+        row.scroll_into_view_if_needed()
+        geometry = link.evaluate("""link => {
+            const path = link.getBoundingClientRect();
+            const title = link.parentElement.getBoundingClientRect();
+            const verb = link.parentElement.firstElementChild.getBoundingClientRect();
+            const count = link.closest('button').querySelector('[data-testid="tool-line-counts"]');
+            return {path: path.toJSON(), title: title.toJSON(), verb: verb.toJSON(),
+                counts: count?.getBoundingClientRect().toJSON(),
+                visiblePathWidth: Math.min(path.right, title.right) - path.left};
+        }""")
+        # The path must retain a readable prefix beside its verb, not disappear atomically.
+        assert geometry["visiblePathWidth"] >= 44, geometry
+        if app_kind:
+            assert geometry["path"]["height"] >= 44, geometry
+            assert geometry["path"]["width"] >= 44, geometry
+            assert geometry["path"]["left"] >= geometry["verb"]["right"], geometry
+            assert geometry["path"]["right"] <= geometry["title"]["right"] + 1, geometry
+        if geometry["counts"]:
+            assert geometry["counts"]["left"] >= geometry["title"]["right"], geometry
+            assert geometry["counts"]["right"] <= width, geometry
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    file_content = "# File opened from a tool row"
+    chat.contract.json(
+        f"{environment_api}/filesystem/{_LONG_TOOL_PATH.lstrip('/')}",
+        {
+            "object": "session.environment.filesystem.file_content",
+            "path": _LONG_TOOL_PATH,
+            "content": file_content,
+            "content_type": "text/markdown",
+            "encoding": "utf-8",
+            "bytes": len(file_content),
+        },
+    )
+    link = edit.get_by_role("link", name=_LONG_TOOL_PATH, exact=True)
+    if app_kind:
+        link.tap()
+    else:
+        link.click()
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
+        "File opened from a tool row"
+    )
+    expect(edit).to_have_attribute("aria-expanded", "false")
 
 
 _PATCH_CHANGES = [
@@ -856,3 +1270,26 @@ def test_failed_edit_rows_show_their_error(
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
     declined.click()
     expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()
+
+
+def test_automation_context_is_hidden_from_transcript(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+
+    chat = chat_session_contract
+    chat.set_items(
+        [
+            message_item(
+                "automation-task",
+                "user",
+                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                response_id="automation-turn",
+            )
+        ]
+    )
+    page.goto(chat.url)
+    user = page.locator('[data-role="user"]')
+    expect(user).to_contain_text("Summarize today's changes.")
+    expect(user).not_to_contain_text("no one is watching")
+    expect(user).not_to_contain_text("omnigent-automation-context")
