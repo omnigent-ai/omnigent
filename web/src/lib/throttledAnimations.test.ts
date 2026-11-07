@@ -3,7 +3,13 @@ import { ANIMATION_STEP_MS, throttleAnimations } from "./throttledAnimations";
 
 function fakeAnimation(iterations: number) {
   return {
-    currentTime: null as number | null,
+    seeks: [] as number[],
+    get currentTime(): number | null {
+      return this.seeks.at(-1) ?? null;
+    },
+    set currentTime(time: number) {
+      this.seeks.push(time);
+    },
     pause: vi.fn(),
     effect: { getTiming: () => ({ iterations }) },
   };
@@ -57,7 +63,7 @@ describe("throttleAnimations", () => {
     throttleAnimations(animatedElement([shared]));
     vi.advanceTimersByTime(ANIMATION_STEP_MS);
 
-    expect(shared.pause).toHaveBeenCalledTimes(1);
+    expect(shared.seeks).toEqual([1234]);
   });
 
   it("skips steps while the document is hidden", () => {

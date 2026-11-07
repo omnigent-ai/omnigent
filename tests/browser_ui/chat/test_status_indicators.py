@@ -190,8 +190,15 @@ def test_bare_idle_clears_the_live_working_indicator(
     )
     body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
     assert working_font == body_font
+    shimmer = working.locator(".text-shimmer").element_handle()
+    started = shimmer.evaluate("element => getComputedStyle(element).backgroundPosition")
     frames_per_second = _presented_frames_per_second(page, 3)
     assert 5 <= frames_per_second < 30, f"a waiting session drew {frames_per_second:.1f} frames/s"
+    page.wait_for_function(
+        f"element => getComputedStyle(element).backgroundPosition !== {json.dumps(started)}",
+        arg=shimmer,
+        timeout=2_000,
+    )
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
