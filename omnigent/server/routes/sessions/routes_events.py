@@ -206,6 +206,7 @@ from omnigent.server.routes._sessions.helpers import (
     _get_runner_client,
     _get_runner_client_for_resource_access,
     _handle_external_session_todos,
+    _HostLaunchAttempt,
     _is_codex_native_subagent,
     _is_devin_native_subagent,
     _launch_runner_on_host,
@@ -3176,10 +3177,17 @@ def register_events_routes(
                 # For SDK/non-native sub-agents the parent runner already
                 # holds the child's state — no re-initialization needed.
                 _runner_needs_session_init = _is_native_terminal_session(conv)
+        source_launch_attempt: _HostLaunchAttempt | None = None
         if runner_client is None:
             # Side chats share the source's runner and have no host. A categorical
             # source relaunch refusal consumes the message with its actionable
             # reason, like the host-bound relaunch below.
+            source_wait_started = time.monotonic()
+
+            def observe_source_launch(attempt: _HostLaunchAttempt | None) -> None:
+                nonlocal source_launch_attempt
+                source_launch_attempt = attempt
+
             try:
                 runner_client, conv = await _recover_side_chat_runner_via_source(
                     conv,
@@ -3189,8 +3197,25 @@ def register_events_routes(
                     user_id=user_id,
                     permission_store=permission_store,
                     raise_host_refusal=True,
+                    on_host_launch=observe_source_launch,
                 )
             except OmnigentError as exc:
+                if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
+                    side_chat_source = await _unrecoverable_side_chat_source(
+                        conv, conversation_store, runner_router
+                    )
+                    offline_host_id = await _session_offline_host_id(
+                        side_chat_source or conv, request.app.state, conversation_store
+                    )
+                    if offline_host_id is not None:
+                        _refuse_offline_host_send(
+                            headers=request.headers,
+                            session_id=session_id,
+                            runner_id=conv.runner_id,
+                            host_id=offline_host_id,
+                            waited_s=time.monotonic() - source_wait_started,
+                        )
+                    raise
                 if exc.code not in (
                     ErrorCode.HARNESS_NOT_CONFIGURED,
                     ErrorCode.WORKSPACE_MISSING,
@@ -3217,8 +3242,12 @@ def register_events_routes(
                 _runner_needs_session_init = True
         # Track the host's launch verdict for the unavailable response below.
         relaunched_runner_id: str | None = None
-        relaunched_launch_acknowledged = False
-        relaunched_launch_refused = False
+        relaunched_launch_acknowledged = (
+            source_launch_attempt is not None and source_launch_attempt.acknowledged
+        )
+        relaunched_launch_refused = source_launch_attempt is not None and bool(
+            source_launch_attempt.error or source_launch_attempt.error_code
+        )
         # The host's launch-refusal reason and whether THIS requester may
         # see it verbatim. Kept out of runner_exit_reports on purpose: that
         # store also feeds the unscoped session-snapshot path
@@ -3497,16 +3526,15 @@ def register_events_routes(
                 )
                 host_offline = offline_host_id is not None
                 if (
-                    conv.host_id is not None
-                    and conv.kind != "sub_agent"
-                    and not exit_cause
+                    not exit_cause
                     and not host_offline
                     and not relaunched_launch_acknowledged
                     and not relaunched_launch_refused
+                    and await asyncio.to_thread(routing_host_id, runner_owner, conversation_store)
+                    is not None
                 ):
-                    # A connected host that never took the launch shows no runner failed
-                    # to start. Refuse the send so the client keeps the message, as for a
-                    # dropped tunnel, instead of consuming it into a failed turn.
+                    # The routing host also owns side chats and sub-agents. Without
+                    # a launch verdict, keep their inputs with the caller to retry.
                     raise OmnigentError(
                         "The host for this session is not responding. "
                         "Wait for it to reconnect and send the message again.",

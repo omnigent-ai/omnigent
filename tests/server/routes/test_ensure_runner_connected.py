@@ -60,16 +60,19 @@ async def test_returns_existing_client_without_waking(monkeypatch: pytest.Monkey
     monkeypatch.setattr(orchestration, "_launch_runner_on_host", _boom)
 
     conv = _conv(runner_id="runner_1")
+    observed_launches: list[Any] = []
     client, out_conv = await orchestration.ensure_runner_connected(
         session_id="conv_1",
         conv=conv,
         app_state=SimpleNamespace(),
         conversation_store=_Store(conv),
         runner_router=None,
+        on_host_launch=observed_launches.append,
     )
 
     assert client is sentinel
     assert out_conv is conv
+    assert observed_launches == [None]
 
 
 @pytest.mark.asyncio
@@ -109,18 +112,21 @@ async def test_launches_runner_on_live_host_then_connects(
     host_registry = SimpleNamespace(get=lambda _hid: object())
     app_state = SimpleNamespace(host_registry=host_registry, tunnel_registry=None)
 
+    observed_launches: list[Any] = []
     client, _ = await orchestration.ensure_runner_connected(
         session_id="conv_1",
         conv=conv,
         app_state=app_state,
         conversation_store=_Store(conv),
         runner_router=None,
+        on_host_launch=observed_launches.append,
     )
 
     assert launched.get("called") is True
     # The connect wait must target the freshly-launched runner id.
     assert waited["runner_id"] == "runner_new"
     assert client is connected
+    assert observed_launches == [None, launch_attempt]
 
 
 @pytest.mark.asyncio
