@@ -1,5 +1,6 @@
 "use client";
 
+import { throttleAnimations } from "@/lib/throttledAnimations";
 import { cn } from "@/lib/utils";
 import type { CSSProperties, ElementType } from "react";
 import { createElement, memo, useMemo } from "react";
@@ -27,6 +28,7 @@ const ShimmerComponent = ({
   return createElement(
     Component,
     {
+      ref: throttleAnimations,
       // `text-shimmer` is applied outside cn()/tailwind-merge: twMerge parses it
       // as a text-color utility and drops it as conflicting with text-transparent,
       // which would silently kill the animation. The class drives the keyframes;
