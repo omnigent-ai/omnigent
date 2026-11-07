@@ -624,6 +624,11 @@ def observe_tool_completion(
         if references:
             pr_reports.notify(session_id)
         shell_result = _shell_result(tool_name, result)
+        reported = shell_result.get("cwd") if isinstance(shell_result, dict) else None
+        if isinstance(reported, str) and reported:
+            # The shell reports where it actually ran, any workdir already applied.
+            cwd = reported
+            arguments = {key: value for key, value in arguments.items() if key != "workdir"}
         if not _failed(shell_result):
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, _facets(), cwd)

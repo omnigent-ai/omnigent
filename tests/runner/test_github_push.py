@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
@@ -344,6 +345,7 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
     _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
     _git("commit", "-q", "--allow-empty", "-m", "other", cwd=other)
     _git("push", "-q", "origin", "HEAD:feature/other", cwd=other)
+    assert push_reflog.recent_pushes([str(work)]) == []
     # Checking out someone else's pushed branch only fetches it.
     clone = work.parent / "clone"
     _git("clone", "-q", str(remote), str(clone), cwd=work.parent)
@@ -358,6 +360,29 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
     later = push_reflog.time.time() + push_reflog.RECENT_PUSH_SECONDS + 60
     monkeypatch.setattr(push_reflog.time, "time", lambda: later)
     assert push_reflog.recent_pushes([str(work)]) == []
+
+
+@pytest.fixture
+def checked_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Directories the observer asks the reflog about; each reports one push with an open PR."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    checked: list[str] = []
+
+    def recent_pushes(candidates: object) -> list[tuple[str, str]]:
+        checked.extend(candidates)  # type: ignore[call-overload]
+        return [("git@github.com:contributor/project.git", "feature/topic")]
+
+    monkeypatch.setattr(github_push, "recent_pushes", recent_pushes)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+    yield checked
+    pool.shutdown(wait=True)
 
 
 @pytest.mark.parametrize(
@@ -376,42 +401,43 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
     ],
 )
 def test_native_hook_checks_the_directories_the_command_ran_in(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
+    checked_directories: list[str],
     cwd: str | None,
     arguments: dict[str, str],
     directories: list[str],
 ) -> None:
-    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
-    checked: list[str] = []
-
-    def recent_pushes(candidates: object) -> list[tuple[str, str]]:
-        checked.extend(candidates)  # type: ignore[call-overload]
-        return [("git@github.com:contributor/project.git", "feature/topic")]
-
-    monkeypatch.setattr(github_push, "recent_pushes", recent_pushes)
-    row = {
-        "state": "open",
-        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
-        "html_url": PR_URL,
-    }
-    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
-        pr_observer.observe_hook(
-            "conv_hook",
-            {
-                "hook_event_name": "PostToolUse",
-                "tool_name": "exec_command" if "cmd" in arguments else "Bash",
-                "tool_input": arguments,
-                "tool_response": {"stdout": "done\n", "stderr": "", "interrupted": False},
-                "tool_use_id": "toolu_push",
-                "cwd": cwd,
-            },
-        )
-    assert list(dict.fromkeys(checked)) == directories
+    pr_observer.observe_hook(
+        "conv_hook",
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec_command" if "cmd" in arguments else "Bash",
+            "tool_input": arguments,
+            "tool_response": {"stdout": "done\n", "stderr": "", "interrupted": False},
+            "tool_use_id": "toolu_push",
+            "cwd": cwd,
+        },
+    )
+    pr_observer._lookup_pool.shutdown(wait=True)
+    assert list(dict.fromkeys(checked_directories)) == directories
     entries = SessionPrRegistry("conv_hook").list()
     assert [entry.url for entry in entries] == ([PR_URL] if directories else [])
+
+
+def test_runner_shell_checks_the_directory_it_reports_running_in(
+    checked_directories: list[str],
+) -> None:
+    """A configured ``os_env.cwd`` with no runner workspace still names the checkout."""
+    observe_tool_completion(
+        "conv_shell",
+        tool_name="sys_os_shell",
+        arguments={"command": "./push.sh"},
+        result=json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"}),
+        call_id="shell_push",
+        source="runner_shell",
+    )
+    pr_observer._lookup_pool.shutdown(wait=True)
+    assert checked_directories == ["/repo"]
+    assert [entry.url for entry in SessionPrRegistry("conv_shell").list()] == [PR_URL]
 
 
 def test_reflog_read_does_not_run_a_configured_signature_verifier(
