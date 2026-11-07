@@ -115,13 +115,18 @@ function host(overrides: Partial<Host> = {}): Host {
   } as Host;
 }
 
-// Mirrors fetchHosts: pickers never see server-managed sandbox hosts; only
-// includeSandbox callers (the action-restrictions lookup) do.
+// Mirrors fetchHosts: pickers hide managed sandboxes except for an explicitly
+// reusable source host; includeSandbox callers see the full list.
 function setHosts(hosts: Host[]): void {
   useHostsMock.mockImplementation(
     (options) =>
       ({
-        data: options?.includeSandbox ? hosts : hosts.filter((h) => !h.sandbox_provider),
+        data: options?.includeSandbox
+          ? hosts
+          : hosts.filter(
+              (candidate) =>
+                !candidate.sandbox_provider || candidate.host_id === options?.sourceHostId,
+            ),
       }) as ReturnType<typeof useHosts>,
   );
 }
@@ -329,10 +334,13 @@ afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
   it.each([
-    ["managed snapshot", null],
-    ["Arclet host", "arclet"],
-    ["Databricks Sandbox host", "lakebox"],
-  ])("offers every destination to a %s source", (source, provider) => {
+    ["managed snapshot", null, true],
+    ["Arclet host", "arclet", true],
+    ["Databricks Sandbox host", "lakebox", true],
+    ["managed snapshot", null, false],
+    ["Arclet host", "arclet", false],
+    ["Databricks Sandbox host", "lakebox", false],
+  ])("offers supported destinations to a %s source (%s, reuse: %s)", (source, provider, reuse) => {
     useSessionMock.mockReturnValue({
       session: {
         hostId: "host_1",
@@ -341,20 +349,34 @@ describe("ForkSessionDialog", () => {
       isLoading: false,
       error: null,
     } as ReturnType<typeof useSession>);
-    setHosts([host({ sandbox_provider: provider }), host({ host_id: "host_2", name: "laptop" })]);
+    setHosts([
+      host({ sandbox_provider: provider }),
+      host({ host_id: "host_2", name: "laptop" }),
+      host({ host_id: "unrelated", sandbox_provider: "arclet" }),
+    ]);
     renderDialog({
       sourceHostId: "host_1",
       sourceWorkspace: "/Users/a/repo",
-      info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_providers: ["lakebox", "arclet"],
+        sibling_sessions: reuse,
+      },
     });
 
     expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
     expect(screen.getByTestId("fork-session-connect-host-toggle")).toBeInTheDocument();
     openHostSelect();
     expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-    // A source's own sandbox host is never offered as an existing destination.
-    if (provider !== null) {
-      expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+    // Embedded managed markers alone do not identify a core sandbox host.
+    expect(screen.queryByTestId("fork-session-host-option-host_1") !== null).toBe(
+      reuse || provider === null,
+    );
+    expect(screen.queryByTestId("fork-session-host-option-unrelated")).not.toBeInTheDocument();
+    if (reuse && provider) {
+      expect(screen.getByTestId("fork-session-host-option-host_1")).toHaveTextContent(
+        "Same sandbox",
+      );
     }
     expect(screen.getByTestId("fork-session-sandbox-option")).toBeInTheDocument();
     expect(screen.getByTestId("fork-session-sandbox-option-arclet")).toBeInTheDocument();
@@ -1029,31 +1051,45 @@ describe("ForkSessionDialog", () => {
     };
 
     it.each([
-      ["plain directory", "/Users/a/repo", null],
-      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch],
-      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null],
-    ])("requires a directory instead of prefilling the missing %s", (_name, workspace, branch) => {
-      renderDialog({ ...RECOVERY, sourceWorkspace: workspace, sourceGitBranch: branch });
+      ["plain directory", "/Users/a/repo", null, null],
+      ["worktree", RECOVERY.sourceWorkspace, RECOVERY.sourceGitBranch, null],
+      ["worktree without a recorded branch", RECOVERY.sourceWorkspace, null, null],
+      ["sandbox directory", "/Users/a/repo", null, "modal"],
+    ])(
+      "requires a directory instead of prefilling the missing %s",
+      (_name, workspace, branch, provider) => {
+        if (provider) setHosts([host({ sandbox_provider: provider })]);
+        renderDialog({
+          ...RECOVERY,
+          sourceWorkspace: workspace,
+          sourceGitBranch: branch,
+          info: { sibling_sessions: true },
+        });
 
-      expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
-      expect(
-        screen.getByText(
-          "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
-        ),
-      ).toBeVisible();
-      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
-      expect(screen.getByTestId("workspace-path-input")).toBeVisible();
-      expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-      // Offered up front, but never prefilled with the missing worktree's branch.
-      expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
-      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
-      expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
-      expect(forkSessionMock).not.toHaveBeenCalled();
-    });
+        expect(
+          screen.getByRole("heading", { name: "Continue in another directory" }),
+        ).toBeVisible();
+        expect(
+          screen.getByText(
+            "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
+          ),
+        ).toBeVisible();
+        expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+          provider ? "Same sandbox" : "serena-laptop",
+        );
+        expect(screen.getByTestId("workspace-path-input")).toBeVisible();
+        expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
+        // Offered up front, but never prefilled with the missing worktree's branch.
+        expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
+        expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
+        expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
+        expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
+          "aria-disabled",
+          "true",
+        );
+        expect(forkSessionMock).not.toHaveBeenCalled();
+      },
+    );
 
     it("rejects a missing chosen path without recreating its worktree or creating a session", async () => {
       checkHostDirectoryMock.mockResolvedValue("The working directory doesn't exist on this host.");
@@ -2103,9 +2139,11 @@ describe("ForkSessionDialog", () => {
       // The first provider row keeps the bare test id; later rows add the provider.
       ["a fresh Arclet", "arclet", "fork-session-sandbox-option-arclet"],
       ["another sandbox provider", "lakebox", "fork-session-sandbox-option"],
+      ["the same sandbox", null, "fork-session-host-option-host_1"],
     ])(
       "forks an Arclet source onto %s beside the connected hosts",
       async (_name, provider, row) => {
+        launchRunnerMock.mockResolvedValue({ runnerId: "fork-runner" });
         useSessionMock.mockReturnValue({
           session: {
             hostId: "host_1",
@@ -2117,7 +2155,7 @@ describe("ForkSessionDialog", () => {
           isLoading: false,
           error: null,
         } as unknown as ReturnType<typeof useSession>);
-        // The source Arclet is filtered from the picker; another machine is a target.
+        // The source Arclet and another machine are both valid targets.
         setHosts([
           host({ sandbox_provider: "arclet" }),
           host({ host_id: "host_2", name: "laptop" }),
@@ -2127,16 +2165,25 @@ describe("ForkSessionDialog", () => {
         } as unknown as Awaited<ReturnType<typeof forkSession>>);
         renderDialog({
           ...CODING,
-          info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_providers: ["lakebox", "arclet"],
+            sibling_sessions: true,
+          },
         });
 
         await act(async () => {});
         expect(screen.queryByTestId("fork-session-unavailable")).not.toBeInTheDocument();
         openHostSelect();
         expect(screen.getByTestId("fork-session-host-option-host_2")).toBeInTheDocument();
-        expect(screen.queryByTestId("fork-session-host-option-host_1")).not.toBeInTheDocument();
+        expect(screen.getByTestId("fork-session-host-option-host_1")).toBeInTheDocument();
         fireEvent.click(screen.getByTestId(row));
-        expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        if (provider) {
+          expect(screen.getByTestId("fork-session-sandbox-repo-row")).toHaveTextContent("universe");
+        } else {
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Same sandbox");
+          expect(screen.queryByTestId("fork-session-sandbox-repo-row")).not.toBeInTheDocument();
+        }
 
         // Picking the sandbox starts a repository-branch lookup that disables Clone until it settles.
         await waitFor(() => expect(screen.getByTestId("fork-session-submit")).not.toBeDisabled());
@@ -2149,10 +2196,22 @@ describe("ForkSessionDialog", () => {
           agentId: undefined,
           upToResponseId: undefined,
           config: {},
-          sandbox: { provider, workspaces: ["https://github.com/databricks-eng/universe"] },
+          sandbox: provider
+            ? { provider, workspaces: ["https://github.com/databricks-eng/universe"] }
+            : undefined,
         });
-        expect(launchRunnerMock).not.toHaveBeenCalled();
-        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        if (provider) {
+          expect(launchRunnerMock).not.toHaveBeenCalled();
+          expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        } else {
+          expect(launchRunnerMock).toHaveBeenCalledWith(
+            "host_1",
+            "conv_fork",
+            CODING.sourceWorkspace,
+            undefined,
+          );
+          expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", CODING.sourceWorkspace);
+        }
         await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
       },
     );
@@ -2204,9 +2263,9 @@ describe("ForkSessionDialog", () => {
         "Arclet Sandbox",
       ],
       [
-        "falls back to a connected host when the server doesn't offer that provider",
+        "reuses the source sandbox when the server no longer offers that provider",
         "modal",
-        "laptop",
+        "Same sandbox",
       ],
     ])("%s", async (_name, sourceProvider, expected) => {
       useSessionMock.mockReturnValue({
@@ -2220,7 +2279,11 @@ describe("ForkSessionDialog", () => {
       ]);
       renderDialog({
         ...CODING,
-        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+        info: {
+          managed_sandboxes_enabled: true,
+          sandbox_providers: ["lakebox", "arclet"],
+          sibling_sessions: true,
+        },
       });
 
       await act(async () => {});

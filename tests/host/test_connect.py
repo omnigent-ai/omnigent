@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -43,6 +44,8 @@ from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     HOST_CAPABILITIES,
     LAUNCH_HANDLER_FAILED_ERROR_CODE,
+    SERVER_CAP_TMUX_READINESS,
+    SERVER_CAPABILITIES_HEADER,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -1850,6 +1853,139 @@ def test_quick_probe_cache_survives_configured_flip_within_ttl(
         assert connect_mod._unavailable_harness_became_ready({"goose-native": False}) is True
     finally:
         connect_mod._invalidate_quick_probe_cache()
+
+
+def _write_fake_tmux(directory: Path, version_line: str) -> None:
+    """Write an executable ``tmux`` that answers ``tmux -V`` with *version_line*."""
+    directory.mkdir(parents=True, exist_ok=True)
+    tmux = directory / "tmux"
+    tmux.write_text(f"#!/bin/sh\necho {shlex.quote(version_line)}\n")
+    tmux.chmod(0o755)
+
+
+async def test_live_host_real_readiness_map_recovers_after_tmux_install(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The periodic full refresh flips a native harness once tmux appears on PATH."""
+    import omnigent._platform as platform
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    devin = bin_dir / "devin"
+    devin.write_text("#!/bin/sh\necho 'devin 1.0.0'\n")
+    devin.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr(platform, "_cli_fallback_dirs", lambda: ())
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._configured_harnesses = await host._probe_configured_harnesses(startup=False)
+    assert host._configured_harnesses is not None
+    assert host._configured_harnesses["devin-native"] == "tmux-unavailable"
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    ws = _RecordingWS()
+
+    _write_fake_tmux(bin_dir, "tmux 3.4")
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=10.0)
+    finally:
+        await _cancel(task)
+
+    refresh = decode_host_frame(ws.sent[0])
+    assert isinstance(refresh, HostHarnessReadinessFrame)
+    assert refresh.configured_harnesses["devin-native"] is True
+    _cleanup_host(host)
+
+
+# What a server without the tmux_readiness capability decodes; its live readiness
+# decoder rejects the whole frame for any other state.
+_PRE_TMUX_SERVER_READINESS = (True, False, "binary-missing", "needs-auth", "version-too-low")
+
+
+@pytest.mark.parametrize(
+    ("server_capabilities", "expected_native"),
+    [(frozenset(), True), (frozenset({SERVER_CAP_TMUX_READINESS}), "tmux-unavailable")],
+    ids=["older-server", "tmux-aware-server"],
+)
+async def test_live_readiness_matches_server_vocabulary(
+    monkeypatch: pytest.MonkeyPatch,
+    server_capabilities: frozenset[str],
+    expected_native: bool | str,
+) -> None:
+    """An older server still gets an unrelated harness's update instead of a rejected frame."""
+    readiness = iter(({"codex": True, "devin-native": "tmux-unavailable"},))
+    monkeypatch.setattr("omnigent.host.connect.gateway_inference_map", dict)
+    monkeypatch.setattr("omnigent.host.connect.configured_harness_map", lambda: next(readiness))
+    monkeypatch.setattr("omnigent.host.connect.HARNESS_READINESS_FULL_REFRESH_INTERVAL_S", 0.01)
+    host = _make_host_process()
+    host._server_capabilities = server_capabilities
+    host._configured_harnesses = {"codex": "needs-auth", "devin-native": "tmux-unavailable"}
+    host._harness_accounts = {}
+    host._gateway_inference = {}
+    ws = _RecordingWS()
+
+    task = asyncio.create_task(host._harness_readiness_loop(ws))
+    try:
+        await asyncio.wait_for(ws.first_send.wait(), timeout=2.0)
+    finally:
+        await _cancel(task)
+
+    sent = json.loads(ws.sent[0])["configured_harnesses"]
+    assert sent == {"codex": True, "devin-native": expected_native}
+    if not server_capabilities:
+        assert all(value in _PRE_TMUX_SERVER_READINESS for value in sent.values())
+    _cleanup_host(host)
+
+
+@pytest.mark.parametrize(
+    ("advertise", "expected_native"),
+    [(False, True), (True, "tmux-unavailable")],
+    ids=["no-capability-header", "capability-header"],
+)
+async def test_hello_readiness_follows_upgrade_capability_header(
+    monkeypatch: pytest.MonkeyPatch,
+    advertise: bool,
+    expected_native: bool | str,
+) -> None:
+    """The host reads the server's upgrade header before encoding its hello."""
+    from websockets.asyncio.server import serve
+
+    received: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+
+    def _process_response(_connection: object, _request: object, response: Response) -> Response:
+        if advertise:
+            response.headers[SERVER_CAPABILITIES_HEADER] = SERVER_CAP_TMUX_READINESS
+        return response
+
+    async def _handler(ws: object) -> None:
+        received.set_result(await ws.recv())  # type: ignore[attr-defined]
+        await ws.wait_closed()  # type: ignore[attr-defined]
+
+    async with serve(_handler, "127.0.0.1", 0, process_response=_process_response) as server:
+        port = server.sockets[0].getsockname()[1]
+        host = HostProcess(
+            identity=HostIdentity(host_id="host_test_connect", name="test-laptop"),
+            server_url=f"http://127.0.0.1:{port}",
+        )
+        host._configured_harnesses = {"devin-native": "tmux-unavailable", "claude-sdk": True}
+        monkeypatch.setattr(host, "_build_connect_headers", dict)
+        monkeypatch.setattr(host, "_initialize_capabilities", AsyncMock())
+        monkeypatch.setattr(host, "_ensure_owner_user_id", AsyncMock())
+        connect_task = asyncio.create_task(host._connect_and_serve())
+        try:
+            hello = json.loads(await asyncio.wait_for(received, timeout=5.0))
+        finally:
+            connect_task.cancel()
+            with contextlib.suppress(BaseException):
+                await connect_task
+            _cleanup_host(host)
+
+    assert hello["configured_harnesses"] == {"devin-native": expected_native, "claude-sdk": True}
 
 
 async def test_live_host_refreshes_harness_readiness_without_reconnect(
@@ -4639,6 +4775,7 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "OMNIGENT_LOG_TTY_FD": "9",
         "OMNIGENT_WRAPPER_COMMAND": "isaac omni",
         "OMNIGENT_DEBUG_LOG_CLIENT_SECRET_COMMAND": "credential-helper --format raw",
+        "OMNIGENT_MCP_AUTH_STATUS_FILE": "/srv/omnigent/mcp-auth-status.json",
     }
 
     env = _build_runner_env(
@@ -4685,6 +4822,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
     # The claude-sdk harness sends this as the Claude CLI entrypoint.
     assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
+    # The executor must read the same MCP sign-in status file the host lists.
+    assert env["OMNIGENT_MCP_AUTH_STATUS_FILE"] == "/srv/omnigent/mcp-auth-status.json"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
@@ -4744,6 +4883,25 @@ def test_build_runner_env_omits_cleanup_owner_without_active_janitor() -> None:
     )
 
     assert RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR not in env
+
+
+def test_build_runner_env_resolves_relative_auth_status_file_in_host_cwd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The runner starts in the session workspace, so a relative override is anchored here."""
+    host_cwd = tmp_path / "host"
+    host_cwd.mkdir()
+    monkeypatch.chdir(host_cwd)
+    env = _build_runner_env(
+        {"OMNIGENT_MCP_AUTH_STATUS_FILE": "status.json"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace=str(tmp_path / "workspace"),
+        parent_pid=42,
+    )
+
+    assert env["OMNIGENT_MCP_AUTH_STATUS_FILE"] == str(Path.cwd() / "status.json")
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Symlink path is POSIX-only.")
@@ -9375,14 +9533,11 @@ async def test_stop_frame_never_overtakes_launch(
             request_id=frame.request_id, status="launched", runner_id="runner_x"
         )
 
-    async def _recording_stop(
-        self_: HostProcess, frame: HostStopRunnerFrame
-    ) -> HostStopRunnerResultFrame:
+    def _recording_claim(self_: HostProcess, frame: HostStopRunnerFrame) -> None:
         order.append("stop")
-        return HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
 
     monkeypatch.setattr(HostProcess, "_handle_launch", _parked_launch)
-    monkeypatch.setattr(HostProcess, "_handle_stop", _recording_stop)
+    monkeypatch.setattr(HostProcess, "_claim_runner_for_stop", _recording_claim)
 
     host._start_frame_task(
         ws,  # type: ignore[arg-type] — duck-typed ws
@@ -9401,6 +9556,66 @@ async def test_stop_frame_never_overtakes_launch(
     release_launch.set()
     await _drain_frame_tasks(host)
     assert order == ["launch:start", "launch:end", "stop"]
+
+
+async def test_slow_runner_exit_does_not_hold_back_later_launches(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A stop waiting on its runner's exit must not queue launches behind it.
+
+    Deleting a batch of sessions and then creating a new batch would
+    otherwise leave each launch waiting for every earlier runner's exit
+    grace, past the server's launch timeout. The stop still reports
+    ``stopped`` only after its runner has exited.
+    """
+    host = _make_host_process()
+    host._maintenance_janitor = SimpleNamespace(trigger=lambda _reason: None)  # type: ignore[assignment]
+    ws = _CollectingWs()
+    exit_started = threading.Event()
+    release_exit = threading.Event()
+    launched = asyncio.Event()
+
+    def _slow_exit(_proc: object) -> None:
+        exit_started.set()
+        release_exit.wait(5.0)
+
+    async def _instant_launch(
+        self_: HostProcess, frame: HostLaunchRunnerFrame
+    ) -> HostLaunchRunnerResultFrame:
+        launched.set()
+        return HostLaunchRunnerResultFrame(
+            request_id=frame.request_id, status="launched", runner_id="runner_new"
+        )
+
+    monkeypatch.setattr(host, "_stop_runner_proc", _slow_exit)
+    monkeypatch.setattr(HostProcess, "_handle_launch", _instant_launch)
+    host._runners["runner_old"] = _RunnerHandle(
+        proc=SimpleNamespace(),  # type: ignore[arg-type] — only the patched exit sees it
+        log_path=tmp_path / "runner-old.log",
+    )
+
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(HostStopRunnerFrame(request_id="rq_stop", runner_id="runner_old")),
+    )
+    assert await asyncio.to_thread(exit_started.wait, 5.0)
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed ws
+        encode_host_frame(
+            HostLaunchRunnerFrame(request_id="rq_launch", binding_token="tok", workspace="/w")
+        ),
+    )
+    try:
+        await asyncio.wait_for(launched.wait(), timeout=2.0)
+        assert "runner_old" not in host._runners
+        assert [decode_host_frame(sent).request_id for sent in ws.sent] == ["rq_launch"]
+    finally:
+        release_exit.set()
+    await _drain_frame_tasks(host)
+
+    stop_result = decode_host_frame(ws.sent[-1])
+    assert isinstance(stop_result, HostStopRunnerResultFrame)
+    assert (stop_result.request_id, stop_result.status) == ("rq_stop", "stopped")
 
 
 @pytest.mark.parametrize("operation", ["stat", "create_dir"])
@@ -9503,7 +9718,7 @@ async def test_filesystem_frame_keeps_host_control_responsive(
 async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """An unrelated queued launch can proceed after the stopped runner exits."""
+    """A forked runner's stop completes and an unrelated queued launch proceeds."""
     host = _make_host_process()
     ws = _CollectingWs()
     manager = ZygoteManager()
@@ -9531,9 +9746,11 @@ async def test_stop_releases_lifecycle_lock_while_forkserver_control_is_busy(
             assert child.poll() is not None
             assert "runner_old" not in host._runners
             replies = [decode_host_frame(raw) for raw in ws.sent]
-            assert [(reply.request_id, reply.status) for reply in replies] == [
-                ("stop", "stopped"),
+            # Launches don't wait for a stopped runner's exit, so the replies
+            # may arrive in either order.
+            assert sorted((reply.request_id, reply.status) for reply in replies) == [
                 ("launch", "launched"),
+                ("stop", "stopped"),
             ]
     finally:
         await _drain_frame_tasks(host)
@@ -10941,6 +11158,62 @@ def test_github_label_ops_are_served_on_host(
     assert edited.status == "ok", edited
     assert edited.payload == {"object": "session.github.pr_labels", "labels": [bug]}
     assert calls[1][-3:] == ["repos/example/one/issues/42/labels", "-f", "labels[]=bug"]
+
+
+def test_github_commit_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists a tracked PR's commits and reads one commit when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    head, commit = "a" * 40, "c" * 40
+    url = "https://github.com/example/one/pull/42"
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if argv[-1] == "repos/example/one/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+            return 0, json.dumps(pr), ""
+        if "--paginate" in argv:
+            author = {"name": "Ada", "date": "2026-11-01T10:00:00Z"}
+            entries = [{"sha": commit, "commit": {"message": "Fix", "author": author}}]
+            return 0, json.dumps([entries]), ""
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="commits",
+                op="github_commits",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "head_sha": head},
+            )
+        )
+        patch = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="commit-diff",
+                op="github_commit_diff",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "commit_sha": commit},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert [entry["sha"] for entry in listed.payload["data"]] == [commit]
+    assert patch.status == "ok", patch
+    assert patch.payload == {"object": "session.github.pr_diff", "patch": "commit-patch"}
 
 
 def test_github_merge_ops_are_served_on_host(

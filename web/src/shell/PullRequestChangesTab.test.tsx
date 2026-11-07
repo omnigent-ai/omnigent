@@ -7,15 +7,37 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Tabs } from "@/components/ui/tabs";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type * as UsePullRequestsModule from "@/hooks/usePullRequests";
 import type { PullRequestChangedFile } from "@/hooks/usePullRequests";
+import type * as ClipboardModule from "@/lib/clipboard";
 import type { ReviewThread } from "@/lib/pullRequestReviewThreads";
+import {
+  unverifiedPatchHash,
+  viewedStorageKey,
+  writeViewed,
+  type PullRequestIdentity,
+} from "@/lib/pullRequestViewed";
+import type * as SonnerModule from "sonner";
 import { PullRequestChangesTab } from "./PullRequestChangesTab";
 import { useChangesViewState } from "./useChangesViewState";
 
+const toast = vi.hoisted(() =>
+  Object.assign(vi.fn(), { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() }),
+);
+const mocks = vi.hoisted(() => ({ copyText: vi.fn(async () => {}), mobile: false }));
+vi.mock("sonner", async (importOriginal) => ({
+  ...(await importOriginal<typeof SonnerModule>()),
+  toast,
+}));
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.mobile }));
+vi.mock("@/lib/clipboard", async (importOriginal) => ({
+  ...(await importOriginal<typeof ClipboardModule>()),
+  copyText: mocks.copyText,
+}));
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof UsePullRequestsModule>()),
   usePullRequestReviewThreadComposer: () => ({
@@ -149,10 +171,11 @@ const diffOf = (path: string) => document.querySelector<HTMLElement>(`[data-path
 const rowOf = (path: string, line: number) =>
   diffOf(path)?.querySelector<HTMLElement>(`[data-line="${line}"]`) ?? null;
 // Scoped to the file's section, so header controls elsewhere in the tab can't match.
+// The overflow trigger also reports aria-expanded, so take the toggle, which has no label.
 const sectionHeader = (path: string, expanded: boolean) =>
-  within(document.querySelector<HTMLElement>(`[data-github-file="${path}"]`)!).getByRole("button", {
-    expanded,
-  });
+  within(document.querySelector<HTMLElement>(`[data-github-file="${path}"]`)!)
+    .getAllByRole("button", { expanded })
+    .find((button) => !button.hasAttribute("aria-label"))!;
 
 describe("PullRequestChangesTab", () => {
   afterEach(() => {
@@ -199,6 +222,7 @@ describe("PullRequestChangesTab", () => {
 
     expect(store.result.current.pathFilter).toBe("");
     expect(screen.getByRole("button", { name: /b\.ts/, expanded: true })).toBeInTheDocument();
+    expect(toast).toHaveBeenCalledWith("Filter cleared to show b.ts");
   });
 
   it("reveals a match in a collapsed file and centres its line", () => {
@@ -479,5 +503,884 @@ describe("PullRequestChangesTab", () => {
         diffOf("b.ts")!.querySelector('[data-review-thread="t1"]'),
       ),
     );
+  });
+});
+
+const PR_URL = "https://github.com/o/r/pull/1";
+const IDENTITY: PullRequestIdentity = {
+  provider: "github",
+  host: "github.com",
+  repository: "o/r",
+  number: 1,
+};
+
+function viewedTab({
+  conversationId,
+  head = "head1",
+  files = [changed("a.ts"), changed("b.ts")],
+  hasMore = false,
+  identity = IDENTITY,
+  threads = [],
+  diffHead = head,
+  listHead = head,
+  patch,
+}: {
+  conversationId: string;
+  head?: string;
+  files?: PullRequestChangedFile[];
+  hasMore?: boolean;
+  identity?: PullRequestIdentity | null;
+  threads?: ReviewThread[];
+  /** The head the loaded patch was fetched for, when it differs from the list's. */
+  diffHead?: string;
+  /** The list's pinned head; null models a provider that doesn't pin revisions. */
+  listHead?: string | null;
+  /** The whole-PR patch the diff reports. Without one, every file is unverified. */
+  patch?: string;
+}) {
+  const props = {
+    conversationId,
+    data: {
+      selected_pr_url: PR_URL,
+      base_ref: "main",
+      capabilities: {},
+      auth: { selected_account: null },
+    },
+    pr: { url: PR_URL, number: 1, head_sha: head, base_sha: "base", state: "OPEN" },
+    prUrl: PR_URL,
+    canEdit: false,
+    selected: true,
+    changes: { data: { available: true, data: files, has_more: hasMore, head_sha: listHead } },
+    prDiff: { data: { head_sha: diffHead, base_sha: "base", patch }, isLoading: false },
+    reviews: {
+      page: { data: threads, head_sha: head, base_sha: "base" },
+      isFetching: false,
+      loadComments: () => {},
+      loadingComments: null,
+    },
+    identity,
+  } as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
+  return (
+    <TooltipProvider>
+      <Tabs value="changes">
+        <PullRequestChangesTab {...props} />
+      </Tabs>
+    </TooltipProvider>
+  );
+}
+
+/** One file's patch with a single hunk whose added line is `line`. */
+function filePatch(file: string, line: string): string {
+  return `diff --git a/${file} b/${file}\nindex 1111111..2222222 100644\n--- a/${file}\n+++ b/${file}\n@@ -1 +1 @@\n-old\n+${line}\n`;
+}
+
+/** A patch for a.ts and b.ts; each file's hunk changes only with its own argument. */
+function twoFilePatch(aLine: string, bLine = "y"): string {
+  return filePatch("a.ts", aLine) + filePatch("b.ts", bLine);
+}
+
+/** The file's section root; its first button is the header's collapse toggle. */
+function fileSection(path: string): HTMLElement {
+  const section = document.querySelector<HTMLElement>(`[data-github-file="${path}"]`);
+  if (!section) throw new Error(`No section for ${path}`);
+  return section;
+}
+
+function isCollapsed(path: string): boolean {
+  return fileSection(path).querySelector("button")?.getAttribute("aria-expanded") === "false";
+}
+
+/** Whether the file has a section in the diff list (titles also match the sidebar row). */
+function isListed(path: string): boolean {
+  return document.querySelector(`[data-github-file="${path}"]`) !== null;
+}
+
+const viewedBox = (path: string) => screen.getByRole("checkbox", { name: `Viewed ${path}` });
+
+describe("PullRequestChangesTab viewed files", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    // A cleared-storage event also drops in-memory fallback values from earlier tests.
+    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+    toast.error.mockClear();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("collapses a file when it is marked viewed and keeps the mark after a reload", () => {
+    const first = render(viewedTab({ conversationId: "viewed-reload" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("Viewed,", { exact: true })).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "Files viewed" })).toHaveAttribute(
+      "aria-valuenow",
+      "50",
+    );
+    first.unmount();
+
+    // A fresh render reads the same localStorage, as a reload would.
+    render(viewedTab({ conversationId: "viewed-reload" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("leaves a file collapsed when its mark is removed", () => {
+    render(viewedTab({ conversationId: "viewed-unmark" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("a.ts"));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("hides viewed files together with the path filter", () => {
+    const store = renderHook(() => useChangesViewState("viewed-hide", PR_URL));
+    const files = [changed("src/a.ts"), changed("src/b.ts"), changed("docs/a.md")];
+    render(viewedTab({ conversationId: "viewed-hide", files }));
+    fireEvent.click(viewedBox("src/a.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    expect(isListed("src/a.ts")).toBe(false);
+    expect(isListed("src/b.ts")).toBe(true);
+    expect(isListed("docs/a.md")).toBe(true);
+
+    act(() => store.result.current.setPathFilter("src"));
+    expect(isListed("docs/a.md")).toBe(false);
+    expect(isListed("src/b.ts")).toBe(true);
+    expect(isListed("src/a.ts")).toBe(false);
+  });
+
+  it("shows an all-viewed state when hiding viewed files leaves nothing", () => {
+    render(viewedTab({ conversationId: "viewed-all" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    expect(screen.getByText("All 2 files viewed")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Show viewed" }));
+
+    expect(screen.getByRole("checkbox", { name: "Hide viewed" })).not.toBeChecked();
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("resets a changed file's mark on a new head and shows a dismissible notice", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-head", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+
+    rerender(
+      viewedTab({ conversationId: "viewed-head", head: "head2", patch: twoFilePatch("newer") }),
+    );
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(screen.getByText("Changed since viewed")).toBeInTheDocument();
+    expect(screen.getByText("0 / 2 files viewed")).toBeInTheDocument();
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    rerender(
+      viewedTab({ conversationId: "viewed-head", head: "head2", patch: twoFilePatch("newer") }),
+    );
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+  });
+
+  it("keeps an unchanged file's mark and collapse on a new head, and flags only the changed file", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-hunks", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    rerender(
+      viewedTab({ conversationId: "viewed-hunks", head: "head2", patch: twoFilePatch("new", "z") }),
+    );
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(viewedBox("b.ts")).not.toBeChecked();
+    expect(screen.getByText("Changed since viewed")).toBeInTheDocument();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+    // The unchanged file stays collapsed; the changed one opens for review.
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(false);
+  });
+
+  it.each([
+    ["absent from the patch", filePatch("a.ts", "new")],
+    ["changed in the patch", twoFilePatch("new", "changed")],
+  ])("does not raise the notice when the list omits a marked b.ts that is %s", (_, headPatch) => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-omitted", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    rerender(
+      viewedTab({
+        conversationId: "viewed-omitted",
+        head: "head2",
+        files: [changed("a.ts")],
+        patch: headPatch,
+      }),
+    );
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.queryByText("Changed since viewed")).toBeNull();
+  });
+
+  it("hides viewed state when the list is not pinned to a head", () => {
+    // A provider that ignores revision pinning can serve a newer patch than the polled head.
+    render(viewedTab({ conversationId: "viewed-unpinned", listHead: null }));
+
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(screen.queryByText(/files viewed/)).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+  });
+
+  it("waits for the list and the patch to agree on a head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-mismatch", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+
+    // The list moved to head2 while the patch on screen is still head1.
+    rerender(
+      viewedTab({
+        conversationId: "viewed-mismatch",
+        head: "head2",
+        diffHead: "head1",
+        patch: twoFilePatch("new"),
+      }),
+    );
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+
+    rerender(
+      viewedTab({ conversationId: "viewed-mismatch", head: "head2", patch: twoFilePatch("newer") }),
+    );
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+  });
+
+  it("clears the notice once every changed file is marked on the new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-new-mark", head: "head1", patch: twoFilePatch("new") }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+    rerender(
+      viewedTab({
+        conversationId: "viewed-new-mark",
+        head: "head2",
+        patch: twoFilePatch("newer", "z"),
+      }),
+    );
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+
+    fireEvent.click(viewedBox("a.ts"));
+    expect(screen.getByText(/changed files lost their viewed marks/)).toBeInTheDocument();
+    fireEvent.click(viewedBox("b.ts"));
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.getByText("2 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("keeps viewed marks when a poll returns the same head", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-same", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+
+    rerender(viewedTab({ conversationId: "viewed-same", head: "head1" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(screen.queryByText(/changed files lost their viewed marks/)).toBeNull();
+    expect(screen.getByText("1 / 2 files viewed")).toBeInTheDocument();
+  });
+
+  it("keeps marks in memory and warns once when storage fails", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("full", "QuotaExceededError");
+    });
+    render(viewedTab({ conversationId: "viewed-storage" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(viewedBox("b.ts"));
+
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(viewedBox("b.ts")).toBeChecked();
+    expect(toast.error).toHaveBeenCalledTimes(1);
+    expect(toast.error).toHaveBeenCalledWith(
+      "Viewed files can't be saved on this device.",
+      expect.objectContaining({ id: "pr-viewed-persistence" }),
+    );
+  });
+
+  it("hides the viewed controls until the PR identity is known", () => {
+    render(viewedTab({ conversationId: "viewed-unknown", identity: null }));
+
+    expect(screen.queryByRole("checkbox", { name: "Viewed a.ts" })).toBeNull();
+    expect(isListed("a.ts")).toBe(true);
+    expect(screen.queryByRole("checkbox", { name: "Hide viewed" })).toBeNull();
+    expect(screen.queryByText(/files viewed/)).toBeNull();
+  });
+
+  it("marks the progress as partial when the file list is truncated", () => {
+    render(viewedTab({ conversationId: "viewed-partial", hasMore: true }));
+
+    expect(screen.getByText("0 / 2 files viewed (partial)")).toBeInTheDocument();
+  });
+
+  it("un-hides a viewed file when navigating to its conversation", () => {
+    const store = renderHook(() => useChangesViewState("viewed-thread", PR_URL));
+    const thread = { id: "t1", path: "a.ts", resolved: false } as ReviewThread;
+    render(viewedTab({ conversationId: "viewed-thread", threads: [thread] }));
+    fireEvent.click(viewedBox("a.ts"));
+    act(() => store.result.current.setHideViewed(true));
+    expect(isListed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+
+    expect(store.result.current.hideViewed).toBe(false);
+    expect(isListed("a.ts")).toBe(true);
+  });
+
+  it("keeps a matching path filter when navigating to a viewed file", () => {
+    const store = renderHook(() => useChangesViewState("viewed-thread-filter", PR_URL));
+    const thread = { id: "t1", path: "a.ts", resolved: false } as ReviewThread;
+    render(viewedTab({ conversationId: "viewed-thread-filter", threads: [thread] }));
+    fireEvent.click(viewedBox("a.ts"));
+    act(() => store.result.current.setPathFilter("a.ts"));
+    act(() => store.result.current.setHideViewed(true));
+    expect(isListed("a.ts")).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Next unresolved conversation" }));
+
+    expect(store.result.current.pathFilter).toBe("a.ts");
+    expect(store.result.current.hideViewed).toBe(false);
+    expect(isListed("a.ts")).toBe(true);
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps files the reader collapsed with Collapse all on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-collapse-all", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(screen.getByRole("button", { name: "Collapse all diffs" }));
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse-all", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+
+  it("expands files collapsed by old marks on a new head but keeps manual collapses", () => {
+    const { rerender } = render(viewedTab({ conversationId: "viewed-collapse", head: "head1" }));
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(fileSection("b.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    // Another tab saved a mark on a.ts at head2. Loading H2 keeps a.ts
+    // collapsed, and that collapse still belongs to the mark: a fresh H3 expands it again.
+    writeViewed(viewedStorageKey(window.location.origin, "alice", IDENTITY), {
+      "a.ts": [unverifiedPatchHash("head2")],
+    });
+    rerender(viewedTab({ conversationId: "viewed-collapse", head: "head2" }));
+    expect(viewedBox("a.ts")).toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse", head: "head3" }));
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+
+  it("expands a mark-collapsed file on a fresh head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-collapse-fresh", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-collapse-fresh", head: "head4" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(false);
+  });
+
+  it("keeps a file the reader collapsed before marking it collapsed on a new head", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-manual-first", head: "head1" }),
+    );
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    fireEvent.click(viewedBox("a.ts"));
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-manual-first", head: "head2" }));
+
+    expect(viewedBox("a.ts")).not.toBeChecked();
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a file collapsed on a new head after the reader expands and recollapses it", () => {
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-manual-again", head: "head1" }),
+    );
+    fireEvent.click(viewedBox("a.ts"));
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    fireEvent.click(fileSection("a.ts").querySelector("button")!);
+    expect(isCollapsed("a.ts")).toBe(true);
+
+    rerender(viewedTab({ conversationId: "viewed-manual-again", head: "head2" }));
+
+    expect(isCollapsed("a.ts")).toBe(true);
+  });
+
+  it("keeps a manual collapse made before identity loads when viewed files seed later", () => {
+    const origin = window.location.origin;
+    writeViewed(viewedStorageKey(origin, "alice", IDENTITY), {
+      "a.ts": [unverifiedPatchHash("head1")],
+    });
+    const { rerender } = render(
+      viewedTab({ conversationId: "viewed-late-identity", identity: null }),
+    );
+    fireEvent.click(fileSection("b.ts").querySelector("button")!);
+    expect(isCollapsed("b.ts")).toBe(true);
+    expect(isCollapsed("a.ts")).toBe(false);
+
+    rerender(viewedTab({ conversationId: "viewed-late-identity" }));
+
+    expect(isCollapsed("a.ts")).toBe(true);
+    expect(isCollapsed("b.ts")).toBe(true);
+  });
+});
+
+describe("PullRequestChangesTab file actions and filter", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.mobile = false;
+    // Viewed marks from other tests share this identity and head, so start from empty storage.
+    localStorage.clear();
+    window.dispatchEvent(new StorageEvent("storage", { key: null }));
+  });
+
+  const ACME_PR_URL = "https://github.com/acme/app/pull/1";
+  const FORK_URL = "https://github.com/fork/app";
+
+  /** The Changes tab's props for one PR; each test uses its own conversation id because view state is module-level. */
+  function tabProps(
+    conversationId: string,
+    {
+      files = [changed("src/app.ts"), changed("src/util.ts"), changed("README.md")],
+      pr = {},
+      threads = [],
+    }: {
+      files?: PullRequestChangedFile[];
+      pr?: Partial<React.ComponentProps<typeof PullRequestChangesTab>["pr"]>;
+      threads?: ReviewThread[];
+    } = {},
+  ) {
+    return {
+      conversationId,
+      identity: null,
+      data: {
+        selected_pr_url: ACME_PR_URL,
+        provider: "github",
+        capabilities: {},
+        auth: { selected_account: null },
+      },
+      pr: {
+        url: ACME_PR_URL,
+        head_sha: "head",
+        base_sha: "base",
+        state: "OPEN",
+        head_repository_url: FORK_URL,
+        ...pr,
+      },
+      prUrl: ACME_PR_URL,
+      canEdit: false,
+      selected: true,
+      changes: {
+        isLoading: false,
+        error: null,
+        data: { available: true, data: files, head_sha: "head", base_sha: "base" },
+      },
+      prDiff: { data: { head_sha: "head", base_sha: "base" }, isLoading: false },
+      reviews: {
+        page: { data: threads, head_sha: "head", base_sha: "base" },
+        isFetching: false,
+        loadComments: () => {},
+        loadingComments: null,
+      },
+    } as unknown as React.ComponentProps<typeof PullRequestChangesTab>;
+  }
+
+  function tree(props: React.ComponentProps<typeof PullRequestChangesTab>) {
+    return (
+      <TooltipProvider>
+        <Tabs value="changes">
+          <PullRequestChangesTab {...props} />
+        </Tabs>
+      </TooltipProvider>
+    );
+  }
+
+  /** The stacked list's sections, by path. */
+  function listedPaths(container: HTMLElement) {
+    return [...container.querySelectorAll("[data-github-file]")].map((element) =>
+      element.getAttribute("data-github-file"),
+    );
+  }
+
+  /** The header button that expands or collapses one file's section. */
+  function fileToggle(container: HTMLElement, path: string) {
+    const toggle = container.querySelector<HTMLElement>(
+      `[data-github-file="${path}"] button[aria-expanded]`,
+    );
+    if (!toggle) throw new Error(`No section for ${path}`);
+    return toggle;
+  }
+
+  function openMenu(path: string) {
+    fireEvent.pointerDown(screen.getByRole("button", { name: `More actions for ${path}` }), {
+      button: 0,
+    });
+  }
+
+  it("filters the tree and list, keeps collapse state, and clears on Escape", () => {
+    const conversationId = "changes-tab-filter";
+    const { container } = render(tree(tabProps(conversationId)));
+    const toggle = () => fileToggle(container, "src/app.ts");
+    expect(toggle()).toHaveAttribute("aria-expanded", "true");
+    fireEvent.click(toggle());
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
+
+    const filter = screen.getByRole("searchbox", { name: "Filter changed files" });
+    fireEvent.change(filter, { target: { value: "UTIL" } });
+    expect(listedPaths(container)).toEqual(["src/util.ts"]);
+    expect(screen.queryAllByTitle("src/app.ts")).toHaveLength(0);
+    expect(screen.getAllByTitle("src/util.ts")).toHaveLength(2);
+
+    fireEvent.change(filter, { target: { value: "src\\" } });
+    expect(listedPaths(container)).toEqual(["src/app.ts", "src/util.ts"]);
+
+    fireEvent.keyDown(filter, { key: "Escape" });
+    expect(filter).toHaveValue("");
+    expect(listedPaths(container)).toEqual(["src/app.ts", "src/util.ts", "README.md"]);
+    expect(toggle()).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("shows an empty state for no matches and clears the filter from it", () => {
+    const conversationId = "changes-tab-empty";
+    const { container } = render(tree(tabProps(conversationId)));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "nothing-here" },
+    });
+    expect(screen.getByText('No changed files match "nothing-here"')).toBeInTheDocument();
+    expect(listedPaths(container)).toEqual([]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear filter" }));
+    expect(listedPaths(container)).toEqual(["src/app.ts", "src/util.ts", "README.md"]);
+  });
+
+  it("matches the previous path of a renamed file", () => {
+    const conversationId = "changes-tab-rename-filter";
+    const renamed = {
+      ...changed("lib/new.ts"),
+      status: "renamed" as const,
+      previous_path: "src/old.ts",
+    };
+    const { container } = render(
+      tree(tabProps(conversationId, { files: [renamed, changed("README.md")] })),
+    );
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "src/old" },
+    });
+    expect(listedPaths(container)).toEqual(["lib/new.ts"]);
+  });
+
+  it("copies the current path and the previous path of a renamed file", async () => {
+    const conversationId = "changes-tab-copy";
+    const renamed = {
+      ...changed("lib/new.ts"),
+      status: "renamed" as const,
+      previous_path: "src/old.ts",
+    };
+    render(tree(tabProps(conversationId, { files: [renamed] })));
+
+    fireEvent.click(screen.getByRole("button", { name: "Copy path lib/new.ts" }));
+    expect(mocks.copyText).toHaveBeenLastCalledWith("lib/new.ts");
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied path"));
+
+    openMenu("lib/new.ts");
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Copy previous path" }));
+    expect(mocks.copyText).toHaveBeenLastCalledWith("src/old.ts");
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Copied previous path"));
+  });
+
+  it("keeps Open on the rendered head after the polled head moves", () => {
+    const conversationId = "changes-tab-open-pinned";
+    const props = tabProps(conversationId, { files: [changed("src/app.ts")] });
+    const { rerender } = render(tree(props));
+    openMenu("src/app.ts");
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `${FORK_URL}/blob/head/src/app.ts`,
+    );
+
+    rerender(
+      tree(
+        tabProps(conversationId, {
+          files: [changed("src/app.ts")],
+          pr: { head_sha: "newer" },
+        }),
+      ),
+    );
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    openMenu("src/app.ts");
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `${FORK_URL}/blob/head/src/app.ts`,
+    );
+  });
+
+  it.each([
+    {
+      provider: "gitlab",
+      display: {
+        id: "gitlab",
+        display_name: "GitLab",
+        request_name: "merge request",
+        number_prefix: "!",
+      },
+      prUrl: "https://gitlab.com/acme/app/-/merge_requests/1",
+      fork: "https://gitlab.com/fork/app",
+      label: "Open in GitLab",
+      href: "https://gitlab.com/fork/app/-/blob/head/src/app.ts",
+    },
+    {
+      provider: "azure_devops",
+      display: {
+        id: "azure_devops",
+        display_name: "Azure DevOps",
+        request_name: "pull request",
+        number_prefix: "#",
+      },
+      prUrl: "https://dev.azure.com/acme/web/_git/app/pullrequest/1",
+      fork: "https://dev.azure.com/fork/web/_git/app",
+      label: "Open in Azure DevOps",
+      href: "https://dev.azure.com/fork/web/_git/app?path=/src/app.ts&version=GChead",
+    },
+  ])("labels and links Open for $provider", ({ provider, display, prUrl, fork, label, href }) => {
+    const props = tabProps(`changes-tab-${provider}`, {
+      files: [changed("src/app.ts")],
+      pr: { url: prUrl, head_repository_url: fork },
+    });
+    props.data = { ...props.data, provider, provider_display: display } as typeof props.data;
+    render(tree(props));
+    openMenu("src/app.ts");
+    expect(screen.getByRole("menuitem", { name: label })).toHaveAttribute("href", href);
+  });
+
+  it("disables Open when the list reports no pinned revision, even with a polled head", () => {
+    const conversationId = "changes-tab-open-unpinned";
+    const props = tabProps(conversationId, { files: [changed("src/app.ts")] });
+    props.changes = {
+      ...props.changes,
+      data: { ...props.changes.data, head_sha: undefined, base_sha: undefined },
+    } as typeof props.changes;
+    render(tree(props));
+    openMenu("src/app.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Revision unknown");
+    expect(disabled).not.toHaveAttribute("href");
+  });
+
+  it("disables Open for a deleted file when the list reports no base revision", () => {
+    const conversationId = "changes-tab-open-no-base";
+    const props = tabProps(conversationId, {
+      files: [{ ...changed("old.ts"), status: "deleted" }, changed("src/app.ts")],
+    });
+    props.changes = {
+      ...props.changes,
+      data: { ...props.changes.data, base_sha: undefined },
+    } as typeof props.changes;
+    render(tree(props));
+    openMenu("old.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Revision unknown");
+    expect(disabled).not.toHaveAttribute("href");
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    openMenu("src/app.ts");
+    expect(screen.getByRole("menuitem", { name: /Open in GitHub/ })).toHaveAttribute(
+      "href",
+      `${FORK_URL}/blob/head/src/app.ts`,
+    );
+  });
+
+  it("opens a deleted file at the base revision in the base repository", () => {
+    const conversationId = "changes-tab-open-deleted";
+    render(
+      tree(tabProps(conversationId, { files: [{ ...changed("old.ts"), status: "deleted" }] })),
+    );
+    openMenu("old.ts");
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      `${ACME_PR_URL.split("/pull/")[0]}/blob/base/old.ts`,
+    );
+  });
+
+  it("disables Open for a non-deleted file when the head repository is absent", () => {
+    const conversationId = "changes-tab-open-absent";
+    // An explicit undefined reads like a host that predates the field.
+    render(
+      tree(
+        tabProps(conversationId, {
+          files: [changed("src/app.ts"), { ...changed("old.ts"), status: "deleted" }],
+          pr: { head_repository_url: undefined },
+        }),
+      ),
+    );
+    openMenu("src/app.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Source repository unavailable");
+    expect(disabled).not.toHaveAttribute("href");
+
+    // A deleted file still opens from the base repository at the base revision.
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+    openMenu("old.ts");
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/blob/base/old.ts",
+    );
+  });
+
+  it("shows the revision as unknown when no revision is known", () => {
+    const conversationId = "changes-tab-open-no-revision";
+    const props = tabProps(conversationId, {
+      files: [changed("src/app.ts")],
+      pr: { head_sha: undefined },
+    });
+    props.changes = {
+      ...props.changes,
+      data: { ...props.changes.data, head_sha: undefined, base_sha: undefined },
+    } as typeof props.changes;
+    render(tree(props));
+    openMenu("src/app.ts");
+    const disabled = screen.getByRole("menuitem", { name: /Open in GitHub/ });
+    expect(disabled).toHaveAttribute("data-disabled");
+    expect(disabled).toHaveTextContent("Revision unknown");
+    expect(disabled).not.toHaveAttribute("href");
+  });
+
+  it("puts every file action in the overflow menu on mobile", () => {
+    mocks.mobile = true;
+    try {
+      const conversationId = "changes-tab-mobile";
+      const { container } = render(tree(tabProps(conversationId)));
+      expect(screen.queryByRole("button", { name: "Copy path src/app.ts" })).toBeNull();
+      openMenu("src/app.ts");
+      expect(screen.getByRole("menuitem", { name: "Copy path" })).toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toBeInTheDocument();
+      fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+      // The sidebar starts collapsed on mobile: the filter opens inline above the list.
+      expect(screen.queryByRole("searchbox", { name: "Filter changed files" })).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Show file filter" }));
+      fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+        target: { value: "readme" },
+      });
+      expect(listedPaths(container)).toEqual(["README.md"]);
+      // Hiding the inline filter clears it, so the list is never narrowed out of sight.
+      fireEvent.click(screen.getByRole("button", { name: "Hide file filter" }));
+      expect(screen.queryByRole("searchbox", { name: "Filter changed files" })).toBeNull();
+      expect(listedPaths(container)).toEqual(["src/app.ts", "src/util.ts", "README.md"]);
+    } finally {
+      mocks.mobile = false;
+    }
+  });
+
+  it("reports a failed copy and keeps the sidebar filter open after collapse", async () => {
+    mocks.copyText.mockRejectedValueOnce(new Error("denied"));
+    const conversationId = "changes-tab-copy-failure";
+    render(tree(tabProps(conversationId)));
+    fireEvent.click(screen.getByRole("button", { name: "Copy path src/app.ts" }));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("Couldn’t copy path"));
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "util" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
+    const inline = screen.getByRole("searchbox", { name: "Filter changed files" });
+    expect(inline).toHaveValue("util");
+    // Clearing with Escape must keep the same input mounted, so focus stays in it.
+    fireEvent.keyDown(inline, { key: "Escape" });
+    expect(screen.getByRole("searchbox", { name: "Filter changed files" })).toBe(inline);
+    expect(inline).toHaveValue("");
+  });
+
+  it("closes the inline filter when the sidebar expands again", () => {
+    const { container } = render(tree(tabProps("changes-tab-inline-close")));
+    fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
+    expect(screen.queryByRole("searchbox", { name: "Filter changed files" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "util" },
+    });
+    expect(listedPaths(container)).toEqual(["src/util.ts"]);
+    fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
+    expect(screen.getByRole("searchbox", { name: "Filter changed files" })).toHaveValue("util");
+    fireEvent.keyDown(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      key: "Escape",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
+    fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
+    expect(screen.queryByRole("searchbox", { name: "Filter changed files" })).toBeNull();
+  });
+
+  it("groups threads on filtered-out files apart from earlier conversations", () => {
+    const conversationId = "changes-tab-threads";
+    const threadOn = (id: string, path: string) => ({ id, path, resolved: false }) as ReviewThread;
+    const threads = [
+      threadOn("t-app", "src/app.ts"),
+      threadOn("t-util", "src/util.ts"),
+      threadOn("t-gone", "deleted-upstream.ts"),
+    ];
+    const { container } = render(tree(tabProps(conversationId, { threads })));
+    expect(container.querySelector('[data-review-thread="t-util"]')).not.toBeNull();
+    expect(screen.queryByText("Earlier conversations and unavailable diffs")).not.toBeNull();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "Filter changed files" }), {
+      target: { value: "src/app" },
+    });
+
+    expect(container.querySelector('[data-review-thread="t-app"]')).not.toBeNull();
+    expect(container.querySelector('[data-review-thread="t-util"]')).toBeNull();
+    const earlier = screen.getByText("Earlier conversations and unavailable diffs").parentElement;
+    expect(earlier!.querySelector('[data-review-thread="t-gone"]')).not.toBeNull();
+    expect(earlier!.querySelector('[data-review-thread="t-util"]')).toBeNull();
+  });
+
+  it("keeps threads on viewed files out of the earlier group while hide-viewed is on", () => {
+    const threads = [
+      { id: "t-a", path: "a.ts", resolved: false },
+      { id: "t-b", path: "b.ts", resolved: false },
+    ] as ReviewThread[];
+    const { container } = render(viewedTab({ conversationId: "threads-viewed", threads }));
+    fireEvent.click(viewedBox("b.ts"));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Hide viewed" }));
+
+    expect(container.querySelector('[data-review-thread="t-b"]')).toBeNull();
+    expect(container.querySelector('[data-review-thread="t-a"]')).not.toBeNull();
+    expect(screen.queryByText("Earlier conversations and unavailable diffs")).toBeNull();
   });
 });

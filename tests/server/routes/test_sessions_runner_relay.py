@@ -185,6 +185,7 @@ async def test_runner_relay_ready_waits_for_runner_heartbeat() -> None:
     [request] = requests
     assert request.method == "GET"
     assert request.url.path == "/v1/sessions/a7f039e9f1311474878eb7d4699c1013/stream"
+    assert request.url.params["accepts_inferred_status"] == "true"
     assert SCHEDULED_RUN_HEADER not in request.headers
 
 
@@ -1786,6 +1787,171 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("server_status", ["idle", "failed", "running"])
+@pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
+async def test_relay_applies_an_inferred_reason_only_to_a_running_turn(
+    monkeypatch: pytest.MonkeyPatch, server_status: str, blocked_on: str | None
+) -> None:
+    """
+    A pane-inferred edge cannot reopen a turn a hook already closed.
+
+    The server publishes a Stop or StopFailure hook's status before forwarding
+    it to the runner, so the runner can still infer a reason in that gap.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    gate = asyncio.Event()
+    edge: dict[str, object] = {"type": "session.status", "status": "running", "inferred": True}
+    if blocked_on is not None:
+        edge["blocked_on"] = blocked_on
+    fake_runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(edge)}\n\n"], gate)
+    store = _RecordingLabelStore(live_status=server_status)
+    session_id = "e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7"
+    if server_status == "failed":
+        store.set_labels(
+            session_id,
+            {
+                sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "agent_error",
+                sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "prior failure",
+            },
+        )
+    sessions_module._session_status_cache[session_id] = server_status
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_inferred_reason",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        if server_status == "running":
+            event = await collector.next_event()
+            assert (event.get("status"), event.get("blocked_on")) == ("running", blocked_on)
+        else:
+            await collector.assert_no_event(within=0.2)
+            assert sessions_module._session_status_cache.get(session_id) == server_status
+        if server_status == "failed":
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None and persisted["code"] == "agent_error"
+    finally:
+        gate.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion", ["idle", "failed"])
+@pytest.mark.parametrize("blocked_on", ["terminal prompt", None], ids=["raise", "clear"])
+async def test_completion_racing_an_inferred_reason_stays_final(
+    monkeypatch: pytest.MonkeyPatch, completion: str, blocked_on: str | None
+) -> None:
+    """
+    A hook closing the turn after the relay handles an inferred reason keeps the last word.
+
+    The ordinary path's failure-label write is gated, so an inferred edge sent down that
+    path lets the hook land mid-write and is then published over the completion.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.schemas import ErrorDetail
+
+    label_writes: list[ErrorDetail | None] = []
+    label_write_started = asyncio.Event()
+    release_label_write = asyncio.Event()
+
+    async def gated_label_write(
+        _session_id: str, error: ErrorDetail | None, _store: object, **_kwargs: object
+    ) -> None:
+        label_writes.append(error)
+        label_write_started.set()
+        await release_label_write.wait()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration._persist_session_status_error_labels",
+        gated_label_write,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    release = asyncio.Event()
+    edge: dict[str, Any] = {"type": "session.status", "status": "running", "inferred": True}
+    if blocked_on is not None:
+        edge["blocked_on"] = blocked_on
+    fake_runner = _ScriptedRunnerClient(release, [edge])
+    session_id = "f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8"
+    sessions_module._session_status_cache[session_id] = "running"
+
+    collector = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            session_id,
+            "runner_inferred_race",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=_RecordingLabelStore(live_status="running"),  # type: ignore[arg-type]
+        )
+        assert handle is not None
+        collector = await start_session_stream_collector(session_id)
+        release.set()
+        write_started = asyncio.ensure_future(label_write_started.wait())
+        await asyncio.wait(
+            {handle.task, write_started},
+            timeout=_TASK_TIMEOUT_S,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        write_started.cancel()
+        # The hook lands during a gated label write, or after the relay ends without one.
+        sessions_module._publish_status(
+            session_id,
+            completion,
+            ErrorDetail(code="agent_error", message="hook failure")
+            if completion == "failed"
+            else None,
+        )
+        release_label_write.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+
+        statuses = []
+        while len(statuses) < 2:
+            event = await collector.next_event()
+            if event.get("type") == "session.status":
+                statuses.append((event.get("status"), event.get("blocked_on")))
+        assert statuses == [("running", blocked_on), (completion, None)]
+        assert sessions_module._session_status_cache.get(session_id) == completion
+        assert label_writes == []
+    finally:
+        release.set()
+        release_label_write.set()
+        if collector is not None:
+            await collector.stop()
+        handle = sessions_module._runner_relay_tasks.get(session_id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
+
+
 class _RegisteredRunnerHttpErrorClient:
     """Fake runner client whose transport says the runner is present but every stream open fails.
 
@@ -2958,6 +3124,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
     tell from a real one and the reconnect recovery could not clear.
     """
     from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
 
@@ -2976,6 +3143,8 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
         sessions_module._session_status_cache[session_id] = cached
     if intentional_stop:
         sessions_module._intentional_stop_sessions[session_id] = "runner-offline"
+    store.set_background_work_running(session_id, True, runner_id="runner-offline")
+    session_live_state.configure(store)
 
     try:
         await sessions_module._mark_runner_sessions_offline(
@@ -2984,7 +3153,11 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             store,
             fail_idle_top_level=fail_idle_top_level,
         )
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
 
+        # The departed runner's stored flag is cleared, whatever the turn did.
+        swept = store.get_conversation(session_id)
+        assert swept is not None and swept.background_work_running is False
         status = sessions_module._session_status_cache.get(session_id)
         refreshed = store.get_conversation(session_id)
         assert refreshed is not None
@@ -3007,6 +3180,7 @@ async def test_mark_runner_sessions_offline_only_fails_interrupted_turns(
             assert status == cached
             assert persisted is None
     finally:
+        session_live_state.configure(None)
         sessions_module._intentional_stop_sessions.pop(session_id, None)
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
@@ -3345,6 +3519,7 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     Anchoring ownership to the exiting runner keeps the cause.
     """
     from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.schemas import ErrorDetail
 
@@ -3366,7 +3541,10 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
     )
     # A concurrent reconnect rebinds the row to a replacement before the re-read.
     store.replace_runner_id(conv.id, "runner-replacement")
+    # The replacement reported a background shell through another replica.
+    store.set_background_work_running(conv.id, True)
     sessions_module._session_status_cache[conv.id] = "failed"
+    session_live_state.configure(store)
     try:
         with capture_debug_rows("server") as rows:
             await sessions_module._mark_runner_sessions_offline(
@@ -3375,15 +3553,80 @@ async def test_offline_sweep_preserves_cause_when_session_rebound_mid_sweep(
                 store,
                 fail_idle_top_level=True,
             )
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
         refreshed = store.get_conversation(conv.id)
         assert refreshed is not None
         assert sessions_module._last_task_error_from_labels(refreshed.labels) == original
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         decision = next(row for row in rows if row["event_name"] == "runner_disconnect_decision")
         assert decision["attributes"]["decision"] == "already_failed"
+        # Sweeping the exiting runner leaves the replacement's flag.
+        assert refreshed.background_work_running is True
     finally:
+        session_live_state.configure(None)
         sessions_module._session_status_cache.pop(conv.id, None)
         session_stream.close(conv.id)
+
+
+@pytest.mark.asyncio
+async def test_offline_sweep_keeps_the_flag_a_reconnected_runner_reported(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that reconnects under the same id while the sweep runs keeps its report.
+
+    The sweep handles the first session, the runner reconnects here and resyncs a
+    running shell on the second, then the sweep reaches the second session. Neither
+    this replica's copy nor the stored flag may be cleared.
+    """
+    import time
+
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.schemas import ErrorDetail
+
+    store = SqlAlchemyConversationStore(db_uri)
+    first = store.create_conversation(runner_id="runner-back")
+    second = store.create_conversation(runner_id="runner-back")
+    snapshots = [store.get_conversation(first.id), store.get_conversation(second.id)]
+    assert all(snapshot is not None for snapshot in snapshots)
+    online: set[str] = set()
+
+    class _Router:
+        def runner_is_online(self, runner_id: str) -> bool:
+            return runner_id in online
+
+    decide = orchestration._runner_disconnect_requires_failure
+
+    async def reconnect_during_the_sweep(*args: Any, **kwargs: Any) -> bool:
+        if not online:
+            online.add("runner-back")
+            store.touch_runner_liveness(["runner-back"], now=int(time.time()))
+            sessions_module._set_background_work_running(second.id, True)
+        return await decide(*args, **kwargs)
+
+    monkeypatch.setattr(
+        orchestration, "_runner_disconnect_requires_failure", reconnect_during_the_sweep
+    )
+    monkeypatch.setattr(orchestration, "get_server_runner_router", lambda: _Router())
+    session_live_state.configure(store)
+    try:
+        await sessions_module._mark_runner_sessions_offline(
+            snapshots,  # type: ignore[arg-type]
+            ErrorDetail(code="runner_disconnected", message="Runner disconnected unexpectedly."),
+            store,
+        )
+        session_live_state.submit("drain", lambda: None).result(timeout=10)
+        refreshed = store.get_conversation(second.id)
+        assert refreshed is not None
+        assert refreshed.background_work_running is True
+    finally:
+        session_live_state.configure(None)
+        for conv in (first, second):
+            sessions_module._session_status_cache.pop(conv.id, None)
+            session_stream.close(conv.id)
 
 
 @pytest.mark.asyncio
@@ -3605,6 +3848,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         )
         assert handle is not None
         sessions_module._session_status_cache[session_id] = "running"
+        sessions_module._session_blocked_on_cache[session_id] = "permission prompt"
         shutdown_state.mark_runner_handed_off(runner_id, reason="rebalance")
 
         with capture_debug_rows("server") as rows:
@@ -3614,6 +3858,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
         assert handle.task.exception() is None
         assert session_id not in store.labels
         assert session_id not in sessions_module._session_status_cache
+        assert sessions_module._blocked_on_for(session_id, None) is None
         assert not any(row["event_name"] == "session_turn_failed" for row in rows)
         outcome = next(row for row in rows if row["event_name"] == "runner_stream_disconnected")
         attributes = cast("dict[str, object]", outcome["attributes"])
@@ -3628,6 +3873,7 @@ async def test_relay_relinquishes_a_turn_this_replica_handed_off(
                 await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
         sessions_module._runner_relay_tasks.clear()
         sessions_module._session_status_cache.pop(session_id, None)
+        sessions_module._session_blocked_on_cache.pop(session_id, None)
         session_stream.close(session_id)
 
 

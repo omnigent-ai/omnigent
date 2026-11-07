@@ -609,42 +609,6 @@ class NativeInterruptRunner:
             self._defer_parent_wake_after_native_interrupt(conv_id)
         return Response(status_code=204)
 
-    async def _finalize_confirmed_stop(
-        self, conv_id: str, *, display_name: str, cancel_auto_forwarder: bool
-    ) -> Response:
-        """Tear down a session after its hard-kill is confirmed and report ``cancelled``.
-
-        Shared tail for every stop handler that kills a vendor process directly
-        (``_uniform_stop``, ``_claude_stop``, ``_antigravity_stop``):
-        ``confirmed_cancellation=True`` tells the delivery seam the kill is
-        verified, not merely requested, so it is never overturned by a later
-        completion report racing the teardown.
-        """
-        await self._teardown_session_terminals(conv_id)
-        if cancel_auto_forwarder:
-            await _cancel_auto_forwarder_task(conv_id)
-        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
-        # The kill is confirmed, so this ``cancelled`` is truthful and settles
-        # any interrupt still waiting on its outcome.
-        self.clear_pending_interrupt(conv_id)
-        delivery_ack = self._mark_subagent_terminal_and_wake(
-            conv_id,
-            status="cancelled",
-            output=None,
-            confirmed_cancellation=True,
-        )
-        if not delivery_ack.delivered and (
-            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
-        ):
-            self._logger.warning(
-                "%s-native stop succeeded but sub-agent delivery was "
-                "not confirmed; session=%s reason=%s",
-                display_name,
-                conv_id,
-                delivery_ack.reason,
-            )
-        return Response(status_code=204)
-
     async def _uniform_stop(self, spec: _UniformStop, conv_id: str) -> Response:
         module = importlib.import_module(spec.module)
         try:
@@ -663,9 +627,29 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context=spec.context),
                 },
             )
-        return await self._finalize_confirmed_stop(
-            conv_id, display_name=spec.display_name, cancel_auto_forwarder=True
+        await self._teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output=None,
+            confirmed_cancellation=True,
         )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "%s-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                spec.display_name,
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
 
     async def _claude_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
@@ -717,9 +701,27 @@ class NativeInterruptRunner:
                     "detail": self._client_safe_error_detail(exc, context="claude-native stop"),
                 },
             )
-        return await self._finalize_confirmed_stop(
-            conv_id, display_name="Claude", cancel_auto_forwarder=False
+        await self._teardown_session_terminals(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output=None,
+            confirmed_cancellation=True,
         )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "Claude-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
 
     async def _antigravity_interrupt(self, conv_id: str) -> Response:
         """Deny a pending interaction before cancelling the cascade; Escape is
@@ -859,9 +861,28 @@ class NativeInterruptRunner:
                     ),
                 },
             )
-        return await self._finalize_confirmed_stop(
-            conv_id, display_name="Antigravity", cancel_auto_forwarder=True
+        await self._teardown_session_terminals(conv_id)
+        await _cancel_auto_forwarder_task(conv_id)
+        self._publish_event(conv_id, {"type": "session.status", "status": "idle"})
+        # The kill is confirmed, so this ``cancelled`` is truthful and settles
+        # any interrupt still waiting on its outcome.
+        self.clear_pending_interrupt(conv_id)
+        delivery_ack = self._mark_subagent_terminal_and_wake(
+            conv_id,
+            status="cancelled",
+            output=None,
+            confirmed_cancellation=True,
         )
+        if not delivery_ack.delivered and (
+            delivery_ack.entry is not None or conv_id in self._session_sub_agent_names
+        ):
+            self._logger.warning(
+                "Antigravity-native stop succeeded but sub-agent delivery was "
+                "not confirmed; session=%s reason=%s",
+                conv_id,
+                delivery_ack.reason,
+            )
+        return Response(status_code=204)
 
     async def _codex_interrupt(self, conv_id: str) -> Response:
         from omnigent.harnesses.codex_native.app_server import (

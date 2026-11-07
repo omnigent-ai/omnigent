@@ -1155,6 +1155,50 @@ def codex_resume_current_model_provider(exc: BaseException) -> str | None:
     return current if isinstance(current, str) and current else None
 
 
+def codex_resume_unconfigured_model_provider(exc: BaseException) -> str | None:
+    """
+    Return the thread's provider when ``thread/resume`` refuses it as unconfigured.
+
+    Codex 0.166+ refuses a thread whose recorded provider has no
+    ``[model_providers.X]`` table, even when the resume names a configured
+    provider — e.g. a thread started under ``Databricks`` resumed after the
+    host switched to ``omnigent_databricks``.
+
+    :param exc: The exception raised by the resume request.
+    :returns: The thread's unconfigured provider, e.g. ``"Databricks"``, or
+        ``None`` for any other failure.
+    """
+    if not isinstance(exc, CodexAppServerResponseError) or exc.code != _CODEX_INVALID_REQUEST_CODE:
+        return None
+    data = exc.error.get("data") if isinstance(exc.error, dict) else None
+    if not isinstance(data, dict) or data.get("type") != "modelProviderNotConfigured":
+        return None
+    missing = data.get("modelProvider")
+    return missing if isinstance(missing, str) and missing else None
+
+
+async def _codex_effective_model_provider(client: CodexAppServerClient, cwd: Path) -> str | None:
+    """
+    Read the provider Codex runs for *cwd*, or ``None`` when it cannot be read.
+
+    :param client: Connected app-server client.
+    :param cwd: Working directory whose config layers apply.
+    :returns: The effective provider id, e.g. ``"omnigent_databricks"``.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.request("config/read", {"includeLayers": False, "cwd": str(cwd)}),
+            timeout=_MODEL_PROVIDER_READ_TIMEOUT_SECONDS,
+        )
+    except (CodexAppServerResponseError, OSError, TimeoutError):
+        _logger.warning("Could not read Codex's effective model provider", exc_info=True)
+        return None
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    effective = config.get("model_provider") if isinstance(config, dict) else None
+    return effective if isinstance(effective, str) and effective else None
+
+
 def is_server_draining_error(error: CodexAppServerResponseError) -> bool:
     """Whether Codex explicitly refused this RPC before submitting its input."""
     return (
@@ -1464,6 +1508,18 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     """Recognize both JSON-RPC and serde errors from older parameter schemas."""
     return exc.code == -32602 or (
         exc.code == -32600 and f"unknown field `{field}`" in (exc.message or "")
+    )
+
+
+def codex_rejects_request_method(exc: CodexAppServerResponseError, method: str) -> bool:
+    """Recognize JSON-RPC and serde errors from an app-server that lacks ``method``.
+
+    :param exc: Structured JSON-RPC error returned for the request.
+    :param method: App-server method the request used, e.g. ``"thread/goal/get"``.
+    :returns: ``True`` when the server does not implement the method.
+    """
+    return exc.code == -32601 or (
+        exc.code == -32600 and f"unknown variant `{method}`" in (exc.message or "")
     )
 
 
@@ -1949,6 +2005,7 @@ async def prepare_codex_provider_config(
     cwd: Path,
     env: Mapping[str, str],
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
     client_surface: str | None = None,
     app_server_command: tuple[str, ...] = (),
 ) -> list[str]:
@@ -1958,7 +2015,11 @@ async def prepare_codex_provider_config(
     resolves inherited providers itself only when Omnigent didn't pick the provider.
     """
     overrides = materialize_codex_provider_config(
-        codex_home, config_overrides, retry_policy=retry_policy, client_surface=client_surface
+        codex_home,
+        config_overrides,
+        retry_policy=retry_policy,
+        source_home=source_home,
+        client_surface=client_surface,
     )
     if not _codex_may_inherit_provider(overrides, app_server_command):
         return overrides
@@ -1993,6 +2054,7 @@ async def prepare_codex_provider_config(
         codex_home,
         overrides,
         retry_policy=retry_policy,
+        source_home=source_home,
         client_surface=client_surface,
         effective_providers=providers,
     )
@@ -2640,6 +2702,7 @@ class CodexNativeAppServer:
         self.config_overrides = await prepare_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            source_home=config_source,
             codex_path=self.codex_path,
             cwd=self.cwd,
             env=self.env,
@@ -4105,6 +4168,8 @@ def build_codex_native_server(
         pinned_model = codex_spawn_model(databricks.model) or databricks.model
     if extra_config_overrides:
         config_overrides.extend(extra_config_overrides)
+    # The --remote TUI's launch args do not configure this app-server's MCP tools.
+    config_overrides.extend(codex_mcp_tool_approval_overrides(terminal_launch_args))
     if bypass_sandbox:
         # Mirror the --remote TUI's --dangerously-bypass-approvals-and-sandbox
         # on the app-server threads: never prompt for approval, and run
@@ -4947,39 +5012,22 @@ def normalize_codex_permission_launch_args(
 ) -> list[str]:
     """Complete permission launch args into their effective stance.
 
-    Two normalizations:
-
-    - Legacy Full Access args (a ``default_permissions=":danger-full-access"``
-      profile with no approval policy) gain ``approval_policy="never"``.
-    - The bare default stance — no approval policy, sandbox, permission
-      profile, reviewer, or bypass flag — gains
-      ``approvals_reviewer="auto_review"``. Codex's built-in default routes
-      escalated approvals (e.g. an out-of-workspace write) to the human,
-      which parks web turns on an approval card even though the default
-      permission mode is presented as automatic. ``auto_review`` keeps the
-      workspace-write sandbox and approval boundaries but lets Codex's
-      automatic reviewer settle eligible requests instead of prompting.
-      Any explicit approval/sandbox/reviewer/profile choice wins untouched.
+    Legacy Full Access args (a ``default_permissions=":danger-full-access"``
+    profile with no approval policy) gain ``approval_policy="never"``. Every
+    other stance passes through unchanged, so the bare default runs Codex's own
+    default (or the user's Codex config).
     """
     args = canonical_codex_launch_args(terminal_launch_args or ())
     full_access = False
-    has_permission_profile = codex_config_profile(args) is not None
-    has_reviewer = False
-    has_sandbox = False
     has_approval_policy = "--dangerously-bypass-approvals-and-sandbox" in args
-    explicit_bypass = has_approval_policy
     index = 0
     while index < len(args):
         arg = args[index]
         if arg == "--":
             break
         assignment: str | None = None
-        if arg == "--approve-for-me":
-            has_reviewer = True
-        elif arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
+        if arg in {"--ask-for-approval", "-a"} or arg.startswith(("--ask-for-approval=", "-a=")):
             has_approval_policy = True
-        elif arg in {"--sandbox", "-s"} or arg.startswith(("--sandbox=", "-s=")):
-            has_sandbox = True
         elif arg in {"--config", "-c"} and index + 1 < len(args):
             index += 1
             assignment = args[index]
@@ -4990,25 +5038,11 @@ def normalize_codex_permission_launch_args(
             key = key.strip()
             if key == "approval_policy":
                 has_approval_policy = True
-            elif key == "sandbox_mode":
-                has_sandbox = True
-            elif key == "approvals_reviewer":
-                has_reviewer = True
             elif key == "default_permissions":
-                has_permission_profile = True
                 full_access = _codex_config_string(raw_value) == ":danger-full-access"
         index += 1
     if full_access and not has_approval_policy:
         args.extend(["-c", 'approval_policy="never"'])
-        has_approval_policy = True
-    if not (
-        explicit_bypass
-        or has_approval_policy
-        or has_sandbox
-        or has_reviewer
-        or has_permission_profile
-    ):
-        args.extend(["-c", 'approvals_reviewer="auto_review"'])
     return args
 
 
@@ -5018,6 +5052,46 @@ def _codex_config_string(raw_value: str) -> str:
     except Exception:  # noqa: BLE001 - Codex accepts some unquoted CLI config values.
         value = raw_value.strip().strip('"').strip("'")
     return value if isinstance(value, str) else ""
+
+
+def codex_mcp_tool_approval_overrides(
+    terminal_launch_args: Sequence[str] | None,
+) -> list[str]:
+    """Return the launch args' explicit approval modes for Omnigent ``sys_*`` tools.
+
+    These ``mcp_servers.omnigent.tools.<tool>.approval_mode`` assignments must
+    also reach the app-server that runs web-chat turns. Other MCP servers,
+    config keys, and the global approval policy are left untouched.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: ``-c`` assignment strings for :func:`build_codex_native_server`.
+    """
+    args = canonical_codex_launch_args(terminal_launch_args or ())
+    modes: dict[str, str | None] = {}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        assignment: str | None = None
+        if arg == "--":
+            break
+        if arg in {"--config", "-c"} and index + 1 < len(args):
+            index += 1
+            assignment = args[index]
+        elif arg.startswith(("--config=", "-c=")):
+            assignment = arg.split("=", 1)[1]
+        if assignment is not None:
+            key, _, raw_value = assignment.partition("=")
+            key = key.strip()
+            # Codex applies overrides in order: a later key or parent-table assignment wins.
+            for tracked_key in [tracked for tracked in modes if tracked.startswith(f"{key}.")]:
+                del modes[tracked_key]
+            if re.fullmatch(r"mcp_servers\.omnigent\.tools\.sys_[a-z_]+\.approval_mode", key):
+                modes[key] = _codex_config_string(raw_value)
+        index += 1
+    # Only explicit grants and prompts are carried; Codex rejects "deny" at startup.
+    return [
+        f"{key}={json.dumps(mode)}" for key, mode in modes.items() if mode in {"approve", "prompt"}
+    ]
 
 
 def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) -> CodexParams:
@@ -5180,7 +5254,8 @@ async def preload_codex_thread_for_resume(
     :param model_provider: Launch-selected provider to apply over persisted thread settings.
         None preserves Codex's default resume behavior.
     :param rollout_path: Thread rollout to restamp when Codex refuses the resume
-        because its effective provider differs, e.g. under a managed config.
+        because its effective provider differs, e.g. under a managed config, or
+        because the thread's recorded provider is no longer configured.
         None surfaces that refusal.
     :returns: The subscribed client when retained, otherwise None.
     :raises RuntimeError: If the app-server rejects the resume.
@@ -5237,8 +5312,19 @@ async def preload_codex_thread_for_resume(
         try:
             await client.request("thread/resume", resume_params)
         except CodexAppServerResponseError as exc:
+            if rollout_path is None:
+                raise
             current_provider = codex_resume_current_model_provider(exc)
-            if current_provider is None or rollout_path is None:
+            unconfigured_provider = codex_resume_unconfigured_model_provider(exc)
+            if unconfigured_provider is not None:
+                # The refusal names only the thread's missing provider; move the
+                # thread to the one this launch runs so the session stays resumable.
+                current_provider = model_provider or await _codex_effective_model_provider(
+                    client, effective_cwd
+                )
+                if current_provider == unconfigured_provider:
+                    current_provider = None
+            if current_provider is None:
                 raise
             _logger.warning(
                 "Codex resumes thread %s only under its effective provider %r "
@@ -5406,8 +5492,8 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
 # list reflects a single coherent stance.
 _CODEX_BYPASS_SANDBOX_FLAG = "--dangerously-bypass-approvals-and-sandbox"
 _CODEX_BYPASS_HOOK_TRUST_FLAG = "--dangerously-bypass-hook-trust"
-# Granular approval/sandbox flags to drop when bypass is on. The "Full
-# access" / "Read only" approval presets emit the long ``--flag value`` form
+# Granular approval/sandbox flags to drop when bypass is on. The web
+# approval presets emit the long ``--flag value`` form
 # (see web CODEX_NATIVE_APPROVAL_MODES), but ``terminal_launch_args`` is
 # client-supplied (validated only for count/length), so the short aliases
 # (``-a`` / ``-s``) are included too: ``-a`` triggers the same startup abort

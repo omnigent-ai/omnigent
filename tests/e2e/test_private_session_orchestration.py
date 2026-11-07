@@ -12,6 +12,7 @@ import pytest
 import yaml
 
 from dev.repro_env.runtime import write_model_config
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
@@ -35,7 +36,7 @@ def test_private_manager_launch_send_read_and_sharing(
     base_env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TMPDIR"}}
     with tempfile.TemporaryDirectory(prefix="orch-native-", dir="/tmp") as native_state:
         env = {
-            "OMNIGENT_FEATURES": None,
+            "OMNIGENT_FEATURES": "sibling_sessions",
             "OMNIGENT_CONFIG_HOME": str(config),
             "OMNIGENT_CODEX_NATIVE_STATE_DIR": native_state,
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
@@ -134,6 +135,11 @@ def test_private_manager_launch_send_read_and_sharing(
                         "workspace": str(stack.workspace),
                     }
                     if harness == "codex-native":
+                        # Codex's own default asks before each Omnigent tool call;
+                        # the mocked automatic reviewer approves them instead.
+                        metadata["terminal_launch_args"] = PERMISSION_LAUNCH_ARGS["codex-native"][
+                            "approve-for-me"
+                        ]
                         created = create_native_session(
                             client,
                             stack.base_url,
@@ -188,7 +194,9 @@ def test_private_manager_launch_send_read_and_sharing(
                     wait_text(manager, "BEFORE_SWITCH_SENT")
                     wait_text(worker, "BEFORE_SWITCH_RESULT")
                     manager_runner = client.get(f"/v1/sessions/{manager}").json()["runner_id"]
-                    stack.restart_server(env={"OMNIGENT_FEATURES": "-session_orchestration"})
+                    stack.restart_server(
+                        env={"OMNIGENT_FEATURES": "sibling_sessions,-session_orchestration"}
+                    )
                     poll_until(
                         lambda: (
                             client.get(f"/v1/runners/{manager_runner}/status").json().get("online")
@@ -233,7 +241,7 @@ def test_private_manager_launch_send_read_and_sharing(
                     return
                 shared = client.put(
                     f"/v1/sessions/{worker}/permissions",
-                    json={"user_id": "__public__", "level": 1},
+                    json={"user_id": "editor@example.test", "level": 2},
                 )
                 assert shared.status_code == 200, shared.text
                 configure("WORKER_TASK", [{"text": "WORKER_RESULT"}])
@@ -344,8 +352,14 @@ def test_private_manager_launch_send_read_and_sharing(
                     output = results[-1].get("output", results[-1].get("content"))
                     if harness == "codex-native":
                         # Codex wraps MCP content in timing text; the SDK renders a Python dict.
-                        content = json.loads(output.split("\nOutput:\n", 1)[1])
-                        payload = json.loads(content[0]["text"])
+                        if isinstance(output, list):
+                            output = "\n".join(part.get("text", "") for part in output)
+                        content = json.loads(output.split("\nOutput:\n", 1)[-1])
+                        payload = (
+                            json.loads(content[0]["text"])
+                            if isinstance(content, list)
+                            else content
+                        )
                     else:
                         payload = ast.literal_eval(output)
                     discovered_worker = (
@@ -454,6 +468,13 @@ def test_private_manager_launch_send_read_and_sharing(
                         "agent_id": agent,
                         "host_id": host_id,
                         "workspace": str(stack.workspace),
+                        # Nobody watches an automation's turn, so Codex's own
+                        # default would park on the first Omnigent tool call.
+                        **(
+                            {"permission_mode": "approve-for-me"}
+                            if harness == "codex-native"
+                            else {}
+                        ),
                     },
                 )
                 assert response.status_code == 200, response.text

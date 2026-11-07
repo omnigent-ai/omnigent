@@ -488,7 +488,7 @@ def test_side_chat_model_settings_before_and_after_first_message(
     contract.json(path, patch, method="PATCH")
     contract.json(f"{path}/events", message, method="POST")
     contract.json(f"{path}/agent", chat._agent())
-    for resource in ("items", "child_sessions", "resources/terminals"):
+    for resource in ("items", "child_sessions", "side_chats", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")
     contract.route(f"**{path}/stream*", chat.route_stream)
@@ -513,6 +513,7 @@ def test_side_chat_model_settings_before_and_after_first_message(
         page.get_by_role("menuitem", name="Side chat", exact=True).click()
 
     picker = page.get_by_role("button", name="Side chat model and effort")
+    page.get_by_test_id("side-chat-input").fill("Explain this in the side chat.")
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
@@ -523,7 +524,6 @@ def test_side_chat_model_settings_before_and_after_first_message(
     expect(picker).to_contain_text("Low")
     assert len(forks) == (1 if entrypoint == "tray" else 0)
     assert chat.session_patches == []
-    page.get_by_test_id("side-chat-input").fill("Explain this in the side chat.")
     with page.expect_response(
         lambda response: (
             response.url.endswith(f"{path}/events") and response.request.method == "POST"
@@ -547,6 +547,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
             "data": {"conversation_id": child_id, "model": "opus"},
         }
     )
+    if mobile:
+        page.get_by_test_id("side-chat-input").fill("A follow-up side question.")
     expect(picker).to_contain_text("Opus")
     expect(page.get_by_test_id("composer-config-gear")).to_contain_text("Sonnet")
     picker.click()

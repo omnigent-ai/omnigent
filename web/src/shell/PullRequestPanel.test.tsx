@@ -82,6 +82,8 @@ const state = vi.hoisted(() => ({
   serveable: undefined as boolean | undefined,
 }));
 
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "alice" }));
+
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   const original = await importOriginal<typeof UsePullRequestsModule>();
   return {
@@ -208,6 +210,7 @@ import {
   LARGE_DIFF_THRESHOLD,
 } from "./PullRequestPanel";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
+import { viewedStorageKey } from "@/lib/pullRequestViewed";
 
 const FORGE_DISPLAY = {
   id: "example_forge",
@@ -268,6 +271,16 @@ function renderChanges() {
   const r = renderPanel();
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
   return r;
+}
+
+/**
+ * Sidebar rows and section toggles by name. A file's copy and overflow buttons carry the
+ * path in their labels and the overflow trigger reports aria-expanded, so skip labeled buttons.
+ */
+function fileRowButtons(name: RegExp) {
+  return screen
+    .getAllByRole("button", { name })
+    .filter((button) => !button.hasAttribute("aria-label"));
 }
 
 /** Render, then switch to the Comments tab (see renderChanges). */
@@ -1483,6 +1496,28 @@ describe("PullRequestPanel", () => {
     expect(screen.queryByText("Checks")).toBeNull();
   });
 
+  it("keys viewed marks by the selected PR's identity and pinned head", async () => {
+    const url = state.info!.data!.pr!.url;
+    const selected = {
+      url,
+      host: "example.com",
+      repository: "acme/app",
+      number: 6000,
+      relationship: "created" as const,
+    };
+    state.info!.data!.pr!.head_sha = "head";
+    state.info!.data!.selected_pr_url = url;
+    state.info!.data!.prs = [selected];
+    // The list's head is pinned, so the mock carries it as an extra field.
+    Object.assign(state.changes!.data!, { head_sha: "head" });
+    state.diff = { ...state.diff!, head_sha: "head" };
+    renderChanges();
+
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Viewed hello.py" }));
+    const key = viewedStorageKey(window.location.origin, "alice", selected);
+    expect(localStorage.getItem(key)).toContain("hello.py");
+  });
+
   it("stacks a diff section per changed file", async () => {
     renderChanges();
     const diffs = await screen.findAllByTestId("diff");
@@ -1517,12 +1552,16 @@ describe("PullRequestPanel", () => {
     expect(screen.getByRole("button", { name: "Collapse all diffs" })).toBeInTheDocument();
     // The jump expanded the file only temporarily; one header click closes it again.
     fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
-    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
 
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Summary" }));
     fireEvent.mouseDown(screen.getByRole("tab", { name: "Changes" }));
     await screen.findAllByTestId("diff");
-    expect(screen.getByRole("button", { name: /app\.ts/, expanded: false })).toBeInTheDocument();
+    expect(
+      fileRowButtons(/app\.ts/).find((b) => b.getAttribute("aria-expanded") === "false"),
+    ).toBeInTheDocument();
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
@@ -1558,12 +1597,12 @@ describe("PullRequestPanel", () => {
     renderChanges();
     await screen.findAllByTestId("diff");
     // hello.py appears as a sidebar jump row and as a section header.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
     fireEvent.click(screen.getByRole("button", { name: "Hide file list" }));
     // Sidebar gone → only the section header remains.
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Show file list" }));
-    expect(screen.getAllByRole("button", { name: /hello\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/hello\.py/)).toHaveLength(2);
   });
 
   it("toggles the diff layout between unified and split", async () => {
@@ -1609,10 +1648,10 @@ describe("PullRequestPanel", () => {
     renderChanges();
     const folder = await screen.findByRole("button", { name: "omnigent/runner" });
     // Before collapse: the sidebar leaf + the diff section header both match.
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(2);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(2);
     fireEvent.click(folder);
     // After collapse: only the diff section header remains (sidebar leaf gone).
-    expect(screen.getAllByRole("button", { name: /app\.py/ })).toHaveLength(1);
+    expect(fileRowButtons(/app\.py/)).toHaveLength(1);
   });
 
   it("shows a pure rename as a note with an old → new header", async () => {

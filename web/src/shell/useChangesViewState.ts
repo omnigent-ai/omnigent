@@ -16,6 +16,8 @@ interface ChangesView {
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
   find: FindState;
+  /** The head whose "changed files lost their viewed marks" notice the reader dismissed. */
+  dismissedResetHead: string | null;
 }
 
 export interface ChangesViewState extends ChangesView {
@@ -24,6 +26,7 @@ export interface ChangesViewState extends ChangesView {
   reveal: (path: string) => void;
   clearReveal: (path: string) => void;
   setFind: (patch: Partial<FindState>) => void;
+  setDismissedResetHead: (head: string | null) => void;
 }
 
 const EMPTY_VIEW: ChangesView = {
@@ -31,6 +34,7 @@ const EMPTY_VIEW: ChangesView = {
   hideViewed: false,
   revealedPaths: new Set(),
   find: { open: false, query: "", matchCase: false, regex: false },
+  dismissedResetHead: null,
 };
 // Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
@@ -68,6 +72,7 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
       setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
+      setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
     }),
     [key],
   );

@@ -21,6 +21,7 @@ lifespan) since none of these paths need the runtime.
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,7 @@ from omnigent.server.auth import (
     UnifiedAuthProvider,
     workspace_sharing_blocked,
 )
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.sharing_settings import (
     read_public_sharing_override,
     read_sharing_mode_override,
@@ -70,6 +72,7 @@ def _isolate_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "")
     monkeypatch.delenv("OMNIGENT_PUBLIC_SHARING_MAX_LEVEL", raising=False)
+    monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     sharing_settings._cache = {}
 
 
@@ -710,13 +713,19 @@ async def test_put_rejects_unknown_value(db_uri: str, tmp_path: Path) -> None:
         assert read_sharing_mode_override() is None
 
 
-async def test_admin_endpoint_requires_admin(db_uri: str, tmp_path: Path) -> None:
-    """A non-admin identity is forbidden from reading or writing the mode."""
+@pytest.mark.parametrize("email,status", [(None, 401), ("intruder@sharing.test", 403)])
+async def test_admin_endpoint_requires_admin(
+    db_uri: str, tmp_path: Path, email: str | None, status: int
+) -> None:
+    """Only authenticated admins can read or write the server-wide settings."""
     app = _admin_app(db_uri, tmp_path)  # only _ADMIN is an admin
-    async with _client(app, "intruder@sharing.test") as c:
-        assert (await c.get("/v1/sharing")).status_code == 403
-        put = await c.put("/v1/sharing", json={"sharing_mode": "off"})
-        assert put.status_code == 403, put.text
+    async with _client(app, email) as c:
+        assert (await c.get("/v1/sharing")).status_code == status
+        for body in ({"sharing_mode": "off"}, {"peer_session_messaging": False}):
+            put = await c.put("/v1/sharing", json=body)
+            assert put.status_code == status, put.text
+    assert read_sharing_mode_override() is None
+    assert not (sharing_settings.resolve_data_dir() / "peer_session_messaging").exists()
 
 
 async def test_put_rejected_when_not_writable(db_uri: str, tmp_path: Path) -> None:
@@ -735,6 +744,101 @@ async def test_put_requires_a_field(db_uri: str, tmp_path: Path) -> None:
     async with _client(app, _ADMIN) as c:
         resp = await c.put("/v1/sharing", json={})
         assert resp.status_code == 400, resp.text
+
+
+async def test_peer_messaging_setting_persists_across_apps(db_uri: str, tmp_path: Path) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["peer_session_messaging_enabled"] is True
+        assert state["peer_session_messaging_editable"] is True
+    for enabled in (False, True):
+        async with _client(app, _ADMIN) as admin:
+            response = await admin.put("/v1/sharing", json={"peer_session_messaging": enabled})
+            assert response.status_code == 200, response.text
+            assert response.json()["peer_session_messaging_enabled"] is enabled
+            assert response.json()["peer_session_messaging_editable"] is True
+        sharing_settings._cache.clear()
+        app = _admin_app(db_uri, tmp_path)
+        async with _client(app, _ADMIN) as admin:
+            state = (await admin.get("/v1/sharing")).json()
+            assert state["peer_session_messaging_enabled"] is enabled
+
+
+@pytest.mark.parametrize("feature", ["peer_session_messaging", "session_orchestration"])
+async def test_deployment_disabled_peer_messaging_rejects_mixed_update(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature: str
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", f"-{feature}")
+    sharing_settings.write_peer_session_messaging_override(True)
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        state = (await admin.get("/v1/sharing")).json()
+        assert state["peer_session_messaging_enabled"] is False
+        assert state["peer_session_messaging_editable"] is False
+        response = await admin.put(
+            "/v1/sharing", json={"sharing_mode": "off", "peer_session_messaging": False}
+        )
+        assert response.status_code == 403, response.text
+    assert read_sharing_mode_override() is None
+    assert (sharing_settings.resolve_data_dir() / "peer_session_messaging").read_text() == "on\n"
+
+
+@pytest.mark.parametrize(
+    "body,status",
+    [
+        ({"sharing_mode": "off", "peer_session_messaging": "false"}, 422),
+        ({"sharing_mode": "off", "peer_session_messaging": 0}, 422),
+        ({"sharing_mode": "off", "peer_session_messaging": 1}, 422),
+        ({"sharing_mode": "typo", "peer_session_messaging": False}, 400),
+    ],
+)
+async def test_peer_messaging_validates_mixed_update_before_writes(
+    db_uri: str, tmp_path: Path, body: dict[str, object], status: int
+) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as admin:
+        response = await admin.put("/v1/sharing", json=body)
+        assert response.status_code == status, response.text
+    assert read_sharing_mode_override() is None
+    assert not (sharing_settings.resolve_data_dir() / "peer_session_messaging").exists()
+
+
+@pytest.mark.parametrize(
+    "raw,error,enabled",
+    [
+        (None, None, True),
+        ("on", None, True),
+        ("off", None, False),
+        ("", None, False),
+        ("typo", None, False),
+        ("off", "read_text", False),
+        ("off", "stat", False),
+    ],
+)
+def test_peer_messaging_override_values(
+    raw: str | None, error: str | None, enabled: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = sharing_settings.resolve_data_dir() / "peer_session_messaging"
+    if raw is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(raw)
+    if error is not None:
+        sharing_settings.write_peer_session_messaging_override(False)
+        if error == "stat":
+            assert (
+                sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is False
+            )
+        original = getattr(Path, error)
+
+        def storage_error(self, *args, **kwargs):
+            if self == path:
+                raise OSError(errno.EIO, "Storage unavailable")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, error, storage_error)
+        assert sharing_settings._read_override_text(path) is None
+    assert sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is enabled
 
 
 # ── Public-access switch (OMNIGENT_PUBLIC_SHARING) ───────────────────

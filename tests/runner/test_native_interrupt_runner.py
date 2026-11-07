@@ -531,7 +531,7 @@ async def test_uniform_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_c", "cancelled", None)]
-    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -611,7 +611,7 @@ async def test_claude_stop_is_idempotent_without_advertised_tmux(
 
     assert isinstance(resp, Response) and resp.status_code == 204
     assert captured["wakes"] == [("conv_cn", "cancelled", None)]
-    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
@@ -1099,7 +1099,7 @@ async def test_antigravity_stop_kills_tears_down_and_goes_idle(
     idle = [e for _, e in captured["published"] if e.get("status") == "idle"]
     assert idle == [{"type": "session.status", "status": "idle"}]
     assert captured["wakes"] == [("conv_agy", "cancelled", None)]
-    assert captured["wake_calls"][0]["confirmed_cancellation"] is True
+    assert captured["wake_calls"][-1]["confirmed_cancellation"] is True
 
 
 @pytest.mark.asyncio
