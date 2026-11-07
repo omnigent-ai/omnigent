@@ -50,6 +50,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state as write_codex_bridge_state,
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native.usage import HOOK_BRIDGE_DIR_ENV_VAR
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.terminal import TerminalInstance
@@ -2904,6 +2905,19 @@ async def test_auto_create_cursor_terminal_inherits_agent_os_env(
 
     assert captured["parent_os_env"] is agent_os_env
     assert captured["spec"].os_env.sandbox is agent_os_env.sandbox
+
+
+@pytest.mark.asyncio
+async def test_auto_create_cursor_terminal_routes_hooks_to_its_bridge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each cursor-agent process names its own bridge for the shared workspace hooks."""
+    captured = await _run_auto_create_cursor_terminal(
+        tmp_path=tmp_path, monkeypatch=monkeypatch, agent_spec=None, terminal_launch_args=None
+    )
+    bridge_dir = cursor_native_bridge.bridge_dir_for_session_id("c42dbcb16fd3a87ee8f5d1fe4cabfdf8")
+    assert captured["spec"].env == {HOOK_BRIDGE_DIR_ENV_VAR: str(bridge_dir)}
 
 
 @pytest.mark.parametrize(

@@ -376,7 +376,8 @@ def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None
     ``<bridge_dir>/cursor_usage.jsonl`` for the runner's usage forwarder to tail
     and post as ``external_session_usage`` (lighting up the web Session-cost
     badge). Bakes the absolute ``--bridge-dir`` so the recorder writes where the
-    forwarder reads, regardless of the hook's working directory.
+    forwarder reads, regardless of the hook's working directory. The recorder
+    prefers ``OMNIGENT_CURSOR_HOOK_BRIDGE_DIR`` when the launching process sets it.
     """
     import shlex
 
