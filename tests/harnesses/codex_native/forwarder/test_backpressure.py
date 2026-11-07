@@ -432,3 +432,114 @@ async def test_nested_child_usage_baseline_follows_connection_order(tmp_path: Pa
 
     assert _posted_cumulative_tokens(client_posts, "conv_g") == [(300, 0, 30)]
     assert _posted_cumulative_tokens(client_posts, "conv_c") == [(2500, 1000, 110)]
+
+
+async def test_parent_rotation_settles_queued_child_questions_first(tmp_path: Path) -> None:
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    child = _child_thread(0)
+    command_released = asyncio.Event()
+    hook_requested = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path.endswith(_ELICITATION_HOOK_PATH):
+            hook_requested.set()
+            await asyncio.Event().wait()  # an unanswered question waits for the user
+        if path == f"/v1/sessions/session_{child}/events":
+            await command_released.wait()
+        if request.method == "GET" and path == f"/v1/sessions/{_SESSION_ID}":
+            snapshot = {"id": _SESSION_ID, "agent_id": "ag_codex", "runner_id": "runner_1"}
+            return httpx.Response(200, json=snapshot, request=request)
+        if request.method == "POST" and path == "/v1/sessions":
+            return httpx.Response(200, json={"id": "conv_rotated"}, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    client = httpx.AsyncClient(base_url="http://test", transport=httpx.MockTransport(handler))
+    state = fwd._CodexForwarderState(parent_session_id=_SESSION_ID, mcp_startup_settled=True)
+    state.note_child_thread(child, f"session_{child}")
+    original_tracker = fwd._CodexElicitationTaskTracker()
+    target = fwd._ForwarderTarget(
+        session_id=_SESSION_ID,
+        thread_id=_PARENT_THREAD,
+        delta_coalescer=fwd._OutputTextDeltaCoalescer(client, _SESSION_ID),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, _SESSION_ID),
+        elicitation_tracker=original_tracker,
+    )
+    question: dict[str, Any] = {
+        "id": 42,
+        "method": "item/tool/requestUserInput",
+        "params": {
+            "threadId": child,
+            "turnId": f"turn_{child}",
+            "itemId": "question",
+            "questions": [{"id": "pick", "header": "Pick", "question": "Which one?"}],
+        },
+    }
+    command = _event("item/completed", child, f"turn_{child}", item=_command_item("cmd"))
+    try:
+        for event in (command, question):
+            deliver = functools.partial(
+                fwd._handle_event,
+                client,
+                session_id=target.session_id,
+                bridge_dir=tmp_path,
+                event=event,
+                delta_coalescer=target.delta_coalescer,
+                usage_coalescer=target.usage_coalescer,
+                elicitation_tracker=target.elicitation_tracker,
+                expected_thread_id=target.thread_id,
+                codex_client=codex,  # type: ignore[arg-type]
+                forwarder_state=state,
+                usage_frame_recorded=True,
+            )
+            assert state.enqueue_child_event(client, event, deliver, parent_thread_id=None)
+        asyncio.get_running_loop().call_later(0.2, command_released.set)
+        async with asyncio.timeout(10):
+            rotated = await fwd._maybe_rotate_session_on_thread_started(
+                ap_client=client,
+                target=target,
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                event={"method": "thread/started", "params": {"thread": {"id": "thread_new"}}},
+                forwarder_state=state,
+            )
+        assert rotated
+        assert target.elicitation_tracker is not original_tracker
+        # The question reached its hook on the tracker that rotation then closed.
+        assert hook_requested.is_set()
+        assert [
+            task
+            for task in asyncio.all_tasks()
+            if task.get_name() == "codex-native-elicitation-hook" and not task.done()
+        ] == []
+    finally:
+        command_released.set()
+        await state.close_child_streams()
+        await target.elicitation_tracker.close()
+        await target.delta_coalescer.close()
+        await target.usage_coalescer.close()
+        await client.aclose()
+
+
+async def test_child_lane_drain_timeout_stops_a_stuck_worker() -> None:
+    client = httpx.AsyncClient(base_url="http://test")
+    state = fwd._CodexForwarderState(parent_session_id=_SESSION_ID)
+    child = _child_thread(0)
+    state.note_child_thread(child, f"session_{child}")
+    started = asyncio.Event()
+
+    async def stuck() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    try:
+        event = _event("item/completed", child, f"turn_{child}")
+        assert state.enqueue_child_event(client, event, stuck, parent_thread_id=None)
+        async with asyncio.timeout(5):
+            await started.wait()
+            await state.child_streams[child].drain(timeout=0.05)
+        assert _live_child_delivery_workers() == []
+    finally:
+        await state.close_child_streams()
+        await client.aclose()

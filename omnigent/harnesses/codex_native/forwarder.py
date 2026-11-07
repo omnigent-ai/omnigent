@@ -427,14 +427,14 @@ class _CodexChildStream:
                 except Exception:  # keep the lane alive, as the parent loop does.
                     _logger.warning("Codex child event handling failed", exc_info=True)
 
-    async def drain(self) -> None:
-        """Deliver queued events, then stop the worker within the shutdown budget."""
+    async def drain(self, timeout: float | None = _CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS) -> None:
+        """Deliver queued events, then stop the worker; ``None`` waits without a bound."""
         worker = self.delivery_worker
         if worker is None or worker.done():
             return
         self.delivery_queue.put_nowait(None)
         try:
-            async with asyncio.timeout(_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS):
+            async with asyncio.timeout(timeout):
                 await asyncio.shield(worker)
         except TimeoutError:
             # The unread sentinel offsets the dequeued event the cancel drops.
@@ -998,6 +998,12 @@ class _CodexForwarderState:
         queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
         self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
         return True
+
+    async def settle_child_lanes(self) -> None:
+        """Deliver every queued child event before the parent's resources are replaced."""
+        await asyncio.gather(
+            *(stream.drain(timeout=None) for stream in self.child_streams.values())
+        )
 
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
@@ -2683,6 +2689,7 @@ async def supervise_forwarder(
                         bridge_dir=bridge_dir,
                         app_server_url=app_server_url,
                         event=event,
+                        forwarder_state=forwarder_state,
                     )
                     if rotated:
                         await _clear_superseded_background_work(
@@ -2898,6 +2905,7 @@ async def _maybe_rotate_session_on_thread_started(
     bridge_dir: Path,
     app_server_url: str,
     event: CodexMessage,
+    forwarder_state: _CodexForwarderState | None = None,
 ) -> bool:
     """
     Rotate Omnigent ownership when Codex starts a new native thread.
@@ -2915,6 +2923,8 @@ async def _maybe_rotate_session_on_thread_started(
         ``"ws://127.0.0.1:9876"``. Persisted to bridge state for the
         replacement session.
     :param event: Codex app-server notification envelope.
+    :param forwarder_state: Connection state whose child lanes still hold
+        handlers bound to the target's current coalescers and tracker.
     :returns: ``True`` when rotation occurred.
     """
     new_thread_id = _thread_id_from_started_event(event)
@@ -2932,6 +2942,10 @@ async def _maybe_rotate_session_on_thread_started(
     # strands the real turn's output as stale. Ignore all ephemeral threads.
     if _thread_started_is_ephemeral(event):
         return False
+    # Queued child handlers captured this target's tracker and coalescers;
+    # deliver them before those are closed, as the serial loop used to.
+    if forwarder_state is not None:
+        await forwarder_state.settle_child_lanes()
     old_delta_coalescer = target.delta_coalescer
     await old_delta_coalescer.flush()
     old_usage_coalescer = target.usage_coalescer
