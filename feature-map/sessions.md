@@ -459,16 +459,16 @@ Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.
 Opening such a session presses Reconnect host for the user once the session
-has stayed open for a second in a visible tab, and so does picking Files or
-Changes in the Workspace rail. This only happens for editors, on an idle
+has stayed open for a second in a visible tab, and so does picking Files,
+Changes or Pull Requests in the Workspace rail. This only happens for editors, on an idle
 session with no error or launch already running; any other session keeps its
 Resume or error card. Each opening checks once, so a session that sleeps again
-while it stays open waits for Reconnect host, a Files or Changes pick, or a
-message. Every way of waking
+while it stays open waits for Reconnect host, a Files, Changes or Pull
+Requests pick, or a message. Every way of waking
 the sandbox (Reconnect host, opening the session, Files or Changes, the
 terminal's Resume) joins one wake per session, including after switching to
-another session and back, and the Files view shows **Starting sandbox…** while
-it runs.
+another session and back, and the Files and Pull Requests views say the
+sandbox is starting while it runs or the server reports its launch.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -1003,7 +1003,7 @@ plain `uv run pytest`, which starts a private server for the test.
   spins the chip and menu dots with no toast, and turns them green once
   `/health` reports the host online. Sibling tests cover a failed wake's error
   toast and Reconnect host retry, a session opened mid-wake, and a wake whose
-  stage outlasts its limit. The open dwell, Files and Changes picks, and the
+  stage outlasts its limit. The open dwell, Files/Changes/Pull Requests picks, and the
   one-wake-per-session sharing are covered by
   `web/src/hooks/useSandboxAutoWake.test.ts` and
   `web/src/hooks/useSessionReconnect.test.ts`. None

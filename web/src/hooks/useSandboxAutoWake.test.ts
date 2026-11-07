@@ -147,20 +147,26 @@ describe("canAutoWakeSandbox", () => {
   const safe = {
     asleep: true,
     launching: false,
-    canEdit: true,
+    permissionLevel: null as number | null,
+    isChild: false,
     status: "idle",
     failed: false,
     undelivered: false,
   };
 
-  it("wakes an idle, healthy, asleep session for an editor", () => {
-    expect(canAutoWakeSandbox(safe)).toBe(true);
+  it.each<[string, Partial<typeof safe>]>([
+    ["the owner of an unshared session", {}],
+    ["an editor", { permissionLevel: 2 }],
+    ["an editor of a child", { permissionLevel: 2, isChild: true }],
+  ])("wakes an idle, healthy, asleep session for %s", (_label, override) => {
+    expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(true);
   });
 
   it.each<[string, Partial<typeof safe>]>([
     ["isn't asleep", { asleep: false }],
     ["is already launching", { launching: true }],
-    ["the viewer can't edit", { canEdit: false }],
+    ["the viewer can only read", { permissionLevel: 1 }],
+    ["is a child the viewer has no known edit grant on", { isChild: true }],
     ["is running a turn", { status: "running" }],
     ["failed", { status: "failed" }],
     ["has an error or a failed sandbox launch", { failed: true }],

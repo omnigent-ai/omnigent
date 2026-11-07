@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 
 import { onSandboxWakeStarted } from "@/hooks/useSessionReconnect";
+import { isEditorLevel } from "@/lib/permissionsApi";
 
 /**
  * How long a session must stay open in a visible tab before its asleep
@@ -19,18 +20,23 @@ const wakeRequests = new Set<(sessionId: string) => void>();
 export function canAutoWakeSandbox({
   asleep,
   launching,
-  canEdit,
+  permissionLevel,
+  isChild,
   status,
   failed,
   undelivered,
 }: {
   asleep: boolean;
   launching: boolean;
-  canEdit: boolean;
+  /** The viewer's level on this session; `null` means unshared, which for a root is its owner. */
+  permissionLevel: number | null;
+  /** A child's `null` level only means no direct grant, so edit access isn't known. */
+  isChild: boolean;
   status: string;
   failed: boolean;
   undelivered: boolean;
 }): boolean {
+  const canEdit = permissionLevel === null ? !isChild : isEditorLevel(permissionLevel);
   return asleep && !launching && canEdit && status === "idle" && !failed && !undelivered;
 }
 

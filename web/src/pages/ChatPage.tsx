@@ -85,7 +85,6 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
   derivePermissionLevel,
-  isEditorLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
@@ -998,7 +997,8 @@ export function ChatPage() {
       : canAutoWakeSandbox({
           asleep: liveness.kind === "host_asleep",
           launching: autoWakeLaunch !== null && autoWakeLaunch.stage !== "failed",
-          canEdit: isEditorLevel(permissionLevel),
+          permissionLevel,
+          isChild: activeSession.parentSessionId != null,
           status: activeSession.status,
           failed: Boolean(activeSession.lastTaskError) || autoWakeLaunch?.stage === "failed",
           undelivered: (activeSession.failedInputs?.length ?? 0) > 0,
