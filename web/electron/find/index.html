@@ -92,6 +92,8 @@
         find.query(q.value, { forward, findNext: true });
       }
       q.addEventListener("keydown", (e) => {
+        // IME composition keys (CJK input) confirm text, not find.
+        if (e.isComposing || e.keyCode === 229) return;
         if (e.key === "Enter") step(!e.shiftKey);
         if (e.key === "Escape") find.close();
       });

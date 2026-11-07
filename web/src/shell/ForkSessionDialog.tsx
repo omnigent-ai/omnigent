@@ -7,6 +7,7 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -819,6 +820,9 @@ function SupportedForkSessionForm({
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
   const [title, setTitle] = useState("");
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -2135,7 +2139,14 @@ function SupportedForkSessionForm({
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
+                  onCompositionStart={() => {
+                    isComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    isComposingRef.current = false;
+                  }}
                   onKeyDown={(e) => {
+                    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                     if (e.key === "Enter" && !busy) handleFork();
                   }}
                   placeholder={namePlaceholder}

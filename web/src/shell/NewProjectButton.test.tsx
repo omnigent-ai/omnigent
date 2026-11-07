@@ -102,6 +102,28 @@ describe("NewProjectButton", () => {
     expect(mocks.createDirectory).not.toHaveBeenCalled();
   });
 
+  it("does not create the project on the Enter that confirms an IME candidate", async () => {
+    renderButton();
+
+    const input = screen.getByPlaceholderText("Project name…");
+    fireEvent.change(input, { target: { value: "庭" } });
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.compositionEnd(input);
+    expect(mocks.createProject).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() =>
+      expect(mocks.createProject).toHaveBeenCalledWith(
+        expect.objectContaining({ name: "庭" }),
+        expect.any(Object),
+      ),
+    );
+  });
+
   it("creates a home folder named after the project and disables browsing", async () => {
     renderButton();
 

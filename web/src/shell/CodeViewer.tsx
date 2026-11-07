@@ -87,6 +87,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
@@ -1103,6 +1104,8 @@ export function CodeViewer({
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
+              // IME composition keys (CJK input) confirm text, not find.
+              if (isImeCompositionKeyEvent(e)) return;
               if (e.key === "Enter" && matches.length > 0) {
                 e.preventDefault();
                 if (e.shiftKey) {
