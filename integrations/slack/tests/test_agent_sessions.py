@@ -304,9 +304,6 @@ async def test_owner_stop_cancels_the_turn_without_restart_notice_or_reopen(
     slack.stream.stopped_by_slack = True
     await _stop(service, slack, "U1")
     await _wait_for_turns(service)
-    # Were the turn still reading, this delta would reopen the reply.
-    release.set()
-    await asyncio.sleep(0.05)
 
     assert omnigent.interrupted == ["conv_1"]
     assert len(slack.streams) == 1
@@ -315,6 +312,11 @@ async def test_owner_stop_cancels_the_turn_without_restart_notice_or_reopen(
     assert _RESTART_ABANDONED_TEXT not in texts
     assert _ACK_TEXT not in texts
     assert _statuses(slack) == ["processing", "active"]
+
+    # Were the turn still reading, this delta would reopen the reply.
+    release.set()
+    await asyncio.sleep(0.05)
+    assert not slack.streams[1:], "the stopped turn reopened its reply"
 
 
 async def test_stop_closes_a_reply_reopened_before_the_stop_arrived(tmp_path: Path) -> None:
