@@ -1771,8 +1771,12 @@ async def test_delete_session_stops_host_runner_once_no_session_uses_it(
     # Child C relaunched onto a runner of its own.
     SqlAlchemyConversationStore(db_uri).replace_runner_id(children[2]["id"], "runner_child_own")
 
+    from omnigent.server.routes._sessions import orchestration
+
     child_delete = await client.delete(f"/v1/sessions/{children[0]['id']}")
     assert child_delete.status_code == 200, child_delete.text
+    # The stop runs detached after the delete; let it decide before draining.
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
     assert _drain_stop_runner_ids(comm) == []
 
     async def _serve_two_stops() -> set[str]:

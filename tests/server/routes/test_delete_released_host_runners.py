@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -112,3 +113,26 @@ async def test_stop_released_host_runners_keeps_going_past_failures(
     await orchestration._stop_released_host_runners("parent", bindings, store, object())
 
     assert [call[2] for call in stops] == ["runner-broken", "runner-c"]
+
+
+async def test_spawned_stop_does_not_hold_the_caller(monkeypatch: pytest.MonkeyPatch) -> None:
+    release = asyncio.Event()
+    stopped: list[str] = []
+
+    async def slow_stop(session_id, host_id, runner_id, host_registry, *, expect_already_stopped):
+        await release.wait()
+        stopped.append(runner_id)
+
+    monkeypatch.setattr(sessions, "_stop_session_host_runner", slow_stop)
+
+    orchestration._spawn_released_host_runner_stop(
+        "parent", {("host-1", "runner-a")}, _Store(), object()
+    )
+    orchestration._spawn_released_host_runner_stop("parent", set(), _Store(), object())
+
+    (task,) = orchestration._detached_stop_tasks
+    assert stopped == []
+    release.set()
+    await task
+    assert stopped == ["runner-a"]
+    assert orchestration._detached_stop_tasks == set()

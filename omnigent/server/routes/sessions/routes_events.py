@@ -291,8 +291,8 @@ from omnigent.server.routes._sessions.orchestration import (
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
     _side_chat_source_id,
+    _spawn_released_host_runner_stop,
     _stop_host_runner_intentionally,
-    _stop_released_host_runners,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
@@ -4234,7 +4234,7 @@ def register_events_routes(
         _cancel_runner_relays([session_id, *descendant_ids])
         # The runner-side delete frees the session's resources but not the
         # host-launched runner process, which would linger until idle timeout.
-        await _stop_released_host_runners(
+        _spawn_released_host_runner_stop(
             session_id,
             host_runner_bindings,
             conversation_store,

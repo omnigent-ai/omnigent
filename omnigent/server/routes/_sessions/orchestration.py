@@ -875,10 +875,31 @@ async def _stop_released_host_runners(
             )
 
 
-# Strong references to detached archive stops so the tasks can't be
-# garbage-collected mid-stop (asyncio only holds weak refs to tasks).
+# Strong references to detached archive and delete stops so the tasks can't
+# be garbage-collected mid-stop (asyncio only holds weak refs to tasks).
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _detached_stop_tasks: set[asyncio.Task[None]] = set()
+
+
+def _spawn_released_host_runner_stop(
+    session_id: str,
+    bindings: set[tuple[str, str]],
+    conversation_store: ConversationStore,
+    host_registry: Any,
+) -> None:
+    """Run :func:`_stop_released_host_runners` as a retained background task.
+
+    The delete is already committed, so it must not wait out a slow or
+    silent host's stop acknowledgement.
+    """
+    if not bindings:
+        return
+    task = asyncio.create_task(
+        _stop_released_host_runners(session_id, bindings, conversation_store, host_registry)
+    )
+    _detached_stop_tasks.add(task)
+    task.add_done_callback(_detached_stop_tasks.discard)
+
 
 # Deferred archive stops still inside the undo grace, keyed by session id.
 # Scheduling a stop cancels the session's prior pending one, and an unarchive
@@ -14247,6 +14268,7 @@ __all__ = [
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_spawn_released_host_runner_stop",
     "_stop_host_runner_intentionally",
     "_stop_released_host_runners",
     "_wait_for_host_bound_runner_client",
