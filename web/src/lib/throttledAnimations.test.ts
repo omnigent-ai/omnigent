@@ -44,6 +44,20 @@ describe("throttleAnimations", () => {
     expect(looping.currentTime).toBe(1234);
     expect(reducedMotion.pause).not.toHaveBeenCalled();
     expect(reducedMotion.currentTime).toBeNull();
+
+    vi.mocked(performance.now).mockReturnValue(1334);
+    vi.advanceTimersByTime(ANIMATION_STEP_MS);
+    expect(looping.currentTime).toBe(1334);
+  });
+
+  it("seeks an animation once when nested registrations share it", () => {
+    const shared = fakeAnimation(Infinity);
+
+    throttleAnimations(animatedElement([shared]));
+    throttleAnimations(animatedElement([shared]));
+    vi.advanceTimersByTime(ANIMATION_STEP_MS);
+
+    expect(shared.pause).toHaveBeenCalledTimes(1);
   });
 
   it("runs one timer for every element and stops it once they leave the document", () => {

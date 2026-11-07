@@ -21,13 +21,16 @@ function step(): void {
   if (document.hidden) return;
   // One shared time keeps every indicator in phase, across remounts too.
   const now = performance.now();
+  // A registered element's subtree can contain another registered element.
+  const animations = new Set<Animation>();
   for (const element of elements) {
-    for (const animation of element.getAnimations({ subtree: true })) {
-      // Reduced motion runs each animation once; let it finish on its own.
-      if (animation.effect?.getTiming().iterations !== Infinity) continue;
-      animation.pause();
-      animation.currentTime = now;
-    }
+    for (const animation of element.getAnimations({ subtree: true })) animations.add(animation);
+  }
+  for (const animation of animations) {
+    // Reduced motion runs each animation once; let it finish on its own.
+    if (animation.effect?.getTiming().iterations !== Infinity) continue;
+    animation.pause();
+    animation.currentTime = now;
   }
 }
 
