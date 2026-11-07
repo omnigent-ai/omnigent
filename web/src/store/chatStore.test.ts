@@ -108,6 +108,8 @@ import {
   initChatStore,
   pumpStreamEvents,
   retryConversationLoad,
+  SEND_STILL_SENDING_AFTER_MS,
+  SESSION_READ_TIMEOUT_MS,
   SSE_MAX_STREAM_AGE_MS,
   SSE_STALE_RECYCLE_MS,
   setPendingInitialPrompt,
@@ -3176,12 +3178,13 @@ describe("chatStore — send (first-send ordering)", () => {
     });
 
     /**
-     * Answer the session's next `request` GETs with `statuses`, and open its
-     * streams on sinks the test writes to. Returns both requests' GETs.
+     * Answer the session's next `request` GETs with `statuses` (`"hang"` never
+     * answers), and open its streams on sinks the test writes to. Returns both
+     * requests' GETs.
      */
     function failSnapshots(
       id: string,
-      statuses: number[],
+      statuses: (number | "hang")[],
       request: "metadata" | "items" = "metadata",
     ): { gets: Record<"metadata" | "items", string[]>; streams: StreamSink[] } {
       const gets = { metadata: [] as string[], items: [] as string[] };
@@ -3206,6 +3209,7 @@ describe("chatStore — send (first-send ordering)", () => {
         if (requested !== null && (init?.method ?? "GET") === "GET") {
           gets[requested].push(url);
           const status = requested === request ? statuses.shift() : undefined;
+          if (status === "hang") return new Promise<Response>(() => {});
           if (status !== undefined) return mockResponse({}, { ok: false, status });
         }
         return defaultFetchHandler(input, init);
@@ -3218,31 +3222,76 @@ describe("chatStore — send (first-send ordering)", () => {
       return sse("response.output_text.delta", { delta, message_id: "m1", index });
     }
 
-    it.each(["metadata", "items"] as const)(
-      "retries a failed %s request on its own",
-      async (request) => {
-        vi.useFakeTimers();
-        seedSession("conv_flaky", []);
-        const { gets } = failSnapshots("conv_flaky", [503], request);
+    it.each([
+      ["a failed", "metadata", 503, 0],
+      ["a failed", "items", 503, 0],
+      ["an unanswered", "metadata", "hang", SESSION_READ_TIMEOUT_MS],
+      ["an unanswered", "items", "hang", SESSION_READ_TIMEOUT_MS],
+    ] as const)("retries %s %s request on its own", async (_label, request, answer, waitMs) => {
+      vi.useFakeTimers();
+      seedSession("conv_flaky", []);
+      const { gets } = failSnapshots("conv_flaky", [answer], request);
 
-        const switched = useChatStore.getState().switchTo("conv_flaky");
-        await vi.advanceTimersByTimeAsync(100);
-        const entry = conversationRegistry.peek("conv_flaky")!;
-        expect(entry.getState()).toMatchObject({
-          loadingConversation: true,
-          conversationLoadError: null,
-        });
-        await vi.advanceTimersByTimeAsync(2_000);
-        await switched;
+      const switched = useChatStore.getState().switchTo("conv_flaky");
+      await vi.advanceTimersByTimeAsync(100 + waitMs);
+      const entry = conversationRegistry.peek("conv_flaky")!;
+      expect(entry.getState()).toMatchObject({
+        loadingConversation: true,
+        conversationLoadError: null,
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
 
-        expect(entry.getState()).toMatchObject({
-          loadingConversation: false,
-          conversationLoadError: null,
-        });
-        expect(gets[request]).toHaveLength(2);
-        expect(gets[request === "metadata" ? "items" : "metadata"]).toHaveLength(1);
-      },
-    );
+      expect(entry.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+      expect(gets[request]).toHaveLength(2);
+      expect(gets[request === "metadata" ? "items" : "metadata"]).toHaveLength(1);
+      await switched;
+    });
+
+    it("lets a first load that is slow but progressing succeed on a longer retry", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_slow_load", []);
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0];
+        if (
+          path === "/v1/sessions/conv_slow_load" ||
+          path === "/v1/sessions/conv_slow_load/items"
+        ) {
+          // Each answer arrives 20 s in, past the first read deadline but within the retry's.
+          return new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(defaultFetchHandler(input, init)), 20_000);
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      const switched = useChatStore.getState().switchTo("conv_slow_load");
+      await vi.advanceTimersByTimeAsync(60_000);
+      await switched;
+
+      expect(conversationRegistry.peek("conv_slow_load")!.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+    });
+
+    it("leaves another caller's read in flight when a load that joined it times out", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_joined_load", []);
+      // Another caller's read of the same session, which the server never answers.
+      void client.fetchQuery({
+        queryKey: ["session", "conv_joined_load"],
+        queryFn: () => new Promise(() => {}),
+      });
+
+      void useChatStore.getState().switchTo("conv_joined_load");
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS + 100);
+
+      expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
+    });
 
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
@@ -6761,6 +6810,46 @@ describe("chatStore — delivered-but-unacked send", () => {
 
   const errorCards = () =>
     useChatStore.getState().blocks.filter((block): block is ErrorBlock => block.type === "error");
+
+  it.each([
+    ["message", () => useChatStore.getState().send("summarize the deploy status", "agent_xyz")],
+    [
+      "slash command",
+      () => useChatStore.getState().sendSlashCommand("grill-me", "review this", "agent_xyz"),
+    ],
+  ])("marks a %s as still sending while its POST goes unanswered", async (_kind, sendInput) => {
+    vi.useFakeTimers();
+    onTestFinished(() => {
+      vi.useRealTimers();
+    });
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    let answerPost: () => void = () => {};
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        // Rejects on abort like a real fetch, so the settled send shows it was never cancelled.
+        return new Promise<Response>((resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          answerPost = () => resolve(mockResponse({ queued: true, item_id: "ci_mock" }));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const pending = () => useChatStore.getState().pendingUserMessages;
+
+    const sent = sendInput();
+    await vi.advanceTimersByTimeAsync(SEND_STILL_SENDING_AFTER_MS - 1);
+    expect(pending()).toHaveLength(1);
+    expect(pending()[0]!.stillSending).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pending()[0]!.stillSending).toBe(true);
+
+    answerPost();
+    await sent;
+    expect(pending()).toEqual([expect.objectContaining({ posted: true })]);
+  });
 
   it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
     useChatStore.setState({
@@ -13932,6 +14021,14 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     return sinks;
   }
 
+  /** A 200 text/html login page, as an expired auth ingress answers a stream open. */
+  function loginPageResponse(): Response {
+    const html = pushableStream();
+    html.push("<!doctype html><title>Login</title>");
+    html.close();
+    return mockResponse(null, { bodyStream: html.stream, contentType: "text/html" });
+  }
+
   async function advanceWithHeartbeats(
     sink: StreamSink | (() => StreamSink),
     durationMs: number,
@@ -14859,6 +14956,48 @@ describe("chatStore — startStreamPump reconnect loop", () => {
           responseId: "resp_401_visible",
           lifecycle: "failed",
           error: "stream unavailable (401)",
+        }),
+      ]),
+    );
+  });
+
+  // An expired sign-in answers every API read with the login page, not just the stream.
+  it("fails a streaming reply with one connection card after persistent login pages", async () => {
+    const response = assistantMessage("resp_unavailable_visible", "Partial reply");
+    seedSession("conv_unavailable_visible", [response]);
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      return url.includes("/v1/") ? loginPageResponse() : defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: "conv_unavailable_visible",
+      abortController: controller,
+      sessionStatus: "running",
+      blocks: itemsToBlocks([response]),
+      activeResponse: { responseId: "resp_unavailable_visible", state: "streaming", error: null },
+    });
+
+    const loop = startStreamPump("conv_unavailable_visible", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(70_000);
+    await loop;
+
+    const state = useChatStore.getState();
+    expect(state.blocks.filter((block) => block.type === "error")).toEqual([
+      expect.objectContaining({
+        code: "stream_unavailable",
+        title: "The live connection to the assistant is unavailable",
+        message: "Reload the page to reconnect.",
+      }),
+    ]);
+    // The bubble carries no banner of its own, so the card is the only notice.
+    expect(buildBubbles(state.blocks, state.activeResponse)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "assistant",
+          responseId: "resp_unavailable_visible",
+          lifecycle: "failed",
+          error: null,
         }),
       ]),
     );
@@ -15903,18 +16042,34 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     newestSink: () => StreamSink,
   ): Promise<void> {
     const fetchesBefore = pump.itemFetches();
-    await advanceWithHeartbeats(newestSink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
-    await drainAsync();
+    // Stop at the read so a held response is released well inside the read timeout.
+    /* oxlint-disable no-await-in-loop */
+    for (
+      let elapsed = 0;
+      pump.itemFetches() === fetchesBefore && elapsed < ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS;
+      elapsed += 5_000
+    ) {
+      newestSink().push(sse("session.heartbeat", {}));
+      await drainAsync(2);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await drainAsync();
+    }
+    /* oxlint-enable no-await-in-loop */
     expect(pump.itemFetches()).toBeGreaterThan(fetchesBefore);
   }
 
   // A 30-item gap needs a backward page; 90 items outrun the page cap into a window rehydrate.
   it.each([
-    ["every history read", 0, () => true],
-    ["a backward history page", 30, (url: string) => url.includes("after=")],
-    ["the window rehydrate", 90, (url: string) => url.includes(`limit=${INITIAL_WINDOW_ITEMS}`)],
+    ["every history read fails", 0, () => true],
+    ["a backward history page fails", 30, (url: string) => url.includes("after=")],
+    [
+      "the window rehydrate fails",
+      90,
+      (url: string) => url.includes(`limit=${INITIAL_WINDOW_ITEMS}`),
+    ],
+    ["every history read goes unanswered", 0, () => new Promise<boolean>(() => {})],
   ])(
-    "settles a missed turn end while %s fails, then backfills its reply once",
+    "settles a missed turn end while %s, then backfills its reply once",
     async (_read, gapLength, readFails) => {
       let itemsDown = true;
       const gap = Array.from({ length: gapLength }, (_, i) => gapUser("missed", i));
@@ -15940,6 +16095,27 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await pump.stop();
     },
   );
+
+  it("reconnects after a drop that follows an unanswered reconnect history read", async () => {
+    let itemsHang = true;
+    const pump = await startMissedEventPump("conv_unanswered_backfill", "idle", {
+      itemsDown: () => (itemsHang ? new Promise<boolean>(() => {}) : false),
+    });
+    pump.bound.set({ pendingUserMessages: [] });
+    const newestSink = () => pump.sinks.at(-1)!;
+
+    await advanceWithHeartbeats(newestSink, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+    await drainAsync();
+    expect(pump.sinks).toHaveLength(2);
+    itemsHang = false;
+    await advanceWithHeartbeats(newestSink, SESSION_READ_TIMEOUT_MS);
+
+    pump.sinks[1]!.error();
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(pump.sinks).toHaveLength(3);
+
+    await pump.stop();
+  });
 
   it("settles a send latch from an ended snapshot only after its running edge arrived", async () => {
     const id = "conv_missed_latched_end";
@@ -16525,36 +16701,131 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
-  it("backs off when the stream open answers with a non-SSE content type", async () => {
-    seedSession("conv_html", []);
-    let opens = 0;
+  it.each([
+    ["no turn", null],
+    [
+      "a completed turn",
+      { responseId: "resp_html_done", state: "completed" as const, error: null, completedAt: 1 },
+    ],
+  ])(
+    "backs off on a login-page stream answer, then gives up with a notice after %s",
+    async (_turn, activeResponse) => {
+      seedSession("conv_html", []);
+      let opens = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+          opens += 1;
+          return loginPageResponse();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_html",
+        abortController: controller,
+        activeResponse,
+      });
+
+      const loop = startStreamPump("conv_html", controller, setState, getState);
+      await vi.advanceTimersByTimeAsync(100);
+      // Rejected as a failed open → retried WITH backoff. Pumping the HTML
+      // instead would read as a clean drop and reconnect with no delay.
+      expect(opens).toBe(1);
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(opens).toBeGreaterThan(1);
+      expect(opens).toBeLessThan(10);
+      // A maintenance page during a restart answers the same way, so a short
+      // run of them keeps retrying without a notice.
+      await vi.advanceTimersByTimeAsync(24_000);
+      expect(opens).toBeGreaterThan(3);
+      expect(useChatStore.getState().blocks.filter((block) => block.type === "error")).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(40_000);
+      const opensAtGiveUp = opens;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(opens).toBe(opensAtGiveUp);
+      const state = useChatStore.getState();
+      expect(state.status).toBe("idle");
+      expect(state.activeResponse).toEqual(activeResponse);
+      const errors = state.blocks.filter((block) => block.type === "error");
+      expect(errors).toEqual([
+        expect.objectContaining({
+          code: "stream_unavailable",
+          title: "The live connection to the assistant is unavailable",
+        }),
+      ]);
+      controller.abort();
+      await loop;
+    },
+  );
+
+  it("restarts the login-page window after a successful stream open", async () => {
+    seedSession("conv_html_reset", []);
+    let answer: "login" | "open" = "login";
+    const sinks: StreamSink[] = [];
     fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
-        opens += 1;
-        // An expired auth ingress: the fetch follows its redirect to a 200
-        // text/html login page instead of the SSE body.
-        const html = pushableStream();
-        html.push("<!doctype html><title>Login</title>");
-        html.close();
-        return mockResponse(null, { bodyStream: html.stream, contentType: "text/html" });
+        if (answer === "login") return loginPageResponse();
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
       }
       return defaultFetchHandler(input, init);
     });
     const controller = new AbortController();
-    useChatStore.setState({ conversationId: "conv_html", abortController: controller });
+    useChatStore.setState({ conversationId: "conv_html_reset", abortController: controller });
+    const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+    const streamOpens = () =>
+      fetchMock.mock.calls.filter(([input]) => /\/stream$/.test(String(input))).length;
 
-    const loop = startStreamPump("conv_html", controller, setState, getState);
+    const loop = startStreamPump("conv_html_reset", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(50_000);
+    answer = "open";
+    const opensBeforeOpen = streamOpens();
     await vi.advanceTimersByTimeAsync(6_000);
+    expect(streamOpens()).toBeGreaterThan(opensBeforeOpen);
 
-    // Rejected as a failed open → retried WITH backoff. Pumping the HTML
-    // instead would read as a clean drop and reconnect with no delay — a
-    // hot loop hammering the login page (dozens of opens in this window).
-    expect(opens).toBeGreaterThan(1);
-    expect(opens).toBeLessThan(10);
+    answer = "login";
+    sinks[0]?.close();
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(errorBlocks()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
 
     controller.abort();
-    await vi.advanceTimersByTimeAsync(6_000);
+    await loop;
+  });
+
+  // Only a successful open ends the window: a 503 or a failed connection between
+  // login pages must not restart it, or a phone alternating with no network gives up never.
+  it("keeps the login-page window across failed connections and 503s", async () => {
+    seedSession("conv_html_mixed", []);
+    const answers = ["login", "503", "network"] as const;
+    let opens = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        const answer = answers[opens % answers.length];
+        opens += 1;
+        if (answer === "login") return loginPageResponse();
+        if (answer === "503") return mockResponse(null, { ok: false, status: 503 });
+        return Promise.reject(new TypeError("Failed to fetch"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_html_mixed", abortController: controller });
+    const errorBlocks = () => useChatStore.getState().blocks.filter((b) => b.type === "error");
+
+    const loop = startStreamPump("conv_html_mixed", controller, setState, getState);
+    await vi.advanceTimersByTimeAsync(50_000);
+    expect(errorBlocks()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(errorBlocks()).toEqual([expect.objectContaining({ code: "stream_unavailable" })]);
+
+    controller.abort();
     await loop;
   });
 

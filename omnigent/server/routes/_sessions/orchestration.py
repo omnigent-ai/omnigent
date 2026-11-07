@@ -952,6 +952,7 @@ async def _archive_stop(
     host_registry: Any,
     *,
     delete_worktree: bool = False,
+    host_store: HostStore | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1049,6 +1050,7 @@ async def _archive_stop(
                 delete_branch=False,
                 host_registry=host_registry,
                 reason="session-archive",
+                host_store=host_store,
                 expected_root_fingerprint=conv.labels.get(WORKTREE_ROOT_LABEL_KEY),
                 conversation_store=conversation_store,
                 exclude_conversation_id=session_id,
@@ -1069,6 +1071,7 @@ def _spawn_archive_stop(
     host_registry: Any = None,
     *,
     delete_worktree: bool = False,
+    host_store: HostStore | None = None,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1116,6 +1119,7 @@ def _spawn_archive_stop(
             runner_router,
             host_registry,
             delete_worktree=delete_worktree,
+            host_store=host_store,
         )
 
     task = asyncio.create_task(_stop_after_grace())
@@ -1174,13 +1178,16 @@ def _labels_for_viewer(labels: dict[str, str], user_id: str | None) -> dict[str,
     :returns: A copy with the pin and sandbox-repo families collapsed to their
         canonical bare keys.
     """
+    from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
+
     my_key = pinned_label_key(user_id)
     my_pin = labels.get(my_key)
     repos = read_managed_repo_workspaces(labels)
     cleaned = {
         k: v
         for k, v in labels.items()
-        if not k.startswith(PROFILE_LABEL_PREFIX)
+        if not k.startswith(FAMILY_PIN_LABEL_PREFIX)
+        and not k.startswith(PROFILE_LABEL_PREFIX)
         and k != PINNED_LABEL_KEY
         and not k.startswith(f"{PINNED_LABEL_KEY}.")
         and k != MANAGED_REPO_LABEL_KEY
@@ -4686,6 +4693,14 @@ async def _run_managed_launch(
         )
         if managed is None:
             return
+        if (
+            relaunch_host is not None
+            and saved_conversation is not None
+            and saved_conversation.host_id == managed.host_id
+            and saved_conversation.workspace is not None
+        ):
+            # Recovery shares compute, while the host restores each session's own cwd.
+            managed.workspace = saved_conversation.workspace
         await _bind_and_launch_managed_runner(
             session_id=session_id,
             managed=managed,
@@ -4768,17 +4783,23 @@ async def _bind_and_launch_managed_runner(
     async def rollback_fresh_host() -> None:
         if relaunch_host is not None:
             return
-        if sandbox_profiles is not None:
-            with contextlib.suppress(ConversationNotFoundError):
-                await asyncio.to_thread(
-                    conversation_store.clear_host_binding,
-                    session_id,
-                    expected_host_id=managed.host_id,
-                    clear_profile=True,
-                )
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                conversation_store.clear_host_binding,
+                session_id,
+                expected_host_id=managed.host_id,
+                expected_sandbox_id=managed.sandbox_id,
+                clear_profile=sandbox_profiles is not None,
+            )
         host = await asyncio.to_thread(host_store.get_host, managed.host_id)
-        if host is not None:
-            await terminate_managed_host(host, host_store, sandbox_config)
+        if host is not None and (
+            managed.sandbox_id is None
+            or (
+                host.sandbox_id == managed.sandbox_id
+                and host.sandbox_provider == managed.sandbox_provider
+            )
+        ):
+            await terminate_managed_host(host, host_store, sandbox_config, keep_if_bound=True)
 
     reason: str | None = None
     cancelled = False
@@ -9359,9 +9380,11 @@ async def _relay_runner_stream_once(
     _relay_timeout = httpx.Timeout(connect=5.0, read=45.0, write=None, pool=None)
     heartbeat_seen = False
     try:
+        # Every connection reopens this stream, so the runner relearns that inferred
+        # status edges are handled below; an older runner ignores the parameter.
         async with runner_client.stream(
             "GET",
-            f"/v1/sessions/{session_id}/stream",
+            f"/v1/sessions/{session_id}/stream?accepts_inferred_status=true",
             timeout=_relay_timeout,
         ) as resp:
             resp.raise_for_status()
@@ -9423,6 +9446,25 @@ async def _relay_runner_stream_once(
                         continue
 
                     _record_native_input_lifecycle(session_id, event)
+
+                    # A pane-inferred reason only annotates a running turn. Publishing it
+                    # without yielding keeps a hook's concurrent completion authoritative.
+                    if evt_type == "session.status" and event.get("inferred") is True:
+                        inferred_blocked_on = event.get("blocked_on")
+                        if (
+                            event.get("status") == "running"
+                            and _session_status_cache.get(session_id) == "running"
+                        ):
+                            _publish_status(
+                                session_id,
+                                "running",
+                                blocked_on=(
+                                    inferred_blocked_on
+                                    if isinstance(inferred_blocked_on, str) and inferred_blocked_on
+                                    else None
+                                ),
+                            )
+                        continue
 
                     if evt_type in _TERMINAL_RESPONSE_EVENT_TYPES or (
                         evt_type == "session.status" and event.get("status") == "running"
@@ -11679,7 +11721,11 @@ async def _create_session_from_existing_agent(
         )
         if source_project is not None:
             project_id = created_by_project_id
-    creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+    creation_metadata(
+        parent_session_id=body.parent_session_id,
+        host_type=body.host_type,
+        created_by_session_id=created_by_session_id,
+    )
     assert body.agent_id is not None
 
     _reject_reserved_cost_control_label_seed(body.labels)
@@ -12312,6 +12358,18 @@ async def _create_session_from_existing_agent(
                 harness_override=harness_override,
                 **snapshot_kwargs,
             )
+            if body.sibling_source_id is not None:
+                from omnigent.server.session_families import complete_sibling_creation
+
+                await complete_sibling_creation(
+                    conversation_store,
+                    body.sibling_source_id,
+                    conv.id,
+                    user_id=user_id,
+                )
+                conv = (
+                    await asyncio.to_thread(conversation_store.get_conversation, conv.id)
+                ) or conv
             await record_profile(request, conv.id, sandbox_profile, conversation_store)
     except NameAlreadyExistsError as exc:
         if (
@@ -14032,6 +14090,23 @@ async def _get_session_snapshot(
         agent_store=agent_store,
         agent_cache=agent_cache,
     )
+    if request is not None:
+        from omnigent.server.session_families import project_families
+
+        _, families = await asyncio.to_thread(
+            project_families,
+            conv_store,
+            getattr(request.app.state, "permission_store", None),
+            [conv],
+            viewer_id,
+        )
+        response.family = families.get(conv.id)
+        if (
+            response.family
+            and response.family.pinned
+            and response.family.representative_id == conv.id
+        ):
+            response.labels[PINNED_LABEL_KEY] = response.family.pinned_at or "1"
     response.side_chat_settings_supported = await _runner_supports_side_chat_settings(
         conv, conv_store, getattr(request.app.state, "tunnel_registry", None) if request else None
     )

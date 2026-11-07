@@ -48,11 +48,17 @@ def creation_stage(attribute: CreationStageAttribute) -> Iterator[None]:
         add_audit_attrs(**{attribute: total_ms})
 
 
-def creation_metadata(*, parent_session_id: str | None, host_type: str) -> None:
+def creation_metadata(
+    *,
+    parent_session_id: str | None,
+    host_type: str,
+    created_by_session_id: str | None = None,
+) -> None:
     """Classify validated creates before persistence or launch can fail."""
     add_audit_attrs(
         creation_kind="child" if parent_session_id else "top_level",
         host_type=host_type,
+        created_by_session_id=created_by_session_id,
     )
 
 

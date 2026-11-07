@@ -1105,6 +1105,10 @@ class _RecoveryConversationStore:
             live_status=self.live_status,
         )
 
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        if self.conversation and self.conversation.host_id == kwargs["expected_host_id"]:
+            self.conversation.host_id = None
+
     def list_items(
         self, conversation_id: str, limit: int = 100, order: str = "asc", **_: Any
     ) -> Any:
@@ -1436,6 +1440,7 @@ async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox
 
     assert await executor.recover(run) == "failed"
     assert startup.launch_failures == []
+    assert conversations.conversation.host_id is None
     assert terminate.await_args.args[0] is hosts.hosts[run.host_id]
 
 
@@ -1636,3 +1641,47 @@ def test_stage_started_deduplicates_nested_scopes_per_run(caplog, stage):
     ]
     assert [(e["run_id"], e["fire_stage"]) for e in events] == [(run, stage) for run in ("A", "B")]
     assert telemetry.current_fire_stage() == "input_validation"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
+    store, db_uri, shared
+) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    hosts = HostStore(db_uri)
+    host = hosts.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="failed-run",
+        user_id="local",
+        token="test-token",
+        provider="modal",
+        sandbox_id="sb-failed",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    failed = conversations.create_conversation(host_id=host.host_id, workspace="/workspace")
+    if shared:
+        peer = conversations.create_conversation(host_id=host.host_id, workspace="/workspace")
+        conversations.update_conversation(peer.id, archived=True)
+    launcher = FakeSandboxLauncher()
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://test.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+            provider="modal",
+        )
+    )
+    await fire_mod._terminate_run_sandbox(
+        _deps(store, conversation_store=conversations, host_store=hosts, sandbox_config=config),
+        host.host_id,
+        failed.id,
+    )
+    assert conversations.get_conversation(failed.id).host_id is None
+    assert (hosts.get_host(host.host_id) is not None) is shared
+    assert launcher.terminated == ([] if shared else ["sb-failed"])
+    if shared:
+        assert conversations.get_conversation(peer.id).host_id == host.host_id

@@ -554,6 +554,13 @@ export interface SessionStatusEvent {
 }
 
 /**
+ * Runner's `blockedOn` reason when the agent still reads as working but its
+ * terminal shows something it did not report, e.g. a dialog opened mid-reply.
+ * Inferred from the screen, so the UI words it tentatively.
+ */
+export const TERMINAL_PROMPT_BLOCKED_ON = "terminal prompt";
+
+/**
  * `session.usage` — token-usage update from a terminal-backed runtime.
  *
  * Substitutes for `response.completed` on claude-native sessions

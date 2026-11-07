@@ -279,6 +279,8 @@ class ServerInfoResponse(BaseModel):
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
     scheduled_task_sandbox_workspaces: bool = True
+    # Owner-private families and reuse of the source session's sandbox.
+    sibling_sessions: bool = False
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -2187,16 +2189,16 @@ def create_app(
             # backstop. Persistent scheduling separately recovers expired startups.
 
         managed_sandbox_reaper: ManagedSandboxReaper | None = None
-        if sandbox_config is not None and sandbox_config.reaper.enabled:
+        if sandbox_config is not None:
             if host_store is None:
                 _logger.warning(
-                    "Managed sandbox reaper is enabled but no host store is configured; "
-                    "the reaper will not run"
+                    "No host store is configured; managed sandbox cleanup will not run"
                 )
             else:
                 managed_sandbox_reaper = ManagedSandboxReaper(
                     host_store=host_store,
                     sandbox_config=sandbox_config,
+                    reap_offline=sandbox_config.reaper.enabled,
                 )
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
@@ -2279,6 +2281,7 @@ def create_app(
         else None
     )
     app.state.startup_inputs = startup_inputs
+    app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
@@ -3649,6 +3652,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,

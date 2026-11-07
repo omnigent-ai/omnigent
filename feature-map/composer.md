@@ -311,6 +311,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- **Add nested agent** opens this composer scoped to the source session, with
+  that session's sandbox preselected. See [sibling entry points](sessions.md#how-to-get-to-it-user-pov).
+  If creation is rejected, the same composer restores the prompt and attachments.
 - Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to

@@ -32,7 +32,13 @@ reattach when the session moves to another host.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
-  says so and routes the user to the terminal.
+  says so and routes the user to the terminal. When Claude Code still reports a
+  running turn but its input box has been hidden for 15 seconds (for example a
+  dialog opened while a reply streams), chat says something in the terminal may
+  need input, and the sidebar row moves to Needs attention with a "May need input"
+  tag, until the input box returns. `!` shell mode, the ctrl+r history search
+  and a draft quoting a dialog's title keep the input box in use, so they do
+  not count as hidden. A runner connected to an older server sends no alert.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -157,6 +163,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py::test_pane_liveness_reads_the_requested_pane`
+  checks both shared WebSocket probes against real split tmux panes, including
+  an exited neighbor. This is a process check without a browser or vendor CLI.
 - **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
   `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
   executable at spawn and cancellation after a real pane starts, including
@@ -176,7 +185,17 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
-  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  injects the blocked event; it does not run a vendor CLI. The hidden-input-box
+  hint is produced by
+  `tests/e2e/test_claude_native_hidden_prompt_e2e.py::test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal`
+  (real Claude Code and tmux against a slow local Messages API; needs `claude`
+  on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
+  (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery or
+  input_box_in_another_mode'`), the pane matrix in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py`
+  (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
+  `web/src/components/SessionStateBadge.test.tsx`.
+  For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
 

@@ -333,6 +333,9 @@ class FakeConversationStore:
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
 
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
+
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
 
