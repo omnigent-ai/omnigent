@@ -18,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from tests._helpers.polling import poll_until_async
 from tests.harnesses.codex_native.forwarder._support import (
     _posted_cumulative_tokens,
     _usage_event,
@@ -361,8 +362,10 @@ async def test_child_delivery_slots_are_shared_and_released_after_failure() -> N
         for thread_id, handle in lane_events:
             event = _event("item/completed", thread_id, f"turn_{thread_id}")
             assert state.enqueue_child_event(client, event, handle, parent_thread_id=None)
-        await asyncio.sleep(0.1)
-        assert peak == 2
+        # Both slots held by blocked handlers; the others wait on the semaphore.
+        await poll_until_async(
+            lambda: active == 2 and state.child_delivery_slots.locked(), timeout_s=5
+        )
         release.set()
         async with asyncio.timeout(5):
             await state.close_child_streams()
