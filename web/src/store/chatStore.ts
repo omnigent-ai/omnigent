@@ -5246,26 +5246,31 @@ async function bindStream(
     // the reader sees as the transcript shifting seconds after it settled.
     const client = queryClient;
     // Each request retries on its own, so a failed one doesn't repeat the other.
+    // Set when the last session read timed out, so its retry can tell that the shared
+    // read it may have joined is the one that never answers.
+    let sessionReadTimedOut = false;
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout((signal) => {
           const queryKey = ["session", id];
-          // Joining another caller's read would tie this load to a request that may
-          // never answer, and its timeout could not cancel that request. Read directly
-          // with this attempt's own deadline, and seed the shared cache with the result.
-          if (client.isFetching({ queryKey, exact: true }) > 0) {
+          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
+          // A retry after a timeout reads directly rather than rejoin a shared read that
+          // may never answer, and its result seeds the shared cache.
+          if (sessionReadTimedOut && joinsSharedRead) {
             return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
               client.setQueryData(queryKey, fresh);
               return fresh;
             });
           }
-          // Otherwise this attempt owns the request, so a timeout drops it and the retry
-          // reads afresh.
-          signal.addEventListener(
-            "abort",
-            () => void client.cancelQueries({ queryKey, exact: true }),
-            { once: true },
-          );
+          // An attempt that starts the request drops it on timeout, so the retry reads
+          // afresh. One that joins another caller's read leaves that read to its caller.
+          if (!joinsSharedRead) {
+            signal.addEventListener(
+              "abort",
+              () => void client.cancelQueries({ queryKey, exact: true }),
+              { once: true },
+            );
+          }
           return client.fetchQuery({
             queryKey,
             queryFn: ({ signal: querySignal }) =>
@@ -5273,7 +5278,10 @@ async function bindStream(
             staleTime: 0,
             retry: false,
           });
-        }, snapshotLoadDeadlineMs(attempt)),
+        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
+          sessionReadTimedOut = error instanceof DOMException && error.name === "TimeoutError";
+          throw error;
+        }),
       ),
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout(

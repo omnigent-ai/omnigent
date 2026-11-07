@@ -3293,7 +3293,7 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
     });
 
-    it("loads a session whose shared read never answers, through the load's own request", async () => {
+    it("recovers a load stuck on a shared read that never answers after its first deadline", async () => {
       vi.useFakeTimers();
       seedSession("conv_stuck_join", []);
       // Another caller's read of the same session, which the server never answers.
@@ -3303,12 +3303,33 @@ describe("chatStore — send (first-send ordering)", () => {
       });
 
       void useChatStore.getState().switchTo("conv_stuck_join");
-      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS + 1_000);
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS - 1_000);
+      expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
+        loadingConversation: true,
+      });
 
+      await vi.advanceTimersByTimeAsync(5_000);
       expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
         loadingConversation: false,
         conversationLoadError: null,
       });
+    });
+
+    it("reads a session once when its load joins a shared read that answers", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_shared_read", []);
+      void client.fetchQuery({
+        queryKey: ["session", "conv_shared_read"],
+        queryFn: () => getSessionSlim("conv_shared_read", { refreshState: true }),
+      });
+
+      void useChatStore.getState().switchTo("conv_shared_read");
+      await vi.advanceTimersByTimeAsync(100);
+
+      const sessionReads = fetchMock.mock.calls.filter(
+        ([input]) => String(input).split("?")[0] === "/v1/sessions/conv_shared_read",
+      );
+      expect(sessionReads).toHaveLength(1);
     });
 
     it("fails a missing session at once", async () => {
