@@ -25,6 +25,7 @@ import enum
 import logging
 import threading
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -41,6 +42,10 @@ _REASON_MAX_CHARS = 200
 
 # MCP ElicitResult verdicts a resolution event may carry.
 _VERDICT_ACTIONS = ("accept", "decline", "cancel")
+
+# Reason the server reports when a wait ended without anyone answering: the
+# prompt expired, or the harness holding it died (a stopped sub-agent).
+_UNANSWERED_REASON = "unanswered"
 
 # Bounded in-handler retry for a transient delivery miss (parent runner briefly
 # unroutable during a reconnect/relaunch). Total attempts = 1 + _WAKE_RETRIES.
@@ -73,6 +78,21 @@ class _WakeOutcome(enum.Enum):
     DELIVERED = "delivered"
     MOOT = "moot"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class _Resolution:
+    """
+    How a woken block ended, as the resolution notice needs to describe it.
+
+    :param action: The MCP verdict (``"accept"``/``"decline"``/``"cancel"``),
+        or ``None`` when the resolution carried none.
+    :param reason: Why the wait ended when no verdict was recorded, e.g.
+        ``"unanswered"``; ``None`` on older runners that omit it.
+    """
+
+    action: str | None
+    reason: str | None
 
 
 async def _sleep(seconds: float) -> None:
@@ -133,10 +153,10 @@ class SubagentBlockNotifier:
         # dispatches a wake so a resolve racing the in-flight wake is never
         # missed; observe() sets it on the resolved event.
         self._resolution_signals: dict[tuple[str, str], asyncio.Event] = {}
-        # Verdict captured off the resolved event ("accept"/"decline"/"cancel"),
-        # stored only while a handler waits on the matching signal so entries
-        # never outlive the notice they inform.
-        self._verdicts: dict[asyncio.Event, str] = {}
+        # Outcome captured off the resolved event (verdict and/or why the wait
+        # ended), stored only while a handler waits on the matching signal so
+        # entries never outlive the notice they inform.
+        self._resolutions: dict[asyncio.Event, _Resolution] = {}
         # Strong refs so scheduled wake futures aren't GC'd mid-flight; close() cancels them.
         self._inflight: set[concurrent.futures.Future[None]] = set()
 
@@ -170,8 +190,12 @@ class SubagentBlockNotifier:
                 self._notified.pop(key)
                 signal = self._resolution_signals.get(key)
                 action = _resolution_action(event)
-                if signal is not None and action is not None:
-                    self._verdicts[signal] = action
+                reason = _resolution_reason(event)
+                # A severed wait carries a reason and no verdict, so keying
+                # this on the verdict alone would drop it and leave the
+                # notice claiming the sub-agent is still running.
+                if signal is not None and (action is not None or reason is not None):
+                    self._resolutions[signal] = _Resolution(action=action, reason=reason)
             if signal is not None:
                 # Event.set is not thread-safe; hop onto the loop. A gone
                 # loop (shutdown) means the waiting handler dies with it.
@@ -323,15 +347,15 @@ class SubagentBlockNotifier:
                 # A retried prompt may already be pending again under this id.
                 if key in self._notified or self._resolution_signals.get(key) is not signal:
                     return
-                verdict = self._verdicts.pop(signal, None)
+                resolution = self._resolutions.pop(signal, None)
             await self._deliver_with_retry(
-                parent_id, child, _format_resolution_notice(child, verdict), armed_id=None
+                parent_id, child, _format_resolution_notice(child, resolution), armed_id=None
             )
         finally:
             with self._lock:
                 if self._resolution_signals.get(key) is signal:
                     self._resolution_signals.pop(key, None)
-                self._verdicts.pop(signal, None)
+                self._resolutions.pop(signal, None)
 
     async def _deliver_with_retry(
         self,
@@ -426,7 +450,7 @@ def _format_block_notice(child: Conversation, event: dict[str, Any]) -> str:
     )
 
 
-def _format_resolution_notice(child: Conversation, action: str | None) -> str:
+def _format_resolution_notice(child: Conversation, resolution: _Resolution | None) -> str:
     """
     Build the follow-up notice sent after a woken block resolves.
 
@@ -439,23 +463,50 @@ def _format_resolution_notice(child: Conversation, action: str | None) -> str:
     (timeout, severed wait, older runner) the notice says so and points
     at the fail-closed reading.
 
+    A wait that ended with nobody answering gets its own wording. The
+    prompt expired, or the harness holding it died — a stopped sub-agent
+    severs it — so the usual "it is continuing" and "the result will
+    arrive" would tell the parent to wait on a child that may be gone.
+
     :param child: The previously blocked child :class:`Conversation`,
         used for its ``<agent>:<title>`` label.
-    :param action: The MCP verdict from the resolution event —
-        ``"accept"``, ``"decline"``, or ``"cancel"`` — or ``None``
-        when the resolution carried no verdict.
+    :param resolution: How the block ended, or ``None`` when the event
+        carried neither a verdict nor a reason.
     :returns: A one-line ``[System: …]`` notice, e.g. ``"[System:
         sub-agent codex/auth-refactor's pending approval has been
         resolved (action: decline — NOT approved) and it is
         continuing. …]"``.
     """
     label = _child_label(child)
+    action = resolution.action if resolution is not None else None
+    reason = resolution.reason if resolution is not None else None
+    if action is None and reason == _UNANSWERED_REASON:
+        return (
+            f"[System: sub-agent {label}'s pending approval is no longer "
+            "waiting, but nobody answered it (treat the call as NOT "
+            "approved). The prompt expired, or the sub-agent was stopped — do "
+            "not assume it is still running, and do not wait on further "
+            "output from it. Check its status with sys_session_get_info "
+            "before you act on the earlier block notice.]"
+        )
     return (
         f"[System: sub-agent {label}'s pending approval has been resolved "
         f"{_verdict_clause(action)} and it is continuing. No action is needed "
         "on the earlier block notice — if you are waiting on its output, the "
         "result will arrive in your inbox as usual.]"
     )
+
+
+def _resolution_reason(event: dict[str, Any]) -> str | None:
+    """
+    Extract why a wait ended from a ``response.elicitation_resolved`` event.
+
+    :param event: The resolved event dict; reads ``reason``.
+    :returns: The reason string, e.g. ``"unanswered"``, or ``None`` when
+        the event predates reason carriage or carries a non-string.
+    """
+    reason = event.get("reason")
+    return reason if isinstance(reason, str) and reason else None
 
 
 def _verdict_clause(action: str | None) -> str:
