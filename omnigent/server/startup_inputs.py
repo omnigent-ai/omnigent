@@ -247,11 +247,25 @@ class ManagedStartupInputs:
             )
         return reason
 
-    async def accepts(self, conv: Conversation, app: Any) -> bool:
+    async def accepts(self, conv: Conversation, app: Any, *, allow_personal: bool = True) -> bool:
         """Whether a new message must wait behind the session's startup."""
         state = conv.labels.get(STARTUP_LABEL)
         if state not in ("pending", "ready"):
             return False
+        if not allow_personal and conv.host_id is not None:
+            connection = self.hosts.get(conv.host_id)
+            if connection is not None:
+                if not connection.registered_with_managed_token:
+                    return False
+            else:
+                host_store = getattr(app.state, "host_store", None)
+                host = (
+                    await asyncio.to_thread(host_store.get_host, conv.host_id)
+                    if host_store is not None
+                    else None
+                )
+                if host is not None and host.sandbox_provider is None:
+                    return False
         # A failed launch can't deliver anything; the message path reports why.
         # The tracker knows on the launching replica, the label everywhere.
         tracker = getattr(app.state, "managed_launches", None)
@@ -316,7 +330,7 @@ class ManagedStartupInputs:
                 wake.set()
                 return
             worker.cancel()
-        if connection is None or not connection.registered_with_managed_token:
+        if connection is None:
             return
         wake = asyncio.Event()
 
@@ -356,12 +370,27 @@ class ManagedStartupInputs:
     ) -> bool:
         """Advance one session's startup here; return whether work is in flight."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-        if conv is None or conv.host_id != connection.host_id:
+        if (
+            conv is None
+            or conv.host_id != connection.host_id
+            or self.hosts.get(connection.host_id) is not connection
+        ):
             return False
         state = conv.labels.get(STARTUP_LABEL)
+        if not connection.registered_with_managed_token:
+            from omnigent.server.routes._sessions.orchestration import _is_native_terminal_session
+
+            if (
+                state not in (None, "ready")
+                or conv.runner_id is None
+                or not _is_native_terminal_session(conv)
+            ):
+                return False
         if state == "failed":
             return False
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
+        if self.hosts.get(connection.host_id) is not connection:
+            return False
         if state == "cancelled":
             if not items:
                 await self._finish(session_id)
@@ -380,7 +409,11 @@ class ManagedStartupInputs:
                 )
                 self._deliveries[key] = task
             return head.status == "in_progress"
-        if state == "pending" and conv.runner_id is None:
+        if (
+            connection.registered_with_managed_token
+            and state == "pending"
+            and conv.runner_id is None
+        ):
             # The launch bound this host on a replica without its tunnel, so it
             # could not start the runner; start it here.
             from omnigent.server.routes.sessions import _launch_runner_on_host
@@ -432,6 +465,7 @@ class ManagedStartupInputs:
             return
         self._deliveries[key] = task
         context: StartupInputContext | None = None
+        conversation: Conversation | None = None
         sent = False
         dispatch_id = uuid4().hex
         try:
@@ -445,11 +479,14 @@ class ManagedStartupInputs:
                 or current.status != "in_progress"
             ):
                 return
+            conversation = conv
             options = (
                 item.data.startup_options
                 if isinstance(item.data, (MessageData, SlashCommandData))
                 else None
             )
+            from omnigent.server.routes.sessions.routes_events import HOST_OFFLINE_HOLD_HEADER
+
             context = StartupInputContext(
                 app,
                 Headers(
@@ -457,6 +494,7 @@ class ManagedStartupInputs:
                         "x-omnigent-background-session-titles": "on"
                         if options and options.background_titles_enabled
                         else "off",
+                        HOST_OFFLINE_HOLD_HEADER: "on",
                     }
                 ),
                 item.created_by,
@@ -517,6 +555,8 @@ class ManagedStartupInputs:
             )
             raise
         except Exception as exc:
+            if await self._waits_out_host_offline(context, conversation, exc):
+                return
             if await self._waits_out_session_move(session_id, exc):
                 return
             log_delivery(
@@ -556,6 +596,52 @@ class ManagedStartupInputs:
             )
         finally:
             self._deliveries.pop(key, None)
+
+    async def _waits_out_host_offline(
+        self,
+        context: StartupInputContext | None,
+        conversation: Conversation | None,
+        exc: Exception,
+    ) -> bool:
+        """Keep an unsubmitted original for its offline personal host's reconnect."""
+        if (
+            not isinstance(exc, OmnigentError)
+            or exc.code != ErrorCode.HOST_OFFLINE
+            or context is None
+            or context.submitted
+            or conversation is None
+            or conversation.host_id is None
+        ):
+            return False
+        current = await asyncio.to_thread(self.conversations.get_conversation, conversation.id)
+        item = await asyncio.to_thread(
+            self.conversations.get_item, conversation.id, context.input_id
+        )
+        if (
+            current is None
+            or current.host_id != conversation.host_id
+            or current.runner_id != conversation.runner_id
+            or current.labels.get(STARTUP_LABEL) == "cancelled"
+            or item is None
+            or item.response_id != PENDING_INPUT_RESPONSE_ID
+            or item.status != "in_progress"
+        ):
+            return False
+        from omnigent.server.routes.sessions.routes_events import (
+            _HeldOfflineHostError,
+            _session_offline_host_id,
+        )
+
+        if isinstance(exc, _HeldOfflineHostError):
+            return (
+                exc.session_id == conversation.id
+                and exc.host_id == conversation.host_id
+                and exc.runner_id == conversation.runner_id
+            )
+        return (
+            await _session_offline_host_id(current, context.app.state, self.conversations)
+            == conversation.host_id
+        )
 
     async def _waits_out_session_move(self, session_id: str, exc: Exception) -> bool:
         """Whether *exc* refused delivery only while ``/clear`` moves the session.

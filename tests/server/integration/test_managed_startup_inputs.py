@@ -253,9 +253,10 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
 @pytest.mark.parametrize(
     "name", [CLAUDE_NATIVE_CODING_AGENT.agent_name, CODEX_NATIVE_CODING_AGENT.agent_name]
 )
-@pytest.mark.parametrize("outcome", ["receipt", "stop"])
+@pytest.mark.parametrize("outcome", ["receipt", "stop", "uncertain"])
+@pytest.mark.parametrize("managed", [True, False], ids=["managed", "personal"])
 async def test_ordinary_native_input_uses_the_host_worker_without_replay(
-    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, outcome: str
+    startup_env: _Env, monkeypatch: pytest.MonkeyPatch, name: str, outcome: str, managed: bool
 ) -> None:
     env = startup_env
     session_id = await _create(env, name=name, initial_input=None)
@@ -263,7 +264,7 @@ async def test_ordinary_native_input_uses_the_host_worker_without_replay(
     host_id = uuid4().hex
     env.conv_store.set_host_id(session_id, host_id, "/tmp/ordinary-workspace")
     env.conv_store.set_runner_id(session_id, uuid4().hex)
-    _connect_host(env, host_id)
+    _connect_host(env, host_id, managed=managed)
     startup = env.app.state.startup_inputs
     dispatch = startup.dispatch
     entered = asyncio.Event()
@@ -277,6 +278,16 @@ async def test_ordinary_native_input_uses_the_host_worker_without_replay(
         startup.dispatch = wait_before_handoff
     forwarded: list[dict[str, Any]] = []
     runner = _stub_runner(monkeypatch, forwarded)
+    if outcome == "uncertain":
+
+        async def reject_submitted_message(response: httpx.Response) -> None:
+            if (
+                response.request.url.path == f"/v1/sessions/{session_id}/events"
+                and json.loads(response.request.content).get("type") == "message"
+            ):
+                response.status_code = 503
+
+        runner.event_hooks["response"].append(reject_submitted_message)
     restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
     restarted.dispatch = dispatch
     try:
@@ -300,18 +311,24 @@ async def test_ordinary_native_input_uses_the_host_worker_without_replay(
         pending_inputs.reset_for_tests()
         await restarted._deliver(env.app, session_id, saved)
         turns = [event for event in forwarded if event.get("type") == "message"]
-        assert len(turns) == int(outcome == "receipt")
+        assert len(turns) == int(outcome != "stop")
         if outcome == "receipt":
             await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
             assert env.conv_store.list_pending_inputs(session_id) == []
         snapshot = (await env.client.get(f"/v1/sessions/{session_id}")).json()
-        assert snapshot["pending_inputs"] == []
+        if outcome == "uncertain":
+            assert len(snapshot["pending_inputs"]) == 1
+            [current] = env.conv_store.list_pending_inputs(session_id)
+            assert current.id == saved.id and current.status == "incomplete"
+            assert not await restarted.retry(session_id)
+        else:
+            assert snapshot["pending_inputs"] == []
     finally:
         await restarted.shutdown()
         await runner.aclose()
 
 
-@pytest.mark.parametrize("connection", ["external", "missing", "cancelled"])
+@pytest.mark.parametrize("connection", ["missing", "cancelled"])
 async def test_ordinary_native_queue_preserves_other_host_and_stop_paths(
     startup_env: _Env, monkeypatch: pytest.MonkeyPatch, connection: str
 ) -> None:
@@ -1037,13 +1054,15 @@ async def test_saved_sdk_skill_resolves_after_launch_and_replaces_pending_bubble
     assert hidden.data.is_meta and hidden.id == turn["persisted_item_id"]
 
 
-def _connect_host(env: _Env, host_id: str) -> Any:
+def _connect_host(
+    env: _Env, host_id: str, *, managed: bool = True, owner: str | None = None
+) -> Any:
     return env.app.state.host_registry.register(
         host_id,
         AsyncMock(),
         HostHelloFrame(version="test", frame_protocol_version=1, name="startup-test", runners=[]),
-        owner=None,
-        registered_with_managed_token=True,
+        owner=owner,
+        registered_with_managed_token=managed,
     )
 
 
@@ -1625,3 +1644,611 @@ async def test_saved_delivery_identifies_failed_boundary(
             if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
         ]
     ) == int(reported_stage == "post_delivery")
+
+
+async def _personal_native_session(
+    app: FastAPI, client: httpx.AsyncClient, native: Any
+) -> tuple[_Env, str, Any]:
+    from omnigent.server.routes._sessions.orchestration import _is_native_terminal_session
+
+    owner = "owner@example.test"
+    client.headers["X-Forwarded-Email"] = owner
+    agent = await create_test_agent(
+        client,
+        name=native.agent_name,
+        executor={"type": "omnigent", "config": {"harness": native.harness}},
+    )
+    created = await client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "external"}
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    store = app.state.startup_inputs.conversations
+    store.delete_label(session_id, STARTUP_LABEL)
+    host_id = uuid4().hex
+    store.set_host_id(session_id, host_id, "/tmp/personal-workspace")
+    store.set_runner_id(session_id, uuid4().hex)
+    app.state.host_store.upsert_on_connect(host_id, "personal-test", owner, managed_token=None)
+    env = _Env(app, client, app.state.host_store, store)
+    connection = _connect_host(env, host_id, managed=False, owner=owner)
+    assert connection.owner == owner and not connection.registered_with_managed_token
+    conv = store.get_conversation(session_id)
+    assert conv is not None and _is_native_terminal_session(conv)
+    return env, session_id, connection
+
+
+@pytest.mark.parametrize("host_kind", ["personal", "managed", "managed_offline"])
+@pytest.mark.parametrize("event_kind", ["peer", "skill"])
+async def test_existing_backlog_does_not_extend_personal_input_kinds(
+    auth_app, auth_client, db_uri, monkeypatch, host_kind, event_kind
+):
+    from omnigent.server.feature_flags import FEATURES_ENV_VAR, resolve_feature_flags
+    from omnigent.server.session_orchestration import ORCHESTRATION_SOURCE_HEADER
+    from tests.server.integration.test_sessions_attribution import _bind_runner
+
+    env, session_id, connection = await _personal_native_session(
+        auth_app, auth_client, CODEX_NATIVE_CODING_AGENT
+    )
+    if host_kind != "personal":
+        host_id = uuid4().hex
+        env.host_store.register_managed_host(
+            host_id=host_id,
+            name="managed-test",
+            user_id="owner@example.test",
+            token="synthetic-managed-token",
+            token_expires_at=2**31,
+            provider="modal",
+            sandbox_id="synthetic-sandbox",
+        )
+        env.conv_store.set_host_id(session_id, host_id, "/tmp/managed-workspace")
+        connection = _connect_host(env, host_id)
+    startup = env.app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_: None)
+    head = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert head.status_code == 202
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    assert env.conv_store.get_conversation(session_id).labels[STARTUP_LABEL] == "ready"
+    if host_kind == "managed_offline":
+        assert env.app.state.host_registry.deregister(connection.host_id, conn=connection)
+        env.host_store.set_offline(connection.host_id)
+        assert env.host_store.get_host(connection.host_id).sandbox_provider == "modal"
+    headers = {}
+    if event_kind == "peer":
+        env.app.state.feature_flags = resolve_feature_flags(
+            {FEATURES_ENV_VAR: "session_orchestration"}
+        )
+        conv = env.conv_store.get_conversation(session_id)
+        source = await env.client.post(
+            "/v1/sessions", json={"agent_id": conv.agent_id, "host_type": "external"}
+        )
+        assert source.status_code == 201
+        source_id = source.json()["id"]
+        headers = {ORCHESTRATION_SOURCE_HEADER: source_id, **_bind_runner(db_uri, source_id)}
+        event = {"type": "session_message", "data": {"message": "Synthetic peer task"}}
+    else:
+        event = {
+            "type": "slash_command",
+            "data": {"kind": "skill", "name": "review", "arguments": "synthetic task"},
+        }
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    forwarded = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        forwarded.append(json.loads(request.content))
+        if request.url.path.endswith("/skills/resolve"):
+            return httpx.Response(
+                200, json={"meta_text": "<skill>Review the synthetic task.</skill>"}
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    runner = httpx.AsyncClient(transport=httpx.MockTransport(handle), base_url="http://runner")
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._get_runner_client", AsyncMock(return_value=runner)
+    )
+    try:
+        response = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json=event, headers=headers
+        )
+        assert response.status_code == 202 and not response.json().get("denied")
+        rows = env.conv_store.list_pending_inputs(session_id)
+        assert rows[0].id == saved.id and rows[0].status == "in_progress"
+        assert len(rows) == (1 if host_kind == "personal" else 2), (
+            "personal backlog must not add peer or skill inputs to the durable queue"
+        )
+        assert bool(forwarded) is (host_kind == "personal")
+        if host_kind == "personal":
+            [sent] = [item for item in forwarded if item.get("type") == "message"]
+            assert sent["content"] == [
+                {
+                    "type": "input_text",
+                    "text": f"[Message from session {source_id}]\nSynthetic peer task"
+                    if event_kind == "peer"
+                    else "<skill>Review the synthetic task.</skill>",
+                }
+            ]
+            if event_kind == "peer":
+                calls = len(forwarded)
+                missing_source_token = await env.client.post(
+                    f"/v1/sessions/{session_id}/events",
+                    json=event,
+                    headers={ORCHESTRATION_SOURCE_HEADER: source_id},
+                )
+                assert missing_source_token.status_code == 403
+                assert len(forwarded) == calls
+                assert [row.id for row in env.conv_store.list_pending_inputs(session_id)] == [
+                    saved.id
+                ]
+    finally:
+        await startup.shutdown()
+        await runner.aclose()
+
+
+async def test_personal_backlog_retains_an_offline_ordinary_human_follower(
+    auth_app, auth_client, monkeypatch
+):
+    env, session_id, connection = await _personal_native_session(
+        auth_app, auth_client, CODEX_NATIVE_CODING_AGENT
+    )
+    startup = env.app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_: None)
+    first = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert first.status_code == 202
+    [head] = env.conv_store.list_pending_inputs(session_id)
+    assert env.app.state.host_registry.deregister(connection.host_id, conn=connection)
+    env.host_store.set_offline(connection.host_id)
+    second = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert second.status_code == 202 and second.json().get("queued") is True
+    [original, follower] = env.conv_store.list_pending_inputs(session_id)
+    assert original.id == head.id and follower.id != head.id
+    assert all(
+        row.status == "in_progress" and row.created_by == "owner@example.test"
+        for row in [original, follower]
+    )
+
+
+@pytest.mark.parametrize(
+    "native",
+    [CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT],
+    ids=["personal-claude", "personal-codex"],
+)
+async def test_authenticated_personal_native_acceptance_keeps_a_durable_saved_row(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    native: Any,
+) -> None:
+    env, session_id, _ = await _personal_native_session(auth_app, auth_client, native)
+    owner = "owner@example.test"
+    store = env.conv_store
+    startup = auth_app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_: None)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    forwarded: list[dict[str, Any]] = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        accepted = await auth_client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+        assert accepted.status_code == 202, accepted.text
+        assert accepted.json().get("queued") is True and not accepted.json().get("denied")
+        saved = store.list_pending_inputs(session_id)
+        assert len(saved) == 1, "accepted personal native input must have a durable saved row"
+        assert saved[0].created_by == owner and saved[0].status == "in_progress"
+        assert not [event for event in forwarded if event.get("type") == "message"]
+    finally:
+        await startup.shutdown()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "native",
+    [CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT],
+    ids=["personal-claude", "personal-codex"],
+)
+@pytest.mark.parametrize("after_hold", ["receipt", "stop", "revoke", "reconnect_before_retention"])
+async def test_personal_offline_original_is_owned_by_the_reconnect_worker(
+    auth_app, auth_client, startup_permissions, monkeypatch, native, after_hold
+):
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    env, session_id, connection = await _personal_native_session(auth_app, auth_client, native)
+    startup = env.app.state.startup_inputs
+    with monkeypatch.context() as admission:
+        admission.setattr(startup, "host_changed", lambda *_: None)
+        accepted = await env.client.post(f"/v1/sessions/{session_id}/events", json=_INPUT)
+    assert accepted.status_code == 202
+    [saved] = env.conv_store.list_pending_inputs(session_id)
+    assert env.app.state.host_registry.deregister(connection.host_id, conn=connection)
+    env.host_store.set_offline(connection.host_id)
+    set_runner_client(None)
+    dispatch = startup.dispatch
+    produced = []
+    if after_hold == "reconnect_before_retention":
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.server.routes.sessions.routes_events import _session_offline_host_id
+
+        async def reconnect_after_real_refusal(context, exact_session_id, event):
+            try:
+                return await dispatch(context, exact_session_id, event)
+            except OmnigentError as exc:
+                assert exc.code == ErrorCode.HOST_OFFLINE and not context.submitted
+                current = env.conv_store.get_conversation(session_id)
+                assert await _session_offline_host_id(current, env.app.state, env.conv_store) == (
+                    connection.host_id
+                )
+                env.host_store.upsert_on_connect(
+                    connection.host_id, "personal-test", "owner@example.test", managed_token=None
+                )
+                _connect_host(env, connection.host_id, managed=False, owner="owner@example.test")
+                assert (
+                    await _session_offline_host_id(current, env.app.state, env.conv_store) is None
+                )
+                produced.append(exc)
+                raise
+
+        startup.dispatch = reconnect_after_real_refusal
+    with monkeypatch.context() as offline:
+        offline.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+        offline.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+        offline.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.01)
+        await startup._deliver(env.app, session_id, saved)
+    startup.dispatch = dispatch
+    if after_hold == "reconnect_before_retention":
+        assert len(produced) == 1
+    [held] = env.conv_store.list_pending_inputs(session_id)
+    assert (held.id, held.status, held.created_by) == (
+        saved.id,
+        "in_progress",
+        "owner@example.test",
+    )
+    assert held.created_at == saved.created_at
+    assert not [
+        item for item in env.conv_store.list_items(session_id).data if item.type == "error"
+    ]
+    if after_hold == "stop":
+        stopped = await env.client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "interrupt"}
+        )
+        assert stopped.status_code == 202
+        assert env.conv_store.list_pending_inputs(session_id) == []
+    elif after_hold == "revoke":
+        startup_permissions.revoke("owner@example.test", session_id)
+
+    env.host_store.upsert_on_connect(
+        connection.host_id, "personal-test", "owner@example.test", managed_token=None
+    )
+    current = _connect_host(env, connection.host_id, managed=False, owner="owner@example.test")
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+    forwarded = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        startup.host_changed(env.app, current.host_id)
+        if after_hold == "stop":
+            await startup._recover_session(env.app, session_id, current)
+            assert env.conv_store.get_conversation(session_id).labels[STARTUP_LABEL] == "cancelled"
+        else:
+            await poll_until_async(
+                lambda: (
+                    env.conv_store.list_pending_inputs(session_id)[0].status
+                    == ("failed" if after_hold == "revoke" else "incomplete")
+                ),
+                timeout_s=5,
+            )
+        pending_inputs.reset_for_tests()
+        restarted = ManagedStartupInputs(env.conv_store, startup.hosts)
+        restarted.dispatch = startup.dispatch
+        try:
+            await restarted._recover_session(env.app, session_id, current)
+            await restarted._deliver(env.app, session_id, saved)
+        finally:
+            await restarted.shutdown()
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == int(after_hold in {"receipt", "reconnect_before_retention"})
+        if after_hold in {"receipt", "reconnect_before_retention"}:
+            await _simulate_transcript_forwarder_echo(env.client, session_id, _TEXT)
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            [message] = [
+                item
+                for item in env.conv_store.list_items(session_id).data
+                if item.type == "message"
+            ]
+            assert message.created_by == "owner@example.test" and message.id == saved.id
+        elif after_hold == "stop":
+            assert env.conv_store.list_pending_inputs(session_id) == []
+            assert env.conv_store.list_items(session_id).data == []
+    finally:
+        await startup.shutdown()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        "held",
+        "unavailable",
+        "unauthorized",
+        "forbidden",
+        "submitted",
+        "runner_changed",
+        "host_changed",
+        "cancelled",
+        "removed",
+        "failed",
+        "online",
+        "managed",
+        "proof_wrong_session",
+        "proof_wrong_host",
+        "proof_wrong_runner",
+        "proof_cancelled",
+        "proof_removed",
+        "proof_runner_changed",
+        "proof_claimed_elsewhere",
+    ],
+)
+async def test_offline_hold_requires_the_exact_unsubmitted_personal_original(
+    auth_app, auth_client, boundary
+):
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes.sessions.routes_events import (
+        HOST_OFFLINE_HOLD_HEADER,
+        _HeldOfflineHostError,
+    )
+
+    env, session_id, connection = await _personal_native_session(
+        auth_app, auth_client, CODEX_NATIVE_CODING_AGENT
+    )
+    startup = env.app.state.startup_inputs
+    saved = await startup.enqueue(
+        session_id,
+        SessionEventInput.model_validate(_INPUT),
+        user_id="owner@example.test",
+        headers=Headers(),
+        first=False,
+    )
+    original = env.conv_store.get_conversation(session_id)
+    assert original is not None and original.host_id is not None
+    context = StartupInputContext(
+        env.app, Headers({HOST_OFFLINE_HOLD_HEADER: "on"}), saved.created_by, saved.id
+    )
+    assert env.app.state.host_registry.deregister(connection.host_id, conn=connection)
+    env.host_store.set_offline(connection.host_id)
+    code = {
+        "unavailable": ErrorCode.RUNNER_UNAVAILABLE,
+        "unauthorized": ErrorCode.UNAUTHORIZED,
+        "forbidden": ErrorCode.FORBIDDEN,
+    }.get(boundary, ErrorCode.HOST_OFFLINE)
+    state_boundary = boundary.removeprefix("proof_")
+    if state_boundary == "submitted":
+        assert await context.claim(env.conv_store, session_id)
+    elif state_boundary == "claimed_elsewhere":
+        assert env.conv_store.transition_pending_input(
+            session_id, saved.id, expected="in_progress", status="incomplete"
+        )
+        assert not context.submitted
+    elif state_boundary == "runner_changed":
+        env.conv_store.clear_runner_id(session_id)
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+    elif state_boundary == "host_changed":
+        env.conv_store.set_host_id(session_id, uuid4().hex, "/tmp/another-personal-workspace")
+    elif state_boundary == "cancelled":
+        env.conv_store.set_labels(session_id, {STARTUP_LABEL: "cancelled"})
+    elif state_boundary in {"removed", "failed"}:
+        assert env.conv_store.transition_pending_input(
+            session_id,
+            saved.id,
+            expected="in_progress",
+            status=None if state_boundary == "removed" else "failed",
+        )
+    elif boundary == "online":
+        _connect_host(env, connection.host_id, managed=False, owner="owner@example.test")
+    elif boundary == "managed":
+        managed_id = uuid4().hex
+        env.host_store.register_managed_host(
+            host_id=managed_id,
+            name="managed-test",
+            user_id="owner@example.test",
+            token="synthetic-token",
+            token_expires_at=2**31,
+            provider="modal",
+            sandbox_id="synthetic-sandbox",
+        )
+        env.conv_store.set_host_id(session_id, managed_id, "/tmp/managed-workspace")
+        original = env.conv_store.get_conversation(session_id)
+    before = env.conv_store.list_pending_inputs(session_id)
+    refusal = OmnigentError("Synthetic refusal", code=code)
+    if boundary.startswith("proof_"):
+        refusal = _HeldOfflineHostError(
+            session_id=uuid4().hex if boundary == "proof_wrong_session" else session_id,
+            host_id=uuid4().hex if boundary == "proof_wrong_host" else original.host_id,
+            runner_id=uuid4().hex if boundary == "proof_wrong_runner" else original.runner_id,
+        )
+    assert await startup._waits_out_host_offline(context, original, refusal) is (
+        boundary == "held"
+    )
+    assert env.conv_store.list_pending_inputs(session_id) == before
+    assert env.conv_store.list_items(session_id).data == []
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ["pending", "failed", "cancelled", "no_runner", "non_native", "superseded", "workspace"],
+)
+async def test_personal_worker_cannot_recover_managed_or_unowned_work(
+    auth_app, auth_client, monkeypatch, boundary
+):
+    from omnigent.db.db_models import workspace_scope
+
+    env, session_id, connection = await _personal_native_session(
+        auth_app, auth_client, CODEX_NATIVE_CODING_AGENT
+    )
+    startup = env.app.state.startup_inputs
+    if boundary in {"pending", "failed", "cancelled"}:
+        env.conv_store.set_labels(session_id, {STARTUP_LABEL: boundary})
+    if boundary in {"pending", "no_runner"}:
+        env.conv_store.clear_runner_id(session_id)
+    if boundary == "non_native":
+        agent = await create_test_agent(env.client, name="ordinary-test-agent")
+        created = await env.client.post("/v1/sessions", json={"agent_id": agent["id"]})
+        assert created.status_code == 201
+        session_id = created.json()["id"]
+        env.conv_store.set_host_id(session_id, connection.host_id, "/tmp/personal-workspace")
+        env.conv_store.set_runner_id(session_id, uuid4().hex)
+    if boundary == "superseded":
+        _connect_host(env, connection.host_id, managed=False, owner="owner@example.test")
+    reads = Mock(side_effect=AssertionError("ineligible personal work read a saved queue"))
+    monkeypatch.setattr(env.conv_store, "list_pending_inputs", reads)
+    launch = AsyncMock(side_effect=AssertionError("personal host acquired managed bootstrap"))
+    monkeypatch.setattr("omnigent.server.routes.sessions._launch_runner_on_host", launch)
+    if boundary == "workspace":
+        with workspace_scope(990):
+            assert not await startup._recover_session(env.app, session_id, connection)
+    else:
+        assert not await startup._recover_session(env.app, session_id, connection)
+    reads.assert_not_called()
+    launch.assert_not_awaited()
+    if boundary in {"pending", "failed", "cancelled"}:
+        assert env.conv_store.get_conversation(session_id).labels[STARTUP_LABEL] == boundary
+
+
+@pytest.mark.parametrize("policy_allowed", [True, False], ids=["allow", "deny"])
+async def test_personal_queue_preserves_exact_private_session_authorization(
+    auth_app, auth_client, startup_permissions, monkeypatch, policy_allowed
+):
+    from omnigent.server.auth import LEVEL_EDIT
+
+    env, session_a, connection = await _personal_native_session(
+        auth_app, auth_client, CODEX_NATIVE_CODING_AGENT
+    )
+    agent = await create_test_agent(env.client, name=CODEX_NATIVE_CODING_AGENT.agent_name)
+    created = await env.client.post(
+        "/v1/sessions", json={"agent_id": agent["id"], "host_type": "external"}
+    )
+    assert created.status_code == 201
+    session_b = created.json()["id"]
+    env.conv_store.set_host_id(session_b, connection.host_id, "/tmp/personal-workspace")
+    env.conv_store.set_runner_id(session_b, uuid4().hex)
+    startup_permissions.ensure_user("editor@example.test")
+    startup_permissions.grant("editor@example.test", session_a, LEVEL_EDIT)
+    env.client.headers["X-Forwarded-Email"] = "editor@example.test"
+    startup = env.app.state.startup_inputs
+    monkeypatch.setattr(startup, "host_changed", lambda *_: None)
+    allowed = await env.client.post(f"/v1/sessions/{session_a}/events", json=_INPUT)
+    assert allowed.status_code == 202
+    [saved] = env.conv_store.list_pending_inputs(session_a)
+    assert saved.created_by == "editor@example.test"
+    denied = await env.client.post(f"/v1/sessions/{session_b}/events", json=_INPUT)
+    assert denied.status_code in {403, 404}
+    assert env.conv_store.list_pending_inputs(session_b) == []
+    shell = await env.client.post(
+        f"/v1/sessions/{session_a}/events",
+        json={
+            "type": "message",
+            "data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "!printf synthetic"}],
+            },
+        },
+    )
+    assert shell.status_code == 403
+    assert [item.id for item in env.conv_store.list_pending_inputs(session_a)] == [saved.id]
+    env.client.headers.pop("X-Forwarded-Email")
+    anonymous = await env.client.post(f"/v1/sessions/{session_a}/events", json=_INPUT)
+    assert anonymous.status_code == 401
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_events._evaluate_input_policy",
+        AsyncMock(
+            return_value=None
+            if policy_allowed
+            else {"verdict": "deny", "reason": "Synthetic policy rejection"}
+        ),
+    )
+    forwarded = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    try:
+        await startup._deliver(env.app, session_a, saved)
+        [current] = env.conv_store.list_pending_inputs(session_a)
+        assert current.status == ("incomplete" if policy_allowed else "failed")
+        assert len([event for event in forwarded if event.get("type") == "message"]) == int(
+            policy_allowed
+        )
+        assert env.conv_store.list_pending_inputs(session_b) == []
+    finally:
+        await startup.shutdown()
+        await runner.aclose()
+
+
+@pytest.mark.parametrize(
+    "native",
+    [CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT],
+    ids=["personal-claude", "personal-codex"],
+)
+@pytest.mark.parametrize("deferred", [False, True], ids=["direct-hold", "saved-hold"])
+async def test_existing_personal_saved_input_preserves_offline_hold(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    native: Any,
+    deferred: bool,
+) -> None:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions.routes_events import _session_offline_host_id
+
+    env, session_id, connection = await _personal_native_session(auth_app, auth_client, native)
+    owner = "owner@example.test"
+    host_id = connection.host_id
+    startup = auth_app.state.startup_inputs
+    store = env.conv_store
+    monkeypatch.setattr(startup, "host_changed", lambda *_: None)
+    hold = {"x-omnigent-hold-when-host-offline": "on"}
+    if deferred:
+        # An existing saved queue already admits followers on a personal host.
+        seed = await startup.enqueue(
+            session_id,
+            SessionEventInput.model_validate(_INPUT),
+            user_id=owner,
+            headers=Headers(hold),
+            first=False,
+        )
+        accepted = await auth_client.post(
+            f"/v1/sessions/{session_id}/events", headers=hold, json=_INPUT
+        )
+        assert accepted.status_code == 202 and accepted.json().get("queued") is True
+        assert store.transition_pending_input(
+            session_id, seed.id, expected="in_progress", status=None
+        )
+        [saved] = store.list_pending_inputs(session_id)
+        assert saved.created_by == owner and saved.status == "in_progress"
+
+    assert auth_app.state.host_registry.deregister(host_id, conn=connection)
+    auth_app.state.host_store.set_offline(host_id)
+    host = auth_app.state.host_store.get_host(host_id)
+    assert host is not None and host.sandbox_provider is None
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert await _session_offline_host_id(conv, auth_app.state, store) == host_id
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=None))
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.01)
+    try:
+        if deferred:
+            await startup._deliver(auth_app, session_id, saved)
+            [remaining] = store.list_pending_inputs(session_id)
+            assert remaining.id == saved.id
+            assert remaining.status == "in_progress", "unsubmitted original must stay held"
+        else:
+            response = await auth_client.post(
+                f"/v1/sessions/{session_id}/events", headers=hold, json=_INPUT
+            )
+            assert response.status_code == 503
+            assert response.json()["error"] == {
+                "code": "host_offline",
+                "message": "The host for this session is offline. "
+                "Your message will be sent when it reconnects.",
+            }
+        assert not [item for item in store.list_items(session_id).data if item.type == "error"]
+        snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
+        assert snapshot.get("status") != "failed"
+    finally:
+        await startup.shutdown()

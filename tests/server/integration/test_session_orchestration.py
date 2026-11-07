@@ -940,8 +940,8 @@ async def test_startup_queue_admission_and_replay(
     startup = auth_app.state.startup_inputs
     accepts = startup.accepts
 
-    async def check_startup(*args):
-        result = await accepts(*args)
+    async def check_startup(*args, **kwargs):
+        result = await accepts(*args, **kwargs)
         assert result is True
         if share_before_admission:
             permissions.grant("bob", source["id"], LEVEL_EDIT)

@@ -687,6 +687,16 @@ def _host_offline_hold_message() -> str:
     return "The host for this session is offline. Your message will be sent when it reconnects."
 
 
+class _HeldOfflineHostError(OmnigentError):
+    """The real offline guard refused an unsubmitted send for this binding."""
+
+    def __init__(self, *, session_id: str, host_id: str, runner_id: str | None) -> None:
+        super().__init__(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
+        self.session_id = session_id
+        self.host_id = host_id
+        self.runner_id = runner_id
+
+
 def _refuse_offline_host_send(
     *,
     headers: Mapping[str, str],
@@ -713,7 +723,7 @@ def _refuse_offline_host_send(
         ),
     )
     if client_holds:
-        raise OmnigentError(_host_offline_hold_message(), code=ErrorCode.HOST_OFFLINE)
+        raise _HeldOfflineHostError(session_id=session_id, host_id=host_id, runner_id=runner_id)
     raise OmnigentError(_host_offline_message(), code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
@@ -1666,10 +1676,15 @@ def register_events_routes(
                     and conv.labels.get(STARTUP_LABEL) not in {"cancelled", "failed"}
                     and conv.runner_id is not None
                     and (native_host := startup.hosts.get(conv.host_id or "")) is not None
-                    and native_host.registered_with_managed_token
+                    and (
+                        native_host.registered_with_managed_token
+                        or conv.labels.get(STARTUP_LABEL) in (None, "ready")
+                    )
                     and _is_native_terminal_session(conv)
                 )
-                or await startup.accepts(conv, request.app)
+                or await startup.accepts(
+                    conv, request.app, allow_personal=body.type == "message" and not peer_message
+                )
             )
         ):
             if peer_message:
