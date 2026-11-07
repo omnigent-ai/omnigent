@@ -1063,6 +1063,9 @@ require(extensionPath)(pi);
 const notices = [];
 const ctx = { ui: { setTitle() {}, setStatus() {}, notify(text) { notices.push(text); } } };
 const settleHistory = () => new Promise(setImmediate);
+const startUserMessage = text => handlers.message_start({
+  message: {role: 'user', content: [{type: 'text', text}]},
+}, ctx);
 function assistantItems() {
   return posted.filter(
     (event) =>
@@ -1187,6 +1190,41 @@ def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("source", ["interactive", "extension", "steer", "followUp"])
+def test_consumed_user_messages_are_mirrored_once(tmp_path: Path, source: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const source = process.argv[3];
+  const hasInputEvent = source === 'interactive' || source === 'extension';
+  for (let timestamp = 1; timestamp <= 2; timestamp++) {
+    if (hasInputEvent) await handlers.input({text: 'same prompt', source}, ctx);
+    const message = {role: 'user', timestamp,
+      content: [{type: 'text', text: 'same prompt'}]};
+    await handlers.message_start?.({message}, ctx);
+    await handlers.message_end({message}, ctx);
+  }
+  // Discarded queued input and assistant starts must not create user bubbles.
+  await handlers.input({text: 'discarded prompt', source: 'extension'}, ctx);
+  await handlers.message_start?.({message: {role: 'assistant',
+    content: [{type: 'text', text: 'answer'}]}}, ctx);
+  await handlers.session_shutdown();
+  const users = posted.filter(event => event.type === 'external_conversation_item' &&
+    event.data.item_data.role === 'user');
+  assert.equal(users.length, 2, 'every consumed prompt must appear exactly once');
+  assert.deepEqual(users.map(event => event.data.item_data.content), [
+    [{type: 'input_text', text: 'same prompt'}],
+    [{type: 'input_text', text: 'same prompt'}],
+  ]);
+  assert.notEqual(users[0].data.source_id, users[1].data.source_id);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), source)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("kind", ["tool_call", "tool_result", "reasoning", "user", "compaction"])
 def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) -> None:
     script = (
@@ -1211,7 +1249,8 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     reasoning: ["message_update", { assistantMessageEvent: {
       type: "thinking_end", contentIndex: 0, content: "plan",
     } }],
-    user: ["input", { text: "terminal prompt", source: "extension" }],
+    user: ["message_start", { message: { role: "user",
+      content: [{ type: "text", text: "terminal prompt" }] } }],
     compaction: ["session_compact", {}],
   };
   if (kind === "tool_result") {
@@ -1344,7 +1383,7 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     };
     return response;
   };
-  await handlers.input({text: "covered input", source: "extension"}, ctx);
+  await startUserMessage("covered input");
   // Repeated summary text can make Pi's event point at an older checkpoint.
   const compacting = handlers.session_compact(
     {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
@@ -1413,7 +1452,7 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
       posted.push(JSON.parse(request.body));
       return new Promise(() => {});
     };
-    await handlers.input({ text: "stuck input", source: "extension" }, ctx);
+    await startUserMessage("stuck input");
     const harnessSetTimeout = global.setTimeout;
     global.setTimeout = (callback, delay, ...args) => {
       if (delay !== 30000) return harnessSetTimeout(callback, delay, ...args);
@@ -1454,7 +1493,7 @@ def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> 
     now += 5000;
     return { ok: false, status: 503 };
   };
-  await handlers.input({ text: "keep working", source: "extension" }, ctx);
+  await startUserMessage("keep working");
   await settleHistory();
   assert.equal(fetchCalls, 4);
   assert.deepEqual(retryDelays, [1000, 2000, 4000]);
@@ -1572,7 +1611,7 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
     text: 'done'},
   ]};
   const watchdog = originalSetTimeout(() => { throw new Error('history blocked Pi hooks'); }, 500);
-  await handlers.input({text: 'read a file', source: 'extension'}, ctx);
+  await startUserMessage('read a file');
   await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
     toolCall: tool}}, ctx);
   const decision = await handlers.tool_call({toolCallId: tool.id, toolName: tool.name,
@@ -1716,7 +1755,7 @@ def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
   const ending = handlers.agent_end({}, ctx).then(() => { finished = true; });
   await settleHistory();
   if (mode === 'superseded-history') await handlers.agent_start({}, ctx);
-  await handlers.input({text: 'next prompt', source: 'extension'}, ctx);
+  await startUserMessage('next prompt');
   ctx.hasPendingMessages = () => mode === 'queued-followup';
   releases.shift()();
   await settleHistory();
@@ -1801,7 +1840,7 @@ def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
       reject(request.signal.reason);
     }, {once: true});
   });
-  await handlers.input({text: 'hang', source: 'extension'}, ctx);
+  await startUserMessage('hang');
   const start = performance.now();
   await handlers.session_shutdown();
   const elapsed = performance.now() - start;
@@ -1810,7 +1849,7 @@ def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
   assert.ok(elapsed < 6500, String(elapsed));
   if (process.argv[3] === 'True') assert.ok(elapsed >= 4900, String(elapsed));
   assert.match(diagnostics.join('\n'), /Failed to persist/);
-  await handlers.input({text: 'after shutdown', source: 'extension'}, ctx);
+  await startUserMessage('after shutdown');
   assert.match(diagnostics.join('\n'), /History queue closed/);
 })().catch(error => { process.stderr.write(String(error)); process.exit(1); });
 """
@@ -1836,8 +1875,7 @@ def test_history_queue_bounds_backlog(tmp_path: Path, limit: str) -> None:
   const items = process.argv[3] === 'items';
   const count = items ? 257 : 3;
   for (let index = 0; index < count; index++) {
-    await handlers.input({text: items ? String(index) : 'x'.repeat(8 * 1024 * 1024),
-    source: 'extension'}, ctx);
+    await startUserMessage(items ? String(index) : 'x'.repeat(8 * 1024 * 1024));
   }
   assert.match(diagnostics.join('\n'), /History queue full/);
   release();
@@ -4251,7 +4289,11 @@ def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
   };
   await handlers.session_start({}, ctx);
   await handlers.input({ text: "one", source: "interactive" }, ctx);
+  await handlers.message_start({message: {role: "user",
+    content: [{type: "text", text: "one"}]}}, ctx);
   await handlers.input({ text: "two", source: "interactive" }, ctx);
+  await handlers.message_start({message: {role: "user",
+    content: [{type: "text", text: "two"}]}}, ctx);
   assert.equal(routeCalls, 1);
   assert.equal(setModelCalls.length, 0);
   // The user's prompt is still mirrored to Omnigent.

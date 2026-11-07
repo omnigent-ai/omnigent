@@ -2705,6 +2705,16 @@ module.exports = function (pi) {
         await applyModelChange(pi, config, ctx, decision.model);
       }
     }
+  });
+
+  // Queued steers and follow-ups can bypass input, including after compaction.
+  // Mirror consumed messages so every delivery path has exactly one user item.
+  pi.on("message_start", async (event, ctx) => {
+    const message = event ? event.message : undefined;
+    if (messageRole(message) !== "user") return;
+    rememberContext(ctx);
+    const text = textFromMessage(message);
+    if (!text) return;
     const responseId = newResponseId("user");
     history.enqueue(
       {
