@@ -610,17 +610,23 @@ def _scan_pushes(
     directories: Sequence[str],
     started_at: float | None,
     finished_at: float,
+    *,
+    lost: bool,
 ) -> tuple[list[pushed_branches.BranchKey], pushed_branches.Window]:
     """Read the branches a shell call pushed from the checkouts it touched.
 
+    :param lost: Whether part of the call ran where only the shell knows, so the
+        checkouts the session used before are read too.
     :returns: The newly pushed branches and the call's time window.
     """
     checkouts = {directory: pushed_branches.checkout(directory) for directory in directories}
     own = {item.toplevel: item for item in checkouts.values() if item is not None}
     touched = list(own.values())
-    for toplevel in _pushes.remember(session_id, own):
-        if toplevel not in own and (item := pushed_branches.checkout(toplevel)):
-            touched.append(item)
+    used_before = _pushes.remember(session_id, own)
+    if lost:
+        for toplevel in used_before:
+            if toplevel not in own and (item := pushed_branches.checkout(toplevel)):
+                touched.append(item)
     since = _pushes.window(session_id, started_at, finished_at)
     keys: list[pushed_branches.BranchKey] = []
     for push in pushed_branches.pushed_branches(touched, since, finished_at):
@@ -746,14 +752,16 @@ def observe_tool_completion(
         window: pushed_branches.Window | None = None
         if command is not None:
             strict = _shell_segments(command)
-            annotated, directories = pushed_branches.with_directories(
+            annotated, directories, lost = pushed_branches.with_directories(
                 strict or _shell_segments(command, tolerant=True),
                 _start_directory(arguments, shell_result, cwd),
             )
             segments = annotated if strict else []
             if repository_visible:
                 # git's state shows a push even when the command's exit status hides it.
-                pushed, window = _scan_pushes(session_id, directories, started_at, finished_at)
+                pushed, window = _scan_pushes(
+                    session_id, directories, started_at, finished_at, lost=lost
+                )
         if command is not None and not failed:
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, facets, segments)

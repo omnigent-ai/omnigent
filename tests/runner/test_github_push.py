@@ -325,6 +325,7 @@ def _github(args: list[str], **_: object) -> tuple[int, str, str]:
 @pytest.fixture
 def observed_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("GH_REPO", raising=False)
     monkeypatch.setattr(pr_observer, "_pushes", pr_observer.pushed_branches.SessionPushes())
     monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=_github))
     return "conv_write"
@@ -661,6 +662,41 @@ def test_call_that_pushes_no_head_of_its_checkouts_looks_up_nothing(
         assert git("rev-parse", "origin/other", cwd=other) == git("rev-parse", "HEAD", cwd=other)
     assert forge.lookups == []
     assert _tracked("conv_quiet") == []
+
+
+@pytest.mark.parametrize(
+    "command,found",
+    [
+        pytest.param("{pusher}", False, id="known-directory"),
+        pytest.param(
+            'export REPO={worktree}; cd "$REPO" && git push -q origin HEAD:topic',
+            True,
+            id="directory-only-the-shell-knows",
+        ),
+    ],
+)
+def test_checkout_used_earlier_is_read_only_when_the_call_directory_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, command: str, found: bool
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+        _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")
+    ]
+    _run_and_observe(monkeypatch, "conv_elsewhere", "git status --short", worktree)
+    # Stands in for a push from another terminal in the checkout during the call.
+    pusher = tmp_path / "pusher"
+    pusher.write_text(
+        f"#!/bin/sh\ngit -C {shlex.quote(str(worktree))} push -q origin HEAD:topic\n"
+    )
+    pusher.chmod(0o755)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    command = command.format(pusher=shlex.quote(str(pusher)), worktree=shlex.quote(str(worktree)))
+    _run_and_observe(monkeypatch, "conv_elsewhere", command, scratch)
+    assert git("rev-parse", "origin/topic", cwd=worktree) == git("rev-parse", "HEAD", cwd=worktree)
+    assert _tracked("conv_elsewhere") == ([(CHECKOUT_PR_URL, "worked_on")] if found else [])
 
 
 @pytest.mark.parametrize("later", ["next-call", "turn-end"])

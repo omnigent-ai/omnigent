@@ -3,7 +3,8 @@
 ``git push`` records ``update by push`` in the reflog of each remote-tracking ref
 it updates, whichever alias, wrapper, pipe, or redirection ran it. A branch counts
 as pushed by the call when that entry falls inside the call's time window and the
-ref now points at the HEAD of a checkout the call touched. The HEAD match keeps
+ref now points at the HEAD of a checkout the call touched, or of one the session
+used before when part of the call ran where only the shell knows. The HEAD match keeps
 out pushes from sibling worktrees at other commits, though one at the same commit
 shares the refs and is indistinguishable. Fetches such as ``gh pr checkout`` write
 no push entry. A push to a URL that matches no remote, or of a branch other than
@@ -189,14 +190,18 @@ def _git_directory(current: str | None, tokens: Sequence[str]) -> str | None:
 
 def with_directories(
     segments: Sequence[ShellSegment], base: str | None
-) -> tuple[list[ShellSegment], list[str]]:
+) -> tuple[list[ShellSegment], list[str], bool]:
     """Set each segment's ``cwd`` and return every directory the command runs git in.
 
     *base* is the absolute directory the command starts in, when known.
+
+    :returns: The annotated segments, the directories, and whether part of the
+        command ran in a directory only the shell knows.
     """
     current = base
     directories: dict[str, None] = dict.fromkeys([base] if base else [])
     annotated: list[ShellSegment] = []
+    lost = not segments
     for segment in segments:
         tokens = segment.invocation_tokens
         if tokens[0] in {"cd", "pushd"}:
@@ -207,12 +212,17 @@ def with_directories(
                 current = _directory(current, "~") if tokens[0] == "cd" else None
         elif tokens[0] == "popd":
             current = None
-        elif PurePath(tokens[0]).name == "git" and (target := _git_directory(current, tokens)):
-            directories[target] = None
+        elif PurePath(tokens[0]).name == "git":
+            if target := _git_directory(current, tokens):
+                directories[target] = None
+            else:
+                lost = True
         if current:
             directories[current] = None
+        else:
+            lost = True
         annotated.append(replace(segment, cwd=current))
-    return annotated, list(directories)
+    return annotated, list(directories), lost
 
 
 @dataclass
