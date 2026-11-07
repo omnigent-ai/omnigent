@@ -659,6 +659,91 @@ async def test_abandoned_forked_spawn_consumes_its_exit_status(
         proc.kill()
 
 
+@pytest.mark.parametrize(
+    "control_loss", ["socket-closed", "control-failed", "generation-replaced"]
+)
+@pytest.mark.parametrize(
+    "identity_missing", [False, True], ids=["pid-reused", "gone-before-handle"]
+)
+def test_poll_after_control_loss_does_not_keep_an_unrelated_pid_alive(
+    monkeypatch: pytest.MonkeyPatch, control_loss: str, identity_missing: bool
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = False
+    process_factory = Mock(return_value=original_process)
+    if identity_missing:
+        process_factory.side_effect = psutil.NoSuchProcess(123)
+    monkeypatch.setattr(psutil, "Process", process_factory)
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    if control_loss == "control-failed":
+        manager._control_failed = True
+    elif control_loss == "generation-replaced":
+        manager._generation += 1
+    monkeypatch.setattr(_proc, "process_alive", lambda _pid: True)
+
+    assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
+    assert proc.wait(timeout=0) == _ZYGOTE_LOST_EXIT_CODE
+    assert proc.returncode == _ZYGOTE_LOST_EXIT_CODE
+    original_process.terminate.assert_not_called()
+    original_process.kill.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("identity_state", "pid_alive", "expected"),
+    [
+        ("live", True, None),
+        ("live", False, _ZYGOTE_LOST_EXIT_CODE),
+        ("denied", True, None),
+        ("denied", False, _ZYGOTE_LOST_EXIT_CODE),
+        ("gone", True, _ZYGOTE_LOST_EXIT_CODE),
+    ],
+)
+def test_control_loss_liveness_preserves_live_and_unreadable_identities(
+    monkeypatch: pytest.MonkeyPatch, identity_state: str, pid_alive: bool, expected: int | None
+) -> None:
+    original_process = Mock()
+    original_process.is_running.return_value = True
+    if identity_state == "denied":
+        original_process.is_running.side_effect = psutil.AccessDenied(123)
+    elif identity_state == "gone":
+        original_process.is_running.side_effect = psutil.NoSuchProcess(123)
+    monkeypatch.setattr(psutil, "Process", Mock(return_value=original_process))
+    proc = ZygoteRunnerProc(123, ZygoteManager())
+    monkeypatch.setattr(_proc, "process_alive", lambda _pid: pid_alive)
+
+    assert proc.poll() == expected
+    assert proc.returncode == expected
+    original_process.terminate.assert_not_called()
+    original_process.kill.assert_not_called()
+
+
+@pytest.mark.parametrize("actual_exit", [0, 7, -signal.SIGTERM])
+def test_real_exit_reply_wins_over_a_missing_process_identity(
+    monkeypatch: pytest.MonkeyPatch, actual_exit: int
+) -> None:
+    monkeypatch.setattr(psutil, "Process", Mock(side_effect=psutil.NoSuchProcess(123)))
+    manager = ZygoteManager()
+    proc = ZygoteRunnerProc(123, manager)
+    monkeypatch.setattr(
+        manager, "_exchange", lambda *_args, **_kwargs: {"returncode": actual_exit}
+    )
+    monkeypatch.setattr(_proc, "process_alive", lambda _pid: pytest.fail("real exit wins"))
+
+    assert proc.poll() == actual_exit
+    assert proc.wait(timeout=0) == actual_exit
+    assert proc.returncode == actual_exit
+
+
+@pytest.mark.parametrize("pid_alive", [False, True])
+def test_direct_manager_poll_keeps_its_default_liveness_probe(
+    monkeypatch: pytest.MonkeyPatch, pid_alive: bool
+) -> None:
+    monkeypatch.setattr(_proc, "process_alive", lambda _pid: pid_alive)
+
+    assert ZygoteManager().poll(123) == (None if pid_alive else _ZYGOTE_LOST_EXIT_CODE)
+
+
 def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp_path) -> None:
     """A still-live runner polls as None once the zygote is stopped.
 
