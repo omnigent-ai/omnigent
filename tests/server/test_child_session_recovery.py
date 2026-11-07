@@ -593,6 +593,52 @@ async def test_requested_work_releases_a_deep_ancestry_in_bounded_reads(
 
 
 @pytest.mark.asyncio
+async def test_a_vanished_cursor_in_the_descendant_sweep_still_releases_the_tree(
+    recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale cursor while sweeping a held root's descendants restarts with the root held."""
+    from omnigent.server import child_session_recovery as recovery
+
+    store, parent, _, _, _, _ = recovery_tree
+    monkeypatch.setattr(recovery, "_RELEASE_SPAWN_TREE_PAGE", 1)
+    children = [
+        store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=parent.id,
+            agent_id=parent.agent_id,
+            runner_id=parent.runner_id,
+        )
+        for _ in range(3)
+    ]
+    for row in (parent, *children):
+        await hold_reconnect_recovery(row.id, store)
+    list_tree = store.list_conversations
+    stale_cursors: list[str] = []
+    root_held_when_stale: list[bool] = []
+
+    def page_with_one_stale_cursor(**query: Any) -> Any:
+        if query["after"] is not None and not stale_cursors:
+            stale_cursors.append(query["after"])
+            root_held_when_stale.append(
+                RECONNECT_RECOVERY_HELD_LABEL_KEY in store.get_conversation(parent.id).labels
+            )
+            raise StaleCursorError(query["after"])
+        return list_tree(**query)
+
+    monkeypatch.setattr(store, "list_conversations", page_with_one_stale_cursor)
+    # Work on the root: the only paging is the descendant sweep.
+    await release_reconnect_recovery(parent.id, store)
+
+    assert stale_cursors
+    # The root's hold outlived the failed sweep, so the restart swept again.
+    assert root_held_when_stale == [True]
+    assert not any(
+        RECONNECT_RECOVERY_HELD_LABEL_KEY in store.get_conversation(row.id).labels
+        for row in (parent, *children)
+    )
+
+
+@pytest.mark.asyncio
 async def test_a_vanished_page_cursor_restarts_the_release(
     recovery_tree: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

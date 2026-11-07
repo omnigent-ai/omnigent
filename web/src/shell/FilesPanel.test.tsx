@@ -639,6 +639,26 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
   });
 
+  it("leaves a restored Files view on a just-opened session to the open dwell", async () => {
+    vi.useFakeTimers();
+    try {
+      // Another session's file viewer hides the panel; the asleep session's
+      // saved tree view then shows it as that session loads.
+      const { rerender } = renderPanel({
+        ...asleepPanel,
+        conversationId: "conv_other",
+        active: false,
+      });
+      rerender(panelAt("conv_other", { conversationId: "conv_asleep", active: false }));
+      await act(async () =>
+        rerender(panelAt("conv_other", { conversationId: "conv_asleep", active: true })),
+      );
+      expect(wakeSessionMock).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("goes back to the offline hint when the wake fails, and wakes again on reopen", async () => {
     wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
     const { rerender } = renderPanel({ ...asleepPanel, active: false });

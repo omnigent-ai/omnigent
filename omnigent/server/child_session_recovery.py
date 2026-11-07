@@ -147,7 +147,13 @@ async def release_reconnect_recovery(session_id: str, store: ConversationStore) 
     next_id: str | None = session_id
     spawn_tree: dict[str, Conversation] = {}
     page: PagedList[Conversation] | None = None
-    root_held = False
+    # A held top-of-tree keeps its hold until its descendants are released, so
+    # a restarted release (stale cursor) still knows the tree's holds are owed.
+    root_hold: str | None = None
+
+    async def release_hold(conv_id: str) -> None:
+        await asyncio.to_thread(store.delete_label, conv_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
+
     while next_id is not None and next_id not in seen:
         if child is None or len(seen) < _RELEASE_MAX_READS:
             conv = await asyncio.to_thread(store.get_conversation, next_id)
@@ -168,26 +174,29 @@ async def release_reconnect_recovery(session_id: str, store: ConversationStore) 
             conv = spawn_tree.get(next_id)
         if conv is None or (child is not None and conv.runner_id != child.runner_id):
             break
+        # The session below wasn't the top of the tree after all.
+        if root_hold is not None:
+            await release_hold(root_hold)
+            root_hold = None
         wake_running = conv.id in _wake_only_retries
         if wake_running:
             _released_during_wake.add(conv.id)
-        # A running wake can land its hold after the read above.
         held = RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels
-        if wake_running or held:
-            await asyncio.to_thread(store.delete_label, conv.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-        # As on runner connect, a hosted child recovers as its own tree.
-        if conv.host_id is not None and not is_parent_owned_subagent(conv):
-            if held:
-                seen.add(conv.id)
-                await _release_tree_holds(conv, store, rows=spawn_tree, page=page, released=seen)
-            return
         seen.add(conv.id)
         child = conv
-        root_held = held
+        # A running wake can land its hold after the read above.
+        if held:
+            root_hold = conv.id
+        elif wake_running:
+            await release_hold(conv.id)
+        # As on runner connect, a hosted child recovers as its own tree.
+        if conv.host_id is not None and not is_parent_owned_subagent(conv):
+            break
         next_id = conv.parent_conversation_id
-    # The walk ended at the top of the recovery tree (`child`).
-    if child is not None and root_held:
+    # `child` is the top of the recovery tree; release its descendants, then it.
+    if child is not None and root_hold is not None:
         await _release_tree_holds(child, store, rows=spawn_tree, page=page, released=seen)
+        await release_hold(root_hold)
 
 
 def reconnect_recovery_deferred(conv: Conversation) -> bool:

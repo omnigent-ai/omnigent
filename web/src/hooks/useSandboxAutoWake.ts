@@ -209,8 +209,9 @@ export function useSandboxWake(conversationId: string | undefined): SandboxWake 
 /**
  * Wake the sandbox when *open* turns true for the same session: the user
  * opened a view that needs the host. A view that stays open while its session
- * changes doesn't count; that is navigation, which
- * {@link useSandboxWakeOnSessionOpen} handles. Neither does mounting open,
+ * changes, or opens within the session-open dwell after it, doesn't count;
+ * that is navigation, which {@link useSandboxWakeOnSessionOpen} handles.
+ * Neither does mounting open,
  * since views remount as sessions load, unless *mountIsOpen* says this view
  * only mounts when the user opens it (a drawer).
  */
@@ -220,11 +221,22 @@ export function useSandboxWakeWhenOpened(
   wakeIfAsleep: () => void,
   { mountIsOpen = false }: { mountIsOpen?: boolean } = {},
 ): void {
-  const previous = useRef({ open: open && !mountIsOpen, conversationId });
+  const previous = useRef<{
+    open: boolean;
+    conversationId: string | undefined;
+    switchedAt: number | null;
+  }>({ open: open && !mountIsOpen, conversationId, switchedAt: null });
   useEffect(() => {
-    const { open: wasOpen, conversationId: previousId } = previous.current;
-    previous.current = { open, conversationId };
-    if (open && !wasOpen && conversationId === previousId) wakeIfAsleep();
+    const before = previous.current;
+    const switched = conversationId !== before.conversationId;
+    const switchedAt = switched ? Date.now() : before.switchedAt;
+    previous.current = { open, conversationId, switchedAt };
+    if (!open || before.open || switched) return;
+    // A session that just opened restores its views (a saved file selection
+    // clearing, say) as it loads. That is still navigation, so it waits for
+    // the session-open dwell instead of waking now.
+    if (switchedAt !== null && Date.now() - switchedAt < SANDBOX_WAKE_OPEN_DWELL_MS) return;
+    wakeIfAsleep();
   }, [open, conversationId, wakeIfAsleep]);
 }
 

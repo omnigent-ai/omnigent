@@ -293,6 +293,20 @@ describe("useSandboxWakeWhenOpened", () => {
     expect(wake).not.toHaveBeenCalled();
   });
 
+  it("waits out the session-open dwell when a view opens just after a switch", () => {
+    vi.useFakeTimers();
+    const { wake, rerender } = renderOpened({ open: false, id: "a" });
+    // The new session restores its views (a saved selection clearing) as it loads.
+    rerender({ open: false, id: "b" });
+    rerender({ open: true, id: "b" });
+    expect(wake).not.toHaveBeenCalled();
+
+    rerender({ open: false, id: "b" });
+    act(() => vi.advanceTimersByTime(SANDBOX_WAKE_OPEN_DWELL_MS));
+    rerender({ open: true, id: "b" });
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
   it("counts mounting open only for a view that mounts when opened", () => {
     expect(renderOpened({ open: true, id: "a" }).wake).not.toHaveBeenCalled();
     expect(renderOpened({ open: true, id: "a" }, true).wake).toHaveBeenCalledTimes(1);
