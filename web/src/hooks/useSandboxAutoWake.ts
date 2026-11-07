@@ -1,5 +1,7 @@
 import { useEffect, useRef } from "react";
 
+import { onSandboxWakeStarted } from "@/hooks/useSessionReconnect";
+
 /**
  * How long a session must stay open in a visible tab before its asleep
  * sandbox wakes, so stepping through sessions (⌘[ / ⌘], the recent-session
@@ -108,14 +110,17 @@ export function useSandboxAutoWake(
   useEffect(() => {
     if (!sessionId) return;
     const onRequest = (requested: string) => {
-      if (requested !== sessionId || !latest.current.canWake) return;
-      // This is the opening's wake; the dwell mustn't send another after it fails.
-      opening.current.checked = true;
-      latest.current.wake();
+      if (requested === sessionId && latest.current.canWake) latest.current.wake();
     };
     wakeRequests.add(onRequest);
+    // Any wake of this session (Reconnect host, Resume, a tab) is this opening's:
+    // the dwell mustn't send another after it fails.
+    const stopListening = onSandboxWakeStarted((started) => {
+      if (started === sessionId) opening.current.checked = true;
+    });
     return () => {
       wakeRequests.delete(onRequest);
+      stopListening();
     };
   }, [sessionId]);
 }

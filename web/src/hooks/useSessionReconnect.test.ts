@@ -930,7 +930,7 @@ describe("useSessionReconnect", () => {
       void result.current.reconnect.reconnect();
     });
     expect(result.current.starting).toBe(true);
-    // The wake's view state belongs to the shown session, as before.
+    // Wake view state belongs to the shown session.
     rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
     expect(result.current.starting).toBe(false);
   });
