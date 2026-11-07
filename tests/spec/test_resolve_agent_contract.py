@@ -255,6 +255,8 @@ def test_requested_design_deliverables_return_to_a_person() -> None:
         "report `partially_fixed`, name the conflict",
         "the unmet request the first `remaining_work` item",
         "Never recommend the narrow fix as the resolution of the report",
+        "whether to keep yours is an unresolved choice under the procedure above",
+        "Without a supported fix, change nothing and report `needs_more_info`",
     ):
         assert requirement in investigate
     assert "List first any deliverable the report explicitly requested" in remaining
