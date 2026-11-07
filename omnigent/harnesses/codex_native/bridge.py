@@ -1097,6 +1097,20 @@ def write_bridge_state(bridge_dir: Path, state: CodexNativeBridgeState) -> None:
     :returns: None.
     """
     with _bridge_state_lock(bridge_dir):
+        current = read_bridge_state(bridge_dir)
+        if current is not None and (
+            current.session_id == state.session_id
+            and current.thread_id == state.thread_id
+            and current.socket_path == state.socket_path
+        ):
+            state = replace(
+                state,
+                active_turn_revision=max(
+                    current.active_turn_revision
+                    + int(state.active_turn_id != current.active_turn_id),
+                    state.active_turn_revision,
+                ),
+            )
         _write_bridge_state_unlocked(bridge_dir, state)
     # A new or rotated session's policies were never checked.
     policy_allow_cache.invalidate(bridge_dir)
