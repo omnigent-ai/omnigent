@@ -1047,29 +1047,6 @@ Request body matches `SessionEventInput`:
                                   (there is no separate "resume" event).
                                   The conversation transcript is
                                   preserved. Returns `{queued: false}`.
-      - "retry_session"         — reconnect or relaunch the session's
-                                  runner (requires LEVEL_EDIT) and retry
-                                  saved inputs that failed before
-                                  submission. Payload `{}`. Returns
-                                  `{queued, recovered, recovery}`.
-      - "wake_session"          — reconnect or relaunch the runner like
-                                  `retry_session`, and nothing more:
-                                  failed saved inputs stay failed and the
-                                  request resumes no interrupted turn, the
-                                  session's own or a sub-agent's; they
-                                  resume on the next message or
-                                  `retry_session`. Payload `{}`; same
-                                  response. A wake shares any in-flight
-                                  attempt; a `retry_session` waits out a
-                                  wake, then runs its own. The guarantee
-                                  covers the woken session's tree only: a
-                                  side chat without its own host wakes
-                                  through its source session, whose
-                                  relaunched runner recovers the source
-                                  as on any reconnect. Servers that list
-                                  `wake_session` in `/v1/info`
-                                  `session_event_types` accept it; older
-                                  ones reject it as an unknown type.
       - "external_conversation_item"
                                 — internal terminal-observed item
                                   envelope; appends/broadcasts without

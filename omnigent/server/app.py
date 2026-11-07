@@ -4556,12 +4556,8 @@ def create_app(
             RECOVERY_STORE_CONCURRENCY,
             _interrupted,
             _restorable,
-            clear_skipped_resume,
             is_parent_owned_subagent,
-            note_skipped_resume,
-            reconnect_recovery_deferred,
             restore_active_children,
-            skipped_resume_runner,
         )
         from omnigent.server.routes._sessions.common import (
             _session_sandbox_status_cache,
@@ -4574,7 +4570,6 @@ def create_app(
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
-        from omnigent.stores.conversation_store import RECONNECT_RECOVERY_HELD_LABEL_KEY
 
         if tunnel_registry.get(runner_id) is not connection:
             return
@@ -4636,39 +4631,7 @@ def create_app(
             root_id = independent_root_id(conv)
             if root_id is not None and not by_id[root_id].archived:
                 eager_root_ids.add(root_id)
-        # A wake-only retry initializes its tree itself, without resuming work.
-        wake_only_root_ids: set[str] = set()
-        skipped_resume_ids_by_root: dict[str, set[str]] = {}
-        # Roots fenced by a held descendant. Their own skip record is an
-        # evictable cache entry, so they take a durable hold as well: work given
-        # to the root then knows it owes the tree's recovery, and releases it.
-        held_by_descendant_root_ids: set[str] = set()
-        for conv in convs:
-            deferred = reconnect_recovery_deferred(conv)
-            if not deferred and skipped_resume_runner(conv.id) is None:
-                continue
-            root_id = independent_root_id(conv)
-            if root_id is None:
-                continue
-            skipped_resume_ids_by_root.setdefault(root_id, set()).update((conv.id, root_id))
-            if deferred:
-                wake_only_root_ids.add(root_id)
-                # Leave the tree's deferred resume for its next plain retry.
-                note_skipped_resume(conv.id, runner_id)
-                note_skipped_resume(root_id, runner_id)
-                if root_id != conv.id:
-                    held_by_descendant_root_ids.add(root_id)
 
-        for root_id in held_by_descendant_root_ids:
-            if RECONNECT_RECOVERY_HELD_LABEL_KEY not in by_id[root_id].labels:
-                try:
-                    await asyncio.to_thread(
-                        conversation_store.set_labels,
-                        root_id,
-                        {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"},
-                    )
-                except Exception:
-                    _logger.exception("Failed to hold reconnect recovery of root %s", root_id)
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))
@@ -4748,10 +4711,7 @@ def create_app(
         frontier = {
             conv.id: conv.id
             for conv, _ in roots
-            if conv.agent_id is not None
-            and _restorable(conv)
-            and conv.id not in eager_root_ids
-            and conv.id not in wake_only_root_ids
+            if conv.agent_id is not None and _restorable(conv) and conv.id not in eager_root_ids
         }
         idle_root_ids = set(frontier.values())
         try:
@@ -4820,15 +4780,12 @@ def create_app(
                     initialize_runtime = (
                         conv.agent_id is not None
                         and not conv.archived
-                        and conv.id not in wake_only_root_ids
                         and (conv.id in eager_root_ids or needs_eager_recovery(conv))
                     )
                     if conv.agent_id is None:
                         reason = "no_agent"
                     elif conv.archived:
                         reason = "archived"
-                    elif conv.id in wake_only_root_ids:
-                        reason = "wake_only"
                     else:
                         reason = "recovery_required" if initialize_runtime else "idle"
                     runner_session_initializer.log_decision(
@@ -4871,17 +4828,13 @@ def create_app(
                         if is_session_agent_removed(response):
                             return
                         response.raise_for_status()
-                        # This recovery runs the resumes an earlier wake skipped.
-                        for session_id in skipped_resume_ids_by_root.get(conv.id, ()):
-                            clear_skipped_resume(session_id)
                     prefetch_session_routing_catalogs(conv.id, conv, client)
                     # Clear only a root's disconnect failure, after successful init.
-                    # Children, and woken roots, keep that evidence until continuation runs.
-                    if conv.id not in wake_only_root_ids:
-                        async with store_slots:
-                            await _publish_runner_recovered_status(
-                                conv.id, conversation_store, require_disconnect_code=True
-                            )
+                    # Children retain interruption evidence until continuation runs.
+                    async with store_slots:
+                        await _publish_runner_recovered_status(
+                            conv.id, conversation_store, require_disconnect_code=True
+                        )
                     if initialize_runtime:
                         await restore_active_children(
                             conv,

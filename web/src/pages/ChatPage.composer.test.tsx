@@ -4,7 +4,6 @@ import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
 import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as UseSessionModule from "@/hooks/useSession";
-import type * as UseSandboxAutoWakeModule from "@/hooks/useSandboxAutoWake";
 import type * as UseHostsModule from "@/hooks/useHosts";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 import type * as UseAgentsModule from "@/hooks/useAgents";
@@ -65,11 +64,6 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
 });
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
-const wakeSandboxMock = vi.fn();
-vi.mock("@/hooks/useSandboxAutoWake", async (importOriginal) => ({
-  ...(await importOriginal<typeof UseSandboxAutoWakeModule>()),
-  useSandboxWake: () => ({ waking: false, ready: true, wakeIfAsleep: wakeSandboxMock }),
-}));
 vi.mock("@/lib/mcpRegistry", () => ({
   registryRequest: vi.fn(),
   authorizeRegistryService: vi.fn(),
@@ -315,40 +309,6 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
 }
 
 describe("Composer focus handle", () => {
-  it("wakes an asleep sandbox when clicked or typed in, without sending", () => {
-    wakeSandboxMock.mockClear();
-    const props = composerProps();
-    render(<Composer {...props} />);
-    act(() => textarea().focus());
-    expect(wakeSandboxMock).not.toHaveBeenCalled();
-
-    fireEvent.pointerDown(textarea());
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
-    fireEvent.change(textarea(), { target: { value: "h" } });
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
-    expect(props.onSend).not.toHaveBeenCalled();
-  });
-
-  it("wakes an asleep sandbox from a reply quote's text, not its focus", () => {
-    wakeSandboxMock.mockClear();
-    const ref = createRef<ComponentRef<typeof Composer>>();
-    const props = composerProps();
-    render(<Composer {...props} ref={ref} />);
-    // Text typed before quoting becomes the editable block before the quote.
-    fireEvent.change(textarea(), { target: { value: "Intro" } });
-    act(() => ref.current?.appendReplyQuote("Quoted text"));
-    wakeSandboxMock.mockClear();
-    const before = screen.getByLabelText("Reply text before quote 1");
-    act(() => before.focus());
-    expect(wakeSandboxMock).not.toHaveBeenCalled();
-
-    fireEvent.pointerDown(before);
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
-    fireEvent.change(before, { target: { value: "My introduction" } });
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
-    expect(props.onSend).not.toHaveBeenCalled();
-  });
-
   it("takes focus for typing, unless disabled or read-only", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     const { rerender } = render(<Composer {...composerProps()} ref={ref} />);
@@ -477,12 +437,9 @@ describe("Composer session drafts", () => {
   });
 
   it("focuses the composer on a switch unless an inline rename has focus", () => {
-    wakeSandboxMock.mockClear();
     render(<Composer {...composerProps()} />);
     act(() => useChatStore.setState({ conversationId: "conv_other" }));
     expect(textarea()).toHaveFocus();
-    // Focusing itself on a switch isn't the user reaching for the composer.
-    expect(wakeSandboxMock).not.toHaveBeenCalled();
 
     const rename = document.createElement("input");
     rename.setAttribute("data-inline-rename", "");
@@ -8200,11 +8157,8 @@ describe("Composer config gear", () => {
       expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("claude-opus-4-8");
     });
 
-    it("pins nothing when opening and closing the model picker, but wakes the sandbox", async () => {
-      wakeSandboxMock.mockClear();
+    it("pins nothing when opening and closing the model picker", async () => {
       const setModel = await openModalOnRoutedSession();
-      // The picker's model list comes from the host, so opening it wakes an asleep sandbox.
-      expect(wakeSandboxMock).toHaveBeenCalled();
       fireEvent.keyDown(screen.getByTestId("composer-agent-config-menu"), { key: "Escape" });
       expect(setModel).not.toHaveBeenCalled();
     });

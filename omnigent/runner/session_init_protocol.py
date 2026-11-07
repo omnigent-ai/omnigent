@@ -12,8 +12,6 @@ from omnigent.entities import Conversation
 SessionInitProtocolVersion: TypeAlias = Literal[2]
 SESSION_INIT_PROTOCOL_VERSION: SessionInitProtocolVersion = 2
 SESSION_INIT_PAYLOAD_KEY = "session_init"
-# Runner hello capability: its session init honors ``hold_subagent_wakes``.
-CAP_HOLD_SUBAGENT_WAKES = "session_init_hold_subagent_wakes"
 
 
 class RunnerSessionInitSnapshot(BaseModel):  # type: ignore[explicit-any]  # Pydantic uses Any
@@ -56,8 +54,6 @@ class RunnerSessionInitEnvelope(BaseModel):  # type: ignore[explicit-any]  # Pyd
     # Resume an interrupted child task in its existing native session.
     resume_interrupted_turn: bool = False
     recovery_id: str | None = None
-    # Queue recovered sub-agent results without waking the parent until its next init or turn.
-    hold_subagent_wakes: bool = False
     # The relay lets a pane-inferred status only annotate a running turn; an older
     # server would let it reopen one a hook just closed.
     accepts_inferred_status: bool = False
@@ -70,7 +66,6 @@ def build_runner_session_init_payload(
     suppress_recovery_turn: bool = False,
     resume_interrupted_turn: bool = False,
     recovery_id: str | None = None,
-    hold_subagent_wakes: bool = False,
 ) -> dict[str, object]:
     """Build the versioned initialization fields appended to the legacy body."""
     from omnigent.inference_config import snapshot_runtime_config
@@ -86,7 +81,6 @@ def build_runner_session_init_payload(
         suppress_recovery_turn=suppress_recovery_turn,
         resume_interrupted_turn=resume_interrupted_turn,
         recovery_id=(recovery_id or uuid4().hex) if resume_interrupted_turn else None,
-        hold_subagent_wakes=hold_subagent_wakes,
         accepts_inferred_status=True,
         snapshot=RunnerSessionInitSnapshot(
             created_at=conversation.created_at,

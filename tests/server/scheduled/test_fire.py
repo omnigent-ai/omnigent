@@ -66,7 +66,6 @@ class _FakeConversation:
     parent_conversation_id: str | None = None
     root_conversation_id: str = ""
     terminal_launch_args: list[str] | None = None
-    kind: str = "default"
 
     def __post_init__(self) -> None:
         self.root_conversation_id = self.root_conversation_id or self.id

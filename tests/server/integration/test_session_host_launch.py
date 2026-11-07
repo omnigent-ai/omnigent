@@ -3998,24 +3998,13 @@ async def test_message_relaunch_recreated_workspace_continues_with_notice(
     assert _WORKSPACE in notice["message"], notice["message"]
 
 
-def _reconnect_recovery_held(db_uri: str, session_id: str) -> bool:
-    """Whether a wake-only retry still holds *session_id*'s reconnect recovery."""
-    from omnigent.server.child_session_recovery import reconnect_recovery_deferred
-
-    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
-    assert conv is not None
-    return reconnect_recovery_deferred(conv)
-
-
-@pytest.mark.parametrize("wake_only", [False, True], ids=["resume", "wake-only"])
 async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    wake_only: bool,
 ) -> None:
-    """Retry relaunches one dead runner; a wake-only retry resumes no turn in its tree."""
+    """Retry relaunches one dead runner and confirms its recovered lifecycle."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -4028,14 +4017,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     before = await client.get(f"/v1/sessions/{session_id}/items")
     runner_client = object()
     wait_for_runner_client = AsyncMock(return_value=runner_client)
-    connect_recovery_deferred: list[bool] = []
-
-    async def _initialize(*_args: Any, **_kwargs: Any) -> bool:
-        # The relaunched runner's connect hook runs while this retry initializes.
-        connect_recovery_deferred.append(_reconnect_recovery_held(db_uri, session_id))
-        return False
-
-    initialize = AsyncMock(side_effect=_initialize)
+    initialize = AsyncMock(return_value=False)
     relay_ready = AsyncMock(return_value=None)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", wait_for_runner_client)
     monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
@@ -4045,7 +4027,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
     response = await client.post(
         f"/v1/sessions/{session_id}/events",
-        json={"type": "wake_session" if wake_only else "retry_session", "data": {}},
+        json={"type": "retry_session", "data": {}},
     )
     await responder
 
@@ -4056,11 +4038,7 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
         "recovery": "runner_relaunched",
     }
     initialize.assert_awaited_once()
-    assert initialize.await_args.kwargs["suppress_recovery_turn"] is wake_only
-    assert initialize.await_args.kwargs["restore_children"] is not wake_only
-    assert connect_recovery_deferred == [wake_only]
-    # A runner connecting after the wake returns still finds the tree's recovery held.
-    assert _reconnect_recovery_held(db_uri, session_id) is wake_only
+    assert initialize.await_args.kwargs["suppress_recovery_turn"] is False
     relay_ready.assert_awaited_once()
     after = await client.get(f"/v1/sessions/{session_id}/items")
     assert after.json() == before.json()
@@ -4069,24 +4047,13 @@ async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     assert conv.runner_id != original_runner_id
 
 
-@pytest.mark.parametrize(
-    ("first_type", "second_type"),
-    [
-        ("retry_session", "retry_session"),
-        ("retry_session", "wake_session"),
-        ("wake_session", "wake_session"),
-    ],
-    ids=["same-mode", "resume-then-wake-only", "wake-only-twice"],
-)
 async def test_retry_session_single_flight_launches_and_rotates_once(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    first_type: str,
-    second_type: str,
 ) -> None:
-    """Concurrent retries share one launch and rotation; a wake joins any retry."""
+    """Concurrent retries share one host launch and one binding rotation."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes.sessions import routes_events
@@ -4097,30 +4064,18 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     session_id = session["id"]
     original_runner_id = session["runner_id"]
     runner_client = object()
-    launched, second_joined = asyncio.Event(), asyncio.Event()
 
-    async def _runner_connects_after_second_caller(*args: Any, **kwargs: Any) -> object:
+    async def _runner_connects_after_launch(*args: Any, **kwargs: Any) -> object:
         del args, kwargs
-        launched.set()
-        await second_joined.wait()
+        await asyncio.sleep(0.05)
         return runner_client
 
-    callers = 0
-    single_flight = routes_events._retry_session_single_flight
-
-    async def _count_callers(**kwargs: Any) -> dict[str, bool | str]:
-        nonlocal callers
-        callers += 1
-        if callers == 2:
-            second_joined.set()
-        return await single_flight(**kwargs)
-
-    initialize = AsyncMock(return_value=False)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects_after_launch)
     monkeypatch.setattr(
-        sessions_module, "_wait_for_runner_client", _runner_connects_after_second_caller
+        routes_events,
+        "_ensure_runner_session_initialized",
+        AsyncMock(return_value=False),
     )
-    monkeypatch.setattr(routes_events, "_retry_session_single_flight", _count_callers)
-    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
     monkeypatch.setattr(
         routes_events,
         "_ensure_runner_relay_ready",
@@ -4129,18 +4084,16 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     set_runner_client(None)
 
     responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    first = asyncio.create_task(
+    responses = await asyncio.gather(
         client.post(
             f"/v1/sessions/{session_id}/events",
-            json={"type": first_type, "data": {}},
-        )
+            json={"type": "retry_session", "data": {}},
+        ),
+        client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "retry_session", "data": {}},
+        ),
     )
-    await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
-    second = await client.post(
-        f"/v1/sessions/{session_id}/events",
-        json={"type": second_type, "data": {}},
-    )
-    responses = [await first, second]
     await responder
 
     expected = {
@@ -4150,380 +4103,9 @@ async def test_retry_session_single_flight_launches_and_rotates_once(
     }
     assert [response.json() for response in responses] == [expected, expected]
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
-    initialize.assert_awaited_once()
-    first_wake_only = first_type == "wake_session"
-    assert initialize.await_args.kwargs["suppress_recovery_turn"] is first_wake_only
-    assert initialize.await_args.kwargs["restore_children"] is not first_wake_only
     conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
     assert conv is not None
     assert conv.runner_id != original_runner_id
-
-
-class _RecordingRunnerClient:
-    """Accepts runner session-init POSTs and records what recovery each one deferred.
-
-    *failing_handshake* is the 1-based handshake it answers with 503.
-    """
-
-    def __init__(self, *, failing_handshake: int | None = None) -> None:
-        self.suppressed_recovery: list[bool] = []
-        self.held_subagent_wakes: list[bool] = []
-        self._failing_handshake = failing_handshake
-
-    async def post(self, path: str, *, json: dict[str, Any], **_kwargs: Any) -> httpx.Response:
-        from omnigent.runner.session_init_protocol import parse_runner_session_init_envelope
-
-        envelope = parse_runner_session_init_envelope(json)
-        assert envelope is not None
-        self.suppressed_recovery.append(envelope.suppress_recovery_turn)
-        self.held_subagent_wakes.append(envelope.hold_subagent_wakes)
-        status = 503 if len(self.suppressed_recovery) == self._failing_handshake else 201
-        return httpx.Response(
-            status, json={"id": json["session_id"]}, request=httpx.Request("POST", path)
-        )
-
-
-@pytest.mark.parametrize(
-    (
-        "resume_during_wake",
-        "wake_handshake_fails",
-        "harness",
-        "runner_holds_wakes",
-        "failed_marker_lost",
-        "first_resume_fails",
-    ),
-    [
-        (True, False, None, True, False, False),
-        (False, False, None, True, False, False),
-        (False, True, None, True, False, False),
-        (False, False, "codex-native", True, False, False),
-        (False, False, None, False, False, False),
-        (False, False, None, True, True, False),
-        (False, False, None, True, True, True),
-    ],
-    ids=[
-        "concurrent",
-        "after-wake",
-        "after-failed-wake",
-        "native-parent",
-        "older-runner",
-        "failed-after-marker-loss",
-        "failed-resume-after-marker-loss",
-    ],
-)
-async def test_resume_after_wake_only_retry_resumes_the_interrupted_turn(
-    client: httpx.AsyncClient,
-    app: FastAPI,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    resume_during_wake: bool,
-    wake_handshake_fails: bool,
-    harness: str | None,
-    runner_holds_wakes: bool,
-    failed_marker_lost: bool,
-    first_resume_fails: bool,
-) -> None:
-    """A Resume after a wake-only retry repeats the handshake without holding results."""
-    import dataclasses
-
-    from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
-    from omnigent.runtime import set_runner_client
-    from omnigent.server import child_session_recovery
-    from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
-    from omnigent.server.routes._sessions.common import _session_status_cache
-    from omnigent.server.routes._sessions.helpers import _last_task_error_from_labels
-    from omnigent.server.routes.sessions import routes_events
-
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    comm = await _connect_host(app)
-    session_id = (await _inline_launch_session(client, comm, harness=harness))["id"]
-    store = SqlAlchemyConversationStore(db_uri)
-    disconnect_labels = {
-        "omnigent.last_task_error_code": "runner_disconnected",
-        "omnigent.last_task_error_message": "Disconnected",
-    }
-    if failed_marker_lost:
-        store.set_labels(session_id, disconnect_labels)
-        store.set_session_live_status(session_id, "failed")
-        _session_status_cache[session_id] = "failed"
-    runner_client = _RecordingRunnerClient(
-        failing_handshake=1 if wake_handshake_fails else 2 if first_resume_fails else None
-    )
-    connected_client: _RecordingRunnerClient | None = None
-    launched, resume_arrived = asyncio.Event(), asyncio.Event()
-    hello = dataclasses.replace(
-        _runner_hello(), capabilities=[CAP_HOLD_SUBAGENT_WAKES] if runner_holds_wakes else []
-    )
-
-    async def _runner_connects(*_args: Any, runner_id: str, **_kwargs: Any) -> object:
-        nonlocal connected_client
-        launched.set()
-        if resume_during_wake:
-            await resume_arrived.wait()
-        app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), hello)
-        connected_client = runner_client
-        return runner_client
-
-    async def _connected_runner(*_args: Any, **_kwargs: Any) -> _RecordingRunnerClient | None:
-        return connected_client
-
-    single_flight = routes_events._retry_session_single_flight
-
-    async def _note_resume(**kwargs: Any) -> dict[str, bool | str]:
-        if not kwargs["wake_only"]:
-            resume_arrived.set()
-        return await single_flight(**kwargs)
-
-    restore_children = AsyncMock(return_value=None)
-    terminal_ready = AsyncMock(return_value=Mock(error=None))
-    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects)
-    monkeypatch.setattr(routes_events, "_get_runner_client", _connected_runner)
-    monkeypatch.setattr(routes_events, "_retry_session_single_flight", _note_resume)
-    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
-    monkeypatch.setattr(routes_events, "_ensure_native_terminal_ready", terminal_ready)
-    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
-    monkeypatch.setattr(child_session_recovery, "restore_active_children", restore_children)
-    set_runner_client(None)
-
-    async def _retry(event_type: str, *, status: int = 202) -> dict[str, Any]:
-        response = await client.post(
-            f"/v1/sessions/{session_id}/events", json={"type": event_type, "data": {}}
-        )
-        assert response.status_code == status, response.text
-        return response.json()
-
-    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-    wake = asyncio.create_task(_retry("wake_session", status=503 if wake_handshake_fails else 202))
-    await asyncio.wait_for(launched.wait(), timeout=budget(5.0))
-    if not resume_during_wake:
-        await wake
-        assert _reconnect_recovery_held(db_uri, session_id)
-    if failed_marker_lost:
-        # The wake leaves the Resume card, and the label outlasts the marker.
-        assert _session_status_cache[session_id] == "failed"
-        labels = store.get_conversation(session_id).labels  # type: ignore[union-attr]
-        assert _last_task_error_from_labels(labels) is not None
-        child_session_recovery.clear_skipped_resume(session_id)
-    if first_resume_fails:
-        await _retry("retry_session", status=503)
-        assert _reconnect_recovery_held(db_uri, session_id)
-    resume = await _retry("retry_session")
-    relaunched = {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
-    native_ready = {"queued": False, "recovered": True, "recovery": "native_terminal_ready"}
-    assert resume == (native_ready if harness else relaunched)
-    if not wake_handshake_fails:
-        assert await wake == relaunched
-    await responder
-
-    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
-    if runner_holds_wakes:
-        # A native parent never resumes from history, but the Resume still releases its results.
-        resumes = 2 if first_resume_fails else 1
-        assert runner_client.suppressed_recovery == [True] + [harness is not None] * resumes
-        assert runner_client.held_subagent_wakes == [True] + [False] * resumes
-    else:
-        # An older runner would ignore the hold, so the wake sends it no handshake.
-        assert runner_client.suppressed_recovery == [False]
-        assert runner_client.held_subagent_wakes == [False]
-    restore_children.assert_awaited_once()
-    assert not _reconnect_recovery_held(db_uri, session_id)
-    assert child_session_recovery.skipped_resume_runner(session_id) is None
-    if failed_marker_lost:
-        assert _session_status_cache[session_id] == "idle"
-        labels = store.get_conversation(session_id).labels  # type: ignore[union-attr]
-        assert _last_task_error_from_labels(labels) is None
-    handshakes = list(runner_client.suppressed_recovery)
-    assert await _retry("retry_session") == (
-        native_ready
-        if harness
-        else {"queued": False, "recovered": False, "recovery": "already_connected"}
-    )
-    assert runner_client.suppressed_recovery == handshakes
-
-
-@pytest.mark.parametrize("woken", [True, False], ids=["woken", "never-woken-runner-loss"])
-async def test_resume_after_waking_a_connected_runner_releases_its_hold(
-    client: httpx.AsyncClient,
-    app: FastAPI,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    woken: bool,
-) -> None:
-    """A wake that initializes a connected runner's session leaves Resume a fresh handshake.
-
-    Resume on a connected runner resumes no turn that no wake held, even one
-    whose runner-loss failure is still shown.
-    """
-    import dataclasses
-
-    from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
-    from omnigent.server import child_session_recovery
-    from omnigent.server.routes._sessions import orchestration
-    from omnigent.server.routes._sessions.common import _session_status_cache
-    from omnigent.server.routes.sessions import routes_events
-
-    comm = await _connect_host(app)
-    session = await _inline_launch_session(client, comm)
-    if not woken:
-        store = SqlAlchemyConversationStore(db_uri)
-        store.set_labels(
-            session["id"],
-            {
-                "omnigent.last_task_error_code": "runner_disconnected",
-                "omnigent.last_task_error_message": "Disconnected",
-            },
-        )
-        store.set_session_live_status(session["id"], "failed")
-        _session_status_cache[session["id"]] = "failed"
-    hello = dataclasses.replace(_runner_hello(), capabilities=[CAP_HOLD_SUBAGENT_WAKES])
-    app.state.tunnel_registry.register(session["runner_id"], _NoopRunnerWS(), hello)
-    runner_client = _RecordingRunnerClient()
-
-    async def _connected_runner(*_args: Any, **_kwargs: Any) -> _RecordingRunnerClient:
-        return runner_client
-
-    monkeypatch.setattr(routes_events, "_get_runner_client", _connected_runner)
-    monkeypatch.setattr(orchestration, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
-    monkeypatch.setattr(
-        child_session_recovery, "restore_active_children", AsyncMock(return_value=None)
-    )
-
-    event_types = ["wake_session", "retry_session"] if woken else ["retry_session"]
-    for event_type in event_types:
-        response = await client.post(
-            f"/v1/sessions/{session['id']}/events", json={"type": event_type, "data": {}}
-        )
-        assert response.status_code == 202, response.text
-        assert response.json() == {
-            "queued": False,
-            "recovered": False,
-            "recovery": "already_connected",
-        }
-
-    assert runner_client.suppressed_recovery == [True] * len(event_types)
-    assert runner_client.held_subagent_wakes == ([True, False] if woken else [False])
-
-
-@pytest.mark.parametrize(
-    ("marker_lost", "first_handshake_fails"),
-    [(False, False), (True, False), (False, True)],
-    ids=["marker", "persisted-hold-only", "failed-handshake"],
-)
-async def test_message_after_wake_only_launch_restores_interrupted_children(
-    client: httpx.AsyncClient,
-    app: FastAPI,
-    db_uri: str,
-    monkeypatch: pytest.MonkeyPatch,
-    marker_lost: bool,
-    first_handshake_fails: bool,
-) -> None:
-    """A message after a wake resumes the interrupted child, but not the parent's turn."""
-    import dataclasses
-
-    from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
-    from omnigent.runtime import set_runner_client
-    from omnigent.server import child_session_recovery
-    from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes._sessions import orchestration
-    from omnigent.server.routes._sessions.common import _session_status_cache
-    from omnigent.server.routes.sessions import routes_events
-    from tests._helpers.polling import poll_until_async
-
-    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
-    comm = await _connect_host(app)
-    session = await _inline_launch_session(client, comm)
-    session_id = session["id"]
-    store = SqlAlchemyConversationStore(db_uri)
-    child = store.create_conversation(
-        kind="sub_agent",
-        parent_conversation_id=session_id,
-        agent_id=store.get_conversation(session_id).agent_id,  # type: ignore[union-attr]
-        runner_id=session["runner_id"],
-        sub_agent_name="worker",
-    )
-    store.set_session_live_status(child.id, "running")
-    _session_status_cache[child.id] = "running"
-    inits: list[tuple[str, bool, bool, bool]] = []
-
-    def accept(request: httpx.Request) -> httpx.Response:
-        if request.url.path != "/v1/sessions":
-            return httpx.Response(202 if request.url.path.endswith("/events") else 200, json={})
-        body = json.loads(request.content)
-        envelope = body["session_init"]
-        inits.append(
-            (
-                body["session_id"],
-                envelope["suppress_recovery_turn"],
-                envelope["hold_subagent_wakes"],
-                envelope["resume_interrupted_turn"],
-            )
-        )
-        if first_handshake_fails and len(inits) == 2:
-            raise httpx.ConnectError("runner tunnel dropped", request=request)
-        return httpx.Response(201, json={"id": body["session_id"]})
-
-    hello = dataclasses.replace(_runner_hello(), capabilities=[CAP_HOLD_SUBAGENT_WAKES])
-    connected: httpx.AsyncClient | None = None
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(accept), base_url="http://runner"
-    ) as runner:
-
-        async def _runner_connects(*_args: Any, runner_id: str, **_kwargs: Any) -> object:
-            nonlocal connected
-            app.state.tunnel_registry.register(runner_id, _NoopRunnerWS(), hello)
-            connected = runner
-            return runner
-
-        async def _connected_runner(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient | None:
-            return connected
-
-        monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _runner_connects)
-        monkeypatch.setattr(routes_events, "_get_runner_client", _connected_runner)
-        monkeypatch.setattr(
-            routes_events, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
-        )
-        monkeypatch.setattr(
-            orchestration, "_ensure_runner_relay_ready", AsyncMock(return_value=None)
-        )
-        set_runner_client(None)
-
-        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-        wake = await client.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"type": "wake_session", "data": {}},
-        )
-        assert wake.status_code == 202, wake.text
-        await responder
-        assert _reconnect_recovery_held(db_uri, session_id)
-        assert [init[0] for init in inits] == [session_id]
-        if marker_lost:
-            # Eviction drops the process-local marker; the persisted hold still owes the handshake.
-            child_session_recovery.clear_skipped_resume(session_id)
-
-        message = {
-            "type": "message",
-            "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
-        }
-        response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
-        assert response.status_code == 202, response.text
-        if first_handshake_fails:
-            # The message is still forwarded; the next one owes the handshake and the child.
-            assert len(inits) == 2
-            assert _reconnect_recovery_held(db_uri, session_id)
-            assert child_session_recovery.skipped_resume_runner(session_id) is not None
-            response = await client.post(f"/v1/sessions/{session_id}/events", json=message)
-            assert response.status_code == 202, response.text
-        await poll_until_async(lambda: inits[-1][0] == child.id, timeout_s=budget(5.0))
-
-    # The message starts the parent's turn, so its handshake only releases held sub-agent results.
-    assert inits == [
-        (session_id, True, True, False),
-        *[(session_id, True, False, False)] * (2 if first_handshake_fails else 1),
-        (child.id, False, False, True),
-    ]
-    assert not _reconnect_recovery_held(db_uri, session_id)
-    assert child_session_recovery.skipped_resume_runner(session_id) is None
 
 
 async def test_retry_session_single_flight_evicts_after_only_waiter_cancelled(

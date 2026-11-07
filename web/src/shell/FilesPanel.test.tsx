@@ -16,30 +16,13 @@ import {
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
-import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
-import { ApiError, retrySession, wakeSession } from "@/lib/sessionsApi";
-import type * as SessionsApiModule from "@/lib/sessionsApi";
-import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
-import { LEVEL_EDIT } from "@/lib/permissionsApi";
 
 const { copyTextMock } = vi.hoisted(() => ({ copyTextMock: vi.fn(() => Promise.resolve()) }));
 vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
-vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof SessionsApiModule>()),
-  retrySession: vi.fn(),
-  wakeSession: vi.fn(),
-}));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
-vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
-  ...(await importOriginal<typeof RunnerHealthModule>()),
-  useSessionRunnerOnline: vi.fn(),
-}));
 
-import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useSession } from "@/hooks/useSession";
-import { resetSandboxWakesForTesting } from "@/hooks/useSandboxAutoWake";
 import { FilesPanel, fileListStatus, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
@@ -91,10 +74,7 @@ vi.mock("@/hooks/useSession", () => ({
 }));
 
 const useAllFilesMock = vi.mocked(useWorkspaceAllFiles);
-const retrySessionMock = vi.mocked(retrySession);
-const wakeSessionMock = vi.mocked(wakeSession);
 const useAsleepMock = vi.mocked(useWorkspaceAsleep);
-const useRunnerOnlineMock = vi.mocked(useSessionRunnerOnline);
 const useChangedFilesMock = vi.mocked(useWorkspaceChangedFiles);
 const useDirectoryMock = vi.mocked(useWorkspaceDirectory);
 const useDirectoriesMock = vi.mocked(useWorkspaceDirectories);
@@ -103,11 +83,6 @@ const useSearchMock = vi.mocked(useWorkspaceFileSearch);
 const allFilesRefetchMock = vi.fn(() => Promise.resolve());
 const changedFilesRefetchMock = vi.fn(() => Promise.resolve());
 const searchRefetchMock = vi.fn(() => Promise.resolve());
-const WAKE_CAPABLE_INFO: ServerInfo = {
-  ...FALLBACK_SERVER_INFO,
-  session_event_types: ["message", "wake_session"],
-};
-let serverInfo: ServerInfo | "loading" = WAKE_CAPABLE_INFO;
 
 function file(path: string, bytes = 10): WorkspaceFile {
   return {
@@ -226,7 +201,6 @@ function renderPanel({
   reachable = null,
   onFileSelect = vi.fn(),
   listsLoaded = true,
-  active,
   environment,
 }: {
   conversationId: string;
@@ -247,7 +221,6 @@ function renderPanel({
   onFileSelect?: (path: string) => void;
   /** False: both list queries are disabled and hold no data (nothing could serve them). */
   listsLoaded?: boolean;
-  active?: boolean;
   /** The environment query's state; defaults to a loaded environment. */
   environment?: { data: unknown; isLoading: boolean; isError: boolean; error: Error | null };
 }) {
@@ -270,43 +243,36 @@ function renderPanel({
     searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
   );
 
-  return render(panelAt(conversationId, { flatView, onFileSelect, showHidden, onClose, active }));
+  return render(panelAt(conversationId, { flatView, onFileSelect, showHidden, onClose }));
 }
 
 /** A fresh routed FilesPanel element, so rerenders re-read the hook mocks. */
 function panelAt(conversationId: string, props: Partial<ComponentProps<typeof FilesPanel>> = {}) {
   return (
-    <CapabilitiesProvider info={serverInfo}>
-      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
-        <Routes>
-          <Route
-            path="/c/:conversationId"
-            element={
-              <FilesPanel
-                sort="recent"
-                onSortChange={vi.fn()}
-                flatView={false}
-                onFileSelect={vi.fn()}
-                showHidden={false}
-                onShowHiddenChange={vi.fn()}
-                {...props}
-              />
-            }
-          />
-        </Routes>
-      </MemoryRouter>
-    </CapabilitiesProvider>
+    <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+      <Routes>
+        <Route
+          path="/c/:conversationId"
+          element={
+            <FilesPanel
+              sort="recent"
+              onSortChange={vi.fn()}
+              flatView={false}
+              onFileSelect={vi.fn()}
+              showHidden={false}
+              onShowHiddenChange={vi.fn()}
+              {...props}
+            />
+          }
+        />
+      </Routes>
+    </MemoryRouter>
   );
 }
 
 beforeEach(() => {
-  serverInfo = WAKE_CAPABLE_INFO;
   useAllFilesMock.mockReset();
   useAsleepMock.mockReturnValue(false);
-  useRunnerOnlineMock.mockReturnValue(undefined);
-  retrySessionMock.mockReset();
-  wakeSessionMock.mockReset();
-  wakeSessionMock.mockResolvedValue({ queued: false, recovered: true });
   useChangedFilesMock.mockReset();
   useDirectoryMock.mockReset();
   useDirectoriesMock.mockClear();
@@ -319,7 +285,6 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  resetSandboxWakesForTesting();
   vi.clearAllMocks();
   vi.useRealTimers();
 });
@@ -511,211 +476,24 @@ describe("FilesPanel before the workspace environment answers", () => {
 });
 
 describe("FilesPanel on an asleep sandbox", () => {
-  beforeEach(() => {
-    vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test", permissionLevel: LEVEL_EDIT },
-    } as unknown as ReturnType<typeof useSession>);
-    useAsleepMock.mockReturnValue(true);
-  });
-
-  afterEach(() => {
-    vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test" },
-    } as unknown as ReturnType<typeof useSession>);
-  });
-
-  const asleepPanel = {
-    conversationId: "conv_asleep",
-    files: [] as WorkspaceFile[],
-    listsLoaded: false,
-  };
-
   it.each([true, false])(
-    "starts the sandbox when the panel is opened (flatView=%s)",
-    async (flatView) => {
-      const { rerender } = renderPanel({ ...asleepPanel, flatView, active: false });
-      expect(wakeSessionMock).not.toHaveBeenCalled();
+    "says the sandbox is offline instead of an empty workspace (flatView=%s)",
+    (flatView) => {
+      useAsleepMock.mockReturnValue(true);
+      renderPanel({ conversationId: "conv_asleep", flatView, files: [], listsLoaded: false });
 
-      await act(async () => rerender(panelAt("conv_asleep", { flatView, active: true })));
-      expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-      expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
-      expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
+      expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
       expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
       expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
     },
   );
 
-  it.each([
-    ["is already open when the page loads", () => renderPanel(asleepPanel)],
-    [
-      "stays open while the user switches sessions",
-      () => {
-        const view = renderPanel({ ...asleepPanel, conversationId: "conv_other" });
-        view.rerender(panelAt("conv_other", { conversationId: "conv_asleep" }));
-        expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-        return view;
-      },
-    ],
-  ])("leaves the sandbox for navigation when the panel %s", async (_label, renderCase) => {
-    renderCase();
-    await act(async () => {});
-    expect(wakeSessionMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-  });
-
-  it("starts the sandbox when the mobile Files drawer opens", async () => {
-    useAsleepMock.mockReturnValue(true);
-    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
-    useChangedFilesMock.mockReturnValue(
-      unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>,
-    );
-    useDirectoryMock.mockReturnValue(directoryResult());
-    useEnvironmentMock.mockReturnValue(environmentResult(null, null));
-    useSearchMock.mockReturnValue(searchResult([], false, false, false));
-    const drawer = (open: boolean) => (
-      <CapabilitiesProvider info={serverInfo}>
-        <MemoryRouter initialEntries={["/c/conv_asleep"]}>
-          <Routes>
-            <Route
-              path="/c/:conversationId"
-              element={
-                <FilesPanelDrawer
-                  sort="recent"
-                  onSortChange={vi.fn()}
-                  open={open}
-                  onClose={vi.fn()}
-                  onFileSelect={vi.fn()}
-                  flatView={false}
-                  showHidden={false}
-                  onShowHiddenChange={vi.fn()}
-                />
-              }
-            />
-          </Routes>
-        </MemoryRouter>
-      </CapabilitiesProvider>
-    );
-    const { rerender } = render(drawer(false));
-    expect(wakeSessionMock).not.toHaveBeenCalled();
-
-    await act(async () => rerender(drawer(true)));
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-    expect(wakeSessionMock).toHaveBeenCalledWith("conv_asleep");
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-  });
-
-  it.each([
-    ["a read-only viewer", LEVEL_EDIT - 1],
-    ["an unknown access level", null],
-  ])("doesn't start the sandbox for %s", async (_label, permissionLevel) => {
-    vi.mocked(useSession).mockReturnValue({
-      session: { hostId: "host_test", permissionLevel },
-    } as unknown as ReturnType<typeof useSession>);
-    const { rerender } = renderPanel({ ...asleepPanel, active: false });
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-
-    expect(wakeSessionMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-  });
-
-  it.each<[string, ServerInfo, number]>([
-    [
-      "that doesn't list the wake",
-      { ...FALLBACK_SERVER_INFO, session_event_types: ["message"] },
-      0,
-    ],
-    ["that rejects the wake as an unknown event", WAKE_CAPABLE_INFO, 1],
-  ])("keeps the send-a-message hint on an older server %s", async (_label, info, wakes) => {
-    serverInfo = info;
-    wakeSessionMock.mockRejectedValueOnce(
-      new ApiError("Unknown event type: 'wake_session'", 400, "invalid_input"),
-    );
-    const { rerender } = renderPanel({ ...asleepPanel, active: false });
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-
-    expect(wakeSessionMock).toHaveBeenCalledTimes(wakes);
-    expect(retrySessionMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-  });
-
-  it("doesn't wake when a grid cell's panel is shown by selecting the cell", async () => {
-    const { rerender } = renderPanel({ ...asleepPanel, active: false });
-    await act(async () => rerender(panelAt("conv_asleep", { active: true, wakeWhenShown: false })));
-    expect(wakeSessionMock).not.toHaveBeenCalled();
-    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-  });
-
-  it("leaves a restored Files view on a just-opened session to the open dwell", async () => {
-    vi.useFakeTimers();
-    try {
-      // Another session's file viewer hides the panel; the asleep session's
-      // saved tree view then shows it as that session loads.
-      const { rerender } = renderPanel({
-        ...asleepPanel,
-        conversationId: "conv_other",
-        active: false,
-      });
-      rerender(panelAt("conv_other", { conversationId: "conv_asleep", active: false }));
-      await act(async () =>
-        rerender(panelAt("conv_other", { conversationId: "conv_asleep", active: true })),
-      );
-      expect(wakeSessionMock).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("goes back to the offline hint when the wake fails, and wakes again on reopen", async () => {
-    wakeSessionMock.mockRejectedValueOnce(new Error("Sandbox resume timed out"));
-    const { rerender } = renderPanel({ ...asleepPanel, active: false });
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-
-    rerender(panelAt("conv_asleep", { active: false }));
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-    expect(wakeSessionMock).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    useAsleepMock.mockReturnValue(false);
-    useRunnerOnlineMock.mockReturnValue(true);
-    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
-    rerender(panelAt("conv_asleep", { active: true }));
-    expect(screen.getByText("README.md")).toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /start sandbox|try again/i }),
-    ).not.toBeInTheDocument();
-  });
-
-  it("loads the files once the sandbox is back, and doesn't wake it again when it sleeps", async () => {
-    const { rerender } = renderPanel({ ...asleepPanel, active: false });
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-    expect(screen.getByText("Starting sandbox…")).toBeInTheDocument();
-
-    useAsleepMock.mockReturnValue(false);
-    useRunnerOnlineMock.mockReturnValue(true);
-    useAllFilesMock.mockReturnValue(allFilesResult([file("README.md")]));
-    rerender(panelAt("conv_asleep", { active: true }));
-    expect(screen.getByText("README.md")).toBeInTheDocument();
-    expect(screen.queryByText("Starting sandbox…")).not.toBeInTheDocument();
-
-    useAsleepMock.mockReturnValue(true);
-    useRunnerOnlineMock.mockReturnValue(false);
-    useAllFilesMock.mockReturnValue(unloadedResult() as ReturnType<typeof useWorkspaceAllFiles>);
-    await act(async () => rerender(panelAt("conv_asleep", { active: true })));
-    expect(screen.getByText("Sandbox is offline")).toBeInTheDocument();
-    expect(wakeSessionMock).toHaveBeenCalledTimes(1);
-  });
-
   it("keeps showing a list cached before the sandbox went offline", () => {
+    useAsleepMock.mockReturnValue(true);
     renderPanel({ conversationId: "conv_asleep", files: [file("README.md")] });
 
     expect(screen.getByText("README.md")).toBeInTheDocument();
     expect(screen.queryByText("Sandbox is offline")).not.toBeInTheDocument();
-    expect(wakeSessionMock).not.toHaveBeenCalled();
   });
 });
 
@@ -784,7 +562,25 @@ describe("FilesPanel changed files search", () => {
 
     expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
 
-    rerender(panelAt("conv_search_visible", { flatView: true }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_search_visible"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={true}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
   });
@@ -827,10 +623,46 @@ describe("FilesPanel changed files search", () => {
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("App");
 
     // Switch to Explore (tree) view
-    rerender(panelAt("conv_search_clear", { flatView: false }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_search_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // Switch back to Changed view
-    rerender(panelAt("conv_search_clear", { flatView: true }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_search_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={true}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // useEffect resets changedSearch when flatView becomes false, so the box should be empty on return
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toHaveValue("");
@@ -1073,7 +905,25 @@ describe("FilesPanel tree (Explore) search", () => {
     expect(screen.queryByRole("searchbox", { name: "Search changed files" })).toBeNull();
 
     // Switch to Changed view
-    rerender(panelAt("conv_tree_search_visible", { flatView: true }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_tree_search_visible"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={true}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // Changed view has its own search box; tree search must not be present
     expect(screen.getByRole("searchbox", { name: "Search changed files" })).toBeInTheDocument();
@@ -1335,10 +1185,46 @@ describe("FilesPanel tree (Explore) search", () => {
 
     // Switch to Changed (flat) view — this triggers the useEffect that calls
     // setTreeSearch("") so returning to tree view starts with a blank query.
-    rerender(panelAt("conv_tree_search_tab_clear", { flatView: true }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_tree_search_tab_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={true}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // Switch back to Explore view
-    rerender(panelAt("conv_tree_search_tab_clear", { flatView: false }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_tree_search_tab_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // The search box must be empty — treeSearch was cleared by the useEffect
     // when flatView became true.  Using rerender() (not render()) keeps the
@@ -1530,11 +1416,47 @@ describe("FilesPanel tree (Explore) search", () => {
     );
 
     // Switch to Changed (flat) view — the useEffect resets the glob filters.
-    rerender(panelAt("conv_tree_filters_tab_clear", { flatView: true }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_tree_filters_tab_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={true}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     // Switch back to Explore — the toggle stays open (UI preference persists)
     // but both filter inputs must be empty again (the values were cleared).
-    rerender(panelAt("conv_tree_filters_tab_clear", { flatView: false }));
+    rerender(
+      <MemoryRouter initialEntries={["/c/conv_tree_filters_tab_clear"]}>
+        <Routes>
+          <Route
+            path="/c/:conversationId"
+            element={
+              <FilesPanel
+                sort="recent"
+                onSortChange={vi.fn()}
+                flatView={false}
+                onFileSelect={vi.fn()}
+                showHidden={false}
+                onShowHiddenChange={vi.fn()}
+              />
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
 
     expect(screen.getByRole("textbox", { name: "files to include" })).toHaveValue("");
     expect(screen.getByRole("textbox", { name: "files to exclude" })).toHaveValue("");

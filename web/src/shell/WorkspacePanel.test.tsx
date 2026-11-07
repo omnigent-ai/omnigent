@@ -65,23 +65,11 @@ vi.mock("./FileViewer", () => ({
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({
-    flatView,
-    conversationId,
-    active,
-    wakeWhenShown,
-  }: {
-    flatView: boolean;
-    conversationId: string;
-    active?: boolean;
-    wakeWhenShown?: boolean;
-  }) => (
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
-      data-active={String(active)}
-      data-wake-when-shown={String(wakeWhenShown)}
     />
   ),
 }));
@@ -127,10 +115,6 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   })),
 }));
 // The "+" menu reads the agent's declared terminals to gate the Shell entry.
-const wakeSandboxMock = vi.fn();
-vi.mock("@/hooks/useSandboxAutoWake", () => ({
-  useSandboxWake: () => ({ waking: false, ready: true, wakeIfAsleep: wakeSandboxMock }),
-}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
@@ -392,10 +376,6 @@ describe("WorkspacePanel surface presentation", () => {
 
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
-    wakeSandboxMock.mockClear();
-    fireEvent.click(screen.getByRole("tab", { name: "Changes" }));
-    // An opened unpinned tab is a pick like a pinned one.
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
@@ -579,20 +559,6 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
-  });
-
-  it("wakes an asleep sandbox when Files or Changes is chosen, not other tabs", () => {
-    wakeSandboxMock.mockClear();
-    writeDefaultWorkspaceTab("changes");
-    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
-
-    // Changes → Files keeps the same mounted panel open; Agents isn't a host view.
-    expect(pressTabNumber(2)).toBe(false);
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
-    expect(pressTabNumber(4)).toBe(false);
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
-    expect(pressTabNumber(1)).toBe(false);
-    expect(wakeSandboxMock).toHaveBeenCalledTimes(2);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {
@@ -847,7 +813,6 @@ describe("WorkspacePanel content area", () => {
     });
     const panel = screen.getByTestId("files-panel-stub");
     expect(panel.parentElement).not.toHaveClass("invisible");
-    expect(panel).toHaveAttribute("data-active", "true");
 
     rerender({ selectedFilePath: "src/App.tsx" });
     // The viewer owns the slot; the scope panel stays mounted (same node, so
@@ -855,48 +820,10 @@ describe("WorkspacePanel content area", () => {
     expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).toHaveClass("invisible");
-    // A hidden panel must not act as if the user opened it (e.g. wake a sandbox).
-    expect(panel).toHaveAttribute("data-active", "false");
 
     rerender({ selectedFilePath: null });
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).not.toHaveClass("invisible");
-    expect(panel).toHaveAttribute("data-active", "true");
-  });
-
-  it.each([
-    ["collapsed", { open: false }],
-    ["inert", { inert: true }],
-    ["squeezed to zero width", { width: 0 }],
-  ])("marks the FilesPanel inactive while the rail is %s", (_label, override) => {
-    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, ...override });
-
-    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "false");
-  });
-
-  it("keeps a maximized FilesPanel active without an inline width", () => {
-    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, width: 0, maximized: true });
-
-    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", "true");
-  });
-
-  it.each([
-    ["the CSS-hidden rail on a phone", false, "false"],
-    ["a contained workspace on a phone", true, "true"],
-  ])("marks the FilesPanel active only while visible: %s", (_label, contained, active) => {
-    isMobileMock.mockReturnValue(true);
-    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, contained });
-
-    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", active);
-  });
-
-  it.each([
-    ["the session's rail", false, "true"],
-    ["a grid cell, whose panel shows when the cell is selected", true, "false"],
-  ])("lets showing the FilesPanel wake the sandbox only in %s", (_label, contained, wakes) => {
-    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, contained });
-
-    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-wake-when-shown", wakes);
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {

@@ -71,13 +71,11 @@ from omnigent.runner.launch_failure import (
     diagnose_codex_provider_auth_failure,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
-from omnigent.runner.session_init_protocol import CAP_HOLD_SUBAGENT_WAKES
 from omnigent.runner.transports.ws_tunnel.frames import (
     EventAckFrame,
     EventBatchFrame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     inflight_text,
     pending_elicitations,
@@ -180,7 +178,6 @@ from omnigent.server.routes._sessions.common import (
     _SNAPSHOT_RUNNER_TIMEOUT_S,
     _STOP_SESSION_TYPE,
     _SUBAGENT_STATUS_TYPE,
-    _WAKE_SESSION_TYPE,
     _intentional_stop_sessions,
     _interrupt_fenced_sessions,
     _logger,
@@ -357,17 +354,9 @@ _retry_recovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
 # One shared Resume attempt per session, split by caller for side chats; see
 # _retry_session_single_flight.
 _RetryFlight = tuple[str, str | None]
-
-
-@dataclass(frozen=True)
-class _RetryAttempt:
-    """An in-flight recovery and whether a wake-only request started it."""
-
-    task: asyncio.Task[dict[str, bool | str]]
-    wake_only: bool
-
-
-_retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, _RetryAttempt] = WorkspaceScopedCache()
+_retry_recovery_tasks: WorkspaceScopedCache[_RetryFlight, asyncio.Task[dict[str, bool | str]]] = (
+    WorkspaceScopedCache()
+)
 
 # POST /events types that arrive per streamed chunk — the harness echoing its
 # own live output back. Their per-call audit row is pure noise (the content is
@@ -387,7 +376,6 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         "message",
         _SLASH_COMMAND_TYPE,
         _RETRY_SESSION_TYPE,
-        _WAKE_SESSION_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _SUBAGENT_STATUS_TYPE,
     }
@@ -492,8 +480,7 @@ def _evict_retry_recovery_task(
     completed_task: asyncio.Task[dict[str, bool | str]],
 ) -> None:
     """Evict a settled retry task without disturbing a newer attempt."""
-    attempt = _retry_recovery_tasks.get(flight)
-    if attempt is not None and attempt.task is completed_task:
+    if _retry_recovery_tasks.get(flight) is completed_task:
         _retry_recovery_tasks.pop(flight, None)
     if not completed_task.cancelled():
         completed_task.exception()
@@ -699,12 +686,6 @@ def _host_offline_hold_message() -> str:
     return "The host for this session is offline. Your message will be sent when it reconnects."
 
 
-def _runner_holds_subagent_wakes(tunnel_registry: TunnelRegistry | None, runner_id: str) -> bool:
-    """Whether the runner's init can hold sub-agent wakes; an in-process runner can."""
-    connection = tunnel_registry.get(runner_id) if tunnel_registry is not None else None
-    return connection is None or CAP_HOLD_SUBAGENT_WAKES in connection.hello.capabilities
-
-
 def _refuse_offline_host_send(
     *,
     headers: Mapping[str, str],
@@ -743,53 +724,11 @@ async def _recover_retry_session(
     runner_router: RunnerRouter | None,
     user_id: str | None,
     permission_store: PermissionStore | None,
-    wake_only: bool = False,
 ) -> dict[str, bool | str]:
-    """Recover runner/terminal readiness without creating transcript input.
-
-    *wake_only* reconnects the runner without resuming an interrupted turn,
-    the session's own or a descendant's. The next plain retry on that runner
-    resumes them.
-    """
-    from omnigent.server.child_session_recovery import defer_reconnect_recovery
-
-    deferral = defer_reconnect_recovery(session_id) if wake_only else contextlib.nullcontext()
-    with deferral:
-        return await _recover_retry_session_once(
-            request=request,
-            session_id=session_id,
-            conversation_store=conversation_store,
-            runner_router=runner_router,
-            user_id=user_id,
-            permission_store=permission_store,
-            wake_only=wake_only,
-        )
-
-
-async def _recover_retry_session_once(
-    *,
-    request: Request,
-    session_id: str,
-    conversation_store: ConversationStore,
-    runner_router: RunnerRouter | None,
-    user_id: str | None,
-    permission_store: PermissionStore | None,
-    wake_only: bool = False,
-) -> dict[str, bool | str]:
-    """Run one recovery attempt for :func:`_recover_retry_session`."""
-    from omnigent.server.child_session_recovery import (
-        clear_skipped_resume,
-        hold_reconnect_recovery,
-        note_skipped_resume,
-        reconnect_recovery_deferred,
-        release_reconnect_recovery,
-        skipped_resume_runner,
-    )
-
+    """Recover runner/terminal readiness without creating transcript input."""
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
     if conv is None:
         raise _session_not_found()
-    was_held = not wake_only and reconnect_recovery_deferred(conv)
 
     original_runner_id = conv.runner_id
     runner_client = await _get_runner_client(session_id, runner_router)
@@ -798,9 +737,6 @@ async def _recover_retry_session_once(
     terminal_ready_from_init = False
     if runner_client is None:
         await _raise_if_runner_on_another_replica(conv, request.app.state, conversation_store)
-        if wake_only:
-            # The runner this launches can connect after the wake gives up waiting.
-            await hold_reconnect_recovery(session_id, conversation_store)
         runner_client, conv = await ensure_runner_connected(
             session_id=session_id,
             conv=conv,
@@ -831,56 +767,16 @@ async def _recover_retry_session_once(
         if startup
         else []
     )
-    owes_resume = (
-        not wake_only
-        and conv.runner_id is not None
-        and (
-            skipped_resume_runner(session_id) == conv.runner_id
-            # The wake's persisted hold outlives an evicted marker.
-            or (was_connected and was_held)
-        )
-    )
-    resumes_wake = (
-        owes_resume
-        and not saved_inputs
-        # Native harnesses never resume a turn from history.
-        and not _is_native_terminal_session(conv)
-    )
-    initializer = getattr(request.app.state, "runner_session_initializer", None)
-    if owes_resume and initializer is not None and conv.runner_id is not None:
-        # Repeat the handshake the wake held, which also releases its held sub-agent results.
-        initializer.forget_completed_handshake(session_id, runner_id=conv.runner_id)
-    if wake_only and not was_connected and conv.runner_id is not None:
-        # Record it before the handshake so a failed wake still leaves the turn for Resume.
-        note_skipped_resume(session_id, conv.runner_id)
-    if (
-        wake_only
-        and conv.runner_id is not None
-        and not _runner_holds_subagent_wakes(
-            getattr(request.app.state, "tunnel_registry", None), conv.runner_id
-        )
-    ):
-        # Its init would wake parents for recovered results; Resume initializes it instead.
-        if runner_relaunched:
-            return {"queued": False, "recovered": True, "recovery": "runner_relaunched"}
-        return {"queued": False, "recovered": False, "recovery": "already_connected"}
     terminal_ready_from_init = await _ensure_runner_session_initialized(
         session_id,
         conv,
         runner_client,
         conversation_store,
-        initializer=initializer,
-        suppress_recovery_turn=(
-            wake_only or (was_connected and not resumes_wake) or bool(saved_inputs)
-        ),
+        initializer=getattr(request.app.state, "runner_session_initializer", None),
+        suppress_recovery_turn=was_connected or bool(saved_inputs),
         require_success=True,
-        restore_children=not wake_only,
         trigger="retry_session",
     )
-    if not wake_only:
-        # Until this handshake succeeds, the hold records the resume a wake left owed.
-        await release_reconnect_recovery(session_id, conversation_store)
-        clear_skipped_resume(session_id)
 
     if _is_native_terminal_session(conv):
         # A cached init response cannot prove that a connected runner's pane still exists.
@@ -910,8 +806,7 @@ async def _recover_retry_session_once(
             "recovery": "runner_relaunched" if runner_relaunched else "native_terminal_ready",
         }
 
-    # Resuming after a wake completes the recovery of the runner it relaunched.
-    if runner_relaunched or resumes_wake:
+    if runner_relaunched:
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
@@ -933,44 +828,34 @@ async def _retry_session_single_flight(
     runner_router: RunnerRouter | None,
     user_id: str | None,
     permission_store: PermissionStore | None,
-    wake_only: bool = False,
 ) -> dict[str, bool | str]:
     """Share one in-flight recovery attempt across concurrent callers.
 
     A side chat's recovery depends on the caller's access to its source and
     ownership of the source's runner, so it is shared only by one caller's
-    concurrent requests. A wake-only request joins any in-flight attempt. A
-    plain request waits out a wake-only attempt and then runs its own, which
-    resumes what the wake left interrupted.
+    concurrent requests.
     """
     is_side_chat = conversation is not None and _side_chat_source_id(conversation) is not None
     flight: _RetryFlight = (session_id, user_id if is_side_chat else None)
     lock = _retry_recovery_lock(session_id)
-    while True:
-        async with lock:
-            attempt = _retry_recovery_tasks.get(flight)
-            if attempt is None or attempt.task.done():
-                attempt = _RetryAttempt(
-                    asyncio.create_task(
-                        _recover_retry_session(
-                            request=request,
-                            session_id=session_id,
-                            conversation_store=conversation_store,
-                            runner_router=runner_router,
-                            user_id=user_id,
-                            permission_store=permission_store,
-                            wake_only=wake_only,
-                        )
-                    ),
-                    wake_only=wake_only,
+    async with lock:
+        task = _retry_recovery_tasks.get(flight)
+        if task is None:
+            task = asyncio.create_task(
+                _recover_retry_session(
+                    request=request,
+                    session_id=session_id,
+                    conversation_store=conversation_store,
+                    runner_router=runner_router,
+                    user_id=user_id,
+                    permission_store=permission_store,
                 )
-                _retry_recovery_tasks[flight] = attempt
-                attempt.task.add_done_callback(
-                    lambda completed_task: _evict_retry_recovery_task(flight, completed_task)
-                )
-        if wake_only or not attempt.wake_only:
-            return await asyncio.shield(attempt.task)
-        await asyncio.wait([attempt.task])
+            )
+            _retry_recovery_tasks[flight] = task
+            task.add_done_callback(
+                lambda completed_task: _evict_retry_recovery_task(flight, completed_task)
+            )
+    return await asyncio.shield(task)
 
 
 class _RunnerNotBoundError(OmnigentError):
@@ -1401,9 +1286,6 @@ def register_events_routes(
           the normal message-dispatch relaunch path.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
-        - ``"wake_session"`` reconnects or relaunches it like
-          ``"retry_session"`` but resumes no interrupted turn and retries
-          no startup input.
         - ``"message"`` on an ``omnigent claude`` terminal session
           is forwarded to the bound runner for tmux injection only;
           the accepted prompt is persisted later when Claude records
@@ -1613,7 +1495,6 @@ def register_events_routes(
             _SLASH_COMMAND_TYPE,
             _STOP_SESSION_TYPE,
             _RETRY_SESSION_TYPE,
-            _WAKE_SESSION_TYPE,
             _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
             _EXTERNAL_CONVERSATION_ITEM_TYPE,
             _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
@@ -1726,7 +1607,7 @@ def register_events_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
         if (
-            body.type in (_RETRY_SESSION_TYPE, _WAKE_SESSION_TYPE)
+            body.type == _RETRY_SESSION_TYPE
             or (body.type == "message" and body.data.get("role") == "user")
         ) and await _codex_side_chat_fork_lost(
             conv,
@@ -1742,10 +1623,8 @@ def register_events_routes(
                 "This side chat ended when its runner restarted and can't be continued.",
                 code=ErrorCode.CONFLICT,
             )
-        if body.type in (_RETRY_SESSION_TYPE, _WAKE_SESSION_TYPE):
+        if body.type == _RETRY_SESSION_TYPE:
             startup = getattr(request.app.state, "startup_inputs", None)
-            # A passive wake (e.g. opening Files) must not start agent work.
-            wake_only = body.type == _WAKE_SESSION_TYPE
             result = await _retry_session_single_flight(
                 request=cast("Request", request),
                 session_id=session_id,
@@ -1754,9 +1633,8 @@ def register_events_routes(
                 runner_router=runner_router,
                 user_id=user_id,
                 permission_store=permission_store,
-                wake_only=wake_only,
             )
-            if not wake_only and startup is not None and await startup.retry(session_id):
+            if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
                 return {**result, "queued": True}
@@ -3824,21 +3702,8 @@ def register_events_routes(
         initializer = getattr(request.app.state, "runner_session_initializer", None)
         # Codex child turns run on a thread in the parent's app-server, not their own session.
         codex_child_turn = body.type == "message" and _codex_side_chat_thread_id(conv) is not None
-        from omnigent.server.child_session_recovery import (
-            clear_skipped_resume,
-            reconnect_recovery_deferred,
-            skipped_resume_runner,
-        )
-
-        # A wake-only retry left this runner's handshake and child restoration to this input.
-        woken_without_resume = conv.runner_id is not None and (
-            skipped_resume_runner(session_id) == conv.runner_id
-            or reconnect_recovery_deferred(conv)
-        )
-        keep_reconnect_deferral = False
         if not codex_child_turn and (
             _runner_needs_session_init
-            or woken_without_resume
             or (
                 conv.runner_id is not None
                 and _is_native_terminal_session(conv)
@@ -3858,14 +3723,6 @@ def register_events_routes(
                 suppress_recovery_turn=True,
                 trigger="web_message",
             )
-            # A best-effort handshake that failed leaves that work owed to the next input.
-            keep_reconnect_deferral = (
-                woken_without_resume
-                and initializer is not None
-                and not initializer.is_initialized(conv, runner_client)
-            )
-            if woken_without_resume and not keep_reconnect_deferral:
-                clear_skipped_resume(session_id)
         await _ensure_runner_relay_ready(
             session_id,
             conv.runner_id,
@@ -3991,7 +3848,6 @@ def register_events_routes(
             # one; absent, the dispatch forwards as before.
             host_registry=getattr(request.app.state, "host_registry", None),
             startup_input=request if isinstance(request, StartupInputContext) else None,
-            keep_reconnect_deferral=keep_reconnect_deferral,
         )
         if pending_background_title is not None:
             pending_background_title.schedule(expected_seed_title=conv.title)

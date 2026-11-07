@@ -191,9 +191,6 @@ def family_pinned_label_key(user_id: str | None) -> str:
     """Derive the caller's family pin key within the label column's length limit."""
     return _scoped_pin_key(FAMILY_PIN_LABEL_PREFIX, user_id)
 
-# Set while a wake-only retry holds runner-connect recovery of the session's tree.
-RECONNECT_RECOVERY_HELD_LABEL_KEY = "omnigent.reconnect_recovery_held"
-
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -222,7 +219,6 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
         "omnigent.last_context_tokens",
         "omnigent.last_context_window",
         "omnigent.startup",
-        RECONNECT_RECOVERY_HELD_LABEL_KEY,
         CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     }
 )

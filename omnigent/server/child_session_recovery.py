@@ -4,34 +4,23 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 from weakref import WeakValueDictionary
 
-import cachetools
 import httpx
 
-from omnigent.db.workspace_cache import WorkspaceScopedCache, WorkspaceScopedSet
-from omnigent.entities import Conversation, PagedList
-from omnigent.errors import restart_on_stale_cursor
+from omnigent.db.workspace_cache import WorkspaceScopedCache
+from omnigent.entities import Conversation
 from omnigent.harness_plugins import native_agents
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.runner.launch_failure import RUNNER_PROCESS_CRASH
 from omnigent.server.runner_session_init import RunnerSessionInitializer, is_session_agent_removed
-from omnigent.stores.conversation_store import (
-    RECONNECT_RECOVERY_HELD_LABEL_KEY,
-    ConversationNotFoundError,
-    ConversationStore,
-)
+from omnigent.stores.conversation_store import ConversationNotFoundError, ConversationStore
 from omnigent.util.session_lifecycle import is_session_closed
 
 _logger = logging.getLogger(__name__)
 RECOVERY_STORE_CONCURRENCY = 8
-# A release reads the session and its ancestors within the routing-host lookup budget.
-_RELEASE_MAX_READS = 16
-# A deeper lineage is finished from spawn-tree pages of at most this many rows.
-_RELEASE_SPAWN_TREE_PAGE = 2000
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScopedCache(
@@ -41,182 +30,6 @@ _child_recovery_locks: WorkspaceScopedCache[str, asyncio.Lock] = WorkspaceScoped
 _restoration_tasks: WorkspaceScopedCache[tuple[str, str, int], asyncio.Task[None]] = (
     WorkspaceScopedCache()
 )
-
-
-_wake_only_retries: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
-# Sessions given work while a wake-only retry was running, whose later hold must not stay.
-_released_during_wake: WorkspaceScopedSet[str] = WorkspaceScopedSet()
-# Session -> runner a wake brought up without resuming its interrupted turn.
-_skipped_resumes: WorkspaceScopedCache[str, str] = WorkspaceScopedCache(
-    lambda: cachetools.LRUCache(maxsize=4096)
-)
-
-
-@contextmanager
-def defer_reconnect_recovery(session_id: str) -> Iterator[None]:
-    """Keep runner-connect recovery of *session_id*'s tree off during a wake-only retry."""
-    _wake_only_retries[session_id] = _wake_only_retries.get(session_id, 0) + 1
-    try:
-        yield
-    finally:
-        remaining = _wake_only_retries.get(session_id, 1) - 1
-        if remaining > 0:
-            _wake_only_retries[session_id] = remaining
-        else:
-            _wake_only_retries.pop(session_id, None)
-            _released_during_wake.discard(session_id)
-
-
-async def hold_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
-    """Keep runner-connect recovery of *session_id*'s tree off until requested work starts.
-
-    The hold is persisted because the launched runner can connect after this server restarts.
-    """
-    await asyncio.to_thread(
-        store.set_labels, session_id, {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"}
-    )
-    if session_id in _released_during_wake:
-        # Work requested during this wake already released recovery.
-        await asyncio.to_thread(store.delete_label, session_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-
-
-async def _release_tree_holds(
-    root: Conversation,
-    store: ConversationStore,
-    *,
-    rows: dict[str, Conversation],
-    page: PagedList[Conversation] | None,
-    released: set[str],
-) -> None:
-    """End the holds of sessions whose runner-connect recovery runs through *root*.
-
-    Runner connect fences a whole independent tree on any held member, so
-    work given to the tree's root must release its descendants too. *rows*
-    and *page* carry spawn-tree pages already read, so reading resumes after
-    them; *released* lists sessions whose holds are already gone.
-    """
-    while page is None or page.has_more:
-        page = await asyncio.to_thread(
-            store.list_conversations,
-            limit=_RELEASE_SPAWN_TREE_PAGE,
-            after=page.last_id if page is not None else None,
-            kind=None,
-            include_archived=True,
-            root_conversation_id=root.root_conversation_id or root.id,
-            order="asc",
-            sort_by="id",
-        )
-        rows.update((row.id, row) for row in page.data)
-
-    def recovered_through_root(row: Conversation) -> bool:
-        # Mirrors runner connect: hostless children on their parent's runner, and
-        # parent-owned sub-agents, recover with the parent's tree.
-        seen: set[str] = set()
-        while row.id != root.id:
-            if row.id in seen or row.runner_id != root.runner_id:
-                return False
-            seen.add(row.id)
-            parent = rows.get(row.parent_conversation_id or "")
-            if parent is None or not (
-                is_parent_owned_subagent(row)
-                or (row.host_id is None and parent.runner_id == row.runner_id)
-            ):
-                return False
-            row = parent
-        return True
-
-    for row in rows.values():
-        if (
-            row.id not in released
-            and row.id != root.id
-            and RECONNECT_RECOVERY_HELD_LABEL_KEY in row.labels
-            and recovered_through_root(row)
-        ):
-            await asyncio.to_thread(store.delete_label, row.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-
-
-@restart_on_stale_cursor
-async def release_reconnect_recovery(session_id: str, store: ConversationStore) -> None:
-    """When *session_id* is given work, end its hold and those of ancestors that recover it.
-
-    A held tree root also releases its held descendants, which runner connect
-    treats as holding the whole tree.
-    """
-    seen: set[str] = set()
-    child: Conversation | None = None
-    next_id: str | None = session_id
-    spawn_tree: dict[str, Conversation] = {}
-    page: PagedList[Conversation] | None = None
-    # A held top-of-tree keeps its hold until its descendants are released, so
-    # a restarted release (stale cursor) still knows the tree's holds are owed.
-    root_hold: str | None = None
-
-    async def release_hold(conv_id: str) -> None:
-        await asyncio.to_thread(store.delete_label, conv_id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
-
-    while next_id is not None and next_id not in seen:
-        if child is None or len(seen) < _RELEASE_MAX_READS:
-            conv = await asyncio.to_thread(store.get_conversation, next_id)
-        else:
-            # Pages follow the tree's id index, so read on until the ancestor or the tree ends.
-            while next_id not in spawn_tree and (page is None or page.has_more):
-                page = await asyncio.to_thread(
-                    store.list_conversations,
-                    limit=_RELEASE_SPAWN_TREE_PAGE,
-                    after=page.last_id if page is not None else None,
-                    kind=None,
-                    include_archived=True,
-                    root_conversation_id=child.root_conversation_id,
-                    order="asc",
-                    sort_by="id",
-                )
-                spawn_tree.update((row.id, row) for row in page.data)
-            conv = spawn_tree.get(next_id)
-        if conv is None or (child is not None and conv.runner_id != child.runner_id):
-            break
-        # The session below wasn't the top of the tree after all.
-        if root_hold is not None:
-            await release_hold(root_hold)
-            root_hold = None
-        wake_running = conv.id in _wake_only_retries
-        if wake_running:
-            _released_during_wake.add(conv.id)
-        held = RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels
-        seen.add(conv.id)
-        child = conv
-        # A running wake can land its hold after the read above.
-        if held:
-            root_hold = conv.id
-        elif wake_running:
-            await release_hold(conv.id)
-        # As on runner connect, a hosted child recovers as its own tree.
-        if conv.host_id is not None and not is_parent_owned_subagent(conv):
-            break
-        next_id = conv.parent_conversation_id
-    # `child` is the top of the recovery tree; release its descendants, then it.
-    if child is not None and root_hold is not None:
-        await _release_tree_holds(child, store, rows=spawn_tree, page=page, released=seen)
-        await release_hold(root_hold)
-
-
-def reconnect_recovery_deferred(conv: Conversation) -> bool:
-    """Whether a wake-only retry of *conv* is running or launched a runner."""
-    return conv.id in _wake_only_retries or RECONNECT_RECOVERY_HELD_LABEL_KEY in conv.labels
-
-
-def note_skipped_resume(session_id: str, runner_id: str) -> None:
-    """Record that *runner_id* came up for a wake of *session_id* without resuming its turn."""
-    _skipped_resumes[session_id] = runner_id
-
-
-def skipped_resume_runner(session_id: str) -> str | None:
-    """The runner that still owes *session_id* the resume a wake skipped."""
-    return _skipped_resumes.get(session_id)
-
-
-def clear_skipped_resume(session_id: str) -> None:
-    """Forget *session_id*'s skipped resume once a plain retry or reconnect recovery runs it."""
-    _skipped_resumes.pop(session_id, None)
 
 
 def schedule_child_restoration(
@@ -366,10 +179,6 @@ async def restore_active_children(
     if initializer.generation_for(runner_id, client) != generation:
         _logger.info("Stopped restoring children of %s: runner tunnel changed", parent.id)
         return
-    # A woken child no longer holds back recovery of the tree restored here.
-    for row in tree.values():
-        if RECONNECT_RECOVERY_HELD_LABEL_KEY in row.labels:
-            await store_call(store.delete_label, row.id, RECONNECT_RECOVERY_HELD_LABEL_KEY)
     active = {row.id for row in tree.values() if row.id != parent.id and _interrupted(row)}
     needed = set(active)
     for row in reversed(list(tree.values())):

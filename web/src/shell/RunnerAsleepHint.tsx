@@ -1,5 +1,4 @@
 import { CloudOffIcon, PauseCircleIcon } from "lucide-react";
-import { Spinner } from "@/components/ui/spinner";
 
 /**
  * Shown in a workspace panel when the session's runner is bound but not
@@ -12,29 +11,8 @@ import { Spinner } from "@/components/ui/spinner";
  * `sandboxOffline`: the session's managed sandbox itself is down (stopped
  * while idle, for example), not just its runner. "The agent is asleep"
  * misreads that, so name the sandbox; a message starts it again.
- * `waking`: a wake of that sandbox is in flight, so say it is starting.
  */
-export function RunnerAsleepHint({
-  sandboxOffline = false,
-  waking = false,
-}: {
-  sandboxOffline?: boolean;
-  waking?: boolean;
-}) {
-  if (sandboxOffline && waking) {
-    return (
-      <div
-        role="status"
-        className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-sm"
-      >
-        <span className="flex items-center gap-1.5 font-medium text-foreground">
-          <Spinner aria-hidden className="size-3.5 shrink-0" />
-          Starting sandbox…
-        </span>
-        <span>Files will load when it's back online.</span>
-      </div>
-    );
-  }
+export function RunnerAsleepHint({ sandboxOffline = false }: { sandboxOffline?: boolean }) {
   const Icon = sandboxOffline ? CloudOffIcon : PauseCircleIcon;
   return (
     <div className="flex flex-col items-start gap-1 px-2 py-1.5 text-muted-foreground text-sm">

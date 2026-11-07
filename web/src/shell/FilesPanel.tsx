@@ -16,7 +16,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { isOwnerLevel } from "@/lib/permissionsApi";
-import { useSandboxWake, useSandboxWakeWhenOpened } from "@/hooks/useSandboxAutoWake";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -82,18 +81,6 @@ interface FilesPanelProps {
    * split layout rather than a drawer.
    */
   frameless?: boolean;
-  /**
-   * Whether the panel is visible to the user. A hidden pre-mounted panel
-   * (behind a file tab, a collapsed rail) must not wake an asleep sandbox.
-   * Default true.
-   */
-  active?: boolean;
-  /**
-   * Whether the panel turning visible counts as the user opening it, and so
-   * wakes an asleep sandbox. False where visibility follows something else
-   * (a grid cell being selected). Default true.
-   */
-  wakeWhenShown?: boolean;
 }
 
 interface QueryStatus {
@@ -286,8 +273,6 @@ export function FilesPanel({
   onSortChange,
   onClose,
   frameless,
-  active = true,
-  wakeWhenShown = true,
 }: FilesPanelProps) {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const conversationId = sessionId ?? routeId;
@@ -520,13 +505,6 @@ export function FilesPanel({
   // lists can't load. Say so rather than "No files in workspace"; a list
   // cached before it slept still renders.
   const showAsleepHint = sandboxAsleep && !dataReady;
-  // Opening the panel (not arriving at a session with it already open) starts
-  // an asleep sandbox so its files load without a chat message. The
-  // full-screen drawer (`onClose`) mounts only when the user opens it.
-  const sandboxWake = useSandboxWake(conversationId);
-  useSandboxWakeWhenOpened(wakeWhenShown && active, conversationId, sandboxWake.wakeIfAsleep, {
-    mountIsOpen: onClose !== undefined,
-  });
 
   return (
     <div
@@ -717,7 +695,7 @@ export function FilesPanel({
         )}
         onScroll={handleScroll}
       >
-        {showAsleepHint && <RunnerAsleepHint sandboxOffline waking={sandboxWake.waking} />}
+        {showAsleepHint && <RunnerAsleepHint sandboxOffline />}
         {!showAsleepHint && flatView && (
           <FlatFileList
             files={changedQuery.data?.data}

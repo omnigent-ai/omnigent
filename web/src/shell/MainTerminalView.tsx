@@ -28,7 +28,6 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
-import { endPassiveSandboxWake, useSandboxPassivelyWoken } from "@/hooks/useSandboxAutoWake";
 import { usePaneCycleHotkey } from "@/hooks/usePaneCycleHotkey";
 import {
   reconcileTerminalSplit,
@@ -123,9 +122,6 @@ export function MainTerminalView({
   const resumeError = resumeState.conversationId === conversationId ? resumeState.error : null;
   const [resumeGeneration, setResumeGeneration] = useState(0);
   const recoveryRef = useRef({ conversationId, attempted: false, pending: false });
-  // A sandbox this page woke without a request for work stays that way: the
-  // stopped-terminal Resume button, not an automatic one, restarts the agent.
-  const passivelyWoken = useSandboxPassivelyWoken(conversationId);
   if (recoveryRef.current.conversationId !== conversationId) {
     recoveryRef.current = { conversationId, attempted: false, pending: false };
   }
@@ -245,7 +241,6 @@ export function MainTerminalView({
   const autoResumeAvailable =
     visible &&
     !readOnly &&
-    !passivelyWoken &&
     !isShellView &&
     hostOnline === true &&
     !terminalsLoading &&
@@ -253,9 +248,6 @@ export function MainTerminalView({
     resumeAvailable &&
     !recoveryRef.current.attempted;
   const agentHealthy = agentTerminal !== null && runnerOnline === true;
-  useEffect(() => {
-    if (agentHealthy) endPassiveSandboxWake(conversationId);
-  }, [agentHealthy, conversationId]);
   useEffect(() => {
     const recovery = recoveryRef.current;
     if (resumePending) return;

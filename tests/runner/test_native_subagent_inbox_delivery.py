@@ -27,7 +27,6 @@ from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app, subagent_work
 from omnigent.spec.types import AgentSpec, ExecutorSpec
-from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -726,102 +725,6 @@ async def test_runner_restart_recovers_undrained_terminal_child(
     request_count = len(server_client.requests)
     await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
     assert len(server_client.requests) == request_count
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("release", ["next-init", "parent-turn"])
-async def test_passive_init_queues_a_recovered_result_without_waking_the_parent(
-    _clean_subagent_registry: None,
-    release: str,
-) -> None:
-    """A passive init queues an undrained child result; the next interaction wakes for it."""
-    from omnigent.runner.session_init_protocol import (
-        SESSION_INIT_PAYLOAD_KEY,
-        SESSION_INIT_PROTOCOL_VERSION,
-        RunnerSessionInitEnvelope,
-        RunnerSessionInitSnapshot,
-    )
-
-    class _WakeRecordingServerClient(_RecoveryServerClient):
-        """Record parent wake notices alongside the recovery reads."""
-
-        def __init__(self) -> None:
-            super().__init__([_child_summary()])
-            self.wakes: list[dict[str, Any]] = []
-
-        async def post(self, url: str, **kwargs: Any) -> Any:
-            if url == f"/v1/sessions/{PARENT_SESSION_ID}/events":
-                self.wakes.append(kwargs["json"])
-            return await super().post(url, **kwargs)
-
-    def _init_body(*, hold_subagent_wakes: bool) -> dict[str, Any]:
-        envelope = RunnerSessionInitEnvelope(
-            protocol_version=SESSION_INIT_PROTOCOL_VERSION,
-            server_version="0.16.0",
-            session_id=PARENT_SESSION_ID,
-            agent_id="ag_orchestrator",
-            suppress_recovery_turn=True,
-            hold_subagent_wakes=hold_subagent_wakes,
-            snapshot=RunnerSessionInitSnapshot(created_at=1, updated_at=1),
-        )
-        return {
-            "session_id": PARENT_SESSION_ID,
-            "agent_id": "ag_orchestrator",
-            SESSION_INIT_PAYLOAD_KEY: envelope.model_dump(mode="json"),
-        }
-
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return AgentSpec(spec_version=1, name="orchestrator")
-
-    harness = _ScriptedHarnessClient(
-        [
-            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
-            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
-        ]
-    )
-    server_client = _WakeRecordingServerClient()
-    app = create_runner_app(
-        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=server_client,  # type: ignore[arg-type]
-    )
-    async with _runner_client(app) as client:
-        response = await client.post("/v1/sessions", json=_init_body(hold_subagent_wakes=True))
-        assert response.status_code == 201, response.text
-        for _ in range(20):
-            await asyncio.sleep(0)
-        inbox = subagent_work._session_inboxes_ref[PARENT_SESSION_ID]
-        assert inbox.qsize() == 1
-        assert server_client.wakes == []
-
-        if release == "next-init":
-            response = await client.post(
-                "/v1/sessions", json=_init_body(hold_subagent_wakes=False)
-            )
-            assert response.status_code == 201, response.text
-        else:
-            response = await client.post(
-                f"/v1/sessions/{PARENT_SESSION_ID}/events",
-                params={"stream": "true"},
-                json={
-                    "type": "message",
-                    "role": "user",
-                    "agent_id": "ag_orchestrator",
-                    "content": [{"type": "input_text", "text": "status?"}],
-                },
-            )
-            assert response.status_code == 200, response.text
-            _ = response.text
-        async with asyncio.timeout(budget(5)):
-            while not server_client.wakes:
-                await asyncio.sleep(0.01)
-        for _ in range(20):
-            await asyncio.sleep(0)
-
-    assert inbox.qsize() == 1
-    assert len(server_client.wakes) == 1
-    assert "sys_read_inbox" in server_client.wakes[0]["data"]["content"][0]["text"]
 
 
 @pytest.mark.asyncio

@@ -1599,14 +1599,6 @@ export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
 }
 
-/**
- * Reconnect or relaunch the runner only: no interrupted turn resumes and
- * failed startup inputs stay failed. Servers without `wake_session` reject it.
- */
-export function wakeSession(sessionId: string): Promise<PostEventResponse> {
-  return postEvent(sessionId, { type: "wake_session", data: {} });
-}
-
 // Multiple error cards can describe the same failed turn.
 const failedTurnContinuations = new Map<string, Promise<void>>();
 

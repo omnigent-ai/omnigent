@@ -5998,7 +5998,6 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
-    restore_children: bool = True,
     trigger: str = "session_ensure",
 ) -> bool:
     """
@@ -6050,9 +6049,6 @@ async def _ensure_runner_session_initialized(
         finishes.
     :param require_success: Raise ``runner_unavailable`` when the handshake
         fails instead of using the message path's best-effort fallback.
-    :param restore_children: Restore interrupted descendants after a required
-        handshake. ``False`` leaves them, sub-agent results recovered during the
-        handshake, and the session's failed status for its next interaction.
     :returns: ``True`` when a current runner explicitly confirmed its native
         terminal is ready; ``False`` for legacy or non-native responses.
     """
@@ -6063,7 +6059,6 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
-                hold_subagent_wakes=not restore_children,
                 trigger=trigger,
             )
         else:
@@ -6075,7 +6070,6 @@ async def _ensure_runner_session_initialized(
                     conv,
                     server_version=VERSION,
                     suppress_recovery_turn=suppress_recovery_turn,
-                    hold_subagent_wakes=not restore_children,
                 ),
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
             )
@@ -6115,8 +6109,7 @@ async def _ensure_runner_session_initialized(
             ) from exc
         return False
 
-    if restore_children:
-        await _publish_runner_recovered_status(session_id, conversation_store)
+    await _publish_runner_recovered_status(session_id, conversation_store)
     from omnigent.server.child_session_recovery import (
         restore_active_children,
         schedule_child_restoration,
@@ -6130,8 +6123,7 @@ async def _ensure_runner_session_initialized(
             await _ensure_runner_relay_ready(
                 session_id, conv.runner_id, runner_client, conversation_store, conversation=conv
             )
-            if restore_children:
-                await restore_active_children(conv, runner_client, conversation_store, initializer)
+            await restore_active_children(conv, runner_client, conversation_store, initializer)
     try:
         payload = resp.json()
     except ValueError:
@@ -8189,7 +8181,6 @@ async def _dispatch_session_event_to_runner_impl(
     background_titles_enabled: bool = True,
     agent_revision: str | None = None,
     startup_input: StartupInputContext | None = None,
-    keep_reconnect_deferral: bool = False,
 ) -> _SessionEventDispatchResult:
     """
     Forward an item-event to the runner with harness-aware dispatch.
@@ -8265,8 +8256,6 @@ async def _dispatch_session_event_to_runner_impl(
         an older host row gets.
     :param agent_revision: The agent's effective bundle and selection revision, stamped on
         both native and non-native forwards to invalidate runner caches.
-    :param keep_reconnect_deferral: Keep a wake-only retry's hold because this
-        message's handshake failed, leaving child restoration to the next input.
     :returns: A :class:`_SessionEventDispatchResult` carrying the
         persisted item id (non-native) or the pending-input id
         (claude-native message bypass).
@@ -8274,11 +8263,7 @@ async def _dispatch_session_event_to_runner_impl(
     if runner_router is not None:
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
-        from omnigent.server.child_session_recovery import release_reconnect_recovery
-
         disconnect_outcome.note_user_turn(conv.id)
-        if not keep_reconnect_deferral:
-            await release_reconnect_recovery(conv.id, conversation_store)
     if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors

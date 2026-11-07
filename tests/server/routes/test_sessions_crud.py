@@ -867,16 +867,12 @@ async def test_list_sessions_pinned_filter(
 
 @pytest.mark.parametrize(
     "label_key",
-    [
-        "omnigent.git.worktree_root_sha256",
-        "omnigent.scheduled_task_worktree_source_sha256",
-        "omnigent.reconnect_recovery_held",
-    ],
+    ["omnigent.git.worktree_root_sha256", "omnigent.scheduled_task_worktree_source_sha256"],
 )
-async def test_patch_rejects_forged_server_owned_label(
+async def test_patch_rejects_forged_worktree_identity(
     client: httpx.AsyncClient, session_id: str, db_uri: str, label_key: str
 ) -> None:
-    """Cleanup identity and the reconnect-recovery hold stay server-owned after creation."""
+    """The cleanup identity must remain server-owned after creation."""
 
     response = await client.patch(
         f"/v1/sessions/{session_id}", json={"labels": {label_key: "forged"}}

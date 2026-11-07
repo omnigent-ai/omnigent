@@ -92,10 +92,6 @@ _STOP_SESSION_TYPE: str = "stop_session"
 _RETRY_SESSION_TYPE: str = "retry_session"
 
 
-# Reconnects like ``retry_session`` but resumes no work; older servers reject it.
-_WAKE_SESSION_TYPE: str = "wake_session"
-
-
 _EXTERNAL_ASSISTANT_MESSAGE_TYPE: str = "external_assistant_message"
 
 
@@ -584,7 +580,6 @@ CLIENT_SESSION_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.key
     _CLEAR_TYPE,
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
-    _WAKE_SESSION_TYPE,
     # The web posts this when the user closes its /btw side chat.
     _EXTERNAL_BTW_DISMISS_TYPE,
 }
@@ -1269,7 +1264,6 @@ __all__ = [
     "_TURN_ACTOR_LABEL",
     "_UI_ADDED_AGENT_TITLE_PREFIX",
     "_UPLOAD_READ_CHUNK_BYTES",
-    "_WAKE_SESSION_TYPE",
     "_WATCHER_TASKS",
     "_MirroredToolCall",
     "_PendingPolicyAskWrites",

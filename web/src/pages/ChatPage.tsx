@@ -79,12 +79,6 @@ import { usePromptHistory } from "@/hooks/usePromptHistory";
 import { useReplyDraft } from "@/hooks/useReplyDraft";
 import { useSessionModelLabel } from "@/hooks/useSessionModelLabel";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
-import {
-  endPassiveSandboxWake,
-  useSandboxWake,
-  useSandboxWakeOnSessionOpen,
-  useSandboxWakeWhenOpened,
-} from "@/hooks/useSandboxAutoWake";
 import { useFocusComposerHotkey } from "@/hooks/useFocusComposerHotkey";
 import { useTypeToComposer } from "@/hooks/useTypeToComposer";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
@@ -568,8 +562,6 @@ export function ChatPage() {
   // stays hidden until the first poll for this session resolves.
   const runnerOnline = useSessionRunnerOnline(sessionConvId);
   useRefreshSessionStateOnRunnerOnline(sessionConvId, runnerOnline);
-  // Opening a session (and staying on it) starts its asleep sandbox.
-  useSandboxWakeOnSessionOpen(sessionConvId);
   // OR'd into "Working…" so cross-client turns surface a shimmer.
   const sessionStatus = useChatStore((s) => s.sessionStatus);
   const backgroundTaskCount = useChatStore((s) => s.backgroundTaskCount);
@@ -1004,8 +996,6 @@ export function ChatPage() {
       if (!agentId) return;
       // No server session yet (still creating) — nothing to POST to.
       if (isTempConvId(urlConvId)) return;
-      // A message asks for work, so automatic recovery may run again.
-      endPassiveSandboxWake(urlConvId);
       // An unbound coding clone (fork-source label) needs a directory before
       // it can run: open the picker and stash this message to replay after
       // the bind. Pin the prompt to THIS session so it replays here, never
@@ -1634,9 +1624,6 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   // remains below it for offline sessions.
   const showTerminal = shouldShowTerminalSurface(conversationId, terminalFirst, runnerOnline);
   useMessageDeepLinkChatView(conversationId);
-  // Switching this session to its terminal view starts an asleep sandbox.
-  const { wakeIfAsleep: wakeSandboxForTerminal } = useSandboxWake(conversationId ?? undefined);
-  useSandboxWakeWhenOpened(showTerminal, conversationId ?? undefined, wakeSandboxForTerminal);
 
   // All hook calls below must run on every render regardless of
   // `showTerminal` — Rules of Hooks. The single return at the bottom
@@ -2611,9 +2598,6 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
-  // Clicking into or typing in the composer starts an asleep sandbox. Not focus:
-  // the composer focuses itself on every session switch.
-  const { wakeIfAsleep: wakeSandboxForComposer } = useSandboxWake(composerSessionId ?? undefined);
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
@@ -4033,7 +4017,6 @@ function ComposerImpl(
   };
 
   const handleTextChange = (id: string | null, e: ChangeEvent<HTMLTextAreaElement>) => {
-    wakeSandboxForComposer();
     slashCompletion.onSelectionChange(e.target);
     editText(id, e.target.value);
     dirtyRef.current = true;
@@ -4184,7 +4167,6 @@ function ComposerImpl(
           ref: bindTailTextarea,
           value: draft.text,
           onChange: (e) => handleTextChange(null, e),
-          onPointerDown: wakeSandboxForComposer,
           onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
           onFocus: (e) => {
             setInputFocused(true);
@@ -4253,7 +4235,6 @@ function ComposerImpl(
                 }}
                 inputFor={(quote) => ({
                   onChange: (e) => handleTextChange(quote.id, e),
-                  onPointerDown: wakeSandboxForComposer,
                   onFocus: (e) => handleTextFocus(quote.id, e.currentTarget),
                   onBlur: dismissMention,
                   onKeyDown: handleKeyDown,
@@ -5036,11 +5017,6 @@ function SessionHarnessPicker({
   );
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
-  // Opening the picker (click or hotkey) starts an asleep sandbox: its model
-  // list comes from the session's host.
-  const pickerSessionId = isTempConvId(conversationId) ? undefined : (conversationId ?? undefined);
-  const { wakeIfAsleep: wakeSandboxForPicker } = useSandboxWake(pickerSessionId);
-  useSandboxWakeWhenOpened(menuOpen, pickerSessionId, wakeSandboxForPicker);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
   const subAgentName = useChatStore((state) => state.subAgentName);
   const pendingModelChange = useChatStore((state) => state.pendingModelChange);

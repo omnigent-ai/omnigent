@@ -327,7 +327,7 @@ async def test_side_chat_recovery_errors_reach_both_routes(
     code: str,
     status: int,
 ) -> None:
-    """Message, Resume, and wake return recovery's redirect and ownership errors unchanged.
+    """Message and Resume return recovery's redirect and ownership errors unchanged.
 
     Neither route may consume the message or replace the error with the generic
     unavailable response.
@@ -358,11 +358,7 @@ async def test_side_chat_recovery_errors_reach_both_routes(
         "type": "message",
         "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
     }
-    # A hostless side chat also wakes through its source's recovery.
-    retry_events = [
-        {"type": event_type, "data": {}} for event_type in ("retry_session", "wake_session")
-    ]
-    for event in (message, *retry_events):
+    for event in (message, {"type": "retry_session", "data": {}}):
         response = await auth_client.post(
             f"/v1/sessions/{side.id}/events",
             json=event,
@@ -371,7 +367,7 @@ async def test_side_chat_recovery_errors_reach_both_routes(
         assert response.status_code == status, response.text
         assert response.json()["error"]["code"] == code, response.text
 
-    assert recover.await_count == 3
+    assert recover.await_count == 2
     assert store.list_items(side.id).data == []
 
 

@@ -70,7 +70,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
-import { useSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1393,7 +1392,6 @@ function WorkspacePanelImpl({
   // Resolve shell tab keys to display labels. The terminals list is already
   // fetched elsewhere for the session, so this shares the same query cache.
   const { terminals } = useTerminals(conversationId);
-  const { wakeIfAsleep: wakeSandboxForFiles } = useSandboxWake(conversationId ?? undefined);
   const terminalLabelFor = useCallback(
     (key: string) => {
       const t = terminals.find((term) => terminalTabKey(term) === key);
@@ -1416,8 +1414,6 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
-  // A phone hides the rail with CSS and shows its own drawer instead.
-  const railShown = !pending && open && !isMobile && (maximized || width > 0);
   const activePanelRef = useRef<HTMLButtonElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activePanelRef.current);
@@ -1458,9 +1454,6 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
-    // Choosing Files or Changes (click, hotkey) starts an asleep sandbox, even
-    // when the panel is already open on the other scope or mounts on this pick.
-    if (tab === "files" || tab === "changes") wakeSandboxForFiles();
     onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {
@@ -1975,7 +1968,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => selectPermanentTab(tab)}
+                        onClick={() => onRightRailTabChange(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -2219,10 +2212,6 @@ function WorkspacePanelImpl({
               <FilesPanel
                 conversationId={contained ? conversationId : undefined}
                 frameless
-                active={railShown && !inert && filesPanelActive}
-                // A grid cell shows its panel when the cell is selected, not
-                // when the user opens Files; there only a tab pick wakes.
-                wakeWhenShown={!contained}
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}

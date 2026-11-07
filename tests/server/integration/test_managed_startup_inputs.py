@@ -27,9 +27,8 @@ from omnigent.runtime import pending_inputs
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import parse_sandbox_config
-from omnigent.server.routes._sessions.common import _ALLOWED_EVENT_TYPES
 from omnigent.server.routes._sessions.helpers import _HostLaunchAttempt
-from omnigent.server.routes.sessions import routes_core, routes_events
+from omnigent.server.routes.sessions import routes_core
 from omnigent.server.scheduled.telemetry import scheduled_run_scope
 from omnigent.server.schemas import SessionEventInput
 from omnigent.server.startup_inputs import (
@@ -231,14 +230,12 @@ async def test_saved_input_survives_service_recreation_and_dispatches_once(
         await runner.aclose()
 
 
-@pytest.mark.parametrize("wake_supported", [True, False], ids=["wake", "wake-unsupported"])
 async def test_refused_delivery_retains_input_until_explicit_retry(
     startup_env: _Env,
     monkeypatch: pytest.MonkeyPatch,
     scheduled_run_context,
     caplog,
     debug_log_rows,
-    wake_supported: bool,
 ) -> None:
     caplog.set_level(logging.INFO)
     env = startup_env
@@ -300,27 +297,6 @@ async def test_refused_delivery_retains_input_until_explicit_retry(
         assert snapshot["pending_inputs"] == []
         denied = False
         env.conv_store.set_runner_id(session_id, uuid4().hex)
-        recover = AsyncMock(wraps=routes_events._retry_session_single_flight)
-        monkeypatch.setattr(routes_events, "_retry_session_single_flight", recover)
-        if not wake_supported:
-            # A server that predates the event, as a client can reach mid-rollout.
-            monkeypatch.setattr(
-                routes_events, "_ALLOWED_EVENT_TYPES", _ALLOWED_EVENT_TYPES - {"wake_session"}
-            )
-        woken = await env.client.post(
-            f"/v1/sessions/{session_id}/events", json={"type": "wake_session", "data": {}}
-        )
-        if wake_supported:
-            assert woken.status_code == 202, woken.text
-            assert woken.json()["queued"] is False
-        else:
-            assert woken.status_code == 400, woken.text
-            assert woken.json()["error"]["code"] == "invalid_input"
-            # The web client recognizes an older server by this message prefix.
-            assert woken.json()["error"]["message"].startswith("Unknown event type")
-        assert recover.await_count == int(wake_supported)
-        assert env.conv_store.list_pending_inputs(session_id)[0].status == "failed"
-        assert not [event for event in forwarded if event.get("type") == "message"]
         retried = await env.client.post(
             f"/v1/sessions/{session_id}/events", json={"type": "retry_session"}
         )

@@ -28,11 +28,9 @@ import {
   openSessionStream,
   postEvent,
   continueFailedTurn,
-  retrySession,
   SESSION_HISTORY_PAGE_SIZE,
   stopSession,
   updateSession,
-  wakeSession,
 } from "./sessionsApi";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "./backgroundSessionTitlesPreferences";
 import { getSessionHost, setSessionHost } from "./sessionHost";
@@ -1801,21 +1799,6 @@ describe("stopSession", () => {
     expect(url).toBe("/v1/sessions/conv_abc/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "stop_session", data: {} });
     expect(out.queued).toBe(false);
-  });
-});
-
-describe("retrySession and wakeSession", () => {
-  it.each([
-    ["retry_session", retrySession],
-    ["wake_session", wakeSession],
-  ] as const)("posts %s with empty data", async (type, post) => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ queued: false, recovered: true }));
-
-    await post("conv_abc");
-
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("/v1/sessions/conv_abc/events");
-    expect(JSON.parse(init.body as string)).toEqual({ type, data: {} });
   });
 });
 
