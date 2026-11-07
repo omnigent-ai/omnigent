@@ -115,7 +115,9 @@ struct DatabricksSessionClient: DatabricksSessionCreating {
           throw CancellationError()
         }
         if let error = error as? DatabricksSessionError { throw error }
-        throw DatabricksSessionError.networkUnavailable
+        let failure = DatabricksTransportFailure(error)
+        NSLog("[omnigent] Databricks session request failed: \(failure)")
+        throw DatabricksSessionError.networkUnavailable(failure)
       }
       try Task.checkCancellation()
       let received = try Self.cookies(from: response)
@@ -251,7 +253,7 @@ struct DatabricksSessionClient: DatabricksSessionCreating {
 enum DatabricksSessionError: Error, Equatable, LocalizedError {
   case invalidResponse, unsafeRedirect, workspaceChanged, unsafeCookie, missingCookie,
     unexpectedLanding
-  case networkUnavailable
+  case networkUnavailable(DatabricksTransportFailure)
   case rejected(Int)
   case cancelled, presentationUnavailable, credentialsChanged, workspaceRequired
   case reauthenticationRequired, recoveryExhausted, signOutIncomplete
@@ -265,7 +267,7 @@ enum DatabricksSessionError: Error, Equatable, LocalizedError {
       "Databricks returned a session cookie with an unsupported scope or security attributes."
     case .missingCookie: "Databricks did not create a session cookie for this workspace."
     case .unexpectedLanding: "Databricks did not finish loading the workspace session."
-    case .networkUnavailable: "Could not reach Databricks. Please try again."
+    case .networkUnavailable(let failure): failure.message
     case .rejected(let status): "Databricks rejected session creation (HTTP \(status))."
     case .reauthenticationRequired: "Your workspace session expired. Sign in again to continue."
     case .recoveryExhausted: "The workspace session could not be restored. Reconnect to try again."
