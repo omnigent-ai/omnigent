@@ -513,17 +513,34 @@ def test_launch_pick_missing_from_the_sandbox_resets_to_default(
     """A launch model the sandbox lacks is replaced by the default, with a notice."""
     chat = chat_session_contract
     _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
-    chat.update_session(model_override="gateway/sonnet", reasoning_effort="high")
+    _serve_landing_beside_sandbox(chat)
+    creates: list[dict] = []
 
-    page.goto(chat.url)
-    chat.wait_for_stream()
-    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
-        "Provisioning sandbox"
-    )
-    _open_models(page)
-    launch_pick = page.locator('[data-model-id="gateway/sonnet"]')
-    expect(launch_pick).to_have_attribute("aria-checked", "true")
+    def create(request: Request) -> dict[str, str]:
+        body = request.post_data_json
+        creates.append(body)
+        chat.update_session(
+            model_override=body.get("model_override"),
+            reasoning_effort=body.get("reasoning_effort"),
+        )
+        return {"id": chat.session_id}
+
+    chat.contract.json("/v1/sessions", create, method="POST")
+
+    page.goto(chat.base_url)
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=20_000)
+    _open_landing_models(page, chat.agent_id)
+    page.get_by_test_id("new-chat-landing-agent-model-gateway/sonnet").click()
     page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+    page.get_by_test_id("new-chat-landing-input").fill("summarize the repo")
+    page.get_by_test_id("new-chat-landing-submit").click()
+
+    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
+        "Provisioning sandbox", timeout=20_000
+    )
+    assert [body.get("model_override") for body in creates] == ["gateway/sonnet"]
+    chat.wait_for_stream()
     _deliver_session_catalog(chat)
 
     expect(
@@ -531,12 +548,12 @@ def test_launch_pick_missing_from_the_sandbox_resets_to_default(
             "gateway/sonnet isn't available in this sandbox. Using the default model."
         )
     ).to_be_visible()
-    # "default" is the clear alias; Claude Code offers High for every model, so effort stays.
+    # "default" is the clear alias; Claude Code's effort ladder fits every model.
     assert chat.session_patches == [{"model_override": "default"}]
     _open_models(page)
     expect(page.locator('[data-model-id="opus"]')).to_be_visible()
     # No off-catalog "(current)" row keeps the unavailable pick alive.
-    expect(launch_pick).to_have_count(0)
+    expect(page.locator('[data-model-id="gateway/sonnet"]')).to_have_count(0)
 
 
 @pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])

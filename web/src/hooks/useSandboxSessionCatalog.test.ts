@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IdentityModule from "@/lib/identity";
 import { getCurrentUserId } from "@/lib/identity";
 import { readModelCatalogCache, sandboxSessionCatalogKey } from "@/lib/modelCatalogCache";
-import type { NativeModelOption, SandboxStatus } from "@/lib/types";
+import { markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
+import type { NativeModelOption } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import {
   launchSelectionNotice,
@@ -103,18 +104,21 @@ describe("sandbox session catalog hooks", () => {
     vi.clearAllMocks();
   });
 
-  function renderCheck(harness = "codex-native") {
+  const claudeModels: NativeModelOption[] = [{ id: "opus", displayName: "Opus" }];
+
+  function renderCheck(harness = "codex-native", { launched = true, enabled = true } = {}) {
+    if (launched) markSandboxLaunch(sessionId);
     return renderHook(
-      ({ status, models }: { status: SandboxStatus | null; models: NativeModelOption[] }) =>
-        useSandboxLaunchSelectionCheck(sessionId, status, harness, models),
-      { initialProps: { status: { stage: "provisioning", provider: "arclet" }, models: [] } },
+      ({ models }: { models: NativeModelOption[] }) =>
+        useSandboxLaunchSelectionCheck(sessionId, harness, models, enabled),
+      { initialProps: { models: [] as NativeModelOption[] } },
     );
   }
 
   it("resets unavailable launch choices once the launched session reports its catalog", async () => {
     const { rerender } = renderCheck();
     expect(setModel).not.toHaveBeenCalled();
-    rerender({ status: null, models: codexModels });
+    rerender({ models: codexModels });
     await waitFor(() =>
       expect(toast.info).toHaveBeenCalledWith(
         "gpt-5 isn't available in this sandbox. Using the default model.",
@@ -123,8 +127,29 @@ describe("sandbox session catalog hooks", () => {
     expect(setModel).toHaveBeenCalledWith(null);
     expect(setEffort).not.toHaveBeenCalled();
     // Later catalog refreshes do not recheck the user's in-session choices.
-    rerender({ status: null, models: [...codexModels] });
+    rerender({ models: [...codexModels] });
     expect(setModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an effort picked while the model reset is pending", async () => {
+    let finishModelReset = () => {};
+    setModel.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishModelReset = resolve;
+        }),
+    );
+    const { rerender } = renderCheck("claude-native");
+    rerender({ models: claudeModels });
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(null));
+    act(() => useChatStore.setState({ sessionReasoningEffort: "high" }));
+    await act(async () => finishModelReset());
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith(
+        "gpt-5 isn't available in this sandbox. Using the default model.",
+      ),
+    );
+    expect(setEffort).not.toHaveBeenCalled();
   });
 
   it("finishes an effort reset when the user returns to the session", async () => {
@@ -133,13 +158,12 @@ describe("sandbox session catalog hooks", () => {
       useChatStore.setState({ conversationId: "conv_other" });
     });
     const { rerender } = renderCheck("claude-native");
-    const claudeModels = [{ id: "opus", displayName: "Opus" }];
-    rerender({ status: null, models: claudeModels });
+    rerender({ models: claudeModels });
     await waitFor(() => expect(setModel).toHaveBeenCalledWith(null));
     expect(setEffort).not.toHaveBeenCalled();
     expect(toast.info).not.toHaveBeenCalled();
     act(() => useChatStore.setState({ conversationId: sessionId }));
-    rerender({ status: null, models: claudeModels });
+    rerender({ models: claudeModels });
     await waitFor(() =>
       expect(toast.info).toHaveBeenCalledWith(
         "Minimal effort isn't available for this model in this sandbox. Using the default effort.",
@@ -152,7 +176,7 @@ describe("sandbox session catalog hooks", () => {
   it("reports a reset the server refused", async () => {
     setModel.mockRejectedValueOnce(new Error("refused"));
     const { rerender } = renderCheck();
-    rerender({ status: null, models: codexModels });
+    rerender({ models: codexModels });
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(
         "Couldn't switch to the sandbox's default model settings.",
@@ -161,12 +185,11 @@ describe("sandbox session catalog hooks", () => {
     expect(toast.info).not.toHaveBeenCalled();
   });
 
-  it("leaves a session it never saw launching alone", () => {
-    const { rerender } = renderHook(
-      ({ models }: { models: NativeModelOption[] }) =>
-        useSandboxLaunchSelectionCheck(sessionId, null, "codex-native", models),
-      { initialProps: { models: [] as NativeModelOption[] } },
-    );
+  it.each([
+    ["a session this tab did not launch, such as one waking", { launched: false }],
+    ["a session with configured inference", { enabled: false }],
+  ])("leaves %s alone", (_label, options) => {
+    const { rerender } = renderCheck("codex-native", options);
     rerender({ models: codexModels });
     expect(setModel).not.toHaveBeenCalled();
     expect(toast.info).not.toHaveBeenCalled();

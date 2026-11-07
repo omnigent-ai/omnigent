@@ -312,6 +312,7 @@ import {
   useSandboxUnsupportedAgents,
 } from "@/hooks/useSandboxModelOptions";
 import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
+import { markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
 import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
@@ -6373,6 +6374,7 @@ function NewChatLandingContent({
         // New Chat is the only create path that can produce a managed sandbox;
         // interactionTelemetry completes/settles the span once the session runs.
         markSessionCreated(created.id, sandboxSelected ? "sandbox" : "computer");
+        if (sandboxSelected) markSandboxLaunch(created.id);
       }
       // Persist the configuration that actually launched. Modal Save updates
       // storage eagerly so an immediate Send cannot observe stale state; this

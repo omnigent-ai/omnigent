@@ -253,6 +253,7 @@ import {
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
+import { hasLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
 import { useSandboxLaunchSelectionCheck } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useRememberSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
@@ -959,13 +960,15 @@ export function ChatPage() {
     sessionSandboxProvider,
     sandboxPreviewHarness,
     sessionModelOptions,
-    sessionCatalogIsActive && !activeSession.inferenceConfigured,
+    sessionCatalogIsActive &&
+      !activeSession.inferenceConfigured &&
+      hasLiveSessionCatalog(activeSession.id),
   );
   useSandboxLaunchSelectionCheck(
     activeSession?.id ?? null,
-    sandboxStatus,
     sandboxPreviewHarness,
     sessionModelOptions,
+    sessionCatalogIsActive && !activeSession.inferenceConfigured,
   );
 
   // The session is unreachable and a message can't wake it: the host is
