@@ -28,7 +28,8 @@ the header menu), and each place is a separate entry point.
   old Pinned slot. Dragging a pinned row into a folder unpins it without one.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
-  row pins it into that slot.
+  row pins it above or below that row, by the half it's released over, and
+  releasing it just below the last pin pins it at the bottom.
 - `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
@@ -302,7 +303,8 @@ use Settings → Appearance → Sidebar.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
-that slot.
+that slot: the line marks whether it lands above or below the row. Release it
+just below the last pin to pin it at the bottom.
 
 **Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
@@ -653,8 +655,9 @@ plain `uv run pytest`, which starts a private server for the test.
   unpin a pinned session, click Undo on the toast, and expect it back in the
   same Pinned position.
 - **`pin-reorder`:**
-  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`.
-  Dropping an unpinned row onto a pinned row has web unit coverage only.
+  `tests/e2e_ui/sessions/test_sidebar_pin_unpin.py::test_drag_reorders_pinned_sessions`
+  also pins an unpinned row by releasing it just below the last pin. Dropping
+  an unpinned row onto either half of a pinned row has web unit coverage only.
 - **`custom-order`:**
   `tests/browser_ui/test_sessions_appearance.py::test_custom_order_keeps_the_list_and_commits_on_drop`
   (built SPA, mocked backend) covers the menu, the insertion line,

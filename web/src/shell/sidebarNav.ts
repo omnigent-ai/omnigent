@@ -465,13 +465,18 @@ export function dedupeConversationsById(conversations: readonly Conversation[]):
 // bottom. A missing/unparseable value sinks to the bottom, stably.
 export function orderByPinnedTimestamp(conversations: readonly Conversation[]): Conversation[] {
   const pinnedAt = (c: Conversation): number => {
-    const raw = isIndividuallyPinnedSibling(c)
-      ? c.labels[PINNED_LABEL_KEY]
-      : (c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY]);
-    const ms = raw ? Number(raw) : NaN;
+    const ms = pinnedSortValue(c);
     return Number.isFinite(ms) ? ms : Number.MAX_SAFE_INTEGER;
   };
   return [...conversations].sort((a, b) => pinnedAt(a) - pinnedAt(b));
+}
+
+// A pinned family member sorts by the family's pin time; NaN when there's no value.
+function pinnedSortValue(c: Conversation): number {
+  const raw = isIndividuallyPinnedSibling(c)
+    ? c.labels[PINNED_LABEL_KEY]
+    : (c.family?.pinned_at ?? c.labels?.[PINNED_LABEL_KEY]);
+  return raw ? Number(raw) : NaN;
 }
 
 /** A pin label rewrite: the new `omnigent.pinned` sort value for one session. */
@@ -492,21 +497,23 @@ export function isPinOrderUnit(conversation: Conversation): boolean {
 /**
  * The pin label writes that move `fromId` into `toId`'s slot of the (already
  * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
- * above `toId`. The label value is the list's sort key, so a move normally
- * rewrites only the moved session, to a value between its new neighbours. When
- * there's no room between them (equal or missing values), every pin is
- * renumbered from the lowest existing value (rows already at their new value
- * are skipped). Returns `[]` for a no-op.
+ * above `toId`, or just below it with `below`. The label value is the list's
+ * sort key, so a move normally rewrites only the moved session, to a value
+ * between its new neighbours. When there's no room between them (equal or
+ * missing values), every pin is renumbered from the lowest existing value (rows
+ * already at their new value are skipped). Returns `[]` for a no-op.
  */
 export function pinOrderWrites(
   rows: readonly Conversation[],
   fromId: string,
   toId: string,
+  below = false,
 ): PinOrderWrite[] {
   const pinned = rows.filter(isPinOrderUnit);
   const from = pinned.findIndex((c) => c.id === fromId);
-  const to = pinned.findIndex((c) => c.id === toId);
-  if (to < 0 || from === to) return [];
+  const target = pinned.findIndex((c) => c.id === toId);
+  if (target < 0 || from === target) return [];
+  const to = from < 0 && below ? target + 1 : target;
   const moved = [...pinned];
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
@@ -539,6 +546,20 @@ export function pinOrderWrites(
   return moved
     .map((c, index) => ({ id: c.id, pinnedAt: base + index }))
     .filter((w, index) => value(moved[index]) !== w.pinnedAt);
+}
+
+/**
+ * The pin label writes that put a not-yet-pinned `fromId` at the bottom of the
+ * (already pin-ordered) Pinned list: just past the highest value any shown row
+ * sorts by, including a family member shown without its representative. When a
+ * row has no value (it sorts last), the pins are renumbered after the last
+ * pin-order unit instead. Returns `[]` when there's no unit to renumber.
+ */
+export function appendPinWrites(rows: readonly Conversation[], fromId: string): PinOrderWrite[] {
+  const highest = Math.max(...rows.map(pinnedSortValue));
+  if (highest + 1 > highest) return [{ id: fromId, pinnedAt: highest + 1 }];
+  const lastUnit = rows.filter(isPinOrderUnit).at(-1);
+  return lastUnit ? pinOrderWrites(rows, fromId, lastUnit.id, true) : [];
 }
 
 // ── Drag-and-drop ────────────────────────────────────────────────────────────
