@@ -14,6 +14,7 @@ import type { SkillContent } from "@/hooks/useSkillContent";
 import type { HarnessInventory } from "@/hooks/useHarnessInventory";
 import { ApiError } from "@/lib/sessionsApi";
 import type { HarnessStartup, Host } from "@/hooks/useHosts";
+import { showToast } from "@/components/ui/toast";
 import { SettingsHarnessesSection } from "./SettingsHarnessesSection";
 
 let pluginMetadataRequested = false;
@@ -47,6 +48,7 @@ let mcpResult: {
     tools: { name: string; description: string | null }[];
     connection: string;
     truncated: boolean;
+    harness_sign_in?: "available" | "signed_in" | null;
   };
   error?: unknown;
   isPending: boolean;
@@ -60,7 +62,8 @@ let mcpResult: {
 };
 let mcpLookups: [string, string, string, string | undefined, boolean][] = [];
 let mcpSources: (string | undefined)[] = [];
-vi.mock("@/hooks/useMcpServerTools", () => ({
+vi.mock("@/hooks/useMcpServerTools", async (importActual) => ({
+  ...(await importActual()),
   useMcpServerTools: (
     host: string,
     harness: string,
@@ -206,6 +209,21 @@ vi.mock("./HarnessFixDialog", () => ({
   },
 }));
 
+const signInDialogProps = vi.fn();
+vi.mock("./McpSignInDialog", () => ({
+  McpSignInDialog: (props: { server: string; onSignedIn: () => void }) => {
+    signInDialogProps(props);
+    return (
+      <div data-testid="mcp-sign-in-dialog" data-server={props.server}>
+        <button type="button" onClick={props.onSignedIn}>
+          Finish MCP sign-in
+        </button>
+      </div>
+    );
+  },
+}));
+vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+
 function renderHarnesses(harness?: string, search = "") {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(
@@ -259,6 +277,8 @@ afterEach(() => {
   harnessInstall = true;
   databricksFeatures = true;
   fixDialogProps.mockReset();
+  signInDialogProps.mockClear();
+  vi.mocked(showToast).mockClear();
   startupCalls.mockClear();
   accountRefreshCalls.mockClear();
   startupData = STARTUP;
@@ -1292,6 +1312,95 @@ it.each([
   expect(status.firstElementChild).toHaveClass(color);
   expect(screen.getByText(detail)).toBeTruthy();
   expect(screen.queryByText(/· 0 tools/)).toBeNull();
+  // Without harness_sign_in (an older host), there is nothing to sign in with.
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
+});
+
+it("offers the harness sign-in for a server that needs it", () => {
+  hosts = [ONLINE];
+  mcpResult = {
+    data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },
+    isPending: false,
+  };
+  const queryClient = renderHarnesses("claude-native");
+  const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+  fireEvent.click(screen.getByTestId("catalog-row-linear"));
+  expect(screen.getByRole("status").textContent).toBe("Needs auth");
+  expect(screen.getByText("Sign in so Claude Code sessions can use this server.")).toBeTruthy();
+  expect(screen.queryByText(/Harness sign-in credentials cannot be reused/)).toBeNull();
+  expect(screen.queryByTestId("mcp-sign-in-dialog")).toBeNull();
+
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(signInDialogProps).toHaveBeenLastCalledWith(
+    expect.objectContaining({
+      open: true,
+      host: ONLINE,
+      harness: "claude",
+      harnessLabel: "Claude Code",
+      server: "linear",
+      serverLabel: "Linear",
+      plugin: "toolkit",
+    }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Finish MCP sign-in" }));
+  expect(screen.queryByTestId("mcp-sign-in-dialog")).toBeNull();
+  expect(showToast).toHaveBeenCalledWith("Signed in to Linear.");
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["mcp-tools", ONLINE.host_id, "claude", "linear", "toolkit", undefined],
+  });
+});
+
+it("signs in to the installed plugin MCP the user chose", () => {
+  hosts = [ONLINE];
+  mcpResult = {
+    data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "available" },
+    isPending: false,
+  };
+  inventory = {
+    ...INVENTORY,
+    context: {
+      ...INVENTORY.context,
+      plugins: ["notes", "toolkit"].map((name) => ({
+        id: name,
+        name,
+        harness: "claude",
+        marketplace: "market",
+        enabled: true,
+        skills: [],
+        mcp_servers: ["docs"],
+        mcp_entries: [{ id: `${name}-mcp`, name: "docs" }],
+      })),
+    },
+  };
+  const queryClient = renderHarnesses("claude-native");
+  const invalidate = vi.spyOn(queryClient, "invalidateQueries");
+  selectTab("Plugins · 2");
+  fireEvent.click(screen.getByTestId("catalog-row-toolkit"));
+  selectTab("MCPs · 1");
+  fireEvent.click(screen.getByTestId("catalog-row-docs"));
+  fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
+  expect(signInDialogProps).toHaveBeenLastCalledWith(
+    expect.objectContaining({ server: "docs", plugin: "toolkit", sourceId: "toolkit-mcp" }),
+  );
+  fireEvent.click(screen.getByRole("button", { name: "Finish MCP sign-in" }));
+  expect(invalidate).toHaveBeenCalledWith({
+    queryKey: ["mcp-tools", ONLINE.host_id, "claude", "docs", "toolkit", "toolkit-mcp"],
+  });
+});
+
+it("shows a server the harness already signed in to as signed in", () => {
+  hosts = [ONLINE];
+  mcpResult = {
+    data: { tools: [], connection: "needs_auth", truncated: false, harness_sign_in: "signed_in" },
+    isPending: false,
+  };
+  renderHarnesses("claude-native");
+  fireEvent.click(screen.getByTestId("catalog-row-github"));
+  const status = screen.getByRole("status");
+  expect(status.textContent).toBe("Signed in");
+  expect(status.firstElementChild).toHaveClass("bg-success");
+  expect(screen.getByText(/Signed in through Claude Code/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Sign in" })).toBeNull();
 });
 
 it.each([false, true])("uses installed MCP identity and honors enabled=%s", (enabled) => {

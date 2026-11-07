@@ -1,5 +1,10 @@
 import * as AccordionPrimitive from "radix-ui/accordion";
-import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
+import {
+  mcpServerToolsKey,
+  useMcpServerTools,
+  type McpServerTools,
+} from "@/hooks/useMcpServerTools";
+import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
@@ -7,7 +12,8 @@ import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { BrandHarness } from "@/components/onboarding/harnessBrand";
+import { harnessDisplayName, type BrandHarness } from "@/components/onboarding/harnessBrand";
+import { showToast } from "@/components/ui/toast";
 import type { Host } from "@/hooks/useHosts";
 import {
   INVENTORY_HARNESS_IDS,
@@ -21,6 +27,7 @@ import remarkGfm from "remark-gfm";
 import { useSkillContent } from "@/hooks/useSkillContent";
 import { ApiError } from "@/lib/sessionsApi";
 import { Spinner } from "../../components/ui/spinner";
+import { McpSignInDialog } from "./McpSignInDialog";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
@@ -545,6 +552,73 @@ const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; c
   unsupported: { label: "Failed to connect", color: "bg-destructive" },
 };
 
+const SIGNED_IN_STATUS = { label: "Signed in", color: "bg-success" };
+
+function isHarnessSignedIn(data: McpServerTools) {
+  return data.connection === "needs_auth" && data.harness_sign_in === "signed_in";
+}
+
+function mcpRowStatus(data: McpServerTools) {
+  if (isHarnessSignedIn(data)) return SIGNED_IN_STATUS;
+  return CONNECTION_STATUS[data.connection];
+}
+
+function McpServerDetails({
+  data,
+  harnessLabel,
+  onSignIn,
+}: {
+  data: McpServerTools;
+  harnessLabel: string;
+  onSignIn: () => void;
+}) {
+  if (isHarnessSignedIn(data)) {
+    return (
+      <Notice>
+        Signed in through {harnessLabel}, so its sessions can use this server. Omnigent can't list
+        the tools because it doesn't reuse {harnessLabel}'s credentials.
+      </Notice>
+    );
+  }
+  if (data.connection === "needs_auth" && data.harness_sign_in === "available") {
+    return (
+      <div className="my-1 flex flex-wrap items-center gap-3">
+        <Notice>Sign in so {harnessLabel} sessions can use this server.</Notice>
+        <Button size="sm" onClick={onSignIn}>
+          Sign in
+        </Button>
+      </div>
+    );
+  }
+  if (data.connection !== "connected")
+    return <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>;
+  return (
+    <>
+      {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
+      {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
+      <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
+        {data.tools.map((tool, index) => (
+          // Capped names can collide; these display-only rows have no state.
+          // eslint-disable-next-line react/no-array-index-key
+          <li key={`${tool.name}-${index}`}>
+            {tool.description ? (
+              <details className="group">
+                <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                  <span className="font-mono">{tool.name}</span>
+                  <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
+                </summary>
+                <div className="my-1">{tool.description}</div>
+              </details>
+            ) : (
+              <span className="pl-4 font-mono">{tool.name}</span>
+            )}
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
 function McpRow({
   host,
   server,
@@ -565,7 +639,11 @@ function McpRow({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   const data = query.data;
-  const status = data && CONNECTION_STATUS[data.connection];
+  const status = data && mcpRowStatus(data);
+  const queryClient = useQueryClient();
+  const [signingIn, setSigningIn] = useState(false);
+  const serverLabel = mcpServerDisplayName(server.name);
+  const harnessLabel = harnessDisplayName(server.harness);
   return (
     <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
       <AccordionPrimitive.Header className="flex">
@@ -575,9 +653,7 @@ function McpRow({
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
           <LetterAvatar name={server.name} />
-          <span className="shrink-0 font-medium text-foreground">
-            {mcpServerDisplayName(server.name)}
-          </span>
+          <span className="shrink-0 font-medium text-foreground">{serverLabel}</span>
           {data?.connection === "connected" && (
             <span className="shrink-0 text-muted-foreground">
               · {data.tools.length}
@@ -607,38 +683,42 @@ function McpRow({
               ? `Update ${host.name} to list tools.`
               : query.error instanceof ApiError && query.error.status === 503
                 ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
-                : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
+                : `Couldn't reach ${serverLabel}.`}
           </Notice>
         ) : data ? (
-          data.connection !== "connected" ? (
-            <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
-          ) : (
-            <>
-              {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
-              {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
-              <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
-                {data.tools.map((tool, index) => (
-                  // Capped names can collide; these display-only rows have no state.
-                  // eslint-disable-next-line react/no-array-index-key
-                  <li key={`${tool.name}-${index}`}>
-                    {tool.description ? (
-                      <details className="group">
-                        <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
-                          <span className="font-mono">{tool.name}</span>
-                          <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
-                        </summary>
-                        <div className="my-1">{tool.description}</div>
-                      </details>
-                    ) : (
-                      <span className="pl-4 font-mono">{tool.name}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </>
-          )
+          <McpServerDetails
+            data={data}
+            harnessLabel={harnessLabel}
+            onSignIn={() => setSigningIn(true)}
+          />
         ) : null}
       </AccordionPrimitive.Content>
+      {signingIn && (
+        <McpSignInDialog
+          open
+          onOpenChange={setSigningIn}
+          host={host}
+          harness={server.harness}
+          harnessLabel={harnessLabel}
+          server={server.name}
+          serverLabel={serverLabel}
+          plugin={server.plugin}
+          sourceId={server.sourceId}
+          onSignedIn={() => {
+            setSigningIn(false);
+            showToast(`Signed in to ${serverLabel}.`);
+            void queryClient.invalidateQueries({
+              queryKey: mcpServerToolsKey(
+                host.host_id,
+                server.harness,
+                server.name,
+                server.plugin,
+                server.sourceId,
+              ),
+            });
+          }}
+        />
+      )}
     </AccordionPrimitive.Item>
   );
 }

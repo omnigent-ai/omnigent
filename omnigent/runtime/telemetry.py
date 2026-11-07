@@ -158,6 +158,8 @@ _REDACT_KEY_SUBSTRINGS = (
     "credential",
     "api_key",
     "apikey",
+    # A pasted OAuth redirect carries the sign-in's one-time code.
+    "callback_url",
 )
 
 

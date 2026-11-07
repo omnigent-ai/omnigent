@@ -159,6 +159,15 @@ implements them separately, so a fix for one harness does not reach the others.
 
 - `mcp-tools`: expand a configured or plugin MCP server to probe its tools,
   with connected/auth/timeout/unreachable/unsupported and mixed-version states.
+- `mcp-sign-in`: a needs-auth Claude Code MCP server (standalone or plugin) or
+  Codex MCP server offers Sign in, which runs the harness CLI's `mcp login` on
+  the host and finishes through its loopback listener or a pasted redirect
+  address. CLIs without `mcp login --no-browser` (Codex 0.142), or whose flag
+  check fails, are supported: the host forwards a pasted redirect to their
+  listener and, on Linux, keeps them from opening a browser on the host. A
+  plugin installed from two marketplaces under one name offers no Sign in,
+  since the CLI can't tell the installs apart. Sign-in needs a POSIX host;
+  on Windows hosts these servers show Needs auth with no Sign in.
 
 - `plugin-inventory`: installed Claude plugins, including disabled and hook/command-only plugins, report metadata and bundled skills/MCPs in Settings → Harnesses.
 - `harness-settings-navigation`: Harnesses is always available in Settings and
@@ -274,6 +283,11 @@ select its namespaced suggestion. See the
 **MCP tools:** Settings → Harnesses → configured harness card (or gear),
 then MCP servers → expand a server, or Plugins → plugin → MCPs → expand.
 Probes run only on expansion.
+
+**MCP sign-in:** the same path to a needs-auth server → Sign in → Open sign-in
+page (or Copy sign-in link), approve, and return; or paste the redirect address
+and click Finish. A failed or expired attempt offers Try again; a server without
+the sign-in routes asks for a server update instead.
 
 **Harness settings navigation:** Settings sidebar → Harnesses, a direct link to
 `/settings/harnesses` or its harness detail pages, or the import review modal
@@ -1025,6 +1039,16 @@ Cross-harness journeys:
   skill rows. A 502/504 shows a generic failure. Bodies must be absent from
   the skills listing and host/server logs, with no other files or paths returned.
 
+- **`mcp-sign-in`:** run `tests/host/test_mcp_login.py`,
+  `tests/server/routes/test_mcp_tools.py`, and
+  `web/src/pages/settings/McpSignInDialog.test.tsx`. With the real `claude` and
+  `codex` CLIs installed, `tests/e2e_ui/settings/test_mcp_sign_in.py` signs in to
+  a local OAuth MCP server through a user server, a plugin server, and Codex's
+  paste path (run it with Codex 0.142 too, via `OMNIGENT_CODEX_PATH`). By hand,
+  check timeout, cancel, a rejected paste, an older
+  host (the row shows Needs auth with no Sign in button), and a switch to an
+  older server while the dialog is open (it asks for a server update).
+
 - **`mcp-tools`:** run `tests/host/test_mcp_tools.py`,
   `tests/server/routes/test_mcp_tools.py`, and the real-host test
   `tests/e2e/test_host_mcp_tools_e2e.py::test_host_mcp_tools` with plain pytest.
@@ -1035,8 +1059,9 @@ Cross-harness journeys:
   From both card and gear entry points, expand a standalone and a plugin server;
   verify the left chevron, immediate expansion, names, count and status dot.
   Collapsed rows must not send probes or start processes. Reopen within five
-  minutes to reuse results. Test an HTTP 401, a hanging stdio process and a
-  missing executable; expect auth, timeout and unreachable states.
+  minutes to reuse results; after 30 seconds, a needs-auth row re-checks the
+  harness sign-in but keeps its cached probe. Test an HTTP 401, a hanging stdio
+  process and a missing executable; expect auth, timeout and unreachable states.
   If both probe slots are occupied, an expired queued request reports that the
   host is busy; collapse and reopen after capacity frees to retry immediately.
   A 501 shows an update hint; inject a 404 from the tools route to retain plain

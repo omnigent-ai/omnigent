@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 import click
+import psutil
 import pytest
 from websockets.datastructures import Headers
 from websockets.exceptions import ConnectionClosedError, InvalidStatus, InvalidURI
@@ -71,6 +72,7 @@ from omnigent.host.frames import (
     HostLaunchRunnerResultFrame,
     HostListDirFrame,
     HostListDirResultFrame,
+    HostMcpLoginFrame,
     HostMcpServersFrame,
     HostMcpServersResultFrame,
     HostMcpToolsFrame,
@@ -3288,6 +3290,12 @@ async def test_incomplete_startup_discovery_is_reused_across_reconnects(
         lambda *, startup: asyncio.sleep(0, result={"codex-native": True}),
     )
     monkeypatch.setattr(host, "_probe_gateway_inference", _gateway)
+    closed_sign_ins: list[object] = []
+
+    async def close_sign_ins(owner: object | None = None) -> None:
+        closed_sign_ins.append(owner)
+
+    monkeypatch.setattr(host._mcp_logins, "close", close_sign_ins)
     first = _FakeTunnel()
     with pytest.raises(ConnectionError, match="test disconnect"):
         await host._serve_frames(first)  # type: ignore[arg-type]
@@ -3304,6 +3312,8 @@ async def test_incomplete_startup_discovery_is_reused_across_reconnects(
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference is None
     assert gateway_calls == 1
+    # Each closed tunnel stops the MCP sign-ins its web UI started.
+    assert closed_sign_ins == [first, second]
 
 
 @pytest.mark.parametrize(
@@ -4327,6 +4337,27 @@ def test_reap_orphans_never_steals_tracked_runner_exit_code(tmp_path: Path) -> N
     assert runner.poll() == 42, "reaper corrupted the tracked runner's exit code"
 
     runner.wait()
+
+
+@pytest.mark.posix_only
+def test_reap_orphans_leaves_mcp_sign_in_exit_codes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An MCP sign-in CLI's exit status belongs to its login manager."""
+    host = _make_host_process()
+    sign_in = subprocess.Popen([sys.executable, "-c", "exit(43)"])
+    try:
+        monkeypatch.setattr(host._mcp_logins, "pids", lambda: {sign_in.pid})
+        deadline = time.monotonic() + 5.0
+        while psutil.Process(sign_in.pid).status() != psutil.STATUS_ZOMBIE:
+            assert time.monotonic() < deadline, "sign-in CLI did not exit"
+            time.sleep(0.02)
+
+        host._reap_orphans_once()
+
+        assert sign_in.poll() == 43, "reaper took the MCP sign-in CLI's exit code"
+    finally:
+        if sign_in.poll() is None:
+            sign_in.kill()
+            sign_in.wait()
 
 
 def test_reaper_does_not_steal_host_owned_subprocess_exit_code(tmp_path: Path) -> None:
@@ -11729,6 +11760,101 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
         HostMcpToolsFrame("m", "claude", "unknown")
     )
     assert result.status == status
+    assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
+
+
+async def test_host_drives_mcp_login_over_the_tunnel(monkeypatch):
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+
+    server = ConfiguredMcpServer(
+        {"name": "docs", "harness": "claude", "transport": "http", "plugin": "toolkit"}, {}
+    )
+
+    async def find(harness, name, plugin, source_id):
+        if name == "gone":
+            raise LookupError(name)
+        assert (harness, name, plugin, source_id) == ("claude", "docs", "toolkit", None)
+        return server
+
+    started, handled = [], []
+
+    def login(login_id, state):
+        return {"login_id": login_id, "state": state, "authorization_url": None, "error": None}
+
+    async def start(self, configured, owner):
+        started.append((configured, owner))
+        return {**login("l1", "pending"), "authorization_url": "https://auth.example.test/a"}
+
+    async def submit(self, login_id, callback_url):
+        handled.append(("submit", login_id, callback_url))
+        return login(login_id, "pending")
+
+    async def cancel(self, login_id):
+        handled.append(("cancel", login_id))
+        return login(login_id, "cancelled")
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.find_configured_server", find)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.start", start)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.submit", submit)
+    monkeypatch.setattr("omnigent.host.mcp_login.HostMcpLogins.cancel", cancel)
+    host = _make_host_process()
+    ws = _RecordingWS()
+    for frame in [
+        HostMcpLoginFrame("m", "start", "claude", "docs", "toolkit"),
+        HostMcpLoginFrame("n", "status", login_id="x"),
+        HostMcpLoginFrame("s", "submit", login_id="l1", callback_url="http://localhost:9/cb"),
+        HostMcpLoginFrame("c", "cancel", login_id="l1"),
+        HostMcpLoginFrame("g", "start", "claude", "gone"),
+        HostMcpLoginFrame("i", "cancel"),
+    ]:
+        host._start_frame_task(ws, encode_host_frame(frame))
+    await _drain_frame_tasks(host)
+    results = {
+        frame.request_id: (frame.status, frame.login_id, frame.state, frame.error)
+        for frame in map(decode_host_frame, ws.sent)
+    }
+    assert started == [(server, ws)]
+    assert sorted(handled) == [("cancel", "l1"), ("submit", "l1", "http://localhost:9/cb")]
+    assert results == {
+        "m": ("ok", "l1", "pending", None),
+        "n": ("not_found", None, None, "Sign-in not found"),
+        "s": ("ok", "l1", "pending", None),
+        "c": ("ok", "l1", "cancelled", None),
+        "g": ("not_found", None, None, "MCP server not found"),
+        "i": ("invalid", None, None, "Missing sign-in id"),
+    }
+
+
+async def test_host_wires_mcp_status_checks_and_sign_ins(monkeypatch):
+    from omnigent.host.mcp_inventory import ConfiguredMcpServer
+
+    host = _make_host_process()
+    seen = []
+
+    async def sign_in_state(server, timeout):
+        seen.append(host._owned_subprocess_ops)
+        return "available"
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.harness_sign_in_state", sign_in_state)
+    server = ConfiguredMcpServer({"name": "docs", "harness": "claude", "transport": "http"}, {})
+    deadline = asyncio.get_running_loop().time() + 10
+    state = await host._mcp_tools._sign_in_state(server, ("claude", "docs"), deadline)
+    # A nonzero count is what stops _reap_orphans_once from taking the exit status.
+    assert (state, seen, host._owned_subprocess_ops) == ("available", [1], 0)
+    assert host._mcp_logins._subprocess_guard == host._host_subprocess_op
+    # A finished sign-in drops the cached needs-auth probe so the row refreshes.
+    assert host._mcp_logins._on_success == host._mcp_tools.clear_cache
+
+
+async def test_host_mcp_login_failure_is_private(monkeypatch, caplog):
+    async def fail(*args):
+        raise RuntimeError("synthetic-private-config")
+
+    monkeypatch.setattr("omnigent.host.mcp_tools.find_configured_server", fail)
+    result = await _make_host_process()._handle_mcp_login(
+        HostMcpLoginFrame("m", "start", "claude", "docs")
+    )
+    assert (result.status, result.error) == ("failed", "MCP sign-in failed")
     assert "synthetic-private-config" not in encode_host_frame(result) + caplog.text
 
 
