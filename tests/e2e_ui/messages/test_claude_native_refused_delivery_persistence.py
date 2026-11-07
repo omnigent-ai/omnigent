@@ -1,4 +1,4 @@
-"""Known native delivery refusals keep the original web input after reload."""
+"""Native delivery failures conserve the original across history or pending replay."""
 
 from __future__ import annotations
 
@@ -111,6 +111,28 @@ def test_claude_refused_message_survives_reload(
         _ensure_chat_view(page)
         composer = page.get_by_label("Message the agent")
         composer.fill(marker)
+        events_url = f"{stack.base_url}/v1/sessions/{session_id}/events"
+        sent_messages = []
+        accepted_messages = []
+
+        def record_request(request):
+            if request.method == "POST" and request.url == events_url:
+                body = request.post_data_json
+                if body["type"] == "message":
+                    sent_messages.append(body)
+
+        def record_finished_request(request):
+            if request.method == "POST" and request.url == events_url:
+                body = request.post_data_json
+                if body["type"] == "message":
+                    response = request.response()
+                    assert response is not None
+                    accepted_messages.append(response)
+
+        page.on("request", record_request)
+        page.on("requestfinished", record_finished_request)
+        resources.callback(page.remove_listener, "request", record_request)
+        resources.callback(page.remove_listener, "requestfinished", record_finished_request)
         composer.press("Enter")
         deadline = time.monotonic() + 80
         items = []
@@ -119,12 +141,21 @@ def test_claude_refused_message_survives_reload(
                 f"{stack.base_url}/v1/sessions/{session_id}/items",
                 params={"order": "asc", "limit": 100},
             ).json()["data"]
-            if any(item["type"] == "error" for item in items):
+            if any(item["type"] == "error" for item in items) and accepted_messages:
                 break
             page.wait_for_timeout(100)
         assert any(item["type"] == "error" for item in items), stack.runner_log_tail()
+        assert len(sent_messages) == len(accepted_messages) == 1
+        assert accepted_messages[0].status == 202
+        accepted_pending_id = accepted_messages[0].json()["pending_id"]
+        assert isinstance(accepted_pending_id, str) and accepted_pending_id
+        submitted_content = sent_messages[0]["data"]["content"]
+        assert marker in json.dumps(submitted_content)
         users = [item for item in items if item.get("role") == "user"]
-        assert len(users) == 1 and marker in json.dumps(users[0])
+        if refusal == "missing_target":
+            assert len(users) == 1 and marker in json.dumps(users[0])
+        else:
+            assert users == []
         detail = json.dumps([item for item in items if item["type"] == "error"])
         expected = (
             "tmux target is not advertised"
@@ -137,11 +168,13 @@ def test_claude_refused_message_survives_reload(
                 "target_wait_s": delivery_timeout_s,
                 "submit_wait_s": delivery_timeout_s,
             }
-        assert (
-            not client.get(f"{stack.base_url}/v1/sessions/{session_id}")
-            .json()
-            .get("pending_inputs")
-        )
+        pending = client.get(f"{stack.base_url}/v1/sessions/{session_id}").json()["pending_inputs"]
+        if refusal == "missing_target":
+            assert not pending
+        else:
+            assert len(pending) == 1
+            assert pending[0]["pending_id"] == accepted_pending_id
+            assert pending[0]["content"] == submitted_content
         alive = subprocess.run(
             [
                 "tmux",
@@ -161,4 +194,15 @@ def test_claude_refused_message_survives_reload(
             page.locator('[data-testid="message-bubble"][data-role="user"]', has_text=marker)
         ).to_have_count(1)
         expect(page.get_by_test_id("error-pill")).to_have_count(1)
+        assert len(sent_messages) == len(accepted_messages) == 1
+        pending_after_reload = client.get(f"{stack.base_url}/v1/sessions/{session_id}").json()[
+            "pending_inputs"
+        ]
+        assert pending_after_reload == pending
+        if refusal == "draft_not_accepted":
+            items_after_reload = client.get(
+                f"{stack.base_url}/v1/sessions/{session_id}/items",
+                params={"order": "asc", "limit": 100},
+            ).json()["data"]
+            assert not [item for item in items_after_reload if item.get("role") == "user"]
         (tmp_path / "persisted-items.json").write_text(json.dumps(items, indent=2))
