@@ -2256,7 +2256,9 @@ def test_overview_status_color_distinguishes_missing_from_unconfigured(
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_cli_installed", lambda family: False
     )
-    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _name: None)
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_cli_binary", lambda _key: None
+    )
     options, selectable, _descriptions, _compact, _max_visible = _capture_setup_overview(
         monkeypatch
     )
