@@ -881,6 +881,24 @@ describe("useSessionReconnect", () => {
     expect(toast.loading).not.toHaveBeenCalled();
   });
 
+  it("hands a caller joining a failing wake its failure", async () => {
+    const pending = deferred<PostEventResponse>();
+    vi.mocked(retrySession).mockReturnValue(pending.promise);
+    renderHook(() => useSessionReconnect({ ...asleepSandbox, hostOnline: false }));
+    let first!: Promise<boolean>;
+    let joined!: Promise<boolean>;
+    await act(async () => {
+      first = startSandboxWake("session");
+      joined = startSandboxWake("session");
+    });
+    await act(async () => {
+      pending.reject(new Error("managed host wake timed out"));
+      await first;
+    });
+    await expect(joined).resolves.toBe(false);
+    expect(retrySession).toHaveBeenCalledOnce();
+  });
+
   it("shares one sandbox wake between Reconnect host and every other caller", async () => {
     const pending = deferred<PostEventResponse>();
     vi.mocked(retrySession).mockReturnValue(pending.promise);
@@ -892,16 +910,22 @@ describe("useSessionReconnect", () => {
       first = startSandboxWake("session");
     });
     expect(result.current.sandboxStarting).toBe(true);
+    let joined!: Promise<boolean>;
+    let settled = false;
     await act(async () => {
       void result.current.reconnect();
-      void startSandboxWake("session");
+      joined = startSandboxWake("session");
+      void joined.then(() => (settled = true));
     });
     expect(retrySession).toHaveBeenCalledOnce();
+    // A caller joining mid-request waits for the server's answer.
+    expect(settled).toBe(false);
 
     await act(async () => {
       pending.resolve({ queued: false, recovered: true });
       await first;
     });
+    await expect(joined).resolves.toBe(true);
     await act(async () => {
       await result.current.reconnect();
     });

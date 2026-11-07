@@ -36,6 +36,8 @@ interface SandboxWake {
   launch: string;
   stageChanged: boolean;
   timer: ReturnType<typeof setTimeout>;
+  /** The server's answer, which callers joining while it is `waking` wait for. */
+  request: Promise<boolean>;
 }
 
 // Per session and outside any view, so every way of waking a sandbox (Reconnect
@@ -76,18 +78,24 @@ export function resetSandboxWakesForTesting(): void {
  *
  * @returns False when the server refused the wake (already reported in a toast).
  */
-export async function startSandboxWake(sessionId: string): Promise<boolean> {
-  if (sandboxWakes.has(sessionId)) return true;
+export function startSandboxWake(sessionId: string): Promise<boolean> {
+  const running = sandboxWakes.get(sessionId);
+  if (running) return running.phase === "waking" ? running.request : Promise.resolve(true);
   const store = useChatStore.getState();
   const startLaunch = store.conversationId === sessionId ? store.sandboxStatus : null;
-  const wake: SandboxWake = {
+  const wake = {
     phase: "waking",
     launch: launchKey(startLaunch),
     stageChanged: false,
-    timer: setTimeout(() => endSandboxWake(sessionId, wake), SANDBOX_WAKE_MAX_MS),
-  };
+  } as SandboxWake;
+  wake.timer = setTimeout(() => endSandboxWake(sessionId, wake), SANDBOX_WAKE_MAX_MS);
   sandboxWakes.set(sessionId, wake);
+  wake.request = requestSandboxWake(sessionId, wake);
   notifySandboxWakes();
+  return wake.request;
+}
+
+async function requestSandboxWake(sessionId: string, wake: SandboxWake): Promise<boolean> {
   try {
     await retrySession(sessionId);
     if (sandboxWakes.get(sessionId) !== wake) return true;
@@ -281,8 +289,9 @@ export function useSessionReconnect({
     if (wake.stageChanged && isSandboxLaunchStopped(launch)) endSandboxWake(sessionId, wake);
   }, [sandboxWake, launch, sessionId]);
 
+  // A press during a running wake has nothing to wait for; the dot shows its progress.
   const wakeSandbox = useCallback(async () => {
-    if (sessionId) await startSandboxWake(sessionId);
+    if (sessionId && !sandboxWakes.has(sessionId)) await startSandboxWake(sessionId);
   }, [sessionId]);
 
   const reconnect = useCallback(async () => {

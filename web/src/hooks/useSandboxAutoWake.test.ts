@@ -2,6 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  canAutoWakeSandbox,
   requestSandboxWake,
   SANDBOX_AUTO_WAKE_DWELL_MS,
   useSandboxAutoWake,
@@ -64,6 +65,16 @@ describe("useSandboxAutoWake", () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
+  it("waits for a tab hidden while the session loaded to be shown again", () => {
+    const { wake, rerender } = renderAutoWake({ id: "a", canWake: null });
+    act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
+    act(() => setVisibility("hidden"));
+    rerender({ id: "a", canWake: true });
+    expect(wake).not.toHaveBeenCalled();
+    act(() => setVisibility("visible"));
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves a session that couldn't wake on opening, even if it can later", () => {
     const { wake, rerender } = renderAutoWake({ id: "a", canWake: false });
     act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
@@ -92,5 +103,24 @@ describe("useSandboxAutoWake", () => {
     const { wake } = renderAutoWake({ id: "a", canWake });
     act(() => requestSandboxWake(requested));
     expect(wake).toHaveBeenCalledTimes(wakes);
+  });
+});
+
+describe("canAutoWakeSandbox", () => {
+  const safe = { asleep: true, launching: false, canEdit: true, status: "idle", failed: false };
+
+  it("wakes an idle, healthy, asleep session for an editor", () => {
+    expect(canAutoWakeSandbox(safe)).toBe(true);
+  });
+
+  it.each<[string, Partial<typeof safe>]>([
+    ["isn't asleep", { asleep: false }],
+    ["is already launching", { launching: true }],
+    ["the viewer can't edit", { canEdit: false }],
+    ["is running a turn", { status: "running" }],
+    ["failed", { status: "failed" }],
+    ["has an error", { failed: true }],
+  ])("leaves a session that %s to its own controls", (_label, override) => {
+    expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(false);
   });
 });

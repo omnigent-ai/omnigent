@@ -9,6 +9,28 @@ export const SANDBOX_AUTO_WAKE_DWELL_MS = 1_000;
 
 const wakeRequests = new Set<(sessionId: string) => void>();
 
+/**
+ * Whether opening a session may wake its asleep sandbox: only an idle session
+ * with no error and no launch already running, so the wake (the same
+ * `retry_session` as Reconnect host) has no interrupted turn or failed input to
+ * resume. Anything else keeps its Resume or error card.
+ */
+export function canAutoWakeSandbox({
+  asleep,
+  launching,
+  canEdit,
+  status,
+  failed,
+}: {
+  asleep: boolean;
+  launching: boolean;
+  canEdit: boolean;
+  status: string;
+  failed: boolean;
+}): boolean {
+  return asleep && !launching && canEdit && status === "idle" && !failed;
+}
+
 /** Ask the open session's view to wake its asleep sandbox, as picking the Files tab does. */
 export function requestSandboxWake(sessionId: string): void {
   for (const listener of wakeRequests) listener(sessionId);
@@ -43,6 +65,8 @@ export function useSandboxAutoWake(
   check.current = () => {
     const current = opening.current;
     if (!current.dwelled || current.checked || canWake === null) return;
+    // A tab hidden while the session loaded decides once it is shown again.
+    if (document.visibilityState !== "visible") return;
     current.checked = true;
     if (canWake) wake();
   };
@@ -59,8 +83,10 @@ export function useSandboxAutoWake(
     };
     // A background tab dwells from when it is shown.
     const onVisibilityChange = () => {
-      if (document.visibilityState === "visible") startDwell();
-      else if (timer !== undefined && !opening.current.dwelled) {
+      if (document.visibilityState === "visible") {
+        startDwell();
+        check.current();
+      } else if (timer !== undefined && !opening.current.dwelled) {
         clearTimeout(timer);
         timer = undefined;
       }

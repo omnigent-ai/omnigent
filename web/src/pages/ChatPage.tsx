@@ -282,7 +282,7 @@ import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { startSandboxWake, useSessionReconnect } from "@/hooks/useSessionReconnect";
-import { useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
+import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -989,17 +989,17 @@ export function ChatPage() {
     hostOnline: reconnectHostOnline,
     isOwner: isOwnerLevel(permissionLevel),
   });
-  // Opening an asleep sandbox's session presses Reconnect host for the user, but
-  // only on an idle, healthy session: there the wake has no interrupted turn or
-  // failed input to resume. Anything else keeps its Resume or error card.
+  // Opening an asleep sandbox's session presses Reconnect host for the user.
   const sandboxAutoWakeAllowed: boolean | null =
     !sessionConvId || !activeSession || liveness.kind === "unknown"
       ? null
-      : liveness.kind === "host_asleep" &&
-        !sandboxLaunching &&
-        isEditorLevel(permissionLevel) &&
-        activeSession.status === "idle" &&
-        !activeSession.lastTaskError;
+      : canAutoWakeSandbox({
+          asleep: liveness.kind === "host_asleep",
+          launching: sandboxLaunching,
+          canEdit: isEditorLevel(permissionLevel),
+          status: activeSession.status,
+          failed: Boolean(activeSession.lastTaskError),
+        });
   useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // A message to an offline Arca host reconnects it from the desktop and waits
   // in the queue until the host is back.
