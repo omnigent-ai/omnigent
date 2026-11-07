@@ -103,7 +103,7 @@ _LEGACY_BRIDGE_STATE_WAIT_SECONDS = 60.0
 _BRIDGE_STATE_FAST_POLL_SECONDS = 0.05
 _BRIDGE_STATE_FAST_POLL_WINDOW_SECONDS = 2.0
 _BRIDGE_STATE_SLOW_POLL_SECONDS = 0.25
-_COMPACTION_WAIT_TIMEOUT_SECONDS = 60.0
+_COMPACTION_WAIT_TIMEOUT_SECONDS = float("inf")
 _DELIVERY_RPC_TIMEOUT_SECONDS = 30.0
 _DELIVERY_RECEIPT_TIMEOUT_SECONDS = 2.0
 _CODEX_COMPACTING_FAILURE = CodexStartupFailure(
@@ -616,7 +616,7 @@ async def _steer_codex_turn(
 # Bound reconciliation after shell submission before releasing the injection lock.
 _SHELL_TURN_WAIT_SECONDS = 2.0
 _SHELL_TURN_POLL_SECONDS = 0.25
-_SHELL_COMPLETION_WAIT_SECONDS = 60.0
+_SHELL_COMPLETION_WAIT_SECONDS = float("inf")
 _SHELL_RECONCILIATION_RPC_SECONDS = 2.0
 _CODEX_SHELL_WAIT_FAILURE = CodexStartupFailure(
     message="Codex has not confirmed that the shell command finished, "
@@ -666,8 +666,12 @@ async def _reconcile_shell_command(
     bridge_dir: Path,
     state: CodexNativeBridgeState,
     timeout_seconds: float,
-) -> None:
-    """Probe core turn state after earlier shell operations, without adding input."""
+) -> bool:
+    """
+    Probe core turn state after earlier shell operations, without adding input.
+
+    :returns: ``False`` when the app-server connection is gone and cannot answer.
+    """
     expected_turn_id = f"omnigent-shell-fence-{uuid.uuid4().hex}"
     try:
         # Shell and steer requests share Codex's per-thread FIFO. Unlike the
@@ -679,18 +683,25 @@ async def _reconcile_shell_command(
             )
     except CodexAppServerResponseError as error:
         if error.code != -32600:
-            return
+            return True
         if error.message == "no active turn to steer":
             reconcile_shell_command_state(bridge_dir, state, None)
-            return
+            return True
         prefix = f"expected active turn id `{expected_turn_id}` but found `"
         message = error.message or ""
         if message.startswith(prefix) and message.endswith("`"):
             active_turn_id = message[len(prefix) : -1]
             if active_turn_id and "`" not in active_turn_id:
                 reconcile_shell_command_state(bridge_dir, state, active_turn_id)
-    except (TimeoutError, OSError, RuntimeError, WebSocketException):
+        return True
+    except TimeoutError:
+        # A probe queued behind the shell times out until the shell settles.
         _logger.debug("Codex shell reconciliation remains unresolved", exc_info=True)
+    except (OSError, RuntimeError, WebSocketException):
+        # A lost connection never answers again; waiting would hold the input forever.
+        _logger.debug("Codex shell reconciliation lost the app-server", exc_info=True)
+        return False
+    return True
 
 
 async def _wait_for_shell_completion(
@@ -718,6 +729,11 @@ async def _wait_for_shell_completion(
                 ),
                 preserve_session=True,
             )
+        failure = read_bridge_startup_failure(bridge_dir)
+        if failure is not None and failure.code == CODEX_APP_SERVER_STOPPED.code:
+            if not require_idle:
+                return current
+            raise _CodexNativeInputUndelivered(failure)
         if current.pending_shell_command_id is None and current.active_shell_turn_id is None:
             return current
         remaining = deadline - asyncio.get_running_loop().time()
@@ -725,9 +741,13 @@ async def _wait_for_shell_completion(
             if not require_idle:
                 return current
             raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
-        await _reconcile_shell_command(
+        connected = await _reconcile_shell_command(
             client, bridge_dir, current, min(_SHELL_RECONCILIATION_RPC_SECONDS, remaining)
         )
+        if not connected:
+            if not require_idle:
+                return current
+            raise _CodexNativeInputUndelivered(_CODEX_SHELL_WAIT_FAILURE)
         remaining = deadline - asyncio.get_running_loop().time()
         await asyncio.sleep(min(_SHELL_TURN_POLL_SECONDS, max(0, remaining)))
 
@@ -797,6 +817,10 @@ async def _wait_for_compaction_turn(
                         remediation="Send the message again in the current session.",
                     )
                 )
+            failure = read_bridge_startup_failure(bridge_dir)
+            if failure is not None and failure.code == CODEX_APP_SERVER_STOPPED.code:
+                outcome = "app_server_stopped"
+                raise _CodexNativeInputUndelivered(failure)
             if current.active_turn_id != state.active_turn_id:
                 outcome = "settled"
                 return current
