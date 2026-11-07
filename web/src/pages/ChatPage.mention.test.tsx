@@ -60,8 +60,9 @@ const sessions = vi.hoisted(() => ({
 }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
   ...(await importOriginal<typeof UseSidebarDataModule>()),
-  useLoadedConversations: () => ({
-    data: { pages: [{ data: sessions.loaded }], pageParams: [undefined] },
+  useOptionalLoadedConversations: () => ({
+    pages: [{ data: sessions.loaded }],
+    pageParams: [undefined],
   }),
 }));
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({

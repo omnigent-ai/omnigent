@@ -21,6 +21,7 @@ vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+  useOptionalLoadedConversations: () => undefined,
 }));
 
 vi.mock("@/hooks/useSkills", () => ({

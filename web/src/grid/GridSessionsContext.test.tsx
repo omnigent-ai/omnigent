@@ -233,7 +233,10 @@ it("keeps a trimmed custom name through layout changes and reloads", () => {
 vi.mock("@/canvas/CanvasWorkspace", () => ({
   CanvasWorkspace: ({ children }: { children: ReactNode }) => children,
 }));
-vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => ({}) }));
+vi.mock("@/hooks/useSidebarData", () => ({
+  useLoadedConversations: () => ({}),
+  useOptionalLoadedConversations: () => undefined,
+}));
 
 it("never accesses anonymous grids and preserves the session subtree through identity recovery", () => {
   const key = "omnigent:session-grids:one:anonymous";

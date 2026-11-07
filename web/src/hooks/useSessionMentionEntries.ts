@@ -2,7 +2,7 @@ import { useMemo } from "react";
 
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import { type Conversation, useSessionSearch } from "@/hooks/useConversations";
-import { useLoadedConversations } from "@/hooks/useSidebarData";
+import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
   type MentionState,
@@ -54,7 +54,9 @@ export function useSessionMentionEntries({
   currentSessionId: string | null;
   subagents?: readonly ChildSessionInfo[];
 }): SessionMention[] {
-  const { data: loadedSessions } = useLoadedConversations();
+  // Optional: surfaces rendered outside the app shell (stories, embeds) have no
+  // sidebar data, and then the menu lists subagents and search hits only.
+  const loadedSessions = useOptionalLoadedConversations();
   const search = useSessionSearch(debouncedQuery, "title", {
     enabled: mention != null && !debouncedQuery.includes("/"),
     includeArchived: false,

@@ -19,6 +19,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useSidebarData", () => ({
   useLoadedConversations: () => ({ data: undefined, isLoading: false }),
+  useOptionalLoadedConversations: () => undefined,
 }));
 
 vi.mock("@/hooks/useSkills", () => ({
