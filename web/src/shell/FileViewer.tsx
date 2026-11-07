@@ -119,7 +119,9 @@ import {
   detectLang,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForPreview,
   isMarkdownTooLargeForRichView,
+  resolveFileViewMode,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -795,10 +797,19 @@ function FileViewerBody({
     conversationId: string;
     path: string;
     source: boolean | undefined;
-  }>({ conversationId, path, source: undefined });
+    noPreview: boolean;
+  }>({ conversationId, path, source: undefined, noPreview: false });
+  // Large Markdown has no rich editor, so its Preview/Edit choice lasts only for
+  // this file visit; persisting it would change how every small file opens.
+  const [largeMarkdownMode, setLargeMarkdownMode] = useState<{
+    conversationId: string;
+    path: string;
+    mode: "preview" | "source";
+  } | null>(null);
   // Choose once per file visit so an autosave crossing the limit cannot
   // replace the editor while it contains newer unsaved edits.
   let markdownSourceFallback = markdownRouting.source;
+  let markdownPreviewFallback = markdownRouting.noPreview;
   if (
     markdownRouting.conversationId !== conversationId ||
     markdownRouting.path !== path ||
@@ -807,10 +818,23 @@ function FileViewerBody({
     markdownSourceFallback = fileQuery.data
       ? isMarkdownTooLargeForRichView(lang, fileContent)
       : undefined;
-    setMarkdownRouting({ conversationId, path, source: markdownSourceFallback });
+    markdownPreviewFallback =
+      !!fileQuery.data &&
+      lang === "markdown" &&
+      (!!fileQuery.data.truncated || isMarkdownTooLargeForPreview(lang, fileContent));
+    setMarkdownRouting({
+      conversationId,
+      path,
+      source: markdownSourceFallback,
+      noPreview: markdownPreviewFallback,
+    });
+    // A new visit to a large file opens in Preview again.
+    if (markdownRouting.conversationId !== conversationId || markdownRouting.path !== path) {
+      setLargeMarkdownMode(null);
+    }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -904,8 +928,12 @@ function FileViewerBody({
   // directly (mirrors the toolbar's switchTo for the non-editor case).
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
-    setPreviewableViewMode("editor");
-  }, []);
+    if (markdownSourceFallback) {
+      setLargeMarkdownMode({ conversationId, path, mode: "source" });
+    } else {
+      setPreviewableViewMode("editor");
+    }
+  }, [markdownSourceFallback, conversationId, path]);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -924,15 +952,18 @@ function FileViewerBody({
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
   // preference still carries across file types — opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
-  const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang === "markdown"
-      ? deepLinkBiasPath === path
-        ? "editor"
-        : previewableViewMode
-      : previewableViewMode === "editor"
-        ? "preview"
-        : previewableViewMode
-    : "source";
+  const largeMarkdownVisitMode =
+    largeMarkdownMode?.conversationId === conversationId && largeMarkdownMode.path === path
+      ? largeMarkdownMode.mode
+      : undefined;
+  const fileViewMode = resolveFileViewMode({
+    isPreviewable,
+    lang,
+    largeMarkdown: markdownSourceFallback ?? false,
+    largeMarkdownVisitMode,
+    deepLinkedComment: deepLinkBiasPath === path,
+    preference: previewableViewMode,
+  });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
   const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
@@ -1184,7 +1215,51 @@ function FileViewerBody({
     splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
+  if (lang === "markdown" && markdownSourceFallback && isPreviewable && viewMode !== "diff") {
+    // Large Markdown opens in Preview; Edit uses the source editor, which stays
+    // responsive at any size. Leaving source must guard its unsaved edits.
+    const switchTo = (mode: "preview" | "source") => {
+      if (mode === viewMode) return;
+      const apply = () => {
+        setDeepLinkBiasPath(null);
+        dismissFilePosition(position);
+        setDismissedPosition(position);
+        setLargeMarkdownMode({ conversationId, path, mode });
+      };
+      if (viewMode === "source") {
+        guardDirty(apply);
+      } else {
+        apply();
+      }
+    };
+    const modeOptions: ToolbarOption[] = [
+      {
+        key: "md-preview",
+        label: "Preview",
+        tooltip: "Rendered preview",
+        icon: <EyeIcon className="size-4" />,
+        active: viewMode === "preview",
+        onSelect: () => switchTo("preview"),
+      },
+      {
+        key: "md-edit",
+        label: "Edit",
+        tooltip: "Edit Markdown source (too large for the rich text editor)",
+        icon: <PencilLineIcon className="size-4" />,
+        active: viewMode === "source",
+        onSelect: () => switchTo("source"),
+      },
+    ];
+    const activeMode = modeOptions.find((o) => o.active) ?? modeOptions[0];
+    toolbarActions.push({
+      key: "md-view-mode",
+      label: `View mode: ${activeMode.label}`,
+      textLabel: activeMode.label,
+      tooltip: "View mode",
+      icon: activeMode.icon,
+      options: modeOptions,
+    });
+  } else if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
     // Markdown is a segmented control over three reachable modes: the rich-text
     // Editor (default), the rendered Preview, and raw Source. Switching away
     // from the editor must guard unsaved edits; the read-only preview/source
