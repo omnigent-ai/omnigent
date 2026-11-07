@@ -493,12 +493,15 @@ async def test_create_failure_never_removes_existing_worktree(
     )
 
 
-@pytest.mark.parametrize("bundled", [False, True])
+@pytest.mark.parametrize(
+    "bundled,failure_stage", [(False, "persistence"), (True, "persistence"), (True, "profile")]
+)
 async def test_create_failure_rolls_back_omnigent_created_worktree(
     register_worktree_host: RegisterHost,
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     bundled: bool,
+    failure_stage: str,
 ) -> None:
     """A create_conversation failure DOES clean up an Omnigent-made worktree.
 
@@ -518,11 +521,14 @@ async def test_create_failure_rolls_back_omnigent_created_worktree(
     def _boom(*args: Any, **kwargs: Any) -> Any:
         raise RuntimeError("simulated create_conversation failure")
 
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore,
-        "create_conversation",
-        _boom,
-    )
+    if failure_stage == "profile":
+        from unittest.mock import AsyncMock
+
+        from omnigent.server.routes.sessions import routes_core
+
+        monkeypatch.setattr(routes_core, "record_profile", AsyncMock(side_effect=_boom))
+    else:
+        monkeypatch.setattr(SqlAlchemyConversationStore, "create_conversation", _boom)
 
     with pytest.raises(RuntimeError, match="simulated create_conversation failure"):
         await _create_git_session(

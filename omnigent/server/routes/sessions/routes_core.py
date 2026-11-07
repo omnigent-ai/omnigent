@@ -1718,6 +1718,7 @@ def register_core_routes(
                     result.session_id,
                     user_id=user_id,
                 )
+            await record_profile(request, result.session_id, sandbox_profile, conversation_store)
         except Exception:
             if (
                 created_worktree_path is not None
@@ -1733,7 +1734,6 @@ def register_core_routes(
                     reason="create-rollback",
                 )
             raise
-        await record_profile(request, result.session_id, sandbox_profile, conversation_store)
         session_created(
             result.session_id,
             inherited_runner_id,
