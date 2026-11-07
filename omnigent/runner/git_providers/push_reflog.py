@@ -9,9 +9,10 @@ with no configured remote, and of a branch other than HEAD, are not seen. The
 branch is the tracking ref's name under ``refs/remotes/<remote>/``, so a remote
 whose fetch refspec renames branches reports the renamed name.
 
-Recency does not prove which session pushed: a session working in a checkout
-at the same HEAD as a recent push from elsewhere (a person or another session)
-also reports that push.
+Recency does not prove which session pushed. A session working at the same HEAD
+as a recent push from elsewhere (a person, or another session in that checkout)
+can report the push, and since each push is reported once per process, whichever
+session scans it first takes it.
 """
 
 from __future__ import annotations

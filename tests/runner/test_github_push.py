@@ -705,3 +705,44 @@ def test_sandboxed_scan_finds_pushes_only_inside_the_workspace(
     finally:
         environment.close()
     assert [(push.url, push.branch) for push in pushes] == [(str(remote), "feature/inside")]
+
+
+@pytest.mark.parametrize(
+    "outcome,recorded",
+    [
+        pytest.param({"exit_code": 1}, True, id="failed-after-push"),
+        pytest.param({"exit_code": 0}, True, id="succeeded"),
+        pytest.param({"exit_code": None, "session_id": 7}, False, id="still-running"),
+        pytest.param({"exit_code": 0, "background_task_id": "job"}, False, id="backgrounded"),
+    ],
+)
+def test_finished_shell_calls_are_scanned_even_when_they_fail(
+    checkout: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: dict[str, object],
+    recorded: bool,
+) -> None:
+    """``git push -q origin HEAD:feature/topic; false`` pushed, then failed."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    _git("config", "remote.origin.pushurl", "git@github.com:contributor/project.git", cwd=work)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+    result = {"stdout": "", "stderr": "", "cwd": str(work), **outcome}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_failed_push",
+            tool_name="sys_os_shell",
+            arguments={"command": "./push.sh"},
+            result=json.dumps(result),
+            source="runner_shell",
+        )
+    entries = SessionPrRegistry("conv_failed_push").list()
+    assert [entry.url for entry in entries] == ([PR_URL] if recorded else [])

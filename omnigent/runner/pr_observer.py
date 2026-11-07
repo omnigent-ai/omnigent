@@ -40,20 +40,30 @@ _pending_lookups: set[tuple[str, str]] = set()
 _pending_lookups_lock = threading.Lock()
 
 
-def _failed(result: object) -> bool:
+def _unfinished(result: object) -> bool:
+    """Whether the call may still be running, or was stopped before it finished."""
     for obj in result_objects(result):
-        if obj.get("isError") is True or obj.get("is_error") is True:
-            return True
-        for key in ("exit_code", "exitCode", "returncode"):
-            if isinstance(obj.get(key), int) and obj[key] != 0:
-                return True
         if obj.get("session_id") is not None and obj.get("exit_code") is None:
             return True
         if obj.get("backgroundTaskId") or obj.get("background_task_id"):
             return True
         if obj.get("interrupted") is True or obj.get("status") in ("running", "in_progress"):
             return True
-        if obj.get("success") is False or obj.get("cancelled") is True:
+        if obj.get("cancelled") is True:
+            return True
+    return False
+
+
+def _failed(result: object) -> bool:
+    if _unfinished(result):
+        return True
+    for obj in result_objects(result):
+        if obj.get("isError") is True or obj.get("is_error") is True:
+            return True
+        for key in ("exit_code", "exitCode", "returncode"):
+            if isinstance(obj.get(key), int) and obj[key] != 0:
+                return True
+        if obj.get("success") is False:
             return True
     return bool(
         re.search(
@@ -638,11 +648,12 @@ def observe_tool_completion(
             # The shell reports where it actually ran, any workdir already applied.
             cwd = reported
             arguments = {key: value for key, value in arguments.items() if key != "workdir"}
-        if not _failed(shell_result):
+        failed = _failed(shell_result)
+        if not _unfinished(shell_result):
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, _facets(), cwd)
             ):
-                if op.resolve_result is None:
+                if op.resolve_result is None or (failed and not op.resolve_after_failure):
                     continue
                 observation_id = observation_key(
                     f"{source}:{provider_id}:{index}:resolved",

@@ -290,6 +290,10 @@ class ShellPrOp:
         Takes precedence over ``parse_output`` and generic extraction.
     :ivar resolve_result: Optional lookup for identities absent from command output.
         Runs in the background after success, separately from immediate PR operations.
+    :ivar resolve_after_failure: Also run ``resolve_result`` after a call that
+        finished with a failure, for lookups whose evidence outlasts the command's
+        exit status, such as a push recorded in the reflog. Never after a call
+        that has not finished.
     """
 
     tracks: bool
@@ -299,6 +303,7 @@ class ShellPrOp:
     parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
     parse_result: Callable[[object], Sequence[PullRequestRef]] | None = None
     resolve_result: Callable[[object], Sequence[PullRequestRef]] | None = None
+    resolve_after_failure: bool = False
 
 
 @runtime_checkable

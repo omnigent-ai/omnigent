@@ -111,16 +111,20 @@ def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
         target=None,
         content_only=True,
         resolve_result=functools.partial(pushed_prs, tuple(segments)),
+        # A command can push and then fail, e.g. "git push -q; make test"; only the
+        # reflog of a known checkout shows such a push.
+        resolve_after_failure=any(segment.cwd for segment in segments),
     )
 
 
 def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullRequestRef]:
     """Find open PRs whose head matches a branch positively updated by this push."""
-    from omnigent.runner.pr_observer import _failed
+    from omnigent.runner.pr_observer import _failed, _unfinished
 
-    if _failed(result):
+    if _unfinished(result):
         return []
-    targets = dict.fromkeys(_output_targets(segments, result))
+    # Output names a push only when the call succeeded; the reflog records one either way.
+    targets = dict.fromkeys(() if _failed(result) else _output_targets(segments, result))
     pushes: dict[tuple[str, str, str], list[tuple[str, str, str, int]]] = {}
     for push in recent_pushes(segment.cwd for segment in segments if segment.cwd):
         remote = resolve_remote(push.url)
