@@ -61,6 +61,7 @@ from omnigent.entities import (
 from omnigent.entities.conversation import (
     ITEM_TYPE_TO_DATA_CLS,
     parse_item_data,
+    strip_session_mention_lines,
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import (
@@ -11438,7 +11439,9 @@ def _latest_message_preview(
         for block in item.data.content:
             block_type = block.get("type")
             text = block.get("text")
-            if block_type in ("input_text", "output_text") and isinstance(text, str):
+            if block_type == "input_text" and isinstance(text, str):
+                parts.append(strip_session_mention_lines(text))
+            elif block_type == "output_text" and isinstance(text, str):
                 parts.append(text)
         collapsed = " ".join(" ".join(parts).split())
         if not collapsed:

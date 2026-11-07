@@ -7,6 +7,7 @@ import pytest
 from omnigent.entities.conversation import (
     ConversationItem,
     MessageData,
+    strip_session_mention_lines,
     synthesize_conversation_title,
 )
 
@@ -115,6 +116,18 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
             [{"type": "input_text", "text": "[Attached: /tmp/omnigent/u/img.png]"}],
             None,
         ),
+        # Composer "@"-session markers and their tool hint are dropped,
+        # so a session started by tagging another is titled by the prose.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": '[Session: "Fix CI" id=s_1 subagent=no]\n'
+                    "[Tagged sessions: read with sys_session_get_history]\n\ncompare these",
+                }
+            ],
+            "compare these",
+        ),
         # A marker mid-line is user prose, not an executor-emitted
         # attachment line — it must survive into the title.
         (
@@ -164,3 +177,14 @@ def test_synthesize_conversation_title_respects_custom_limit() -> None:
     """Custom ``limit`` is honored."""
     content = [{"type": "input_text", "text": "a" * 50}]
     assert synthesize_conversation_title(content, limit=10) == "a" * 9 + "…"
+
+
+def test_strip_session_mention_lines_keeps_prose() -> None:
+    text = (
+        '[Session: "Fix CI" id=s_1 subagent=yes]\n'
+        "[Tagged sessions: read with sys_session_get_history]\n"
+        "\n"
+        'why is [Session: "x" id=y subagent=no] inline?'
+    )
+    # Only whole marker lines go; a marker typed mid-sentence is user prose.
+    assert strip_session_mention_lines(text) == '\nwhy is [Session: "x" id=y subagent=no] inline?'

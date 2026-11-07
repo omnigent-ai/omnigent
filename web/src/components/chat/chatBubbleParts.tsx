@@ -60,7 +60,13 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
 import { cn } from "@/lib/utils";
-import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
+import {
+  extractSessionMentions,
+  mentionItemPath,
+  stripSessionMentionMarkers,
+  type MentionItem,
+} from "@/lib/composerMentions";
+import { SessionMentionChip } from "@/components/composer/ComposerMentionChips";
 import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
@@ -119,14 +125,16 @@ function sliceByCodePoint(str: string, limit: number): string {
 export const SessionSharedContext = createContext(false);
 
 export function extractUserText(content: MessageContentBlock[]): string {
-  return stripAutomationContext(
-    content
-      .filter(isTextBlock)
-      .map((c) => c.text)
-      .join(""),
-  )
+  return stripSessionMentionMarkers(stripAutomationContext(joinTextBlocks(content)))
     .replace(ATTACHED_RE, "")
     .trimEnd();
+}
+
+function joinTextBlocks(content: MessageContentBlock[]): string {
+  return content
+    .filter(isTextBlock)
+    .map((c) => c.text)
+    .join("");
 }
 
 // An absolute filesystem path in any form a native executor might materialize
@@ -958,6 +966,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // "@"-mentioned workspace files/folders ride in as "[Attached: …]" text
   // markers (no input_file block), so surface them as chips.
   const mentionedChips = isShellCommand ? [] : extractAttachedPaths(bubble.content);
+  // "@"-tagged sessions ride in as "[Session: …]" markers; show them as chips.
+  const mentionedSessions = isShellCommand
+    ? []
+    : extractSessionMentions(joinTextBlocks(bubble.content));
   // Equality selector so Zustand only re-renders the matching bubble.
   const flashing = useChatStore((s) => s.flashItemId === bubble.itemId);
   const { isCopied, handleCopy } = useCopyMessage(() => text);
@@ -975,7 +987,12 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const visibleText = isCollapsed ? sliceByCodePoint(text, COLLAPSE_THRESHOLD) : text;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
   // the content is a pure system marker, swap in a muted centered indicator.
-  if (images.length === 0 && fileChips.length === 0 && mentionedChips.length === 0) {
+  if (
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    mentionedChips.length === 0 &&
+    mentionedSessions.length === 0
+  ) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
@@ -1064,7 +1081,10 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                 })}
               </div>
             )}
-            {(text || fileChips.length > 0 || mentionedChips.length > 0) && (
+            {(text ||
+              fileChips.length > 0 ||
+              mentionedChips.length > 0 ||
+              mentionedSessions.length > 0) && (
               <MessageContent
                 data-testid="user-message-content"
                 className={flashing ? "animate-message-highlight" : undefined}
@@ -1086,6 +1106,13 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         />
                       ),
                     )}
+                  </div>
+                )}
+                {mentionedSessions.length > 0 && (
+                  <div className="flex flex-wrap gap-1.5">
+                    {mentionedSessions.map((session) => (
+                      <SessionMentionChip key={`session:${session.id}`} session={session} />
+                    ))}
                   </div>
                 )}
                 {/* "@"-mentioned workspace files/folders (delivered as text markers) */}

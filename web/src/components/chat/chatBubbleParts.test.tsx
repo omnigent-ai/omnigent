@@ -3,6 +3,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bubble, RenderItem } from "@/lib/renderItems";
+import { buildMentionPreamble } from "@/lib/composerMentions";
 import { useChatStore, type ChatState } from "@/store/chatStore";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -218,6 +219,30 @@ describe("message navigation highlight", () => {
     expect(screen.getByText(text).closest(highlightSelector)).not.toBeNull();
     act(() => useChatStore.setState({ flashItemId: null }));
     expect(container.querySelector(highlightSelector)).toBeNull();
+  });
+});
+
+describe("UserBubble session mentions", () => {
+  it("shows tagged sessions as chips and hides the markers", () => {
+    const preamble = buildMentionPreamble([], null, [
+      { id: "s_child", title: "auth", isSubagent: true },
+      { id: "s_alpha", title: "Alpha planning", isSubagent: false },
+    ]);
+    render(
+      <BubbleView
+        bubble={{
+          kind: "user",
+          itemId: "user_sessions",
+          content: [{ type: "input_text", text: `${preamble}summarize both` }],
+        }}
+        isLastAssistant={false}
+      />,
+    );
+
+    const chips = screen.getAllByTestId("session-mention-chip").map((chip) => chip.textContent);
+    expect(chips).toEqual(["@auth", "@Alpha planning"]);
+    expect(screen.getByText("summarize both")).toBeInTheDocument();
+    expect(screen.queryByText(/Tagged sessions/)).not.toBeInTheDocument();
   });
 });
 

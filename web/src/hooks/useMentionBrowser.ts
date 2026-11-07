@@ -1,6 +1,11 @@
 import { type KeyboardEvent, type RefObject, useRef, useState } from "react";
 
-import type { MentionItem, MentionState } from "@/lib/composerMentions";
+import {
+  NO_SESSION_MENTIONS,
+  type MentionItem,
+  type MentionState,
+  type SessionMention,
+} from "@/lib/composerMentions";
 import { composerAttachmentKey } from "@/store/chatStore";
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 
@@ -18,6 +23,8 @@ export interface MentionBrowserParams {
   setMention: (next: MentionState | null) => void;
   /** Current directory's entries — already filtered, folders-first, capped. */
   mentionEntries: WorkspaceFile[];
+  /** Matching sessions, listed above the files. Already filtered and capped. */
+  sessionEntries?: readonly SessionMention[];
   /** The textarea value and a setter (which may also flag the draft dirty). */
   text: string;
   setText: (next: string) => void;
@@ -36,6 +43,11 @@ export interface MentionBrowser {
   /** Drill into a folder: rewrite the token to ``@<dir>/`` and keep browsing. */
   openMentionDir: (path: string) => void;
   removeMentionedItem: (index: number) => void;
+  mentionedSessions: SessionMention[];
+  setMentionedSessions: React.Dispatch<React.SetStateAction<SessionMention[]>>;
+  /** Tag a session as a chip, replacing the typed token. */
+  attachSession: (session: SessionMention) => void;
+  removeMentionedSession: (index: number) => void;
   /** Handle a key event for the open menu; returns true when it consumed it. */
   handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
   /** Dismiss the menu (e.g. on blur). */
@@ -43,7 +55,7 @@ export interface MentionBrowser {
 }
 
 /**
- * Shared ``@``-file-mention controller for the in-session composer and the
+ * Shared ``@``-mention controller (sessions and files) for the in-session composer and the
  * new-session launcher. Owns the selection index, the tagged-chip list, and
  * the attach/drill/remove + keyboard behaviour; the composer owns the token
  * state and supplies the directory listing (its data source differs).
@@ -53,6 +65,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     mention,
     setMention,
     mentionEntries,
+    sessionEntries = NO_SESSION_MENTIONS,
     text,
     setText,
     textareaRef,
@@ -60,14 +73,20 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
   const [mentionedItems, setMentionedItems] = useState<MentionItem[]>([]);
-  const mentionOpen = mentionEntries.length > 0;
+  const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>([]);
+  // Sessions occupy rows [0, sessionEntries.length); files follow.
+  const rowCount = sessionEntries.length + mentionEntries.length;
+  const mentionOpen = rowCount > 0;
 
   // Pre-select the top row whenever the listing changes — lets Enter/Tab act on
   // the top hit without arrowing first. Keyed by type+path so a file and a dir
   // of the same name stay distinct. (Render-phase state adjustment, the React
   // "store-previous-props" pattern — mirrors the slash menu's reset.)
   const prevMentionMatchesRef = useRef<string[]>([]);
-  const mentionEntryKeys = mentionEntries.map((e) => `${e.type}:${e.path}`);
+  const mentionEntryKeys = [
+    ...sessionEntries.map((session) => `session:${session.id}`),
+    ...mentionEntries.map((e) => `${e.type}:${e.path}`),
+  ];
   if (
     mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
     mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
@@ -76,9 +95,31 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
+  // Remove the typed token and put the caret back where it started.
+  const consumeToken = (active: MentionState) => {
+    setText(text.slice(0, active.start) + text.slice(active.end));
+    setMention(null);
+    setMentionIndex(-1);
+    queueMicrotask(() => {
+      const ta = textareaRef.current;
+      if (ta) ta.setSelectionRange(active.start, active.start);
+      ta?.focus();
+    });
+  };
+
+  const attachSession = (session: SessionMention) => {
+    if (!mention) return;
+    setMentionedSessions((prev) =>
+      prev.some((it) => it.id === session.id) ? prev : [...prev, session],
+    );
+    consumeToken(mention);
+  };
+
+  const removeMentionedSession = (index: number) =>
+    setMentionedSessions((prev) => prev.filter((_, i) => i !== index));
+
   const attachMention = (path: string, isDir: boolean) => {
     if (!mention) return;
-    setText(text.slice(0, mention.start) + text.slice(mention.end));
     // Dedup on the shared attachment key (path + dir-ness + range) — the same
     // identity the store queue uses — so the "@" menu and the file viewer's
     // "Attach to agent" never disagree about what counts as a duplicate.
@@ -87,14 +128,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     setMentionedItems((prev) =>
       prev.some((it) => composerAttachmentKey(it) === itemKey) ? prev : [...prev, item],
     );
-    setMention(null);
-    setMentionIndex(-1);
-    // Restore the caret to where the token was so typing continues naturally.
-    queueMicrotask(() => {
-      const ta = textareaRef.current;
-      if (ta) ta.setSelectionRange(mention.start, mention.start);
-      ta?.focus();
-    });
+    consumeToken(mention);
   };
 
   const openMentionDir = (path: string) => {
@@ -123,15 +157,24 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
     if (!mentionOpen) return false;
-    const active = mentionIndex >= 0 ? mentionEntries[mentionIndex] : undefined;
+    const activeSession = mentionIndex >= 0 ? sessionEntries[mentionIndex] : undefined;
+    const active =
+      mentionIndex >= sessionEntries.length
+        ? mentionEntries[mentionIndex - sessionEntries.length]
+        : undefined;
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setMentionIndex((i) => (i + 1) % mentionEntries.length);
+      setMentionIndex((i) => (i + 1) % rowCount);
       return true;
     }
     if (e.key === "ArrowUp") {
       e.preventDefault();
-      setMentionIndex((i) => (i <= 0 ? mentionEntries.length - 1 : i - 1));
+      setMentionIndex((i) => (i <= 0 ? rowCount - 1 : i - 1));
+      return true;
+    }
+    if (activeSession && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !isMobile))) {
+      e.preventDefault();
+      attachSession(activeSession);
       return true;
     }
     // Enter: open a folder (drill in) or attach a file. Tab: attach the
@@ -163,6 +206,10 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     attachMention,
     openMentionDir,
     removeMentionedItem,
+    mentionedSessions,
+    setMentionedSessions,
+    attachSession,
+    removeMentionedSession,
     handleKeyDown,
     dismiss,
   };
