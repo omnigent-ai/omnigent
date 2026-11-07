@@ -211,7 +211,7 @@ async def test_oidc_poll_pending_then_session_jwt() -> None:
     finally:
         await client.aclose()
     assert result.access_token == "sess-jwt"
-    assert result.refresh_token == ""  # OIDC session JWT has no refresh token
+    assert result.refresh_token == ""  # login grants absent: standalone-JWT flow
     assert result.expires_in == 28800
     assert "code_verifier" not in poll.calls.last.request.url.params
     assert poll.calls.last.request.headers["X-Omnigent-Code-Verifier"] == "v" * 64
@@ -240,6 +240,22 @@ async def test_oidc_poll_malformed_200_raises_oauth_error() -> None:
 @respx.mock
 async def test_device_poll_malformed_200_raises_oauth_error() -> None:
     respx.post(_TOKEN).mock(return_value=httpx.Response(200, text="not json"))
+    from omnigent_slack import oauth as _oauth
+
+    client = httpx.AsyncClient(base_url=_BASE)
+    try:
+        with pytest.raises(OAuthError):
+            await _oauth._poll_device(client, "dc", interval=0, expires_in=600)
+    finally:
+        await client.aclose()
+
+
+@respx.mock
+async def test_device_poll_200_without_refresh_token_raises_oauth_error() -> None:
+    """The device grant always issues a refresh token; a 200 without one is malformed."""
+    respx.post(_TOKEN).mock(
+        return_value=httpx.Response(200, json={"access_token": "at", "expires_in": 3600})
+    )
     from omnigent_slack import oauth as _oauth
 
     client = httpx.AsyncClient(base_url=_BASE)
@@ -362,3 +378,36 @@ async def test_client_secret_sent_on_refresh_and_revoke() -> None:
         await client.aclose()
     assert refresh.calls.last.request.headers.get(_HEADER) == "s3cr3t"
     assert revoke.calls.last.request.headers.get(_HEADER) == "s3cr3t"
+
+
+@respx.mock
+async def test_oidc_poll_keeps_login_grant_refresh_token() -> None:
+    """Issue #12493: the ticket-flow 200 carries the server's refresh_token.
+
+    With a grant store wired, /auth/cli-poll returns the session JWT plus a
+    refresh_token; the bot keeps it so the session renews silently until the
+    grant ends instead of re-prompting a login every session-JWT expiry.
+    """
+    poll = respx.get(_BASE + "/auth/cli-poll").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "token": "sess-jwt",
+                "refresh_token": "grant-rt",
+                "user_id": "a@x",
+                "expires_in": 28800,
+            },
+        ),
+    )
+    from omnigent_slack import oauth as _oauth
+
+    client = httpx.AsyncClient(base_url=_BASE)
+    try:
+        result = await _oauth._poll_cli_ticket(client, "T1", "v" * 64, interval=0)
+    finally:
+        await client.aclose()
+    assert result.access_token == "sess-jwt"
+    assert result.refresh_token == "grant-rt"
+    assert result.expires_in == 28800
+    assert "code_verifier" not in poll.calls.last.request.url.params
+    assert poll.calls.last.request.headers["X-Omnigent-Code-Verifier"] == "v" * 64
