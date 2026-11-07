@@ -368,6 +368,46 @@ def test_install_target_selects_extras(lib: Path, args: str, target: str) -> Non
     ]
 
 
+@pytest.mark.parametrize(
+    ("args", "index_env", "rerun"),
+    [
+        ("", {}, "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh\n"),
+        (
+            "--repo https://user:s3cr3t-token@example.com/org/repo.git --extra mcp",
+            {},
+            "| UV_DEFAULT_INDEX=https://pypi.example.com/simple sh -s -- "
+            "<your original options>\n",
+        ),
+        ("", {"UV_DEFAULT_INDEX": "https://mirror.example/simple"}, None),
+        ("", {"UV_INDEX_URL": "https://mirror.example/simple"}, None),
+    ],
+)
+def test_failed_install_suggests_package_mirror(
+    lib: Path, args: str, index_env: dict[str, str], rerun: str | None
+) -> None:
+    r = run(
+        lib,
+        f"""
+        uv() {{ echo 'error: Failed to fetch: https://pypi.org/simple/omnigent/' >&2; return 2; }}
+        parse_args {args}
+        normalize_repo_url
+        install_omnigent
+        echo continued
+        """,
+        env={"UV_DEFAULT_INDEX": "", "UV_INDEX_URL": "", **index_env},
+    )
+    assert r.returncode != 0
+    assert "continued" not in r.stdout
+    assert "Failed to fetch: https://pypi.org/simple/omnigent/" in r.stderr
+    assert "Omnigent could not be installed. Check the error above." in r.stderr
+    assert "s3cr3t-token" not in r.stdout + r.stderr
+    if rerun is None:
+        assert "pypi.example.com" not in r.stderr
+    else:
+        assert "If your network blocks pypi.org" in r.stderr
+        assert rerun in r.stderr
+
+
 _CLI_COMMANDS = """
 uname() { case "$1" in -s) echo Linux;; -m) echo x86_64;; esac; }
 uv() { [ "$1 $2" = 'python find' ] || return 1; printf '%s\\n' "$TEST_PYTHON"; }

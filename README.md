@@ -98,6 +98,27 @@ Available user-facing extras include:
 </details>
 
 <details>
+<summary>Networks that block pypi.org</summary>
+
+The installer downloads Omnigent from PyPI with uv. If your network blocks
+pypi.org, set `UV_DEFAULT_INDEX` to your package mirror (replace the example URL):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/omnigent-ai/omnigent/main/scripts/install_oss.sh | UV_DEFAULT_INDEX='https://pypi.example.com/simple' sh
+```
+
+To keep using the mirror for later upgrades and update checks, set it as uv's
+default index in `~/.config/uv/uv.toml` instead:
+
+```toml
+[[index]]
+url = "https://pypi.example.com/simple"
+default = true
+```
+
+</details>
+
+<details>
 <summary>Prefer to install manually?</summary>
 
 Omnigent needs **Python 3.12+**. Install the `omnigent` package:
