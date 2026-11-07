@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import base64
+import urllib.request
 
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item, model_option
@@ -96,11 +98,15 @@ def test_wait_for_stream_waits_for_reconnect_after_reload(
     page.goto(chat.url)
     chat.wait_for_stream()
 
-    page.reload()
-    chat.wait_for_stream()
-    chat.emit_busy("reloaded-turn")
+    with urllib.request.urlopen(chat.stream.url, timeout=5) as old_socket:
+        assert old_socket.read(1) == b":"
+        with pytest.raises(TimeoutError, match="Timed out waiting for the chat event stream"):
+            chat.wait_for_stream(timeout=0)
+        page.reload()
+        chat.wait_for_stream()
+        chat.emit_busy("reloaded-turn")
 
-    expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=10_000)
+        expect(page.get_by_test_id("working-indicator")).to_be_visible(timeout=10_000)
 
 
 def test_contract_can_hold_and_release_session_skills(
