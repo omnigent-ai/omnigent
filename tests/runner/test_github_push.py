@@ -361,22 +361,25 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
 
 
 @pytest.mark.parametrize(
-    "cwd,command,directories",
+    "cwd,arguments,directories",
     [
-        ("/work/repo", "git pp 2>&1 | tail -3", ["/work/repo"]),
-        ("/work", "cd repo && git pp | tail -3", ["/work/repo"]),
-        (None, "git -C /work/repo pp && echo done", ["/work/repo"]),
-        (None, "git pp", []),
+        ("/work/repo", {"command": "git pp 2>&1 | tail -3"}, ["/work/repo"]),
+        ("/work", {"command": "cd repo && git pp | tail -3"}, ["/work/repo"]),
+        (None, {"command": "git -C /work/repo pp && echo done"}, ["/work/repo"]),
+        (None, {"command": "git pp"}, []),
+        # An explicit workdir is where the command ran, relative to the hook cwd.
+        ("/work", {"cmd": "./push.sh", "workdir": "repo"}, ["/work/repo"]),
         # Output attribution rejects "||", but the checkouts still get checked.
-        ("/work/repo", "git pp || true", ["/work/repo"]),
-        ("/work", "cd repo && git pp || echo failed", ["/work", "/work/repo"]),
+        ("/work/repo", {"command": "git pp || true"}, ["/work/repo"]),
+        ("/work", {"command": "cd repo && git pp || echo failed"}, ["/work", "/work/repo"]),
+        (None, {"command": "git -C /work/repo pp || true"}, ["/work/repo"]),
     ],
 )
 def test_native_hook_checks_the_directories_the_command_ran_in(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cwd: str | None,
-    command: str,
+    arguments: dict[str, str],
     directories: list[str],
 ) -> None:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -399,8 +402,8 @@ def test_native_hook_checks_the_directories_the_command_ran_in(
             "conv_hook",
             {
                 "hook_event_name": "PostToolUse",
-                "tool_name": "Bash",
-                "tool_input": {"command": command},
+                "tool_name": "exec_command" if "cmd" in arguments else "Bash",
+                "tool_input": arguments,
                 "tool_response": {"stdout": "done\n", "stderr": "", "interrupted": False},
                 "tool_use_id": "toolu_push",
                 "cwd": cwd,

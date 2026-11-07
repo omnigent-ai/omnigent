@@ -467,12 +467,15 @@ def _shell_operations(
     if not isinstance(command, str) or len(command) > 100_000:
         return []
     workdir = arguments.get("workdir")
-    start = cwd or (workdir if isinstance(workdir, str) else None)
+    start = cwd
+    if isinstance(workdir, str) and workdir:
+        # An explicit workdir (``exec_command``) is where the command ran.
+        start = _resolve_directory(cwd, workdir) or start
     segments = _with_directories(_shell_segments(command), start)
-    if not segments and start:
+    if not segments:
         # Output attribution rejects this command, but the checkouts it ran in
         # still record its pushes, so pass only those on, as plain ``cd`` steps.
-        directories = [start] + [
+        directories = ([start] if start else []) + [
             segment.cwd
             for segment in _with_directories(_shell_segments(command, split_or=True), start)
             if segment.cwd

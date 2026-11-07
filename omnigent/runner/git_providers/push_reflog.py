@@ -5,7 +5,9 @@ updates, so this sees pushes run through aliases, scripts, pipes, or ``--quiet``
 which the push's output alone cannot show. A push counts only when that entry is
 recent and the ref points at the HEAD of a checkout the call ran in, so pushes
 from other worktrees of the same repository are not picked up. Pushes to a URL
-with no configured remote, and of a branch other than HEAD, are not seen.
+with no configured remote, and of a branch other than HEAD, are not seen. The
+branch is the tracking ref's name under ``refs/remotes/<remote>/``, so a remote
+whose fetch refspec renames branches reports the renamed name.
 
 Recency does not prove which session pushed: a session working in a checkout
 at the same HEAD as a recent push from elsewhere (a person or another session)
@@ -121,9 +123,9 @@ def recent_pushes(directories: Iterable[str]) -> list[tuple[str, str]]:
             remote = next(
                 (name for name in names if ref.startswith(f"refs/remotes/{name}/")), None
             )
-            if remote is None or not _claim((common_dir, ref, int(match[1]))):
+            if remote is None:
                 continue
             url = (_git(directory, "remote", "get-url", "--push", remote) or "").strip()
-            if url:
+            if url and _claim((common_dir, ref, int(match[1]))):
                 found.append((url, ref.removeprefix(f"refs/remotes/{remote}/")))
     return found
