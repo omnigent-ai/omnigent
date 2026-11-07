@@ -86,6 +86,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    short_description: str | None = None
     loads_user_settings = True
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
@@ -100,6 +101,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         )
         if description is None:
             description = loaded.spec.description
+        short_description = loaded.spec.short_description
         # Declared terminal names, in spec order (mirrors the
         # session-agent endpoint so both report it consistently).
         terminals = list(loaded.spec.terminals or {})
@@ -136,6 +138,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         name=agent.name,
         version=agent.version,
         description=description,
+        short_description=short_description,
         created_at=agent.created_at,
         updated_at=agent.updated_at,
         harness=harness,
