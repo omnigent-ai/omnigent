@@ -23,7 +23,7 @@ from tests.e2e_ui.start_session.test_start_session import (
 def test_start_session_while_worktree_discovery_is_slow(
     seeded_session: tuple[str, str],
 ) -> None:
-    """Send enables and the session starts while ``/worktrees`` is still pending."""
+    """The selected folder stays usable and starts while ``/worktrees`` is pending."""
     _run_in_fresh_loop(_drive_slow_worktree_discovery(*seeded_session))
 
 
@@ -61,6 +61,20 @@ async def _drive_slow_worktree_discovery(base_url: str, session_id: str) -> None
             composer = page.get_by_test_id("new-chat-landing-input")
             await composer.wait_for(state="visible", timeout=30_000)
             await poll_until_async(lambda: len(worktree_requests) == 1)
+            workspace = page.get_by_test_id("new-chat-landing-workspace-chip")
+            await expect(workspace).to_be_visible()
+            await expect(workspace).to_be_enabled()
+            await expect(workspace).to_have_attribute("title", "/work/repo")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_have_count(
+                0
+            )
+            await workspace.click()
+            await page.get_by_test_id("recent-workspace-select-0").click()
+            await expect(workspace).to_be_enabled()
+            await expect(workspace).to_have_attribute("title", "/work/repo")
+            await expect(page.get_by_test_id("new-chat-landing-workspace-loading")).to_have_count(
+                0
+            )
             await composer.fill("set up the project")
 
             submit = page.get_by_test_id("new-chat-landing-submit")
