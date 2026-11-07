@@ -25,6 +25,9 @@ from omnigent.preferences import (
 
 _log = logging.getLogger(__name__)
 _cwd_missing_warned = False
+# Paths already reported as unreadable, so a locked-down config warns once
+# rather than on every read in a long-lived process.
+_unreadable_warned: set[Path] = set()
 
 _Config: TypeAlias = dict[str, object]
 
@@ -40,14 +43,41 @@ def global_config_path(default_path: Path | None = None) -> Path:
     return default_path or _GLOBAL_CONFIG_PATH
 
 
+def _read_config_file(resolved_path: Path) -> _Config:
+    """
+    Read one config file, treating an unreadable path as an absent one.
+
+    A directory the process cannot traverse makes ``exists()`` raise instead
+    of answering, so a locked-down ``$HOME`` would otherwise crash every
+    command that reads config rather than running without one. Warned once
+    per path so a misconfigured permission is visible without flooding a
+    long-lived process. Malformed YAML still raises: the file was readable
+    and its contents are wrong, which is not the same as having no config.
+
+    :param resolved_path: Config file to read, e.g.
+        ``~/.omnigent/config.yaml``.
+    :returns: The parsed mapping, or an empty one when absent or unreadable.
+    """
+    try:
+        if not resolved_path.exists():
+            return {}
+        with resolved_path.open() as config_file:
+            raw: _Config = yaml.safe_load(config_file) or {}
+    except OSError as exc:
+        if resolved_path not in _unreadable_warned:
+            _unreadable_warned.add(resolved_path)
+            _log.warning(
+                "config: %s is unreadable (%s); continuing without it",
+                resolved_path,
+                exc.strerror or exc,
+            )
+        return {}
+    return raw
+
+
 def load_global_config(path: Path | None = None) -> _Config:
     """Load the user-level config, returning an empty mapping when absent."""
-    resolved_path = path or global_config_path()
-    if not resolved_path.exists():
-        return {}
-    with resolved_path.open() as config_file:
-        raw: _Config = yaml.safe_load(config_file) or {}
-        return raw
+    return _read_config_file(path or global_config_path())
 
 
 def load_local_config(path: Path | None = None) -> _Config:
@@ -64,11 +94,7 @@ def load_local_config(path: Path | None = None) -> _Config:
             return {}
     else:
         resolved_path = path
-    if not resolved_path.exists():
-        return {}
-    with resolved_path.open() as config_file:
-        raw: _Config = yaml.safe_load(config_file) or {}
-        return raw
+    return _read_config_file(resolved_path)
 
 
 def _ignored_project_harness_keys(cfg: _Config) -> list[str]:
