@@ -455,7 +455,8 @@ class BwrapSandboxBackend(SandboxBackend):
         # Make sure argv[0] (the helper interpreter) is reachable inside
         # the sandbox even when it lives outside the default mounts —
         # e.g. a pyenv install under ``$HOME/.pyenv``.
-        bwrap_args += _ensure_executable_visible(argv, cwd_resolved)
+        bound_roots = [cwd_resolved, *(policy.read_roots or []), *policy.write_roots]
+        bwrap_args += _ensure_executable_visible(argv, bound_roots, policy.write_roots)
 
         # Make sure the final target binary (e.g. the claude CLI at
         # node_modules/.bin/claude) is also reachable.  The launcher
@@ -464,7 +465,7 @@ class BwrapSandboxBackend(SandboxBackend):
         # directory is invisible inside the namespace and the exec
         # fails with FileNotFoundError.
         if target is not None:
-            bwrap_args += _ensure_executable_visible([target], cwd_resolved)
+            bwrap_args += _ensure_executable_visible([target], bound_roots, policy.write_roots)
 
         # Extra read roots beyond the default toolchain bind set. These
         # mounts precede write grants because bwrap resolves overlaps by
@@ -888,7 +889,9 @@ def _is_same_path(a: Path, b: Path) -> bool:
     return a.resolve(strict=False) == b.resolve(strict=False)
 
 
-def _ensure_executable_visible(argv: list[str], cwd: Path) -> list[str]:
+def _ensure_executable_visible(
+    argv: list[str], bound_roots: Sequence[Path], writable_roots: Sequence[Path] = ()
+) -> list[str]:
     """
     Return any extra ``--ro-bind-try`` args needed so ``argv[0]`` (the
     helper interpreter) is reachable inside the sandbox.
@@ -902,7 +905,12 @@ def _ensure_executable_visible(argv: list[str], cwd: Path) -> list[str]:
     handles intermediate directory-symlinks: e.g. uv installs a
     version-floating symlink ``cpython-3.12 -> cpython-3.12.13``; the
     kernel traverses the literal ``cpython-3.12`` name, so we mount the
-    real ``cpython-3.12.13`` contents there.
+    real ``cpython-3.12.13`` contents there. A directory-symlink leading to
+    the interpreter's virtualenv is also bound at the target's own path, so
+    the link still resolves where a wholesale bind (cwd, ``read_paths``,
+    ``write_paths``) shows the literal name instead. Only the final target
+    is mounted: a link that passes through another unmounted directory-link
+    (``.venv -> /venvs/current -> /venvs/proj``) still does not resolve.
 
     Common cases:
 
@@ -919,18 +927,30 @@ def _ensure_executable_visible(argv: list[str], cwd: Path) -> list[str]:
     - Pyenv-style ``$HOME/.pyenv/versions/3.12/bin/python``: same
       walk produces the binds needed whether or not the
       ``versions/3.12`` component is itself a symlink.
+    - ``<cwd>/.venv -> /srv/venvs/proj`` (a project venv kept outside
+      the tree) with a read-only cwd: the cwd bind shows the symlink
+      itself, so the real ``/srv/venvs/proj`` is bound at its own path
+      for it to resolve. Under a writable root the link is not followed.
 
     :param argv: Helper argv. The function inspects ``argv[0]``.
-    :param cwd: Effective working directory; used to skip binds for
-        paths already covered by the cwd mount.
+    :param bound_roots: Directories bound wholesale (cwd plus read/write
+        roots); descendants need no literal bind.
+    :param writable_roots: The subset of *bound_roots* the sandboxed
+        process may write to. The agent could retarget a directory-symlink
+        stored in one of them, so such a link is never followed, even when
+        it is reached through an alias from a read-only path.
     :returns: Extra bwrap args (possibly empty) to insert before the
-        cwd bind. Never includes a destination already covered by
-        :data:`_DEFAULT_RO_DIRS` or by *cwd*.
+        wholesale binds. Never includes a destination already covered by
+        :data:`_DEFAULT_RO_DIRS` or by *bound_roots*.
     """
-    return _interpreter_chain_binds(argv, [Path(p) for p in _DEFAULT_RO_DIRS] + [cwd])
+    return _interpreter_chain_binds(
+        argv, [Path(p) for p in _DEFAULT_RO_DIRS] + list(bound_roots), writable_roots
+    )
 
 
-def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) -> list[str]:
+def _interpreter_chain_binds(
+    argv: Sequence[str], covered_prefixes: list[Path], writable_prefixes: Sequence[Path] = ()
+) -> list[str]:
     """
     Walk ``argv[0]``'s symlink chain and return the ``--ro-bind-try``
     args needed to reach each hop, skipping destinations already
@@ -939,8 +959,9 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
     Factored out of :func:`_ensure_executable_visible` so the post-mask
     interpreter re-expose (:func:`_interpreter_reexpose_after_mask`) can
     reuse the exact same walk with a NARROWER covered set — the default
-    mounts only, without cwd. cwd "covers" the interpreter only until
-    the dotfile masker ``--tmpfs``-masks a hidden ancestor dir under it
+    mounts only, without the wholesale binds. cwd "covers" the
+    interpreter only until the dotfile masker ``--tmpfs``-masks a hidden
+    ancestor dir under it
     (e.g. a uv-tool install at ``~/.local/share/uv/tools/.../python``);
     re-running the walk against the default mounts alone yields the
     binds needed to punch the interpreter back through that mask.
@@ -948,6 +969,9 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
     :param argv: Helper argv. Only ``argv[0]`` is inspected.
     :param covered_prefixes: Paths whose descendants need no explicit
         bind (already visible inside the sandbox).
+    :param writable_prefixes: Covered paths the sandboxed process may
+        write to; a directory-symlink stored in one of them is never
+        followed, however it is reached.
     :returns: Extra bwrap args (possibly empty), as ``--ro-bind-try
         <src> <dst>`` triples.
     """
@@ -956,6 +980,31 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
 
     extra: list[str] = []
     seen_dest: set[Path] = set()
+
+    def _under(path: Path, roots: Sequence[Path]) -> bool:
+        return any(_is_within(path, root, resolve=False) for root in roots)
+
+    def _retargetable(path: Path, depth: int = 0) -> bool:
+        """Whether a symlink on the way to *path* is stored in a directory the
+        sandboxed process may write to, letting the agent point it elsewhere.
+        Resolution is replayed component by component so an alias into a
+        write root is caught; unreadable or cyclic chains count as unsafe."""
+        if depth > 40:
+            return True
+        resolved = Path("/")
+        try:
+            for part in path.parts[1:]:
+                entry = resolved / part
+                if entry.is_symlink():
+                    if _under(resolved, writable_prefixes):
+                        return True
+                    link = os.path.join(str(resolved), os.readlink(str(entry)))
+                    if _retargetable(Path(os.path.normpath(link)), depth + 1):
+                        return True
+                resolved = Path(os.path.realpath(str(entry)))
+        except OSError:
+            return True
+        return False
 
     def _emit(src: Path, dst: Path) -> None:
         if dst in seen_dest or dst == dst.parent or src == src.parent:
@@ -967,30 +1016,41 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
         seen_dest.add(dst)
         extra.extend(["--ro-bind-try", str(src), str(dst)])
 
-    def _emit_parent_pair(literal: Path) -> None:
-        """Bind ``literal``'s parent and grandparent at their literal
-        paths, sourcing from each path's realpath so intermediate
-        directory-symlinks resolve correctly inside the sandbox."""
-        if any(_is_within(literal, root, resolve=False) for root in covered_prefixes):
-            return
+    def _emit_parent_pair(literal: Path, follow_venv_links: bool) -> None:
+        """Make ``literal``'s parent and grandparent reachable: bind each
+        realpath at its literal name outside the covered mounts. Where a
+        covered mount shows a directory-symlink instead, bind its target at
+        its own path — only a virtualenv target, and only when no write root
+        lets the agent retarget the link, so it cannot widen the mounts."""
         parent_literal = literal.parent
-        parent_real = Path(os.path.realpath(str(parent_literal)))
-        _emit(parent_real, parent_literal)
-        gp_literal = parent_literal.parent
-        if gp_literal != parent_literal:
-            gp_real = Path(os.path.realpath(str(gp_literal)))
-            _emit(gp_real, gp_literal)
+        dirs = (parent_literal, parent_literal.parent)
+        if not _under(literal, covered_prefixes):
+            for literal_dir in dirs:
+                _emit(Path(os.path.realpath(str(literal_dir))), literal_dir)
+            return
+        if not follow_venv_links:
+            return
+        # The venv root's mount already contains ``bin``; a separately
+        # symlinked ``bin`` is the only case that needs the inner mount.
+        for literal_dir in reversed(dirs):
+            real_dir = Path(os.path.realpath(str(literal_dir)))
+            if (
+                real_dir != literal_dir
+                and _is_venv_dir(real_dir)
+                and not _retargetable(literal_dir)
+            ):
+                _emit(real_dir, real_dir)
+                return
 
     # Walk the symlink chain hop-by-hop until either a regular file is
-    # reached or the visited-set catches a cycle. The 40-hop cap matches
+    # reached or the hop list catches a cycle. The 40-hop cap matches
     # Linux's MAXSYMLINKS / ELOOP threshold.
-    visited: set[Path] = set()
+    hops: list[Path] = []
     current = Path(os.path.abspath(str(Path(argv[0]))))
     for _ in range(40):
-        if current in visited:
+        if current in hops:
             break
-        visited.add(current)
-        _emit_parent_pair(current)
+        hops.append(current)
         try:
             if not current.is_symlink():
                 break
@@ -1001,8 +1061,20 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
             current = Path(link)
         else:
             current = Path(os.path.normpath(str(current.parent / link)))
+    # Symlink targets are only worth exposing when the chain ends at an
+    # interpreter file.
+    resolves = hops[-1].is_file()
+    for hop in hops:
+        _emit_parent_pair(hop, resolves)
 
     return extra
+
+
+def _is_venv_dir(path: Path) -> bool:
+    """Whether *path* is a virtualenv root or its ``bin`` directory."""
+    return (path / "pyvenv.cfg").is_file() or (
+        path.name == "bin" and (path.parent / "pyvenv.cfg").is_file()
+    )
 
 
 def _tmpfs_mask_dirs(mask_args: Sequence[str]) -> list[Path]:
@@ -1047,8 +1119,9 @@ def _interpreter_reexpose_after_mask(
     over the cwd bind, so the interpreter vanishes and bwrap's
     ``execvp`` fails with ``ENOENT``.
 
-    This recomputes the interpreter binds WITHOUT the cwd-coverage skip
-    (only the always-present default mounts count as covered) and keeps
+    This recomputes the interpreter binds WITHOUT the wholesale-bind
+    coverage skip (only the always-present default mounts count as
+    covered) and keeps
     only the ones that land STRICTLY inside a masked dir. Emitted after
     the mask, they layer over it and reach exactly the interpreter
     subtree — never the masked dir itself (which would re-expose the
