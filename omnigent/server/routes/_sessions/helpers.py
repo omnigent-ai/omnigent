@@ -7932,7 +7932,9 @@ def _stable_id_reuse_is_exact_retry(
         from the same author.
     :raises OmnigentError: ``CONFLICT`` when the author differs.
     """
-    if persisted.created_by != item.created_by:
+    from omnigent.server.routes._auth_helpers import attribution_user
+
+    if attribution_user(persisted.created_by) != attribution_user(item.created_by):
         raise OmnigentError(
             f"stable_id {item.stable_id!r} already names another author's item in this session",
             code=ErrorCode.CONFLICT,
