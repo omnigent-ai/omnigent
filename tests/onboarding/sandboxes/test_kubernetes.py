@@ -1323,6 +1323,8 @@ class _FakeCore:
         self.list_pod_error: Exception | None = None
         self.last_label_selector: str | None = None
         self.pod_list_items: list[object] = []
+        self.secret_patches: list[tuple[str, dict[str, object]]] = []
+        self.patch_secret_error: Exception | None = None
 
     def create_namespaced_secret(self, namespace, body, _request_timeout=None):
         self.calls.append("create_secret")
@@ -1343,6 +1345,12 @@ class _FakeCore:
         if isinstance(resp, Exception):
             raise resp
         return resp
+
+    def patch_namespaced_secret(self, name, namespace, body, _request_timeout=None):
+        self.calls.append("patch_secret")
+        if self.patch_secret_error is not None:
+            raise self.patch_secret_error
+        self.secret_patches.append((name, body))
 
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
@@ -1375,12 +1383,18 @@ class _FakeBatch:
         self.last_delete_body: object = None
         self.create_job_error: Exception | None = None
         self.delete_job_errors: list[Exception | None] = []
+        # Server-assigned uid echoed on the created Job; None mimics a response
+        # without one (nothing to own the token Secret).
+        self.job_uid: str | None = "uid-job-1"
 
     def create_namespaced_job(self, namespace, body, _request_timeout=None):
         self.calls.append("create_job")
         if self.create_job_error is not None:
             raise self.create_job_error
         self.created_jobs.append(body)
+        return SimpleNamespace(
+            metadata=SimpleNamespace(name=body["metadata"]["name"], uid=self.job_uid)
+        )
 
     def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
         self.calls.append("delete_job")
@@ -1489,6 +1503,111 @@ def test_launch_host_creates_secret_then_job_and_returns_workspace(
     assert batch.created_jobs[0]["metadata"]["name"] == "omnigent-job-1"
     # Nothing torn down on success.
     assert batch.deleted_jobs == []
+
+
+def test_launch_host_makes_the_job_own_its_token_secret(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """
+    The token Secret is patched to be owned by the Job right after the Job
+    exists, so a Job reaped by activeDeadlineSeconds + ttlSecondsAfterFinished
+    (which never runs terminate()) takes its Secret with it instead of leaking
+    it into the namespace's count/secrets quota.
+    """
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    _launcher().start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert core.secret_patches == [
+        (
+            "omnigent-job-1-token",
+            {
+                "metadata": {
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "name": "omnigent-job-1",
+                            "uid": "uid-job-1",
+                        }
+                    ]
+                }
+            },
+        )
+    ]
+    # Adopted only once the owner exists (and before readiness polling).
+    assert batch.calls.index("create_job") == 0
+    assert core.calls.index("patch_secret") > core.calls.index("create_secret")
+    assert core.calls.index("patch_secret") < core.calls.index("list_pod")
+
+
+def test_launch_host_survives_a_forbidden_secret_adoption(
+    fake_clients: tuple[_FakeCore, _FakeBatch], caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A Role without `patch` on secrets (every deployment before this change)
+    must not break launches: the owner is skipped with a pointed warning and
+    the Secret is still removed by terminate(), as before.
+    """
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    core.patch_secret_error = _FakeApiException(status=403, reason="Forbidden")
+    with caplog.at_level(logging.WARNING, logger=k8s.__name__):
+        workspace = _launcher().start_host(
+            "omnigent-job-1",
+            token=_TOKEN,
+            host_id="host_1",
+            host_name="managed-1",
+            server_url="http://srv.example.com",
+        )
+    assert workspace == "/home/omnigent/workspace"
+    assert batch.deleted_jobs == [] and core.deleted_secrets == []
+    assert "omnigent-job-1-token" in caplog.text
+    assert "grant `patch` on `secrets`" in caplog.text
+
+
+def test_launch_host_skips_adoption_when_the_job_has_no_uid(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """No uid on the create response means nothing can own the Secret: no patch."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    batch.job_uid = None
+    _launcher().start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    assert "patch_secret" not in core.calls
+
+
+@pytest.mark.parametrize(
+    ("obj", "expected"),
+    [
+        (
+            SimpleNamespace(metadata=SimpleNamespace(name="j", uid="u")),
+            {"apiVersion": "batch/v1", "kind": "Job", "name": "j", "uid": "u"},
+        ),
+        (
+            {"metadata": {"name": "j", "uid": "u"}},
+            {"apiVersion": "batch/v1", "kind": "Job", "name": "j", "uid": "u"},
+        ),
+        ({"metadata": {"name": "j"}}, None),
+        (SimpleNamespace(metadata=SimpleNamespace(name="j", uid="")), None),
+        (None, None),
+        ({}, None),
+    ],
+)
+def test_owner_reference_reads_typed_and_dict_responses(obj: object, expected: object) -> None:
+    """Both client response shapes work; a missing name/uid yields no owner."""
+    assert k8s.owner_reference("batch/v1", "Job", obj) == expected
 
 
 def test_launch_host_threads_pvc_mounts_into_the_job(
