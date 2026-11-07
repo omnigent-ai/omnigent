@@ -941,6 +941,16 @@ describe("useSessionReconnect", () => {
     },
   );
 
+  it("counts a launch the server reports in progress as starting", () => {
+    useChatStore.setState({ conversationId: "session", sandboxStatus: { stage: "provisioning" } });
+    const { result, rerender } = renderHook(() => useSandboxStarting("session"));
+    // A wake from before a session switch, another tab, or a sent message.
+    expect(result.current).toBe(true);
+    act(() => useChatStore.setState({ sandboxStatus: { stage: "failed", error: "x" } }));
+    rerender();
+    expect(result.current).toBe(false);
+  });
+
   it("tells other panels while Reconnect host wakes the shown session's sandbox", async () => {
     vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
     const { result, rerender } = renderHook(

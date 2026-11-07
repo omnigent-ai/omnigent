@@ -1455,8 +1455,9 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
-    // Files and Changes need the session's host, so picking one wakes an asleep sandbox.
-    if ((tab === "files" || tab === "changes") && conversationId) {
+    // Files, Changes and Pull Requests need the session's host, so picking one wakes
+    // an asleep sandbox.
+    if ((tab === "files" || tab === "changes" || tab === "github") && conversationId) {
       requestSandboxWake(conversationId);
     }
     onRightRailTabChange(tab);

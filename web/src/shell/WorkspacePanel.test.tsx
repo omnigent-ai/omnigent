@@ -569,7 +569,7 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
   });
 
-  it("asks to wake the sandbox when Files or Changes is picked, not other tabs", () => {
+  it("asks to wake the sandbox when Files, Changes or Pull Requests is picked, not Agents", () => {
     requestSandboxWakeMock.mockClear();
     writeDefaultWorkspaceTab("changes");
     renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
@@ -580,6 +580,9 @@ describe("WorkspacePanel surface presentation", () => {
     expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
     expect(pressTabNumber(1)).toBe(false);
     expect(requestSandboxWakeMock).toHaveBeenCalledTimes(2);
+    // Pull Requests also loads its details from the host.
+    expect(pressTabNumber(3)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(3);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {

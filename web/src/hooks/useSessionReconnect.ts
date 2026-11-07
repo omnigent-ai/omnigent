@@ -67,13 +67,23 @@ function markSandboxStarting(sessionId: string, delta: 1 | -1): void {
   for (const listener of startingListeners) listener();
 }
 
-/** Whether Reconnect host is waking *sessionId*'s sandbox, as its host dot shows. */
+/**
+ * Whether *sessionId*'s sandbox is starting, as its host dot shows: Reconnect
+ * host is waking it, or the server reports its launch in progress (a wake from
+ * before a session switch, another tab, or a sent message).
+ */
 export function useSandboxStarting(sessionId: string | null | undefined): boolean {
   const read = useCallback(
     () => (sessionId ? startingSandboxes.has(sessionId) : false),
     [sessionId],
   );
-  return useSyncExternalStore(subscribeStartingSandboxes, read);
+  const waking = useSyncExternalStore(subscribeStartingSandboxes, read);
+  const launching = useChatStore((s) =>
+    s.conversationId === sessionId && s.sandboxStatus !== null
+      ? !isSandboxLaunchStopped(s.sandboxStatus)
+      : false,
+  );
+  return waking || launching;
 }
 
 /** Identifies a reported launch stage by value; snapshots rebuild the object. */
