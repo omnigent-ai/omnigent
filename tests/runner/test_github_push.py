@@ -317,9 +317,9 @@ def checkout(tmp_path: Path) -> tuple[Path, Path]:
 @pytest.mark.parametrize(
     "command",
     [
-        "git shipit 2>&1 | tail -1",
-        "git push -q origin HEAD:feature/topic",
-        "sh push.sh > /dev/null 2>&1",
+        pytest.param("git shipit 2>&1 | tail -1", id="alias-piped"),
+        pytest.param("git push -q origin HEAD:feature/topic", id="quiet"),
+        pytest.param("sh push.sh > /dev/null 2>&1", id="script-redirected"),
     ],
 )
 def test_reflog_reports_pushes_the_output_cannot_show(
@@ -388,16 +388,39 @@ def checked_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
 @pytest.mark.parametrize(
     "cwd,arguments,directories",
     [
-        ("/work/repo", {"command": "git pp 2>&1 | tail -3"}, ["/work/repo"]),
-        ("/work", {"command": "cd repo && git pp | tail -3"}, ["/work/repo"]),
-        (None, {"command": "git -C /work/repo pp && echo done"}, ["/work/repo"]),
-        (None, {"command": "git pp"}, []),
+        pytest.param(
+            "/work/repo", {"command": "git pp 2>&1 | tail -3"}, ["/work/repo"], id="hook-cwd"
+        ),
+        pytest.param(
+            "/work", {"command": "cd repo && git pp | tail -3"}, ["/work/repo"], id="relative-cd"
+        ),
+        pytest.param(
+            None,
+            {"command": "git -C /work/repo pp && echo done"},
+            ["/work/repo"],
+            id="git-C-without-cwd",
+        ),
+        pytest.param(None, {"command": "git pp"}, [], id="no-directory"),
         # An explicit workdir is where the command ran, relative to the hook cwd.
-        ("/work", {"cmd": "./push.sh", "workdir": "repo"}, ["/work/repo"]),
-        # Output attribution rejects "||", but the checkouts still get checked.
-        ("/work/repo", {"command": "git pp || true"}, ["/work/repo"]),
-        ("/work", {"command": "cd repo && git pp || echo failed"}, ["/work", "/work/repo"]),
-        (None, {"command": "git -C /work/repo pp || true"}, ["/work/repo"]),
+        pytest.param(
+            "/work", {"cmd": "./push.sh", "workdir": "repo"}, ["/work/repo"], id="relative-workdir"
+        ),
+        # Output attribution rejects OR-lists, but their checkouts still get checked.
+        pytest.param(
+            "/work/repo", {"command": "git pp || true"}, ["/work/repo"], id="or-list-hook-cwd"
+        ),
+        pytest.param(
+            "/work",
+            {"command": "cd repo && git pp || echo failed"},
+            ["/work", "/work/repo"],
+            id="or-list-relative-cd",
+        ),
+        pytest.param(
+            None,
+            {"command": "git -C /work/repo pp || true"},
+            ["/work/repo"],
+            id="or-list-git-C-without-cwd",
+        ),
     ],
 )
 def test_native_hook_checks_the_directories_the_command_ran_in(
