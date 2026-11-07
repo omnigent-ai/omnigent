@@ -11,6 +11,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict, Unpack
 
@@ -34,11 +35,13 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     PingFrame,
+    PongFrame,
     RequestCancelFrame,
     RequestFrame,
     WSCloseFrame,
     WSFrame,
     WSOpenFrame,
+    decode_frame,
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import (
@@ -1284,6 +1287,8 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert attributes["attempt"] == 1
     assert attributes["pid"] == os.getpid()
     assert attributes["downtime_s"] is None
+    # A first connect reports how long the process took to come up.
+    assert attributes["process_age_ms"] >= 0
     assert attributes["protocol_keepalive_source"] == "websockets_connection"
     assert attributes["protocol_ping_interval_s"] == keepalive[0]
     assert attributes["protocol_ping_timeout_s"] == keepalive[1]
@@ -1346,6 +1351,7 @@ async def test_serve_tunnel_once_sends_bearer_header(
     assert reconnected["reconnect"] is True
     assert reconnected["attempt"] == 2
     assert reconnected["downtime_s"] >= 1.5
+    assert reconnected["process_age_ms"] is None
     assert json.loads(captured["sent"])["connection_id"] == "conn-reconnect"
 
 
@@ -2066,6 +2072,47 @@ async def test_handle_tunnel_frame_drops_malformed_frame(
 
     assert dispatch_tasks == {}
     assert sent == []
+
+
+def _report_keep_warm_failure() -> bool:
+    raise RuntimeError("activity state unavailable")
+
+
+@pytest.mark.parametrize(
+    ("report_keep_warm", "expected"),
+    [
+        pytest.param(None, None, id="not-reported"),
+        pytest.param(lambda: True, True, id="keep-warm"),
+        pytest.param(lambda: False, False, id="let-it-stop"),
+        # Keeping a sandbox warm one extra interval beats stopping an in-use one.
+        pytest.param(_report_keep_warm_failure, True, id="failing-report-keeps-warm"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pong_carries_the_runners_keep_warm_report(
+    report_keep_warm: Callable[[], bool] | None, expected: bool | None
+) -> None:
+    """A ping is answered with a pong carrying the runner's keep-warm report.
+
+    :param report_keep_warm: The runner's keep-warm callback, or ``None``.
+    :param expected: The ``keep_warm`` value the pong must carry.
+    :returns: None.
+    """
+    sent: list[str] = []
+
+    async def _send_text(text: str) -> None:
+        sent.append(text)
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        encode_frame(PingFrame(ts=123)),
+        _send_text,
+        {},
+        {},
+        report_keep_warm=report_keep_warm,
+    )
+
+    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, keep_warm=expected)]
 
 
 @pytest.mark.asyncio
@@ -3921,3 +3968,50 @@ async def test_pending_sign_in_cancellation_clears_launch_marker(tmp_path, monke
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def test_linux_process_age_ms_uses_the_boot_relative_clock(tmp_path: Path) -> None:
+    """Age is uptime minus the process start time, both boot-relative."""
+    (tmp_path / "self").mkdir()
+    (tmp_path / "uptime").write_text("1000.50 4000.00\n")
+    ticks_per_s = os.sysconf("SC_CLK_TCK")
+    start_ticks = int(998.25 * ticks_per_s)
+    # A command name with spaces and ")" must not shift the fields.
+    fields = ["S", *["0"] * 18, str(start_ticks), "0"]
+    (tmp_path / "self" / "stat").write_text(f"123 (python (x) y) {' '.join(fields)}\n")
+
+    assert serve_module._linux_process_age_ms(str(tmp_path)) == 2250
+
+
+def test_linux_process_age_ms_is_none_without_procfs(tmp_path: Path) -> None:
+    assert serve_module._linux_process_age_ms(str(tmp_path / "missing")) is None
+
+
+def test_process_age_ms_falls_back_to_psutil_off_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without procfs, the age is wall time since psutil's creation time."""
+
+    class _Process:
+        def create_time(self) -> float:
+            return 1_000.0
+
+    monkeypatch.setattr(serve_module, "_linux_process_age_ms", lambda: None)
+    monkeypatch.setattr("psutil.Process", _Process)
+    monkeypatch.setattr(serve_module.time, "time", lambda: 1_002.5)
+
+    assert serve_module._process_age_ms() == 2_500
+
+
+def test_process_age_ms_is_none_when_the_process_is_unreadable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A psutil failure leaves the age unknown instead of failing the connect row."""
+    import psutil
+
+    class _Process:
+        def create_time(self) -> float:
+            raise psutil.AccessDenied()
+
+    monkeypatch.setattr(serve_module, "_linux_process_age_ms", lambda: None)
+    monkeypatch.setattr("psutil.Process", _Process)
+
+    assert serve_module._process_age_ms() is None
