@@ -667,6 +667,22 @@ def test_outside_checkout_still_serves_manually_linked_mr(tmp_path: Path, api: M
     assert module.PULL_REQUESTS.reference_info(str(tmp_path), ref())["pr"]["number"] == 7
 
 
+def test_commit_history_is_refused_for_merge_requests(
+    root: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from omnigent.runner import pr_resource
+    from omnigent.runner.session_prs import SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    SessionPrRegistry("gitlab-commits").record([ref()], relationship="attached", source="test")
+    assert module.PULL_REQUESTS.capabilities.commit_history is False
+    message = "Listing commits is not supported for GitLab merge request"
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commits(root, session_id="gitlab-commits", pr_url=URL, head_sha=HEAD)
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commit_diff(root, session_id="gitlab-commits", pr_url=URL, commit_sha=BASE)
+
+
 def test_upstream_remote_precedence_preserves_other_gitlab_remotes(root: str) -> None:
     for args in (
         ["remote", "add", "upstream", "https://gitlab.com/team/sub/project.git"],

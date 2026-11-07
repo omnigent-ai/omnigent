@@ -2,7 +2,13 @@
 
 from typing import Any
 
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.tools.base import Tool
+
+
+def peer_session_messaging_enabled() -> bool:
+    """Whether this process's ``OMNIGENT_FEATURES`` leaves peer messaging enabled."""
+    return resolve_feature_flags().enabled(Feature.PEER_SESSION_MESSAGING)
 
 
 class SysSessionMessageTool(Tool):

@@ -261,6 +261,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
 # boot), so a healthy launch registers in seconds; the budget covers a
 # cold registry pull of the image on first use.
 MANAGED_HOST_ONLINE_TIMEOUT_S = 120
+_MANAGED_RECOVERY_HEARTBEAT_S = 20
 _ONLINE_POLL_INTERVAL_S = 1.0
 
 # Provider defaults; sandbox.token_ttl_s can override these windows.
@@ -984,6 +985,8 @@ class ManagedHostLaunch:
 
     host_id: str
     workspace: str
+    sandbox_id: str | None = None
+    sandbox_provider: str | None = None
 
 
 # A full 40-hex object id — rejected as a clone fragment: cloning a
@@ -3950,7 +3953,12 @@ async def launch_managed_host(
             slice_key_enabled=slice_key_enabled,
             owner_credentials=config.owner_credentials,
         )
-    return ManagedHostLaunch(host_id=host_id, workspace=workspace)
+    return ManagedHostLaunch(
+        host_id=host_id,
+        workspace=workspace,
+        sandbox_id=sandbox_id,
+        sandbox_provider=launcher.provider,
+    )
 
 
 async def relaunch_managed_host(
@@ -3964,14 +3972,100 @@ async def relaunch_managed_host(
     slice_key_enabled: bool = False,
     launch_state: ManagedLaunch | None = None,
 ) -> ManagedHostLaunch:
+    """Recover shared compute once across all bound sessions and server replicas."""
+    token = secrets.token_urlsafe(32)
+    try:
+        claimed = await asyncio.to_thread(host_store.claim_managed_recovery, host, token)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not claimed:
+        try:
+            async with asyncio.timeout(MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S):
+                while True:
+                    try:
+                        result = await asyncio.to_thread(
+                            host_store.managed_recovery_result, host.host_id
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    if result is not None:
+                        return ManagedHostLaunch(
+                            host_id=host.host_id,
+                            workspace=result[0],
+                            sandbox_id=result[1],
+                            sandbox_provider=host.sandbox_provider,
+                        )
+                    await asyncio.sleep(0.5)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status_code=504,
+                detail="Timed out waiting for shared sandbox recovery; retry once it is ready",
+            ) from exc
+
+    async def renew() -> None:
+        while True:
+            await asyncio.sleep(_MANAGED_RECOVERY_HEARTBEAT_S)
+            try:
+                if not await asyncio.to_thread(
+                    host_store.update_managed_recovery, host.host_id, token
+                ):
+                    return
+            except Exception:
+                _logger.warning("Failed to renew sandbox recovery lease", exc_info=True)
+
+    heartbeat = asyncio.create_task(renew())
+    result = None
+    try:
+        result = await _relaunch_managed_host(
+            config=config,
+            host=host,
+            host_store=host_store,
+            repos=repos,
+            agent_name=agent_name,
+            on_stage=on_stage,
+            slice_key_enabled=slice_key_enabled,
+            recovery_token=token,
+            launch_state=launch_state,
+        )
+        return result
+    finally:
+        heartbeat.cancel()
+        try:
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        finally:
+            try:
+                await asyncio.to_thread(
+                    host_store.update_managed_recovery,
+                    host.host_id,
+                    token,
+                    finished=True,
+                    workspace=result.workspace if result else None,
+                    sandbox_id=result.sandbox_id if result else None,
+                )
+            except Exception:
+                _logger.warning("Failed to finish sandbox recovery lease", exc_info=True)
+
+
+async def _relaunch_managed_host(
+    *,
+    config: ManagedSandboxDeployment,
+    host: Host,
+    host_store: HostStore,
+    repos: Sequence[RepoWorkspace] = (),
+    agent_name: str | None = None,
+    on_stage: SandboxStageObserver | None = None,
+    recovery_token: str | None = None,
+    slice_key_enabled: bool = False,
+    launch_state: ManagedLaunch | None = None,
+) -> ManagedHostLaunch:
     """
     Provision a NEW sandbox generation for an existing managed host.
 
     The host identity is durable while its sandbox is not: when the
     sandbox dies (the provider's lifetime cap, a crash, a manual
     terminate), the host row and the sessions bound to it remain.
-    This relaunch keeps that identity — terminate the old sandbox
-    (best-effort; it is usually already gone), provision a fresh one,
+    This relaunch keeps that identity — drain recorded sandbox generations,
+    provision a fresh one,
     and re-arm the SAME host row with a new token + sandbox id (which
     atomically revokes the previous generation's token).
 
@@ -4017,16 +4111,26 @@ async def relaunch_managed_host(
     entry = config.recorded(host.sandbox_provider)
     await _select_launch_profile(launcher, entry, host.user_id)
     repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
-    # The old generation is normally already dead (that is why we are
-    # here), but terminate defensively so a transient tunnel outage
-    # can never leave two live sandboxes claiming one host identity.
-    if host.sandbox_id is not None:
-        await _terminate_sandbox_best_effort(
-            launcher,
-            host.sandbox_id,
-            host_id=host.host_id,
-            provider=host.sandbox_provider,
-        )
+    # ponytail: one pending cleanup slot; drain recorded generations before replacing them.
+    for sandbox_id in dict.fromkeys((host.terminating_sandbox_id, host.sandbox_id)):
+        if sandbox_id is None:
+            continue
+        try:
+            await asyncio.to_thread(launcher.terminate, sandbox_id)
+        except OwnerCredentialMissingError as exc:
+            raise HTTPException(status_code=409, detail=exc.message) from exc
+        except Exception as exc:
+            _logger.warning(
+                "Failed to clean up sandbox %s before recovery", sandbox_id, exc_info=True
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="Previous managed sandbox cleanup failed; retry recovery",
+            ) from exc
+        if sandbox_id == host.terminating_sandbox_id:
+            await asyncio.to_thread(
+                host_store.mark_sandbox_terminated, host.host_id, sandbox_id=sandbox_id
+            )
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
@@ -4052,6 +4156,8 @@ async def relaunch_managed_host(
                 agent_name=agent_name,
                 on_stage=on_stage,
                 keep_host_on_failure=True,
+                expected_host=host,
+                recovery_token=recovery_token,
                 slice_key_enabled=slice_key_enabled,
             )
     except ValueError as exc:
@@ -4059,7 +4165,12 @@ async def relaunch_managed_host(
             status_code=409,
             detail=f"managed sandbox relaunch conflicted with host lifecycle: {exc}",
         ) from exc
-    return ManagedHostLaunch(host_id=host.host_id, workspace=workspace)
+    return ManagedHostLaunch(
+        host_id=host.host_id,
+        workspace=workspace,
+        sandbox_id=sandbox_id,
+        sandbox_provider=launcher.provider,
+    )
 
 
 def _apply_git_clone_options(
@@ -4175,6 +4286,8 @@ async def _register_and_start_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     keep_host_on_failure: bool = False,
+    recovery_token: str | None = None,
+    expected_host: Host | None = None,
     slice_key_enabled: bool = False,
     owner_credentials: Mapping[str, Callable[[str], Mapping[str, object] | None]] | None = None,
 ) -> str:
@@ -4228,6 +4341,8 @@ async def _register_and_start_host(
         if keep_host_on_failure:
             record = await asyncio.to_thread(
                 host_store.replace_managed_host_sandbox,
+                expected_host=expected_host,
+                recovery_token=recovery_token,
                 host_id=host_id,
                 user_id=owner,
                 token=token,
@@ -4292,13 +4407,24 @@ async def _register_and_start_host(
             if isinstance(exc, ValueError):
                 raise
         elif keep_host_on_failure:
-            await _terminate_sandbox_best_effort(
-                launcher,
-                sandbox_id,
-                host_id=record.host_id,
-                provider=record.sandbox_provider,
-            )
-            await asyncio.to_thread(host_store.revoke_launch_token, host_id)
+            # A late connection or a replacement generation owns its credential.
+            try:
+                current = await asyncio.to_thread(host_store.get_host, host_id)
+                detached = current is not None and await asyncio.to_thread(
+                    host_store.detach_stale_managed_sandbox,
+                    host_id,
+                    sandbox_id=sandbox_id,
+                    expected_updated_at=current.updated_at,
+                    expected_token=token,
+                )
+                if detached and await _terminate_sandbox_best_effort(
+                    launcher, sandbox_id, host_id=record.host_id, provider=record.sandbox_provider
+                ):
+                    await asyncio.to_thread(
+                        host_store.mark_sandbox_terminated, host_id, sandbox_id=sandbox_id
+                    )
+            except Exception:
+                _logger.exception("Could not clean up failed host relaunch")
         else:
             # The row was just armed with THIS single-provider config, so a
             # one-provider deployment tears it back down as the same owner.
@@ -4308,6 +4434,7 @@ async def _register_and_start_host(
                 ManagedSandboxDeployment(
                     configs=(config,), owner_credentials=owner_credentials or {}
                 ),
+                keep_if_bound=True,
             )
         if isinstance(exc, HTTPException):
             raise
@@ -4623,7 +4750,10 @@ async def terminate_managed_host(
         terminating, e.g. after a client saw the session's turn fail.
     """
     tombstone = await asyncio.to_thread(
-        host_store.delete_host, host.host_id, keep_if_bound=keep_if_bound
+        host_store.delete_host,
+        host.host_id,
+        keep_if_bound=keep_if_bound,
+        expected_host=host if keep_if_bound else None,
     )
     if tombstone is None:
         return
@@ -4669,7 +4799,7 @@ async def release_session_managed_host(
         still deleted and its token revoked).
     :param capture_logs: Log the sandbox's log tails before terminating.
     """
-    host = await asyncio.to_thread(host_store.get_host, host_id)
+    host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
     if host is None or host.sandbox_provider is None:
         return
     await terminate_managed_host(

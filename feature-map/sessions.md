@@ -9,6 +9,16 @@ the header menu), and each place is a separate entry point.
 
 ## Sub-features
 
+- `siblings`: **Add nested agent** creates a private, fresh conversation in the
+  same sidebar family. Its composer follows the server's Add Agent destination
+  policy and offers only the clicked member's ephemeral host among existing
+  managed hosts, preselected. Siblings have one
+  indentation level with curved connectors and are absent from the Agents panel.
+  Archive/delete promotes the oldest active member; compute survives while any
+  session remains bound. The representative pins/moves the family; individual
+  pins appear only in Pinned and return to their nest when unpinned. Existing
+  sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
+
 - `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
@@ -19,7 +29,7 @@ the header menu), and each place is a separate entry point.
 - `pin-reorder`: drag a pinned row onto another pinned row to change the Pinned
   order, which persists across reloads; dropping an unpinned row onto a pinned
   row pins it into that slot.
-- `custom-order`: behind `sidebar_grouping_ui`, drop one of your sessions onto
+- `custom-order`: with `sidebar_grouping_ui` (on by default), drop one of your sessions onto
   another row of the same list, project or group (or use Move up/down) to switch
   Ordering to Custom. Positions are saved on this device and new sessions appear
   above them; a drop on another project's row still files the session there.
@@ -197,8 +207,9 @@ the header menu), and each place is a separate entry point.
   All groupings replace
   Projects, Shared and Sessions with titled groups; the first group's header takes
   the Projects header's place. Select sessions sits beside the filter and selects every list below it at once. Behind
-  the `sidebar_grouping_ui` release flag; with it off, the Sessions header keeps
-  a flat Display filter and the tooltip keeps its plain layout.
+  the `sidebar_grouping_ui` release flag, on by default; with
+  `OMNIGENT_FEATURES=-sidebar_grouping_ui`, the Sessions header keeps a flat
+  Display filter and the tooltip keeps its plain layout.
 - `mobile-drawer-swipe`: on phone layouts, swiping left on the open sidebar
   drawer or the dimmed chat strip beside it drags the drawer shut. Lifting past
   a third of its width, or after a quick flick, closes it; a shorter drag springs
@@ -206,6 +217,13 @@ the header menu), and each place is a separate entry point.
   keep their own touch handling.
 
 ## How to get to it (user POV)
+
+- For siblings, open an owned active session's sidebar kebab, right-click menu,
+  or header menu and choose **Add nested agent**. Mobile row/header menus offer
+  the same action. On desktop, Cmd/Ctrl+Alt+A opens **Add nested agent** for the active
+  session. Select a host in the composer and send the first message.
+  Server admins configure the available targets under Settings → Admin → General →
+  **Nested agent destinations**.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
@@ -286,7 +304,7 @@ use Settings → Appearance → Sidebar.
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
 that slot.
 
-**Custom order:** with `sidebar_grouping_ui` on, drag one of your sessions onto
+**Custom order:** with `sidebar_grouping_ui` on (the default), drag one of your sessions onto
 another row in the same list, project or group and release it; a line like the
 Pinned section's marks where it lands. Move up and Move down in the row menu or
 right-click menu do the same. On mobile, press and hold a row in the sidebar
@@ -344,13 +362,15 @@ action offers the same choices.
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
+The prompt explains that worktrees inside sandboxes or used by other sessions,
+including archived sessions, are retained.
 Dismissing it cancels the archive. Settings → Git → Worktrees holds the saved
 choice only when the server supports cleanup.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
 
-**Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
+**Sidebar filter menu:** with `sidebar_grouping_ui` on (the default), the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
 Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
@@ -438,6 +458,17 @@ toast while the dot keeps spinning on the server's stage.
 Reloading during the wake keeps it spinning, with the stage (for example
 "Provisioning sandbox") in the chip's tooltip and in the chat. Reconnect host
 stays in the menu then, in case that stage never finishes.
+Opening such a session presses Reconnect host for the user once the session
+has stayed open for a second in a visible tab, and so does picking Files,
+Changes or Pull Requests in the Workspace rail. This only happens for editors,
+on an idle session whose launch isn't already running, and does exactly what
+pressing Reconnect host does. Each opening checks once, so a session that sleeps again
+while it stays open waits for Reconnect host, a Files, Changes or Pull
+Requests pick, or a message. Every way of waking
+the sandbox (Reconnect host, opening the session, Files or Changes, the
+terminal's Resume) joins one wake per session, including after switching to
+another session and back, and the Files and Pull Requests views say the
+sandbox is starting while it runs or the server reports its launch.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -476,11 +507,15 @@ chat, otherwise it springs back. Settings and desktop widths don't use it.
 sidebar menus, and message actions, and offers the same destinations as any
 other session: connected hosts and each offered sandbox provider. Sessions
 labelled `omnigent.host_type: managed` fork the same way. The source's own
-sandbox host is never listed, since pickers show connected hosts only. A fork
+sandbox is offered as **Same sandbox** when shared-sandbox support is available;
+it keeps the working directory and creates a standalone fork with copied history.
+Other sessions' ephemeral sandboxes are omitted, and an offline source cannot
+be selected. Older servers keep the fresh-sandbox choices. A fork
 of any sandbox session defaults to a fresh sandbox from the source's provider
-when the server offers it, and otherwise to a connected host.
-**Continue in another directory…** on these sessions continues on a connected
-host; like any recovery, it never offers a new sandbox. The composer's host
+when the server offers it, otherwise to its reusable online sandbox, then to a
+connected host.
+**Continue in another directory…** can use a connected host or the same online
+sandbox, with an explicitly chosen existing directory; it never offers a new sandbox. The composer's host
 menu shows a disabled **Switch host…** item when you have write access.
 Read-only viewers retain the existing host menu without switching controls.
 Hover or focus a disabled action to read why it is unsupported.
@@ -737,6 +772,8 @@ plain `uv run pytest`, which starts a private server for the test.
   runs without a repro instance using `uv run pytest <test>
 --browser-ui-skip-build --video=on --output=<evidence-directory>`.
   Each entry checks current-branch prefilling and the unpushed-branch fallback.
+  Each also selects **Same sandbox**, checks directory reuse and exclusion of
+  unrelated sandboxes, then switches back to a fresh sandbox.
   Desktop and phone header variants remove a repo, search for another, choose
   independent branches, and check the fork request and navigation. The message
   variant submits the inherited selection and checks the history cutoff; sidebar
@@ -965,12 +1002,16 @@ plain `uv run pytest`, which starts a private server for the test.
   and a message that waits for the host, not live SSH or the desktop's consent
   console.
 - **`reconnect`, asleep sandbox:**
-  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_wakes_asleep_sandbox_in_status_dot`
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_opening_asleep_session_wakes_sandbox_in_status_dot`
   drives the real SPA and server with the session patched to an asleep Arclet
-  host. It checks that Reconnect host sends `retry_session`, spins the chip and
-  menu dots with no toast, and turns them green once `/health` reports the host
-  online. Sibling tests cover a failed wake's error toast and retry, a
-  session opened mid-wake, and a wake whose stage outlasts its limit. None
+  host. It checks that opening the session sends `retry_session` on its own,
+  spins the chip and menu dots with no toast, and turns them green once
+  `/health` reports the host online. Sibling tests cover a failed wake's error
+  toast and Reconnect host retry, a session opened mid-wake, and a wake whose
+  stage outlasts its limit. The open dwell, Files/Changes/Pull Requests picks, and the
+  one-wake-per-session sharing are covered by
+  `web/src/hooks/useSandboxAutoWake.test.ts` and
+  `web/src/hooks/useSessionReconnect.test.ts`. None
   of them resume a live sandbox.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
@@ -1121,7 +1162,7 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
-  (enable the flag by patching `GET /v1/info`). Unit tests in
+  (the flag-off case disables it by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
 - **`project-show-more`:** no browser test drives it. Component tests in
@@ -1159,7 +1200,34 @@ the hidden rail's tabs stay open and the app returns to the new-session page.
 Native accelerator delivery requires an Electron run; component tests cover
 selection, visibility, and stop failure.
 
+Own-environment sibling CUJs: `uv run --no-sync pytest
+ tests/e2e_ui/sessions/test_sibling_sessions.py --ui-skip-build --reruns 0`.
+This uses real replicas/hosts/runners with local sandbox allocation and a scripted
+model. It covers desktop kebab/right-click/header and mobile long-press/header
+composer navigation, shared/fresh compute, pin/project/fork actions, archive/undo,
+and survivor messaging after representative deletion. It also checks that expanded
+family rows hide actions when not hovered, deletion keeps peers nested before the
+server responds, and personal pins appear only once. Set `OMNIGENT_DEMO_DIR`
+outside the checkout to retain recordings.
+The component tests in `web/src/shell/HeaderConversationMenu.test.tsx` and
+`web/src/components/KeyboardShortcutsDialog.test.tsx` cover Cmd/Ctrl+Alt+A and
+its discoverability.
+
 ## Gotchas
+
+- Family membership is owner-only navigation context, not a sharing grant.
+  Siblings start private even if the source has readers. Edit-shared sources
+  cannot create siblings. Shared viewers see flat rows.
+- Families are bounded to 100 retained members, including archived members.
+  Use the row chevron to **Collapse session family** or **Expand session family**.
+- Nested creation and same-sandbox fork selection require the default-off
+  `OMNIGENT_FEATURES=sibling_sessions` flag. Reload the UI after enabling it.
+  Opening a saved **Add nested agent** link while disabled or on an older server
+  shows an unavailable message instead of a composer that cannot submit.
+- If the source disappears after a rejected create, **Continue in a new session**
+  carries the recovered prompt and attachments into the ordinary composer.
+- Sandbox expiry and explicit whole-host destruction remain separate from
+  deleting one session. Shared compute means a shared filesystem, not history.
 
 - Existing side chats on separate runners must still be closed individually.
   Hostless CLI Stop keeps its existing per-conversation behavior.
