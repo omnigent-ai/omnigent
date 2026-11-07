@@ -135,9 +135,12 @@ checks competing causes, and looks for the design rationale in code and history.
 It does not reverse intentional behavior simply to make a repro test pass.
 Uncertain product choices go to PR review as a supported proposal, with a draft
 and `partially_fixed` outcome when a material choice remains. Missing required
-inputs, credentials, or authorization still block dependent work. Workflow-owned
-publication follows its supplied contract; the prompt does not add draft support
-to the publisher. No new test-selection gate is introduced.
+inputs, credentials, or authorization still block dependent work. Requested
+design comparisons or prototypes go back to a person; a narrow fix delivered
+alongside them, or against a report that rules out symptom fixes, is
+`partially_fixed` and names the unmet request first in `remaining_work`.
+Workflow-owned publication follows its supplied contract; the prompt does not
+add draft support to the publisher. No new test-selection gate is introduced.
 
 ## What it does
 
