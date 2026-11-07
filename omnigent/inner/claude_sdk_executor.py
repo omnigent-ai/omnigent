@@ -36,7 +36,7 @@ import pathlib
 import sys
 import tempfile
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -65,6 +65,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
+from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
@@ -194,6 +195,12 @@ ElicitationHandler: TypeAlias = Callable[
     Awaitable[bool],
 ]
 
+# Adapter bridge: shows AskUserQuestion as a form; returns input+``answers`` or a deny reason.
+AskQuestionHandler: TypeAlias = Callable[
+    [ToolArgs],
+    Awaitable[dict[str, Any] | str],
+]
+
 # Opaque SDK artifacts whose concrete shape we don't touch directly:
 # - ``SdkMcpTool``: returned by ``sdk.tool(...)`` decorator and passed back
 #   to ``sdk.create_sdk_mcp_server(tools=...)`` without field access.
@@ -314,6 +321,8 @@ class _ClaudeClient(Protocol):
     ) -> None: ...
     async def set_model(self, model: str | None) -> None: ...
     async def interrupt(self) -> None: ...
+    async def get_mcp_status(self) -> Mapping[str, object]: ...
+    async def reconnect_mcp_server(self, server_name: str) -> None: ...
 
     # receive_response yields heterogeneous SDK message objects — kept
     # as ``Any`` so the caller can ``isinstance``-narrow onto the SDK's
@@ -414,6 +423,8 @@ class _ClaudeSDK(Protocol):
 
 _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
+_MCP_STATUS_TIMEOUT_SECONDS = 10.0
+_MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -897,6 +908,76 @@ class _ClaudeClientState:
     task: asyncio.Task[None] | None = None
     effort: str | None = None
     transcript: ClaudeCompactionTranscript = field(default_factory=ClaudeCompactionTranscript)
+    # Host-reported account state of each Claude MCP server when last checked.
+    mcp_auth: dict[str, str] = field(default_factory=dict)
+
+
+def _claude_mcp_auth_statuses() -> dict[str, str]:
+    """The host sign-in manager's account state for each Claude MCP server, by name."""
+    try:
+        from omnigent.host.mcp_inventory import read_auth_status_overlay
+
+        overlay = read_auth_status_overlay(pathlib.Path.home())
+    except Exception:
+        logger.warning("Reading MCP auth status failed", exc_info=True)
+        return {}
+    return {
+        name: fields["auth_status"]
+        for (harness, name), fields in overlay.items()
+        if harness == "claude"
+    }
+
+
+def _inventory_mcp_server_name(live_name: str) -> str:
+    """The host inventory's name for a server; the CLI adds ``plugin:<plugin>:`` to plugin ones."""
+    prefix, plugin_sep, rest = live_name.partition(":")
+    if prefix == "plugin" and plugin_sep:
+        _plugin, server_sep, server = rest.partition(":")
+        if server_sep and server:
+            return server
+    return live_name
+
+
+async def _reconnect_failed_mcp_servers(client: _ClaudeClient, names: set[str]) -> set[str]:
+    """Reconnect the named servers the CLI reports failed; return those to check again.
+
+    :raises TimeoutError: The CLI did not answer in time and is still busy with the request.
+    """
+    try:
+        response = await asyncio.wait_for(
+            client.get_mcp_status(), timeout=_MCP_STATUS_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        logger.warning("Reading MCP status before reconnect failed", exc_info=True)
+        return names
+    retry: set[str] = set()
+    # (live CLI name, host inventory name) of each server to reconnect.
+    failed: list[tuple[str, str]] = []
+    servers = response.get("mcpServers")
+    for server in servers if isinstance(servers, list) else []:
+        live_name = server.get("name") if isinstance(server, Mapping) else None
+        if not isinstance(live_name, str):
+            continue
+        name = _inventory_mcp_server_name(live_name)
+        if name not in names:
+            continue
+        status = server.get("status")
+        if status == "pending":
+            retry.add(name)
+        elif status in ("failed", "needs-auth"):
+            failed.append((live_name, name))
+
+    # The CLI handles control requests one at a time, so the reconnects share one budget.
+    async with asyncio.timeout(_MCP_RECONNECT_TIMEOUT_SECONDS):
+        for live_name, name in failed:
+            try:
+                await client.reconnect_mcp_server(live_name)
+            except Exception:
+                logger.warning("Reconnecting MCP server %r failed", live_name, exc_info=True)
+                retry.add(name)
+    return retry
 
 
 @dataclass(frozen=True)
@@ -952,6 +1033,20 @@ def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
     }
 
 
+def _mark_mcp_error(response: McpResponse) -> McpResponse:
+    """Flag an SDK MCP handler response as a tool error, in both spellings.
+
+    ``claude_agent_sdk.create_sdk_mcp_server`` builds the wire result from the
+    handler's snake_case ``is_error`` only (``CallToolResult(isError=
+    result.get("is_error", False))``), so a response carrying just ``isError``
+    reaches the model as a success. ``isError`` is kept for native MCP
+    clients and existing readers of these dicts.
+    """
+    response["is_error"] = True
+    response["isError"] = True
+    return response
+
+
 def _build_mcp_tools(
     tool_schemas: list[ToolSpec],
     tool_executor: ToolExecutor | None,
@@ -979,16 +1074,18 @@ def _build_mcp_tools(
         def _make_handler(tool_name: str) -> Callable[[ToolArgs], Awaitable[McpResponse]]:
             async def handler(args: ToolArgs) -> McpResponse:
                 if tool_executor is None:
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe(
-                                    {"error": f"No tool executor for '{tool_name}'"}
-                                ),
-                            }
-                        ],
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe(
+                                        {"error": f"No tool executor for '{tool_name}'"}
+                                    ),
+                                }
+                            ],
+                        }
+                    )
                 try:
                     # ``tool_executor`` is declared as ``Awaitable[ToolResult]``
                     # so we always await. The isinstance guard below preserves
@@ -1008,18 +1105,19 @@ def _build_mcp_tools(
                     if result.get("blocked") is True or (
                         "error" in result and result.get("error")
                     ):
-                        response["isError"] = True
+                        return _mark_mcp_error(response)
                     return response
                 except Exception as exc:  # noqa: BLE001 — tool handler converts any error to MCP error response
-                    return {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": json_dumps_transport_safe({"error": str(exc)}),
-                            }
-                        ],
-                        "isError": True,
-                    }
+                    return _mark_mcp_error(
+                        {
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": json_dumps_transport_safe({"error": str(exc)}),
+                                }
+                            ],
+                        }
+                    )
 
             return handler
 
@@ -1228,10 +1326,8 @@ def _claude_settings_payload(
 def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
     """Read the ``env`` block of Claude Code's user ``settings.json``.
 
-    Uses ``$CLAUDE_CONFIG_DIR/settings.json`` when set, else
-    ``~/.claude/settings.json``, matching Claude Code's user settings scope.
-    As in Claude Code, ``~`` in ``CLAUDE_CONFIG_DIR`` is not expanded and a
-    relative value is relative to the CLI's working directory.
+    The file is located by
+    :func:`omnigent.onboarding.ambient.read_claude_user_settings`.
 
     :param cwd: The CLI's working directory, e.g. ``"/home/user/repo"``;
         ``None`` means this process's working directory.
@@ -1239,14 +1335,10 @@ def _claude_user_settings_env(cwd: str | None = None) -> dict[str, str]:
         ``{"ANTHROPIC_BEDROCK_BASE_URL": "https://gateway.example"}``; empty
         when the file is missing, unreadable, or has no ``env`` object.
     """
-    configured = os.environ.get("CLAUDE_CONFIG_DIR")
-    config_dir = pathlib.Path(configured) if configured else pathlib.Path.home() / ".claude"
-    settings_path = pathlib.Path(cwd or "") / config_dir / "settings.json"
-    try:
-        settings = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = settings.get("env") if isinstance(settings, dict) else None
+    from omnigent.onboarding.ambient import read_claude_user_settings
+
+    settings = read_claude_user_settings(cwd)
+    env = settings.get("env") if settings is not None else None
     if not isinstance(env, dict):
         return {}
     return {
@@ -1301,19 +1393,17 @@ def _resolve_gateway_env(
         corresponding base URL or auth command.
     """
     host = host_override.rstrip("/") if host_override else None
-    if host is None and base_url_override is not None and auth_command_override is not None:
+    generic_provider = (
+        host is None and base_url_override is not None and auth_command_override is not None
+    )
+    if generic_provider:
         # Generic-provider gateway: explicit base_url + auth command,
         # no Databricks host or profile required (e.g. ApiKeyAuth with
         # a mock LLM server URL).
-        return {
-            "ANTHROPIC_BASE_URL": base_url_override,
-            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
-                auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
-            ),
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command_override,
-        }
-    if host is None:
+        assert base_url_override is not None and auth_command_override is not None
+        base_url = base_url_override
+        auth_command = auth_command_override
+    elif host is None:
         # Only the workspace host is needed here: the auth command mints the
         # bearer at request time. Resolving the host (rather than a static
         # ``(host, token)`` credential pair) keeps OAuth U2M profiles working
@@ -1357,9 +1447,10 @@ def _resolve_gateway_env(
         "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": str(
             auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS
         ),
-        _ANTHROPIC_CUSTOM_HEADERS_ENV: _DATABRICKS_CODING_AGENT_HEADER,
         _CLAUDE_API_KEY_HELPER_ENV_KEY: auth_command,
     }
+    if not generic_provider:
+        gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = _DATABRICKS_CODING_AGENT_HEADER
     # DATABRICKS-PATCH(claude-sdk-gateway-betas)
     # Blanket-disabling betas makes Claude Code strip `interleaved-thinking`,
     # after which the Databricks gateway rejects the malformed thinking blocks
@@ -1372,9 +1463,10 @@ def _resolve_gateway_env(
     if is_databricks_ai_gateway_url(base_url):
         gateway_env["CLAUDE_CODE_USE_GATEWAY"] = "1"
         gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV] = with_gateway_attribution_lines(
-            gateway_env[_ANTHROPIC_CUSTOM_HEADERS_ENV],
+            gateway_env.get(_ANTHROPIC_CUSTOM_HEADERS_ENV),
             CLAUDE_CODE_AGENT,
             via_ug=is_ug_route(base_url),
+            client_surface=harness_client_surface(),
         )
     else:
         gateway_env["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] = "1"
@@ -1839,6 +1931,8 @@ class ClaudeSDKExecutor(Executor):
         # the Omnigent elicitation system rather than silently allowed.
         # ``None`` until the adapter installs it on first use.
         self._elicitation_handler: ElicitationHandler | None = None
+        # AskUserQuestion bridge installed by ExecutorAdapter; None until wired.
+        self._ask_question_handler: AskQuestionHandler | None = None
         # Live Claude SDK clients keyed by Omnigent session id.
         self._clients: dict[str, _ClaudeClientState] = {}
         self._pending_framework_context: dict[str, str] = {}
@@ -1921,11 +2015,7 @@ class ClaudeSDKExecutor(Executor):
         if entrypoint := os.environ.get("OMNIGENT_CLAUDE_CODE_ENTRYPOINT"):
             self._extra_env["CLAUDE_CODE_ENTRYPOINT"] = entrypoint
 
-        # Retry policy → Anthropic SDK env vars passed to the Claude
-        # CLI subprocess. ``ANTHROPIC_MAX_RETRIES`` and
-        # ``ANTHROPIC_REQUEST_TIMEOUT_SECONDS`` are speculative — the
-        # CLI's retry budget isn't publicly documented as env-tunable.
-        # See ``RetryPolicy.claude_cli.env()``.
+        # Pass the retry budget and response-header timeout to the Claude CLI.
         self._retry_policy = retry_policy if retry_policy is not None else RetryPolicy()
         self._extra_env.update(self._retry_policy.claude_cli.env())
 
@@ -1985,6 +2075,7 @@ class ClaudeSDKExecutor(Executor):
     ) -> _ClaudeClient:
         state = self._clients.get(session_key)
         if state is None:
+            mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
@@ -2081,6 +2172,7 @@ class ClaudeSDKExecutor(Executor):
                 task=current_task,
                 effort=getattr(options, "effort", None),
                 transcript=transcript,
+                mcp_auth=mcp_auth,
             )
             self._clients[session_key] = state
             return client
@@ -2089,6 +2181,37 @@ class ClaudeSDKExecutor(Executor):
             await state.client.set_model(model)
             state.model = model
         return state.client
+
+    async def _reconnect_signed_in_mcp_servers(self, state: _ClaudeClientState) -> bool:
+        """Reconnect servers the host reports signed in since this client last checked.
+
+        The CLI connects MCP servers only at startup, so one that failed while its
+        sign-in was pending stays failed for the life of the client.
+
+        :returns: ``False`` when the CLI is still busy with a timed-out request and
+            would hold the next prompt, so the client must be replaced.
+        """
+        current = _claude_mcp_auth_statuses()
+        signed_in = {
+            name
+            for name, status in current.items()
+            if status == "connected" and state.mcp_auth.get(name) != "connected"
+        }
+        try:
+            retry = (
+                await _reconnect_failed_mcp_servers(state.client, signed_in)
+                if signed_in
+                else set()
+            )
+        except TimeoutError:
+            logger.warning(
+                "Reconnecting MCP servers timed out; restarting the Claude CLI, "
+                "which connects them as it starts"
+            )
+            return False
+        # A server left out of the snapshot is checked again next turn.
+        state.mcp_auth = {name: status for name, status in current.items() if name not in retry}
+        return True
 
     async def close_session(self, session_key: str) -> None:
         self._crashed_sessions.pop(session_key, None)
@@ -2436,6 +2559,130 @@ class ClaudeSDKExecutor(Executor):
         hooks["PreToolUse"] = entries
         options.hooks = hooks
 
+    def _ask_user_question_enabled(self, sdk: _ClaudeSDK) -> bool:
+        """Whether ``AskUserQuestion`` may be exposed to the model.
+
+        True only when BOTH the answer bridge is wired AND the SDK exposes
+        ``HookMatcher`` (so the PreToolUse intercept can actually be
+        installed). Exposing the tool without the intercept would hang
+        headless, so :meth:`_base_tools` and
+        :meth:`_install_ask_user_question_hook` gate on this single predicate
+        — they can never disagree.
+        """
+        return (
+            self._ask_question_handler is not None
+            and getattr(sdk, "HookMatcher", None) is not None
+        )
+
+    def _base_tools(self, sdk: _ClaudeSDK) -> list[str]:
+        """Native Claude Code tools exposed to the model.
+
+        ``Skill`` and ``ToolSearch`` are always present so MCP tool
+        definitions can be discovered on demand. ``AskUserQuestion`` is added
+        only when :meth:`_ask_user_question_enabled` — the tool would hang
+        headless without the PreToolUse intercept, so it's never exposed
+        without the bridge that answers it. OS-environment operations route
+        through Omnigent ``sys_os_*`` MCP tools, not the SDK's native
+        Bash/Read/Edit/Write.
+        """
+        tools = ["Skill", "ToolSearch"]
+        if self._ask_user_question_enabled(sdk):
+            tools.append("AskUserQuestion")
+        return tools
+
+    # The SDK awaits hook callbacks with no cap, so this is the human-answer
+    # ceiling; it matches the native path's 24h permission-hook timeout.
+    _ASK_QUESTION_HOOK_TIMEOUT_S: float = 86400.0
+
+    def _install_ask_user_question_hook(
+        self,
+        sdk: _ClaudeSDK,
+        options: Any,  # type: ignore[explicit-any]  # ClaudeAgentOptions — avoid a hard sdk import
+    ) -> None:
+        """
+        Register the in-process ``AskUserQuestion`` PreToolUse hook.
+
+        Claude Code's ``AskUserQuestion`` tool would normally open a terminal
+        picker — impossible under the headless SDK. This hook intercepts the
+        call, routes the questions through the Omnigent elicitation form (the
+        clickable card the web UI renders), and returns the user's selections
+        via ``updatedInput`` so Claude reports them as the tool result.
+
+        Allowing from PreToolUse skips ``can_use_tool``, so the hook runs the
+        TOOL_CALL policy check itself before showing the form.
+
+        No-op unless the adapter has wired an ``_ask_question_handler``; the
+        bridge is what reaches the active turn's elicitation round-trip.
+
+        :param sdk: The ``claude_agent_sdk`` module (or a test double).
+        :param options: ``ClaudeAgentOptions`` to mutate.
+        """
+        if not self._ask_user_question_enabled(sdk):
+            return
+        # Presence is guaranteed by _ask_user_question_enabled; fetch via
+        # getattr (not ``sdk.HookMatcher``) because ``HookMatcher`` isn't
+        # declared on the _ClaudeSDK protocol.
+        hook_matcher_cls = getattr(sdk, "HookMatcher")  # noqa: B009
+
+        def _deny(reason: str) -> dict[str, Any]:  # type: ignore[explicit-any]  # HookJSONOutput
+            # Fail closed: a path that can't produce answers denies, so Claude
+            # never falls through to a headless native picker that hangs.
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            }
+
+        async def handle_ask_user_question(
+            payload: Any,  # type: ignore[explicit-any]  # HookInput TypedDict
+            tool_use_id: str | None,  # noqa: ARG001 -- HookCallback signature
+            context: Any,  # type: ignore[explicit-any]  # HookContext  # noqa: ARG001 -- HookCallback signature
+        ) -> dict[str, Any]:  # type: ignore[explicit-any]  # HookJSONOutput
+            handler = self._ask_question_handler
+            if handler is None or not isinstance(payload, dict):
+                # Defensive / can't-happen (exposure is gated on the handler):
+                # deny deterministically rather than fall through to consent.
+                return _deny("AskUserQuestion unavailable via Omnigent")
+            tool_input = payload.get("tool_input") or {}
+            # A raised hook reaches the CLI as "no opinion" and falls back to
+            # native handling; deny instead. Cancellation still propagates.
+            try:
+                policy_result = await self._evaluate_tool_call_policy(
+                    "AskUserQuestion", tool_input
+                )
+                if getattr(policy_result, "behavior", None) == "deny":
+                    return _deny(
+                        getattr(policy_result, "message", "")
+                        or "Denied by Omnigent TOOL_CALL policy"
+                    )
+                updated_input = await handler(tool_input)
+            except Exception:
+                logger.exception("AskUserQuestion hook failed; denying the call")
+                return _deny("AskUserQuestion failed in Omnigent; ask in plain text instead.")
+            if isinstance(updated_input, str):
+                return _deny(updated_input)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "updatedInput": updated_input,
+                }
+            }
+
+        hooks = dict(getattr(options, "hooks", None) or {})
+        entries = list(hooks.get("PreToolUse") or [])
+        entries.append(
+            hook_matcher_cls(
+                matcher="AskUserQuestion",
+                timeout=self._ASK_QUESTION_HOOK_TIMEOUT_S,
+                hooks=[handle_ask_user_question],
+            )
+        )
+        hooks["PreToolUse"] = entries
+        options.hooks = hooks
+
     async def _can_use_tool_for_permission(
         self,
         tool_name: str,
@@ -2669,12 +2916,21 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
-            # turns, but let /compact operate on the existing client's context.
-            await self._close_live_client(session_key)
-            resume_session = False
-            prompt = self._build_prompt(messages, resume_session=False)
+        if state is not None and prompt != "/compact":
+            # Effort is a launch option, and a CLI busy with a timed-out MCP reconnect
+            # holds the prompt. Rebuild with history for conversational turns, but let
+            # /compact operate on the existing client's context.
+            rebuild = state.effort != reasoning_effort
+            if not rebuild:
+                try:
+                    rebuild = not await self._reconnect_signed_in_mcp_servers(state)
+                except asyncio.CancelledError:
+                    self._evict_client_on_cancel(session_key)
+                    raise
+            if rebuild:
+                await self._close_live_client(session_key)
+                resume_session = False
+                prompt = self._build_prompt(messages, resume_session=False)
 
         # Build MCP tools from Omnigent tool schemas
         mcp_tools = _build_mcp_tools(tools, self._tool_executor) if tools else []
@@ -2743,6 +2999,7 @@ class ClaudeSDKExecutor(Executor):
         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
         # ``""`` here would still leave an empty key in the child env.
         env = dict(self._extra_env)
+        env["CLAUDE_AGENT_SDK_CLIENT_APP"] = "omnigent"
         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
         # Teach Claude Code this gateway's spellings so no model surface routes
         # to an id the gateway rejects: pins for the family aliases, rewrites
@@ -2789,7 +3046,7 @@ class ClaudeSDKExecutor(Executor):
         # MCP tools (declared via ``os_env`` in the spec), not the
         # SDK's native Bash/Read/Edit/Write. Keep Skill and ToolSearch in
         # the base set so MCP definitions can be discovered on demand.
-        base_tools: list[str] = ["Skill", "ToolSearch"]
+        base_tools: list[str] = self._base_tools(sdk)
         # Translate the spec's host-skill filter into the SDK
         # options. Falls back to ``"all"`` semantics when the
         # field is malformed (the parser already validates, so
@@ -2902,6 +3159,7 @@ class ClaudeSDKExecutor(Executor):
 
         self._install_subagent_router_hook(sdk, options, model)
         self._install_framework_context_hook(sdk, options, session_key)
+        self._install_ask_user_question_hook(sdk, options)
 
         # Log the full configuration for debugging
         logger.info(

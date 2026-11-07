@@ -14,7 +14,13 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  FileEditRequest,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -470,6 +476,8 @@ export interface ErrorBlock {
    * native terminal, whose mirrored message carries no stable id.
    */
   unansweredSend?: { stableId: string; text?: string };
+  /** A client-only card for a failure carried only by a `failed` session status. */
+  fromSessionStatus?: true;
 }
 
 /**
@@ -683,6 +691,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,

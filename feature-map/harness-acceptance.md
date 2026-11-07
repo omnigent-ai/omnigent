@@ -164,6 +164,23 @@ over 64 KiB but below 16 MiB, then one above the limit, and confirm another smal
 tool call succeeds after each. The limit includes the serialized request
 envelope, not only its arguments.
 
+### Pi SDK compaction and restart (own environment)
+
+For `compaction`, `reload-resume` and `fork`, run
+`tests/e2e/test_pi_compact_restart_resume.py::test_pi_compacted_session_resumes_compacted_after_restart`.
+It drives the real Pi CLI through a server/runner with a scripted provider and
+a 32k context limit. After repeated compactions, restart both processes and
+continue the session, then fork it and continue the copy. Both outgoing requests
+must retain the summary and recent context, omit summarized turns and fit the
+window; the fork must leave its parent unchanged.
+
+This is an API/process check, not browser reload or live-provider acceptance.
+Existing sessions without a saved compaction checkpoint are not repaired by
+this recipe. After compaction, a failed streamed retry is aborted and drained
+to settlement before exporting context and evicting Pi; retry text is suppressed.
+If settlement or context export fails, the fallback retains only the summary
+and loses recent kept context. Component tests cover these failure paths separately.
+
 ### Pi SDK bundled resources (own environment)
 
 For `launch-reply`, launch an uploaded Pi agent bundle through the server/runner,
@@ -195,15 +212,17 @@ user agent root, with relative local-package paths and disabled-resource pattern
 default and relative custom roots; inspect provider requests for loaded skills,
 package markers, excluded extensions, and unchanged SDK tool restrictions.
 `tests/e2e/omnigent/test_pi_context_files_e2e.py` checks that context/prompt controls
-and `skills: none` still apply. Native startup/resume is covered by
+and `skills: none` still apply, and that the user root's `AGENTS.md` follows
+`context_files`. Native startup/resume is covered by
 `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` through server/host/runner.
 A host custom root uses the existing explicit
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=PI_CODING_AGENT_DIR` setting.
 
 These scenarios use real Pi with scripted providers or prompt-observer extensions;
 they do not establish marketplace compatibility, browser rendering, live MCP OAuth,
-OS sandbox or Managed deployment acceptance. Linked resources are shared writable
-files; global instruction files, model credentials and session state stay separate.
+OS sandbox or Managed deployment acceptance. Linked resources, including global
+context files, are shared writable files; `SYSTEM.md`, `APPEND_SYSTEM.md`, model
+credentials and session state stay separate.
 
 ### Deterministic checks versus live canaries
 

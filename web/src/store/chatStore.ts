@@ -54,12 +54,19 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
+import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import {
+  acknowledgeLocalElicitationResolution,
+  affectedSessionIds,
+  beginLocalElicitationResolution,
+  cancelLocalElicitationResolution,
+} from "@/lib/localElicitationResolutions";
 import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
@@ -74,6 +81,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -87,6 +95,8 @@ import type {
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
 import { randomUUID } from "@/lib/randomUUID";
 import { awaitReconnectDelay } from "@/lib/reconnectBackoff";
+import { describeSendFailure } from "@/lib/sendFailure";
+import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -112,14 +122,31 @@ import {
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
-import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
-import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
+import {
+  forgetUnsentSend,
+  peekQueuedSends,
+  peekUnsentSend,
+  rememberQueuedSends,
+  rememberUnsentSend,
+} from "@/lib/unsentSends";
+import {
+  isSideChatCommand,
+  sideChatSettingsMutationKey,
+  SIDE_CHAT_SETTINGS_MUTATION,
+  usesNativeSideChatFork,
+  type SideChatModelSettings,
+} from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
 import { useTerminalActivityStore } from "./terminalActivity";
-import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
+import {
+  isClosedDuringLaunch,
+  terminalInfoFromResource,
+  terminalsQueryKey,
+  type TerminalInfo,
+} from "@/lib/terminals";
 import type {
   BackgroundTaskInfo,
   ContentBlock,
@@ -141,6 +168,7 @@ import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanM
 import {
   getCurrentAuthorId,
   getCurrentUserId,
+  isSignInExpired,
   resolveSessionHost,
   subscribeIdentity,
 } from "@/lib/identity";
@@ -165,7 +193,14 @@ import {
   isNativeTerminalSession as isNativeTerminalSessionFn,
   nativeCodingAgentForHarness,
 } from "@/lib/nativeCodingAgents";
-import type { ReplyQuote, StoredReplyDraft } from "@/lib/replyDraft";
+import {
+  appendReplyDraft,
+  restoreReplyDraft,
+  serializeReplyDraft,
+  snapshotReplyDraft,
+  type ReplyQuote,
+  type StoredReplyDraft,
+} from "@/lib/replyDraft";
 import { toast } from "sonner";
 
 export interface SendOptions {
@@ -584,6 +619,8 @@ export interface PendingUserMessage {
    * on snapshot-replayed entries (they're already server-owned).
    */
   posted?: boolean;
+  /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
+  stillSending?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -639,6 +676,11 @@ export interface QueuedMessage {
   requiresRetry?: boolean;
   /** The session's host was offline; held until it reconnects, then sent. */
   waitingForHost?: boolean;
+  /**
+   * Queued beside the session on screen (a side chat), whose composer takes no
+   * text back after a reload.
+   */
+  offScreen?: boolean;
 }
 
 /**
@@ -896,6 +938,11 @@ export interface ConversationState {
      * settles it (see `committedItemProvesDelivery`).
      */
     unsettled?: boolean;
+    /**
+     * Recovered from this tab's records when the session loaded. No other copy
+     * is left, so the composer adds it after newer input instead of dropping it.
+     */
+    recovered?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -929,6 +976,12 @@ export interface ConversationState {
    * travel together (adoption on new-chat, eviction, mirroring).
    */
   sendLatchedAt: number | null;
+  /**
+   * The `sendLatchedAt` a `running` status edge last arrived under. When it
+   * matches the current latch, that send's turn was seen starting, so a
+   * turn-end snapshot may settle the latch.
+   */
+  sendLatchSeenRunning: number | null;
   /**
    * LLM model identifier from the bound agent's spec for the active
    * session, e.g. ``"anthropic/claude-sonnet-4-6"``. Populated from
@@ -1062,6 +1115,12 @@ export interface ConversationState {
   /** Managed startup accepts sends durably before its first harness dispatch. */
   startupPending: boolean;
   /**
+   * Saved startup messages the server never delivered (e.g. the sandbox host
+   * didn't come online), from the snapshot's `failed_inputs`. Rendered as
+   * "Not delivered" bubbles the user can start a new session from.
+   */
+  failedInputs: PendingInput[];
+  /**
    * Native MCP startup progress, cleared when startup settles or live
    * assistant text arrives. Failures/cancellations stay in host diagnostics,
    * not the conversation. Null for harnesses that report no MCP startup.
@@ -1101,7 +1160,11 @@ export interface ConversationState {
  */
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
+  settings?: SideChatModelSettings;
   starting?: boolean;
+  /** Focus the input once it accepts text; set by a `+` that opened the tab,
+   *  consumed by the composer. */
+  autoFocus?: boolean;
   quotes?: ReplyQuote[];
   text: string;
   files: File[];
@@ -1208,6 +1271,8 @@ export interface ChatActions {
     childSessionId: string,
     mutate: (current: SideChatComposerDraft) => SideChatComposerDraft,
   ) => void;
+  /** Ask a side chat's composer to take focus once it accepts text. */
+  requestSideChatFocus: (childSessionId: string) => void;
   /** Drop a side chat's unsent composer state (sent, or the tab was closed). */
   clearSideChatComposer: (childSessionId: string) => void;
   /**
@@ -1389,7 +1454,7 @@ export interface ChatActions {
    * there is no active conversation.
    */
   compact: () => Promise<void>;
-  /** Run the native harness's /clear in the session terminal. */
+  /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
@@ -1422,11 +1487,23 @@ export interface ChatActions {
 export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
+let unsubscribeSettingsMutations: (() => void) | undefined;
+
+function sideChatSettingsPending(conversationId: string): boolean {
+  return (
+    (queryClient?.isMutating({ mutationKey: sideChatSettingsMutationKey(conversationId) }) ?? 0) > 0
+  );
+}
 
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
 const streamEventRevisions = new Map<string, number>();
-conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+// Live turn edges only: a reopened stream's connect replay carries none.
+const streamTurnEdgeRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => {
+  streamEventRevisions.delete(id);
+  streamTurnEdgeRevisions.delete(id);
+});
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
@@ -1608,15 +1685,11 @@ function snapshotModelPatch(
 async function adoptSnapshotModel(conversationId: string): Promise<void> {
   const entry = conversationRegistry.peek(conversationId);
   if (entry === undefined) return;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
   let session: Session;
   try {
-    session = await getSessionSlim(conversationId, { signal: controller.signal });
+    session = await withReadTimeout((signal) => getSessionSlim(conversationId, { signal }));
   } catch {
     return;
-  } finally {
-    clearTimeout(timeout);
   }
   // A conversation reopened under the same id during the read is a different entry.
   if (entry.disposed) return;
@@ -1865,7 +1938,12 @@ const FLASH_DURATION_MS = 1500;
 const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
-export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
+// A session snapshot or items read still unanswered after this counts as failed,
+// so its caller retries instead of waiting on a request the server never answers.
+export const SESSION_READ_TIMEOUT_MS = 15_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
+// A send whose POST is still open after this says so on its bubble.
+export const SEND_STILL_SENDING_AFTER_MS = 10_000;
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -1880,6 +1958,12 @@ export const RECONNECT_STATUS_CATCHUP_DELAYS_MS = [3_000, 8_000, 20_000] as cons
 // of trusting them forever, so a truly deleted/invalid conversation still
 // gives up rather than polling it forever.
 const MAX_TRANSIENT_404_RETRIES = 10;
+// A login page means the sign-in expired, which no retry renews. A maintenance
+// page during a restart looks the same, so give up only after one outlasts a restart.
+const NON_SSE_STREAM_GIVE_UP_MS = 60_000;
+// One failed open can be a blip; a second in a row is worth asking the auth edge
+// whether the sign-in is what failed.
+const SIGN_IN_PROBE_AFTER_FAILED_OPENS = 2;
 
 /**
  * Make `id` the live, active conversation and return setters bound to its entry.
@@ -1917,6 +2001,7 @@ export function bindConversationForTest(
  * conversation is created.
  */
 export function initChatStore(client: QueryClient): void {
+  unsubscribeSettingsMutations?.();
   for (const timer of workspaceInvalidationTimers.values()) {
     clearTimeout(timer);
   }
@@ -1929,11 +2014,21 @@ export function initChatStore(client: QueryClient): void {
   // Drop this tab's held stream slots; disposed pumps release their own locks,
   // and a boot/reset starts from an empty set.
   heldStreamSlots.clear();
+  streamSlotOwners.clear();
   // Reset the POST-ordering chains so a prior run's unresolved send can't block
   // the next one (production calls this once at boot; tests call it per case).
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
+  startupReads.clear();
   queryClient = client;
+  unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
+    if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
+    const [kind, conversationId] = event.mutation.options.mutationKey ?? [];
+    if (kind !== SIDE_CHAT_SETTINGS_MUTATION || typeof conversationId !== "string") return;
+    // A pane may be closed when the save settles; the store owns queue resumption.
+    useChatStore.getState().maybeFlushQueuedHead(conversationId);
+    useChatStore.getState().flushBackgroundQueues();
+  });
 }
 
 function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
@@ -2127,6 +2222,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   pendingRetryStableId: null,
   restoredSendDraft: null,
   sendLatchedAt: null,
+  sendLatchSeenRunning: null,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
@@ -2149,6 +2245,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sandboxStatus: null,
   sandboxActionDismissed: null,
   startupPending: false,
+  failedInputs: [],
   mcpStartup: null,
   mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
@@ -2175,6 +2272,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
+    const offScreen = targetId !== undefined && targetId !== get().conversationId;
     target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
@@ -2194,6 +2292,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(files && files.length > 0 ? { files } : {}),
           ...(replyDraft ? { replyDraft } : {}),
           ...(waitingForHost ? { waitingForHost } : {}),
+          ...(offScreen ? { offScreen } : {}),
         },
       ],
     }));
@@ -2256,6 +2355,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (sideChatSettingsPending(target.conversationId)) return;
     if (waitsForHost(s.queuedMessages, target.conversationId)) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Nothing can be steered past a first message still held for startup; it stays queued.
@@ -2267,6 +2367,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   steerAllQueuedMessages: (conversationId) => {
+    if (sideChatSettingsPending(conversationId)) return;
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0 || waitsForHost(own, conversationId)) return;
@@ -2342,6 +2443,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // an actively `running` turn gate the flush. No agent → nothing to send to.
     if (
       s.conversationId === null ||
+      sideChatSettingsPending(s.conversationId) ||
       s.boundAgentId === null ||
       s.sessionStatus === "running" ||
       holdsInitialDraft(s)
@@ -2366,9 +2468,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // the global array head. The queue is one flat array across conversations,
     // so an undrained message from another conversation can sit at index 0; a
     // head-only guard would let it block this conversation's messages forever.
-    const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
-    if (head === undefined || head.requiresRetry) return;
-    if (waitsForHost(s.queuedMessages, s.conversationId)) return;
+    const head = sendableQueuedHead(s.queuedMessages, s.conversationId);
+    if (head === null) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     target.write({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
@@ -2409,6 +2510,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // next idle (via WS/poll) triggers this again for the next message (FIFO).
     const now = Date.now();
     for (const conversationId of candidateIds) {
+      if (sideChatSettingsPending(conversationId)) continue;
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);
@@ -2526,6 +2628,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         [childSessionId]: mutate(s.sideChatComposers[childSessionId] ?? EMPTY_SIDE_CHAT_COMPOSER),
       },
     }));
+  },
+  requestSideChatFocus: (childSessionId) => {
+    useChatStore
+      .getState()
+      .updateSideChatComposer(childSessionId, (current) => ({ ...current, autoFocus: true }));
   },
   clearSideChatComposer: (childSessionId) => {
     useChatStore.setState((s) => {
@@ -2668,7 +2775,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
-      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({
+        status: "streaming",
+        activeResponse: null,
+        sendLatchedAt: Date.now(),
+        sendLatchSeenRunning: null,
+      });
     }
 
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
@@ -2825,20 +2937,23 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ),
           status: "streaming",
           sendLatchedAt: Date.now(),
+          sendLatchSeenRunning: null,
         }));
         initialDispatched = true;
       }
-      const postResult = await postEvent(
-        sessionId,
-        {
-          type: "message",
-          data: {
-            role: "user",
-            content: serverContent,
-            stable_id: stableId,
+      const postResult = await withStillSendingMark(sessionId, tempId, () =>
+        postEvent(
+          sessionId,
+          {
+            type: "message",
+            data: {
+              role: "user",
+              content: serverContent,
+              stable_id: stableId,
+            },
           },
-        },
-        { holdWhenHostOffline: true },
+          { holdWhenHostOffline: true },
+        ),
       );
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
@@ -2922,6 +3037,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           ...(agentId ? { agentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
           ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          ...(sentOnScreen ? {} : { offScreen: true }),
         });
       }
       const callerHandlesError = heldForHost || opts?.onError !== undefined;
@@ -3067,7 +3183,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // See `send`: latch and status on one entry, in one patch.
-      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({
+        status: "streaming",
+        activeResponse: null,
+        sendLatchedAt: Date.now(),
+        sendLatchSeenRunning: null,
+      });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
     // the chat shows nothing until the server's `slash_command` receipt
@@ -3110,17 +3231,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
-      const postResult = await postEvent(sessionId, {
-        type: "slash_command",
-        data: {
-          kind: "skill",
-          name,
-          arguments: args,
-          ...(setterForState(sessionId)?.startupPending
-            ? { stable_id: randomUUID().replace(/-/g, "") }
-            : {}),
-        },
-      });
+      const postResult = await withStillSendingMark(sessionId, tempId, () =>
+        postEvent(sessionId, {
+          type: "slash_command",
+          data: {
+            kind: "skill",
+            name,
+            arguments: args,
+            ...(setterForState(sessionId)?.startupPending
+              ? { stable_id: randomUUID().replace(/-/g, "") }
+              : {}),
+          },
+        }),
+      );
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -3419,6 +3542,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           : b,
       ),
     }));
+    // Sidebar counts drop now, before the server confirms the verdict.
+    const holdToken = beginLocalElicitationResolution(
+      elicitationId,
+      affectedSessionIds(
+        [sessionId, targetSessionId],
+        (knownSessionId) =>
+          queryClient?.getQueryData<Session>(["session", knownSessionId])?.parentSessionId,
+      ),
+      { nativeDelivery: Boolean(originalBlock?.nativeDelivery) },
+    );
     // Human-in-the-loop decision: accept = granted, decline = rejected, cancel =
     // dismissed without deciding. Fires on the user's action (live only).
     emitInteractionPhase({
@@ -3427,13 +3560,21 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       phase: "complete",
       status: action === "accept" ? "success" : action === "decline" ? "failure" : "cancelled",
     });
+    elicitationVerdictsInFlight.add(elicitationId);
+    bumpElicitationVerdictRevision(sessionId, elicitationId);
     try {
       await approveElicitation(targetSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       });
+      acknowledgeLocalElicitationResolution(elicitationId, holdToken);
+      clearAskUserQuestionDraft(elicitationId);
+      if (elicitationRechecksAfterVerdict.delete(elicitationId)) {
+        void recheckAnsweredElicitation(sessionId, elicitationId);
+      }
     } catch {
+      cancelLocalElicitationResolution(elicitationId, holdToken);
       // Roll back to pending so the user can retry. Surfacing the
       // error is a future affordance — for now, the buttons
       // reappear and the user can try again.
@@ -3456,6 +3597,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
             : b,
         ),
       }));
+    } finally {
+      elicitationVerdictsInFlight.delete(elicitationId);
+      elicitationRechecksAfterVerdict.delete(elicitationId);
     }
   },
 
@@ -3504,7 +3648,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearContext: async () => {
     const { conversationId } = get();
     if (!conversationId) return;
-    await postEvent(conversationId, { type: "clear", data: {} });
+    const { sessionId } = await postEvent(conversationId, { type: "clear", data: {} });
+    // A claude-sdk clear names its new session; follow it if the live
+    // `session.superseded` redirect was missed, unless the user moved on or a
+    // redirect is already pending. A native clear names none.
+    if (!sessionId || sessionId === conversationId) return;
+    useChatStore.setState((s) =>
+      s.conversationId === conversationId && s.redirectToConversationId === null
+        ? { redirectToConversationId: sessionId }
+        : {},
+    );
   },
 
   refreshSessionState: async (conversationId) => {
@@ -3857,6 +4010,37 @@ function waitsForHost(queuedMessages: QueuedMessage[], conversationId: string | 
   return queuedMessages.some((m) => m.conversationId === conversationId && m.waitingForHost);
 }
 
+/** The conversation's queued message that sends as soon as its session is free, if any. */
+export function sendableQueuedHead(
+  queuedMessages: QueuedMessage[],
+  conversationId: string | null | undefined,
+): QueuedMessage | null {
+  const head = queuedMessages.find((m) => m.conversationId === conversationId);
+  if (head === undefined || head.requiresRetry) return null;
+  return waitsForHost(queuedMessages, head.conversationId) ? null : head;
+}
+
+/** Await a send's POST, marking its pending bubble once the POST is slow to answer. */
+async function withStillSendingMark<T>(
+  sessionId: string,
+  tempId: string,
+  post: () => Promise<T>,
+): Promise<T> {
+  const timer = setTimeout(() => {
+    setterFor(sessionId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.map((p) =>
+        p.tempId === tempId && p.posted !== true ? { ...p, stillSending: true } : p,
+      ),
+    }));
+  }, SEND_STILL_SENDING_AFTER_MS);
+  try {
+    // Never cancelled: the server may already have accepted the send.
+    return await post();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Queue a send the server refused because the session's host is offline. It
  * waits ahead of the conversation's other queued messages until
@@ -3939,6 +4123,9 @@ const rootSetState = useChatStore.setState;
 // One held slot == one live stream this tab is counted for against the shared,
 // cross-tab cap (see `streamSlots`). Keyed by conversation id.
 const heldStreamSlots = new Map<string, StreamSlot>();
+// The pump that holds each slot. A rebind's pump takes the slot over, so the
+// pump it replaced must not release it when it exits.
+const streamSlotOwners = new Map<string, AbortController>();
 
 /**
  * Take an origin-wide stream slot for `id` before opening its stream.
@@ -3952,8 +4139,13 @@ const heldStreamSlots = new Map<string, StreamSlot>();
  * has nothing of its own to reclaim; the active conversation then opens over
  * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
-  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+async function acquireStreamSlot(id: string, owner: AbortController): Promise<boolean> {
+  // Rebinding a still-slotted stream: the new pump takes the slot over at once,
+  // so the pump it replaces can't release it while the new bind is waiting.
+  if (heldStreamSlots.has(id)) {
+    streamSlotOwners.set(id, owner);
+    return true;
+  }
   let slot = await getStreamSlotManager().tryAcquire();
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
@@ -3964,12 +4156,16 @@ async function acquireStreamSlot(id: string): Promise<boolean> {
     const evictedSlot = heldStreamSlots.get(evictedId);
     if (evictedSlot !== undefined) {
       heldStreamSlots.delete(evictedId);
+      streamSlotOwners.delete(evictedId);
       await evictedSlot.release();
     }
     slot = await getStreamSlotManager().tryAcquire();
   }
   /* eslint-enable no-await-in-loop */
-  if (slot !== null) heldStreamSlots.set(id, slot);
+  if (slot !== null) {
+    heldStreamSlots.set(id, slot);
+    streamSlotOwners.set(id, owner);
+  }
   setStreamBudgetExceeded(slot === null);
   return slot !== null;
 }
@@ -3979,7 +4175,13 @@ function releaseStreamSlot(id: string): void {
   const slot = heldStreamSlots.get(id);
   if (slot === undefined) return;
   heldStreamSlots.delete(id);
+  streamSlotOwners.delete(id);
   void slot.release();
+}
+
+/** Hand back `id`'s stream slot if `owner`'s pump still holds it. */
+function releaseOwnedStreamSlot(id: string, owner: AbortController): void {
+  if (streamSlotOwners.get(id) === owner) releaseStreamSlot(id);
 }
 
 /**
@@ -4348,6 +4550,29 @@ useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
   for (const id of entryDrainedQueues) scheduleEntryFlush(id);
 });
+// The queue lives only in memory; keep each session's queued messages for a reload (see
+// `unsentSendToRestore`). Attachments stay behind, as for an unanswered send.
+useChatStore.subscribe((state, previous) => {
+  if (state.queuedMessages === previous.queuedMessages) return;
+  const authorId = getCurrentUserId();
+  const touched = [...previous.queuedMessages, ...state.queuedMessages];
+  const queuedHere = new Set(touched.map((m) => m.stableId));
+  for (const id of new Set(touched.map((m) => m.conversationId))) {
+    // A record this page never queued is an earlier page's, kept for its session's next load.
+    const earlier = peekQueuedSends(id).filter((send) => !queuedHere.has(send.stableId));
+    const kept = state.queuedMessages.flatMap((m) =>
+      authorId === null ||
+      m.conversationId !== id ||
+      m.stableId === undefined ||
+      m.command !== undefined ||
+      m.offScreen ||
+      !m.text.trim()
+        ? []
+        : [{ stableId: m.stableId, text: m.text, authorId, replyDraft: m.replyDraft }],
+    );
+    rememberQueuedSends(id, [...earlier, ...kept]);
+  }
+});
 // Without a live entry there's no status to watch; the queue waits until the side chat reopens.
 conversationRegistry.subscribeDisposed((id) => entryDrainedQueues.delete(id));
 
@@ -4660,6 +4885,7 @@ function sessionBindingPatch(
   | "sandboxStatus"
   | "sandboxActionDismissed"
   | "startupPending"
+  | "failedInputs"
   | "mcpStartup"
   | "mcpStartupLaunch"
 > {
@@ -4698,14 +4924,58 @@ function sessionBindingPatch(
     // A reload that shows the launch moved on ends the dismissal of its last warning.
     sandboxActionDismissed:
       session.sandboxStatus?.stage === "action_required" ? state.sandboxActionDismissed : null,
+    ...startupInputsPatch(session),
+    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
+  };
+}
+
+/** The managed-startup state a session snapshot reports. */
+function startupInputsPatch(
+  session: Session,
+): Pick<ConversationState, "startupPending" | "failedInputs"> {
+  return {
     // "ready" with saved inputs left: a native first input awaits its transcript
     // receipt, and the server still saves new messages behind it.
     startupPending:
       session.labels?.["omnigent.startup"] === "pending" ||
       (session.labels?.["omnigent.startup"] === "ready" &&
         (session.pendingInputs ?? []).length > 0),
-    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
+    failedInputs: session.failedInputs ?? [],
   };
+}
+
+/**
+ * Drop the optimistic bubbles a snapshot's undelivered inputs replace.
+ *
+ * Matches one-to-one: by pending id when the bubble knows it (snapshot-replayed,
+ * or an accepted follow-up), otherwise by text for this tab's accepted first
+ * message (no server id, and its attachments were stored under new file ids).
+ *
+ * @param pending - The conversation's optimistic user bubbles.
+ * @param failedInputs - The snapshot's `failedInputs`.
+ * @returns `pending` itself when nothing matched, else the remaining bubbles.
+ */
+export function withoutFailedInputs(
+  pending: PendingUserMessage[],
+  failedInputs: PendingInput[],
+): PendingUserMessage[] {
+  if (failedInputs.length === 0 || pending.length === 0) return pending;
+  const unmatched = [...failedInputs];
+  const remaining = pending.filter((message) => {
+    // A snapshot-replayed bubble is keyed by its server id.
+    const serverId = message.pendingId ?? message.tempId;
+    const index = unmatched.findIndex(
+      (input) =>
+        input.pendingId === serverId ||
+        (message.pendingId === undefined &&
+          message.posted === true &&
+          messageContentText(input.content) === messageContentText(message.content)),
+    );
+    if (index === -1) return true;
+    unmatched.splice(index, 1);
+    return false;
+  });
+  return remaining.length === pending.length ? pending : remaining;
 }
 
 /**
@@ -4743,6 +5013,128 @@ async function refreshSessionBinding(id: string): Promise<void> {
   setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
+// The newest startup re-read per conversation. Read numbers are never reused, so
+// an older read that lands later can't pass for the newest.
+let startupReadCount = 0;
+const startupReads = new Map<string, number>();
+
+/**
+ * Re-read a session's undelivered startup messages after its launch failed or
+ * one of them was delivered, so they show (or stop showing) as undelivered.
+ *
+ * A launch can report "failed" before the server has marked its saved inputs
+ * failed, then again once it has, and a delivery can land while a read is out;
+ * each starts a fresh read rather than joining one in flight, and only the
+ * newest applies. The snapshot also ends the startup state a failed launch
+ * leaves behind.
+ *
+ * @param id - Conversation/session id to re-read.
+ */
+async function refreshFailedInputs(id: string): Promise<void> {
+  startupReadCount += 1;
+  const read = startupReadCount;
+  startupReads.set(id, read);
+  let session: Session | null = null;
+  try {
+    session = await getSessionSlim(id);
+  } catch {
+    // The next bind reads the snapshot again.
+  }
+  if (startupReads.get(id) !== read) return;
+  startupReads.delete(id);
+  if (session === null) return;
+  const fresh = session;
+  queryClient?.setQueryData(["session", id], fresh);
+  setterFor(id)((s) => {
+    const startup = startupInputsPatch(fresh);
+    // Only the startup fields: live events stay newer than this read for the
+    // rest, e.g. a "failed" launch stage a replica without the launch doesn't know.
+    return {
+      ...startup,
+      pendingUserMessages: withoutFailedInputs(s.pendingUserMessages, startup.failedInputs),
+    };
+  });
+}
+
+/** Retries of a snapshot load that failed in a way a retry can fix. */
+const SNAPSHOT_LOAD_RETRIES = 2;
+
+/**
+ * A large first page on a slow phone network can take longer than one read
+ * deadline. Each retry waits longer (15, 30, then 60 s), so a slow load still
+ * finishes while a hung one stays bounded.
+ */
+const snapshotLoadDeadlineMs = (attempt: number): number => SESSION_READ_TIMEOUT_MS * 2 ** attempt;
+
+/** Run a session read, rejecting with a retryable timeout if the server never answers. */
+async function withReadTimeout<T>(
+  read: (signal: AbortSignal) => Promise<T>,
+  timeoutMs = SESSION_READ_TIMEOUT_MS,
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new DOMException("session read timed out", "TimeoutError");
+      controller.abort(error);
+      reject(error);
+    }, timeoutMs);
+  });
+  try {
+    // The race also bounds a read that is stuck before it reaches the signal.
+    return await Promise.race([read(controller.signal), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Run a conversation's snapshot load, repeating a failure a retry can fix (a
+ * 5xx, or a dropped connection while the server restarts) while the
+ * conversation is still open. Other failures, such as a 404, throw at once.
+ */
+async function withSnapshotRetries<T>(
+  id: string,
+  load: (attempt: number) => Promise<T>,
+): Promise<T> {
+  const entry = conversationRegistry.peek(id);
+  const stillOpen = () =>
+    entry !== undefined && conversationRegistry.peek(id) === entry && !entry.disposed;
+  // Sequential by design: each attempt waits for the one before it to fail.
+  for (let failures = 0; ; failures += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await load(failures);
+    } catch (error) {
+      if (failures >= SNAPSHOT_LOAD_RETRIES || !isRetryableRequestError(error) || !stillOpen()) {
+        throw error;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, queryRetryDelay(failures, error));
+      });
+      if (!stillOpen()) throw error;
+    }
+  }
+}
+
+/**
+ * Load a conversation again after its load failed, in place.
+ *
+ * @param id - The conversation whose snapshot load failed.
+ */
+export async function retryConversationLoad(id: string): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.getState().conversationLoadError === null) return;
+  // A failed snapshot leaves the pump open; close it so the new bind is the
+  // entry's only subscriber, and drop its live previews, which the new stream
+  // replays in full.
+  abortConversationStream(entry);
+  dropEphemeralInFlightBlocks(id, entrySetter(entry));
+  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  await bindStream(id, entrySetter(entry), entryGetter(entry), true);
+}
+
 /**
  * Start the session SSE stream, kick off the pump in the background
  * once the stream connects, then fetch metadata plus the most recent
@@ -4770,11 +5162,11 @@ async function bindStream(
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
+  await acquireStreamSlot(id, controller);
   if (isConversationDisposed(id)) {
     // Switched away / evicted while awaiting the slot — don't open a dead
     // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
+    releaseOwnedStreamSlot(id, controller);
     return;
   }
   set({ abortController: controller });
@@ -4805,15 +5197,16 @@ async function bindStream(
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
     if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
+      releaseOwnedStreamSlot(id, controller);
       return;
     }
   }
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
-  // terminal close, an abort from switchTo/dispose, or eviction).
+  // terminal close, an abort from switchTo/dispose, or eviction) unless a
+  // rebind's pump has taken it over.
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
-    releaseStreamSlot(id),
+    releaseOwnedStreamSlot(id, controller),
   );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
@@ -4840,8 +5233,8 @@ async function bindStream(
   // another conversation; reusing it drops messages until a page refresh.
   // Bind fetches the whole initial window in one request; nothing loads more
   // until the reader scrolls up (`loadMoreHistory`).
-  // `retry: false` because the most common failure here is "invalid conv
-  // id in URL" (not transient).
+  // The most common failure here is an invalid id in the URL, which fails at
+  // once; `withSnapshotRetries` repeats only failures a retry can fix.
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
@@ -4851,14 +5244,53 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
+    const client = queryClient;
+    // Each request retries on its own, so a failed one doesn't repeat the other.
+    // Set once a session read times out, and kept set through later failures: the shared
+    // read it may have joined is still the one that never answers.
+    let sessionReadTimedOut = false;
     const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
+      withSnapshotRetries(id, (attempt) =>
+        withReadTimeout((signal) => {
+          const queryKey = ["session", id];
+          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
+          // A retry after a timeout reads directly rather than rejoin a shared read that
+          // may never answer, and its result seeds the shared cache.
+          if (sessionReadTimedOut && joinsSharedRead) {
+            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
+              client.setQueryData(queryKey, fresh);
+              return fresh;
+            });
+          }
+          // An attempt that starts the request drops it on timeout, so the retry reads
+          // afresh. One that joins another caller's read leaves that read to its caller.
+          if (!joinsSharedRead) {
+            signal.addEventListener(
+              "abort",
+              () => void client.cancelQueries({ queryKey, exact: true }),
+              { once: true },
+            );
+          }
+          return client.fetchQuery({
+            queryKey,
+            queryFn: ({ signal: querySignal }) =>
+              getSessionSlim(id, { refreshState: true, signal: querySignal }),
+            staleTime: 0,
+            retry: false,
+          });
+        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
+          if (error instanceof DOMException && error.name === "TimeoutError") {
+            sessionReadTimedOut = true;
+          }
+          throw error;
+        }),
+      ),
+      withSnapshotRetries(id, (attempt) =>
+        withReadTimeout(
+          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+          snapshotLoadDeadlineMs(attempt),
+        ),
+      ),
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
@@ -5009,6 +5441,10 @@ async function bindStream(
           : null;
       return {
         ...effectiveBindingPatch,
+        // A failure re-read that landed during the fetch is newer than this snapshot.
+        ...(state.failedInputs !== stateBeforeFetch.failedInputs
+          ? { failedInputs: state.failedInputs, startupPending: state.startupPending }
+          : {}),
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         ...(unsentDraft !== null && state.failedSendDraft === null
@@ -5021,7 +5457,11 @@ async function bindStream(
         historyGeneration: state.historyGeneration + 1,
         // The voided page's stale early-return skips its own flag clear.
         loadingMoreHistory: false,
-        sessionStatus: session.status,
+        // A live status edge during the fetch is newer than this snapshot.
+        sessionStatus:
+          state.sessionStatus !== stateBeforeFetch.sessionStatus
+            ? state.sessionStatus
+            : session.status,
         // Mid-turn first open: the snapshot carries the in-flight turn's
         // `activeResponseId`, and the turn-start `running` edge that would
         // have opened the streaming lifecycle is long gone from the SSE
@@ -5267,7 +5707,8 @@ function launchSnapshotPatch(
  * token/context/cost counters, the MCP startup band, and — when the turn
  * ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
- * event would have applied, so "Working…" clears.
+ * event would have applied, so "Working…" clears. `settleTurn: false` leaves
+ * the turn lifecycle (`sessionStatus`, `activeResponse`, `status`, latch) alone.
  *
  * The inverse also matters: when the snapshot shows a turn STILL running and
  * carries its in-flight `activeResponseId`, reopen the streaming
@@ -5281,14 +5722,17 @@ function reconnectStatusPatch(
   session: Session,
   s: ChatState,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  latchBeforeFetch: SendLatchEvidence,
+  settleTurn = true,
 ): Partial<ChatState> {
   const patch: Partial<ChatState> = {
-    sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
     ...launchSnapshotPatch(session, s),
     // A `session.model` missed in the gap would otherwise hold a first
     // message on `waitForInitialDispatch` until its deadline.
     ...snapshotModelPatch(session, s),
+    // A launch that failed during the gap still shows what it never delivered.
+    failedInputs: session.failedInputs ?? [],
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -5298,6 +5742,8 @@ function reconnectStatusPatch(
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
   if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
   if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (!settleTurn) return patch;
+  patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
   // outlives it), so it settles the local send lifecycle like `idle` — it must
   // NOT reopen a streaming response. The server keeps `active_response_id`
@@ -5306,10 +5752,8 @@ function reconnectStatusPatch(
   // reconnect and strand the composer on the "(queued)" placeholder — re-queuing
   // sends, the exact behavior this fix removes. `sessionStatus` stays `waiting`
   // and `backgroundTaskCount` is recovered above, so the spinner survives.
-  if (
-    (session.status === "idle" || session.status === "failed") &&
-    s.activeResponse?.state === "streaming"
-  ) {
+  const snapshotEnded = session.status === "idle" || session.status === "failed";
+  if (snapshotEnded && s.activeResponse?.state === "streaming") {
     patch.activeResponse = {
       ...s.activeResponse,
       state: session.status === "failed" ? "failed" : "completed",
@@ -5317,6 +5761,10 @@ function reconnectStatusPatch(
       completedAt: Date.now(),
     };
     patch.status = "idle";
+  } else if (snapshotEnded && latchedTurnSeenBefore(latchBeforeFetch, s)) {
+    patch.status = "idle";
+    patch.sendLatchedAt = null;
+    patch.sendLatchSeenRunning = null;
   } else if (session.status === "waiting") {
     // Turn ended, background work remains. Finalize a still-streaming response
     // and free the local send lifecycle so the composer dispatches a new turn.
@@ -5347,6 +5795,22 @@ function reconnectStatusPatch(
   return patch;
 }
 
+type SendLatchEvidence = Pick<ChatState, "status" | "sendLatchedAt" | "sendLatchSeenRunning">;
+
+/**
+ * Whether the send latch held when a snapshot read began had already seen its
+ * turn start and still holds, so the snapshot's turn end is that turn's end.
+ */
+function latchedTurnSeenBefore(before: SendLatchEvidence, s: SendLatchEvidence): boolean {
+  return (
+    before.status === "streaming" &&
+    before.sendLatchedAt !== null &&
+    before.sendLatchSeenRunning === before.sendLatchedAt &&
+    s.status === "streaming" &&
+    s.sendLatchedAt === before.sendLatchedAt
+  );
+}
+
 /**
  * Re-read only a launch's stage, on screen or not. Live events that leave the launch
  * alone can't void the read; a launch update that lands during it wins instead.
@@ -5363,18 +5827,36 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
+/** How a status reconcile hands a stream that missed events to the reconnect backfill. */
+interface MissedEventRecovery {
+  /** Abort the connected stream attempt; false when none is connected. */
+  recycleStream: () => boolean;
+  /** Sends already recycled for, so a server that forgot one recycles only once. */
+  revealedPendingIds: Set<string>;
+  /** Ended turns already recycled for; a later tick settles them from the snapshot. */
+  recycledTurnKeys: Set<string>;
+  /** The latest reconnect backfill failed a read, so status reconciles retry it. */
+  backfillOwed: boolean;
+  /** Run the reconnect backfill, with or without its status patch, recording `backfillOwed`. */
+  backfill: (settleStatus: boolean) => Promise<void>;
+}
+
 /**
  * Reconcile the visible conversation's lifecycle from its persisted snapshot.
  *
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
- * stream event arrives during the fetch.
+ * stream event arrives during the fetch. A snapshot that shows the visible turn
+ * idle or failed, or no longer queues a posted send still pending here, proves
+ * the stream also missed that turn's items, so the stream is recycled once for
+ * the reconnect backfill instead. A failed backfill is retried on this cadence until one lands.
  */
 async function reconcileActiveSessionStatus(
   id: string,
   controller: AbortController,
   set: Setter,
   get: Getter,
+  recovery: MissedEventRecovery,
 ): Promise<void> {
   if (
     queryClient === null ||
@@ -5424,22 +5906,55 @@ async function reconcileActiveSessionStatus(
   ) {
     return;
   }
+  const queuedPendingIds = new Set((session.pendingInputs ?? []).map((p) => p.pendingId));
+  // A send the client already settled during the read is not missing.
+  const stillPendingIds = new Set(current.pendingUserMessages.map((p) => p.pendingId));
+  const consumedPendingIds = stateBeforeFetch.pendingUserMessages.flatMap((p) =>
+    p.posted &&
+    p.pendingId &&
+    stillPendingIds.has(p.pendingId) &&
+    !queuedPendingIds.has(p.pendingId) &&
+    !recovery.revealedPendingIds.has(p.pendingId)
+      ? [p.pendingId]
+      : [],
+  );
+  const turnSeenRunning =
+    current.activeResponse?.state === "streaming" ||
+    latchedTurnSeenBefore(stateBeforeFetch, current);
+  // A `waiting` turn can still be live, parked on async work, so it never recycles.
+  const turnEnded = turnSeenRunning && (session.status === "idle" || session.status === "failed");
+  const turnKey =
+    current.activeResponse?.state === "streaming"
+      ? current.activeResponse.responseId
+      : `latch:${current.sendLatchedAt}`;
+  const recycleForTurn = turnEnded && !recovery.recycledTurnKeys.has(turnKey);
+  // Skip the patch: the reconnect drops in-flight blocks, then its backfill settles status.
+  if ((recycleForTurn || consumedPendingIds.length > 0) && recovery.recycleStream()) {
+    if (recycleForTurn) recovery.recycledTurnKeys.add(turnKey);
+    for (const pendingId of consumedPendingIds) recovery.revealedPendingIds.add(pendingId);
+    return;
+  }
   set((s) => {
-    const patch = reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch);
+    const patch = reconnectStatusPatch(
+      session,
+      s,
+      stateBeforeFetch.mcpStartupLaunch,
+      stateBeforeFetch,
+    );
     const blocks = snapshotCompactionSpinners(s.blocks, s.activeResponse, patch.activeResponse);
     return blocks === null ? patch : { ...patch, blocks };
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
-  const ignored = nativePreviewTombstonesByController.get(controller);
   if (
-    ignored &&
+    recovery.backfillOwed ||
     get().blocks.some(
       (block) =>
         isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
     )
   ) {
-    // Retry a missed final-item backfill on the existing status-reconcile cadence.
-    await reconcileOnReconnect(id, set, get, ignored);
+    // Retry a failed or missed final-item backfill on the existing status-reconcile
+    // cadence. This guarded snapshot settled status; the retry's later read must not.
+    await recovery.backfill(false);
   }
 }
 
@@ -5460,9 +5975,13 @@ async function reconcileActiveSessionStatus(
  * - A rendered pending card absent from the snapshot → flip to
  *   "Resolved elsewhere" (it was answered during the gap), mirroring
  *   the missed `response.elicitation_resolved` event.
- * - A rendered auto-resolved card present in the snapshot → flip back
- *   to pending in place (the prompt re-parked after its deferred clear
- *   fired), so the user can still answer it.
+ * - A rendered auto-resolved or answered card present in the snapshot
+ *   → flip back to pending in place (the prompt re-parked after its
+ *   deferred clear fired, or the answer never reached the waiting
+ *   hook), so the user can still answer it. See
+ *   `isRevivableElicitation`, rebuilt from the snapshot's request. A
+ *   resolution event or newer answer since the capture means the
+ *   snapshot may predate it, so that card stays.
  *
  * The two flips are restricted to cards captured in the `preGap*` sets
  * — cards the caller saw BEFORE fetching the snapshot. Cards the live
@@ -5475,8 +5994,9 @@ function reconcileElicitationBlocks(
   blocks: AnyBlock[],
   snapshotPending: AnyBlock[],
   preGapPendingIds: Set<string>,
-  preGapAutoResolvedIds: Set<string>,
+  preGapRevivable: Map<string, number>,
   preGapCards: Map<string, ElicitationBlock>,
+  conversationId: string,
 ): AnyBlock[] | null {
   const pendingNow = new Set(
     snapshotPending
@@ -5515,15 +6035,14 @@ function reconcileElicitationBlocks(
       return updated;
     }
     if (
-      b.status === "responded" &&
-      b.response?.action === "auto_resolved" &&
-      !b.nativeDelivery &&
-      preGapAutoResolvedIds.has(b.elicitationId) &&
-      pendingNow.has(b.elicitationId)
+      currentDelivery !== undefined &&
+      isRevivableElicitation(b) &&
+      preGapRevivable.get(b.elicitationId) ===
+        elicitationVerdictRevision(conversationId, b.elicitationId)
     ) {
+      // Rebuilt from the snapshot: a recurring id can carry a different request.
       changed = true;
-      const updated: ElicitationBlock = { ...b, status: "pending", response: null };
-      return updated;
+      return { ...currentDelivery, ctx: b.ctx };
     }
     return b;
   });
@@ -5573,26 +6092,31 @@ function withoutRebuiltUserInputCards(
 /**
  * Snapshot the ids of currently rendered elicitation cards, split by
  * answerable state, BEFORE a snapshot fetch. `pending` cards are
- * eligible for the gap-resolved flip; `autoResolved` cards are
- * eligible for the re-parked revival. See
+ * eligible for the gap-resolved flip; `revivable` cards, mapped to their
+ * verdict revision, are eligible for the re-parked revival. See
  * `reconcileElicitationBlocks` for why eligibility is captured ahead
  * of the fetch.
  */
-function captureElicitationIdsByStatus(blocks: AnyBlock[]): {
+function captureElicitationIdsByStatus(
+  blocks: AnyBlock[],
+  conversationId: string,
+): {
   pending: Set<string>;
-  autoResolved: Set<string>;
+  revivable: Map<string, number>;
   cards: Map<string, ElicitationBlock>;
 } {
   const cards = new Map<string, ElicitationBlock>();
   const pending = new Set<string>();
-  const autoResolved = new Set<string>();
+  const revivable = new Map<string, number>();
   for (const b of blocks) {
     if (b.type !== "elicitation") continue;
     cards.set(b.elicitationId, b);
     if (b.status === "pending") pending.add(b.elicitationId);
-    else if (b.response?.action === "auto_resolved") autoResolved.add(b.elicitationId);
+    else if (isRevivableElicitation(b)) {
+      revivable.set(b.elicitationId, elicitationVerdictRevision(conversationId, b.elicitationId));
+    }
   }
-  return { pending, autoResolved, cards };
+  return { pending, revivable, cards };
 }
 
 function blockWallClockS(block: AnyBlock): number | undefined {
@@ -5653,17 +6177,19 @@ async function rehydrateWindowOnReconnect(
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
-  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
-): Promise<void> {
+  statusPatchFor: (s: ChatState) => Partial<ChatState>,
+): Promise<ReconnectBackfill> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
   let fresh: SessionItemsPage;
   try {
-    fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
+    fresh = await withReadTimeout((signal) =>
+      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+    );
   } catch {
-    return;
+    return "failed";
   }
-  if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  if (isConversationDisposed(id) || get().historyGeneration !== generation) return "skipped";
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5694,14 +6220,15 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
-    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const statusPatch = statusPatchFor(s);
     const blocks =
       reconcileElicitationBlocks(
         merged,
         snapshotPending,
         preGapElicitations.pending,
-        preGapElicitations.autoResolved,
+        preGapElicitations.revivable,
         preGapElicitations.cards,
+        id,
       ) ?? merged;
     return {
       ...statusPatch,
@@ -5717,7 +6244,12 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  return "applied";
 }
+
+/** A reconnect backfill's outcome; only a failed read leaves history owed. */
+type ReconnectBackfill = "applied" | "failed" | "skipped";
 
 /**
  * Reconcile committed state after a reconnect.
@@ -5742,18 +6274,22 @@ async function rehydrateWindowOnReconnect(
  * are not items, so the item backfill can't recover prompts that fired or
  * resolved while the socket was dead. The backfill path leaves history-window
  * state (`hasMoreHistory` / `oldestItemId`) untouched — a reconnect is not a
- * re-hydrate. Swallows fetch errors: a transient
- * failure just means the next reconnect retries. All writes are
- * `historyGeneration`-guarded so a window reset mid-fetch voids them.
+ * re-hydrate. Swallows fetch errors, resolving "failed" so the caller can
+ * retry. All writes are `historyGeneration`-guarded so a window reset
+ * mid-fetch voids them. `settleStatus: false` skips the status patch; a live
+ * turn edge or send latch change during the reads skips only its turn lifecycle.
  */
 async function reconcileOnReconnect(
   id: string,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
-): Promise<void> {
-  if (queryClient === null) return;
-  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  settleStatus = true,
+): Promise<ReconnectBackfill> {
+  if (queryClient === null) return "skipped";
+  const stateBeforeFetch = get();
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, stateBeforeFetch);
+  const turnEdgesBeforeFetch = streamTurnEdgeRevisions.get(id) ?? 0;
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -5766,27 +6302,42 @@ async function reconcileOnReconnect(
   // Same pre-gap capture for elicitation cards: only cards rendered
   // before the snapshot fetch are eligible for its flips — see
   // `reconcileElicitationBlocks`.
-  const preGapElicitations = captureElicitationIdsByStatus(get().blocks);
+  const preGapElicitations = captureElicitationIdsByStatus(get().blocks, id);
   // A window reset mid-fetch (A→B→A revisit, rebind) defeats the id check alone.
   const generation = get().historyGeneration;
   const stale = (): boolean => isConversationDisposed(id) || get().historyGeneration !== generation;
   let session: Session;
   let page: SessionItemsPage;
+  const client = queryClient;
   try {
     [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id),
-        staleTime: 0,
-        retry: false,
+      // Read fresh rather than join the shared ["session", id] request: one
+      // started before an answered card's verdict POST returned can still list
+      // that prompt as pending, and the reconcile would reopen the card.
+      withReadTimeout((signal) => getSessionSlim(id, { signal })).then((fresh) => {
+        client.setQueryData(["session", id], fresh);
+        return fresh;
       }),
-      fetchSessionItemsPage(id),
+      withReadTimeout((signal) => fetchSessionItemsPage(id, { signal })),
     ]);
   } catch {
-    return;
+    return "failed";
   }
-  if (stale()) return;
+  if (stale()) return "skipped";
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  // A live turn edge or send latch change during these reads owns the turn lifecycle.
+  const statusPatchFor = (s: ChatState): Partial<ChatState> =>
+    settleStatus
+      ? reconnectStatusPatch(
+          session,
+          s,
+          launchBeforeFetch,
+          stateBeforeFetch,
+          (streamTurnEdgeRevisions.get(id) ?? 0) === turnEdgesBeforeFetch &&
+            s.sendLatchedAt === stateBeforeFetch.sendLatchedAt &&
+            s.sendLatchSeenRunning === stateBeforeFetch.sendLatchSeenRunning,
+        )
+      : {};
 
   // Page backwards until the fetched window reaches the pre-gap transcript
   // or the conversation start. A single newest page is not enough: a gap
@@ -5802,15 +6353,17 @@ async function reconcileOnReconnect(
     if (!cursor) break;
     let older: SessionItemsPage;
     try {
-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
+      older = await withReadTimeout((signal) =>
+        fetchSessionItemsPage(id, { olderThan: cursor, signal }),
+      );
     } catch (error) {
       // A cursor whose item was deleted can never be paged past. Stop the
       // backfill with the gap still uncovered so the full rehydrate below
       // runs, instead of leaving items no path can fetch.
       if (isStaleCursorError(error)) break;
-      return;
+      return "failed";
     }
-    if (stale()) return;
+    if (stale()) return "skipped";
     items = [...older.items, ...items];
     hasMore = older.hasMore;
     covered = !hasMore || older.items.some((it) => preGapIds.has(it.id));
@@ -5820,7 +6373,7 @@ async function reconcileOnReconnect(
   const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   if (!covered) {
-    await rehydrateWindowOnReconnect(
+    return rehydrateWindowOnReconnect(
       id,
       session,
       preGapIds,
@@ -5828,9 +6381,8 @@ async function reconcileOnReconnect(
       set,
       get,
       ignoredNativeMessageIds,
-      launchBeforeFetch,
+      statusPatchFor,
     );
-    return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
@@ -5847,7 +6399,7 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...statusPatchFor(s),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -5899,8 +6451,9 @@ async function reconcileOnReconnect(
       nextBlocks,
       snapshotPending,
       preGapElicitations.pending,
-      preGapElicitations.autoResolved,
+      preGapElicitations.revivable,
       preGapElicitations.cards,
+      id,
     );
     if (reconciled !== null) nextBlocks = reconciled;
     nextBlocks =
@@ -5908,6 +6461,8 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
+  return "applied";
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────
@@ -5940,6 +6495,11 @@ const streamAttemptActivity = new Map<AbortController, number>();
 // the stall guard's own window (`SSE_STALL_TIMEOUT_MS`): the guard is the
 // ceiling; these event-driven checks make the common cases immediate.
 export const SSE_STALE_RECYCLE_MS = 35_000;
+
+// Reopen each stream before the Databricks ingress's ~5-minute cap, which can
+// drop it without a close the client sees; the stall guard would then take
+// up to `SSE_STALL_TIMEOUT_MS` to notice, leaving the transcript stale.
+export const SSE_MAX_STREAM_AGE_MS = 270_000;
 
 /**
  * Recycle every live stream attempt that looks dead — no bytes for
@@ -6003,6 +6563,35 @@ export async function startStreamPump(
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
   let statusReconcileInFlight = false;
+  // Ordinary failed opens still use bindStream's initial snapshot; successful
+  // connections and host readdresses need reconnect reconciliation.
+  let hasConnected = false;
+  // The open currently live, so routing changes and missed events can recycle it.
+  let liveAttempt: AbortController | null = null;
+  let backfillRuns = 0;
+  const missedEventRecovery: MissedEventRecovery = {
+    recycleStream: () => {
+      if (liveAttempt === null || !hasConnected) return false;
+      liveAttempt.abort();
+      return true;
+    },
+    revealedPendingIds: new Set<string>(),
+    recycledTurnKeys: new Set<string>(),
+    backfillOwed: false,
+    backfill: async (settleStatus) => {
+      backfillRuns += 1;
+      const run = backfillRuns;
+      const outcome = await reconcileOnReconnect(
+        id,
+        set,
+        get,
+        ignoredNativeMessageIds,
+        settleStatus,
+      );
+      // A slower earlier run must not overwrite the latest run's outcome.
+      if (run === backfillRuns) missedEventRecovery.backfillOwed = outcome === "failed";
+    },
+  };
   // Shared by the periodic reconcile and the post-reconnect catch-up burst so
   // reconciliations stay serialized: a catch-up tick that straddles a slow
   // snapshot fetch (or the periodic tick) is skipped rather than issuing a
@@ -6010,7 +6599,7 @@ export async function startStreamPump(
   const runGuardedStatusReconcile = (): void => {
     if (statusReconcileInFlight) return;
     statusReconcileInFlight = true;
-    void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+    void reconcileActiveSessionStatus(id, controller, set, get, missedEventRecovery).finally(() => {
       statusReconcileInFlight = false;
     });
   };
@@ -6045,17 +6634,15 @@ export async function startStreamPump(
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
   let consecutive404s = 0;
-  // Ordinary failed opens still use bindStream's initial snapshot; successful
-  // connections and host readdresses need reconnect reconciliation.
-  let hasConnected = false;
+  // When login-page answers began, since the last successful stream open.
+  let nonSseAnswersSince: number | null = null;
   let previousStreamEpoch: string | null = null;
   const nativePreviewBaselines = new Map<string, string>();
   // A host can be learned while an open is pending or backing off; the bind
   // snapshot may predate that gap even without a successful open.
   let hostReaddressed = false;
-  // The host the latest open was addressed to, and that open while it is live.
+  // The host the latest open was addressed to.
   let openedHost = getSessionHost(id);
-  let liveAttempt: AbortController | null = null;
   const unsubscribeHost = isDatabricksWorkspace()
     ? subscribeSessionHostChanges(() => {
         const host = getSessionHost(id);
@@ -6097,6 +6684,7 @@ export async function startStreamPump(
       streamAttemptActivity.set(attempt, Date.now());
       openedHost = getSessionHost(id);
       liveAttempt = attempt;
+      let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -6112,6 +6700,12 @@ export async function startStreamPump(
           if (isConversationDisposed(id)) break;
           console.warn(`Session ${id}: stream connect failed, will retry`, err);
           failedOpens += 1;
+          // Offline failures are the network, not the sign-in, so only probe while online.
+          if (navigator.onLine && (await streamSignInExpired(id, failedOpens, controller.signal))) {
+            failUnavailableStream(set, null, SIGN_IN_NOTICE);
+            set({ status: "idle" });
+            break;
+          }
           continue;
         }
 
@@ -6158,17 +6752,27 @@ export async function startStreamPump(
           failedOpens += 1;
           continue;
         }
-        // An auth layer in front of the server (e.g. an expired app-ingress
-        // session) can answer with a redirect the fetch follows to a 200
-        // text/html login page. Pumping that body would end instantly
-        // without `[DONE]` and reconnect with no backoff — a hot loop that
-        // leaves the transcript silently frozen. Treat a non-SSE content
-        // type as a failed open so it backs off like any other bad answer.
+        // A login page from an auth layer would pump as a clean drop and reconnect
+        // in a hot loop; back off on it instead, and give up like a 401 once it persists.
         const contentType = streamRes.headers.get("content-type") ?? "";
         if (!contentType.toLowerCase().includes("text/event-stream")) {
           void streamRes.body.cancel().catch(() => {});
+          nonSseAnswersSince ??= Date.now();
+          if (Date.now() - nonSseAnswersSince >= NON_SSE_STREAM_GIVE_UP_MS) {
+            console.warn(
+              `Session ${id}: stream open returned '${contentType}' for ${NON_SSE_STREAM_GIVE_UP_MS} ms, giving up`,
+            );
+            failUnavailableStream(set, null);
+            set({ status: "idle" });
+            break;
+          }
           console.warn(`Session ${id}: stream open returned '${contentType}', will retry`);
           failedOpens += 1;
+          if (await streamSignInExpired(id, failedOpens, controller.signal)) {
+            failUnavailableStream(set, null, SIGN_IN_NOTICE);
+            set({ status: "idle" });
+            break;
+          }
           continue;
         }
 
@@ -6179,8 +6783,10 @@ export async function startStreamPump(
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
+        nonSseAnswersSince = null;
         presenceIdle.noteReported(idle);
         streamAttemptActivity.set(attempt, Date.now());
+        maxAgeTimer = setTimeout(() => attempt.abort(), SSE_MAX_STREAM_AGE_MS);
         if (reconnecting) {
           if (previousStreamEpoch === null || streamEpoch === null) {
             nativePreviewBaselines.clear();
@@ -6235,7 +6841,7 @@ export async function startStreamPump(
           ignoredNativeMessageIds,
         );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
+          await missedEventRecovery.backfill(true);
           // reconcileOnReconnect can read a stale "running" when the server
           // just restarted and hasn't reprocessed the turn's completion yet,
           // stranding the tab on "Working…" until the 60s periodic reconcile.
@@ -6262,6 +6868,7 @@ export async function startStreamPump(
           markLivePreviewsInterrupted(id, set);
         }
       } finally {
+        if (maxAgeTimer !== null) clearTimeout(maxAgeTimer);
         liveAttempt = null;
         controller.signal.removeEventListener("abort", onOuterAbort);
         presenceAttemptControllers.delete(attempt);
@@ -6738,22 +7345,113 @@ export function isStaleCompletedResponse(s: { activeResponse: ActiveResponse | n
   );
 }
 
+/** Elicitation ids whose verdict POST (`submitApproval`) has not returned. */
+const elicitationVerdictsInFlight = new Set<string>();
+
 /**
- * Flip an auto-resolved ApprovalCard back to answerable, in place.
+ * Whether a responded card may flip back to pending when the server shows
+ * its prompt waiting again (a re-published request, or a reconnect
+ * snapshot's pending list).
  *
- * Used when the server re-publishes `response.elicitation_request` for
- * an id whose card was already flipped to "Resolved elsewhere" (the
- * deferred clear after a severed harness wait fired before the retry
- * re-parked) — the re-publish proves the prompt is parked again and
- * still waiting for a verdict. Only an `auto_resolved` card is
- * revived: a card carrying a real user verdict means an answer is
- * already in flight, and `submitApproval` owns rolling that back if
- * its POST fails.
+ * The server adopts a stored verdict before it publishes a re-parked
+ * prompt, so a prompt shown waiting after its verdict POST returned never
+ * got that verdict (it landed on a replica with no waiter), or was
+ * auto-cleared before the hook re-parked ("Resolved elsewhere"). While the
+ * POST is in flight, the evidence may predate the verdict. Native-delivery
+ * cards follow their own delivery state.
+ */
+function isRevivableElicitation(block: ElicitationBlock): boolean {
+  if (block.status !== "responded" || block.nativeDelivery) return false;
+  return (
+    block.response?.action === "auto_resolved" ||
+    !elicitationVerdictsInFlight.has(block.elicitationId)
+  );
+}
+
+/**
+ * Per conversation and elicitation id, the count of `response.elicitation_resolved`
+ * events received (even when the card already shows an answer) and verdicts
+ * submitted. Snapshot-driven revival compares it across its fetch, so a
+ * snapshot read before the prompt was resolved, or before a newer answer,
+ * cannot reopen the card.
+ */
+const elicitationVerdictRevisions = new Map<string, Map<string, number>>();
+conversationRegistry.subscribeDisposed((id) => elicitationVerdictRevisions.delete(id));
+
+function elicitationVerdictRevision(conversationId: string, elicitationId: string): number {
+  return elicitationVerdictRevisions.get(conversationId)?.get(elicitationId) ?? 0;
+}
+
+function bumpElicitationVerdictRevision(conversationId: string, elicitationId: string): void {
+  let revisions = elicitationVerdictRevisions.get(conversationId);
+  if (revisions === undefined) {
+    revisions = new Map();
+    elicitationVerdictRevisions.set(conversationId, revisions);
+  }
+  revisions.set(elicitationId, (revisions.get(elicitationId) ?? 0) + 1);
+}
+
+/**
+ * Snapshot-check pending evidence received while the verdict POST was in
+ * flight, once the POST returns.
+ */
+const elicitationRechecksAfterVerdict = new Set<string>();
+
+/**
+ * Recheck answered cards a reconnect snapshot still lists but the reconcile
+ * did not revive: now, or once their verdict POST returns.
+ */
+function queueAnsweredElicitationRechecks(
+  conversationId: string,
+  snapshotPending: AnyBlock[],
+  blocks: AnyBlock[],
+): void {
+  const listed = new Set(
+    snapshotPending
+      .filter((b): b is ElicitationBlock => b.type === "elicitation")
+      .map((b) => b.elicitationId),
+  );
+  for (const b of blocks) {
+    if (b.type !== "elicitation" || b.status !== "responded" || b.nativeDelivery) continue;
+    if (b.response?.action === "auto_resolved" || !listed.has(b.elicitationId)) continue;
+    if (elicitationVerdictsInFlight.has(b.elicitationId)) {
+      elicitationRechecksAfterVerdict.add(b.elicitationId);
+    } else {
+      void recheckAnsweredElicitation(conversationId, b.elicitationId);
+    }
+  }
+}
+
+/** Reopen an answered card if a fresh snapshot still lists its prompt. */
+async function recheckAnsweredElicitation(
+  conversationId: string,
+  elicitationId: string,
+): Promise<void> {
+  const revisionBeforeFetch = elicitationVerdictRevision(conversationId, elicitationId);
+  let session: Session;
+  try {
+    session = await getSessionSlim(conversationId);
+  } catch {
+    return;
+  }
+  if (isConversationDisposed(conversationId)) return;
+  // A resolution event or newer answer during the fetch means the snapshot may predate it.
+  if (elicitationVerdictRevision(conversationId, elicitationId) !== revisionBeforeFetch) return;
+  const current = pendingElicitationBlocksFromSnapshot(session).find(
+    (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
+  );
+  if (current) revivePendingElicitationBlock(setterFor(conversationId), elicitationId, current);
+}
+
+/**
+ * Flip a responded ApprovalCard back to answerable, in place, when the
+ * server re-publishes `response.elicitation_request` for its id; see
+ * `isRevivableElicitation` for which cards qualify.
  */
 function revivePendingElicitationBlock(
   set: Setter,
   elicitationId: string,
-  incoming?: ElicitationBlock,
+  incoming: ElicitationBlock,
 ): void {
   set((s) => {
     const idx = s.blocks.findIndex(
@@ -6762,13 +7460,20 @@ function revivePendingElicitationBlock(
     if (idx === -1) return {};
     const target = s.blocks[idx] as ElicitationBlock;
     if (target.nativeDeliveryResolved) return {};
-    if (incoming?.nativeDelivery) {
+    if (incoming.nativeDelivery) {
       if (target.status === "responded" && target.response?.action !== "auto_resolved") return {};
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
-    if (target.status !== "responded" || target.response?.action !== "auto_resolved") return {};
-    const updated: ElicitationBlock = { ...target, status: "pending", response: null };
+    if (!isRevivableElicitation(target)) return {};
+    // Rebuilt from the incoming request: a recurring id can carry a different
+    // request, and the reopened card must show what an answer would approve.
+    const updated: ElicitationBlock = {
+      ...incoming,
+      ctx: target.ctx,
+      status: "pending",
+      response: null,
+    };
     return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
   });
 }
@@ -6985,9 +7690,8 @@ export async function pumpStreamEvents(
       // server re-publishes the same id whenever a severed harness wait
       // re-parks (hook retries reuse their id), so an already-rendered
       // id must not append a second card: a pending card (or one
-      // carrying an in-flight user verdict) stays untouched, and a card
-      // the deferred clear flipped to "Resolved elsewhere" is revived
-      // to answerable in place.
+      // carrying an in-flight user verdict) stays untouched, and a
+      // responded card is revived to answerable in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
         const buffered = buffer.findIndex(
@@ -6998,6 +7702,8 @@ export async function pumpStreamEvents(
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
+          // Ignored while its verdict POST is in flight; re-check once it returns.
+          if (elicitationVerdictsInFlight.has(eid)) elicitationRechecksAfterVerdict.add(eid);
           revivePendingElicitationBlock(set, eid, block);
           continue;
         }
@@ -7256,17 +7962,27 @@ export function restoredSendDraftUnchanged(
   );
 }
 
-/** Consume a session's failed send once, retaining retry identity only when restored. */
-export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
+/**
+ * Consume a session's failed send once, retaining retry identity only when restored.
+ * `appendsRecovered`: the composer adds a recovered send after its newer input.
+ */
+export function takeFailedSendDraft(
+  conversationId: string,
+  hasDraft: boolean,
+  appendsRecovered = false,
+) {
   const state = setterForState(conversationId);
   const failed = state?.failedSendDraft;
   if (!state || !failed || failed.conversationId !== conversationId) return null;
   const delivered = committedItemProvesDelivery(state.blocks, failed);
-  const restore = !hasDraft && !delivered;
+  // Added after newer input, the text goes out as a new message.
+  const appended = hasDraft && appendsRecovered && failed.recovered === true;
+  const restore = (!hasDraft || appended) && !delivered;
+  const tracked = restore && !appended;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
-  if (!delivered) patch.pendingRetryStableId = restore ? (failed.stableId ?? null) : null;
+  if (!delivered) patch.pendingRetryStableId = tracked ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
-  if (restore && failed.stableId)
+  if (tracked && failed.stableId)
     patch.restoredSendDraft = {
       conversationId,
       stableId: failed.stableId,
@@ -7385,7 +8101,8 @@ async function sendVerdictFromServer(
  * sandbox wake, which persists nothing until the wake ends. Only the sender
  * gets the text back, and only if the snapshot holds no item under its stable
  * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing.
+ * carry no stable id, and another message can say the same thing. Messages the
+ * page still held in its queue come back the same way, joined after any such send.
  *
  * @param conversationId - The session being bound.
  * @param items - The snapshot's committed items.
@@ -7397,24 +8114,45 @@ function unsentSendToRestore(
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
   // A send still open in this tab settles on its own.
-  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  if (unsent !== null && inFlightSends.has(unsent.stableId)) return null;
+  // Messages this page still queues aren't lost; only a reload empties the queue.
+  const queuedHere = new Set(useChatStore.getState().queuedMessages.map((m) => m.stableId));
+  const stored = peekQueuedSends(conversationId);
+  const queued = stored.filter((send) => !queuedHere.has(send.stableId));
+  if (unsent === null && queued.length === 0) return null;
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
     restoreUnsentSendOnceIdentified(conversationId, items);
     return null;
   }
-  forgetUnsentSend(conversationId, unsent.stableId);
-  // Another account has signed in to this tab since.
-  if (unsent.authorId !== viewerId) return null;
-  if (items.some((item) => item.id === unsent.stableId)) return null;
+  if (unsent !== null) forgetUnsentSend(conversationId, unsent.stableId);
+  if (queued.length > 0) {
+    rememberQueuedSends(
+      conversationId,
+      stored.filter((send) => queuedHere.has(send.stableId)),
+    );
+  }
+  const sends = [...(unsent === null ? [] : [unsent]), ...queued].filter(
+    // Another account may have signed in to this tab since.
+    (send) => send.authorId === viewerId && !items.some((item) => item.id === send.stableId),
+  );
+  const [first] = sends;
+  if (first === undefined) return null;
+  // Joined as drafts, not text, so each message keeps its reply cards.
+  const joined = sends
+    .map((send) => restoreReplyDraft(send.text, send.replyDraft))
+    .reduce(appendReplyDraft);
+  const replyDraft = snapshotReplyDraft(joined);
   return {
     conversationId,
-    text: unsent.text,
+    text: serializeReplyDraft(joined),
     files: [],
-    stableId: unsent.stableId,
-    ...(unsent.replyDraft ? { replyDraft: unsent.replyDraft } : {}),
+    // A resend of one message reuses its id, which the server dedupes; joined text is a new message.
+    ...(sends.length === 1 ? { stableId: first.stableId } : {}),
+    ...(replyDraft ? { replyDraft } : {}),
     serverRefused: false,
+    recovered: true,
   };
 }
 
@@ -7880,6 +8618,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
                 event.stage === "action_required" ? s.sandboxActionDismissed : null,
             },
       );
+      if (event.stage === "failed") void refreshFailedInputs(event.conversationId);
       // The sandbox host is bound before its runner starts; refetch the binding and a
       // host list cached before that host registered, so the composer can name it.
       if (event.stage === "connecting" || event.stage === "ready") {
@@ -8022,6 +8761,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
       return;
+    case "session_background_tasks":
+      // Tasks that changed between turns (codex-native background terminals).
+      // The count is authoritative, as on a `session.status` edge.
+      applyToNamedConversation(event.conversationId, {
+        backgroundTaskCount: event.backgroundTaskCount,
+        backgroundTasks: event.backgroundTasks,
+      });
+      return;
     case "session_codex_approval_mode":
       // A Codex approval switch made in the web picker or the native TUI's
       // /permissions popup; the server has confirmed it's the live mode.
@@ -8138,6 +8885,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // so an absent one means "no longer parked".
           blockedOn: event.blockedOn ?? null,
         };
+        if (event.status === "running") patch.sendLatchSeenRunning = s.sendLatchedAt;
         // The background-shell tally is STICKY. Only the Stop-hook-derived
         // status carries an authoritative count (the forwarder relabels its
         // `idle` to `waiting` and attaches `background_task_count`); the
@@ -8306,6 +9054,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               source: "",
               code: statusError.code,
               ...structuredErrorFields(statusError, statusAgentName),
+              fromSessionStatus: true,
             } satisfies ErrorBlock,
           ];
         }
@@ -8382,8 +9131,24 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // without a fresh transition, would strand the queue forever.
       return;
     }
-    case "session_input_consumed":
+    case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A retry from another client may have delivered an undelivered message: clear
+      // it now when the receipt names it (native ones do), and re-read either way,
+      // superseding any failure read still in flight from before the delivery.
+      if (
+        sourceConversationId &&
+        ((setterForState(sourceConversationId)?.failedInputs.length ?? 0) > 0 ||
+          startupReads.has(sourceConversationId))
+      ) {
+        const deliveredId = event.clearedPendingId;
+        if (deliveredId) {
+          applyToConversation((s) => ({
+            failedInputs: s.failedInputs.filter((input) => input.pendingId !== deliveredId),
+          }));
+        }
+        void refreshFailedInputs(sourceConversationId);
+      }
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
       // before it (re)populates the composer with an already-sent prompt,
@@ -8564,6 +9329,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         };
       });
       return;
+    }
     case "slash_command":
       // Claude-native: a `/skill-name` or surfaced CLI command typed
       // in the web composer round-trips through tmux → Claude TUI →
@@ -8748,6 +9514,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // elsewhere".
       return;
     case "elicitation_resolved":
+      // Without a verdict the card can reopen if the prompt re-parks, so keep its draft.
+      if (event.action) clearAskUserQuestionDraft(event.elicitationId);
       // Match by id, not first-pending — the `pending` guard keeps
       // a user-delivered verdict from being overwritten by a later
       // duplicate-resolve.
@@ -8831,6 +9599,14 @@ function patchConversationStatusInCache(
       return mutated ? { ...data, pages } : data;
     },
   );
+  // The sidebar's fetched row for an open session outside the loaded pages.
+  // Writing an unchanged row would still mark it fresh and notify subscribers.
+  const backfillKey = ["conversation-backfill", conversationId];
+  const backfillRow = queryClient.getQueryData<Conversation | null>(backfillKey);
+  if (backfillRow && backfillRow.status !== listStatus) {
+    const patchedRow: Conversation = { ...backfillRow, status: listStatus };
+    queryClient.setQueryData<Conversation | null>(backfillKey, patchedRow);
+  }
 }
 
 /**
@@ -8851,6 +9627,8 @@ function applyTerminalCreated(resource: Record<string, unknown>): void {
   if (info === null) return;
   if (queryClient === null) return;
   const key = terminalsQueryKey(sessionId);
+  // The user closed this shell before its create returned; its launch deletes it.
+  if (isClosedDuringLaunch(info.id)) return;
   const current = queryClient.getQueryData<TerminalInfo[]>(key) ?? [];
   if (current.some((t) => t.id === info.id)) return;
   queryClient.setQueryData<TerminalInfo[]>(key, [...current, info]);
@@ -8970,11 +9748,19 @@ async function* tapSessionEvents(
   beforeTurnEdge?: () => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    const turnEdge = event.type === "session_status" || event.type === "session_interrupted";
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+      if (turnEdge) {
+        streamTurnEdgeRevisions.set(
+          conversationId,
+          (streamTurnEdgeRevisions.get(conversationId) ?? 0) + 1,
+        );
+      }
     }
-    if (event.type === "session_status" || event.type === "session_interrupted") {
-      beforeTurnEdge?.();
+    if (turnEdge) beforeTurnEdge?.();
+    if (event.type === "elicitation_resolved") {
+      bumpElicitationVerdictRevision(conversationId, event.elicitationId);
     }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {
@@ -9036,67 +9822,89 @@ function finalizeActive(
   });
 }
 
-const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
+interface StreamNotice {
+  code: string;
+  title: string;
+  message: string;
+}
 
-/** Fail the active turn and surface one fallback when no bubble can show it. */
-function failUnavailableStream(set: Setter, error: string): void {
+/** The stream dropped and retries gave up; reloading the page reconnects it. */
+const CONNECTION_NOTICE: StreamNotice = {
+  code: "stream_unavailable",
+  title: "The live connection to the assistant is unavailable",
+  message: "Reload the page to reconnect.",
+};
+/** The sign-in expired, which only a fresh top-level page can renew. */
+const SIGN_IN_NOTICE: StreamNotice = {
+  code: SIGN_IN_EXPIRED_CODE,
+  title: "Your sign-in expired",
+  message: "Reload the page to sign in again.",
+};
+
+/**
+ * Whether repeated failed opens point at an expired sign-in, which retrying cannot
+ * fix. A probe that never answers reads as not expired, and the loop keeps retrying.
+ */
+async function streamSignInExpired(
+  id: string,
+  failedOpens: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  if (failedOpens < SIGN_IN_PROBE_AFTER_FAILED_OPENS) return false;
+  // AbortSignal.any is missing on older Safari and iOS, so forward both aborts by hand.
+  const probe = new AbortController();
+  const abortProbe = () => probe.abort();
+  signal.addEventListener("abort", abortProbe, { once: true });
+  try {
+    const expired = await withReadTimeout((probeSignal) => {
+      probeSignal.addEventListener("abort", abortProbe, { once: true });
+      return isSignInExpired(probe.signal);
+    }).catch(() => false);
+    return expired && !signal.aborted && !isConversationDisposed(id);
+  } finally {
+    signal.removeEventListener("abort", abortProbe);
+  }
+}
+
+/**
+ * Fail the live turn once its stream is gone for good. A status the bubble can
+ * show (`error`) gets the standalone card only when no bubble can show it; a
+ * null `error` (a login-page give-up) always gets the card. A settled turn keeps
+ * its outcome.
+ */
+function failUnavailableStream(
+  set: Setter,
+  error: string | null,
+  notice: StreamNotice = CONNECTION_NOTICE,
+): void {
   set((s) => {
-    const activeResponse =
-      s.activeResponse === null
-        ? null
-        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+    const live = s.activeResponse?.state === "streaming" ? s.activeResponse : null;
+    const failed =
+      live === null ? null : { ...live, state: "failed" as const, error, completedAt: Date.now() };
     const blocks = s.blocks.filter(
-      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+      (block) =>
+        block.type !== "error" ||
+        (block.code !== CONNECTION_NOTICE.code && block.code !== SIGN_IN_NOTICE.code),
     );
     const hasVisibleFailure =
-      activeResponse !== null &&
-      buildBubbles(blocks, activeResponse).some(
-        (bubble) => bubble.kind === "assistant" && bubble.responseId === activeResponse.responseId,
+      failed !== null &&
+      error !== null &&
+      buildBubbles(blocks, failed).some(
+        (bubble) => bubble.kind === "assistant" && bubble.responseId === failed.responseId,
       );
     if (hasVisibleFailure) {
-      return blocks.length === s.blocks.length ? { activeResponse } : { activeResponse, blocks };
+      return blocks.length === s.blocks.length
+        ? { activeResponse: failed }
+        : { activeResponse: failed, blocks };
     }
     return {
-      ...(activeResponse !== null ? { activeResponse } : {}),
+      ...(failed !== null ? { activeResponse: failed } : {}),
       blocks: [
         ...blocks,
-        makeClientErrorBlock(
-          "The live connection to the assistant is unavailable. Reload the page to reconnect.",
-          STREAM_UNAVAILABLE_CODE,
-        ),
+        { ...makeClientErrorBlock(notice.message, notice.code), title: notice.title },
       ],
     };
   });
-}
-
-// Mirrors the server's ErrorCode.RUNNER_UNAVAILABLE (omnigent/errors.py) —
-// the 503 returned by POST /events when a host-bound runner never connects
-// within the connect-grace + relaunch window.
-const RUNNER_UNAVAILABLE_CODE = "runner_unavailable";
-
-// Replace only the server's no-context fallback; preserve phase-specific detail.
-const RUNNER_UNAVAILABLE_TERSE_MESSAGE = "No runner bound for session";
-
-/**
- * Turn a thrown send failure into user-facing banner text + a code.
- *
- * Keep the runner-unavailable code and any phase-specific detail. Replace
- * only the server's no-context message with friendly copy.
- */
-function describeSendFailure(err: unknown): { message: string; code: string } {
-  if (err instanceof ApiError && err.code === RUNNER_UNAVAILABLE_CODE) {
-    const informative = err.message && err.message !== RUNNER_UNAVAILABLE_TERSE_MESSAGE;
-    return {
-      message: informative
-        ? err.message
-        : "The runner didn't come online in time. Please try again.",
-      code: RUNNER_UNAVAILABLE_CODE,
-    };
-  }
-  if (err instanceof ApiError) {
-    return { message: err.message, code: err.code ?? "" };
-  }
-  return { message: err instanceof Error ? err.message : String(err), code: "" };
 }
 
 /**

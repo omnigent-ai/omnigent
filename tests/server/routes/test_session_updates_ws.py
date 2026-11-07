@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from datetime import UTC, datetime
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -24,7 +25,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
-from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -173,7 +174,9 @@ def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[s
     raise AssertionError(f"no frame in {wanted} after {max_frames} frames")
 
 
-def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> None:
+def test_watch_returns_snapshot_of_accessible_sessions(
+    app: FastAPI, stores, debug_log_rows: list[dict[str, Any]]
+) -> None:
     """A ``watch`` for owned ids returns a snapshot containing exactly
     those sessions, with their persisted titles."""
     s1 = _seed_session(stores, owner=ALICE, title="first")
@@ -198,6 +201,14 @@ def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> 
         # would drop the key (stream dumps full rows, so it must be present).
         assert items[s1]["runner_online"] is True
         assert items[s1]["host_online"] is None
+    # WebSockets skip the HTTP middleware that attributes debug-log rows, so
+    # the handler binds the caller itself.
+    connected = [
+        row
+        for row in debug_log_rows
+        if row["event_name"] == "session_updates" and row["attributes"].get("phase") == "connected"
+    ]
+    assert [row["user_id"] for row in connected] == [ALICE]
 
 
 def test_child_busy_rollup_flows_through_updates_stream(
@@ -315,6 +326,26 @@ def test_title_change_pushes_changed_frame(app: FastAPI, stores, fast_rescan: No
         # The changed frame carries the new title — proves the diff fired
         # on the real field change, not a spurious or stale value.
         assert items[s1]["title"] == "after"
+
+
+def test_share_change_pushes_owner_shared_flag(app: FastAPI, stores, fast_rescan: None) -> None:
+    """Granting and revoking another user reaches the owner's watched row on rescan,
+    with no other change to the session."""
+    permission_store = stores[2]
+    s1 = _seed_session(stores, owner=ALICE, title="mine")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["shared_with_others"] is False  # type: ignore[index]
+        permission_store.ensure_user(BOB)
+        permission_store.grant(BOB, s1, LEVEL_READ)
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["shared_with_others"] is True  # type: ignore[index]
+        permission_store.revoke(BOB, s1)
+        changed = _recv_until(ws, {"changed"})
+        assert changed["items"][0]["shared_with_others"] is False  # type: ignore[index]
 
 
 def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: None) -> None:
@@ -599,6 +630,32 @@ def test_session_added_for_inaccessible_session_is_not_pushed(
                 f"expected only heartbeats, got {frame['type']} "
                 f"(a changed frame would mean Bob's session leaked to Alice)"
             )
+
+
+def test_session_added_for_watched_session_pushes_access_changed(
+    app: FastAPI, stores, fast_rescan: None
+) -> None:
+    """A share of a session the client already watches pushes ``access_changed``.
+
+    Bob has Alice's session open (so it is watched) through read access, and
+    Alice then shares it with him directly at the same level. His row is
+    unchanged, so the interval diff emits nothing; without ``access_changed``
+    his Shared list would not learn the session now belongs there.
+    """
+    shared = _seed_session(stores, owner=ALICE, title="alice")
+    permission_store = stores[2]
+    permission_store.ensure_user(BOB)
+    permission_store.grant(BOB, shared, LEVEL_READ)
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": BOB}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [shared]}))
+        _recv_until(ws, {"snapshot"})
+        sessions_routes.user_session_stream.publish(
+            BOB, {"type": "session_added", "session_id": shared}
+        )
+        frame = _recv_until(ws, {"access_changed", "changed"})
+        assert frame == {"type": "access_changed", "ids": [shared]}
 
 
 def test_pin_label_collapses_to_canonical_key_on_the_wire(

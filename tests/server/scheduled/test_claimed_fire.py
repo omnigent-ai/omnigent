@@ -8,20 +8,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+import threading
 import time
 import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.managed_hosts import ManagedLaunchTracker
 from omnigent.server.scheduled import fire as fire_mod
+from omnigent.server.scheduled import telemetry
 from omnigent.server.scheduled.dispatch_scheduler import (
     FireIdentityRevoked,
     PersistentTaskScheduler,
@@ -29,17 +33,24 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     StartupLeaseLost,
 )
 from omnigent.server.scheduled.fire import ClaimedRunExecutor, FireDeps
-from omnigent.server.scheduled.schedule import occurrence_host_id, scheduled_trigger_key
+from omnigent.server.scheduled.schedule import (
+    continued_sandbox_host_id,
+    host_ownership_key,
+    manual_trigger_key,
+    occurrence_host_id,
+    scheduled_trigger_key,
+)
 from omnigent.server.startup_inputs import STARTUP_LABEL
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests.server.scheduled.test_fire import (
     FakeAgentStore,
-    FakeConversationStore,
     FakeHostStore,
     FakePermissionStore,
     FakeProjectStore,
     FakeStartupInputs,
     _drain_managed_launches,
+    _ExistingConversationStore,
     _FakeAgent,
     _FakeConversation,
     _FakeHost,
@@ -54,7 +65,7 @@ _HOST_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "host").hex
 _CONV_ID = uuid.uuid5(uuid.NAMESPACE_DNS, "conversation").hex
 
 
-class _ConversationStore(FakeConversationStore):
+class _ConversationStore(_ExistingConversationStore):
     """Mints UUID session ids and remembers host bindings a managed launch writes."""
 
     def __init__(self) -> None:
@@ -64,11 +75,16 @@ class _ConversationStore(FakeConversationStore):
 
     def create_conversation(self, **kwargs: Any) -> _FakeConversation:
         conv = super().create_conversation(**kwargs)
-        conv.id = uuid.uuid4().hex
+        conv.id = kwargs.get("conversation_id") or uuid.uuid4().hex
+        conv.root_conversation_id = conv.id
         self.ids.append(conv.id)
+        self.existing[conv.id] = conv
         return conv
 
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
+        if conversation_id in self.existing:
+            conv = self.existing[conversation_id]
+            return replace(conv, host_id=self.hosts.get(conversation_id, conv.host_id))
         return _FakeConversation(
             id=conversation_id, agent_id=_AGENT_ID, host_id=self.hosts.get(conversation_id)
         )
@@ -122,7 +138,7 @@ def _deps(store: SqlAlchemyScheduledTaskStore, **overrides: Any) -> FireDeps:
         scheduled_task_store=store,
         agent_store=FakeAgentStore({_AGENT_ID: _FakeAgent(_AGENT_ID)}),
         conversation_store=overrides.get("conversation_store", _ConversationStore()),
-        permission_store=FakePermissionStore(),
+        permission_store=overrides.get("permission_store", FakePermissionStore()),
         host_store=overrides.get("host_store", FakeHostStore()),
         host_registry=None,
         sandbox_config=overrides.get("sandbox_config"),
@@ -139,13 +155,14 @@ def _runs(store: SqlAlchemyScheduledTaskStore, task: ScheduledTask) -> list[Sche
 # ── Starting a claimed run ───────────────────────────────────────────────────
 
 
-async def test_connected_fire_runs_on_the_claimed_run(store) -> None:
+async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> None:
     claimed = _claim(store)
     conversations = _ConversationStore()
     seen: list[ScheduledTaskRun] = []
 
     async def dispatch(conv: Any, task: ScheduledTask) -> None:
         seen.append(store.list_runs(task.id)[0][0])
+        await asyncio.to_thread(fire_mod._logger.info, "dispatch correlation probe")
 
     executor = ClaimedRunExecutor(
         _deps(store, conversation_store=conversations), launch_dispatch=dispatch
@@ -161,6 +178,484 @@ async def test_connected_fire_runs_on_the_claimed_run(store) -> None:
     task = store.get(claimed.task.id)
     assert task.last_run_conversation_id == session_id
     assert task.last_run_at is not None
+    [row] = [row for row in debug_log_rows if row["message"] == "dispatch correlation probe"]
+    assert row["session_id"] == session_id
+    assert row["attributes"]["run_id"] == run.id
+    assert row["attributes"]["task_id"] == claimed.task.id
+    assert row["attributes"]["trigger_key"] == run.trigger_key
+
+
+@pytest.mark.parametrize(
+    "session_mode,failed_stage",
+    [
+        ("new", stage)
+        for stage in [
+            None,
+            "runner_start",
+            "prompt_prepare",
+            "prompt_send",
+            "runner_start_cancelled",
+            "prompt_send_cancelled",
+            "native_refusal",
+            "dispatch_bookkeeping",
+        ]
+    ]
+    + [("continue", None), ("continue", "native_refusal")],
+)
+async def test_prompt_logs_measure_delivery_and_locate_failures(
+    store, monkeypatch, caplog, session_mode, failed_stage, db_uri
+) -> None:
+    from omnigent.server.routes import sessions
+
+    caplog.set_level(logging.INFO)
+    claimed = _claim(
+        store,
+        session_mode=session_mode,
+        session_id=_CONV_ID if session_mode == "continue" else None,
+    )
+    conversations = (
+        _ExistingConversationStore(
+            _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+        )
+        if session_mode == "continue"
+        else _ConversationStore()
+    )
+    post_acceptance = failed_stage == "dispatch_bookkeeping"
+    cancelled = failed_stage in {"runner_start_cancelled", "prompt_send_cancelled"}
+    reported_stage = (
+        "prompt_send" if post_acceptance else (failed_stage or "").removesuffix("_cancelled")
+    )
+    failure = (
+        asyncio.CancelledError("delivery cancelled")
+        if cancelled
+        else RuntimeError("delivery failed")
+    )
+    if post_acceptance:
+        conversations = SqlAlchemyConversationStore(db_uri)
+    deps = _deps(store, conversation_store=conversations)
+    monkeypatch.setattr(telemetry, "time", SimpleNamespace(time=lambda: claimed.clock.now() + 15))
+    initialize = AsyncMock(side_effect=failure if reported_stage == "runner_start" else None)
+    send = AsyncMock(
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None),
+        side_effect=failure if reported_stage == "prompt_send" else None,
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", initialize)
+    native_refusal = failed_stage == "native_refusal"
+    if native_refusal:
+        from omnigent.server.routes._sessions import orchestration
+
+        monkeypatch.setattr(
+            orchestration,
+            "_ensure_native_terminal_ready",
+            AsyncMock(
+                return_value=sessions._NativeTerminalEnsureOutcome(
+                    error=RuntimeError("terminal failed")
+                )
+            ),
+        )
+        persisted_failure = AsyncMock(return_value="failure-item")
+        monkeypatch.setattr(orchestration, "_persist_native_terminal_failure", persisted_failure)
+    elif post_acceptance:
+        from omnigent.server.routes._sessions import orchestration
+
+        def fail_acknowledgement(*args, **kwargs):
+            raise RuntimeError("bookkeeping failed after acceptance")
+
+        monkeypatch.setattr(orchestration, "_publish_input_consumed", fail_acknowledgement)
+    else:
+        monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(
+        fire_mod,
+        "_agent_revision",
+        AsyncMock(
+            return_value=None,
+            side_effect=RuntimeError("agent read failed")
+            if failed_stage == "prompt_prepare"
+            else None,
+        ),
+    )
+
+    async def dispatch(conv, task):
+        if native_refusal:
+            conv = SimpleNamespace(**vars(conv), kind="default", harness_override="claude-native")
+            conv.labels = {**conv.labels, "omnigent.wrapper": "claude-native"}
+        if post_acceptance:
+            async with httpx.AsyncClient(
+                base_url="http://runner", transport=httpx.MockTransport(accept)
+            ) as runner:
+                await fire_mod._send_prompt(deps, conv, runner, task)
+        else:
+            await fire_mod._send_prompt(deps, conv, object(), task)
+
+    accepted = []
+
+    def accept(request):
+        accepted.append(request)
+        return httpx.Response(202, json={"queued": True})
+
+    executor = ClaimedRunExecutor(deps, launch_dispatch=dispatch)
+    if cancelled:
+        with pytest.raises(asyncio.CancelledError, match="delivery cancelled"):
+            await executor.fire(claimed.task, claimed.lease)
+    else:
+        await executor.fire(claimed.task, claimed.lease)
+    if post_acceptance:
+        assert len(accepted) == 1
+    sent = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_prompt_sent"
+    ]
+    failed = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    created = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_session_created"
+    ]
+    assert len(created) == int(session_mode == "new")
+    if created:
+        assert created[0].session_id == _runs(store, claimed.task)[0].conversation_id
+        assert created[0].attributes["session_delay_seconds"] == 15
+    if native_refusal:
+        persisted_failure.assert_awaited_once()
+        assert not sent
+        assert not failed
+        [refusal] = [
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_prompt_not_accepted"
+        ]
+        assert refusal.attributes["run_id"] == claimed.lease.run.id
+        assert refusal.attributes["failure_stage"] == "prompt_send"
+        assert refusal.attributes["outcome"] == "not_sent"
+        # A native refusal persists its own failure item; dispatch still returns normally.
+        assert _runs(store, claimed.task)[0].status == (
+            "running" if session_mode == "new" else "succeeded"
+        )
+    started = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_prompt_dispatch_started"
+    ]
+    interrupted = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_stage_interrupted"
+    ]
+    assert len(interrupted) == int(cancelled)
+    if reported_stage in {"runner_start", "prompt_prepare"}:
+        assert not started
+    else:
+        assert len(started) == 1
+        assert started[0].attributes["dispatch_id"]
+    if cancelled:
+        assert not sent
+        assert not failed
+        assert interrupted[0].attributes["failure_stage"] == reported_stage
+        assert interrupted[0].attributes["run_id"] == claimed.lease.run.id
+        assert interrupted[0].attributes["outcome"] == "uncertain"
+        assert not any(
+            getattr(r, "event_name", None) == "scheduled_run_startup_ended" for r in caplog.records
+        )
+        [run] = _runs(store, claimed.task)
+        assert (run.status, run.error_code, run.finished_at) == ("starting", None, None)
+        assert run.lease_expires_at == claimed.clock.now() + _LEASE_SECONDS
+        assert run.conversation_id is not None
+        claimed.clock.advance(_LEASE_SECONDS)
+        recovery = ClaimedRunExecutor(
+            _deps(
+                store,
+                conversation_store=_RecoveryConversationStore(
+                    conversations.get_conversation(run.conversation_id)
+                ),
+            )
+        )
+        assert await recovery.recover(run) == "failed"
+        initialize.assert_awaited_once()
+        assert send.await_count == int(reported_stage == "prompt_send")
+    elif failed_stage and not native_refusal:
+        assert not sent
+        assert len(failed) == 1
+        assert failed[0].attributes["failure_stage"] == reported_stage
+        outcome = next(
+            r
+            for r in caplog.records
+            if getattr(r, "event_name", None) == "scheduled_run_startup_ended"
+        )
+        assert outcome.attributes["failure_stage"] == reported_stage
+        assert any(
+            getattr(r, "event_name", None) == "scheduled_run_stage_started"
+            and r.attributes["fire_stage"] == reported_stage
+            for r in caplog.records
+        )
+        assert failed[0].attributes["run_id"] == claimed.lease.run.id
+        assert _runs(store, claimed.task)[0].status == "failed"
+    elif not native_refusal:
+        assert not failed
+        assert len(sent) == 1
+        assert sent[0].attributes["dispatch_id"] == started[0].attributes["dispatch_id"]
+        assert sent[0].attributes["prompt_delay_seconds"] == 15
+        assert sent[0].attributes["run_id"] == claimed.lease.run.id
+        assert sent[0].attributes["trigger_key"] == claimed.lease.run.trigger_key
+        assert sent[0].attributes["target"] == "connected_host"
+        assert sent[0].attributes["session_mode"] == session_mode
+        assert sent[0].session_id == _runs(store, claimed.task)[0].conversation_id
+    assert telemetry.current_scheduled_run() is None
+
+
+async def test_delivery_log_failure_does_not_fail_the_run(store, monkeypatch) -> None:
+    from omnigent.server.routes import sessions
+
+    claimed = _claim(store)
+    deps = _deps(store)
+    send = AsyncMock(
+        return_value=sessions._SessionEventDispatchResult(item_id="item", pending_id=None)
+    )
+    monkeypatch.setattr(sessions, "_ensure_runner_session_initialized", AsyncMock())
+    monkeypatch.setattr(sessions, "_dispatch_session_event_to_runner", send)
+    monkeypatch.setattr(fire_mod, "_agent_revision", AsyncMock(return_value=None))
+
+    def fail_log(*args, **kwargs):
+        raise RuntimeError("log sink failed")
+
+    monkeypatch.setattr(telemetry._logger, "info", fail_log)
+
+    async def dispatch(conv, task):
+        await fire_mod._send_prompt(deps, conv, object(), task)
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+    send.assert_awaited_once()
+    assert _runs(store, claimed.task)[0].status == "running"
+
+
+async def test_continued_session_fire_runs_on_the_claimed_run(store) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+    )
+    seen: list[tuple[str, ScheduledTaskRun]] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        seen.append((conv.id, store.list_runs(task.id)[0][0]))
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert conversations.created == []
+    # The session goes on the run only once the prompt is delivered, so recovery
+    # of an interrupted send fails the run instead of judging an earlier turn.
+    assert [(conv_id, run.status, run.conversation_id) for conv_id, run in seen] == [
+        (_CONV_ID, "starting", None)
+    ]
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.conversation_id, run.lease_expires_at) == (
+        "succeeded",
+        _CONV_ID,
+        None,
+    )
+    assert store.get(claimed.task.id).session_id == _CONV_ID
+
+
+async def test_a_continue_tasks_first_claimed_run_keeps_its_session(store) -> None:
+    claimed = _claim(store, session_mode="continue")
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=AsyncMock()
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    [session_id] = conversations.ids
+    assert store.get(claimed.task.id).session_id == session_id
+
+
+def _second_claim(store: SqlAlchemyScheduledTaskStore, claimed: _Claimed) -> StartupLease:
+    """Claim a Run now for the same task, from the same task snapshot."""
+    requested = store.request_manual_run(
+        claimed.task,
+        now=int(claimed.clock.now()),
+        trigger_key=manual_trigger_key(),
+        host_id=occurrence_host_id(claimed.task, manual_trigger_key()),
+    )
+    assert requested is not None
+    pending = store.claim_pending_run(requested, now=int(claimed.clock.now()), lease_seconds=60)
+    assert pending is not None
+    _, run = pending
+    return StartupLease(store, run, now=claimed.clock.now, lease_seconds=_LEASE_SECONDS)
+
+
+async def test_a_second_run_sends_into_a_session_another_run_is_using(store) -> None:
+    claimed = _claim(store, session_mode="continue", session_id=_CONV_ID)
+    second = _second_claim(store, claimed)
+    conversations = _ExistingConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=_HOST_ID, workspace="/repo")
+    )
+    dispatched: list[str] = []
+
+    async def dispatch(conv: Any, task: ScheduledTask) -> None:
+        dispatched.append(conv.id)
+        if len(dispatched) == 1:
+            # The other run fires while this prompt is in flight.
+            await ClaimedRunExecutor(
+                _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+            ).fire(claimed.task, second)
+
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+    )
+    await executor.fire(claimed.task, claimed.lease)
+
+    assert dispatched == [_CONV_ID, _CONV_ID]
+    outcomes = [(run.status, run.conversation_id) for run in _runs(store, claimed.task)]
+    assert outcomes == [("succeeded", _CONV_ID)] * 2
+
+
+@pytest.mark.parametrize("target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("overlap", [False, True])
+async def test_two_first_runs_send_both_prompts_into_one_session(store, target, overlap) -> None:
+    claimed = _claim(
+        store,
+        session_mode="continue",
+        execution_target=target,
+        host_id=_HOST_ID if target == "connected_host" else None,
+        workspace="/repo" if target == "connected_host" else None,
+    )
+    second = _second_claim(store, claimed)
+    conversations = _ConversationStore()
+
+    async def send_second() -> None:
+        store.update(claimed.task.id, prompt="edited after the runs were claimed")
+        await executor.fire(replace(claimed.task, prompt="second prompt"), second)
+
+    async def during_dispatch(conv: Any, task: ScheduledTask) -> None:
+        if overlap and dispatch.await_count == 1:
+            await send_second()
+
+    dispatch = AsyncMock(side_effect=during_dispatch)
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            sandbox_config=_managed_sandbox_config() if target == "managed_sandbox" else None,
+        ),
+        launch_dispatch=dispatch,
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+    if not overlap:
+        await send_second()
+
+    kept, discarded = conversations.ids
+    assert conversations.deleted == [discarded]
+    assert store.get(claimed.task.id).session_id == kept
+    outcomes = sorted((run.status, run.error_code) for run in _runs(store, claimed.task))
+    assert outcomes == [("running", None), ("succeeded", None)]
+    assert {run.conversation_id for run in _runs(store, claimed.task)} == {kept}
+    assert [(call.args[0].id, call.args[1].prompt) for call in dispatch.await_args_list] == [
+        (kept, claimed.task.prompt),
+        (kept, "second prompt"),
+    ]
+
+
+class _HeldConversationStore(_ConversationStore):
+    """Holds the first session create until released, so another run can fire meanwhile."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def create_conversation(self, **kwargs: Any) -> _FakeConversation:
+        if not self.first_started.is_set():
+            self.first_started.set()
+            assert self.release_first.wait(10)
+        return super().create_conversation(**kwargs)
+
+
+class _HeldPermissionStore(FakePermissionStore):
+    """Holds the first owner grant until released, so another run can fire meanwhile."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_started = threading.Event()
+        self.release_first = threading.Event()
+
+    def grant(self, user_id: str, conversation_id: str, level: int) -> Any:
+        if not self.first_started.is_set():
+            self.first_started.set()
+            assert self.release_first.wait(10)
+        return super().grant(user_id, conversation_id, level)
+
+
+@pytest.mark.parametrize("held", ["creating the session", "granting its owner"])
+async def test_a_run_never_finds_a_recorded_first_session_it_cannot_continue(store, held) -> None:
+    """Overlapping first runs both send to the session recorded after its owner grant."""
+    claimed = _claim(store, session_mode="continue")
+    second = _second_claim(store, claimed)
+    conversations = (
+        _HeldConversationStore() if held == "creating the session" else _ConversationStore()
+    )
+    permissions = _HeldPermissionStore() if held == "granting its owner" else FakePermissionStore()
+    gate = conversations if held == "creating the session" else permissions
+    dispatch = AsyncMock()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=dispatch,
+    )
+
+    first = asyncio.create_task(executor.fire(claimed.task, claimed.lease))
+    assert await asyncio.to_thread(gate.first_started.wait, 10)
+    assert store.get(claimed.task.id).session_id is None
+    await executor.fire(store.get(claimed.task.id), second)
+    gate.release_first.set()
+    await first
+
+    kept = store.get(claimed.task.id).session_id
+    [discarded] = conversations.deleted
+    assert sorted(conversations.ids) == sorted([kept, discarded]) and kept != discarded
+    outcomes = sorted((run.status, run.error_code) for run in _runs(store, claimed.task))
+    assert outcomes == [("running", None), ("succeeded", None)]
+    assert [call.args[0].id for call in dispatch.await_args_list] == [kept, kept]
+    assert {run.conversation_id for run in _runs(store, claimed.task)} == {kept}
+
+
+async def test_a_first_run_whose_owner_grant_fails_leaves_the_next_run_a_new_session(
+    store,
+) -> None:
+    claimed = _claim(store, session_mode="continue")
+    conversations = _ConversationStore()
+    permissions = FakePermissionStore(fail_grant=True)
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=AsyncMock(),
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+    assert store.get(claimed.task.id).session_id is None
+
+    permissions.fail_grant = False
+    task = store.get(claimed.task.id)
+    await executor.fire(task, _second_claim(store, replace(claimed, task=task)))
+
+    first, second = conversations.ids
+    assert store.get(claimed.task.id).session_id == second != first
+
+
+async def test_an_edit_during_the_first_run_keeps_its_session_unbound(store) -> None:
+    claimed = _claim(store, session_mode="continue")
+    store.update(claimed.task.id, workspace="/elsewhere")
+    conversations = _ConversationStore()
+    executor = ClaimedRunExecutor(
+        _deps(store, conversation_store=conversations), launch_dispatch=AsyncMock()
+    )
+
+    await executor.fire(claimed.task, claimed.lease)
+
+    # The run used a session for the old workspace; the next run starts one for the new.
+    assert len(conversations.ids) == 1
+    assert store.get(claimed.task.id).session_id is None
 
 
 async def test_launch_failure_fails_the_claimed_run(store) -> None:
@@ -381,7 +876,10 @@ async def test_managed_fire_hands_off_once_the_sandbox_host_is_bound(
         assert reason in (run.error or "")
 
 
-async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, monkeypatch) -> None:
+@pytest.mark.parametrize("hint_outcome", ["absent", "hint", "none", "empty", "raises", "blocked"])
+async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(
+    store, monkeypatch, hint_outcome
+) -> None:
     from omnigent.server import managed_hosts
     from omnigent.server.routes import sessions
 
@@ -391,8 +889,25 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     startup = FakeStartupInputs()
     cancelled = asyncio.Event()
+    release_hint = threading.Event()
+    event_loop_thread = threading.get_ident()
+    hint_threads: list[int] = []
+    monkeypatch.setattr(fire_mod, "_REGISTRATION_HINT_TIMEOUT_S", 0.01)
+
+    def hint() -> str | None:
+        hint_threads.append(threading.get_ident())
+        if hint_outcome == "raises":
+            raise RuntimeError("provider unavailable")
+        if hint_outcome == "blocked":
+            release_hint.wait()
+        if hint_outcome == "empty":
+            return ""
+        return "Check provider sign-in and retry." if hint_outcome == "hint" else None
 
     async def launch(**kwargs: Any) -> None:
+        state = kwargs["tracker"].get(kwargs["session_id"])
+        if hint_outcome != "absent":
+            state.host_online_failure_hint = hint
         try:
             await asyncio.Event().wait()  # Provisioning never finishes.
         except asyncio.CancelledError:
@@ -414,6 +929,7 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     try:
         await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
     finally:
+        release_hint.set()
         await _drain_managed_launches()
 
     [run] = _runs(store, claimed.task)
@@ -422,7 +938,88 @@ async def test_sandbox_that_never_registers_is_abandoned_and_torn_down(store, mo
     assert terminate.await_args.args[0] is hosts.hosts[host_id]
     # The saved prompt fails with the timeout first. The cancelled launch's later
     # attempt finds nothing pending, so a generic shutdown reason never shows.
-    assert "did not register within 0.2 seconds" in startup.launch_failures[0][1]
+    reason = "the sandbox did not register within 0.2 seconds"
+    if hint_outcome == "hint":
+        reason += " — Check provider sign-in and retry."
+    assert startup.launch_failures[0][1] == reason
+    assert run.error == reason
+    assert len(hint_threads) == (0 if hint_outcome == "absent" else 1)
+    assert event_loop_thread not in hint_threads
+
+
+async def test_replacement_registration_timeout_preserves_provider_guidance(
+    store, db_uri, monkeypatch
+) -> None:
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions.helpers import _provision_managed_sandbox
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+    from tests.server.test_managed_hosts import _injected_config
+
+    claimed = _claim(
+        store,
+        execution_target="managed_sandbox",
+        session_mode="continue",
+        host_id=None,
+        workspace=None,
+    )
+    host_id = claimed.lease.run.host_id
+    hosts = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="durable-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="old-token",
+        token_expires_at=int(time.time()) + 3600,
+        provider=fake.provider,
+        sandbox_id="old-sandbox",
+    )
+    monkeypatch.setattr(
+        fake, "host_online_failure_hint", lambda sandbox_id: f"Inspect logs for {sandbox_id}"
+    )
+    states = []
+
+    async def launch(**kwargs: Any) -> None:
+        states.append(kwargs["tracker"].get(kwargs["session_id"]))
+        # Exercise provider selection and registration; no runner can start before binding.
+        await _provision_managed_sandbox(
+            session_id=kwargs["session_id"],
+            owner=kwargs["owner"],
+            sandbox_config=kwargs["sandbox_config"],
+            repos=kwargs["repos"],
+            tracker=kwargs["tracker"],
+            host_store=kwargs["host_store"],
+            relaunch_host=kwargs["relaunch_host"],
+        )
+
+    monkeypatch.setattr(sessions, "_run_managed_launch", launch)
+    startup = FakeStartupInputs()
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            host_store=hosts,
+            sandbox_config=_injected_config(fake),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        ),
+        registration_timeout_s=0.5,
+    )
+    try:
+        await asyncio.wait_for(executor.fire(claimed.task, claimed.lease), 10)
+    finally:
+        await _drain_managed_launches()
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("failed", "sandbox_registration_timeout")
+    assert run.error == (
+        "the sandbox did not register within 0.5 seconds — Inspect logs for sb-fake-1"
+    )
+    assert startup.launch_failures[0][1] == run.error
+    assert states[0].host_online_failure_hint is None
+    assert fake.host_starts[0].host_id == host_id
+    assert fake.host_starts[0].host_name == "durable-host"
+    assert fake.terminated == ["old-sandbox", "sb-fake-1"]
+    assert hosts.get_host(host_id) is None
 
 
 async def test_lost_lease_during_the_binding_wait_leaves_the_launch_running(
@@ -508,6 +1105,10 @@ class _RecoveryConversationStore:
             live_status=self.live_status,
         )
 
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        if self.conversation and self.conversation.host_id == kwargs["expected_host_id"]:
+            self.conversation.host_id = None
+
     def list_items(
         self, conversation_id: str, limit: int = 100, order: str = "asc", **_: Any
     ) -> Any:
@@ -590,6 +1191,70 @@ async def test_recovery_decides_a_connected_host_run_from_its_session(
     assert await executor.recover(_expired_run(task)) == expected
 
 
+def test_a_continue_tasks_runs_share_one_sandbox_identity() -> None:
+    """Every sandbox run of the task routes by the task's own host id, not its workspace."""
+    connected = ScheduledTask(
+        id=uuid.uuid4().hex,
+        name="n",
+        prompt="p",
+        rrule="FREQ=HOURLY",
+        user_id=None,
+        agent_id=_AGENT_ID,
+        timezone="UTC",
+        created_at=0,
+        host_id=_HOST_ID,
+        session_mode="continue",
+        session_id=_CONV_ID,
+    )
+    managed = replace(connected, host_id=None, execution_target="managed_sandbox")
+    scheduled, manual = scheduled_trigger_key(1_800_000_000), manual_trigger_key()
+    own = continued_sandbox_host_id(managed.id, managed.workspace_id)
+
+    assert occurrence_host_id(connected, scheduled) == _HOST_ID
+    # The first run, before a session exists, and every later one.
+    assert {
+        occurrence_host_id(managed, scheduled),
+        occurrence_host_id(managed, manual),
+        occurrence_host_id(replace(managed, session_id=None), scheduled),
+    } == {own}
+    assert host_ownership_key(managed.workspace_id, own) != str(managed.workspace_id)
+    # A task that starts a new session per run gets a fresh sandbox per occurrence.
+    fresh = occurrence_host_id(replace(managed, session_mode="new", session_id=None), scheduled)
+    assert fresh is not None and fresh != own
+
+
+async def test_recovery_fails_a_continued_run_that_never_recorded_its_session(store) -> None:
+    """A continued run attaches its session only once its prompt is delivered; never resent."""
+    task = _saved_task(store, session_mode="continue", session_id=_CONV_ID)
+    run = _expired_run(task, conversation_id=None)
+    assert run.host_id == _HOST_ID
+    executor = ClaimedRunExecutor(_deps(store))
+
+    assert await executor.recover(run) == "failed"
+
+
+async def test_recovery_fails_a_joined_sandbox_run_whose_prompt_was_never_sent(store) -> None:
+    """A session that joined the task's sandbox gets no saved prompt, so with nothing
+    pending and nothing in its transcript, the prompt was never sent."""
+    task = _saved_task(store, execution_target="managed_sandbox", session_mode="continue")
+    run = _expired_run(task)
+    conversations = _RecoveryConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=run.host_id),
+        live_status="idle",
+    )
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=FakeHostStore(
+                {run.host_id: _FakeHost(run.host_id, "local", sandbox_provider="agent_sandbox")}
+            ),
+        )
+    )
+
+    assert await executor.recover(run) == "failed"
+
+
 def _sandbox_hosts(task: ScheduledTask, run: ScheduledTaskRun, provider: str | None) -> Any:
     return FakeHostStore({run.host_id: _FakeHost(run.host_id, "local", sandbox_provider=provider)})
 
@@ -605,14 +1270,16 @@ def _sandbox_hosts(task: ScheduledTask, run: ScheduledTaskRun, provider: str | N
         ([], [_PROMPT], "failed", "failed"),
     ],
 )
+@pytest.mark.parametrize("session_mode", ["new", "continue"])
 async def test_recovery_keeps_a_bound_managed_run_and_reads_its_turn(
-    store, monkeypatch, pending, items, live_status, expected
+    store, monkeypatch, pending, items, live_status, expected, session_mode
 ) -> None:
     from omnigent.server import managed_hosts
 
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
-    task = _saved_task(store, execution_target="managed_sandbox")
+    # A continue task's first run uses the task's sandbox host, not the occurrence's.
+    task = _saved_task(store, execution_target="managed_sandbox", session_mode=session_mode)
     run = _expired_run(task)
     conversations = _RecoveryConversationStore(
         _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, host_id=run.host_id),
@@ -695,6 +1362,39 @@ async def test_recovery_cleans_up_the_sandbox_of_a_deleted_session(store, monkey
     terminate.assert_awaited_once()
 
 
+@pytest.mark.parametrize("state", ["session deleted", "launch failed", "launch abandoned"])
+async def test_recovery_never_tears_down_a_continue_tasks_shared_sandbox(
+    store, monkeypatch, state
+) -> None:
+    """Another session of the task, such as one started after a reset, may be using it."""
+    from omnigent.server import managed_hosts
+
+    terminate = AsyncMock()
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
+    task = _saved_task(store, execution_target="managed_sandbox", session_mode="continue")
+    run = _expired_run(task)
+    assert run.host_id == continued_sandbox_host_id(task.id, task.workspace_id)
+    label = {"launch failed": "failed", "launch abandoned": "pending"}.get(state)
+    conversations = _RecoveryConversationStore(
+        None
+        if state == "session deleted"
+        else _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, labels={STARTUP_LABEL: label})
+    )
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=_sandbox_hosts(task, run, "agent_sandbox"),
+            sandbox_config=_draining_sandbox_config(0),
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=FakeStartupInputs(),
+        )
+    )
+
+    assert await executor.recover(run) == "failed"
+    terminate.assert_not_awaited()
+
+
 def _draining_sandbox_config(shutdown_drain_s: float) -> Any:
     from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
 
@@ -740,6 +1440,7 @@ async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox
 
     assert await executor.recover(run) == "failed"
     assert startup.launch_failures == []
+    assert conversations.conversation.host_id is None
     assert terminate.await_args.args[0] is hosts.hosts[run.host_id]
 
 
@@ -882,3 +1583,105 @@ async def test_scheduler_records_a_session_that_finished_during_startup(store) -
     [run] = _runs(store, task)
     assert (run.status, run.conversation_id, run.lease_expires_at) == ("succeeded", _CONV_ID, None)
     assert run.finished_at is not None
+
+
+@pytest.mark.parametrize("status", ["running", "succeeded", "failed", "missing", "raced"])
+async def test_late_startup_failure_logs_only_a_transition(store, caplog, monkeypatch, status):
+    caplog.set_level(logging.INFO)
+    claimed = _claim(store)
+    run = claimed.lease.run
+    if status != "missing":
+        await claimed.lease.attach_session(_CONV_ID)
+        await claimed.lease.finish("running", conversation_id=_CONV_ID)
+        if status not in {"running", "raced"}:
+            store.update_run(run.id, status=status, finished_at=int(time.time()))
+    if status == "raced":
+        update = store.update_run
+
+        def finish_before_failure(run_id, **kwargs):
+            update(run_id, status="succeeded", finished_at=int(time.time()))
+            return update(run_id, **kwargs)
+
+        monkeypatch.setattr(store, "update_run", finish_before_failure)
+    with telemetry.scheduled_run_scope(telemetry.run_log_context(claimed.task, run)):
+        await fire_mod._fail_running_run(_deps(store), _CONV_ID, "late failure", "launch_failed")
+    failures = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_run_stage_failed"
+    ]
+    assert len(failures) == int(status == "running")
+    assert _runs(store, claimed.task)[0].status == (
+        {"running": "failed", "missing": "starting", "raced": "succeeded"}.get(status, status)
+    )
+
+
+@pytest.mark.parametrize("stage", ["input_validation", "runner_start"])
+def test_stage_started_deduplicates_nested_scopes_per_run(caplog, stage):
+    from omnigent.entities.scheduled_task import ScheduledRunLogContext
+
+    caplog.set_level(logging.INFO)
+    for run_id in ("A", "B"):
+        run = ScheduledRunLogContext(
+            task_id="task",
+            run_id=run_id,
+            task_workspace_id=0,
+            scheduled_at=1000,
+            target="connected_host",
+            session_mode="continue",
+        )
+        with telemetry.scheduled_run_scope(run):
+            telemetry.start_fire_stage(stage)
+            with telemetry.fire_stage(stage, session_id="session"):
+                with telemetry.fire_stage(stage, session_id="session"):
+                    telemetry.start_fire_stage(stage, session_id="session")
+                    assert telemetry.current_fire_stage() == stage
+    events = [
+        r.attributes
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "scheduled_run_stage_started"
+    ]
+    assert [(e["run_id"], e["fire_stage"]) for e in events] == [(run, stage) for run in ("A", "B")]
+    assert telemetry.current_fire_stage() == "input_validation"
+
+
+@pytest.mark.parametrize("shared", [False, True])
+async def test_failed_run_releases_its_binding_without_deleting_a_peers_sandbox(
+    store, db_uri, shared
+) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.stores.host_store import HostStore
+    from tests.server.helpers import FakeSandboxLauncher
+
+    hosts = HostStore(db_uri)
+    host = hosts.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="failed-run",
+        user_id="local",
+        token="test-token",
+        provider="modal",
+        sandbox_id="sb-failed",
+        token_expires_at=int(time.time()) + 3600,
+    )
+    conversations = SqlAlchemyConversationStore(db_uri)
+    failed = conversations.create_conversation(host_id=host.host_id, workspace="/workspace")
+    if shared:
+        peer = conversations.create_conversation(host_id=host.host_id, workspace="/workspace")
+        conversations.update_conversation(peer.id, archived=True)
+    launcher = FakeSandboxLauncher()
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://test.example.com",
+            launcher_factory=lambda: launcher,
+            token_ttl_s=3600,
+            provider="modal",
+        )
+    )
+    await fire_mod._terminate_run_sandbox(
+        _deps(store, conversation_store=conversations, host_store=hosts, sandbox_config=config),
+        host.host_id,
+        failed.id,
+    )
+    assert conversations.get_conversation(failed.id).host_id is None
+    assert (hosts.get_host(host.host_id) is not None) is shared
+    assert launcher.terminated == ([] if shared else ["sb-failed"])
+    if shared:
+        assert conversations.get_conversation(peer.id).host_id == host.host_id

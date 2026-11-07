@@ -2480,6 +2480,39 @@ async def test_list_sessions_includes_owner_for_own_session(
     )
 
 
+async def test_list_sessions_shared_with_others_is_owner_only(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """``shared_with_others`` tracks the owner's grants and is hidden from grantees."""
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "bryan"))["id"]
+
+    async def row_as(user: str) -> dict[str, Any]:
+        rows = await _list_sessions_as(auth_client, user)
+        return next(s for s in rows if s["id"] == session_id)
+
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+    resp = await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="corey", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    assert (await row_as("bryan"))["shared_with_others"] is True
+    # The grantee's row omits the flag, so it never reveals the owner's grant list.
+    assert "shared_with_others" not in await row_as("corey")
+
+    resp = await _revoke_permission(auth_client, session_id, revoker="bryan", target_user="corey")
+    assert resp.status_code in (200, 204)
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+    # Public-by-default deployments grant __public__ on create, so it alone doesn't count.
+    resp = await _grant_permission(
+        auth_client, session_id, granter="bryan", target_user="__public__", level=LEVEL_READ
+    )
+    assert resp.status_code == 200
+    assert (await row_as("bryan"))["shared_with_others"] is False
+
+
 # ── session-create authorization ─────────────
 
 
@@ -2806,10 +2839,12 @@ async def test_fork_switch_denies_session_scoped_target_without_access(
     assert [s["id"] for s in corey_sessions] == [source["id"]]
 
 
+@pytest.mark.parametrize("bundle", [False, True], ids=["agent-id", "bundle"])
 async def test_create_session_rejects_other_users_host(
     host_perm_app: FastAPI,
     host_perm_client: httpx.AsyncClient,
     db_uri: str,
+    bundle: bool,
 ) -> None:
     """
     Creating a session that targets another user's host is rejected
@@ -2826,34 +2861,50 @@ async def test_create_session_rejects_other_users_host(
     The ``detail == "not your host"`` assertion pins the 403 to the
     host-owner check (an agent-access rejection would 403 differently),
     and the empty ``outbound_queue`` proves the order: a missing check
-    would have enqueued the stat frame to Alice's connection.
+    would have enqueued the stat frame to Alice's connection. A Plan-mode
+    create must not get the older-host 409 either, which would reveal her build.
     """
     # Alice owns an online host.
     _register_online_host(host_perm_app, "f54bb9272002938a3a934bfcb6bb228a", "alice@example.com")
     alice_conn = host_perm_app.state.host_registry.get("f54bb9272002938a3a934bfcb6bb228a")
     assert alice_conn is not None
 
-    # A bindable BUILT-IN (template) agent: session_id IS NULL, so any
-    # user can bind it. Session-scoped agents are owned by one session
-    # and would block Bob at the agent-access check before the host
-    # check (see designs/BUILTIN_AGENTS.md); creating a template here
-    # isolates the host-owner check.
+    # A bindable template agent (session_id NULL) running Codex: isolates the
+    # host-owner check from agent access and the Plan-mode 409.
     SqlAlchemyAgentStore(db_uri).create(
         "f2b40a7cc3eaec4ee8cbb151e1021c75",
-        "builtin-xuser-agent",
+        "codex-native-ui",
         "f2b40a7cc3eaec4ee8cbb151e1021c75/bundle",
     )
 
     # Bob targets Alice's host.
-    resp = await host_perm_client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75",
-            "host_id": "f54bb9272002938a3a934bfcb6bb228a",
-            "workspace": "/tmp",
-        },
-        headers={"X-Forwarded-Email": "bob@example.com"},
-    )
+    metadata = {
+        "host_id": "f54bb9272002938a3a934bfcb6bb228a",
+        "workspace": "/tmp",
+        "labels": {"omnigent.codex_native.collaboration_mode": "plan"},
+    }
+    if bundle:
+        resp = await host_perm_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        name="bob-xuser-bundle",
+                        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
+    else:
+        resp = await host_perm_client.post(
+            "/v1/sessions",
+            json={**metadata, "agent_id": "f2b40a7cc3eaec4ee8cbb151e1021c75"},
+            headers={"X-Forwarded-Email": "bob@example.com"},
+        )
 
     assert resp.status_code == 403, (
         f"Bob targeting Alice's host should be 403, got {resp.status_code}: {resp.text}"
@@ -3023,9 +3074,11 @@ async def test_bob_cannot_clean_up_alice_worktree_via_delete(
 # ── child_sessions: enumeration is gated on parent READ ──────
 
 
+@pytest.mark.parametrize("descendants", [False, True], ids=["one-level", "descendants"])
 async def test_list_child_sessions_blocks_cross_user(
     auth_client: httpx.AsyncClient,
     db_uri: str,
+    descendants: bool,
 ) -> None:
     """
     A user without READ on the parent cannot enumerate its child sub-agents.
@@ -3040,6 +3093,7 @@ async def test_list_child_sessions_blocks_cross_user(
 
     :param auth_client: Permission-enabled test client.
     :param db_uri: Per-test SQLite database URI, used to seed the child.
+    :param descendants: Ask for the whole subtree, which must be gated the same way.
     """
     agent = await create_test_agent(auth_client, user="user-a")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
@@ -3058,6 +3112,7 @@ async def test_list_child_sessions_blocks_cross_user(
     # isn't leaked. The pre-fix bug returned 200 with the full child listing.
     denied = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-b"},
     )
     assert denied.status_code == 404, (
@@ -3074,6 +3129,7 @@ async def test_list_child_sessions_blocks_cross_user(
     # happy path, and this is exactly the data user-b was denied.
     owned = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-a"},
     )
     assert owned.status_code == 200, f"owner list failed: {owned.text}"
@@ -3083,9 +3139,11 @@ async def test_list_child_sessions_blocks_cross_user(
     )
 
 
+@pytest.mark.parametrize("descendants", [False, True], ids=["one-level", "descendants"])
 async def test_list_child_sessions_allows_read_grant(
     auth_client: httpx.AsyncClient,
     db_uri: str,
+    descendants: bool,
 ) -> None:
     """
     A user granted READ on the parent may enumerate its children.
@@ -3095,6 +3153,7 @@ async def test_list_child_sessions_allows_read_grant(
 
     :param auth_client: Permission-enabled test client.
     :param db_uri: Per-test SQLite database URI, used to seed the child.
+    :param descendants: Ask for the whole subtree, which must be gated the same way.
     """
     agent = await create_test_agent(auth_client, user="user-a")
     s1 = await _create_session_as(auth_client, agent["id"], "user-a")
@@ -3113,6 +3172,7 @@ async def test_list_child_sessions_allows_read_grant(
 
     resp = await auth_client.get(
         f"/v1/sessions/{parent_id}/child_sessions",
+        params={"descendants": "true"} if descendants else None,
         headers={"X-Forwarded-Email": "user-b"},
     )
     assert resp.status_code == 200, (

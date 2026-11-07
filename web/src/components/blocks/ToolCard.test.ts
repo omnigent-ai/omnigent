@@ -1,14 +1,16 @@
 import { createElement } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
-import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+import { ToolCard, ToolGroupSummary, formatToolDuration } from "./ToolCard";
+import { getOutputPreview } from "./ToolCodePanel";
+import type * as ToolViewsModule from "./toolViews";
 import type { ToolView } from "./toolViews";
 
-// The registry ships empty; tests register views here to exercise the plug point.
+// Tests register the views they exercise here, in place of the real registry.
 const registeredViews = vi.hoisted(() => new Map<string, ToolView>());
 vi.mock("./toolViews", () => ({ toolViewFor: (name: string) => registeredViews.get(name) }));
 
@@ -23,8 +25,14 @@ function renderCard(props: Parameters<typeof ToolCard>[0]) {
   return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
 }
 
+/** Registers the tool's real view in the test registry. */
+async function registerRealView(name: string) {
+  const actualViews = await vi.importActual<typeof ToolViewsModule>("./toolViews");
+  registeredViews.set(name, actualViews.toolViewFor(name)!);
+}
+
 // Radix tabs switch on mouse down (or focus), not on a synthetic click.
-function showView(name: "Fields" | "Raw") {
+function showView(name: "Fields" | "Diff" | "Raw") {
   fireEvent.mouseDown(screen.getByRole("tab", { name }));
 }
 
@@ -106,7 +114,7 @@ describe("getOutputPreview", () => {
 });
 
 describe("ToolCard rendering", () => {
-  it("renders an unknown tool's humanized title, result line and duration", () => {
+  it("renders an unknown tool's humanized title and duration, with no line under a success", () => {
     // WHY: the always-visible trigger shows a humanized title and key argument values.
     const { container } = renderCard({
       name: "manage_todo_list",
@@ -119,16 +127,16 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText("Manage todo list")).toBeInTheDocument();
     expect(trigger.textContent).toContain("write · 1 item");
     expect(trigger).toHaveAttribute("title", "Manage todo list write · 1 item (manage_todo_list)");
-    expect(screen.getByTestId("tool-result-line").textContent).toBe("Task plan updated (1 task).");
+    // WHY: a successful call's details wait behind the expand, so the row reads as its title.
+    expect(trigger.textContent).not.toContain("Task plan updated");
     expect(screen.getByText("3.3s")).toBeInTheDocument();
-    // WHY: row text follows the Interface font size; the result line sits one caption step down.
+    // WHY: row text follows the Interface font size.
     expect(trigger).toHaveClass("text-ui");
     expect(screen.getByText("Manage todo list")).toHaveClass("font-medium");
-    expect(screen.getByTestId("tool-result-line")).toHaveClass("text-sm");
   });
 
-  it("tags an MCP tool with its server and reports its failure on the result line", () => {
-    renderCard({
+  it("tags an MCP tool with its server and shows its failure only when expanded", () => {
+    const { container } = renderCard({
       name: "mcp__github__create_pull_request",
       arguments: { owner: "omnigent-ai", repo: "omnigent", draft: true },
       output: "Error: 422 Validation Failed: A pull request already exists",
@@ -138,9 +146,13 @@ describe("ToolCard rendering", () => {
     // A known server shows its brand spelling rather than the config name.
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.queryByText("github")).toBeNull();
-    const line = screen.getByTestId("tool-result-line");
-    expect(line.textContent).toBe("Error: 422 Validation Failed: A pull request already exists");
-    expect(line.className).toContain("text-destructive");
+    const error = "Error: 422 Validation Failed: A pull request already exists";
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    fireEvent.click(trigger);
+    expect(screen.queryByText(error)).toBeNull();
   });
 
   it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
@@ -158,7 +170,7 @@ describe("ToolCard rendering", () => {
     expect(screen.getByText("Find workflow")).toBeInTheDocument();
     expect(screen.getByText("done")).toBeInTheDocument();
     expect(screen.getByText("Result")).toBeInTheDocument();
-    expect(screen.getAllByText("the output text").length).toBeGreaterThan(1);
+    expect(screen.getByText("the output text")).toBeInTheDocument();
     expect(screen.queryByText("Parameters")).toBeNull();
 
     // Both views stay visible, so the current one reads at a glance.
@@ -234,17 +246,54 @@ describe("ToolCard rendering", () => {
     },
   );
 
-  it("shows a reported failure above the record's other fields", () => {
-    // WHY: a partial failure still returns data; hiding it behind Raw loses the useful part.
-    const { container } = renderCard({
+  it.each([
+    {
+      producer: "partial failure",
       name: "search_issues",
+      output: { error: "2 of 3 pages failed", results: ["OMNI-1"] },
+      error: "2 of 3 pages failed",
+      fields: "ResultsOMNI-1",
+    },
+    {
+      producer: "failed SDK Pi result",
+      name: "grep",
+      output: {
+        content: [{ type: "text", text: "Path not found: /repo/missing" }],
+        details: { path: "/repo/missing" },
+        isError: true,
+      },
+      error: "Path not found: /repo/missing",
+      fields: "DetailsPath/repo/missing",
+    },
+    {
+      producer: "failed SDK Pi result with no text",
+      name: "read",
+      output: { content: [{ type: "image", data: "aGk=", mimeType: "image/png" }], isError: true },
+      error: "The tool reported an error.",
+      fields: "Content1TypeimageDataaGk=Mime typeimage/png",
+    },
+    {
+      producer: "failed result with its own error",
+      name: "fetch",
+      output: {
+        error: "Timed out",
+        content: [{ type: "text", text: "Partial page" }],
+        isError: true,
+      },
+      error: "Timed out",
+      fields: "Content1Partial pageType text",
+    },
+  ])("shows a $producer above the record's other fields", ({ name, output, error, fields }) => {
+    // WHY: a failure can still return data; hiding it behind Raw loses the useful part.
+    const { container } = renderCard({
+      name,
       arguments: {},
-      output: JSON.stringify({ error: "2 of 3 pages failed", results: ["OMNI-1"] }),
+      output: JSON.stringify(output),
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("2 of 3 pages failed")).toHaveLength(2);
-    expect(screen.getByTestId("tool-value-view").textContent).toBe("ResultsOMNI-1");
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    expect(screen.getByTestId("tool-value-view").textContent).toBe(fields);
   });
 
   it("keeps a short result with a trailing newline inline", () => {
@@ -291,7 +340,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("permission denied")).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent("permission denied");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
@@ -410,12 +459,11 @@ describe("ToolCard rendering", () => {
 });
 
 describe("ToolCard registered views", () => {
-  it("uses a registered view's title, result line and body in place of the generic ones", () => {
+  it("uses a registered view's title and body in place of the generic ones", () => {
     // WHY: tool-specific renderers plug in through toolViews.ts without
     // touching ToolCard; each part replaces only its generic counterpart.
     registeredViews.set("fake_plan", {
       title: () => ({ verb: "Started 2 of 2", body: "Fetch open PRs" }),
-      summary: (call) => ({ text: `Done: ${String(call.args.done)}`, isError: false }),
       Body: ({ call }) => createElement("div", null, `Checklist for ${call.name}`),
     });
     const { container } = renderCard({
@@ -425,14 +473,293 @@ describe("ToolCard registered views", () => {
       state: "output-available",
     });
     expect(screen.getByText("Started 2 of 2")).toBeInTheDocument();
-    expect(screen.getByTestId("tool-result-line").textContent).toBe("Done: Find workflow");
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Checklist for fake_plan")).toBeInTheDocument();
     expect(screen.queryByText("Input")).toBeNull();
+    // The raw payload stays one switch away from a view's body.
+    showView("Raw");
+    expect(screen.getByText("Input")).toBeInTheDocument();
   });
 
+  it("shows an edit's line counts after its title and its diff behind a Diff | Raw switch", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: {
+        file_path: "/repo/config.py",
+        old_string: "TIMEOUT = 30\nRETRIES = 3",
+        new_string: "TIMEOUT = 60",
+      },
+      output: "The file /repo/config.py has been updated successfully.",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    const counts = screen.getByTestId("tool-line-counts");
+    expect(trigger.textContent).toBe("Edit /repo/config.py+1 -2");
+    expect(within(counts).getByText("+1")).toHaveClass("text-green-600");
+    expect(within(counts).getByText("-2")).toHaveClass("text-red-600");
+
+    fireEvent.click(trigger);
+    const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+    expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+    // The Diff tab names the view; the panel is titled with the file and its counts instead.
+    expect(screen.getAllByText("Diff")).toHaveLength(1);
+    const added = within(body).getByText("+1");
+    expect(added).toHaveClass("text-green-600");
+    expect(within(body).getByText("-2")).toHaveClass("text-red-600");
+    expect(added.parentElement?.textContent).toBe("/repo/config.py+1-2");
+    expect(container.textContent).toContain("-TIMEOUT = 30");
+    expect(container.textContent).toContain("+TIMEOUT = 60");
+    expect(screen.queryByText("Input")).toBeNull();
+    showView("Raw");
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    showView("Diff");
+    expect(container.textContent).toContain("-RETRIES = 3");
+  });
+
+  it("gives a replace-all edit no row counts and labels its panel's as each match's", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "x", new_string: "y", replace_all: true },
+      output: "The file /repo/a.py has been updated. All occurrences were successfully replaced.",
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/a.py (each match)+1-1");
+  });
+
+  it("shows a write that created its file like an edit, counted and all added", async () => {
+    // WHY: a new file's every line is an addition, so it reads the same as an edit.
+    await registerRealView("Write");
+    const { container } = renderCard({
+      name: "Write",
+      arguments: { file_path: "/repo/notes.md", content: "# Notes\n\n- one\n" },
+      output: "File created successfully at: /repo/notes.md",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger.textContent).toBe("Write /repo/notes.md+3");
+    expect(within(screen.getByTestId("tool-line-counts")).getByText("+3")).toHaveClass(
+      "text-green-600",
+    );
+    fireEvent.click(trigger);
+    expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
+    const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+    expect(within(body).getByText("+3").parentElement?.textContent).toBe(
+      "/repo/notes.md (new file)+3",
+    );
+    expect(body.textContent).toContain("+- one");
+    expect(screen.queryByText("Content")).toBeNull();
+  });
+
+  it("shows a write over an existing file as its content, with no counts", async () => {
+    await registerRealView("Write");
+    const { container } = renderCard({
+      name: "Write",
+      arguments: { file_path: "/repo/notes.md", content: "# Notes\n" },
+      output: "The file /repo/notes.md has been updated successfully.",
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("/repo/notes.md (whole file written)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy file" })).toBeInTheDocument();
+    const body = container.querySelector<HTMLElement>('[data-slot="collapsible-content"]')!;
+    expect(body.textContent).toContain("# Notes");
+    expect(body.textContent).not.toContain("+# Notes");
+  });
+
+  it.each([
+    {
+      producer: "Codex declined patch",
+      name: "apply_patch",
+      args: { changes: [{ path: "/repo/app.py", kind: { type: "update" }, diff: "@@\n-a\n+b\n" }] },
+      output: "Error: File change ended with status declined.\nupdate /repo/app.py",
+      error: "Error: File change ended with status declined.",
+      diffText: "+b",
+    },
+    {
+      producer: "OpenCode failed edit",
+      name: "edit",
+      args: { filePath: "a.py", oldString: "x", newString: "y" },
+      output: "[error] Error: oldString not found in content",
+      error: "Error: oldString not found in content",
+      diffText: "+y",
+    },
+    {
+      producer: "SDK Pi failed edit",
+      name: "edit",
+      args: { path: "a.py", oldText: "x", newText: "y" },
+      output: JSON.stringify({
+        content: [{ type: "text", text: "Could not find the exact text in a.py." }],
+        details: {},
+        isError: true,
+      }),
+      error: "Could not find the exact text in a.py.",
+      diffText: "+y",
+    },
+  ])(
+    "shows a $producer's error only inside its expanded diff",
+    async ({ name, args, output, error, diffText }) => {
+      await registerRealView(name);
+      const { container } = renderCard({
+        name,
+        arguments: args,
+        output,
+        state: "output-available",
+      });
+      expect(screen.queryByText(error)).toBeNull();
+      expect(screen.queryByTestId("tool-line-counts")).toBeNull();
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      // The expanded body repeats the error in a box, then labels the diff as not applied.
+      expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+      expect(screen.getByText("Requested change, not applied:")).toBeInTheDocument();
+      expect(container.textContent).toContain(diffText);
+    },
+  );
+
+  it.each([
+    ["Permission denied: /repo/a.py", "Permission denied: /repo/a.py"],
+    ["  ", "The edit failed with no output."],
+  ])(
+    "shows a failed edit's unrecognized output %j as its error above the diff",
+    async (output, shown) => {
+      await registerRealView("Edit");
+      const { container } = renderCard({
+        name: "Edit",
+        arguments: { file_path: "/repo/a.py", old_string: "x", new_string: "y" },
+        output,
+        state: "output-error",
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.getByTestId("tool-error-box").textContent).toBe(shown);
+      expect(container.textContent).toContain("+y");
+    },
+  );
+
+  it("shows output that does not confirm the edit above its diff, with no counts", async () => {
+    await registerRealView("Edit");
+    const output = "Error reading /repo/missing.py: [Errno 2] No such file or directory";
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/missing.py", old_string: "x", new_string: "y" },
+      output,
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const text = container.textContent ?? "";
+    expect(text).toContain(output);
+    expect(text.indexOf(output)).toBeLessThan(text.indexOf("+y"));
+    expect(
+      screen.getByText("Requested change; the output does not confirm it applied:"),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ["input-available", "Waiting for output"],
+    ["cancelled", "Tool was cancelled before output arrived."],
+    ["output-error", "Tool did not return output before the response failed."],
+  ] as const)("keeps a %s edit's state under its diff", async (state, message) => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "a = 1", new_string: "a = 2" },
+      output: null,
+      state,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.textContent).toContain("+a = 2");
+    expect(screen.getByText(message)).toBeInTheDocument();
+    expect(screen.queryByText("No diff recorded for this edit.")).toBeNull();
+  });
+
+  it("shows a finished edit's output when its arguments give no diff", async () => {
+    await registerRealView("apply_patch");
+    const files = Array.from({ length: 100 }, (_, index) => `M src/file${index}.py`);
+    const { container } = renderCard({
+      name: "apply_patch",
+      arguments: {},
+      output: `Success. Updated the following files:\n${files.join("\n")}`,
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+    expect(container.textContent).toContain("M src/file0.py");
+    // Long output keeps the generic preview, with the rest behind Expand.
+    expect(container.textContent).not.toContain("M src/file99.py");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("M src/file99.py");
+  });
+
+  it.each([
+    ["output-available", "Error: String to replace not found in file."],
+    ["output-error", "Permission denied: /repo/a.py"],
+  ] as const)("shows a %s edit's error when its arguments give no diff", async (state, output) => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py" },
+      output,
+      state,
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByTestId("tool-error-box").textContent).toBe(output);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+    expect(screen.queryByText("Output")).toBeNull();
+  });
+
+  it("keeps a long diff behind the output preview until expanded", async () => {
+    await registerRealView("Edit");
+    const lines = Array.from({ length: 100 }, (_, index) => `line${index}`);
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "", new_string: lines.join("\n") },
+      output: "The file /repo/a.py has been updated successfully.",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.textContent).toContain("+line0");
+    expect(container.textContent).not.toContain("+line99");
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(container.textContent).toContain("+line99");
+  });
+
+  it("says a finished edit without output or a diff has no diff", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py" },
+      output: null,
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("No diff recorded for this edit.")).toBeInTheDocument();
+  });
+
+  it.each([
+    ["input-available", "Waiting for output"],
+    ["cancelled", "Tool was cancelled before output arrived."],
+  ] as const)(
+    "does not call a %s edit's incomplete arguments a missing diff",
+    async (state, shown) => {
+      await registerRealView("Edit");
+      const { container } = renderCard({
+        name: "Edit",
+        arguments: { file_path: "/repo/a.py" },
+        output: null,
+        state,
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.queryByText("No diff recorded for this edit.")).toBeNull();
+      expect(screen.getByText(shown)).toBeInTheDocument();
+    },
+  );
+
   it("falls back to the generic parts a view leaves out", () => {
-    registeredViews.set("fake_plan", { summary: () => null });
+    registeredViews.set("fake_plan", { lineCounts: () => null });
     const { container } = renderCard({
       name: "fake_plan",
       arguments: { step: "one" },
@@ -440,7 +767,7 @@ describe("ToolCard registered views", () => {
       state: "output-available",
     });
     expect(screen.getByText("Fake plan")).toBeInTheDocument();
-    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    expect(screen.queryByTestId("tool-line-counts")).toBeNull();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
     expect(screen.getByText("Input")).toBeInTheDocument();
   });
@@ -493,6 +820,32 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
     expect(screen.queryByText("Parameters")).toBeNull();
     expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
+  });
+
+  it.each([
+    { name: "shell", output: "missing\n[exit code: 1]", detail: "exit 1" },
+    {
+      name: "sys_os_shell",
+      output: JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true }),
+      detail: "timed out",
+    },
+    {
+      name: "Bash",
+      output: "<tool_use_error>Permission to use Bash was denied.</tool_use_error>",
+      detail: "Permission to use Bash was denied.",
+    },
+  ])("shows a $name failure only inside the expanded terminal", ({ name, output, detail }) => {
+    const { container } = renderCard({
+      name,
+      arguments: { command: "make" },
+      output,
+      state: "output-available",
+    });
+    expect(container).not.toHaveTextContent(detail);
+    expand(container);
+    expect(screen.getByTestId("shell-tool-terminal")).toHaveTextContent(detail);
+    expand(container);
+    expect(container).not.toHaveTextContent(detail);
   });
 
   it("reads the exit code in the output format of the tool that ran", () => {

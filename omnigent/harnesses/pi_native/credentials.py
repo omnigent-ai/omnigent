@@ -253,6 +253,9 @@ class PiProviderConfig:
         Metadata for the picker only — never rendered into ``models.json`` — and
         ``None`` for the Databricks / cli-config / subscription paths, which
         resolve their models elsewhere.
+    :param auth_refresh_interval_ms: Recorded Codex auth cache lifetime; zero
+        retains request-time command execution.
+    :param auth_timeout_ms: Recorded timeout for refreshing outside Pi's deadline.
     """
 
     provider_id: str
@@ -281,6 +284,8 @@ class PiProviderConfig:
     curated_models: bool = False
     model_allowlist: tuple[str, ...] | None = None
     inference_bound: bool = False
+    auth_refresh_interval_ms: int = 0
+    auth_timeout_ms: int = 20_000
 
     @property
     def _primary_claude_only(self) -> bool:
@@ -339,7 +344,7 @@ class PiProviderConfig:
             "start a new Pi session."
         )
 
-    def to_models_config(self) -> _PiModelsConfig:
+    def to_models_config(self, *, client_surface: str | None = None) -> _PiModelsConfig:
         """Render this provider as a Pi ``models.json`` mapping."""
         models: list[_PiModelEntry] = list(self.extra_models)
         additional: dict[str, _PiProviderPayload] = dict(self.additional_providers)
@@ -394,7 +399,10 @@ class PiProviderConfig:
             if is_databricks_ai_gateway_url(payload["baseUrl"]):
                 # Copy rather than mutate: additional payloads are shared across renders.
                 headers = with_gateway_attribution(
-                    payload.get("headers"), PI_AGENT, payload["baseUrl"]
+                    payload.get("headers"),
+                    PI_AGENT,
+                    payload["baseUrl"],
+                    client_surface=client_surface,
                 )
                 providers[provider_id] = {**payload, "headers": headers}
         return {"providers": providers}
@@ -1121,10 +1129,7 @@ def _cli_config_databricks_transport(entry: ProviderEntry) -> CodexConfigTranspo
 
             ws = resolve_databricks_workspace(None)
             auth_cmd = _databricks_codex_auth_command(ws.host, None)
-            transport = CodexConfigTransport(
-                base_url=transport.base_url,
-                auth_command=auth_cmd,
-            )
+            transport = replace(transport, auth_command=auth_cmd)
             _LOGGER.info(
                 "pi-native: cli-config provider %r has no auth command; "
                 "using SDK-derived auth for %s",
@@ -1368,10 +1373,15 @@ def _cli_config_pi_provider(entry: ProviderEntry, *, model: str | None) -> PiPro
     transport = _cli_config_databricks_transport(entry)
     if transport is None:
         return None
-    return _databricks_gateway_pi_provider(
+    provider = _databricks_gateway_pi_provider(
         gateway_base_url=transport.base_url,
         model=model,
         auth_command=transport.auth_command,
+    )
+    return replace(
+        provider,
+        auth_refresh_interval_ms=transport.auth_refresh_interval_ms,
+        auth_timeout_ms=transport.auth_timeout_ms,
     )
 
 
@@ -1893,12 +1903,22 @@ def write_pi_models_config(
         rendered = provider.to_models_config()
     agent_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(agent_dir, 0o700)
+    # Relaunches must not refresh token commands from retired providers.
+    for config_path in (agent_dir / AUTH_DIR_NAME).glob("auth-*.json"):
+        if not config_path.name.endswith(".result.json"):
+            config_path.unlink(missing_ok=True)
     rendered = deepcopy(rendered)
     for provider_id, config in rendered["providers"].items():
         api_key = config.get("apiKey")
         # Windows Pi can use a configured PowerShell; preserve its own resolver.
         if os.name == "posix" and isinstance(api_key, str) and api_key.startswith("!"):
-            config["apiKey"] = wrap_auth_command(agent_dir, provider_id, api_key[1:])
+            config["apiKey"] = wrap_auth_command(
+                agent_dir,
+                provider_id,
+                api_key[1:],
+                refresh_interval_ms=provider.auth_refresh_interval_ms,
+                refresh_timeout_ms=provider.auth_timeout_ms,
+            )
     models_path = agent_dir / "models.json"
     # 0o600: the apiKey may be a literal token (key-kind providers).
     fd = os.open(models_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1949,6 +1969,7 @@ def pi_native_provider_launch(
     *,
     selection: str | None = None,
     global_agent_dir: Path | None = None,
+    client_surface: str | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1966,7 +1987,7 @@ def pi_native_provider_launch(
     """
     # Render once and reuse: rendering logs how an uncataloged model was routed,
     # and this function both writes the config and reads it back for --provider.
-    rendered = provider.to_models_config()
+    rendered = provider.to_models_config(client_surface=client_surface)
     # Resolve which provider the selected model lives in. Non-Claude models
     # (GLM, GPT, Llama…) are in secondary providers; Claude models are in the
     # primary provider. Read the rendered config so family fallbacks agree.

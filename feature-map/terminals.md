@@ -11,7 +11,10 @@ reattach when the session moves to another host.
 
 - `agent-terminal-view`: the Chat/Terminal switcher shows the harness terminal
   and returns to chat with the terminal's content kept. States: starting up
-  (no Resume action), stopped (Resume offered), connected.
+  (no Resume action), automatically restarting on an online host, stopped
+  (Resume offered after recovery fails or when the host is offline), connected.
+  Automatic recovery runs once when opening Terminal. Leaving it open does not
+  revive an idle-reaped pane. Failed recovery stays manual across view switches.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
@@ -26,7 +29,13 @@ reattach when the session moves to another host.
 - `hidden-terminal`: in chat view, the background terminal never draws over the
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
-  says so and routes the user to the terminal.
+  says so and routes the user to the terminal. When Claude Code still reports a
+  running turn but its input box has been hidden for 15 seconds (for example a
+  dialog opened while a reply streams), chat says something in the terminal may
+  need input, and the sidebar row moves to Needs attention with a "May need input"
+  tag, until the input box returns. `!` shell mode, the ctrl+r history search
+  and a draft quoting a dialog's title keep the input box in use, so they do
+  not count as hidden. A runner connected to an older server sends no alert.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -59,10 +68,16 @@ with their own terminal retain the switcher.
 
 - Open a new shell from the workspace rail on desktop, or from the header menu
   on a phone.
-- Press ⌘/Ctrl+Alt+T to open a shell of the remembered default type. The chord
-  is inert while the host is offline, the session is stranded, or a shell is
-  still being created, and it yields to a focused terminal or editor.
+- Press Control+` (on every platform) to open a shell of the remembered default
+  type, also from a focused terminal. The chord is inert while the host is
+  offline, the session is stranded, or a shell is still being created.
+- In the desktop app, Control+` or File → New Terminal does the same, also
+  while an embedded browser tab has focus. The menu item is disabled whenever
+  the chord would be inert.
 - Select an open shell from the rail's shell list; close it from its tab.
+  In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
+  workspace tab, using the same terminal confirmation. A read-only viewer's
+  terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host, then look at both the terminal strip and the agent terminal.
@@ -85,6 +100,12 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 ```
 
 - **`agent-terminal-view`:**
+  `tests/browser_ui/chat/test_terminal_auto_resume.py` covers automatic recovery
+  through the desktop switch, keyboard shortcut, mobile menu and grid switch,
+  plus failed attempts followed by manual Resume, including a cached closed
+  terminal that stays mounted during recovery. It uses the built SPA with
+  mocked host, retry and terminal transports; run with
+  `--browser-ui-skip-build --reruns 0 --video=on`.
   Grid cells: `tests/browser_ui/chat/test_session_grid.py` covers two real xterm
   surfaces against mocked terminal WebSockets, independent input, per-cell
   switches and keeping connections across view changes. Run without a server
@@ -103,6 +124,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`user-shell`:**
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_launches_and_opens`,
   `tests/e2e_ui/shells/test_new_shell.py::test_new_shell_accepts_typed_command`.
+  A program's terminal queries get exactly one reply:
+  `tests/e2e_ui/shells/test_new_shell.py::test_shell_program_gets_one_reply_to_a_cursor_position_query`.
   Closing a shell has no e2e coverage: close its tab, confirm, and expect the
   tab to disappear.
 - **`agent-terminal-view`, `user-shell`, `split-panes`, keyboard:** no e2e
@@ -113,9 +136,8 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `web/src/shell/TerminalSplitControls.test.tsx` and
   `web/src/shell/MainTerminalView.test.tsx` (`pnpm --dir web test`). Manually,
   in a Claude or Codex session with the composer focused: press ⌘/Ctrl+Alt+\
-  twice and expect Terminal view, then Chat view; press ⌘/Ctrl+Alt+T and
-  expect a new shell tab to open and take focus. Repeat ⌘/Ctrl+Alt+T with the
-  shell focused and expect no second shell. With `splittable_terminal_view_ui`,
+  twice and expect Terminal view, then Chat view; press Control+` and
+  expect a new shell tab to open and take focus. With `splittable_terminal_view_ui`,
   in Terminal view with the agent terminal focused, press ⌘/Ctrl+Alt+Shift+\
   and expect a default shell pane on the right that takes typing; press
   ⌘/Ctrl+Alt+Shift+] and expect typing to reach the agent pane again.
@@ -138,6 +160,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 - **`tmux-outage`:**
   `tests/e2e_ui/shells/test_antigravity_tmux_recovery.py::test_antigravity_survives_probe_outage_then_detects_exit`
   (opt-in; Antigravity only).
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py::test_pane_liveness_reads_the_requested_pane`
+  checks both shared WebSocket probes against real split tmux panes, including
+  an exited neighbor. This is a process check without a browser or vendor CLI.
 - **Launch failure and cancellation (plain `uv run pytest`, own tmux):**
   `tests/terminals/test_launch_failure_cleanup.py` checks a missing tmux
   executable at spawn and cancellation after a real pane starts, including
@@ -157,9 +182,26 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**
   `tests/e2e_ui/chat/test_blocked_dialog_terminal_routing.py::test_chat_blocked_on_terminal_dialog_routes_user_to_terminal`
-  injects the blocked event; it does not run a vendor CLI. For Claude's OSC
+  injects the blocked event; it does not run a vendor CLI. The hidden-input-box
+  hint is produced by
+  `tests/e2e/test_claude_native_hidden_prompt_e2e.py::test_real_claude_dialog_opened_mid_reply_points_chat_at_terminal`
+  (real Claude Code and tmux against a slow local Messages API; needs `claude`
+  on `PATH`), with timing cases in `tests/runner/test_resource_registry.py`
+  (`-k 'hidden_input_box or input_box_probe or queued_alert_delivery or
+  input_box_in_another_mode'`), the pane matrix in
+  `tests/harnesses/claude_native/test_claude_native_bridge.py`
+  (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
+  `web/src/components/SessionStateBadge.test.tsx`.
+  For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).
+
+For the desktop Close shortcut, open a shell tab in an ordinary session,
+focus its terminal, and press Cmd/Ctrl+W. Confirm any terminal-close prompt;
+only that tab should close. Cancel the prompt to keep the tab and session.
+Repeat as a read-only viewer: the shortcut should leave the terminal open.
+Cmd/Ctrl+Shift+W should close the window. Native accelerator delivery requires
+an Electron run; component tests cover the selection and confirmation paths.
 
 ## Gotchas
 

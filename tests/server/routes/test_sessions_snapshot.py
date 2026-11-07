@@ -1018,7 +1018,7 @@ async def test_session_snapshot_exit_report_still_fails_non_idle_session_of_conn
 
     assert snapshot.status == "failed"
     assert snapshot.last_task_error == {
-        "code": "runner_failed_to_start",
+        "code": "runner_process_crash",
         "message": _RUNNER_EXIT_ERROR,
     }
 
@@ -1107,21 +1107,127 @@ class _NotFoundRunnerClient:
 class _GatedRunnerClient:
     """Fake runner whose status GET blocks until released, so callers provably overlap."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, status: str = "running", status_code: int = 200) -> None:
         self.get_calls: list[str] = []
         self.arrived = asyncio.Event()
         self.release = asyncio.Event()
+        self.status = status
+        self.status_code = status_code
 
     async def get(self, url: str, timeout: float) -> Any:
         self.get_calls.append(url)
         self.arrived.set()
         await self.release.wait()
-        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+        return SimpleNamespace(status_code=self.status_code, json=lambda: {"status": self.status})
 
 
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe_http_status", [200, 404])
+@pytest.mark.parametrize(
+    ("probed_status", "published_status"),
+    [("running", "idle"), ("idle", "running"), ("idle", "waiting"), ("running", "failed")],
+)
+async def test_session_snapshot_preserves_status_published_during_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    probed_status: str,
+    published_status: str,
+    probe_http_status: int,
+) -> None:
+    """A late status reply cannot undo a turn edge or make completed work fail on disconnect."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "52970ab86e2a4eeaa9804421091d5002"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        runner_id="runner_status_race",
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+    )
+    conv_store = _ConversationStore([], conversations={session_id: conv})
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    persisted: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_live_status",
+        lambda key, status: persisted.append((key, status)),
+    )
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient(status=probed_status, status_code=probe_http_status)
+    _use_runner_client(monkeypatch, runner_client)
+    snapshot_task = asyncio.create_task(
+        _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+        helpers._publish_status(
+            session_id, published_status, failure_origin="synthetic_native_failure"
+        )
+        runner_client.release.set()
+        snapshot = await asyncio.wait_for(snapshot_task, timeout=1.0)
+
+        assert snapshot.status == (
+            "running" if published_status == "waiting" else published_status
+        )
+        assert _sessions_mod._session_status_cache.get(session_id) == published_status
+        assert persisted == [(session_id, published_status)]
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is None
+        assert _sessions_mod._runner_status_probe_backoff.get(session_id) is None
+        assert await orchestration._runner_disconnect_requires_failure(
+            session_id,
+            conv_store,  # type: ignore[arg-type]
+            origin="runner_offline_sweep",
+            snapshot=conv,
+        ) is (published_status in {"running", "waiting"})
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(snapshot_task, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_session_status_edge_before_probe_task_starts_takes_precedence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A queued probe cannot treat an intervening turn edge as its original cache state."""
+    from omnigent.server.routes._sessions import helpers, orchestration
+
+    session_id = "b9dfc503c89441fdbfcf9db877ae361b"
+    _sessions_mod._session_status_cache.pop(session_id, None)
+    _sessions_mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(helpers.session_live_state, "persist_live_status", lambda *args: None)
+    monkeypatch.setattr(
+        helpers.session_live_state,
+        "persist_scheduled_run_completion",
+        lambda *args, **kwargs: None,
+    )
+    runner_client = _GatedRunnerClient()
+    probe = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not runner_client.arrived.is_set()
+        assert _sessions_mod._runner_status_probe_inflight.get(session_id) is not None
+        helpers._publish_status(session_id, "idle")
+        runner_client.release.set()
+        assert await asyncio.wait_for(probe, timeout=1.0) == "idle"
+        assert _sessions_mod._session_status_cache.get(session_id) == "idle"
+    finally:
+        runner_client.release.set()
+        await asyncio.gather(probe, return_exceptions=True)
+        _sessions_mod._session_status_cache.pop(session_id, None)
 
 
 @pytest.mark.asyncio
@@ -3085,6 +3191,14 @@ _TRACEBACK_LINES = (
     *(f'  File "/venv/site-packages/pkg/module_{n}.py", line {n}, in call' for n in range(10)),
     "asyncio.exceptions.CancelledError",
 )
+_RUNNER_SHUTDOWN_LOG_LINES = (
+    "INFO  10-28 23:03:02.662 debug_logging                    _post              | "
+    "debug-log sink: first batch delivered to example.default.debug_logs (1 row(s))",
+    "DEBUG 10-28 23:03:02.663 runner._zygote                   _flush_child       | "
+    "flushing runner output",
+    "WARN  10-28 23:03:02.664 debug_logging                    _diag              | "
+    "debug-log sink: flush timed out",
+)
 
 
 def _runner_exit_report(summary: str, *tail_lines: str) -> str:
@@ -3092,23 +3206,50 @@ def _runner_exit_report(summary: str, *tail_lines: str) -> str:
     return "\n".join([summary, RUNNER_LOG_TAIL_HEADING, *tail_lines])
 
 
-def test_truncate_error_message_label_keeps_runner_exit_cause() -> None:
-    """A long runner-exit report keeps its summary and the tail's last line."""
+@pytest.mark.parametrize(
+    ("cause", "trailing_lines"),
+    [
+        pytest.param(_REJECTED_TUNNEL_ERROR, (), id="last-line"),
+        pytest.param(_REJECTED_TUNNEL_ERROR, _RUNNER_SHUTDOWN_LOG_LINES[:1], id="debug-upload"),
+        pytest.param(
+            _REJECTED_TUNNEL_ERROR, ("", *_RUNNER_SHUTDOWN_LOG_LINES), id="shutdown-logs"
+        ),
+        pytest.param(
+            "OSError: [Errno 28] No space left on device: '/tmp/runner-specs-example'",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="disk-full-traceback",
+        ),
+        pytest.param(
+            "ERROR 10-28 23:03:02.660 runner._zygote _child_main | runner child failed",
+            _RUNNER_SHUTDOWN_LOG_LINES,
+            id="error-record",
+        ),
+    ],
+)
+def test_truncate_error_message_label_keeps_runner_exit_cause(
+    cause: str, trailing_lines: tuple[str, ...]
+) -> None:
+    """Shutdown diagnostics must not displace the failure in a saved report."""
     summary = "runner process exited with code 1 (log on host: ~/logs/runner-a1.log)"
-    report = _runner_exit_report(summary, *_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR)
+    report = _runner_exit_report(summary, *_TRACEBACK_LINES, cause, *trailing_lines)
     assert len(report) > _LABEL_VALUE_MAX_LEN
 
     result = _truncate_error_message_label(report)
 
     # The traceback is dropped; the line naming the cause survives whole.
-    assert result == f"{summary}\n…\n{_REJECTED_TUNNEL_ERROR}"
+    assert result == f"{summary}\n…\n{cause}"
     assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
-def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
-    """An oversized last line is trimmed so the summary's start still fits."""
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+def test_truncate_error_message_label_trims_an_oversized_last_line(
+    trailing_lines: tuple[str, ...],
+) -> None:
+    """An oversized cause is trimmed so the summary's start still fits."""
     report = _runner_exit_report(
-        "runner process exited with code 1 (log on host: ~/x.log)", "error: " + "y" * 400
+        "runner process exited with code 1 (log on host: ~/x.log)",
+        "error: " + "y" * 400,
+        *trailing_lines,
     )
 
     result = _truncate_error_message_label(report)
@@ -3117,6 +3258,16 @@ def test_truncate_error_message_label_trims_an_oversized_last_line() -> None:
     assert result.startswith("runner process exited with code 1")
     assert "…\n…\nerror: yyy" in result
     assert result.endswith("y…")
+
+
+def test_truncate_error_message_label_keeps_last_log_when_no_cause_is_available() -> None:
+    summary = "runner process exited with code 1"
+    report = _runner_exit_report(summary, *_RUNNER_SHUTDOWN_LOG_LINES)
+
+    result = _truncate_error_message_label(report)
+
+    assert result == f"{summary}\n…\n{_RUNNER_SHUTDOWN_LOG_LINES[-1]}"
+    assert len(result) <= _LABEL_VALUE_MAX_LEN
 
 
 @pytest.mark.parametrize(
@@ -3192,7 +3343,10 @@ async def test_persist_error_labels_truncates_long_message() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path) -> None:
+@pytest.mark.parametrize("trailing_lines", [(), _RUNNER_SHUTDOWN_LOG_LINES])
+async def test_persist_error_labels_keeps_host_runner_exit_cause(
+    tmp_path: Path, trailing_lines: tuple[str, ...]
+) -> None:
     """A host's runner-exit report still names its cause once stored.
 
     The live failure event carries the whole report, but a reloaded session
@@ -3202,7 +3356,9 @@ async def test_persist_error_labels_keeps_host_runner_exit_cause(tmp_path: Path)
     from omnigent.server.schemas import ErrorDetail
 
     log_path = tmp_path / "runner.log"
-    log_path.write_text("\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR]) + "\n")
+    log_path.write_text(
+        "\n".join([*_TRACEBACK_LINES, _REJECTED_TUNNEL_ERROR, *trailing_lines]) + "\n"
+    )
     captured: dict[str, dict[str, str]] = {}
 
     class _MockStore:

@@ -8,7 +8,9 @@ loops, no file I/O.
 The expression receives the full ``PolicyEvent`` dict as an
 ``event`` variable and must return a map with a ``result`` key
 (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-``"reason"`` and/or ``"state_updates"`` key. Non-map returns abstain.
+``"reason"`` and/or ``"state_updates"`` key. ``null`` or a map without a
+``result`` abstains; any other value (e.g. a bare ``bool``) abstains and logs
+a warning, because it is almost always a mistake.
 ``state_updates`` must be a list of maps shaped
 ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
 ``value`` is required for ``set``, ``increment``, and ``append``, and ignored
@@ -27,7 +29,9 @@ Static, in an agent ``config.yaml`` (``policies:`` block, parsed by
         type: function
         handler: omnigent.policies.builtins.cel.cel_policy
         factory_params:
-          expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+          expression: >-
+            event.type == "tool_call" && event.data.name == "sys_os_shell"
+            ? {"result": "DENY"} : {"result": "ALLOW"}
           reason: Shell access is blocked.
 
 Static, in a bundled agent spec (``guardrails.policies``, parsed by
@@ -42,10 +46,14 @@ NOT read ``factory_params``)::
           function:
             path: omnigent.policies.builtins.cel.cel_policy
             arguments:
-              expression: 'event.type == "tool_call" && event.data.name == "sys_os_shell"'
+              expression: >-
+                event.type == "tool_call" && event.data.name == "sys_os_shell"
+                ? {"result": "DENY"} : {"result": "ALLOW"}
               reason: Shell access is blocked.
 
-Dynamic, via the session policy API::
+Dynamic, via the session policy API:
+
+.. code-block:: http
 
     POST /v1/sessions/{session_id}/policies
     {
@@ -53,7 +61,7 @@ Dynamic, via the session policy API::
         "type": "python",
         "handler": "omnigent.policies.builtins.cel.cel_policy",
         "factory_params": {
-            "expression": "event.type == \\"tool_call\\" && event.data.name == \\"sys_os_shell\\"",
+            "expression": "event.target == 'sys_os_shell' ? {'result': 'DENY'} : null",
             "reason": "Shell access is blocked."
         }
     }
@@ -63,12 +71,14 @@ CEL reference: https://cel.dev/overview/cel-overview
 
 from __future__ import annotations
 
+import functools
 import logging
 from collections.abc import Mapping, Sequence
 
 try:
     import celpy
     import celpy.celtypes
+    from celpy import Environment, Runner
     from celpy.adapter import json_to_cel
     from celpy.celparser import CELParseError
     from celpy.evaluation import CELEvalError
@@ -85,6 +95,10 @@ from omnigent.policies.schema import (
 
 _log = logging.getLogger(__name__)
 
+# Engines are rebuilt for every evaluation, so compiled programs are reused
+# across builds from a bounded cache. A multi-KB expression's AST is up to ~1 MB.
+_PROGRAM_CACHE_SIZE = 64
+
 
 def cel_policy(
     *,
@@ -95,8 +109,10 @@ def cel_policy(
 
     The expression must return a map with a ``result`` key
     (``"DENY"``, ``"ASK"``, or ``"ALLOW"``) and an optional
-    ``"reason"`` and/or ``"state_updates"`` key. Returning ``None``
-    or a map without a valid ``result`` abstains (ALLOW).
+    ``"reason"`` and/or ``"state_updates"`` key. Returning ``null``
+    or a map without a valid ``result`` abstains (ALLOW). Other
+    non-decision values (e.g. a bare ``bool``) and unknown ``result``
+    values also abstain, and log a warning once per expression.
     ``state_updates`` must be a list of maps shaped
     ``{"key": string, "action": "set"|"increment"|"delete"|"append", "value": any}``.
     ``value`` is required for ``set``, ``increment``, and ``append``,
@@ -129,14 +145,15 @@ def cel_policy(
             "Install it with: pip install cel-python"
         )
 
-    env = celpy.Environment()
+    # Environment() raises the recursion limit deep expressions need; cache
+    # hits skip it, so keep that side effect on every build.
+    Environment()
     try:
-        ast = env.compile(expression)
+        prog = _compile(expression)
     except CELParseError as exc:
         _log.warning("CEL compile error: %s", exc)
         raise ValueError(f"CEL policy: compile error in expression: {exc}") from exc
 
-    prog = env.program(ast)
     _result_key = celpy.celtypes.StringType("result")
     _reason_key = celpy.celtypes.StringType("reason")
     _state_updates_key = celpy.celtypes.StringType("state_updates")
@@ -165,12 +182,17 @@ def cel_policy(
             return None
 
         if not isinstance(result, celpy.celtypes.MapType):
+            if result is not None and not isinstance(result, celpy.celtypes.NullType):
+                _warn_non_decision(expression, f"a {type(result).__name__} instead of a map")
             return None
 
         if _result_key not in result:
             return None
         verdict = str(result[_result_key]).upper()
         if verdict not in ("DENY", "ASK", "ALLOW"):
+            # Name only the type: the value can carry event content.
+            result_type = type(result[_result_key]).__name__
+            _warn_non_decision(expression, f"a {result_type} result other than DENY, ASK or ALLOW")
             return None
 
         out: PolicyResponse = {"result": verdict}  # type: ignore[typeddict-item]
@@ -192,6 +214,43 @@ def cel_policy(
         return out
 
     return evaluate
+
+
+@functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
+def _compile(expression: str) -> Runner:
+    """
+    Parse and program a CEL expression, memoised per process.
+
+    The interpreted runner is reentrant: each ``evaluate`` call builds its
+    own evaluator and activation and only reads the shared AST. Parse
+    errors are not cached, so invalid expressions raise on every call.
+
+    :param expression: CEL source text.
+    :returns: A runner ready to evaluate.
+    :raises CELParseError: If the expression has syntax errors.
+    """
+    env = Environment()
+    return env.program(env.compile(expression))
+
+
+@functools.lru_cache(maxsize=_PROGRAM_CACHE_SIZE)
+def _warn_non_decision(expression: str, description: str) -> None:
+    """
+    Warn that an expression returned a value that is not a decision.
+
+    Memoised so each distinct problem logs once per process rather than on
+    every event, since policy engines are rebuilt for every evaluation.
+
+    :param expression: CEL source text, truncated in the log message.
+    :param description: What the expression returned, e.g.
+        ``"a BoolType instead of a map"``.
+    """
+    _log.warning(
+        "CEL policy expression returned %s, so the policy abstained. "
+        'Return a map such as {"result": "DENY"}. Expression: %.200s',
+        description,
+        expression,
+    )
 
 
 def _plain_cel_value(value: object) -> object:

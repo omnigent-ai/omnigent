@@ -77,7 +77,9 @@ class RetryPolicy:
         their own jitter at L0.
     :param timeout_per_request_s: Per-HTTP-request timeout. ``None``
         lets the SDK use its default. Used at L0 only — bounds an
-        individual attempt's wall-clock.
+        individual attempt according to the SDK's timeout semantics.
+        For Claude CLI, this bounds the wait for response headers;
+        streaming responses have separate idle timeouts.
     :param retryable_status_codes: HTTP status codes the in-process
         LLM path's ``classify_llm_error`` treats as retryable.
         Used only by the in-process LLM path and the tool-retry
@@ -317,17 +319,16 @@ class _ClaudeCliRetryAdapter:
         """
         Env vars to merge into ``ClaudeAgentOptions.env``.
 
-        The Claude CLI's retry budget isn't publicly documented as
-        env-tunable; we set Anthropic SDK conventions
-        speculatively.
+        Claude CLI caps retries at 15 outside its retry-watchdog mode.
+        Its request timeout is in milliseconds and ends at response headers.
 
         :returns: Dict mapping env var names to string values.
         """
         env: dict[str, str] = {
-            "ANTHROPIC_MAX_RETRIES": str(self.policy.max_retries),
+            "CLAUDE_CODE_MAX_RETRIES": str(self.policy.max_retries),
         }
         if self.policy.timeout_per_request_s is not None:
-            env["ANTHROPIC_REQUEST_TIMEOUT_SECONDS"] = str(int(self.policy.timeout_per_request_s))
+            env["API_TIMEOUT_MS"] = str(max(1, round(self.policy.timeout_per_request_s * 1000)))
         return env
 
 
@@ -1653,3 +1654,14 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+    @property
+    def loads_user_settings(self) -> bool:
+        """Whether a claude-sdk run loads the user's Claude settings and user-scope MCP servers.
+
+        ``skills_filter: "none"`` runs the CLI with ``setting_sources=[]``, so only
+        managed (enterprise) servers load; every other filter keeps the user source.
+
+        :returns: ``False`` only for ``skills_filter == "none"``.
+        """
+        return self.skills_filter != "none"
