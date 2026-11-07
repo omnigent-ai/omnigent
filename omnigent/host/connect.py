@@ -4034,15 +4034,28 @@ class HostProcess:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
 
+        from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+
         path = quote(frame.session_id or "", safe="")
-        return httpx.get(
+        headers = self._build_connect_headers()
+        auth_factory = self._auth_token_factory
+        response = httpx.get(
             f"{self._server_url}/v1/sessions/{path}/agent/contents",
-            headers=self._build_connect_headers(),
+            headers=headers,
             timeout=10.0,
-            # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
-            # deleted bundle; verify like the host tunnel does instead.
+            # A deleted SSL_CERT_FILE must not break the host's existing TLS context.
             verify=client_ssl_context(),
         )
+        if (
+            response.status_code == 401
+            and headers.get("Authorization")
+            and MANAGED_HOST_TOKEN_HEADER not in headers
+            and self._auth_token_factory is auth_factory
+        ):
+            # Let the next request rediscover repaired credentials without replaying this one.
+            self._auth_token_factory = None
+            self._auth_token_factory_resolved = False
+        return response
 
     async def _prewarm_model_options(self) -> bool:
         """
