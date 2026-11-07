@@ -682,6 +682,7 @@ def test_active_turn_update_requires_storage_only_when_state_changes(
         pytest.param("session_id", "turn_b", 0, 0, id="new-session-reset"),
         pytest.param("thread_id", "turn_b", 0, 0, id="new-thread-reset"),
         pytest.param("socket_path", "turn_b", 0, 0, id="new-socket-reset"),
+        pytest.param("codex_home", "turn_b", 0, 0, id="new-home-reset"),
     ],
 )
 def test_full_state_publication_preserves_revision_for_the_same_owner(
@@ -733,6 +734,22 @@ def test_full_state_publication_preserves_revision_for_the_same_owner(
         (None, [("rewritten", "session_id")], "turn_a", False, None),
         (None, [("rewritten", "thread_id")], "turn_a", False, None),
         (None, [("rewritten", "socket_path")], "turn_a", False, None),
+        pytest.param(
+            None,
+            [("rewritten", "codex_home")],
+            "turn_a",
+            False,
+            None,
+            id="home-only-rotation",
+        ),
+        pytest.param(
+            "turn_a",
+            [("rewritten", "codex_home")],
+            "turn_a",
+            True,
+            "turn_a",
+            id="already-recorded-home-rotation",
+        ),
         pytest.param(
             "turn_a",
             [("published", "turn_a"), ("published", "turn_b"), ("published", "turn_a")],
