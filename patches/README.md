@@ -25,3 +25,22 @@ per-write registry copies. Validate snapshot identity, batched notifications,
 and mounted code-block replacement, removal, and undo with
 `TipTapRendererRegistry.test.tsx`, `TipTapNodeViewSelection.test.tsx`, and the
 standard journeys in `feature-map/markdown-editor.md`.
+
+`mermaid@11.16.1` relaxes the width comparison in `addHtmlSpan` that decides
+whether an HTML node label should wrap. Mermaid first lays a label out on one
+line clamped to `max-width`, then switches it to wrapping only when the measured
+width equals that maximum exactly. At a fractional window zoom or display scale,
+Chromium reports a clamped label a sub-pixel wider (for example 200.00003 for
+200), so long labels stay on one line, the node box is sized for one line, and
+the text is clipped. The patch treats any width within 1px of the maximum as
+clamped. Upstream tracks this in https://github.com/mermaid-js/mermaid/issues/7794
+and https://github.com/mermaid-js/mermaid/issues/8608, with candidate fixes in
+https://github.com/mermaid-js/mermaid/pull/8233,
+https://github.com/mermaid-js/mermaid/pull/8242 and
+https://github.com/mermaid-js/mermaid/pull/8609. Only the `mermaid.core` chunk
+that the package export map resolves for bundlers is patched; the other
+bundles and source maps remain upstream's.
+
+Remove the patch when upgrading to a Mermaid release that tolerates sub-pixel
+label widths. Validate it with `tests/browser_ui/chat/test_mermaid_display_scale.py`
+and the Mermaid tests in `tests/browser_ui/chat/test_transcript_rendering.py`.

@@ -154,3 +154,4 @@ allowBuilds:
 
 patchedDependencies:
   '@tiptap/react@3.31.4': patches/@tiptap__react@3.31.4.patch
+  mermaid@11.16.1: patches/mermaid@11.16.1.patch

@@ -1,0 +1,14 @@
+diff --git a/dist/chunks/mermaid.core/chunk-WRU74C26.mjs b/dist/chunks/mermaid.core/chunk-WRU74C26.mjs
+index 271fe5ccaa644e1bdfcf4150d7e2d1867a72f033..104c1b27046c9580f694f302c8ba450f2699d838 100644
+--- a/dist/chunks/mermaid.core/chunk-WRU74C26.mjs
++++ b/dist/chunks/mermaid.core/chunk-WRU74C26.mjs
+@@ -233,7 +233,8 @@ async function addHtmlSpan(element, node, width, classes, addBackground = false,
+     div.attr("class", "labelBkg");
+   }
+   let bbox = div.node().getBoundingClientRect();
+-  if (bbox.width === width) {
++  // Fractional zoom or display scaling reports a clamped label a sub-pixel off `width`.
++  if (bbox.width >= width - 1) {
+     div.style("display", "table");
+     div.style("white-space", "break-spaces");
+     div.style("width", width + "px");

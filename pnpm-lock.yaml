@@ -96,6 +96,7 @@ packageExtensionsChecksum: sha256-pFEExG4o57joHucsVi/dgGpp9BfdxYD7y4blLQUpCqI=
 
 patchedDependencies:
   '@tiptap/react@3.31.4': 4276dd6552be2980d90b31e5346540e66e9b4eb3807014472e56c38116c14473
+  mermaid@11.16.1: c08d0012f90f6de1e1313ac12e970164113c616e1f36548200694c8584530d0f
 
 importers:
 
@@ -13413,7 +13414,7 @@ snapshots:
 
   '@streamdown/mermaid@1.0.3(react@18.3.1)':
     dependencies:
-      mermaid: 11.16.1
+      mermaid: 11.16.1(patch_hash=c08d0012f90f6de1e1313ac12e970164113c616e1f36548200694c8584530d0f)
       react: 18.3.1
 
   '@szmarczak/http-timer@4.0.6':
@@ -17099,7 +17100,7 @@ snapshots:
 
   merge2@1.4.1: {}
 
-  mermaid@11.16.1:
+  mermaid@11.16.1(patch_hash=c08d0012f90f6de1e1313ac12e970164113c616e1f36548200694c8584530d0f):
     dependencies:
       '@braintree/sanitize-url': 7.1.2
       '@iconify/utils': 3.1.7
@@ -19362,7 +19363,7 @@ snapshots:
       hast-util-to-jsx-runtime: 2.3.6(supports-color@10.2.2)
       html-url-attributes: 3.0.1
       marked: 17.0.6
-      mermaid: 11.16.1
+      mermaid: 11.16.1(patch_hash=c08d0012f90f6de1e1313ac12e970164113c616e1f36548200694c8584530d0f)
       react: 18.3.1
       react-dom: 18.3.1(react@18.3.1)
       rehype-harden: 1.1.8
