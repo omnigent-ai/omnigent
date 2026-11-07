@@ -2378,6 +2378,7 @@ function NewChatLandingContent({
 
   // Filter and order selectable agents by deployment curation.
   const info = useServerInfo();
+  const bundleWorkspacesSupported = info !== "loading" && info.session_bundle_workspaces === true;
   const curation = pickerCuration(info);
   const agentList = useMemo(
     () =>
@@ -3228,11 +3229,6 @@ function NewChatLandingContent({
   // A pick only wins while it exists in the list — a persisted id whose
   // agent has since been unregistered (or hidden) falls back to the default.
   // The pending custom agent sentinel also wins when set.
-  // A pending (just-created, not-yet-submitted) custom agent can't run on a
-  // managed sandbox — the sandbox create path doesn't provision a runner for a
-  // bundled agent. So a pending pick made before switching to a sandbox is
-  // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
   // A configured agent absent from templates and the first 30 Mine sessions
   // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
@@ -3274,8 +3270,9 @@ function NewChatLandingContent({
     rememberedHarnessResolution.source === "fallback"
       ? rememberedHarnessResolution
       : null;
+  const pendingAgentAllowedOnTarget = !sandboxSelected || bundleWorkspacesSupported;
   const defaultEffectiveAgentId =
-    pickedAgentId === PENDING_AGENT_ID && pendingAgentAllowedOnTarget
+    pickedAgentId === PENDING_AGENT_ID && pendingAgent !== null && pendingAgentAllowedOnTarget
       ? PENDING_AGENT_ID
       : agentList.some((a) => a.id === pickedAgentId)
         ? pickedAgentId
@@ -5325,6 +5322,18 @@ function NewChatLandingContent({
     field: "sandboxRepo" | "other";
     message: string | null;
   } | null => {
+    if (
+      effectiveAgentId === PENDING_AGENT_ID &&
+      siblingSourceId &&
+      (shouldCreateWorktree || startInExistingWorktree) &&
+      !bundleWorkspacesSupported
+    ) {
+      return {
+        field: "other",
+        message:
+          "This server needs an update to create a custom agent in a worktree. Choose an existing agent or use the current folder.",
+      };
+    }
     if (mcpAuthorizing || mcpSelectionError !== null) {
       return {
         field: "other",
@@ -6009,18 +6018,56 @@ function NewChatLandingContent({
       let launchedAgentId = effectiveAgentId;
 
       if (effectiveAgentId === PENDING_AGENT_ID && pendingAgent) {
-        // Custom agents upload their bundle with the session, then launch on the host below.
+        // Custom agents upload their bundle with the session. Sibling and managed
+        // creates launch server-side; ordinary connected-host creates launch below.
         const bundle = await buildAgentBundle(pendingAgent);
-        const metadata: Record<string, unknown> = {
-          labels: createLabels,
-          ...(siblingSourceId ? { sibling_source_id: siblingSourceId } : {}),
-        };
+        let bundledGitOptions: Parameters<typeof launchRunner>[3];
+        if (shouldCreateWorktree) {
+          bundledGitOptions = {
+            branchName: trimmedBranch,
+            baseBranch: baseBranch.trim() || undefined,
+          };
+        } else if (startInExistingWorktree) {
+          bundledGitOptions = { branchName: activeWorktree!.branch!, existingWorktree: true };
+        }
+        const metadata: Parameters<typeof createBundledSession>[1] = { labels: createLabels };
+        if (siblingSourceId) metadata.sibling_source_id = siblingSourceId;
+        if (sandboxSelected) {
+          // Multipart creates allocate their host server-side; they cannot reserve a host ID.
+          metadata.host_type = "managed";
+          metadata.workspaces = composeSandboxWorkspaces(sandboxRepoSelections);
+          if (sandboxProvider !== null) metadata.sandbox_provider = sandboxProvider;
+          if (selectedSandboxProfile !== null) {
+            metadata.sandbox_profile_id = selectedSandboxProfile.id;
+            metadata.sandbox_profile_revision = selectedSandboxProfile.revision;
+          }
+          if (createProjectId !== null) {
+            metadata.workspace = null;
+            metadata.git = null;
+          }
+          if (serverOwnsInitialInput) metadata.initial_input = initialInput;
+        } else if (siblingSourceId && selectedHostId) {
+          metadata.host_id = selectedHostId;
+          if (bundledGitOptions) {
+            metadata.git = {
+              branch_name: bundledGitOptions.branchName,
+              base_branch: bundledGitOptions.baseBranch,
+              existing_worktree: bundledGitOptions.existingWorktree,
+            };
+          }
+        }
         if (mcpServicesForLaunch.length) {
           metadata.mcp_registry_services = mcpServicesForLaunch;
         }
         // A config-seeded workspace is omitted on a `project_id` create so the
         // server default-fills it (same field semantics as the JSON path).
-        if (workspaceTrimmed && !workspaceFromProjectConfig) metadata.workspace = workspaceTrimmed;
+        if (
+          !sandboxSelected &&
+          workspaceTrimmed &&
+          (siblingSourceId || !workspaceFromProjectConfig)
+        ) {
+          metadata.workspace = workspaceTrimmed;
+        }
         if (createProjectId !== null) {
           // Atomic filing: the server sets first-class `project_id` at create.
           metadata.project_id = createProjectId;
@@ -6031,7 +6078,8 @@ function NewChatLandingContent({
         }
         const bundled = await createBundledSession(
           bundle,
-          metadata as Parameters<typeof createBundledSession>[1],
+          metadata,
+          serverOwnsInitialInput ? files : [],
         );
         data = { id: bundled.id };
         launchedAgentId = bundled.agentId ?? null;
@@ -6039,18 +6087,8 @@ function NewChatLandingContent({
         // otherwise both sandbox and computer bundled creates emit nothing. Split
         // by the picked host; interactionTelemetry completes/settles the span.
         markSessionCreated(data.id, sandboxSelected ? "sandbox" : "computer");
-        // Launch the runner on the selected host. The multipart create
-        // only stores DB rows — launchRunner binds + starts the runner.
-        if (!sandboxSelected && selectedHostId && workspaceTrimmed) {
-          // Create a new worktree, bind an existing one (records the branch
-          // for the sidebar + delete flow without creating anything), or
-          // neither — mirrored on the `git` block.
-          const gitOpts = shouldCreateWorktree
-            ? { branchName: trimmedBranch, baseBranch: baseBranch.trim() || undefined }
-            : startInExistingWorktree
-              ? { branchName: activeWorktree!.branch!, existingWorktree: true }
-              : undefined;
-          await launchRunner(selectedHostId, data.id, workspaceTrimmed, gitOpts);
+        if (!siblingSourceId && !sandboxSelected && selectedHostId && workspaceTrimmed) {
+          await launchRunner(selectedHostId, data.id, workspaceTrimmed, bundledGitOptions);
         }
         // Clear pending agent after successful creation.
         setPendingAgent(null);

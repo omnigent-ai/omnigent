@@ -79,6 +79,7 @@ export type FeatureValues = Record<string, boolean>;
 /** Shape of the response from ``GET /v1/info``. */
 export interface ServerInfo {
   sibling_sessions?: boolean;
+  session_bundle_workspaces?: boolean;
   accounts_enabled: boolean;
   /**
    * True only on an explicit single-user local runtime
@@ -396,6 +397,7 @@ function parseBranding(raw: unknown): Branding | null {
 
 /** Sentinel used when the probe fails — accounts and release features are off. */
 export const FALLBACK_SERVER_INFO: ServerInfo = {
+  session_bundle_workspaces: false,
   accounts_enabled: false,
   // Fail to multi-user: a failed probe must not hide account/sharing chrome.
   single_user: false,
@@ -545,6 +547,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          session_bundle_workspaces: data.session_bundle_workspaces === true,
           accounts_enabled: data.accounts_enabled === true,
           single_user: data.single_user === true,
           login_url: typeof data.login_url === "string" ? data.login_url : null,

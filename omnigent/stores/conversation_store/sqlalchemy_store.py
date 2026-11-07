@@ -420,6 +420,7 @@ def _new_session_metadata_row(
     parent_conversation_id: str | None = None,
     runner_id: str | None = None,
     workspace: str | None = None,
+    git_branch: str | None = None,
     terminal_launch_args: list[str] | None = None,
     project_id: str | None = None,
     host_id: str | None = None,
@@ -452,6 +453,7 @@ def _new_session_metadata_row(
         host_id=host_id,
         inference_snapshot=inference_snapshot,
         workspace=workspace,
+        git_branch=git_branch,
         terminal_launch_args=(
             json.dumps(terminal_launch_args) if terminal_launch_args is not None else None
         ),
@@ -5582,6 +5584,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -5620,6 +5623,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``None`` — but only when ``host_id`` is also unset (the
             ``ck_conversations_workspace_required_for_host``
             constraint requires the pair).
+        :param git_branch: Optional branch associated with ``workspace``.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -5657,6 +5661,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             reasoning_effort=reasoning_effort,
             model_override=model_override,
             workspace=workspace,
+            git_branch=git_branch,
             terminal_launch_args=terminal_launch_args,
             parent_conversation_id=parent_conversation_id,
             runner_id=runner_id,
@@ -5679,6 +5684,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -5764,6 +5770,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 runner_id=runner_id,
                 project_id=project_id,
                 workspace=workspace,
+                git_branch=git_branch,
                 terminal_launch_args=terminal_launch_args,
                 host_id=host_id,
                 inference_snapshot=encoded_inference_snapshot,

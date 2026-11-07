@@ -45,7 +45,7 @@ import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessio
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
-import { useHosts } from "@/hooks/useHosts";
+import { useHosts, useHostModelOptions } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
@@ -250,6 +250,7 @@ function setRepoIsGit(): void {
 function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
   rerender: (ui: ReactNode) => void;
   unmount: () => void;
+  client: QueryClient;
 } {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const info = {
@@ -271,6 +272,11 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
     dictation_available: false,
     ...infoOverrides,
   } as ServerInfo;
+  const fetch = vi.mocked(authenticatedFetch).getMockImplementation();
+  vi.mocked(authenticatedFetch).mockImplementation((url, options) => {
+    if (url === "/v1/info") return Promise.resolve(Response.json(info));
+    return fetch ? fetch(url, options) : Promise.reject(new Error(`Unexpected request: ${url}`));
+  });
   function Wrapper({ children }: { children: ReactNode }) {
     return (
       <QueryClientProvider client={client}>
@@ -281,7 +287,7 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
     );
   }
   const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
-  return { rerender, unmount };
+  return { rerender, unmount, client };
 }
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
@@ -298,23 +304,33 @@ function selectAgent(agentId: string): void {
 async function submitAndReadBody(
   response: Record<string, unknown> = { id: "conv_new" },
 ): Promise<Record<string, unknown>> {
-  vi.mocked(authenticatedFetch).mockResolvedValueOnce({
-    ok: true,
-    json: () => Promise.resolve(response),
-  } as Response);
+  const fetch = vi.mocked(authenticatedFetch).getMockImplementation()!;
+  vi.mocked(authenticatedFetch).mockImplementation((url, options) =>
+    url === "/v1/sessions" && options?.method === "POST"
+      ? Promise.resolve(Response.json(response))
+      : fetch(url, options),
+  );
   fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
     target: { value: "hello" },
   });
   fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
-  await waitFor(() => expect(vi.mocked(authenticatedFetch)).toHaveBeenCalled());
+  await waitFor(() =>
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions",
+      expect.objectContaining({ method: "POST" }),
+    ),
+  );
   // Let the post-create bookkeeping (move / invalidations / navigation) run
   // before reading the body, so move-call assertions can't race the submit.
   await waitFor(() => expect(navigateMock).toHaveBeenCalled());
-  const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-  return JSON.parse(init.body as string) as Record<string, unknown>;
+  const [, init] = vi
+    .mocked(authenticatedFetch)
+    .mock.calls.find(([url, options]) => url === "/v1/sessions" && options?.method === "POST")!;
+  return JSON.parse(init!.body as string) as Record<string, unknown>;
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   navigateMock.mockReset();
   vi.mocked(authenticatedFetch).mockReset();
   vi.mocked(moveConversationToProject).mockReset();
@@ -589,7 +605,7 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     const config = { host_id: "host_1", workspace: REPO, agent_id: "ag_other" };
     setProjectConfig(config);
     vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
-    renderLanding();
+    renderLanding({ session_bundle_workspaces: true });
     await waitFor(() =>
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("alpha"),
     );
@@ -737,7 +753,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       });
       cleanup();
       searchParams = new URLSearchParams("sibling=source");
-      renderLanding({ sibling_sessions: true });
+      renderLanding({ sibling_sessions: true, session_bundle_workspaces: true });
       await screen.findByRole("heading", { name: "Add nested agent" });
       expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
       expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
@@ -759,9 +775,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
           workspace: REPO,
         });
 
-        await waitFor(() =>
-          expect(launchRunner).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined),
-        );
+        expect(launchRunner).not.toHaveBeenCalled();
       } else {
         expect(await submitAndReadBody()).toMatchObject({
           sibling_source_id: "source",
@@ -782,6 +796,123 @@ describe("NewChatLandingScreen nested agent creation", () => {
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+    },
+  );
+});
+
+describe("NewChatLandingScreen uploaded agent destinations", () => {
+  it.each(["folder", "new", "existing", "unsupported"] as const)(
+    "binds an uploaded nested agent with %s worktree metadata",
+    async (worktree) => {
+      searchParams = new URLSearchParams("sibling=source");
+      if (worktree !== "folder") {
+        vi.mocked(useHostWorktrees).mockReturnValue({
+          data: [
+            { path: REPO, branch: "main", is_main: true, detached: false },
+            { path: EXISTING_WORKTREE, branch: "feature/alpha", is_main: false, detached: false },
+          ],
+          isError: false,
+        } as ReturnType<typeof useHostWorktrees>);
+      }
+      renderLanding({
+        sibling_sessions: true,
+        session_bundle_workspaces: worktree !== "unsupported",
+      });
+      await screen.findByRole("heading", { name: "Add nested agent" });
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      if (worktree !== "folder") {
+        fireEvent.click(screen.getByTestId("new-chat-landing-branch-chip"));
+        if (worktree === "existing") {
+          fireEvent.click(screen.getByRole("radio", { name: "Use worktree alpha-feature" }));
+        } else {
+          fireEvent.change(screen.getByTestId("new-chat-landing-branch-input"), {
+            target: { value: "feature/review" },
+          });
+          fireEvent.keyDown(screen.getByTestId("new-chat-landing-branch-input"), { key: "Escape" });
+        }
+      }
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Review the API" },
+      });
+      if (worktree === "unsupported") {
+        expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-submit").parentElement!);
+        expect(screen.getByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+          "server needs an update to create a custom agent in a worktree",
+        );
+        expect(createBundledSession).not.toHaveBeenCalled();
+        return;
+      }
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(createBundledSession).toHaveBeenCalled());
+      const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
+      expect(metadata).toEqual(
+        expect.objectContaining({
+          sibling_source_id: "source",
+          host_id: "host_1",
+          workspace: worktree === "existing" ? EXISTING_WORKTREE : REPO,
+        }),
+      );
+      if (worktree === "folder") expect(metadata?.git).toBeUndefined();
+      else
+        expect(metadata?.git).toEqual(
+          expect.objectContaining(
+            worktree === "existing"
+              ? { branch_name: "feature/alpha", existing_worktree: true }
+              : { branch_name: "feature/review" },
+          ),
+        );
+      expect(launchRunner).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    "delivers an uploaded sibling agent task on a new sandbox (durable=%s)",
+    async (durable) => {
+      searchParams = new URLSearchParams("sibling=source");
+      renderLanding({
+        session_bundle_workspaces: true,
+        durable_initial_input: durable,
+        sibling_sessions: true,
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "modal",
+      });
+      await screen.findByRole("heading", { name: "Add nested agent" });
+
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+      await waitFor(() => expect(vi.mocked(useHostModelOptions).mock.lastCall?.[0]).toBeNull());
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Review the API" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(createBundledSession).toHaveBeenCalled());
+
+      const [, metadata] = vi.mocked(createBundledSession).mock.calls[0];
+      expect(metadata).toEqual(
+        expect.objectContaining({
+          sibling_source_id: "source",
+          host_type: "managed",
+          workspaces: [],
+        }),
+      );
+      await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+      const { setPendingInitialPrompt } = await import("@/store/chatStore");
+      if (durable) {
+        expect(metadata?.initial_input).toEqual({
+          type: "message",
+          data: { role: "user", content: [{ type: "input_text", text: "Review the API" }] },
+        });
+        expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+      } else {
+        expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+          "conv_new",
+          expect.objectContaining({ text: "Review the API" }),
+        );
+      }
+      expect(metadata).not.toHaveProperty("host_id");
+      expect(launchRunner).not.toHaveBeenCalled();
     },
   );
 });
