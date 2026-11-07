@@ -24,7 +24,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TypeAlias
+from typing import TypeAlias, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from starlette.types import ASGIApp, Message, Scope
@@ -351,6 +351,13 @@ async def dispatch_via_asgi(
         raise
 
 
+class _TunnelActivityKwargs(TypedDict, total=False):
+    """Optional activity callbacks forwarded to each tunnel connection."""
+
+    on_activity: Callable[[], None]
+    report_keep_warm: Callable[[], bool]
+
+
 async def serve_tunnel(
     app: _ASGIApp,
     *,
@@ -362,6 +369,7 @@ async def serve_tunnel(
     auth_token_factory: Callable[[], str | None] | None = None,
     on_reconnect: Callable[[], Awaitable[None]] | None = None,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     direct_attach_port: int | None = None,
@@ -404,6 +412,9 @@ async def serve_tunnel(
     :param on_activity: Optional sync callback fired for real
         server-to-runner work frames. Tunnel pings are excluded so
         keepalives do not keep an otherwise idle runner alive.
+    :param report_keep_warm: Optional sync callback whose result rides on each
+        pong as ``keep_warm``, so the server extends a managed sandbox only while
+        the runner wants it kept warm.
     :param shutdown_event: Optional event that, when set, requests a
         *graceful* tunnel shutdown: the current connection stops reading new
         frames, waits for in-flight ``GET /stream`` dispatch tasks to finish
@@ -553,7 +564,11 @@ async def serve_tunnel(
         connection_id = uuid.uuid4().hex
         diagnostics = TunnelDiagnostics()
         try:
-            activity_kwargs = {"on_activity": on_activity} if on_activity is not None else {}
+            activity_kwargs: _TunnelActivityKwargs = {}
+            if on_activity is not None:
+                activity_kwargs["on_activity"] = on_activity
+            if report_keep_warm is not None:
+                activity_kwargs["report_keep_warm"] = report_keep_warm
             close_details = await _serve_tunnel_once(
                 app,
                 tunnel_url=tunnel_url,
@@ -1040,6 +1055,7 @@ async def _serve_tunnel_once(
     auth_token: str | None = None,
     tunnel_token: str | None = None,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     shutdown_event: asyncio.Event | None = None,
     on_graceful_shutdown: Callable[[], None] | None = None,
     on_connected: Callable[[], None] | None = None,
@@ -1073,6 +1089,8 @@ async def _serve_tunnel_once(
     :param on_activity: Optional sync callback fired for real work
         frames received from the server. Ping keepalives do not
         trigger it.
+    :param report_keep_warm: Optional keep-warm report attached to each pong;
+        see :func:`serve_tunnel`.
     :param shutdown_event: Optional event whose set state ends the read
         loop and triggers the graceful drain (see ``_graceful_drain``).
     :param on_graceful_shutdown: Optional sync callback fired once, before
@@ -1192,6 +1210,7 @@ async def _serve_tunnel_once(
                 dispatch_tasks,
                 ws_channels,
                 on_activity=on_activity,
+                report_keep_warm=report_keep_warm,
                 event_dispatcher=event_dispatcher,
                 diagnostics=diagnostics,
                 passive_dispatch_tasks=passive_dispatch_tasks,
@@ -1547,6 +1566,7 @@ async def _handle_tunnel_frame(
     ws_channels: dict[str, _RunnerWSChannel],
     *,
     on_activity: Callable[[], None] | None = None,
+    report_keep_warm: Callable[[], bool] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
     passive_dispatch_tasks: set[asyncio.Task[None]] | None = None,
@@ -1564,6 +1584,8 @@ async def _handle_tunnel_frame(
         state map.
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
+    :param report_keep_warm: Optional keep-warm report attached to each pong;
+        see :func:`serve_tunnel`.
     :param diagnostics: Connection-local application frame and heartbeat observations.
     :param passive_dispatch_tasks: Connection-owned subscriptions that can safely reconnect.
     :returns: None.
@@ -1589,7 +1611,8 @@ async def _handle_tunnel_frame(
     elif isinstance(frame, PingFrame):
         if diagnostics is not None:
             diagnostics.app_ping_received()
-        await send_text(encode_frame(PongFrame(ts=frame.ts)))
+        keep_warm = _keep_warm_for_pong(report_keep_warm)
+        await send_text(encode_frame(PongFrame(ts=frame.ts, keep_warm=keep_warm)))
         if diagnostics is not None:
             diagnostics.app_pong_sent()
     elif isinstance(frame, RequestFrame):
@@ -1665,6 +1688,24 @@ async def _handle_tunnel_frame(
         if closing_channel is None:
             return
         closing_channel.inbound.put_nowait(("close", (frame.code, frame.reason)))
+
+
+def _keep_warm_for_pong(report_keep_warm: Callable[[], bool] | None) -> bool | None:
+    """Return the pong's ``keep_warm`` report; ``None`` if the runner does not report.
+
+    A failing callback reports ``True``: keeping a sandbox warm for one extra
+    interval is cheaper than letting an in-use one stop.
+
+    :param report_keep_warm: The runner's keep-warm callback, if any.
+    :returns: The value for the next pong's ``keep_warm``.
+    """
+    if report_keep_warm is None:
+        return None
+    try:
+        return bool(report_keep_warm())
+    except Exception:  # a keep-warm report must never break the pong
+        _logger.debug("runner keep-warm report failed; reporting True", exc_info=True)
+        return True
 
 
 async def _cancel_dispatch_tasks(dispatch_tasks: dict[str, asyncio.Task[None]]) -> None:
