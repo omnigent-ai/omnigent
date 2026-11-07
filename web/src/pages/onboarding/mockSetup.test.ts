@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { maybeMockSetup } from "./mockSetup";
 
 const params = (q: string) => new URLSearchParams(q);
@@ -25,5 +25,15 @@ describe("maybeMockSetup", () => {
     expect(setup?.installed).toBe(false);
     expect(setup?.managedServers).toEqual([]);
     expect(setup?.recentServers).toEqual([]);
+  });
+});
+
+describe("maybeMockSetup clipboard", () => {
+  it("writes to the real browser clipboard and rejects when denied", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { value: { writeText }, configurable: true });
+    await maybeMockSetup(params("mock=1"))?.onCopy("hello");
+    expect(writeText).toHaveBeenCalledWith("hello");
+    await expect(maybeMockSetup(params("mock=1&clipboard=deny"))?.onCopy("x")).rejects.toThrow();
   });
 });

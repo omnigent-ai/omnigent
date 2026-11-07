@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld("arcaConnect", {
   confirm: () => ipcRenderer.send("arca-connect:confirm"),
   /** Cancel / close the console (kills a mid-run command). */
   cancel: () => ipcRenderer.send("arca-connect:cancel"),
+  /** Copy the shell-built diagnostics for the last failure; resolves `{ ok }`. Sends no text. */
+  copyDiagnostics: () => ipcRenderer.invoke("arca-connect:copy-diagnostics"),
   /** Resize the shell-owned window to the rendered page, within main-owned bounds. */
   resizeToContent: (size) => ipcRenderer.send("arca-connect:resize", size),
   /** `{ serverUrl, command }` once the flow is ready. */
@@ -28,6 +30,6 @@ contextBridge.exposeInMainWorld("arcaConnect", {
   onStarted: (callback) => on("arca-connect:started", callback),
   /** A chunk of live stdout/stderr. */
   onOutput: (callback) => on("arca-connect:output", callback),
-  /** `{ ok, error }` once the connect, and any sign-in it needed, finishes. */
+  /** `{ ok, error, errorMessage?, errorAction?, canCopyDiagnostics }` once the connect, and any sign-in it needed, finishes. */
   onDone: (callback) => on("arca-connect:done", callback),
 });

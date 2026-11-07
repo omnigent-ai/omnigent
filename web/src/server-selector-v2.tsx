@@ -311,6 +311,7 @@ export function BridgeSetupApp() {
               error: result?.error,
               errorMessage: result?.errorMessage,
               errorAction: result?.errorAction,
+              errorKind: result?.errorKind,
             };
           } catch (e) {
             return { ok: false, error: e instanceof Error ? e.message : String(e) };
@@ -345,9 +346,11 @@ export function BridgeSetupApp() {
     // Copy via the shell's native clipboard bridge — navigator.clipboard is
     // denied on the file:// wizard page.
     onCopy: (text) => {
-      setupBridge()
-        ?.copyText(text)
-        .catch(() => {});
+      const bridge = setupBridge();
+      // Returned so callers can report a failed copy; fire-and-forget callers swallow it.
+      return bridge
+        ? bridge.copyText(text)
+        : Promise.reject(new Error("The desktop shell is unavailable."));
     },
     // Cloud deploy docs open in the real browser: window.open on this file://
     // page is routed out by the shell's popup policy, not opened in-window.
