@@ -31,7 +31,7 @@ RECENT_PUSH_SECONDS = 300.0
 _MAX_DIRECTORIES = 4
 _GIT_TIMEOUT_SECONDS = 5.0
 # Pushes already reported, so later calls in the same checkout do not look them up again.
-_reported: OrderedDict[tuple[str, str, int], None] = OrderedDict()
+_reported: OrderedDict[tuple[str, str, str, int], None] = OrderedDict()
 _reported_lock = threading.Lock()
 _MAX_REPORTED = 1024
 
@@ -63,7 +63,7 @@ def _git(directory: str, *argv: str) -> str | None:
     return completed.stdout.decode("utf-8", errors="replace")
 
 
-def _claim(push: tuple[str, str, int]) -> bool:
+def _claim(push: tuple[str, str, str, int]) -> bool:
     with _reported_lock:
         if push in _reported:
             return False
@@ -126,6 +126,6 @@ def recent_pushes(directories: Iterable[str]) -> list[tuple[str, str]]:
             if remote is None:
                 continue
             url = (_git(directory, "remote", "get-url", "--push", remote) or "").strip()
-            if url and _claim((common_dir, ref, int(match[1]))):
+            if url and _claim((common_dir, ref, head, int(match[1]))):
                 found.append((url, ref.removeprefix(f"refs/remotes/{remote}/")))
     return found

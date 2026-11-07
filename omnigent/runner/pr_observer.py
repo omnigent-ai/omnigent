@@ -582,11 +582,14 @@ def _record_resolved_prs(
 ) -> None:
     try:
         references = [ref for ref in resolve(result) if ref.provider == provider_id]
+        # Identical calls (same command, output and cwd) can push different branches;
+        # keying on what they found keeps the second from being dropped as a replay.
+        found = ",".join(sorted(ref.url for ref in references))
         SessionPrRegistry(session_id).record(
             references,
             relationship="created" if created else "worked_on",
             source=source,
-            observation_id=observation_id,
+            observation_id=f"{observation_id}:{found}",
         )
         pr_reports.notify(session_id)
     except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution

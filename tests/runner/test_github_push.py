@@ -440,6 +440,55 @@ def test_runner_shell_checks_the_directory_it_reports_running_in(
     assert [entry.url for entry in SessionPrRegistry("conv_shell").list()] == [PR_URL]
 
 
+def test_reflog_reports_distinct_pushes_to_one_branch_in_the_same_second(
+    checkout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, work = checkout
+    other = work.parent / "other"
+    _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "other", cwd=other)
+    # Git stamps reflog entries with the committer date, so both land in one second.
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(push_reflog.time.time())} +0000")
+    _git("push", "-q", "origin", "HEAD:feature/shared", cwd=work)
+    assert push_reflog.recent_pushes([str(work)]) == [(str(remote), "feature/shared")]
+    _git("push", "-q", "--force", "origin", "HEAD:feature/shared", cwd=other)
+    assert push_reflog.recent_pushes([str(other)]) == [(str(remote), "feature/shared")]
+    assert push_reflog.recent_pushes([str(other)]) == []
+
+
+def test_identical_runner_shell_calls_record_each_pushed_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "git@github.com:contributor/project.git"
+    pushes = iter([[(url, "feature/a")], [(url, "feature/b")]])
+    monkeypatch.setattr(github_push, "recent_pushes", lambda _directories: next(pushes))
+    urls = {
+        branch: f"https://github.com/contributor/project/pull/{number}"
+        for branch, number in (("feature/a", 1), ("feature/b", 2))
+    }
+
+    def gh(argv: list[str], **_: object) -> tuple[int, str, str]:
+        branch = argv[-1].split("/commits/")[1].split("/pulls")[0].replace("%2F", "/")
+        head = {"ref": branch, "repo": {"full_name": "contributor/project"}}
+        return 0, json.dumps([{"state": "open", "head": head, "html_url": urls[branch]}]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    result = json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"})
+    for _ in range(2):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+            observe_tool_completion(
+                "conv_quiet",
+                tool_name="sys_os_shell",
+                arguments={"command": "./push.sh"},
+                result=result,
+                source="runner_shell",
+            )
+    entries = SessionPrRegistry("conv_quiet").list()
+    assert sorted(entry.url for entry in entries) == sorted(urls.values())
+
+
 def test_reflog_read_does_not_run_a_configured_signature_verifier(
     checkout: tuple[Path, Path], tmp_path: Path
 ) -> None:
