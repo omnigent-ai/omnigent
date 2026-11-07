@@ -1,15 +1,23 @@
 """Input correlation stays isolated and cannot expose message content."""
 
 import asyncio
+import copy
 import logging
 
 import pytest
 
+from omnigent.native import input_receipt
 from omnigent.native.input_diagnostics import (
     current_input_attributes,
     input_attributes,
     input_delivery_scope,
     log_input_event,
+)
+from omnigent.native.input_receipt import (
+    build_native_input_receipt,
+    current_native_input_receipt,
+    native_input_receipt_scope,
+    validate_native_input_receipt,
 )
 
 
@@ -97,3 +105,80 @@ def test_diagnostic_emit_filters_extra_content_and_malformed_fields(
         "reason_code": "completed_without_native_record",
         "rpc_error_code": -32600,
     }
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "version",
+        "boolean_version",
+        "extra",
+        "attempt",
+        "pending",
+        "block",
+        "nan",
+        "surrogate",
+        "size",
+    ],
+)
+def test_receipt_rejects_partial_or_unknown_contract(
+    fault: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    value = build_native_input_receipt(
+        [{"type": "input_text", "text": "original\r\n"}],
+        {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32},
+    )
+    assert value is not None
+    if fault == "version":
+        value["version"] = 2
+    elif fault == "boolean_version":
+        value["version"] = True
+    elif fault == "extra":
+        value["unrecognized"] = True
+    elif fault == "attempt":
+        value["identity"].pop("delivery_attempt_id")
+    elif fault == "pending":
+        value["identity"].pop("pending_id")
+    elif fault == "size":
+        monkeypatch.setattr(input_receipt, "MAX_SESSION_EVENT_REQUEST_BYTES", 32)
+    elif fault == "block":
+        value["content"] = ["flattened"]
+    else:
+        value["content"][0]["text"] = float("nan") if fault == "nan" else "\ud800"
+    assert validate_native_input_receipt(value) is None
+
+
+@pytest.mark.asyncio
+async def test_receipts_copy_original_blocks_and_isolate_concurrent_workers() -> None:
+    async def observe(letter: str) -> dict:
+        original = [
+            {"type": "input_text", "text": letter + "\r\n"},
+            {"type": "input_file", "file_id": "file_original"},
+        ]
+        receipt = build_native_input_receipt(
+            original,
+            {
+                "pending_id": "pending_" + letter * 32,
+                "delivery_attempt_id": letter * 32,
+            },
+        )
+        assert receipt is not None
+        expected = copy.deepcopy(receipt)
+        with native_input_receipt_scope(receipt):
+            original[0]["text"] = "changed"
+            receipt["content"].clear()
+            observed = await asyncio.to_thread(current_native_input_receipt)
+            assert observed == expected
+            observed["content"].clear()
+            assert current_native_input_receipt() == expected
+            assert current_input_attributes() == {}
+            with pytest.raises(RuntimeError, match="nested failure"):
+                with native_input_receipt_scope(None):
+                    assert current_native_input_receipt() is None
+                    raise RuntimeError("nested failure")
+            assert current_native_input_receipt() == expected
+        return expected
+
+    first, second = await asyncio.gather(observe("a"), observe("b"))
+    assert first != second
+    assert current_native_input_receipt() is None

@@ -578,21 +578,65 @@ def test_peek_side_chat_requests_discards_corrupt_payloads(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("question_size", [0, 1_100_000], ids=["ordinary", "oversized"])
+@pytest.mark.parametrize("input_form", ["string", "text-block"])
 async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    question_size: int,
+    input_form: str,
 ) -> None:
     """The drain loop must fork on the connection it was handed.
 
     A fork made on the executor's client streams its answer into a connection
     that closes immediately, which is why this runs on the forwarder's client.
     """
+    from omnigent.inner import codex_native_executor, native_attachments
+    from omnigent.inner.executor import TurnComplete
+    from omnigent.native.input_diagnostics import input_delivery_scope
+
     client = _FakeCodexClient(
         {
             "thread/fork": {"result": {"thread": {"id": "thread_side"}}},
             "turn/start": {"result": {"turn": {"id": "turn_1"}}},
         }
     )
-    side_chat.request_side_chat(tmp_path, "what does this repo do?")
+    question = "  - First\n  - Second" + "q" * question_size
+    command = "/side " + question
+    content = command if input_form == "string" else [{"type": "input_text", "text": command}]
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_parent",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+        ),
+    )
+    executor_client = AsyncMock(spec=codex_app_server.CodexAppServerClient)
+    executor_client.supports_user_message_ids = True
+    executor_client.request.return_value = {"result": {"turn": {"id": "unexpected_parent_turn"}}}
+    monkeypatch.setattr(
+        codex_native_executor,
+        "_connect_to_app_server",
+        AsyncMock(return_value=executor_client),
+    )
+    monkeypatch.setattr(native_attachments, "data_dir", lambda: tmp_path / "data")
+    with input_delivery_scope(
+        {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    ):
+        events = [
+            event
+            async for event in codex_native_executor.CodexNativeExecutor(
+                bridge_dir=tmp_path
+            ).run_turn([{"role": "user", "content": content}], [], "")
+        ]
+    assert [type(event) for event in events] == [TurnComplete]
+    executor_client.request.assert_not_awaited()
+    assert [request.question for request in side_chat.peek_side_chat_requests(tmp_path)] == [
+        question
+    ]
+    assert not native_attachments.attachment_cache_dir(tmp_path).exists()
 
     async def _stop(_seconds: float) -> None:
         raise asyncio.CancelledError
@@ -610,6 +654,7 @@ async def test_drive_side_chat_requests_forks_on_the_forwarder_client(
     assert client.calls[0][1]["threadId"] == "thread_parent"
     assert client.calls[0][1]["ephemeral"] is True
     assert client.calls[1][1]["threadId"] == "thread_side"  # first turn on the fork
+    assert client.calls[1][1]["input"] == [{"type": "text", "text": question}]
     assert side_chat.peek_side_chat_requests(tmp_path) == []  # request consumed after forking
 
 

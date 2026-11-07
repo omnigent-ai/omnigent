@@ -108,13 +108,34 @@ def test_stable_id_reuse_by_the_same_author_is_a_retry_only_when_the_body_matche
     assert _stable_id_reuse_is_exact_retry(_persisted(created_by=None), _resend(created_by=None))
 
 
-def test_stable_id_reuse_by_another_author_is_refused() -> None:
+@pytest.mark.parametrize(
+    "saved_author,retry_author",
+    [("user_a", "user_b"), ("user_a", None), ("local", "user_a"), ("user_a", "local")],
+)
+def test_stable_id_reuse_by_another_author_is_refused(
+    saved_author: str | None, retry_author: str | None
+) -> None:
     """A visible item id must never let someone else's prompt run under that item."""
     with pytest.raises(OmnigentError) as excinfo:
         _stable_id_reuse_is_exact_retry(
-            _persisted(created_by="user_a"), _resend(created_by="user_b")
+            _persisted(created_by=saved_author), _resend(created_by=retry_author)
         )
     assert excinfo.value.code == ErrorCode.CONFLICT
+
+
+@pytest.mark.parametrize("saved_author,retry_author", [("local", None), (None, "local")])
+def test_single_user_startup_retry_keeps_authorization_identity(
+    saved_author: str | None, retry_author: str | None
+) -> None:
+    saved = _persisted(created_by=saved_author)
+    retry = _resend(created_by=retry_author)
+
+    assert _stable_id_reuse_is_exact_retry(saved, retry)
+    assert not _stable_id_reuse_is_exact_retry(
+        saved, _resend(f"{_TEXT}, but edited", created_by=retry_author)
+    )
+    assert saved.created_by == saved_author
+    assert retry.created_by == retry_author
 
 
 def _stub_runner(

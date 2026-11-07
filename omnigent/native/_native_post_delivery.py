@@ -400,7 +400,7 @@ def _dead_letter_record_replayable(
         payload = record.get("payload")
         source_id = payload.get("source_id") if isinstance(payload, dict) else None
         if not (
-            event_type == "external_conversation_item"
+            event_type in {"external_conversation_item", "external_native_input_receipt"}
             and isinstance(source_id, str)
             and bool(source_id.strip())
         ):
