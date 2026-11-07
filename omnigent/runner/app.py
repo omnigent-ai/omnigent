@@ -1585,13 +1585,14 @@ def create_runner_app(
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
         :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
-        :returns: ``True`` when a permission hook is parked or the pane shows recent
-            input or output.
+        :returns: ``True`` for a parked permission hook, live child work, or recent
+            pane input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.native._native_forwarder_health import has_active_subagents
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
-        if approval_wait_is_fresh(session_id):
+        if approval_wait_is_fresh(session_id) or has_active_subagents(session_id):
             return True
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
@@ -8713,6 +8714,10 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            from omnigent.native._native_forwarder_health import has_active_subagents
+
+            if has_active_subagents(conv_id):
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a
