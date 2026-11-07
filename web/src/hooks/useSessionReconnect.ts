@@ -233,9 +233,11 @@ export function useSessionReconnect({
       if (start && inFlight.current === start.operation) inFlight.current = null;
       wakeStart.current = null;
       setSandboxWake(null);
+      // A request whose answer never comes mustn't capture the next Reconnect host.
+      if (sessionId) sandboxWakeRequests.delete(sessionId);
     }, SANDBOX_WAKE_STAGE_LIMIT_MS);
     return () => clearTimeout(timer);
-  }, [wakeRunning, launchInProgress]);
+  }, [wakeRunning, launchInProgress, sessionId]);
 
   // A failed or waiting stage left over from before the click mustn't end the
   // wake; one reported since then does, even if it repeats the old one.

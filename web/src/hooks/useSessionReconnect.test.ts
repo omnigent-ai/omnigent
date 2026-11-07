@@ -658,6 +658,31 @@ describe("useSessionReconnect", () => {
     );
   });
 
+  it("sends a fresh wake after the stage limit even if the old answer never arrives", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(retrySession).mockReturnValueOnce(deferred<PostEventResponse>().promise);
+      useChatStore.setState({ conversationId: "session", sandboxStatus: null });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      await act(async () => {
+        void result.current.reconnect();
+      });
+      act(() => useChatStore.setState({ sandboxStatus: { stage: "provisioning" } }));
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS));
+      expect(result.current.sandboxStarting).toBe(false);
+
+      vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+      await act(async () => {
+        await result.current.reconnect();
+      });
+      expect(retrySession).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     ["after the server answers", true],
     ["while the server hasn't answered", false],
