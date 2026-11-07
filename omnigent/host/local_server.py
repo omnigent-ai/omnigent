@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -736,19 +737,42 @@ def _await_doomed_child_exit(proc: subprocess.Popen[bytes]) -> None:
 def _foreign_port_owner(port: int, own_pid: int) -> int | None:
     """Return the pid of a foreign process listening on *port*, if any.
 
-    Best-effort via ``lsof`` (:func:`_pid_listening_on_port`): when ``lsof``
+    Confirm our child's IPv4 endpoint if a port-wide lookup names another
+    listener. Best-effort via ``lsof``: when ``lsof``
     is missing or reports nothing, ownership cannot be disproven and the
     caller proceeds, matching the pre-existing degraded behavior of
     :func:`stop_untracked_local_server`.
 
     :param port: Loopback TCP port the child was asked to bind, e.g. ``6767``.
     :param own_pid: Our spawned child's pid.
-    :returns: The listening pid when it is NOT *own_pid*, else ``None``.
+    :returns: A foreign pid without evidence of our child's endpoint, else ``None``.
     """
     owner = _pid_listening_on_port(port)
     if owner is None or owner == own_pid:
         return None
+    # A port-wide lookup can name an IPv6 or another loopback listener first.
+    if _process_owns_loopback_listener(own_pid, port):
+        return None
     return owner
+
+
+def _process_owns_loopback_listener(pid: int, port: int) -> bool:
+    """Confirm the spawned child's exact IPv4 loopback listening endpoint."""
+    try:
+        process = psutil.Process(pid)
+        connections = getattr(process, "net_connections", None)
+        if connections is None:
+            connections = process.connections
+        return any(
+            connection.status == psutil.CONN_LISTEN
+            and connection.family == socket.AF_INET
+            and connection.laddr
+            and connection.laddr.ip == "127.0.0.1"
+            and connection.laddr.port == port
+            for connection in connections(kind="tcp")
+        )
+    except (psutil.Error, OSError, AttributeError):
+        return False
 
 
 def _spawn_local_server(port: int, base_path: str) -> _SpawnedLocalServer:
