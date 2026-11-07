@@ -6,6 +6,7 @@ import json
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -314,6 +315,12 @@ def test_get_models_preserves_context_and_cache_pricing_metadata() -> None:
         ("SYSTEM.AI.KIMI-K3", "databricks", "databricks-kimi-k3"),
         ("system.ai.kimi-k2.7-code", "moonshot", "kimi-k2.7-code"),
         ("kimi-k3-databricks", "moonshot", "kimi-k3"),
+        ("claude-opus-4-8[1m]", "anthropic", "claude-opus-4-8"),
+        ("CLAUDE-OPUS-4-8[1M]", "anthropic", "claude-opus-4-8"),
+        ("anthropic/claude-opus-4-8[1m]", "anthropic", "claude-opus-4-8"),
+        ("databricks-claude-opus-4-8[1m]", "anthropic", "claude-opus-4-8"),
+        ("us.anthropic.claude-opus-4-8-v1:0[1m]", "anthropic", "claude-opus-4-8"),
+        ("claude-opus-4-8-20990101", "anthropic", "claude-opus-4-8"),
     ],
 )
 def test_find_catalog_models_resolves_provider_and_vendor_namespaces(
@@ -353,6 +360,70 @@ def test_kimi_native_forwarder_ids_price_and_size_from_the_catalog() -> None:
     assert find_model_context_window("kimi-k3-databricks") == 262_144
 
     assert fetch_model_pricing("system.ai.no-such-model") is None
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "claude-opus-4-9",
+        "claude-opus-4-20990101",
+        "claude-opus-4-9[1m]",
+    ],
+)
+def test_find_catalog_models_family_fallback_does_not_cross_versions(model_id: str) -> None:
+    """An unlisted version never borrows a different version's catalog row."""
+    assert find_catalog_models(model_id) == []
+
+
+def test_fetch_model_pricing_prices_1m_marker_as_base_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Claude ``[1m]`` id prices like its base model, not a sibling version."""
+    from omnigent.llms.context_window import fetch_model_pricing
+
+    def _priced(input_price: float, output_price: float) -> dict[str, Any]:
+        return {
+            "mode": "chat",
+            "pricing": {
+                "input_per_million_tokens": input_price,
+                "output_per_million_tokens": output_price,
+            },
+        }
+
+    monkeypatch.setitem(
+        _FAKE_CATALOG,
+        "anthropic",
+        {
+            "schema_version": "1.0",
+            "models": {
+                "claude-sonnet-4-5": _priced(3.0, 15.0),
+                "claude-sonnet-4-6": _priced(4.0, 20.0),
+            },
+        },
+    )
+
+    base = fetch_model_pricing("claude-sonnet-4-5")
+    assert base is not None
+    assert base.input_per_token == pytest.approx(3e-6)
+    assert fetch_model_pricing("claude-sonnet-4-5[1m]") == base
+    assert fetch_model_pricing("anthropic/claude-sonnet-4-5[1M]") == base
+    assert fetch_model_pricing("us.anthropic.claude-sonnet-4-5-v1:0[1m]") == base
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    [
+        ("claude-sonnet-4-5[1m]", ("claude-sonnet-4-5", True)),
+        (" Claude-Sonnet-4-5[1M] ", ("Claude-Sonnet-4-5", True)),
+        ("us.anthropic.claude-sonnet-4-5-v1:0[1m]", ("us.anthropic.claude-sonnet-4-5-v1:0", True)),
+        ("claude-sonnet-4-5", ("claude-sonnet-4-5", False)),
+        ("gpt-5.4[1m]", ("gpt-5.4[1m]", False)),
+        ("claude-gateway/my-model[1m]", ("claude-gateway/my-model[1m]", False)),
+    ],
+)
+def test_split_anthropic_1m_context_marker(model_id: str, expected: tuple[str, bool]) -> None:
+    """Only a trailing marker on a Claude model name is stripped."""
+    assert _providers_mod.split_anthropic_1m_context_marker(model_id) == expected
 
 
 def test_find_catalog_models_matches_vendor_namespaced_families() -> None:

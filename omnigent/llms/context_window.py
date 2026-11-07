@@ -14,11 +14,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, cast
 
-from omnigent.onboarding.providers import ModelInfo, find_catalog_models
+from omnigent.onboarding.providers import (
+    ModelInfo,
+    find_catalog_models,
+    split_anthropic_1m_context_marker,
+)
 
 _DEFAULT_CONTEXT_WINDOW: int = 128_000
 
-_ANTHROPIC_1M_BETA_SUFFIX = "[1m]"
 _ANTHROPIC_1M_BETA_WINDOW = 1_000_000
 
 
@@ -28,8 +31,8 @@ class _LiteLLM(Protocol):
 
 def _encoded_context_window(model: str) -> int | None:
     """Read a context size explicitly encoded in a provider model id."""
-    bare = model.rsplit("/", 1)[-1].split(":", 1)[0].strip().lower()
-    if "claude" in bare and bare.endswith(_ANTHROPIC_1M_BETA_SUFFIX):
+    _, has_marker = split_anthropic_1m_context_marker(model)
+    if has_marker:
         return _ANTHROPIC_1M_BETA_WINDOW
     return None
 
@@ -211,7 +214,9 @@ def fetch_model_pricing(model: str) -> ModelPricing | None:
     Returns prices per token (not per million), including cache-read /
     cache-write rates when the catalog publishes them. Uses the same
     shared catalog lookup as :func:`get_model_context_window`, including the
-    same unambiguous family-prefix fallback for newly released variants.
+    same unambiguous family-prefix fallback for newly released variants. A
+    Claude ``[1m]`` id prices as its base model; the catalog publishes no
+    long-context premium, so none is applied.
 
     :param model: Model identifier, e.g. ``"anthropic/claude-sonnet-4-6"``
         or ``"databricks-gpt-5-5"``.

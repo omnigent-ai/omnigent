@@ -633,9 +633,57 @@ _FIREWORKS_MODEL_PREFIX = "accounts/fireworks/"
 _FIREWORKS_PROVIDER_ALIAS = "fireworks"
 
 
+ANTHROPIC_1M_CONTEXT_MARKER = "[1m]"
+
+# A short numeric hyphen segment ("4", "5", "2.5") names a model version; a
+# date stamp ("20250929") or a word ("preview") names a variant of one.
+_VERSION_SEGMENT_PATTERN = re.compile(r"^\d{1,2}(?:\.\d+)*$")
+
+
+def split_anthropic_1m_context_marker(model: str) -> tuple[str, bool]:
+    """Strip Claude Code's trailing ``[1m]`` long-context marker from a Claude id.
+
+    The marker selects the 1M-context beta of the same model, e.g.
+    ``"claude-sonnet-4-5[1m]"`` → ``("claude-sonnet-4-5", True)``. Non-Claude ids
+    are returned unchanged, e.g. ``"gpt-5.4[1m]"`` → ``("gpt-5.4[1m]", False)``.
+
+    :param model: Model id as reported by a harness or gateway.
+    :returns: The id without the marker, and whether the marker was present.
+    """
+    stripped = model.strip()
+    if not stripped.lower().endswith(ANTHROPIC_1M_CONTEXT_MARKER):
+        return stripped, False
+    base = stripped[: -len(ANTHROPIC_1M_CONTEXT_MARKER)].rstrip()
+    bare_name = base.rsplit("/", 1)[-1].split(":", 1)[0].lower()
+    if "claude" not in bare_name:
+        return stripped, False
+    return base, True
+
+
+def _is_version_segment(segment: str) -> bool:
+    """Whether a hyphen-separated id segment names a model version."""
+    return _VERSION_SEGMENT_PATTERN.match(segment) is not None
+
+
+def _is_same_version_family_member(candidate_name: str, family_prefix: str) -> bool:
+    """Whether *candidate_name* extends *family_prefix* without a different version.
+
+    ``claude-sonnet-4`` covers ``claude-sonnet-4-20250514`` but not
+    ``claude-sonnet-4-5``, which is a different model with its own price.
+    """
+    if not candidate_name.startswith(family_prefix):
+        return False
+    remainder = candidate_name[len(family_prefix) :]
+    if not remainder.startswith("-"):
+        return True
+    next_segment = remainder[1:].split("-", 1)[0]
+    return not _is_version_segment(next_segment)
+
+
 def _catalog_lookup_targets(model: str) -> list[tuple[str, str]]:
     """Return bounded provider/id pairs for a model catalog lookup."""
-    normalized = model.split(":", 1)[0].strip()
+    unmarked, _ = split_anthropic_1m_context_marker(model)
+    normalized = unmarked.split(":", 1)[0].strip()
     known_providers = set(get_all_providers())
     targets: list[tuple[str, str]] = []
 
@@ -696,7 +744,10 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
     query OpenRouter, while bare ids use stable family-to-provider routing with
     OpenRouter as a bounded fallback. Exact matches win; otherwise all entries
     sharing the id without its final hyphen segment are returned so callers can
-    accept a field only when every candidate reports the same value.
+    accept a field only when every candidate reports the same value. The family
+    fallback never crosses a version segment: ``claude-opus-4-9`` does not fall
+    back to ``claude-opus-4-*``, and ``claude-sonnet-4-<date>`` does not match
+    ``claude-sonnet-4-5``. A trailing Claude ``[1m]`` marker is ignored.
 
     :param model: Provider-local, provider-qualified, or vendor-namespaced id.
     :returns: One exact match, compatible family-prefix matches, or an empty list.
@@ -713,14 +764,17 @@ def find_catalog_models(model: str) -> list[ModelInfo]:
                 return [candidate]
         if "-" not in lookup_id:
             continue
-        prefixes = {lookup_lower.rsplit("-", 1)[0]}
+        family_prefix, dropped_segment = lookup_lower.rsplit("-", 1)
+        if _is_version_segment(dropped_segment):
+            continue
+        prefixes = {family_prefix}
         if provider == "openrouter":
             prefixes.add(lookup_lower.rsplit("/", 1)[-1].rsplit("-", 1)[0])
         family_matches.extend(
             candidate
             for candidate in models
             if any(
-                candidate_name.startswith(prefix)
+                _is_same_version_family_member(candidate_name, prefix)
                 for prefix in prefixes
                 for candidate_name in (
                     candidate.name.lower(),
