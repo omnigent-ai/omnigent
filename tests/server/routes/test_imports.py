@@ -7,6 +7,7 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -332,13 +333,16 @@ async def test_concurrent_identical_imports_return_one_session(
     assert imported is not None
 
 
+@pytest.mark.parametrize("replacement", ["unbound", "managed", "native", "interrupted"])
 async def test_force_import_replaces_existing_session(
     client: httpx.AsyncClient,
     db_uri: str,
+    replacement: str,
+    monkeypatch,
 ) -> None:
     """A forced retry replaces the transcript while retaining its stable id."""
     _seed_claude_agent(db_uri)
-    payload = {
+    payload: dict[str, Any] = {
         "source": "claude",
         "external_session_id": "claude-force-1",
         "workspace": "/repo/old",
@@ -353,7 +357,45 @@ async def test_force_import_replaces_existing_session(
             }
         ],
     }
+    host_id = "0123456789abcdef0123456789abcdef"
+    hosts = HostStore(db_uri)
+    managed_host = replacement != "unbound"
+    if managed_host:
+        from omnigent.db.utils import now_epoch
+
+        hosts.register_managed_host(
+            host_id=host_id,
+            name="import-sandbox",
+            user_id="local",
+            token="import-token",
+            provider="modal",
+            sandbox_id="import-sandbox",
+            token_expires_at=now_epoch() + 3600,
+        )
+        payload["host_id"] = host_id
     created = await client.post("/v1/imports", json=payload)
+    assert created.status_code == 201, created.text
+    store = SqlAlchemyConversationStore(db_uri)
+    original_id = created.json()["session_id"]
+    native_id = None
+    if replacement == "native":
+        native = store.fork_conversation(original_id, continue_source=True)
+        native_id = native.id
+        store.set_external_session_id(native.id, payload["external_session_id"])
+        await store.delete_conversation(original_id)
+    elif replacement == "interrupted":
+        await store.delete_conversation(original_id, preserve_host_binding=host_id)
+
+    original_delete = SqlAlchemyConversationStore.delete_conversation
+
+    async def observe_replacement(self, session_id, **kwargs):
+        deleted = await original_delete(self, session_id, **kwargs)
+        if kwargs.get("preserve_host_binding") is not None:
+            assert hosts.delete_host(host_id, keep_if_bound=True) is None
+            assert hosts.resolve_launch_token(host_id, "import-token") is not None
+        return deleted
+
+    monkeypatch.setattr(SqlAlchemyConversationStore, "delete_conversation", observe_replacement)
     payload["force"] = True
     payload["workspace"] = "/repo/new"
     payload["items"] = [
@@ -372,12 +414,17 @@ async def test_force_import_replaces_existing_session(
     assert created.status_code == 201
     assert replaced.status_code == 201
     assert replaced.json()["session_id"] == created.json()["session_id"]
+    if native_id is not None:
+        assert store.get_conversation(native_id) is None
     conversation = SqlAlchemyConversationStore(db_uri).get_conversation(
         replaced.json()["session_id"]
     )
     assert conversation is not None
     assert conversation.workspace == "/repo/new"
     assert conversation.title == "new prompt"
+    if managed_host:
+        assert conversation.host_id == host_id
+        assert hosts.resolve_launch_token(host_id, "import-token") is not None
     items = await client.get(f"/v1/sessions/{conversation.id}/items")
     assert items.status_code == 200
     assert [item["content"][0]["text"] for item in items.json()["data"]] == ["new prompt"]

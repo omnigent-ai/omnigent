@@ -26,6 +26,8 @@ export function useIsAdmin(): boolean {
     // Seed from the already-resolved cache so first paint is correct when
     // identity resolved during boot (the common case).
     initialData: getCurrentIsAdmin,
+    // A false seed may mean the startup identity probe is still pending.
+    initialDataUpdatedAt: 0,
   });
   return data;
 }
