@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { copyText } from "@/lib/clipboard";
 import { getSessionSignInLink } from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
@@ -8,7 +9,10 @@ import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { ErrorBanner, RoutingDecisionCard } from "./StatusBlocks";
 
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn(() => Promise.resolve()) }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSignInLink: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSignInLink: vi.fn(),
+}));
 
 afterEach(cleanup);
 
