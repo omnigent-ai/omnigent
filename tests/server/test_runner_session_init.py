@@ -231,6 +231,35 @@ async def test_session_init_readiness_is_explicit_and_backward_compatible(
     assert ready is expected_ready
 
 
+@pytest.mark.asyncio
+async def test_rejected_session_init_is_refused_only_when_requested() -> None:
+    """Default callers stay best-effort on a rejected handshake; opted-in callers refuse."""
+    from omnigent.server.routes import sessions as sessions_routes
+
+    class _Initializer:
+        async def initialize(self, *_args: Any, **_kwargs: Any) -> httpx.Response:
+            return httpx.Response(
+                503,
+                json={"error": "spec_resolver_failed", "detail": "Could not load the agent spec."},
+                request=httpx.Request("POST", "http://runner/v1/sessions"),
+            )
+
+    async def ensure(**options: bool) -> bool:
+        return await sessions_routes._ensure_runner_session_initialized(
+            "conv_init",
+            _conversation(),
+            object(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            initializer=_Initializer(),  # type: ignore[arg-type]
+            **options,
+        )
+
+    assert await ensure() is False
+    with pytest.raises(OmnigentError, match="spec_resolver_failed") as refused:
+        await ensure(refuse_rejection=True)
+    assert refused.value.code == ErrorCode.RUNNER_UNAVAILABLE
+
+
 def test_reconnect_init_envelope_carries_fork_history_directives(db_uri: str) -> None:
     """A forked native session's fork directives survive to the runner envelope.
 
