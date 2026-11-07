@@ -3408,6 +3408,7 @@ async def test_message_is_refused_when_the_runner_rejects_deferred_session_setup
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A native session whose runner rejects setup refuses the message; the next send retries."""
+    from omnigent.runtime import pending_inputs
     from omnigent.server.routes import sessions as sessions_module
 
     comm = await _connect_host(app)
@@ -3459,21 +3460,19 @@ async def test_message_is_refused_when_the_runner_rejects_deferred_session_setup
             ),
         }
         assert runner_paths == ["/v1/sessions"]
+        assert pending_inputs.snapshot_for(session_id) == []
 
         retried = await _send("hi")
         assert retried.status_code < 300, retried.text
+        [queued] = pending_inputs.snapshot_for(session_id)
+        assert queued["pending_id"] == retried.json()["pending_id"]
+        assert queued["content"] == [{"type": "input_text", "text": "hi"}]
     finally:
         await fake_runner.aclose()
+        for pending in pending_inputs.snapshot_for(session_id):
+            pending_inputs.resolve(session_id, pending["pending_id"])
 
     assert runner_paths == ["/v1/sessions", "/v1/sessions", f"/v1/sessions/{session_id}/events"]
-    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
-    texts = [
-        part.get("text")
-        for item in items
-        if item["type"] == "message"
-        for part in item.get("content", [])
-    ]
-    assert "what are the updates?" not in texts
 
 
 async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
