@@ -40,8 +40,9 @@ MCP independent creation.
   unavailable source project is rejected before creation. A standalone session
   is filed in its creator's project, if that project still exists. A
   `project_name` argument files a standalone session in the owner's project
-  with that name instead, created if missing. Project defaults do not override
-  the worker's agent or placement.
+  with that name instead, created if missing. With `sibling_sessions` enabled,
+  the tool refuses `project_name` before it finds or creates a project. Project
+  defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
   any available host. The server enforces the same choice for the composer,
