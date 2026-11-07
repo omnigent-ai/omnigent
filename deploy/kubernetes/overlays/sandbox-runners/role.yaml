@@ -50,11 +50,12 @@ rules:
     resources: ["pods/log"]
     verbs: ["get"]
   # The per-launch token rides a per-Job Secret (referenced by the Pod's
-  # `secretKeyRef`).  The launcher creates that Secret before the Job and
-  # deletes it alongside the Job at terminate.
+  # `secretKeyRef`).  The launcher creates that Secret before the Job,
+  # patches the Job (or Sandbox) on as its owner so Kubernetes collects it
+  # with the workload, and deletes it alongside the Job at terminate.
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["create", "delete"]
+    verbs: ["create", "patch", "delete"]
   # Surface scheduler/kubelet events in the provider's error messages.
   - apiGroups: [""]
     resources: ["events"]

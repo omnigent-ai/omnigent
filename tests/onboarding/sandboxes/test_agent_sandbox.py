@@ -128,6 +128,8 @@ class _FakeCustom:
         if self.create_error is not None:
             raise self.create_error
         self.created.append(body)
+        # The apiserver echoes the object back with its server-assigned uid.
+        return {**body, "metadata": {**body["metadata"], "uid": "uid-created"}}
 
     def patch_namespaced_custom_object(
         self, group, version, namespace, plural, name, body, _request_timeout=None
@@ -137,6 +139,7 @@ class _FakeCustom:
         if self.patch_error is not None:
             raise self.patch_error
         self.patches.append((name, body))
+        return {"metadata": {"name": name, "uid": "uid-existing"}, **body}
 
     def delete_namespaced_custom_object(
         self, group, version, namespace, plural, name, _request_timeout=None
@@ -532,10 +535,18 @@ def test_create_workload_creates_a_fresh_sandbox(
     _, custom = fake_clients
     monkeypatch.setenv(WORKSPACE_SIZE_ENV_VAR, "20Gi")
     job = k8s.build_job_manifest(**_MANIFEST_KW)  # type: ignore[arg-type]
-    _launcher()._create_workload("omnigent-sandboxes", job)
+    owner = _launcher()._create_workload("omnigent-sandboxes", job)
 
     assert custom.calls == ["create"]
     assert "volumeClaimTemplates" in custom.created[0]["spec"]
+    # The created Sandbox becomes the token Secret's owner, so deleting the
+    # Sandbox by any path also collects the Secret.
+    assert owner == {
+        "apiVersion": f"{API_GROUP}/{API_VERSION}",
+        "kind": "Sandbox",
+        "name": _SANDBOX_ID,
+        "uid": "uid-created",
+    }
 
 
 def test_create_workload_wakes_an_existing_sandbox_instead_of_failing(
@@ -550,9 +561,12 @@ def test_create_workload_wakes_an_existing_sandbox_instead_of_failing(
     custom.create_error = _FakeApiException(status=409, reason="AlreadyExists")
     monkeypatch.setenv(WORKSPACE_SIZE_ENV_VAR, "20Gi")
     job = k8s.build_job_manifest(**_MANIFEST_KW)  # type: ignore[arg-type]
-    _launcher()._create_workload("omnigent-sandboxes", job)
+    owner = _launcher()._create_workload("omnigent-sandboxes", job)
 
     assert custom.calls == ["create", "patch"]
+    # A wake re-mints the token Secret; the existing Sandbox owns the new one.
+    assert owner is not None and owner["kind"] == "Sandbox"
+    assert (owner["name"], owner["uid"]) == (_SANDBOX_ID, "uid-existing")
     name, body = custom.patches[0]
     assert name == _SANDBOX_ID
     spec = body["spec"]
