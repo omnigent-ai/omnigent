@@ -367,33 +367,33 @@ def write_mcp_config(
 
 
 def build_hooks_config(bridge_dir: Path, *, python_executable: str | None = None) -> _JsonObject:
-    """Build Cursor's ``.cursor/hooks.json`` registering the usage ``stop`` hook.
-
-    cursor-agent fires the ``stop`` hook once per completed turn with a JSON
-    payload (on stdin) carrying that turn's token usage — the only surface where
-    the interactive TUI exposes usage. The hook command runs
-    ``omnigent.harnesses.cursor_native.usage record-usage``, which appends the usage to
-    ``<bridge_dir>/cursor_usage.jsonl`` for the runner's usage forwarder to tail
-    and post as ``external_session_usage`` (lighting up the web Session-cost
-    badge). Bakes the absolute ``--bridge-dir`` so the recorder writes where the
-    forwarder reads, regardless of the hook's working directory.
-    """
+    """Register generation-start and usage/stop recorders for this native session."""
     import shlex
 
     python = python_executable or sys.executable
-    command = " ".join(
-        shlex.quote(part)
-        for part in (
-            python,
-            "-I",
-            "-m",
-            _USAGE_HOOK_MODULE,
-            "record-usage",
-            "--bridge-dir",
-            str(bridge_dir),
+    hooks = {
+        event: [
+            {
+                "command": " ".join(
+                    shlex.quote(part)
+                    for part in (
+                        python,
+                        "-I",
+                        "-m",
+                        _USAGE_HOOK_MODULE,
+                        command,
+                        "--bridge-dir",
+                        str(bridge_dir),
+                    )
+                )
+            }
+        ]
+        for event, command in (
+            ("beforeSubmitPrompt", "record-turn-start"),
+            ("stop", "record-usage"),
         )
-    )
-    return {"version": 1, "hooks": {"stop": [{"command": command}]}}
+    }
+    return {"version": 1, "hooks": hooks}
 
 
 def _load_json_config(path: Path) -> object:
@@ -612,8 +612,8 @@ def _run_tmux(socket_path: str, *args: str) -> None:
         raise RuntimeError(f"tmux command failed (rc={proc.returncode}): {detail}")
 
 
-def _capture_pane(socket_path: str, tmux_target: str) -> str:
-    """Capture the visible pane contents; ``""`` on any failure (treat as not-ready)."""
+def _capture_pane_or_none(socket_path: str, tmux_target: str) -> str | None:
+    """Return captured text, or ``None`` when tmux could not provide a frame."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "capture-pane", "-p", "-t", tmux_target],
@@ -623,8 +623,13 @@ def _capture_pane(socket_path: str, tmux_target: str) -> str:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return ""
-    return proc.stdout if proc.returncode == 0 else ""
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _capture_pane(socket_path: str, tmux_target: str) -> str:
+    """Return an empty frame when capture fails for readiness polling."""
+    return _capture_pane_or_none(socket_path, tmux_target) or ""
 
 
 def _paste_payload_bytes(text: str) -> bytes:
@@ -645,8 +650,8 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+def _session_alive(socket_path: str, tmux_target: str) -> bool | None:
+    """Return tmux liveness, or ``None`` when the probe is inconclusive."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
@@ -656,30 +661,20 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
     return proc.returncode == 0
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:
-    """
-    Return the visible Cursor pane text, or ``None`` if the TUI is not running.
-
-    Reused by the runner-side approval mirror
-    (:mod:`omnigent.harnesses.cursor_native.permissions`) to detect cursor-agent's native
-    tool-approval prompts. ``None`` (no advertised tmux target, or a dead pane)
-    is distinct from ``""`` (a live but empty capture) so the caller can skip
-    polling a TUI that has not started yet or has exited.
-
-    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
-    :returns: The captured pane text, or ``None`` when no live pane exists.
-    """
+    """Return pane text, including empty frames, or ``None`` if capture is unavailable."""
     info = read_tmux_info(bridge_dir)
     if info is None:
         return None
     socket_path, tmux_target = info["socket_path"], info["tmux_target"]
-    if not _session_alive(socket_path, tmux_target):
+    alive = _session_alive(socket_path, tmux_target)
+    if alive is not True:
         return None
-    return _capture_pane(socket_path, tmux_target)
+    return _capture_pane_or_none(socket_path, tmux_target)
 
 
 def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
