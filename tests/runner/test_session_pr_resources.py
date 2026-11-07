@@ -96,7 +96,7 @@ def test_titles_include_unselected_prs_and_are_cached_between_polls(
         B: "Second",
     }
     assert [call[-1] for call in calls] == [
-        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid",
+        github._PR_VIEW_FIELDS + ",headRefOid,baseRefOid,headRepository,headRepositoryOwner",
         "title",
     ]
     registry = SessionPrRegistry("session")
@@ -499,6 +499,149 @@ def test_context_uses_fork_head_and_merge_base(
         github.github_file_diff(
             tracked, "main", "new.py", session_id="session", pr_url=B, head_sha="stale"
         )
+
+
+async def test_changes_route_pins_revision_and_reports_truncation(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, base = "a" * 40, "b" * 40
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if args[-1] == "repos/example/two/pulls/42":
+            pr = {"head": {"sha": head}, "base": {"sha": base}, "changed_files": 3001}
+            return 0, json.dumps(pr), ""
+        assert args[-1] == "repos/example/two/pulls/42/files?per_page=100"
+        page = [{"filename": f"f{index}.py", "status": "added"} for index in range(3000)]
+        return 0, json.dumps([page]), ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head, "base_sha": base},
+        )
+        partial = await client.get(
+            "/v1/sessions/session/resources/github/changes",
+            params={"pr_url": B, "head_sha": head},
+        )
+
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert len(result["data"]) == 3000
+    assert {key: result[key] for key in ("has_more", "total_count", "head_sha", "base_sha")} == {
+        "has_more": True,
+        "total_count": 3001,
+        "head_sha": head,
+        "base_sha": base,
+    }
+    assert result["warning"] == "The provider lists at most 3000 files; 1 files are not shown."
+    assert partial.status_code == 400
+    assert partial.json()["detail"] == "Expected full head and base commit SHAs"
+
+
+@pytest.mark.parametrize("bad_sha", ["", "abc", "A" * 40, "a" * 39, "a" * 41])
+def test_commit_ids_must_be_full_lowercase_shas(
+    tracked: str, monkeypatch: pytest.MonkeyPatch, bad_sha: str
+) -> None:
+    def forbidden_gh(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("A malformed commit id must not reach gh")
+
+    monkeypatch.setattr(github, "_gh", forbidden_gh)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commits(tracked, session_id="session", pr_url=B, head_sha=bad_sha)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        pr_resource.pr_commit_diff(tracked, session_id="session", pr_url=B, commit_sha=bad_sha)
+
+
+async def test_commits_route_pins_head_and_diff_route_reads_one_commit(
+    tracked: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head, commit = "a" * 40, "c" * 40
+    pr = {"head": {"sha": head}, "base": {"sha": "b" * 40}, "commits": 1}
+    listing = [
+        [
+            {
+                "sha": commit,
+                "commit": {
+                    "message": "Fix the thing\n\nDetails",
+                    "author": {"name": "Ada", "date": "2026-11-01T10:00:00Z"},
+                },
+            }
+        ]
+    ]
+    gh_args: list[list[str]] = []
+
+    def gh(args: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        gh_args.append(args)
+        if args[-1] == "repos/example/two/pulls/42":
+            return 0, json.dumps(pr), ""
+        if args[-1] == "repos/example/two/pulls/42/commits?per_page=100":
+            return 0, json.dumps(listing), ""
+        assert args[-1] == f"repos/example/two/commits/{commit}"
+        return 0, "commit-patch", ""
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(
+        runner_workspace=Path(tracked),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        commits = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": head},
+        )
+        unpinned = await client.get(
+            "/v1/sessions/session/resources/github/commits", params={"pr_url": B}
+        )
+        moved = await client.get(
+            "/v1/sessions/session/resources/github/commits",
+            params={"pr_url": B, "head_sha": "d" * 40},
+        )
+        patch = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": commit},
+        )
+        malformed = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "abc"},
+        )
+        foreign = await client.get(
+            "/v1/sessions/session/resources/github/commit-diff",
+            params={"pr_url": B, "commit_sha": "e" * 40},
+        )
+
+    assert commits.status_code == 200, commits.text
+    assert commits.json() == {
+        "object": "list",
+        "has_more": False,
+        "data": [
+            {
+                "object": "session.github.commit",
+                "sha": commit,
+                "title": "Fix the thing",
+                "author": "Ada",
+                "date": "2026-11-01T10:00:00Z",
+            }
+        ],
+    }
+    assert unpinned.status_code == 400
+    assert unpinned.json()["detail"] == "Expected head_sha to be a full commit SHA"
+    assert moved.status_code == 400
+    assert "pull request changed" in moved.json()["detail"]
+    assert patch.status_code == 200, patch.text
+    assert patch.json() == {"object": "session.github.pr_diff", "patch": "commit-patch"}
+    assert any("Accept: application/vnd.github.diff" in args for args in gh_args)
+    assert malformed.status_code == 400
+    assert foreign.status_code == 400
+    assert foreign.json()["detail"] == "That commit is not part of the selected pull request."
 
 
 @pytest.fixture

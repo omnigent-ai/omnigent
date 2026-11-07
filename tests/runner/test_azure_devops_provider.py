@@ -66,6 +66,7 @@ NO_CAPABILITIES = {
     "review_thread_creation": False,
     "details_editing": False,
     "attachment_uploads": False,
+    "commit_history": False,
 }
 # Keys of the panel's end-to-end info fixture, less GitHub's legacy fields.
 INFO_KEYS = {"object", "available", "branch", "base_ref", "repo", "pr"}
@@ -375,6 +376,7 @@ def test_workspace_info_shows_the_branch_pr_without_legacy_fields(
         "head_ref": "feature",
         "head_sha": HEAD,
         "base_sha": BASE,
+        "head_repository_url": ORIGIN,
         "checks": NO_CHECKS,
         "body": "## Summary\n\nAdds CI.",
         "comments": [],
@@ -544,6 +546,32 @@ def test_reference_info_maps_the_pr_status(
     assert (info["branch"], info["base_ref"]) == ("feature", "main")
     assert info["repo"] == {"name_with_owner": "contoso/web/app"}
     assert info["auth"]["authenticated"] is True
+
+
+@pytest.mark.parametrize(
+    ("fork_repository", "expected"),
+    [
+        (
+            {"webUrl": "https://dev.azure.com/forker/web/_git/app"},
+            "https://dev.azure.com/forker/web/_git/app",
+        ),
+        # A fork Azure DevOps no longer describes has no link.
+        ({}, None),
+    ],
+)
+def test_reference_info_links_the_fork_repository(
+    facet: AzureDevOpsPullRequests,
+    tmp_path: Path,
+    ado_transport: RecordingTransport,
+    fork_repository: dict[str, Any],
+    expected: str | None,
+) -> None:
+    fork = {"name": "refs/heads/feature", "repository": fork_repository}
+    serve(ado_transport, pull_request(forkSource=fork))
+
+    info = facet.reference_info(str(tmp_path), reference())
+
+    assert info["pr"]["head_repository_url"] == expected
 
 
 def test_reference_info_when_the_pr_cannot_be_read(

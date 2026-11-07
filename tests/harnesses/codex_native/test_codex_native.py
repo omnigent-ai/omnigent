@@ -38,7 +38,6 @@ from omnigent.spec import load
 
 # The default-stance auto-review override normalize_codex_permission_launch_args
 # adds when no explicit approval/sandbox/reviewer/profile choice is present.
-_AUTO_REVIEW_ARGS = ["-c", 'approvals_reviewer="auto_review"']
 
 
 @pytest.fixture(autouse=True)
@@ -846,6 +845,238 @@ def test_preload_codex_thread_closes_client_on_failure(
     assert fake_client.closed
 
 
+_PROVIDER_MISMATCH = {
+    "code": -32600,
+    "message": "provider mismatch",
+    "data": {
+        "type": "modelProviderMismatch",
+        "modelProvider": "omnigent_databricks",
+        "currentModelProvider": "Databricks",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("error", "has_rollout"),
+    [
+        (_PROVIDER_MISMATCH, False),
+        ({**_PROVIDER_MISMATCH, "data": {"type": "modelProviderMismatch"}}, True),
+        ({**_PROVIDER_MISMATCH, "code": -32603}, True),
+        ({"code": -32600, "message": "no rollout found for thread id thread_test"}, True),
+    ],
+    ids=["no_rollout_path", "no_current_provider", "internal_error", "missing_rollout"],
+)
+def test_preload_codex_thread_surfaces_refusals_it_cannot_restamp(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: dict[str, Any],
+    has_rollout: bool,
+) -> None:
+    """Only a provider mismatch naming Codex's provider restamps a known rollout."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(error)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+
+    with pytest.raises(codex_native_app_server.CodexAppServerResponseError):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout if has_rollout else None,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert fake_client.closed
+
+
+@pytest.mark.parametrize(
+    ("first_record", "replace_fails", "raised"),
+    [
+        (b'{"type":"turn_context","payload":{}}', False, ValueError),
+        (b"not json", False, ValueError),
+        (b'{"type":"session_meta","payload":{"model_provider":"p"}}', True, OSError),
+    ],
+    ids=["not_session_meta", "unparseable_record", "replace_fails"],
+)
+def test_preload_codex_thread_keeps_rollout_when_restamp_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    first_record: bytes,
+    replace_fails: bool,
+    raised: type[Exception],
+) -> None:
+    """A rollout that cannot be restamped stays intact and the resume is not retried."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = first_record + b'\n{"type":"response_item","payload":{}}\n'
+    rollout.write_bytes(original)
+    fake_client = _FakeCodexAppServerClient(
+        error=codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+    )
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    if replace_fails:
+
+        def _fail_replace(*_args: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(codex_native_app_server.os, "replace", _fail_replace)
+
+    with pytest.raises(raised):
+        asyncio.run(
+            codex_native_app_server.preload_codex_thread_for_resume(
+                "ws://127.0.0.1:9876",
+                "thread_test",
+                model_provider="omnigent_databricks",
+                rollout_path=rollout,
+            )
+        )
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert rollout.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [rollout]
+    assert fake_client.closed
+
+
+class _ScriptedResumeClient(_FakeCodexAppServerClient):
+    """Fake client that raises each scripted error once, then answers normally."""
+
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = errors
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        self.error = self.errors.pop(0) if self.errors else None
+        return await super().request(method, params)
+
+
+@pytest.mark.parametrize(
+    ("retain_client", "retry_refused"),
+    [(False, False), (True, False), (True, True)],
+    ids=["closes_client", "retains_client", "second_refusal_surfaces"],
+)
+def test_preload_codex_thread_retries_provider_mismatch_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    retain_client: bool,
+    retry_refused: bool,
+) -> None:
+    """A restamped resume retries once under Codex's provider and keeps client ownership."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    rollout.write_bytes(
+        b'{"type":"session_meta","payload":{"model_provider":"omnigent_databricks"}}\n'
+    )
+    refusals = [
+        codex_native_app_server.CodexAppServerResponseError(_PROVIDER_MISMATCH)
+        for _ in range(2 if retry_refused else 1)
+    ]
+    fake_client = _ScriptedResumeClient(list(refusals))
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider="omnigent_databricks",
+        retain_client=retain_client,
+        rollout_path=rollout,
+    )
+
+    if retry_refused:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusals[1]
+    else:
+        assert asyncio.run(preload) is (fake_client if retain_client else None)
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"] * 2
+    first, retry = (params for _method, params in fake_client.requests)
+    assert retry == {**first, "modelProvider": "Databricks"}
+    assert json.loads(rollout.read_text())["payload"]["model_provider"] == "Databricks"
+    assert fake_client.closed is (retry_refused or not retain_client)
+
+
+_PROVIDER_NOT_CONFIGURED = {
+    "code": -32600,
+    "message": "This chat uses model provider “Databricks”, which is no longer configured.",
+    "data": {"type": "modelProviderNotConfigured", "modelProvider": "Databricks"},
+}
+
+
+class _ConfiguredProviderResumeClient(_ScriptedResumeClient):
+    """Scripted resume client whose ``config/read`` reports *effective_provider*."""
+
+    def __init__(self, errors: list[Exception], effective_provider: str | None) -> None:
+        super().__init__(errors)
+        self.effective_provider = effective_provider
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if method != "config/read":
+            return await super().request(method, params)
+        self.requests.append((method, params))
+        return {"result": {"config": {"model_provider": self.effective_provider}}}
+
+
+@pytest.mark.parametrize(
+    ("launch_provider", "effective_provider", "restamped_to"),
+    [
+        ("omnigent_databricks", None, "omnigent_databricks"),
+        (None, "omnigent_databricks", "omnigent_databricks"),
+        (None, None, None),
+        (None, "Databricks", None),
+    ],
+    ids=["pinned_launch", "config_selected", "no_provider", "same_missing_provider"],
+)
+def test_preload_codex_thread_moves_unconfigured_thread_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launch_provider: str | None,
+    effective_provider: str | None,
+    restamped_to: str | None,
+) -> None:
+    """A thread whose recorded provider is gone resumes under the launch's provider."""
+    rollout = tmp_path / "rollout-thread_test.jsonl"
+    original = b'{"type":"session_meta","payload":{"model_provider":"Databricks"}}\n'
+    rollout.write_bytes(original)
+    refusal = codex_native_app_server.CodexAppServerResponseError(_PROVIDER_NOT_CONFIGURED)
+    fake_client = _ConfiguredProviderResumeClient([refusal], effective_provider)
+    monkeypatch.setattr(
+        codex_native_app_server, "client_for_transport", lambda *_args, **_kwargs: fake_client
+    )
+    preload = codex_native_app_server.preload_codex_thread_for_resume(
+        "ws://127.0.0.1:9876",
+        "thread_test",
+        model_provider=launch_provider,
+        rollout_path=rollout,
+    )
+
+    if restamped_to is None:
+        with pytest.raises(codex_native_app_server.CodexAppServerResponseError) as raised:
+            asyncio.run(preload)
+        assert raised.value is refusal
+        assert rollout.read_bytes() == original
+        assert [method for method, _params in fake_client.requests] == [
+            "thread/resume",
+            "config/read",
+        ]
+    else:
+        assert asyncio.run(preload) is None
+        resumes = [params for method, params in fake_client.requests if method == "thread/resume"]
+        assert len(resumes) == 2
+        assert resumes[1]["modelProvider"] == restamped_to
+        assert json.loads(rollout.read_text())["payload"]["model_provider"] == restamped_to
+    assert fake_client.closed
+
+
 @pytest.mark.parametrize(
     ("exc", "expected"),
     [
@@ -1026,7 +1257,7 @@ def test_codex_resume_permission_params_repairs_legacy_full_access_profile() -> 
 @pytest.mark.parametrize(
     ("permission_args", "expected_permissions"),
     [
-        ((), {"approvalsReviewer": "auto_review"}),
+        ((), {}),
         (
             ("-a", "on-failure", "-s=read-only"),
             {"approvalPolicy": "on-failure", "sandbox": "read-only"},
@@ -1647,7 +1878,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "unix:///tmp/app-server.sock",
-            [*_AUTO_REVIEW_ARGS, "--remote", "unix:///tmp/app-server.sock"],
+            ["--remote", "unix:///tmp/app-server.sock"],
         ),
         # Resume an existing thread over a Unix socket (local reattach).
         (
@@ -1666,7 +1897,7 @@ def test_materialized_codex_agent_spec_loads_as_valid_omnigent_yaml(
             (),
             None,
             "ws://127.0.0.1:9876",
-            [*_AUTO_REVIEW_ARGS, "--remote", "ws://127.0.0.1:9876"],
+            ["--remote", "ws://127.0.0.1:9876"],
         ),
         # Resume an existing thread over a loopback ws endpoint: the
         # host-spawned runner path. The app-server listens on ws:// there
@@ -1733,7 +1964,6 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
-                *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
             ],
@@ -1845,7 +2075,7 @@ def test_build_codex_remote_args_default_keeps_approval_flags_no_bypass() -> Non
     Default (``bypass_sandbox=False``) emits NO bypass flag and preserves the
     approval/sandbox flags the approval-mode presets pass through.
 
-    The web "Full access" / "Read only" presets are sent as
+    The web "Full Access" / "Read Only" presets are sent as
     ``--sandbox`` / ``--ask-for-approval`` pairs inside ``codex_args``. With
     bypass off those must reach the TUI verbatim and the dangerous bypass
     flag must never appear — a regression here would either drop a user's
@@ -2249,10 +2479,15 @@ def test_supervise_forwarder_subscribes_without_replaying_dead_letters(
     asyncio.run(run())
 
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
-    assert ap_requests == []
+    # Only the startup background-work sync reaches the server; no dead letter is replayed.
+    assert [json.loads(request.content)["type"] for request in ap_requests] == [
+        "external_background_work"
+    ]
     assert (tmp_path / "dead_letter.jsonl").exists()
 
 
@@ -2299,7 +2534,9 @@ def test_supervise_forwarder_resumes_when_it_opens_client(
 
     assert fake_client.connected
     assert fake_client.requests == [
-        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("thread/goal/get", {"threadId": "thread_123"}),
+        ("thread/backgroundTerminals/list", {"threadId": "thread_123"}),
     ]
     assert fake_client.closed
 
@@ -6076,9 +6313,10 @@ def test_supervise_forwarder_rotation_clears_unparented_pending_child_threads(
         for event in session_events
         if event.session_id == "conv_new" and event.body["type"] == "external_session_status"
     ] == ["running"]
-    # The cleared session gets only the /clear notice and redirect, never a
-    # stale child-thread event.
+    # The cleared session gets only the startup flag sync, the /clear notice and
+    # redirect, never a stale child-thread event.
     assert [event.body["type"] for event in session_events if event.session_id == "conv_old"] == [
+        "external_background_work",
         "external_session_status",
         "external_conversation_item",
         "external_session_superseded",
@@ -7219,8 +7457,8 @@ def test_forwarder_sends_file_change_to_observer(
             "tool_name": "apply_patch",
             "tool_input": {
                 "changes": [
-                    {"path": "/repo/new.py", "kind": {"type": "add"}},
-                    {"path": "/repo/old.py", "kind": {"type": "delete"}},
+                    {"path": "/repo/new.py", "kind": {"type": "add"}, "diff": "new"},
+                    {"path": "/repo/old.py", "kind": {"type": "delete"}, "diff": "old"},
                 ]
             },
             "tool_response": {"type": "success"},
@@ -12649,9 +12887,9 @@ def test_command_execution_appends_sandbox_bypass_guidance_on_namespace_error() 
     # The raw bwrap output and the exit code are preserved verbatim...
     assert "No permissions to create new namespace" in tool_call.output
     assert "[exit code: 1]" in tool_call.output
-    # ...with actionable recovery guidance appended (the "Full access" preset
+    # ...with actionable recovery guidance appended (the "Full Access" preset
     # and the config sandbox_mode workaround).
-    assert "Full access" in tool_call.output
+    assert "Full Access" in tool_call.output
     assert "danger-full-access" in tool_call.output
 
 
@@ -12662,7 +12900,7 @@ def test_command_execution_leaves_normal_output_untouched() -> None:
     tool_call = codex_native_forwarder._command_execution_tool_call("call_1", item)
     assert tool_call is not None
     assert tool_call.output == "/repo\n"
-    assert "Full access" not in tool_call.output
+    assert "Full Access" not in tool_call.output
     assert "danger-full-access" not in tool_call.output
 
 
