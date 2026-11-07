@@ -165,19 +165,18 @@ class ClaudeNativeExecutor(Executor):
         if self._holding_message:
             # Refused, it follows as the next turn, behind the held message.
             return False
-        text = _content_to_text(content, self._bridge_dir)
-        if not text:
-            return False
-        if is_auth_slash_command(text):
-            # Same dead end as in run_turn(): /login and /logout must
-            # never be typed into the pane. Refusing the live injection
-            # keeps the runner's buffered copy (no injection.consumed is
-            # emitted), so the message re-arrives as the next turn and
-            # run_turn's short-circuit answers it with the `omni setup`
-            # guidance instead of spending a model turn on it.
-            return False
         try:
             async with self._inject_lock:
+                if self._holding_message or await asyncio.to_thread(
+                    _transcript_disk_full, self._bridge_dir
+                ):
+                    return False
+                if not _session_is_active(self._bridge_dir, self._request_session_id):
+                    return False
+                text = _content_to_text(content, self._bridge_dir)
+                if not text or is_auth_slash_command(text):
+                    # Refusal retains the runner's buffered copy for run_turn.
+                    return False
                 await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
@@ -423,9 +422,14 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: host disk is full; holding the message",
                 extra={"session_id": self._request_session_id},
             )
-            yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
-            while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
-                await asyncio.sleep(_HOST_DISK_POLL_S)
+            self._holding_message = True
+            try:
+                yield TextChunk(text=_HOST_DISK_WAIT_MESSAGE)
+                while await asyncio.to_thread(_transcript_disk_full, self._bridge_dir):
+                    await asyncio.sleep(_HOST_DISK_POLL_S)
+            except BaseException:
+                self._holding_message = False
+                raise
         from omnigent.runtime import telemetry
 
         # Span the tmux send-keys inject — the input half of the decoupled
@@ -550,6 +554,8 @@ class ClaudeNativeExecutor(Executor):
             )
             yield ExecutorError(message=describe_exception(exc))
             return
+        finally:
+            self._holding_message = False
         yield TurnComplete(response=None)
 
     async def _inject(self, operation: Callable[[], None]) -> None:

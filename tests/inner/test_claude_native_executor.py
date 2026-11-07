@@ -369,11 +369,8 @@ async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     (tmp_path / claude_bridge._STATE_FILE).write_text(
         json.dumps({"transcript_path": str(transcript)}), encoding="utf-8"
     )
-    monkeypatch.setattr(
-        claude_native_executor,
-        "_transcript_disk_full",
-        Mock(return_value=True),
-    )
+    disk_full = Mock(return_value=True)
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
     injected = Mock()
     monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
     executor = ClaudeNativeExecutor(tmp_path)
@@ -392,6 +389,82 @@ async def test_run_turn_cancels_a_full_disk_hold_without_failing(
     await turn.aclose()
 
     injected.assert_not_called()
+    disk_full.return_value = False
+    assert await executor.enqueue_session_message("session", "after cancellation") is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disk_full, active_after_probe", [(True, True), (False, False)])
+async def test_enqueue_keeps_unadmitted_message_queued_without_preparing_attachments(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    disk_full: bool,
+    active_after_probe: bool,
+) -> None:
+    """Check transcript capacity and post-probe ownership before any attachment write."""
+    monkeypatch.setattr(
+        claude_native_executor, "_transcript_disk_full", Mock(return_value=disk_full)
+    )
+    monkeypatch.setattr(
+        claude_native_executor,
+        "_session_is_active",
+        Mock(side_effect=[True, active_after_probe]),
+    )
+    prepared = Mock(return_value="prepared attachment")
+    monkeypatch.setattr(claude_native_executor, "_content_to_text", prepared)
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+
+    accepted = await executor.enqueue_session_message("session", "keep this message")
+
+    assert accepted is False
+    prepared.assert_not_called()
+    injected.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("queued_before_hold", [False, True])
+async def test_live_message_cannot_overtake_a_disk_held_turn_after_space_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    queued_before_hold: bool,
+) -> None:
+    """Returning capacity does not let a newer message pass the suspended original."""
+    disk_full = Mock(return_value=True)
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
+    injected = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    executor = ClaudeNativeExecutor(tmp_path)
+    live_send: asyncio.Task[bool] | None = None
+    if queued_before_hold:
+        await executor._inject_lock.acquire()
+        live_send = asyncio.create_task(
+            executor.enqueue_session_message("session", "newer message")
+        )
+        await asyncio.sleep(0)
+    turn = executor.run_turn(
+        messages=[{"role": "user", "content": "original message"}],
+        tools=[],
+        system_prompt="ignored",
+    )
+
+    assert isinstance(await turn.__anext__(), TextChunk)
+    disk_full.return_value = False
+    try:
+        injected.assert_not_called()
+        if live_send is None:
+            assert await executor.enqueue_session_message("session", "newer message") is False
+            result = await turn.__anext__()
+        else:
+            original_send = asyncio.create_task(turn.__anext__())
+            executor._inject_lock.release()
+            assert await live_send is False
+            result = await original_send
+        assert result == TurnComplete(response=None)
+        injected.assert_called_once_with(tmp_path, content="original message")
+    finally:
+        await turn.aclose()
 
 
 @pytest.mark.asyncio
