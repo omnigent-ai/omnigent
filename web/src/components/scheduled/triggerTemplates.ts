@@ -37,7 +37,10 @@ export interface TriggerCondition {
 export interface TriggerFields {
   /** One of the source's {@link TriggerTemplate.events}, e.g. GitHub's `"issue"`. */
   event: string;
-  /** Jira: project keys. Slack: channels. GitHub: `owner/repo`. Linear: team keys. Comma-separated. */
+  /**
+   * Jira: project keys. Slack: channels, or people for DMs. GitHub: `owner/repo`.
+   * Linear: team keys. Comma-separated.
+   */
   scope: string;
   /** Omitted by older callers, which infer membership from the number of values. */
   scopeOperator?: "is" | "in";
@@ -65,6 +68,8 @@ export interface TriggerPromptContext {
   model?: string;
   /** The task's reasoning effort override. */
   effort?: string;
+  /** The initial search must cover the wait until the first poll. */
+  pollingIntervalMinutes?: number;
 }
 
 export interface TriggerConditionField {
@@ -85,6 +90,24 @@ export function triggerOperatorLabel(
   return field.operatorLabels?.[operator] ?? TRIGGER_OPERATOR_LABELS[operator];
 }
 
+/** One event a template can fire on, e.g. Slack's "Direct message received". */
+export interface TriggerEvent {
+  id: string;
+  label: string;
+  /** Who can write what the event watches, e.g. "create a ticket in this project". */
+  authorAction: string;
+  /** Overrides the template's scope label, e.g. "sender" for Slack DMs. */
+  scopeLabel?: string;
+  /** Overrides the template's scope placeholder. */
+  scopePlaceholder?: string;
+  /** Shown before the scope input and stripped from pasted entries, e.g. "#". */
+  scopePrefix?: "#" | "@";
+  /** The scope lists every member of one group, so it has no equals/in operator. */
+  scopeIsGroup?: boolean;
+  /** Condition fields that don't apply to this event, e.g. Author when the scope is the sender. */
+  hiddenFields?: string[];
+}
+
 export interface TriggerTemplate {
   source: TriggerSource;
   icon: LucideIcon;
@@ -93,11 +116,8 @@ export interface TriggerTemplate {
   description: string;
   /** Prefilled task name. */
   name: string;
-  /**
-   * The creation events the template can fire on; the first is the default. `authorAction`
-   * names who can write what the event watches, e.g. "create a ticket in this project".
-   */
-  events: { id: string; label: string; authorAction: string }[];
+  /** The creation events the template can fire on; the first is the default. */
+  events: TriggerEvent[];
   /** Scope field, e.g. "project", compared by the selected operator. */
   scopeLabel: string;
   scopePlaceholder: string;
@@ -155,9 +175,34 @@ export const TRIGGER_TEMPLATES: Record<TriggerSource, TriggerTemplate> = {
     iconClassName: "text-purple-600 dark:text-purple-400",
     title: "Slack messages",
     description:
-      "Watch channels for matching messages and start a session to respond or investigate.",
+      "Watch channels or DMs for matching messages and start a session to respond or investigate.",
     name: "Slack messages",
-    events: [{ id: "posted", label: "Message posted", authorAction: "post in this channel" }],
+    events: [
+      {
+        id: "posted",
+        label: "Message posted in a channel",
+        authorAction: "post in this channel",
+        scopePrefix: "#",
+      },
+      {
+        id: "dm",
+        label: "Direct message received",
+        authorAction: "send you a direct message from one of these accounts",
+        scopeLabel: "sender",
+        scopePlaceholder: "alice, bob",
+        scopePrefix: "@",
+        hiddenFields: ["author"],
+      },
+      {
+        id: "group_dm",
+        label: "Group DM message received",
+        authorAction: "post in this group DM",
+        scopeLabel: "group DM with",
+        scopePlaceholder: "alice, bob",
+        scopePrefix: "@",
+        scopeIsGroup: true,
+      },
+    ],
     scopeLabel: "channel",
     scopePlaceholder: "eng-support, bugs",
     fields: [
@@ -279,6 +324,65 @@ export function emptyTriggerFields(source: TriggerSource): TriggerFields {
 
 export const TRIGGER_SOURCES: TriggerSource[] = ["jira", "slack", "github", "linear"];
 
+/** The selected event of a template, or its default when `eventId` is unknown. */
+export function triggerEvent(source: TriggerSource, eventId: string): TriggerEvent {
+  const { events } = TRIGGER_TEMPLATES[source];
+  return events.find((event) => event.id === eventId) ?? events[0];
+}
+
+/** The scope label, placeholder and prefix for the selected event. */
+export function triggerScope(source: TriggerSource, eventId: string) {
+  const template = TRIGGER_TEMPLATES[source];
+  const event = triggerEvent(source, eventId);
+  return {
+    label: event.scopeLabel ?? template.scopeLabel,
+    placeholder: event.scopePlaceholder ?? template.scopePlaceholder,
+    prefix: event.scopePrefix ?? "",
+    isGroup: event.scopeIsGroup === true,
+  };
+}
+
+/** The condition fields the selected event offers. */
+export function triggerConditionFields(
+  source: TriggerSource,
+  eventId: string,
+): TriggerConditionField[] {
+  const hidden = triggerEvent(source, eventId).hiddenFields ?? [];
+  return TRIGGER_TEMPLATES[source].fields.filter((field) => !hidden.includes(field.id));
+}
+
+/** Drops a leading prefix from each entry, e.g. `"#eng, #bugs"` → `"eng, bugs"` for `"#"`. */
+export function stripScopePrefix(scope: string, prefix: string): string {
+  if (prefix === "") return scope;
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return scope.replace(new RegExp(`(^|,)(\\s*)(?:${escaped})+`, "g"), "$1$2");
+}
+
+/**
+ * Switch events, clearing what the new event reads differently: the scope when it
+ * names channels instead of people, and conditions on fields the event hides.
+ */
+export function withTriggerEvent(
+  source: TriggerSource,
+  fields: TriggerFields,
+  eventId: string,
+): TriggerFields {
+  const before = triggerScope(source, fields.event);
+  const after = triggerScope(source, eventId);
+  // "#" scopes name channels and "@" scopes name people; the rest share one kind.
+  const sameScope = before.prefix === after.prefix;
+  const visible = new Set(triggerConditionFields(source, eventId).map((field) => field.id));
+  let scopeOperator = sameScope ? fields.scopeOperator : "is";
+  if (after.isGroup) scopeOperator = "in";
+  return {
+    ...fields,
+    event: eventId,
+    scope: sameScope ? fields.scope : "",
+    scopeOperator,
+    conditions: fields.conditions.filter((c) => visible.has(c.field)),
+  };
+}
+
 /** Workers started per run; the rest wait for the next run. */
 export const MAX_SESSIONS_PER_RUN = 10;
 
@@ -353,6 +457,80 @@ export function combineTriggerPrompt(userPrompt: string, systemPrompt: string | 
   return `${managerInstructions}${SESSION_INSTRUCTIONS}${userPrompt}${postingSeparator}${postingInstructions}`;
 }
 
+export interface TriggerWorkerSettings {
+  /** Null keeps the polling session's agent. */
+  agentId: string | null;
+  model: string;
+  effort: string;
+}
+
+const QUOTED_WORKER_VALUE = String.raw`"(?:[^"\\]|\\.)*"`;
+const WORKER_SETTINGS_PATTERN = new RegExp(
+  `call sys_session_create with agent_id (set to your agent ID|${QUOTED_WORKER_VALUE}), ` +
+    `(placement "(?:same_host|managed)", title ${QUOTED_WORKER_VALUE})` +
+    `(?:, model (${QUOTED_WORKER_VALUE}))?` +
+    `(?:, reasoning_effort (${QUOTED_WORKER_VALUE}))?` +
+    `, and a message under 8000 characters\\.`,
+  "g",
+);
+
+function workerSettingsMatch(prompt: string) {
+  const parts = splitTriggerPrompt(prompt);
+  if (parts.systemPrompt === null) return null;
+  const manager = parts.systemPrompt.split(SESSION_POSTING_INSTRUCTIONS)[0];
+  const matches = [...manager.matchAll(WORKER_SETTINGS_PATTERN)];
+  if (matches.length !== 1) return null;
+  const match = matches[0];
+  // Only the generated call and its result references have unambiguous settings.
+  const otherInstructions = manager
+    .replace(match[0], "")
+    .replace(/\bthat\s+`?sys_session_create`?\s+returned\b/gi, "");
+  if (/\bsys_session_create\b/i.test(otherInstructions)) return null;
+  try {
+    const settings: TriggerWorkerSettings = {
+      agentId: match[1] === "set to your agent ID" ? null : JSON.parse(match[1]),
+      model: match[3] === undefined ? "" : JSON.parse(match[3]),
+      effort: match[4] === undefined ? "" : JSON.parse(match[4]),
+    };
+    return { parts, match, settings };
+  } catch {
+    return null;
+  }
+}
+
+/** Read the generated creation call without treating worker task text as configuration. */
+export function readTriggerWorkerSettings(prompt: string): TriggerWorkerSettings | null {
+  return workerSettingsMatch(prompt)?.settings ?? null;
+}
+
+/** Placement remains part of the authored instructions when the poller moves. */
+export function readTriggerWorkerPlacement(prompt: string): "managed" | "same_host" | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  return parsed.match[2].startsWith('placement "managed"') ? "managed" : "same_host";
+}
+
+/** Change only the creation-call settings, preserving the rest of the authored prompt. */
+export function updateTriggerWorkerSettings(
+  prompt: string,
+  settings: TriggerWorkerSettings,
+): string | null {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return null;
+  const { parts, match } = parsed;
+  const args = [
+    `agent_id ${settings.agentId === null ? "set to your agent ID" : JSON.stringify(settings.agentId)}`,
+    match[2],
+    ...(settings.model ? [`model ${JSON.stringify(settings.model)}`] : []),
+    ...(settings.effort ? [`reasoning_effort ${JSON.stringify(settings.effort)}`] : []),
+  ];
+  const systemPrompt = parts.systemPrompt!.replace(
+    match[0],
+    () => `call sys_session_create with ${args.join(", ")}, and a message under 8000 characters.`,
+  );
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+}
+
 const SERVICE_NAMES: Record<TriggerSource, string> = {
   jira: "Jira",
   slack: "Slack",
@@ -407,17 +585,32 @@ export function splitJqlOrderBy(jql: string): { where: string; orderBy: string }
 /**
  * Whether the fields can render a prompt: at least one scope entry (`","`
  * alone would drop GitHub's repo filter), filled-in rows, and instructions
- * within budget.
+ * within budget. A group scope needs two people besides the owner, since a
+ * group DM with one person is a direct message.
  */
-export function triggerFieldsComplete(fields: TriggerFields): boolean {
+export function triggerFieldsComplete(fields: TriggerFields, source?: TriggerSource): boolean {
   const instructions = fields.instructions.trim();
+  const isGroup = source !== undefined && triggerScope(source, fields.event).isGroup;
+  const entries =
+    source === undefined ? scopeList(fields.scope) : triggerScopeEntries(source, fields);
   return (
-    scopeList(fields.scope).length > 0 &&
-    (fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
+    entries.length >= (isGroup ? 2 : 1) &&
+    (isGroup || fields.scopeOperator !== "is" || !fields.scope.includes(",")) &&
     fields.conditions.every((c) => VALUELESS_OPERATORS.has(c.operator) || c.value.trim() !== "") &&
     instructions !== "" &&
     instructions.length <= MAX_INSTRUCTIONS_CHARS
   );
+}
+
+/**
+ * The scope's entries with the event's prefix stripped; Slack people are rendered
+ * and deduplicated, so `"alice, @Alice"` is one person.
+ */
+export function triggerScopeEntries(source: TriggerSource, fields: TriggerFields): string[] {
+  const { prefix } = triggerScope(source, fields.event);
+  return prefix === "@"
+    ? slackPeople(fields.scope)
+    : scopeList(stripScopePrefix(fields.scope, prefix));
 }
 
 /** The comma-separated entries of a scope field, e.g. `"ES, OPS"` → `["ES", "OPS"]`. */
@@ -503,6 +696,45 @@ export function compileGithubQuery(fields: TriggerFields): string {
     if (c.field === "qualifiers") parts.push(c.value.trim());
   }
   return parts.join(" ");
+}
+
+/** Slack IDs, e.g. `C0123ABCD` or `U0123ABCD`, which take no `#` or `@`. */
+const SLACK_ID = /^[CDGUW][A-Z0-9]{6,}$/;
+
+/** Slack channels as `#name`, keeping IDs bare, e.g. `"eng, C0123ABCD"` → `"#eng, C0123ABCD"`. */
+export function slackChannels(scope: string): string {
+  return scopeList(stripScopePrefix(scope, "#"))
+    .map((channel) => (SLACK_ID.test(channel) ? channel : `#${channel}`))
+    .join(", ");
+}
+
+/** Slack people as `@handle`, keeping IDs and emails bare; repeats are dropped, ignoring case. */
+export function slackPeople(scope: string): string[] {
+  const seen = new Set<string>();
+  const people: string[] = [];
+  for (const entry of scopeList(stripScopePrefix(scope, "@"))) {
+    const person = SLACK_ID.test(entry) || entry.includes("@") ? entry : `@${entry}`;
+    if (seen.has(person.toLowerCase())) continue;
+    seen.add(person.toLowerCase());
+    people.push(person);
+  }
+  return people;
+}
+
+/** Words joined as a list, e.g. `["a", "b", "c"]` → `"a, b and c"`. */
+function joinAnd(words: string[]): string {
+  return words.length <= 1
+    ? words.join("")
+    : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1]}`;
+}
+
+/** Finding the people a DM trigger lists, without guessing at ambiguous names. */
+function slackFindPeople(people: string[]): string {
+  return `Use your Slack tools to find ${people.length === 1 ? people[0] : `each of ${joinAnd(people)}`} by handle, display name or email. A name that matches no one or more than one person counts as no match: say so in your reply.`;
+}
+
+function slackCantRead(what: string): string {
+  return ` If your Slack tools can't read ${what}, skip to your reply and say that this automation needs a Slack MCP server that can read ${what}.`;
 }
 
 /** The Slack condition rows as a clause, e.g. `whose text contains "error"`; "" with none. */
@@ -617,21 +849,50 @@ function sourceText(source: TriggerSource, fields: TriggerFields): SourceText {
     };
   }
   if (source === "slack") {
-    const channels = scopeList(fields.scope).join(", ");
     const filter = describeSlackFilter(fields);
-    return {
-      watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
-      search: () =>
-        `Use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. Replies inside a thread don't start a new session.` +
-        (filter !== "" ? ` Only messages ${filter} count.` : " Every top-level message counts."),
+    const only = filter !== "" ? ` Only messages ${filter} count.` : "";
+    const slack = {
       readOrder: READ_OLDEST_FIRST,
       createdAt: "posted",
       item: "message",
       fence: "slack-message",
       title: '"Slack <channel> <message ts>"',
-      details: "the channel, author, message text and permalink",
-      linkBack: (link) =>
+      linkBack: (link: string) =>
         `Reply "${link}" in the thread of each message you started a session for.`,
+    };
+    if (fields.event === "dm" || fields.event === "group_dm") {
+      const people = slackPeople(fields.scope);
+      const watched = filter !== "" ? ` ${filter}` : "";
+      if (fields.event === "dm") {
+        return {
+          ...slack,
+          watch: () =>
+            `Watch: new Slack direct messages sent to you by ${joinAnd(people)}${watched}`,
+          search: () =>
+            `${slackFindPeople(people)} Then read the messages ${people.length === 1 ? "they" : "each of them"} sent you since that time in your one-to-one direct message with them, oldest first. Your own messages and replies inside a thread don't start a new session.` +
+            (only || " Every other message counts.") +
+            slackCantRead("your direct messages"),
+          details: "the sender, the direct message's channel ID, the message text and permalink",
+        };
+      }
+      return {
+        ...slack,
+        watch: () => `Watch: new Slack messages in your group DM with ${joinAnd(people)}${watched}`,
+        search: () =>
+          `${slackFindPeople(people)} Then find the group DM whose members are exactly you and those people; a group DM that also includes anyone else doesn't count. If any name has no match, the names resolve to fewer than two people besides you, or there's no such group DM, skip to your reply and say so. Read the top-level messages posted in it since that time, oldest first. Your own messages and replies inside a thread don't start a new session.` +
+          (only || " Every other top-level message counts.") +
+          slackCantRead("your group DMs"),
+        details: "the group DM's channel ID, the author, the message text and permalink",
+      };
+    }
+    const channels = slackChannels(fields.scope);
+    return {
+      ...slack,
+      watch: () => `Watch: new Slack messages in ${channels}${filter !== "" ? ` ${filter}` : ""}`,
+      search: () =>
+        `Use your Slack tools to read the top-level messages posted in ${channels} since that time, oldest first. Replies inside a thread don't start a new session.` +
+        (only || " Every top-level message counts."),
+      details: "the channel, author, message text and permalink",
     };
   }
   if (source === "linear") {
@@ -686,6 +947,9 @@ export function renderTriggerPrompt(
 ): string {
   const text = sourceText(source, fields);
   const service = triggerServiceName(source);
+  const initialLookbackMinutes = Math.max(60, ctx.pollingIntervalMinutes ?? 60);
+  const initialLookback =
+    initialLookbackMinutes === 60 ? "one hour" : `${initialLookbackMinutes} minutes`;
   const createArgs = [
     "agent_id set to your agent ID",
     `placement "${ctx.placement}"`,
@@ -704,7 +968,7 @@ export function renderTriggerPrompt(
   ];
   const steps = [
     ...(source === "github" ? [GITHUB_ACCOUNT_INSTRUCTIONS] : []),
-    `Read your state from your most recent reply in this session that has a "${CHECKED_THROUGH}" line: that check time, and any ${pendingLines.join(" and ")} lines. On the first run, use one hour ago and nothing pending. If you have no way to use ${service} here, or signing in to it fails, skip to your reply and say that this automation needs ${TRIGGER_TEMPLATES[source].toolsExample} where it runs.`,
+    `Read your state from your most recent reply in this session that has a "${CHECKED_THROUGH}" line: that check time, and any ${pendingLines.join(" and ")} lines. On the first run, use ${initialLookback} ago and nothing pending. If you have no way to use ${service} here, or signing in to it fails, skip to your reply and say that this automation needs ${TRIGGER_TEMPLATES[source].toolsExample} where it runs.`,
     `For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true). If no such session exists and the listed rows carry an archived field (so archived sessions were included), the start never happened: drop the entry, fetch that ${text.item} again by the key in its title, and handle it with this run's matches below, since the search window may have moved past it. If the rows have no archived field, an archived session could be hiding: keep the entry pending and ask the owner in your reply to check for that session. Otherwise read that session's history with sys_session_get_history. If your task message is there, it was delivered: drop the entry. If it isn't, keep the entry pending and point the owner to that session in your reply: the task may still be queued where the history can't show it, so never resend it and never create another session for it.`,
     ...(managerPostsLink
       ? [

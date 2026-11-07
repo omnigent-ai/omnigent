@@ -100,6 +100,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runner.launch_failure import classify_native_turn_error, diagnose_model_unavailable
 from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.session_init_protocol import build_runner_session_init_payload
 from omnigent.runner.subagent_routing import ROUTING_DECISION_LABEL_KEY
 from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
 from omnigent.runtime import (
@@ -143,6 +144,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._host_worktree import CreatedWorktree
 from omnigent.server.routes._session_create_validation import (
     validate_existing_host_workspace,
+    validate_session_model_metadata,
 )
 
 # Shared constants, state, and small dataclasses live in the _sessions.common
@@ -307,6 +309,7 @@ from omnigent.server.schemas import (
     SessionTerminalPendingEvent,
     SessionTitleEvent,
     SessionTodosEvent,
+    SupersessionReason,
     ToolOutputDeltaEvent,
 )
 from omnigent.server.session_metadata_logging import harness_attributes
@@ -339,6 +342,7 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
     title_without_closed_marker,
 )
+from omnigent.version import VERSION
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -4403,6 +4407,8 @@ async def _create_and_publish_codex_child(
                 else None
             ),
             reasoning_effort=parent_conv.reasoning_effort if side_chat else None,
+            # Lists the /side fork in its parent's Workspace rail on every device.
+            side_chat_parent_id=parent_conv.id if side_chat else None,
         )
     except NameAlreadyExistsError:
         # A concurrent POST (or a retry that arrived before set_labels ran)
@@ -5723,7 +5729,12 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
     session_stream.publish(session_id, payload)
 
 
-def _publish_session_superseded(session_id: str, target_conversation_id: str) -> None:
+def _publish_session_superseded(
+    session_id: str,
+    target_conversation_id: str,
+    *,
+    reason: SupersessionReason = "clear",
+) -> None:
     """
     Publish a ``session.superseded`` event to the live stream.
 
@@ -5738,12 +5749,13 @@ def _publish_session_superseded(session_id: str, target_conversation_id: str) ->
         should receive the event, e.g. ``"conv_old"``.
     :param target_conversation_id: The conversation to redirect to, e.g.
         ``"conv_new"``.
+    :param reason: The command that moved the session, e.g. ``"clear"``.
     """
     event = SessionSupersededEvent(
         type="session.superseded",
         conversation_id=session_id,
         target_conversation_id=target_conversation_id,
-        reason="clear",
+        reason=reason,
     )
     session_stream.publish(session_id, event.model_dump())
     # Discard any unconsumed pending inputs on the superseded session — notably
@@ -6832,6 +6844,7 @@ async def _provision_managed_sandbox(
                 agent_name=agent_name,
                 on_stage=_on_stage,
                 slice_key_enabled=relaunch_slice_key_enabled,
+                launch_state=tracker.get(session_id),
             )
         return await launch_managed_host(
             config=sandbox_config,
@@ -6842,6 +6855,7 @@ async def _provision_managed_sandbox(
             agent_name=agent_name,
             on_stage=_on_stage,
             host_id=host_id,
+            launch_state=tracker.get(session_id),
         )
     except HTTPException as exc:
         _logger.warning(
@@ -10133,15 +10147,16 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
     """
     try:
         parsed = SessionCreateMetadata.model_validate_json(metadata)
-        reasoning_effort = validate_effort(
-            parsed.reasoning_effort,
-            "session metadata",
-            EFFORT_VALUES,
+        model_override, reasoning_effort = validate_session_model_metadata(
+            model_override=parsed.model_override,
+            reasoning_effort=parsed.reasoning_effort,
         )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={"reasoning_effort": reasoning_effort, "model_override": model_override}
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
@@ -10285,6 +10300,7 @@ async def _remove_session_worktree_best_effort(
     host_registry: Any,
     reason: str,
     conversation_store: ConversationStore | None = None,
+    host_store: HostStore | None = None,
     exclude_conversation_id: str | None = None,
     fail_if_unavailable: bool = False,
     expected_root_fingerprint: str | None = None,
@@ -10334,6 +10350,13 @@ async def _remove_session_worktree_best_effort(
     )
     from omnigent.server.routes._workspace_validation import _is_subpath_of
 
+    if host_store is not None:
+        host = await asyncio.to_thread(host_store.get_host, host_id, include_deleted=True)
+        if host is not None and host.sandbox_provider is not None:
+            # Shared sandbox files live until last-binding teardown, including
+            # admissions racing this optional worktree cleanup.
+            return
+
     # A fork reusing the source's directory, or several sessions attached to
     # one existing worktree, all run in the same cwd. Removing it under them
     # leaves their runners on a deleted directory, so leave a shared worktree
@@ -10353,10 +10376,11 @@ async def _remove_session_worktree_best_effort(
             workspace=cleanup_root,
             exclude_conversation_id=exclude_conversation_id,
             include_subdirectories=True,
+            include_archived=True,
         )
         if shared:
             _logger.info(
-                "Keeping worktree %s (%s): another live session still runs there",
+                "Keeping worktree %s (%s): another session still uses it",
                 worktree_path,
                 reason,
             )
@@ -10886,11 +10910,14 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
         CREATED_BY_SESSION_LABEL_KEY,
+        FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
+    if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in labels):
+        raise OmnigentError("Family pins are server-owned", code=ErrorCode.INVALID_INPUT)
     for key in (
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
@@ -11033,6 +11060,7 @@ def _persist_stored_session_bundle(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
 ) -> CreatedSessionResponse:
     """
@@ -11074,6 +11102,7 @@ def _persist_stored_session_bundle(
             labels=metadata.labels,
             reasoning_effort=metadata.reasoning_effort,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             parent_conversation_id=metadata.parent_session_id,
             runner_id=runner_id,
@@ -11132,6 +11161,7 @@ def _persist_session_for_uploaded_agent(
     runner_id: str | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
 ) -> CreatedSessionResponse:
     """
     Persist a top-level session bound to the agent row of an earlier, identical upload.
@@ -11154,6 +11184,7 @@ def _persist_session_for_uploaded_agent(
             runner_id=runner_id,
             host_id=metadata.host_id,
             workspace=metadata.workspace,
+            git_branch=git_branch,
             terminal_launch_args=metadata.terminal_launch_args,
             project_id=metadata.project_id,
             inference_snapshot=inference_snapshot,
@@ -11259,6 +11290,9 @@ async def _notify_runner_of_bundled_child(
     session_id: str,
     agent_id: str,
     runner_router: RunnerRouter | None,
+    conversation: Conversation | None = None,
+    *,
+    conversation_store: ConversationStore | None = None,
 ) -> None:
     """
     Notify the inherited runner that a bundled child session exists.
@@ -11273,24 +11307,47 @@ async def _notify_runner_of_bundled_child(
         e.g. ``"ag_abc123"``.
     :param runner_router: Router used to resolve the bound runner's
         client; ``None`` falls back to the in-process runner.
+    :param conversation: The created child row. When given, the runner gets
+        the full session-init envelope, so it seeds the requested model and
+        effort instead of fetching them back; ``None`` sends the id-only body.
+    :param conversation_store: Store to read the child row from when
+        *conversation* is not given. The read is best-effort like the envelope
+        build: the session is already persisted, so a failed read sends the
+        id-only body instead of failing the create.
     :returns: None.
     """
     runner_client = await _get_runner_client(session_id, runner_router)
     if runner_client is None:
         return
+    body: dict[str, Any] = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "sub_agent_name": None,
+    }
+    if conversation is not None or conversation_store is not None:
+        try:
+            if conversation is None and conversation_store is not None:
+                conversation = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
+                )
+            if conversation is not None:
+                # The route forwards any initial input itself right after
+                # this notify, so a recovery turn would run it twice.
+                body = build_runner_session_init_payload(
+                    conversation,
+                    server_version=VERSION,
+                    suppress_recovery_turn=True,
+                )
+        except Exception:  # noqa: BLE001 — must not fail the create, as on the JSON path.
+            # The runner falls back to fetching the row.
+            _logger.warning(
+                "session-init envelope build failed for bundled session %s; "
+                "sending the id-only body",
+                session_id,
+                exc_info=True,
+            )
     try:
-        # Bundled children keep the legacy id-only body: bundle creation plumbs
-        # no harness/model override for a session-init envelope to seed. The
-        # create and rebind notifies send the full envelope instead.
-        await runner_client.post(
-            "/v1/sessions",
-            json={
-                "session_id": session_id,
-                "agent_id": agent_id,
-                "sub_agent_name": None,
-            },
-            timeout=10.0,
-        )
+        await runner_client.post("/v1/sessions", json=body, timeout=10.0)
     except (httpx.HTTPError, ConnectionError):
         _logger.warning(
             "Failed to notify runner about bundled session %s",

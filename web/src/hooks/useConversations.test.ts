@@ -1,7 +1,7 @@
 // Unit tests for the conversation-mutation HTTP helpers, plus the
 // query-invalidation contract of the stop mutation hook.
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act, render, renderHook, screen, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
@@ -314,6 +314,7 @@ describe("useSessionSearch", () => {
       const params = new URL(url, "http://localhost").searchParams;
       expect(params.get("search_query")).toBe("kestrel");
       expect(params.get("search_scope")).toBe(scope);
+      expect(params.has("expand_families")).toBe(false);
       expect(params.get("include_archived")).toBe("true");
       expect(params.get("limit")).toBe("8");
     },
@@ -2085,6 +2086,38 @@ describe("overlapping pin writes", () => {
   );
 });
 
+it.each(["pin", "reorder"])("refreshes every family list after a %s", async (action) => {
+  const family = { id: "family", representative_id: "conv_a", pinned: true, pinned_at: "1000" };
+  const row = conversation({ id: "conv_a", labels: { [PINNED_LABEL_KEY]: "1000" }, family });
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  const listKeys = [
+    ["conversations", "", false],
+    ["project-sessions", "Project", "updated_at", false],
+  ];
+  for (const key of listKeys) queryClient.setQueryData(key, infinitePage([row]));
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations: [row], filterHonored: true });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  const { result } = renderHook(
+    () => ({ toggle: useTogglePinnedConversation(), reorder: useReorderPinnedConversations() }),
+    { wrapper },
+  );
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      ...row,
+      labels: { [PINNED_LABEL_KEY]: "2000" },
+      family: { ...family, pinned_at: "2000" },
+    }),
+  );
+  await act(async () => {
+    if (action === "pin") await result.current.toggle.mutateAsync({ id: row.id, pinned: true });
+    else await result.current.reorder.mutateAsync([{ id: row.id, pinnedAt: 2000 }]);
+  });
+  for (const key of [...listKeys, PINNED_CONVERSATIONS_KEY]) {
+    expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+  }
+});
+
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
     ["unpin", "3000", false, "Couldn't unpin the session."],
@@ -2297,6 +2330,62 @@ describe("fetchPinnedConversations filter-honored detection", () => {
     expect(result.filterHonored).toBe(true);
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
+
+  it.each(["archive", "delete"] as const)(
+    "follows pinned pages and reconciles family context on %s",
+    async (operation) => {
+      const family = { id: "family", representative_id: "a", pinned: true };
+      const members = ["a", "b", "c"].map((id) => ({
+        id,
+        title: id,
+        created_at: 0,
+        updated_at: 1,
+        labels: id === "a" ? { "omnigent.pinned": "1" } : {},
+        family,
+      }));
+      fetchMock
+        .mockResolvedValueOnce(mockResponse({ data: members, has_more: true, last_id: "b" }))
+        .mockResolvedValueOnce(
+          mockResponse({ data: [members[2], pinnedRow("old")], has_more: false, last_id: "old" }),
+        );
+
+      const result = await fetchPinnedConversations(false, 2);
+
+      expect(result.conversations.map((row) => row.id)).toEqual(["old", "a", "c", "b"]);
+      expect(result.filterHonored).toBe(true);
+      expect(
+        new URL(String(fetchMock.mock.calls[1][0]), "http://test").searchParams.get("after"),
+      ).toBe("b");
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      client.setQueryData(PINNED_CONVERSATIONS_KEY, result);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const hook = renderHook(
+        () => ({ archive: useArchiveConversation(), remove: useStopAndDeleteConversation() }),
+        { wrapper },
+      );
+      const mutate = () =>
+        operation === "archive"
+          ? hook.result.current.archive.mutateAsync({ id: "b", archived: true })
+          : hook.result.current.remove.mutateAsync({ id: "b" });
+      fetchMock.mockResolvedValue(mockResponse({}, { ok: false, status: 500 }));
+      await act(async () => {
+        await expect(mutate()).rejects.toThrow();
+      });
+      expect(client.getQueryData(PINNED_CONVERSATIONS_KEY)).toEqual(result);
+      fetchMock.mockResolvedValue(mockResponse({ id: "b", archived: true, deleted: true }));
+      await act(async () => {
+        await mutate();
+      });
+      expect(
+        client
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((item) => item.id),
+      ).toEqual(["old", "a", "c"]);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: PINNED_CONVERSATIONS_KEY });
+    },
+  );
 
   it("fails with the response's status and Retry-After so the retry policy can read them", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -2804,6 +2893,7 @@ describe("useProjectSessions", () => {
       const url = fetchMock.mock.calls[0][0] as string;
       expect(url).toContain("/v1/sessions?");
       expect(url).toContain("project=Sprint+42");
+      expect(url).toContain("expand_families=true");
       expect(url).toContain("order=desc");
       expect(url).toContain(`sort_by=${sortBy}`);
       expect(url).toContain("limit=20");
@@ -3220,6 +3310,34 @@ describe("useMoveToProject", () => {
     expect(queryClient.getQueryData(["projects"])).toEqual([{ id: "p_new", name: "Legacy" }]);
   });
 
+  it("does not restore an open-session row a remote removal cleared while a move failed", async () => {
+    let settlePatch: (value: Response) => void = () => {};
+    fetchMock.mockReset();
+    fetchMock.mockReturnValueOnce(
+      new Promise<Response>((resolve) => {
+        settlePatch = resolve;
+      }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([conversation({ id: "conv_move", project_id: "p_old" })]),
+    );
+    const openRowKey = ["conversation-backfill", "conv_move"];
+    queryClient.setQueryData(openRowKey, conversation({ id: "conv_move", project_id: "p_old" }));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToProject(), { wrapper });
+
+    result.current.mutate({ id: "conv_move", project: "" });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    queryClient.setQueryData(openRowKey, null);
+    settlePatch(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(queryClient.getQueryData(openRowKey)).toBeNull();
+  });
+
   it("unfiles optimistically without needing the projects cache", async () => {
     // "" needs no name→id resolution, so the held-open PATCH is the only call.
     let resolvePatch: (value: Response) => void = () => {};
@@ -3628,6 +3746,140 @@ describe("useArchiveConversation", () => {
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
+  const openRowKey = ["conversation-backfill", "conv_a"];
+
+  it("restores a fetched open-session row when unarchiving fails", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    // The optimistic overlay flipped this entry; the sidebar row reads it, so
+    // the rollback must bring its Unarchive control back.
+    expect(queryClient.getQueryData<Conversation>(openRowKey)?.archived).toBe(true);
+  });
+
+  it("drops an open-session row fetch that was in flight when unarchiving", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ id: "conv_a", archived: false }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const archivedRow = conversation({ id: "conv_a", archived: true });
+    queryClient.setQueryData(openRowKey, archivedRow);
+    let settleFetch = (_row: Conversation) => {};
+    const staleFetch = queryClient.fetchQuery({
+      queryKey: openRowKey,
+      queryFn: () =>
+        new Promise<Conversation>((resolve) => {
+          settleFetch = resolve;
+        }),
+    });
+    void staleFetch.catch(() => undefined);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+    result.current.mutate({ id: "conv_a", archived: false });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    settleFetch(archivedRow);
+    await staleFetch.catch(() => undefined);
+
+    expect(queryClient.getQueryData<Conversation>(openRowKey)?.archived).toBe(false);
+  });
+
+  it.each([
+    {
+      removal: "a local delete",
+      remove: (queryClient: QueryClient) => queryClient.removeQueries({ queryKey: openRowKey }),
+    },
+    {
+      // The session-updates stream leaves the removed row null.
+      removal: "a remote removal",
+      remove: (queryClient: QueryClient) => queryClient.setQueryData(openRowKey, null),
+    },
+  ])(
+    "does not restore an open-session row $removal cleared while unarchiving failed",
+    async ({ remove }) => {
+      let settleArchive = (_res: Response) => {};
+      fetchMock.mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            settleArchive = resolve;
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(openRowKey, conversation({ id: "conv_a", archived: true }));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useArchiveConversation(), { wrapper });
+
+      result.current.mutate({ id: "conv_a", archived: false });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      remove(queryClient);
+      settleArchive(mockResponse({ error: "nope" }, { ok: false, status: 500 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+
+      expect(queryClient.getQueryData(openRowKey) ?? null).toBeNull();
+    },
+  );
+
+  it.each(
+    [true, false].flatMap((archived) => [
+      {
+        hook: "useArchiveConversation",
+        archived,
+        useArchive: () => {
+          const archive = useArchiveConversation();
+          return { archiveA: () => archive.mutate({ id: "conv_a", archived }), archive };
+        },
+      },
+      {
+        hook: "useBulkArchiveConversations",
+        archived,
+        useArchive: () => {
+          const archive = useBulkArchiveConversations();
+          return { archiveA: () => archive.mutate({ ids: ["conv_a"], archived }), archive };
+        },
+      },
+    ]),
+  )(
+    "$hook (archived: $archived) refetches an open-session row whose first fetch predates it",
+    async ({ archived, useArchive }) => {
+      fetchMock.mockResolvedValue(mockResponse({ id: "conv_a", archived }));
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      let settleFirstFetch = (_row: Conversation) => {};
+      const fetchRow = vi
+        .fn<() => Promise<Conversation>>()
+        .mockImplementationOnce(
+          () =>
+            new Promise<Conversation>((resolve) => {
+              settleFirstFetch = resolve;
+            }),
+        )
+        .mockResolvedValueOnce(conversation({ id: "conv_a", archived }));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(
+        () => ({
+          ...useArchive(),
+          openRow: useQuery({ queryKey: openRowKey, queryFn: fetchRow, retry: false }),
+        }),
+        { wrapper },
+      );
+      await waitFor(() => expect(fetchRow).toHaveBeenCalledOnce());
+
+      result.current.archiveA();
+      await waitFor(() => expect(result.current.archive.isSuccess).toBe(true));
+      settleFirstFetch(conversation({ id: "conv_a", archived: !archived }));
+
+      await waitFor(() => expect(result.current.openRow.data?.archived).toBe(archived));
+      expect(fetchRow).toHaveBeenCalledTimes(2);
+    },
+  );
+
   it("does not restore a row with a concurrent delete in flight", async () => {
     let settleArchive = (_res: Response) => {};
     fetchMock.mockImplementationOnce(
@@ -3797,6 +4049,39 @@ describe("useDeleteProject", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 
+  it("unfiles the family through its representative before archiving peers", async () => {
+    const family = { id: "family", representative_id: "a", pinned: false };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "b", family },
+            { id: "a", family },
+          ],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("a"))
+      .mockResolvedValueOnce(archivedConv("b"))
+      .mockResolvedValueOnce(mockResponse({ deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/a");
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({
+      archived: true,
+      project_id: "",
+      labels: { omni_project: "" },
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe("/v1/sessions/b");
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual({
+      archived: true,
+    });
+  });
+
   it("throws with succeeded/failed split when some archives fail", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -3929,10 +4214,10 @@ it("fetches and deduplicates pins across mine and shared scopes", async () => {
   expect(params.every((p) => p.get("limit") === "30" && p.get("pinned") === "true")).toBe(true);
 });
 
-it("rejects a pin at the cap without sending a request or changing membership", async () => {
+it.each([29, 30])("counts %s pin units without charging for family context", async (count) => {
   const queryClient = new QueryClient();
   const conversations = Array.from(
-    { length: 30 },
+    { length: count },
     (_, i) =>
       ({
         id: `pin-${i}`,
@@ -3944,16 +4229,24 @@ it("rejects a pin at the cap without sending a request or changing membership", 
         permission_level: 4,
       }) as Conversation,
   );
+  const family = { id: "family", representative_id: "pin-0", pinned: true };
+  conversations[0].family = family;
+  conversations.push(conversation({ id: "context", family }));
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations, filterHonored: true });
+  const added = conversation({ id: "new-pin", labels: { [PINNED_LABEL_KEY]: "2" } });
+  queryClient.setQueryData(["conversations", "", false], infinitePage([added]));
+  fetchMock.mockResolvedValue(mockResponse(added));
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
   const { result } = renderHook(useTogglePinnedConversation, { wrapper });
-  act(() => result.current.mutate({ id: "too-many", pinned: true }));
-  await waitFor(() => expect(result.current.isError).toBe(true));
-  expect(fetchMock).not.toHaveBeenCalled();
+  act(() => result.current.mutate({ id: "new-pin", pinned: true }));
+  await waitFor(() =>
+    expect(count === 30 ? result.current.isError : result.current.isSuccess).toBe(true),
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(count === 30 ? 0 : 1);
   expect(
     queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
-  ).toEqual(conversations);
+  ).toEqual(count === 30 ? conversations : [...conversations, added]);
 });
 
 describe("opaque pagination during optimistic removal", () => {

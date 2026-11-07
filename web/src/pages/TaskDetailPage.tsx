@@ -31,7 +31,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
-import { splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
+import { isTriggerPrompt, splitTriggerPrompt } from "@/components/scheduled/triggerTemplates";
 import {
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
@@ -276,6 +276,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
     );
   }
 
+  const triggerMode = task.sessionMode === "continue" && isTriggerPrompt(task.prompt);
   const paused = task.state === "paused";
   const { userPrompt, systemPrompt } = splitTriggerPrompt(task.prompt);
   const permissionOption = nativePermissionOptions(harness).find(
@@ -373,23 +374,25 @@ function TaskDetail({ taskId }: { taskId: string }) {
           >
             <Trash2Icon className="size-4" />
           </Button>
-          <Button
-            data-testid="task-detail-run-now"
-            disabled={busy || awaitingRunRow}
-            onClick={handleRunNow}
-          >
-            {runNowMutation.isPending || awaitingRunRow ? (
-              <>
-                <Loader2Icon className="size-4 animate-spin" />
-                In progress
-              </>
-            ) : (
-              <>
-                <PlayIcon className="size-4" />
-                Run now
-              </>
-            )}
-          </Button>
+          {!triggerMode && (
+            <Button
+              data-testid="task-detail-run-now"
+              disabled={busy || awaitingRunRow}
+              onClick={handleRunNow}
+            >
+              {runNowMutation.isPending || awaitingRunRow ? (
+                <>
+                  <Loader2Icon className="size-4 animate-spin" />
+                  In progress
+                </>
+              ) : (
+                <>
+                  <PlayIcon className="size-4" />
+                  Run now
+                </>
+              )}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -416,8 +419,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
           {paused ? "Paused" : "Active"}
         </span>
         <span className="text-muted-foreground" data-testid="task-detail-schedule">
-          {scheduleSummary}
-          {nextRun && ` · Next run ${nextRun}`}
+          {triggerMode ? "Runs when new items match" : scheduleSummary}
+          {!triggerMode && nextRun && ` · Next run ${nextRun}`}
         </span>
       </div>
 
@@ -647,7 +650,9 @@ function RunRow({
   // Unread only applies to a succeeded run that produced a conversation.
   const unread = useRunUnread(run);
   const failure = isUnsuccessfulRun(run) ? describeRunFailure(run.errorCode, run.status) : null;
-  const inFlightLabel = IN_FLIGHT_RUN_LABELS[run.status];
+  const inFlightLabel =
+    IN_FLIGHT_RUN_LABELS[run.status] ??
+    (isSessionStillRunning(run) ? "Session running" : undefined);
 
   const body = (
     <>
@@ -734,6 +739,7 @@ function RunRow({
  *   1. failed / incomplete → amber warning triangle, tooltip = "Failed".
  *   2. skipped             → muted calendar-off icon, tooltip = "Skipped".
  *   3. starting / running  → spinning loader icon, tooltip = the status.
+ *      succeeded, session still running → the same spinner, tooltip "Session still running".
  *   4. succeeded + UNREAD  → blue filled dot, tooltip = "Unread".
  *   5. succeeded + READ / no conversation → muted grey dot, tooltip = "Completed".
  *   6. scheduled           → muted grey dot, no tooltip (not started yet).
@@ -777,6 +783,17 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
       </IndicatorWithTooltip>
     );
   }
+  if (isSessionStillRunning(run)) {
+    return (
+      <IndicatorWithTooltip tooltip="Session still running" announce={false}>
+        <Loader2Icon
+          data-testid="run-status-icon"
+          data-run-icon="session-running"
+          className="size-3.5 shrink-0 animate-spin text-muted-foreground"
+        />
+      </IndicatorWithTooltip>
+    );
+  }
   if (run.status === "succeeded" && unread) {
     return (
       <IndicatorWithTooltip tooltip="Unread">
@@ -805,6 +822,19 @@ function RunStatusIcon({ run, unread }: { run: ScheduledTaskRun; unread: boolean
     return <IndicatorWithTooltip tooltip="Completed">{dot}</IndicatorWithTooltip>;
   }
   return dot;
+}
+
+/**
+ * A succeeded run whose session is still working. The run row settles when its
+ * turn ends, but the session can keep running (background work, a manager
+ * session that outlives the turn), so a "completed" dot would read as finished.
+ */
+function isSessionStillRunning(run: ScheduledTaskRun): boolean {
+  return (
+    run.status === "succeeded" &&
+    run.conversationId !== null &&
+    run.conversationStatus === "running"
+  );
 }
 
 // A run that hasn't finished says what it's doing; the spinner alone doesn't

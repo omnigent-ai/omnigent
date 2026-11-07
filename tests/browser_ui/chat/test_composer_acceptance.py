@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from itertools import pairwise
 from pathlib import Path
 
@@ -160,6 +161,39 @@ def test_pr_context_and_background_tasks_share_workspace_bar(
     page.goto(chat.url)
     chat.wait_for_stream()
     bar = page.get_by_test_id("composer-workspace-controls")
+    if is_mobile:
+        expect(bar).to_have_count(0)
+        pill = page.get_by_test_id("mobile-header-controls-slot").get_by_test_id(
+            "background-task-pill"
+        )
+        expect(pill).to_have_accessible_name("1 background task still running")
+        pill.click()
+        expect(page.get_by_text(_MONITOR_TASK["command"], exact=True)).to_be_visible()
+        page.keyboard.press("Escape")
+        menu_button = page.get_by_role(
+            "button", name=re.compile(r"^(?:Conversation|Session) actions$")
+        )
+        menu_button.click()
+        expect(page.get_by_label("Working directory: /work/repo", exact=True)).to_have_text("repo")
+        page.get_by_role("menuitem", name="Pull Requests", exact=True).click()
+        panel = page.get_by_test_id("github-panel-drawer")
+        expect(panel).to_have_attribute("data-state", "open")
+        expect(panel.get_by_text("Acceptance PR", exact=True)).to_be_visible()
+        panel.get_by_role("button", name="Close", exact=True).click()
+        expect(panel).to_have_attribute("data-state", "closed")
+        expect(menu_button).to_be_in_viewport()
+        chat.emit(
+            {
+                "event": "session.status",
+                "data": {
+                    "conversation_id": session_id,
+                    "status": "idle",
+                    "background_task_count": 0,
+                },
+            }
+        )
+        expect(pill).to_have_count(0)
+        return
     pr_link = bar.get_by_test_id("composer-pr-link")
     pr_label = pr_link.locator("span").last
     expect(pr_label).to_have_text(f"#{pr_number}", timeout=30_000)
@@ -353,6 +387,8 @@ def test_long_model_and_permission_remain_single_row(
     label = page.get_by_test_id("composer-agent-config-value")
     expect(label).to_contain_text("Opus 4.8 1M", timeout=30_000)
     permission = page.get_by_test_id("composer-permission-chip")
+    if width < 768:
+        page.get_by_label("Message the agent").focus()
     expect(permission).to_be_visible()
     if width == 3200:
         for text in (
