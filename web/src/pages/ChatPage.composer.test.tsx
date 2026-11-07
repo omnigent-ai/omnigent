@@ -308,6 +308,16 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
   );
 }
 
+describe("Composer test ids", () => {
+  it("tags the textbox and send button for UI tests", () => {
+    render(<Composer {...composerProps()} />);
+    expect(screen.getByTestId("chat-input")).toBe(textarea());
+    expect(screen.getByTestId("chat-send-button")).toBe(
+      screen.getByRole("button", { name: "Send" }),
+    );
+  });
+});
+
 describe("Composer focus handle", () => {
   it("takes focus for typing, unless disabled or read-only", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
