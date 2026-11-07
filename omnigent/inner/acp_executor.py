@@ -49,7 +49,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import math
 import os
 import secrets
 import shlex
@@ -84,6 +83,7 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
+from omnigent.inner.harness_timeouts import timeout_seconds_from_env
 from omnigent.inner.os_env import OSEnvironment, create_os_environment
 from omnigent.process_logging import current_process_log_path, display_log_path
 
@@ -161,13 +161,7 @@ _TOOL_STATUS_FAILED = "failed"
 # this is configurable. Parsing is import-time and fail-loud: a malformed,
 # non-positive, or non-finite value aborts the ACP child at startup.
 _PROMPT_TIMEOUT_ENV = "HARNESS_ACP_PROMPT_TIMEOUT_S"
-_PROMPT_TIMEOUT_ERR = f"{_PROMPT_TIMEOUT_ENV} must be a positive finite number of seconds"
-try:
-    _PROMPT_TIMEOUT_SECONDS = float(os.environ.get(_PROMPT_TIMEOUT_ENV, "300"))
-except ValueError as exc:
-    raise ValueError(_PROMPT_TIMEOUT_ERR) from exc
-if not math.isfinite(_PROMPT_TIMEOUT_SECONDS) or _PROMPT_TIMEOUT_SECONDS <= 0:
-    raise ValueError(_PROMPT_TIMEOUT_ERR)
+_PROMPT_TIMEOUT_SECONDS = timeout_seconds_from_env(_PROMPT_TIMEOUT_ENV, 300.0)
 
 # Idle timeout for the initial ACP handshake (initialize / session setup).
 _INIT_TIMEOUT_SECONDS = 30.0
