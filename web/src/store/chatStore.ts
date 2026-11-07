@@ -5249,19 +5249,25 @@ async function bindStream(
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout((signal) => {
-          // An attempt that starts the request drops it on timeout, so the retry reads
-          // afresh instead of joining it. One that joins another caller's request leaves
-          // its cancellation to that caller.
-          const startsRequest = client.isFetching({ queryKey: ["session", id], exact: true }) === 0;
-          if (startsRequest) {
-            signal.addEventListener(
-              "abort",
-              () => void client.cancelQueries({ queryKey: ["session", id], exact: true }),
-              { once: true },
-            );
+          const queryKey = ["session", id];
+          // Joining another caller's read would tie this load to a request that may
+          // never answer, and its timeout could not cancel that request. Read directly
+          // with this attempt's own deadline, and seed the shared cache with the result.
+          if (client.isFetching({ queryKey, exact: true }) > 0) {
+            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
+              client.setQueryData(queryKey, fresh);
+              return fresh;
+            });
           }
+          // Otherwise this attempt owns the request, so a timeout drops it and the retry
+          // reads afresh.
+          signal.addEventListener(
+            "abort",
+            () => void client.cancelQueries({ queryKey, exact: true }),
+            { once: true },
+          );
           return client.fetchQuery({
-            queryKey: ["session", id],
+            queryKey,
             queryFn: ({ signal: querySignal }) =>
               getSessionSlim(id, { refreshState: true, signal: querySignal }),
             staleTime: 0,

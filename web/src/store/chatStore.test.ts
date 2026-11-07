@@ -3293,6 +3293,24 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
     });
 
+    it("loads a session whose shared read never answers, through the load's own request", async () => {
+      vi.useFakeTimers();
+      seedSession("conv_stuck_join", []);
+      // Another caller's read of the same session, which the server never answers.
+      void client.fetchQuery({
+        queryKey: ["session", "conv_stuck_join"],
+        queryFn: () => new Promise(() => {}),
+      });
+
+      void useChatStore.getState().switchTo("conv_stuck_join");
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS + 1_000);
+
+      expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
+        loadingConversation: false,
+        conversationLoadError: null,
+      });
+    });
+
     it("fails a missing session at once", async () => {
       seedSession("conv_missing", []);
       const { gets } = failSnapshots("conv_missing", [404, 404, 404]);
