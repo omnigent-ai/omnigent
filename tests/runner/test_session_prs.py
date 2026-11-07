@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from filelock import FileLock
@@ -1232,6 +1234,38 @@ async def test_runner_shell_dispatch_records_only_success(tmp_path, monkeypatch,
     )
     assert result == output
     assert [pr.url for pr in SessionPrRegistry("conv_dispatch").list()] == ([] if failed else [A])
+
+
+async def test_forwarded_runner_shell_is_observed_once(monkeypatch) -> None:
+    from omnigent.runner import tool_dispatch
+
+    observed: list[str] = []
+    monkeypatch.setattr(
+        pr_observer, "observe_tool_completion", lambda session_id, **_: observed.append(session_id)
+    )
+
+    async def shell(*_args, **_kwargs):
+        return A + "\n"
+
+    class ForwardingManager:
+        async def call_tool(self, _spec, tool_name, arguments):
+            return await tool_dispatch.execute_tool(
+                tool_name=tool_name,
+                arguments=json.dumps(arguments),
+                conversation_id="conv_forwarded",
+                agent_spec=None,
+            )
+
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", shell)
+    result = await tool_dispatch.execute_tool(
+        tool_name="sys_os_shell",
+        arguments=json.dumps({"command": "gh pr create"}),
+        conversation_id="conv_forwarded",
+        agent_spec=cast(Any, SimpleNamespace(os_env=None)),
+        mcp_manager=cast(Any, ForwardingManager()),
+    )
+    assert result == A + "\n"
+    assert observed == ["conv_forwarded"]
 
 
 @pytest.mark.parametrize(

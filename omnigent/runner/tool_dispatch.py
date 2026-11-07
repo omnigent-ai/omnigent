@@ -7278,7 +7278,8 @@ async def execute_tool(
         )
         output = f"Error: {type(exc).__name__}: {exc}"
 
-    if conversation_id and tool_name == "sys_os_shell":
+    # A call forwarded through the MCP endpoint is observed by the hop that runs it.
+    if conversation_id and tool_name == "sys_os_shell" and mcp_manager is None:
         from omnigent.runner.pr_observer import observe_tool_completion
 
         await asyncio.to_thread(
