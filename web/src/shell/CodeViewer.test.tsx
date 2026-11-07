@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type * as fileContentModule from "@/hooks/useFileContent";
+import type * as mathMarkdownModule from "@/components/ai-elements/mathMarkdown";
 import type { Comment } from "@/hooks/useComments";
 import { CodeViewer, type CodeViewerProps } from "./CodeViewer";
 import { FileViewerContext } from "./FileViewerContext";
@@ -14,6 +15,13 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 // ── Module mocks ──────────────────────────────────────────────────────────────
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
+vi.mock("@/components/ai-elements/mathMarkdown", async (importOriginal) => {
+  const actual = await importOriginal<typeof mathMarkdownModule>();
+  return {
+    ...actual,
+    normalizeExplicitMathDelimiters: vi.fn(actual.normalizeExplicitMathDelimiters),
+  };
+});
 vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
   ...(await importOriginal<typeof fileContentModule>()),
   useFileContent: vi.fn(() => ({ data: undefined })),
@@ -1278,17 +1286,51 @@ it.each([true, false])(
 );
 
 describe("large Markdown source fallback", () => {
-  it.each(["editor", "preview", "source"] as const)("uses Monaco in %s mode", async (viewMode) => {
+  const large = "# Large heading\n\n" + "a".repeat(MAX_RICH_MARKDOWN_BYTES + 1);
+
+  it("edits in Monaco from source mode", async () => {
     vi.mocked(highlightCode).mockClear();
-    renderViewer("a".repeat(MAX_RICH_MARKDOWN_BYTES + 1), true, "large.md", {
-      viewMode,
-      markdownSourceFallback: true,
-    });
+    renderViewer(large, true, "large.md", { viewMode: "source", markdownSourceFallback: true });
     expect(await screen.findByTestId("monaco-editor-stub")).toBeVisible();
     expect(screen.getByTestId("monaco-editor-stub")).toHaveAttribute("data-large-markdown", "true");
     expect(highlightCode).not.toHaveBeenCalled();
     expect(screen.queryByText(/too large to load fully/)).not.toBeInTheDocument();
   });
+
+  it("renders the preview, whose edit hint opens source", async () => {
+    vi.mocked(highlightCode).mockClear();
+    const onRequestEditMode = vi.fn();
+    renderViewer(large, true, "large.md", {
+      viewMode: "preview",
+      markdownSourceFallback: true,
+      onRequestEditMode,
+    });
+    expect(await screen.findByRole("heading", { name: "Large heading" })).toBeVisible();
+    expect(screen.queryByTestId("monaco-editor-stub")).not.toBeInTheDocument();
+    expect(highlightCode).not.toHaveBeenCalled();
+    expect(document.querySelector(".markdown-preview")?.className).toContain(
+      "content-visibility:auto",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
+    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  });
+});
+
+it("does not re-parse the Markdown preview when only unrelated props change", async () => {
+  const { normalizeExplicitMathDelimiters } = await import("@/components/ai-elements/mathMarkdown");
+  vi.mocked(normalizeExplicitMathDelimiters).mockClear();
+  const opts = { viewMode: "preview" } as const;
+  const view = render(viewerElement("# Stable", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Stable" })).toBeVisible();
+  view.rerender(viewerElement("# Stable", true, "notes.md", { ...opts, mediaActive: false }));
+  view.rerender(viewerElement("# Stable", false, "notes.md", opts));
+  expect(normalizeExplicitMathDelimiters).toHaveBeenCalledTimes(1);
+  expect(document.querySelector(".markdown-preview")?.className).not.toContain(
+    "content-visibility",
+  );
+  view.rerender(viewerElement("# Changed", true, "notes.md", opts));
+  expect(await screen.findByRole("heading", { name: "Changed" })).toBeVisible();
+  expect(normalizeExplicitMathDelimiters).toHaveBeenCalledTimes(2);
 });
 
 describe("CodeViewer refresh failures", () => {
