@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import threading
@@ -25,9 +26,10 @@ from omnigent.policies.builtins._shell import (
     unwrap_shell_command,
 )
 from omnigent.runner import pr_reports
-from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
+from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment, push_reflog
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
+from omnigent.runtime.filesystem_registry import GitCommandRunner
 
 _logger = logging.getLogger(__name__)
 # Ids of the providers that already failed once in this process.
@@ -38,20 +40,30 @@ _pending_lookups: set[tuple[str, str]] = set()
 _pending_lookups_lock = threading.Lock()
 
 
-def _failed(result: object) -> bool:
+def _unfinished(result: object) -> bool:
+    """Whether the call may still be running, or was stopped before it finished."""
     for obj in result_objects(result):
-        if obj.get("isError") is True or obj.get("is_error") is True:
-            return True
-        for key in ("exit_code", "exitCode", "returncode"):
-            if isinstance(obj.get(key), int) and obj[key] != 0:
-                return True
         if obj.get("session_id") is not None and obj.get("exit_code") is None:
             return True
         if obj.get("backgroundTaskId") or obj.get("background_task_id"):
             return True
         if obj.get("interrupted") is True or obj.get("status") in ("running", "in_progress"):
             return True
-        if obj.get("success") is False or obj.get("cancelled") is True:
+        if obj.get("cancelled") is True:
+            return True
+    return False
+
+
+def _failed(result: object) -> bool:
+    if _unfinished(result):
+        return True
+    for obj in result_objects(result):
+        if obj.get("isError") is True or obj.get("is_error") is True:
+            return True
+        for key in ("exit_code", "exitCode", "returncode"):
+            if isinstance(obj.get(key), int) and obj[key] != 0:
+                return True
+        if obj.get("success") is False:
             return True
     return bool(
         re.search(
@@ -274,11 +286,12 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
-def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
+def _shell_segments(command: str, depth: int = 0, *, split_or: bool = False) -> list[ShellSegment]:
     """Split a command into simple commands, unwrapping nested shell strings in place.
 
     A command with ``||`` or one that cannot be lexed has no segments, since
-    which of its commands ran is unknown.
+    which of its commands ran is unknown. With *split_or*, ``||`` separates
+    segments instead, and none of them is output-eligible.
     """
     if depth > MAX_SHELL_NESTING:
         return []
@@ -291,7 +304,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     output_eligible = not redirected
     try:
         for token in lexer:
-            if token == "||":
+            if token == "||" and not split_or:
                 return []
             if token and all(char in ";&|\n" for char in token):
                 if token.strip(";\n") not in {"", "&&"}:
@@ -307,7 +320,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            nested = _shell_segments(inner, depth + 1)
+            nested = _shell_segments(inner, depth + 1, split_or=split_or)
             if not nested:
                 output_eligible = False
             found.extend(nested)
@@ -416,15 +429,80 @@ def _object_pr(obj: dict[str, object], facets: list[_ProviderFacet]) -> PullRequ
     return None
 
 
+def _resolve_directory(current: str | None, argument: str) -> str | None:
+    """Return the absolute directory a ``cd``-style *argument* names, if known statically."""
+    if argument == "-" or "$" in argument or "`" in argument:
+        return None
+    path = os.path.expanduser(argument)
+    if not os.path.isabs(path):
+        if current is None:
+            return None
+        path = os.path.join(current, path)
+    return os.path.normpath(path)
+
+
+def _with_directories(segments: list[ShellSegment], start: str | None) -> list[ShellSegment]:
+    """Set each segment's ``cwd`` by following ``cd`` and ``git -C`` from *start*."""
+    current = start if start and os.path.isabs(start) else None
+    annotated: list[ShellSegment] = []
+    for segment in segments:
+        tokens = segment.invocation_tokens
+        directory = current
+        if tokens[0] in {"cd", "pushd"}:
+            arguments = [token for token in tokens[1:] if token not in {"-L", "-P", "-e", "--"}]
+            if tokens[0] == "cd" and not arguments:
+                arguments = ["~"]
+            current = _resolve_directory(current, arguments[0]) if arguments else None
+            directory = current
+        elif tokens[0] == "popd":
+            current = directory = None
+        elif os.path.basename(tokens[0]) == "git":
+            index = 1
+            while index < len(tokens) - 1 and tokens[index].startswith("-"):
+                if tokens[index] == "-C":
+                    directory = _resolve_directory(directory, tokens[index + 1])
+                index += 2 if tokens[index] in {"-C", "-c"} else 1
+        annotated.append(replace(segment, cwd=directory))
+    return annotated
+
+
 def _shell_operations(
-    tool_name: str, arguments: dict[str, object], facets: list[_ProviderFacet]
+    tool_name: str,
+    arguments: dict[str, object],
+    facets: list[_ProviderFacet],
+    cwd: str | None = None,
 ) -> list[tuple[str, ShellPrOp]]:
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
         return []
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
         return []
-    segments = _shell_segments(command)
+    workdir = arguments.get("workdir")
+    start = cwd
+    if isinstance(workdir, str) and workdir:
+        # An explicit workdir (``exec_command``) is where the command ran.
+        start = _resolve_directory(cwd, workdir) or start
+    parsed = _shell_segments(command)
+    if parsed and start:
+        # A native hook reports where the shell was after the command, which can be
+        # where it pushed, so the caller's directory is always a candidate.
+        parsed = [
+            ShellSegment(("cd", start), ("cd", start), parsed[0].output_eligible),
+            *parsed,
+        ]
+    segments = _with_directories(parsed, start)
+    if not segments:
+        # Output attribution rejects this command, but the checkouts it ran in
+        # still record its pushes, so pass only those on, as plain ``cd`` steps.
+        directories = ([start] if start else []) + [
+            segment.cwd
+            for segment in _with_directories(_shell_segments(command, split_or=True), start)
+            if segment.cwd
+        ]
+        segments = [
+            ShellSegment(("cd", path), ("cd", path), output_eligible=False, cwd=path)
+            for path in dict.fromkeys(directories)
+        ]
     return [
         (facet.provider_id, op) for facet in facets for op in facet.shell_pr_operations(segments)
     ]
@@ -520,14 +598,19 @@ def _record_resolved_prs(
     source: str,
     observation_id: str,
     created: bool = False,
+    git_runner: GitCommandRunner | None = None,
 ) -> None:
     try:
-        references = [ref for ref in resolve(result) if ref.provider == provider_id]
+        with push_reflog.git_runner(git_runner):
+            references = [ref for ref in resolve(result) if ref.provider == provider_id]
+        # Identical calls (same command, output and cwd) can push different branches;
+        # keying on what they found keeps the second from being dropped as a replay.
+        found = ",".join(sorted(ref.url for ref in references))
         SessionPrRegistry(session_id).record(
             references,
             relationship="created" if created else "worked_on",
             source=source,
-            observation_id=observation_id,
+            observation_id=f"{observation_id}:{found}",
         )
         pr_reports.notify(session_id)
     except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution
@@ -546,8 +629,15 @@ def observe_tool_completion(
     call_id: str = "",
     source: str = "tool",
     successful: bool = True,
+    cwd: str | None = None,
+    git_runner: GitCommandRunner | None = None,
 ) -> None:
-    """Best-effort observer; failures never change execution or tool results."""
+    """Best-effort observer; failures never change execution or tool results.
+
+    *cwd* is the directory a shell call started in, when the caller knows it.
+    *git_runner* runs the push scan's Git reads in the environment the shell ran
+    in, so a sandbox limits them as it limited the shell.
+    """
     if not successful or not session_id:
         return
     try:
@@ -561,11 +651,17 @@ def observe_tool_completion(
         if references:
             pr_reports.notify(session_id)
         shell_result = _shell_result(tool_name, result)
-        if not _failed(shell_result):
+        reported = shell_result.get("cwd") if isinstance(shell_result, dict) else None
+        if isinstance(reported, str) and reported:
+            # The shell reports where it actually ran, any workdir already applied.
+            cwd = reported
+            arguments = {key: value for key, value in arguments.items() if key != "workdir"}
+        failed = _failed(shell_result)
+        if not _unfinished(shell_result):
             for index, (provider_id, op) in enumerate(
-                _shell_operations(tool_name, arguments, _facets())
+                _shell_operations(tool_name, arguments, _facets(), cwd)
             ):
-                if op.resolve_result is None:
+                if op.resolve_result is None or (failed and not op.resolve_after_failure):
                     continue
                 observation_id = observation_key(
                     f"{source}:{provider_id}:{index}:resolved",
@@ -587,6 +683,7 @@ def observe_tool_completion(
                         source,
                         observation_id,
                         op.creates,
+                        git_runner,
                     )
                 except Exception:
                     with _pending_lookups_lock:
@@ -605,7 +702,7 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
     name, arguments = payload.get("tool_name"), payload.get("tool_input")
     if not isinstance(name, str) or not isinstance(arguments, dict):
         return
-    call_id = payload.get("tool_use_id")
+    call_id, cwd = payload.get("tool_use_id"), payload.get("cwd")
     observe_tool_completion(
         session_id,
         tool_name=name,
@@ -613,4 +710,5 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
         result=payload.get("tool_response", payload.get("tool_output")),
         call_id=call_id if isinstance(call_id, str) else "",
         source="native_hook",
+        cwd=cwd if isinstance(cwd, str) else None,
     )

@@ -682,6 +682,42 @@ def test_git_reads_preserve_filters_inside_the_session_sandbox(
         scratch_env.close()
 
 
+def test_git_ref_reads_stay_inside_the_session_sandbox(tmp_path: Path) -> None:
+    """The PR push scan's ref reads get the same reach checks as status and diff."""
+    workspace = tmp_path / "workspace"
+    repo = workspace / "repo"
+    repo.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    for checkout in (repo, outside):
+        subprocess.run(["git", "init", "-q"], cwd=checkout, check=True)
+        subprocess.run(
+            ["git", "remote", "add", "origin", "https://example.com/r.git"],
+            cwd=checkout,
+            check=True,
+        )
+    os_env = _helper_env(workspace, "none")
+    try:
+        for argv in (
+            ["rev-parse", "--git-common-dir"],
+            ["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+            ["remote"],
+            ["remote", "get-url", "--push", "origin"],
+        ):
+            assert os_env.run_git(argv, repo, 5).returncode == 0, argv
+            with pytest.raises(OSError, match="outside"):
+                os_env.run_git(argv, outside, 5)
+        for argv in (
+            ["remote", "add", "x", "https://example.com/x.git"],
+            ["reflog", "expire", "--all"],
+            ["config", "core.worktree", "/outside"],
+        ):
+            with pytest.raises(OSError, match="Invalid Git"):
+                os_env.run_git(argv, repo, 5)
+    finally:
+        os_env.close()
+
+
 def test_git_read_timeout_survives_helper_transport(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

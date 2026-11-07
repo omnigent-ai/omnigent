@@ -1,8 +1,11 @@
-"""Push status identifies the updated remote branch without inspecting the checkout."""
+"""Pushes are found from git's status output and from the checkout's reflog."""
 
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import Mock
@@ -10,7 +13,7 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.runner import github_resource, pr_observer
-from omnigent.runner.git_providers import github_push
+from omnigent.runner.git_providers import github_push, push_reflog
 from omnigent.runner.git_providers.github_push import push_operation, pushed_prs
 from omnigent.runner.pr_observer import _shell_segments, observe_tool_completion
 from omnigent.runner.session_prs import SessionPrRegistry
@@ -285,3 +288,503 @@ def test_serialized_shell_envelope_reaches_the_push_lookup_decoded(
         )
     entries = SessionPrRegistry("conv_push").list()
     assert [(entry.url, entry.relationship) for entry in entries] == [(PR_URL, "worked_on")]
+
+
+def _git(*argv: str, cwd: Path) -> str:
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    return subprocess.run(
+        ["git", *argv], cwd=cwd, check=True, capture_output=True, text=True, env=env
+    ).stdout
+
+
+def _report(directories: list[str]) -> list[tuple[str, str]]:
+    """Return ``(url, branch)`` for recent pushes, marking them reported as a lookup would."""
+    pushes = push_reflog.recent_pushes(directories)
+    push_reflog.mark_reported(push.key for push in pushes)
+    return [(push.url, push.branch) for push in pushes]
+
+
+@pytest.fixture
+def checkout(tmp_path: Path) -> tuple[Path, Path]:
+    """A checkout on branch ``local`` whose ``origin`` is a local bare repository."""
+    remote, work = tmp_path / "remote.git", tmp_path / "work"
+    _git("init", "--bare", "-q", str(remote), cwd=tmp_path)
+    _git("init", "-q", "-b", "local", str(work), cwd=tmp_path)
+    _git("remote", "add", "origin", str(remote), cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "change", cwd=work)
+    return remote, work
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("git shipit 2>&1 | tail -1", id="alias-piped"),
+        pytest.param("git push -q origin HEAD:feature/topic", id="quiet"),
+        pytest.param("sh push.sh > /dev/null 2>&1", id="script-redirected"),
+    ],
+)
+def test_reflog_reports_pushes_the_output_cannot_show(
+    checkout: tuple[Path, Path], command: str
+) -> None:
+    remote, work = checkout
+    _git("config", "alias.shipit", "push origin HEAD:feature/topic", cwd=work)
+    (work / "push.sh").write_text("git push origin HEAD:feature/topic\n")
+    subprocess.run(command, shell=True, cwd=work, check=True, capture_output=True)
+    assert _report([str(work)]) == [(str(remote), "feature/topic")]
+    # A later call in the same checkout does not report the push again.
+    assert _report([str(work)]) == []
+
+
+def test_reflog_ignores_pushes_this_checkout_did_not_make(
+    checkout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, work = checkout
+    _git("push", "-q", "--dry-run", "origin", "HEAD:feature/dry-run", cwd=work)
+    assert _report([str(work)]) == []
+    # Another worktree of the same repository pushes a different commit.
+    other = work.parent / "other"
+    _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "other", cwd=other)
+    _git("push", "-q", "origin", "HEAD:feature/other", cwd=other)
+    assert _report([str(work)]) == []
+    # Checking out someone else's pushed branch only fetches it.
+    clone = work.parent / "clone"
+    _git("clone", "-q", str(remote), str(clone), cwd=work.parent)
+    _git("commit", "-q", "--allow-empty", "-m", "theirs", cwd=clone)
+    _git("push", "-q", "origin", "HEAD:feature/theirs", cwd=clone)
+    _git("fetch", "-q", "origin", cwd=work)
+    _git("checkout", "-q", "origin/feature/theirs", cwd=work)
+    assert _report([str(work)]) == []
+    # A push made long before the call is not this call's.
+    _git("checkout", "-q", "local", cwd=work)
+    _git("push", "-q", "origin", "HEAD:feature/old", cwd=work)
+    later = push_reflog.time.time() + push_reflog.RECENT_PUSH_SECONDS + 60
+    monkeypatch.setattr(push_reflog.time, "time", lambda: later)
+    assert _report([str(work)]) == []
+
+
+@pytest.fixture
+def checked_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Directories the observer asks the reflog about; each reports one push with an open PR."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    checked: list[str] = []
+
+    def recent_pushes(candidates: object) -> list[push_reflog.RecentPush]:
+        checked.extend(candidates)  # type: ignore[call-overload]
+        return [
+            push_reflog.RecentPush(
+                "git@github.com:contributor/project.git", "feature/topic", ("repo", "ref", "x", 0)
+            )
+        ]
+
+    monkeypatch.setattr(github_push, "recent_pushes", recent_pushes)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+    pool = ThreadPoolExecutor(max_workers=1)
+    monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+    yield checked
+    pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize(
+    "cwd,arguments,directories",
+    [
+        pytest.param(
+            "/work/repo", {"command": "git pp 2>&1 | tail -3"}, ["/work/repo"], id="hook-cwd"
+        ),
+        pytest.param(
+            "/work",
+            {"command": "cd repo && git pp | tail -3"},
+            ["/work", "/work/repo"],
+            id="relative-cd",
+        ),
+        # Claude Code reports its cwd after the command, so "cd repo" already happened.
+        pytest.param(
+            "/work/repo",
+            {"command": "cd repo && ./push.sh"},
+            ["/work/repo", "/work/repo/repo"],
+            id="post-command-hook-cwd",
+        ),
+        pytest.param(
+            None,
+            {"command": "git -C /work/repo pp && echo done"},
+            ["/work/repo"],
+            id="git-C-without-cwd",
+        ),
+        pytest.param(None, {"command": "git pp"}, [], id="no-directory"),
+        # An explicit workdir is where the command ran, relative to the hook cwd.
+        pytest.param(
+            "/work", {"cmd": "./push.sh", "workdir": "repo"}, ["/work/repo"], id="relative-workdir"
+        ),
+        # Output attribution rejects OR-lists, but their checkouts still get checked.
+        pytest.param(
+            "/work/repo", {"command": "git pp || true"}, ["/work/repo"], id="or-list-hook-cwd"
+        ),
+        pytest.param(
+            "/work",
+            {"command": "cd repo && git pp || echo failed"},
+            ["/work", "/work/repo"],
+            id="or-list-relative-cd",
+        ),
+        pytest.param(
+            None,
+            {"command": "git -C /work/repo pp || true"},
+            ["/work/repo"],
+            id="or-list-git-C-without-cwd",
+        ),
+    ],
+)
+def test_native_hook_checks_the_directories_the_command_ran_in(
+    checked_directories: list[str],
+    cwd: str | None,
+    arguments: dict[str, str],
+    directories: list[str],
+) -> None:
+    pr_observer.observe_hook(
+        "conv_hook",
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "exec_command" if "cmd" in arguments else "Bash",
+            "tool_input": arguments,
+            "tool_response": {"stdout": "done\n", "stderr": "", "interrupted": False},
+            "tool_use_id": "toolu_push",
+            "cwd": cwd,
+        },
+    )
+    pr_observer._lookup_pool.shutdown(wait=True)
+    assert list(dict.fromkeys(checked_directories)) == directories
+    entries = SessionPrRegistry("conv_hook").list()
+    assert [entry.url for entry in entries] == ([PR_URL] if directories else [])
+
+
+def test_runner_shell_checks_the_directory_it_reports_running_in(
+    checked_directories: list[str],
+) -> None:
+    """A configured ``os_env.cwd`` with no runner workspace still names the checkout."""
+    observe_tool_completion(
+        "conv_shell",
+        tool_name="sys_os_shell",
+        arguments={"command": "./push.sh"},
+        result=json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"}),
+        call_id="shell_push",
+        source="runner_shell",
+    )
+    pr_observer._lookup_pool.shutdown(wait=True)
+    assert list(dict.fromkeys(checked_directories)) == ["/repo"]
+    assert [entry.url for entry in SessionPrRegistry("conv_shell").list()] == [PR_URL]
+
+
+def test_reflog_reports_distinct_pushes_to_one_branch_in_the_same_second(
+    checkout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, work = checkout
+    other = work.parent / "other"
+    _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "other", cwd=other)
+    # Git stamps reflog entries with the committer date, so both land in one second.
+    monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{int(push_reflog.time.time())} +0000")
+    _git("push", "-q", "origin", "HEAD:feature/shared", cwd=work)
+    assert _report([str(work)]) == [(str(remote), "feature/shared")]
+    _git("push", "-q", "--force", "origin", "HEAD:feature/shared", cwd=other)
+    assert _report([str(other)]) == [(str(remote), "feature/shared")]
+    assert _report([str(other)]) == []
+
+
+def test_identical_runner_shell_calls_record_each_pushed_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    url = "git@github.com:contributor/project.git"
+    pushes = iter(
+        [
+            [push_reflog.RecentPush(url, "feature/a", ("repo", "a", "x", 0))],
+            [push_reflog.RecentPush(url, "feature/b", ("repo", "b", "y", 0))],
+        ]
+    )
+    monkeypatch.setattr(github_push, "recent_pushes", lambda _directories: next(pushes))
+    urls = {
+        branch: f"https://github.com/contributor/project/pull/{number}"
+        for branch, number in (("feature/a", 1), ("feature/b", 2))
+    }
+
+    def gh(argv: list[str], **_: object) -> tuple[int, str, str]:
+        branch = argv[-1].split("/commits/")[1].split("/pulls")[0].replace("%2F", "/")
+        head = {"ref": branch, "repo": {"full_name": "contributor/project"}}
+        return 0, json.dumps([{"state": "open", "head": head, "html_url": urls[branch]}]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    result = json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"})
+    for _ in range(2):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+            observe_tool_completion(
+                "conv_quiet",
+                tool_name="sys_os_shell",
+                arguments={"command": "./push.sh"},
+                result=result,
+                source="runner_shell",
+            )
+    entries = SessionPrRegistry("conv_quiet").list()
+    assert sorted(entry.url for entry in entries) == sorted(urls.values())
+
+
+def test_reflog_read_does_not_run_a_configured_signature_verifier(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    remote, work = checkout
+    marker = tmp_path / "verifier-ran"
+    verifier = tmp_path / "verifier.sh"
+    verifier.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    verifier.chmod(0o755)
+    # An agent can write the checkout's config and commit a signature header.
+    tree = _git("hash-object", "-t", "tree", "/dev/null", cwd=work).strip()
+    head = _git("rev-parse", "HEAD", cwd=work).strip()
+    signed = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=work,
+        input=(
+            f"tree {tree}\nparent {head}\n"
+            "author Test <test@example.com> 1700000000 +0000\n"
+            "committer Test <test@example.com> 1700000000 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n"
+            "\nsigned\n"
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git("reset", "-q", "--hard", signed, cwd=work)
+    _git("push", "-q", "origin", "HEAD:feature/signed", cwd=work)
+    _git("config", "log.showSignature", "true", cwd=work)
+    _git("config", "gpg.program", str(verifier), cwd=work)
+    assert _report([str(work)]) == [(str(remote), "feature/signed")]
+    assert not marker.exists()
+
+
+def test_failed_lookup_leaves_the_push_for_a_later_call(
+    checkout: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    # Report the push as going to GitHub; the push itself went to the local remote.
+    _git("config", "remote.origin.pushurl", "git@github.com:contributor/project.git", cwd=work)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    gh = Mock(side_effect=[(1, "", "unavailable"), (0, json.dumps([row]), "")])
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    segments = pr_observer._with_directories(_shell_segments("./push.sh"), str(work))
+    result = {"stdout": "", "stderr": "", "exit_code": 0}
+    assert pushed_prs(segments, result) == []
+    assert [reference.url for reference in pushed_prs(segments, result)] == [PR_URL]
+    assert pushed_prs(segments, result) == []
+    assert gh.call_count == 2
+
+
+def test_reflog_checks_every_directory_the_command_ran_in(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    remote, work = checkout
+    elsewhere = [tmp_path / name for name in "abcd"]
+    for directory in elsewhere:
+        directory.mkdir()
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    directories = [*map(str, elsewhere), str(work)]
+    assert _report(directories) == [(str(remote), "feature/topic")]
+
+
+def test_reflog_read_does_not_fetch_a_missing_object(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    marker = tmp_path / "upload-pack-ran"
+    upload_pack = tmp_path / "upload-pack.sh"
+    upload_pack.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    upload_pack.chmod(0o755)
+    # An agent can make the checkout a partial clone whose fetch runs its own program,
+    # then drop the pushed commit so reading the reflog would fetch it.
+    _git("config", "core.repositoryformatversion", "1", cwd=work)
+    _git("config", "extensions.partialClone", "origin", cwd=work)
+    _git("config", "remote.origin.promisor", "true", cwd=work)
+    _git("config", "remote.origin.uploadpack", str(upload_pack), cwd=work)
+    head = _git("rev-parse", "HEAD", cwd=work).strip()
+    (work / ".git" / "objects" / head[:2] / head[2:]).unlink()
+    assert not marker.exists()
+    push_reflog.recent_pushes([str(work)])
+    assert not marker.exists()
+
+
+def test_reflog_scan_reads_through_the_session_git_runner(
+    checkout: tuple[Path, Path],
+) -> None:
+    remote, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    reads: list[list[str]] = []
+
+    def allowed(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        reads.append(argv)
+        return subprocess.run(["git", *argv], cwd=cwd, capture_output=True, timeout=timeout)
+
+    def refused(argv: list[str], cwd: Path, timeout: float) -> subprocess.CompletedProcess[bytes]:
+        raise OSError(f"{cwd} is outside the sandbox")
+
+    # A sandbox that refuses the checkout hides its pushes from the scan.
+    with push_reflog.git_runner(refused):
+        assert push_reflog.recent_pushes([str(work)]) == []
+    with push_reflog.git_runner(allowed):
+        pushes = push_reflog.recent_pushes([str(work)])
+    assert [(push.url, push.branch) for push in pushes] == [(str(remote), "feature/topic")]
+    assert reads and all(
+        argv[0] in {"rev-parse", "for-each-ref", "reflog", "remote"} for argv in reads
+    )
+
+
+@pytest.mark.parametrize("has_registry", [True, False])
+async def test_runner_shell_dispatch_scans_through_the_session_environment(
+    monkeypatch: pytest.MonkeyPatch, has_registry: bool
+) -> None:
+    from omnigent.runner import tool_dispatch
+
+    async def shell(*_args: object, **_kwargs: object) -> str:
+        return json.dumps({"stdout": "", "stderr": "", "exit_code": 0, "cwd": "/repo"})
+
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(tool_dispatch, "_execute_os_env_tool", shell)
+    monkeypatch.setattr(
+        pr_observer, "observe_tool_completion", lambda *_a, **kw: observed.update(kw)
+    )
+    environment = Mock()
+    environment.run_git.return_value = subprocess.CompletedProcess(["git"], 0, b"", b"")
+    registry = Mock()
+    registry.resolve_environment.return_value = environment
+    await tool_dispatch.execute_tool(
+        tool_name="sys_os_shell",
+        arguments=json.dumps({"command": "./push.sh"}),
+        conversation_id="conv_sandboxed",
+        agent_spec=None,
+        resource_registry=registry if has_registry else None,
+    )
+    run_git = observed["git_runner"]
+    assert callable(run_git)
+    if has_registry:
+        run_git(["remote"], Path("/repo"), 5.0)
+        environment.run_git.assert_called_once_with(["remote"], Path("/repo"), 5.0)
+    else:
+        with pytest.raises(OSError):
+            run_git(["remote"], Path("/repo"), 5.0)
+
+
+def test_sandboxed_scan_finds_pushes_only_inside_the_workspace(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+
+    remote, work = checkout
+    outside = tmp_path / "outside"
+    _git("clone", "-q", str(remote), str(outside), cwd=tmp_path)
+    _git("push", "-q", "origin", "HEAD:feature/inside", cwd=work)
+    _git("commit", "-q", "--allow-empty", "-m", "outside", cwd=outside)
+    _git("push", "-q", "origin", "HEAD:feature/outside", cwd=outside)
+    environment = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(work),
+            sandbox=OSEnvSandboxSpec(type="none", read_paths=[], write_paths=["."]),
+        )
+    )
+    assert environment is not None
+    try:
+        with push_reflog.git_runner(environment.run_git):
+            pushes = push_reflog.recent_pushes([str(outside), str(work)])
+    finally:
+        environment.close()
+    assert [(push.url, push.branch) for push in pushes] == [(str(remote), "feature/inside")]
+
+
+@pytest.mark.parametrize(
+    "outcome,recorded",
+    [
+        pytest.param({"exit_code": 1}, True, id="failed-after-push"),
+        pytest.param({"exit_code": 0}, True, id="succeeded"),
+        pytest.param({"exit_code": None, "session_id": 7}, False, id="still-running"),
+        pytest.param({"exit_code": 0, "background_task_id": "job"}, False, id="backgrounded"),
+    ],
+)
+def test_finished_shell_calls_are_scanned_even_when_they_fail(
+    checkout: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: dict[str, object],
+    recorded: bool,
+) -> None:
+    """``git push -q origin HEAD:feature/topic; false`` pushed, then failed."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    _git("config", "remote.origin.pushurl", "git@github.com:contributor/project.git", cwd=work)
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+    result = {"stdout": "", "stderr": "", "cwd": str(work), **outcome}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_failed_push",
+            tool_name="sys_os_shell",
+            arguments={"command": "./push.sh"},
+            result=json.dumps(result),
+            source="runner_shell",
+        )
+    entries = SessionPrRegistry("conv_failed_push").list()
+    assert [entry.url for entry in entries] == ([PR_URL] if recorded else [])
+
+
+def test_reflog_scan_failure_keeps_the_output_parsed_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session without an environment to read in still records a literal push."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+
+    def no_environment(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        raise ValueError("Session has no os_env to resolve")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_no_env",
+            tool_name="sys_os_shell",
+            arguments={"command": "git push origin local:feature/topic"},
+            result=json.dumps(
+                {"stdout": "", "stderr": PUSH_OUTPUT, "exit_code": 0, "cwd": str(tmp_path)}
+            ),
+            call_id="push",
+            git_runner=no_environment,
+        )
+    assert [entry.url for entry in SessionPrRegistry("conv_no_env").list()] == [PR_URL]

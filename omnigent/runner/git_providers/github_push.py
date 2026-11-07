@@ -1,22 +1,25 @@
-"""Resolve existing GitHub PRs from successful git push status output."""
+"""Resolve existing GitHub PRs for branches a shell call pushed."""
 
 from __future__ import annotations
 
 import functools
 import json
+import logging
 import re
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import PurePath
 from urllib.parse import quote
 
 from omnigent.git_providers import resolve_remote
 from omnigent.policies.builtins.github import _git_subcommand_index
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
+from omnigent.runner.git_providers.push_reflog import mark_reported, recent_pushes
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
 from omnigent.runner.session_prs import PullRequestRef
 
+_logger = logging.getLogger(__name__)
 _NORMAL_UPDATE = re.compile(
     r"^[ \t]*[+*]?[ \t]*(?:[0-9a-f]{4,64}\.\.\.?[0-9a-f]{4,64}|\[new branch\])"
     r"\s+\S+\s+->\s+(\S+)(?:\s+\(forced update\))?\s*$"
@@ -97,8 +100,12 @@ def _push_count(segments: Sequence[ShellSegment]) -> int:
 
 
 def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
-    """Describe a push for deferred resolution without changing stdout attribution."""
-    if not _push_count(segments):
+    """Describe a push for deferred resolution without changing stdout attribution.
+
+    A call that ran in a known checkout always gets one, since an alias or script
+    can push without a recognizable ``git push`` in the command.
+    """
+    if not _push_count(segments) and not any(segment.cwd for segment in segments):
         return None
     return ShellPrOp(
         tracks=True,
@@ -106,16 +113,44 @@ def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
         target=None,
         content_only=True,
         resolve_result=functools.partial(pushed_prs, tuple(segments)),
+        # A command can push and then fail, e.g. "git push -q; make test"; only the
+        # reflog of a known checkout shows such a push.
+        resolve_after_failure=any(segment.cwd for segment in segments),
     )
 
 
 def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullRequestRef]:
     """Find open PRs whose head matches a branch positively updated by this push."""
-    from omnigent.runner import github_resource
-    from omnigent.runner.pr_observer import _failed
+    from omnigent.runner.pr_observer import _failed, _unfinished
 
+    if _unfinished(result):
+        return []
+    # Output names a push only when the call succeeded; the reflog records one either way.
+    targets = dict.fromkeys(() if _failed(result) else _output_targets(segments, result))
+    pushes: dict[tuple[str, str, str], list[tuple[str, str, str, int]]] = {}
+    try:
+        found = recent_pushes(segment.cwd for segment in segments if segment.cwd)
+    except Exception:  # noqa: BLE001 — the reflog scan must not cost the output's targets
+        _logger.warning("Reflog push scan failed", exc_info=True)
+        found = []
+    for push in found:
+        remote = resolve_remote(push.url)
+        if remote is not None and remote.provider == "github":
+            target = (remote.host, remote.repository, push.branch)
+            targets[target] = None
+            pushes.setdefault(target, []).append(push.key)
+    references, looked_up = _open_prs(targets)
+    # A failed or skipped lookup leaves the push for the next shell call to retry.
+    mark_reported(key for target in looked_up for key in pushes.get(target, []))
+    return references
+
+
+def _output_targets(
+    segments: Sequence[ShellSegment], result: object
+) -> list[tuple[str, str, str]]:
+    """Return ``(host, repository, branch)`` for each update in literal ``git push`` output."""
     count = _push_count(segments)
-    if not count or _failed(result):
+    if not count:
         return []
     text = output_text(result)
     # Claude Bash merges process streams into stdout; its stderr holds diagnostics.
@@ -148,7 +183,20 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
             elif not match[1].startswith("refs/") or match[1].startswith("refs/heads/"):
                 branch = match[1].removeprefix("refs/heads/")
                 targets[(remote.host, remote.repository, branch)] = None
+    return list(targets)
+
+
+def _open_prs(
+    targets: Iterable[tuple[str, str, str]],
+) -> tuple[list[PullRequestRef], set[tuple[str, str, str]]]:
+    """Return the open PRs whose head is each ``(host, repository, branch)``.
+
+    Also returns the targets GitHub answered for, whether or not they have a PR.
+    """
+    from omnigent.runner import github_resource
+
     references: dict[str, PullRequestRef] = {}
+    answered: set[tuple[str, str, str]] = set()
     deadline = time.monotonic() + 5.0
     with github_resource._gh_deadline_scope(deadline):
         for host, repository, branch in targets:
@@ -166,6 +214,7 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
                 continue
             if not isinstance(rows, list):
                 continue
+            answered.add((host, repository, branch))
             for row in rows:
                 if not isinstance(row, dict) or row.get("state") != "open":
                     continue
@@ -183,4 +232,4 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
                     and reference.host == host
                 ):
                     references[reference.url] = reference
-    return list(references.values())
+    return list(references.values()), answered
