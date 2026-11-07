@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import * as Dialog from "radix-ui/dialog";
 import { MemoryRouter, useLocation, useMatch, useNavigate } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CanvasWorkspace, useCanvasWorkspace } from "./CanvasWorkspace";
 
@@ -154,6 +155,27 @@ describe("CanvasWorkspace", () => {
     expect(screen.queryByRole("separator")).toBeNull();
     expect(screen.getByLabelText("Board state")).toBe(board);
     expect(board).toHaveValue("Preserved viewport and cards");
+  });
+
+  it("restores the board on Escape without declining a question in the conversation", async () => {
+    await renderWorkspace("/canvas/c/first?canvas=project");
+    const onReject = vi.fn();
+    render(
+      <AskUserQuestionForm
+        elicitationId="elic_canvas"
+        questions={[
+          { id: "pick", question: "Pick one", multiSelect: false, options: [{ label: "A" }] },
+        ]}
+        onSubmit={vi.fn()}
+        onReject={onReject}
+        keyboardActive
+      />,
+    );
+    fireEvent.click(screen.getByText("Focus session"));
+    expect(screen.getByLabelText("Canvas pane")).toHaveClass("hidden");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.getByLabelText("Canvas pane")).not.toHaveClass("hidden");
+    expect(onReject).not.toHaveBeenCalled();
   });
 
   it("persists keyboard resizing within both panes' minimum widths", async () => {

@@ -213,6 +213,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **Foreground terminal hangup (own environment, Linux):**
+  `tests/e2e/test_host_terminal_hangup_mid_turn_e2e.py::test_terminal_hangup_lets_in_flight_turn_finish`
+  closes a real PTY while a mock reply is held. Direct and zygote runners finish
+  the same turn after the host dies by SIGHUP, without replay, then exit. SIGTERM
+  and Ctrl-C controls stop the busy runner before the reply is released. Run
+  with plain `uv run --no-sync pytest`; no live credentials are needed. This
+  proves the foreground terminal path; a generic SIGHUP report does not identify
+  its initiator. Installed system services and native browser journeys are separate.
 - **Background harness credentials (own environment, installed Codex/Claude SDK):**
   `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
   and background hosts. Saved provider env references and named passthrough keep

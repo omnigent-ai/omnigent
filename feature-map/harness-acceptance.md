@@ -212,15 +212,17 @@ user agent root, with relative local-package paths and disabled-resource pattern
 default and relative custom roots; inspect provider requests for loaded skills,
 package markers, excluded extensions, and unchanged SDK tool restrictions.
 `tests/e2e/omnigent/test_pi_context_files_e2e.py` checks that context/prompt controls
-and `skills: none` still apply. Native startup/resume is covered by
+and `skills: none` still apply, and that the user root's `AGENTS.md` follows
+`context_files`. Native startup/resume is covered by
 `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` through server/host/runner.
 A host custom root uses the existing explicit
 `OMNIGENT_RUNNER_ENV_PASSTHROUGH=PI_CODING_AGENT_DIR` setting.
 
 These scenarios use real Pi with scripted providers or prompt-observer extensions;
 they do not establish marketplace compatibility, browser rendering, live MCP OAuth,
-OS sandbox or Managed deployment acceptance. Linked resources are shared writable
-files; global instruction files, model credentials and session state stay separate.
+OS sandbox or Managed deployment acceptance. Linked resources, including global
+context files, are shared writable files; `SYSTEM.md`, `APPEND_SYSTEM.md`, model
+credentials and session state stay separate.
 
 ### Deterministic checks versus live canaries
 
