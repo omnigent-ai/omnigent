@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { useState } from "react";
 import { expect, userEvent, within } from "storybook/test";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import type { Host } from "@/hooks/useHosts";
 import type { AgentBundleInput } from "@/lib/agentBundle";
@@ -278,6 +279,51 @@ export const OtherHarnessSelected: Story = {
     await expect(
       await within(canvasElement.ownerDocument.body).findByTestId("new-chat-landing-harness-more"),
     ).toHaveTextContent("Other... (OpenCode Experimental Extended Harness)");
+  },
+};
+
+// Edit on an "Other..." harness selects it, so its host model catalog starts
+// loading; the open flyout and model submenu stay up with a loading row.
+function EditOtherHarnessWhileLoading(args: React.ComponentProps<typeof AgentHarnessPicker>) {
+  const [selectedId, setSelectedId] = useState(claude.id);
+  const loading = selectedId === pi.id;
+  return (
+    <AgentHarnessPicker
+      {...args}
+      effectiveAgentId={selectedId}
+      agentLabel={loading ? "Pi" : "Claude Code"}
+      loading={loading}
+      onSelectAgent={(next) => setSelectedId(next.id)}
+      selectedConfigContent={
+        <ComposerConfigSections
+          models={{
+            testId: "new-chat-landing-agent-models",
+            header: "Models",
+            leading: loading ? (
+              <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+            ) : undefined,
+            choices: loading ? [] : [{ key: "opus", label: "Opus 4.8", checked: true }],
+          }}
+        />
+      }
+    />
+  );
+}
+
+export const OtherHarnessEditLoadingModels: Story = {
+  args: { harnessEntries: otherHarnesses },
+  render: (args) => <EditOtherHarnessWhileLoading {...args} />,
+  play: async ({ canvasElement }) => {
+    await openPicker(canvasElement);
+    const page = within(canvasElement.ownerDocument.body);
+    const other = await page.findByTestId("new-chat-landing-harness-more");
+    await userEvent.click(other);
+    const edit = await page.findByTestId(`new-chat-landing-agent-config-${pi.id}`);
+    await userEvent.click(within(edit).getByText("Edit", { exact: true }));
+    await expect(await page.findByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+    await expect(other).toHaveAttribute("data-state", "open");
   },
 };
 
