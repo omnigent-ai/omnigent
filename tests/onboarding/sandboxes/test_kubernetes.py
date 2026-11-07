@@ -1312,6 +1312,7 @@ class _FakeCore:
     def __init__(self) -> None:
         self.calls: list[str] = []
         self.created_secrets: list[dict[str, object]] = []
+        self.patched_secrets: list[tuple[str, dict[str, object]]] = []
         self.deleted_secrets: list[str] = []
         self.deleted_pods: list[str] = []
         self.delete_pod_errors: list[Exception | None] = []
@@ -1323,14 +1324,16 @@ class _FakeCore:
         self.list_pod_error: Exception | None = None
         self.last_label_selector: str | None = None
         self.pod_list_items: list[object] = []
-        self.secret_patches: list[tuple[str, dict[str, object]]] = []
-        self.patch_secret_error: Exception | None = None
 
     def create_namespaced_secret(self, namespace, body, _request_timeout=None):
         self.calls.append("create_secret")
         if self.create_secret_error is not None:
             raise self.create_secret_error
         self.created_secrets.append(body)
+
+    def patch_namespaced_secret(self, name, namespace, body, _request_timeout=None):
+        self.calls.append("patch_secret")
+        self.patched_secrets.append((name, body))
 
     def list_namespaced_pod(self, namespace, label_selector=None, _request_timeout=None):
         self.calls.append("list_pod")
@@ -1345,12 +1348,6 @@ class _FakeCore:
         if isinstance(resp, Exception):
             raise resp
         return resp
-
-    def patch_namespaced_secret(self, name, namespace, body, _request_timeout=None):
-        self.calls.append("patch_secret")
-        if self.patch_secret_error is not None:
-            raise self.patch_secret_error
-        self.secret_patches.append((name, body))
 
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
@@ -1383,18 +1380,16 @@ class _FakeBatch:
         self.last_delete_body: object = None
         self.create_job_error: Exception | None = None
         self.delete_job_errors: list[Exception | None] = []
-        # Server-assigned uid echoed on the created Job; None mimics a response
-        # without one (nothing to own the token Secret).
-        self.job_uid: str | None = "uid-job-1"
 
     def create_namespaced_job(self, namespace, body, _request_timeout=None):
         self.calls.append("create_job")
         if self.create_job_error is not None:
             raise self.create_job_error
         self.created_jobs.append(body)
-        return SimpleNamespace(
-            metadata=SimpleNamespace(name=body["metadata"]["name"], uid=self.job_uid)
-        )
+        return self.read_namespaced_job(body["metadata"]["name"], namespace)
+
+    def read_namespaced_job(self, name, namespace, _request_timeout=None):
+        return SimpleNamespace(metadata=SimpleNamespace(name=name, uid=f"uid-{name}"))
 
     def delete_namespaced_job(self, name, namespace, body=None, _request_timeout=None):
         self.calls.append("delete_job")
@@ -1505,49 +1500,10 @@ def test_launch_host_creates_secret_then_job_and_returns_workspace(
     assert batch.deleted_jobs == []
 
 
-def test_launch_host_makes_the_job_own_its_token_secret(
-    fake_clients: tuple[_FakeCore, _FakeBatch],
-) -> None:
-    """
-    The token Secret is patched to be owned by the Job right after the Job
-    exists, so a Job reaped by activeDeadlineSeconds + ttlSecondsAfterFinished
-    (which never runs terminate()) takes its Secret with it instead of leaking
-    it into the namespace's count/secrets quota.
-    """
-    core, batch = fake_clients
-    _setup_pod_discovery(core)
-    _launcher().start_host(
-        "omnigent-job-1",
-        token=_TOKEN,
-        host_id="host_1",
-        host_name="managed-1",
-        server_url="http://srv.example.com",
-    )
-    assert core.secret_patches == [
-        (
-            "omnigent-job-1-token",
-            {
-                "metadata": {
-                    "ownerReferences": [
-                        {
-                            "apiVersion": "batch/v1",
-                            "kind": "Job",
-                            "name": "omnigent-job-1",
-                            "uid": "uid-job-1",
-                        }
-                    ]
-                }
-            },
-        )
-    ]
-    # Adopted only once the owner exists (and before readiness polling).
-    assert batch.calls.index("create_job") == 0
-    assert core.calls.index("patch_secret") > core.calls.index("create_secret")
-    assert core.calls.index("patch_secret") < core.calls.index("list_pod")
-
-
 def test_launch_host_survives_a_forbidden_secret_adoption(
-    fake_clients: tuple[_FakeCore, _FakeBatch], caplog: pytest.LogCaptureFixture
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     A Role without `patch` on secrets (every deployment before this change)
@@ -1556,7 +1512,11 @@ def test_launch_host_survives_a_forbidden_secret_adoption(
     """
     core, batch = fake_clients
     _setup_pod_discovery(core)
-    core.patch_secret_error = _FakeApiException(status=403, reason="Forbidden")
+
+    def forbidden_patch(name, namespace, body, _request_timeout=None):
+        raise _FakeApiException(status=403, reason="Forbidden")
+
+    monkeypatch.setattr(core, "patch_namespaced_secret", forbidden_patch)
     with caplog.at_level(logging.WARNING, logger=k8s.__name__):
         workspace = _launcher().start_host(
             "omnigent-job-1",
@@ -1572,12 +1532,18 @@ def test_launch_host_survives_a_forbidden_secret_adoption(
 
 
 def test_launch_host_skips_adoption_when_the_job_has_no_uid(
-    fake_clients: tuple[_FakeCore, _FakeBatch],
+    fake_clients: tuple[_FakeCore, _FakeBatch], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """No uid on the create response means nothing can own the Secret: no patch."""
     core, batch = fake_clients
     _setup_pod_discovery(core)
-    batch.job_uid = None
+    monkeypatch.setattr(
+        batch,
+        "read_namespaced_job",
+        lambda name, namespace, _request_timeout=None: SimpleNamespace(
+            metadata=SimpleNamespace(name=name, uid=None)
+        ),
+    )
     _launcher().start_host(
         "omnigent-job-1",
         token=_TOKEN,
@@ -1818,6 +1784,142 @@ def test_launch_host_cleans_up_on_create_failure(
         )
     assert "omnigent-job-3-token" in core.deleted_secrets
     assert "omnigent-job-3" in batch.deleted_jobs
+
+
+def test_launch_host_token_secret_is_owned_by_its_job(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+) -> None:
+    """Kubernetes garbage-collects the token Secret with its Job, however the Job is deleted."""
+    core, _batch = fake_clients
+    _setup_pod_discovery(core)
+    _launcher().start_host(
+        "omnigent-job-owned",
+        token=_TOKEN,
+        host_id="host_owned",
+        host_name="managed-owned",
+        server_url="http://srv.example.com",
+    )
+    secret_metadata = [core.created_secrets[0]["metadata"]]
+    secret_metadata += [patch.get("metadata", {}) for _name, patch in core.patched_secrets]
+    owners = {
+        (ref["kind"], ref["name"], ref["uid"])
+        for metadata in secret_metadata
+        for ref in metadata.get("ownerReferences") or []
+    }
+    assert owners == {("Job", "omnigent-job-owned", "uid-omnigent-job-owned")}
+    # The owner is patched on once the Job exists, before readiness polling.
+    assert core.patched_secrets == [
+        (
+            "omnigent-job-owned-token",
+            {
+                "metadata": {
+                    "ownerReferences": [
+                        {
+                            "apiVersion": "batch/v1",
+                            "kind": "Job",
+                            "name": "omnigent-job-owned",
+                            "uid": "uid-omnigent-job-owned",
+                        }
+                    ]
+                }
+            },
+        )
+    ]
+    assert (
+        core.calls.index("create_secret")
+        < core.calls.index("patch_secret")
+        < core.calls.index("list_pod")
+    )
+
+
+def _forbidden_status(message: str) -> str:
+    return json.dumps(
+        {
+            "kind": "Status",
+            "status": "Failure",
+            "message": message,
+            "reason": "Forbidden",
+            "code": 403,
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("body", "detail", "names_rbac"),
+    [
+        pytest.param(
+            _forbidden_status(
+                'secrets "omnigent-job-quota-token" is forbidden: exceeded quota: '
+                "omnigent-sandboxes, requested: count/secrets=1, used: count/secrets=120, "
+                "limited: count/secrets=120"
+            ),
+            "exceeded quota: omnigent-sandboxes",
+            False,
+            id="quota-exceeded",
+        ),
+        pytest.param(
+            _forbidden_status(
+                'secrets is forbidden: User "system:serviceaccount:omnigent:omnigent-server" '
+                'cannot create resource "secrets" in API group "" in the namespace '
+                '"omnigent-sandboxes"'
+            ),
+            "cannot create resource",
+            True,
+            id="missing-rbac",
+        ),
+    ],
+)
+def test_launch_host_forbidden_names_rbac_only_for_permission_denials(
+    fake_clients: tuple[_FakeCore, _FakeBatch], body: str, detail: str, names_rbac: bool
+) -> None:
+    """A count/secrets quota rejection is reported as itself, not as a missing RBAC Role."""
+    core, _batch = fake_clients
+    core.create_secret_error = _FakeApiException(status=403, reason="Forbidden", body=body)
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher().start_host(
+            "omnigent-job-quota",
+            token=_TOKEN,
+            host_id="host_quota",
+            host_name="managed-quota",
+            server_url="http://srv.example.com",
+        )
+    assert detail in excinfo.value.message
+    assert ("sandbox-manager Role" in excinfo.value.message) is names_rbac
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected"),
+    [
+        pytest.param(403, "", True, id="no-body"),
+        pytest.param(
+            403,
+            'pods is forbidden: User "alice" cannot list resource "pods" in API group ""',
+            True,
+            id="plain-text-rbac",
+        ),
+        pytest.param(
+            403,
+            _forbidden_status(
+                'pods "p" is forbidden: violates PodSecurity "restricted:latest": privileged'
+            ),
+            False,
+            id="pod-security",
+        ),
+        pytest.param(
+            403,
+            _forbidden_status('admission webhook "policy.example.com" denied the request'),
+            False,
+            id="webhook",
+        ),
+        pytest.param(404, "", False, id="not-forbidden"),
+    ],
+)
+def test_is_authorization_denial_distinguishes_rbac_from_other_403s(
+    status: int, body: str, expected: bool
+) -> None:
+    """Only the authorizer's refusal (or an unexplained 403) points at the Role."""
+    exc = _FakeApiException(status=status, reason="Forbidden", body=body)
+    assert k8s._is_authorization_denial(exc) is expected
 
 
 def test_launch_host_invalid_config_home_fails_before_creating_secret(

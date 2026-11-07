@@ -76,6 +76,8 @@ class _FakeCore:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.created_secrets: list[dict[str, object]] = []
+        self.patched_secrets: list[tuple[str, dict[str, object]]] = []
         self.deleted_secrets: list[str] = []
         self.deleted_pods: list[str] = []
         self.read_pod_error: Exception | None = None
@@ -86,8 +88,22 @@ class _FakeCore:
         if self.read_pod_error is not None:
             raise self.read_pod_error
         return SimpleNamespace(
-            metadata=SimpleNamespace(name=name, deletion_timestamp=self.pod_deletion_timestamp)
+            metadata=SimpleNamespace(name=name, deletion_timestamp=self.pod_deletion_timestamp),
+            status=SimpleNamespace(
+                phase="Running",
+                init_container_statuses=None,
+                container_statuses=None,
+                conditions=None,
+            ),
         )
+
+    def create_namespaced_secret(self, namespace, body, _request_timeout=None):
+        self.calls.append("create_secret")
+        self.created_secrets.append(body)
+
+    def patch_namespaced_secret(self, name, namespace, body, _request_timeout=None):
+        self.calls.append("patch_secret")
+        self.patched_secrets.append((name, body))
 
     def delete_namespaced_secret(self, name, namespace, _request_timeout=None):
         self.calls.append("delete_secret")
@@ -118,7 +134,7 @@ class _FakeCustom:
         assert (group, version, plural) == (API_GROUP, API_VERSION, SANDBOX_PLURAL)
         if self.get_error is not None:
             raise self.get_error
-        return {"metadata": {"name": name}}
+        return {"metadata": {"name": name, "uid": f"uid-{name}"}}
 
     def create_namespaced_custom_object(
         self, group, version, namespace, plural, body, _request_timeout=None
@@ -128,8 +144,8 @@ class _FakeCustom:
         if self.create_error is not None:
             raise self.create_error
         self.created.append(body)
-        # The apiserver echoes the object back with its server-assigned uid.
-        return {**body, "metadata": {**body["metadata"], "uid": "uid-created"}}
+        name = body["metadata"]["name"]
+        return {"metadata": {"name": name, "uid": f"uid-{name}"}}
 
     def patch_namespaced_custom_object(
         self, group, version, namespace, plural, name, body, _request_timeout=None
@@ -525,6 +541,28 @@ def test_terminate_treats_a_missing_sandbox_as_success(
     assert core.deleted_secrets == [f"{_SANDBOX_ID}-token"]
 
 
+def test_start_host_token_secret_is_owned_by_its_sandbox(
+    fake_clients: tuple[_FakeCore, _FakeCustom],
+) -> None:
+    """Kubernetes garbage-collects the token Secret with its Sandbox, however it is deleted."""
+    core, _custom = fake_clients
+    _launcher().start_host(
+        _SANDBOX_ID,
+        token="launch-token-xyz",
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+    )
+    secret_metadata = [core.created_secrets[0]["metadata"]]
+    secret_metadata += [patch.get("metadata", {}) for _name, patch in core.patched_secrets]
+    owners = {
+        (ref["kind"], ref["name"], ref["uid"])
+        for metadata in secret_metadata
+        for ref in metadata.get("ownerReferences") or []
+    }
+    assert owners == {("Sandbox", _SANDBOX_ID, f"uid-{_SANDBOX_ID}")}
+
+
 # ── suspend / wake in place ─────────────────────────────
 
 
@@ -545,7 +583,7 @@ def test_create_workload_creates_a_fresh_sandbox(
         "apiVersion": f"{API_GROUP}/{API_VERSION}",
         "kind": "Sandbox",
         "name": _SANDBOX_ID,
-        "uid": "uid-created",
+        "uid": f"uid-{_SANDBOX_ID}",
     }
 
 
