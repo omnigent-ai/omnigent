@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 from itertools import pairwise
 
@@ -159,11 +160,23 @@ def test_attachment_only_steering_explanation_stays_visible_on_desktop(
     page.wait_for_function(f"element => ({opacity})(element) >= 0.99", arg=notice.element_handle())
 
 
+def _presented_frames_per_second(page: Page, seconds: float) -> float:
+    browser = page.context.browser
+    assert browser is not None
+    browser.start_tracing(page=page, categories=["viz"])
+    page.wait_for_timeout(seconds * 1000)
+    events = json.loads(browser.stop_tracing())["traceEvents"]
+    return sum(event.get("name") == "Display::DrawAndSwap" for event in events) / seconds
+
+
 def test_bare_idle_clears_the_live_working_indicator(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """The real SPA consumes a running edge followed by an id-less idle."""
+    """The real SPA consumes a running edge followed by an id-less idle.
+
+    While no events arrive, the Working indicator keeps moving without redrawing at display rate.
+    """
     chat = chat_session_contract
     page.goto(chat.url)
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=20_000)
@@ -177,6 +190,15 @@ def test_bare_idle_clears_the_live_working_indicator(
     )
     body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
     assert working_font == body_font
+    shimmer = working.locator(".text-shimmer").element_handle()
+    started = shimmer.evaluate("element => getComputedStyle(element).backgroundPosition")
+    frames_per_second = _presented_frames_per_second(page, 3)
+    assert 5 <= frames_per_second < 30, f"a waiting session drew {frames_per_second:.1f} frames/s"
+    page.wait_for_function(
+        f"element => getComputedStyle(element).backgroundPosition !== {json.dumps(started)}",
+        arg=shimmer,
+        timeout=2_000,
+    )
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
