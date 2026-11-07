@@ -742,6 +742,43 @@ describe("useSessionReconnect", () => {
     }
   });
 
+  it("keeps the stage limit's deadline across switching to another session and back", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
+      useChatStore.setState({
+        conversationId: "session",
+        sandboxStatus: { stage: "provisioning" },
+      });
+      const { result, rerender } = renderHook(useSessionReconnect, {
+        initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
+      });
+      await act(async () => {
+        void result.current.reconnect();
+      });
+      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS - 60_000));
+      useChatStore.setState({ conversationId: "other-session", sandboxStatus: null });
+      rerender({
+        ...asleepSandbox,
+        sessionId: "other-session",
+        hostId: "other-host",
+        hostOnline: false,
+      });
+      act(() => vi.advanceTimersByTime(30_000));
+      useChatStore.setState({
+        conversationId: "session",
+        sandboxStatus: { stage: "provisioning" },
+      });
+      rerender({ ...asleepSandbox, hostOnline: false });
+      expect(result.current.sandboxStarting).toBe(true);
+      // The original five minutes, not a fresh five from the return.
+      act(() => vi.advanceTimersByTime(30_000));
+      expect(result.current.sandboxStarting).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops the stage limit once the launch stops reporting progress", async () => {
     vi.useFakeTimers();
     try {

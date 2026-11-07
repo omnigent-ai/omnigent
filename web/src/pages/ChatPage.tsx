@@ -998,7 +998,8 @@ export function ChatPage() {
           launching: sandboxLaunching,
           canEdit: isEditorLevel(permissionLevel),
           status: activeSession.status,
-          failed: Boolean(activeSession.lastTaskError),
+          // A failed sandbox launch keeps its card and Reconnect host, with no task error.
+          failed: Boolean(activeSession.lastTaskError) || sandboxStatus?.stage === "failed",
         });
   useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // A message to an offline Arca host reconnects it from the desktop and waits

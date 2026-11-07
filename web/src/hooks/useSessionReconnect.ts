@@ -38,6 +38,8 @@ interface SandboxWake {
   timer: ReturnType<typeof setTimeout>;
   /** The server's answer, which callers joining while it is `waking` wait for. */
   request: Promise<boolean>;
+  /** When a launch stage that never finishes lets Reconnect host return, once one is seen. */
+  stageDeadline?: number;
 }
 
 // Per session and outside any view, so every way of waking a sandbox (Reconnect
@@ -271,12 +273,17 @@ export function useSessionReconnect({
   // The count above waits on the launch, so a stage that never finishes would spin
   // with Reconnect host hidden. Let the wake go quietly: the server's stage keeps the
   // dot spinning, and Reconnect host returns as it does after a reload.
-  // Keyed on whether a wake is running, so the server answering mid-stage keeps the deadline.
+  // The deadline belongs to the wake, so the server answering mid-stage or the
+  // user switching sessions and back keeps it.
   const wakeRunning = sandboxWake !== null;
   useEffect(() => {
-    if (!wakeRunning || !launchInProgress || !sessionId) return;
-    const wake = sandboxWakes.get(sessionId);
-    const timer = setTimeout(() => endSandboxWake(sessionId, wake), SANDBOX_WAKE_STAGE_LIMIT_MS);
+    const wake = sessionId ? sandboxWakes.get(sessionId) : undefined;
+    if (!wakeRunning || !launchInProgress || !sessionId || !wake) return;
+    wake.stageDeadline ??= Date.now() + SANDBOX_WAKE_STAGE_LIMIT_MS;
+    const timer = setTimeout(
+      () => endSandboxWake(sessionId, wake),
+      Math.max(0, wake.stageDeadline - Date.now()),
+    );
     return () => clearTimeout(timer);
   }, [wakeRunning, launchInProgress, sessionId]);
 

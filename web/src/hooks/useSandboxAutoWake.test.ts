@@ -119,7 +119,7 @@ describe("canAutoWakeSandbox", () => {
     ["the viewer can't edit", { canEdit: false }],
     ["is running a turn", { status: "running" }],
     ["failed", { status: "failed" }],
-    ["has an error", { failed: true }],
+    ["has an error or a failed sandbox launch", { failed: true }],
   ])("leaves a session that %s to its own controls", (_label, override) => {
     expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(false);
   });
