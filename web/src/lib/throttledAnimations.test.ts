@@ -60,6 +60,16 @@ describe("throttleAnimations", () => {
     expect(shared.pause).toHaveBeenCalledTimes(1);
   });
 
+  it("skips steps while the document is hidden", () => {
+    const looping = fakeAnimation(Infinity);
+    vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+
+    throttleAnimations(animatedElement([looping]));
+    vi.advanceTimersByTime(ANIMATION_STEP_MS);
+
+    expect(looping.pause).not.toHaveBeenCalled();
+  });
+
   it("runs one timer for every element and stops it once they leave the document", () => {
     const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
     const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");

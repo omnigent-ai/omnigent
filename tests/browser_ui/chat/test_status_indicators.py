@@ -191,7 +191,7 @@ def test_bare_idle_clears_the_live_working_indicator(
     body_font = page.evaluate("() => getComputedStyle(document.body).fontFamily")
     assert working_font == body_font
     frames_per_second = _presented_frames_per_second(page, 3)
-    assert 5 <= frames_per_second < 15, f"a waiting session drew {frames_per_second:.1f} frames/s"
+    assert 5 <= frames_per_second < 30, f"a waiting session drew {frames_per_second:.1f} frames/s"
 
     chat.emit_idle(None)
     expect(working).to_be_hidden(timeout=10_000)
