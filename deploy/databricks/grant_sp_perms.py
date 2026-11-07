@@ -145,7 +145,16 @@ def main() -> int:
     """
     args = _parse_args()
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    if __package__:
+        from .src.databricks_sdk_policy import workspace_client_with_cli_cache
+    else:
+        from src.databricks_sdk_policy import workspace_client_with_cli_cache
+
+    wc = (
+        workspace_client_with_cli_cache(WorkspaceClient, profile=args.profile)
+        if args.profile
+        else workspace_client_with_cli_cache(WorkspaceClient)
+    )
 
     app = wc.apps.get(name=args.app_name)
     sp_uuid = app.service_principal_client_id

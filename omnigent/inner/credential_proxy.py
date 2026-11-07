@@ -47,6 +47,7 @@ from omnigent.inner.datamodel import (
     DatabricksProxySpec,
 )
 from omnigent.inner.sandbox import SandboxPolicy, protect_credential_source
+from omnigent.util.databricks_sdk import with_cli_cache_policy
 
 # Prefix on every minted placeholder. The proxy uses it to recognise a
 # value as one of *its* synthetic credentials (so it can reject a
@@ -526,7 +527,7 @@ def _databricks_config(profile: str) -> object:
             code=ErrorCode.INVALID_INPUT,
         ) from exc
     try:
-        return Config(profile=profile)
+        return with_cli_cache_policy(Config)(profile=profile)
     except Exception as exc:
         raise OmnigentError(
             f"Failed to load Databricks profile {profile!r}: {exc}",

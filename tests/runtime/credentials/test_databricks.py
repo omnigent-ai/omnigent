@@ -350,6 +350,34 @@ def test_non_cli_sdk_profile_does_not_recommend_databricks_auth_login(
     assert "databricks auth login" not in msg
 
 
+@pytest.mark.parametrize("supports_policy", [False, True], ids=["legacy", "supported"])
+@pytest.mark.parametrize("profile", [None, "owned"])
+def test_runtime_sdk_credentials_use_normal_cli_cache_when_supported(
+    monkeypatch: pytest.MonkeyPatch, supports_policy: bool, profile: str | None
+) -> None:
+    from omnigent.runtime.credentials.databricks import _call_sdk_authenticate
+    from tests._helpers.databricks_sdk import sdk_config_double
+
+    calls: list[dict[str, object]] = []
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "ambient-profile")
+    config = sdk_config_double(
+        supports_policy=supports_policy,
+        resolved_host="https://example.databricks.com/",
+        headers={"Authorization": "Bearer synthetic"},
+        on_construct=calls.append,
+    )
+    monkeypatch.setattr("databricks.sdk.config.Config", config)
+
+    assert _call_sdk_authenticate(profile) == WorkspaceCreds(
+        host="https://example.databricks.com", token="synthetic"
+    )
+
+    expected: dict[str, object] = {"profile": profile or "ambient-profile", "host": None}
+    if supports_policy:
+        expected["databricks_cli_force_refresh"] = False
+    assert calls == [expected]
+
+
 def test_resolves_via_sdk_when_sdk_returns_creds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
