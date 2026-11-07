@@ -290,8 +290,8 @@ class ShellPrOp:
         Takes precedence over ``parse_output`` and generic extraction.
     :ivar resolve_result: Optional lookup for identities absent from command output.
         Runs in the background after success, separately from immediate PR operations.
-    :ivar push_output: ``resolve_result`` reads ``git push`` status output. The
-        observer runs it only when it cannot read the pushed checkout's own state.
+    :ivar push_output: ``resolve_result`` reads ``git push`` status output and takes a
+        ``scanned`` keyword naming the pushes already found in the checkout's git state.
     """
 
     tracks: bool

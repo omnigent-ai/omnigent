@@ -192,6 +192,7 @@ class _RecordingCtx:
 
     def __init__(self) -> None:
         self.response_id = "resp_1"
+        self.session_id: str | None = None
         self.emitted: list[Any] = []
         self.provider_usage: dict[str, Any] | None = None
 

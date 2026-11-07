@@ -13,9 +13,11 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
+import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -1675,6 +1677,52 @@ def test_dispatched_call_does_not_reemit_a_completed_function_call() -> None:
     assert ctx.emitted == []
 
 
+@pytest.mark.asyncio
+async def test_pr_observation_leaves_the_event_loop_free_until_the_turn_completes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow git read behind PR tracking holds the turn's end, not the event loop."""
+    from omnigent.inner.executor import (
+        ToolCallComplete,
+        ToolCallRequest,
+        ToolCallStatus,
+        TurnComplete,
+    )
+    from omnigent.runner import pr_observer
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    release = threading.Event()
+    observed: list[str] = []
+
+    def observe_tool_completion(session_id: str, **call: object) -> None:
+        release.wait(timeout=10)
+        observed.append(f"{session_id}:{call['tool_name']}")
+
+    monkeypatch.setattr(pr_observer, "observe_tool_completion", observe_tool_completion)
+    monkeypatch.setattr(pr_observer, "recheck_pending", lambda session_id: observed.append("end"))
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    ctx.session_id = "conv_push"  # type: ignore[assignment]
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    for event in (
+        ToolCallRequest(name="Bash", args={"command": "git pp"}, metadata={"call_id": "p1"}),
+        ToolCallComplete(
+            name="Bash", status=ToolCallStatus.SUCCESS, result="", metadata={"call_id": "p1"}
+        ),
+        TurnComplete(response=None),
+    ):
+        adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+    assert _fc_items(ctx)[-1]["type"] == "function_call_output"
+
+    finishing = asyncio.ensure_future(adapter._record_pr_observations())
+    await asyncio.sleep(0.05)
+    assert not finishing.done()
+    assert observed == []
+    release.set()
+    await asyncio.wait_for(finishing, timeout=10)
+    assert observed == ["conv_push:Bash", "end"]
+
+
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:
     """
     A ``ToolCallRequest`` with an MCP-prefixed name pushes the
@@ -3292,7 +3340,7 @@ def test_interrupt_slice_covers_pi_rpc_session_close_reap_budget() -> None:
     )
 
 
-def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) -> None:
+async def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) -> None:
     from omnigent.inner.executor import ToolCallComplete, ToolCallRequest, ToolCallStatus
     from omnigent.runner.session_prs import SessionPrRegistry
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
@@ -3317,6 +3365,7 @@ def test_observer_records_raw_output_in_omnigent_session(tmp_path, monkeypatch) 
         ),
         ctx,
     )
+    await adapter._record_pr_observations()
     assert [entry.url for entry in SessionPrRegistry("conv_sdk").list()] == [url]
     assert SessionPrRegistry("resp_pr").list() == []
 

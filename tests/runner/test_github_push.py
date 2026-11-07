@@ -690,20 +690,19 @@ def test_numbered_pr_write_without_repo_uses_the_checkout_base_repository(
 
 
 @pytest.mark.parametrize(
-    "visible,reports_cwd,tracked",
+    "visible,reports_cwd",
     [
-        pytest.param(True, True, False, id="readable-checkout"),
-        pytest.param(False, True, True, id="copy-on-write-workspace"),
-        pytest.param(True, False, True, id="unknown-directory"),
+        pytest.param(True, True, id="readable-checkout"),
+        pytest.param(False, True, id="copy-on-write-workspace"),
+        pytest.param(True, False, id="unknown-directory"),
     ],
 )
-def test_push_output_is_read_only_where_the_checkout_is_not(
+def test_push_output_finds_pushes_the_checkout_state_does_not_show(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     forge: _Forge,
     visible: bool,
     reports_cwd: bool,
-    tracked: bool,
 ) -> None:
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
@@ -727,4 +726,65 @@ def test_push_output_is_read_only_where_the_checkout_is_not(
         started_at=time.time(),
         repository_visible=visible,
     )
-    assert _tracked("conv_output") == ([(CHECKOUT_PR_URL, "worked_on")] if tracked else [])
+    assert _tracked("conv_output") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+def test_push_in_both_output_and_checkout_state_is_looked_up_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
+    _run_and_observe(monkeypatch, "conv_once", "git push origin HEAD:topic", worktree)
+    assert forge.lookups == [f"repos/{CHECKOUT_REPO}/commits/topic/pulls"]
+    assert _tracked("conv_once") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+def test_gh_api_branch_write_fills_repository_placeholders_from_the_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
+    command = (
+        "gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
+        " -f message='Update notes' -f content=bm90ZXMK -f branch=topic"
+    )
+    result = {"stdout": "{}", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
+    _observe_shell(monkeypatch, "conv_placeholder", command, result)
+    assert forge.lookups == [f"repos/{CHECKOUT_REPO}/commits/topic/pulls"]
+    assert _tracked("conv_placeholder") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+def test_reading_a_push_runs_no_program_the_checkout_config_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    commit = (
+        f"tree {git('rev-parse', 'HEAD^{tree}', cwd=worktree)}\n"
+        f"parent {git('rev-parse', 'HEAD', cwd=worktree)}\n"
+        "author Contributor <contributor@example.com> 1700000000 +0000\n"
+        "committer Contributor <contributor@example.com> 1700000000 +0000\n"
+        "gpgsig -----BEGIN PGP SIGNATURE-----\n \n iQ==\n -----END PGP SIGNATURE-----\n"
+        "\nSigned change\n"
+    )
+    signed = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=worktree, input=commit, capture_output=True, text=True, check=True,
+    ).stdout.strip()  # fmt: skip
+    git("reset", "-q", "--hard", signed, cwd=worktree)
+    marker = tmp_path / "verifier-ran"
+    verifier = tmp_path / "verifier"
+    verifier.write_text(f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\nexit 1\n")
+    verifier.chmod(0o755)
+    git("config", "log.showSignature", "true", cwd=worktree)
+    git("config", "gpg.program", str(verifier), cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
+    _run_and_observe(monkeypatch, "conv_signed", "git push -q", worktree)
+    assert _tracked("conv_signed") == [(CHECKOUT_PR_URL, "worked_on")]
+    assert not marker.exists()
+    git("reflog", "show", "-n", "1", "--format=%gD %gs", "origin/topic", cwd=worktree)
+    assert marker.exists()

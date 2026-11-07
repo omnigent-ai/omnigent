@@ -757,6 +757,14 @@ def shell_branch_writes(segments: Sequence[ShellSegment]) -> list[BranchWrite]:
         method = _api_method(tokens)
         endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0].strip("/")
         host = _flag(tokens, "--hostname") or "github.com"
+        if "{owner}" in endpoint or "{repo}" in endpoint:
+            # gh fills these from the base repository of the directory it runs in.
+            checkout = _checkout_repository(segment.cwd) if segment.cwd else None
+            if checkout is None:
+                continue
+            owner, name = checkout[1].split("/", 1)
+            endpoint = endpoint.replace("{owner}", owner).replace("{repo}", name)
+            host = _flag(tokens, "--hostname") or checkout[0]
         branch = None
         if match := re.fullmatch(r"repos/([^/]+/[^/]+)/contents/.+", endpoint):
             branch = _api_field(tokens, "branch") if method in {"PUT", "DELETE"} else None

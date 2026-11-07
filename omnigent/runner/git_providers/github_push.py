@@ -110,8 +110,15 @@ def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
     )
 
 
-def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullRequestRef]:
-    """Find open PRs whose head matches a branch positively updated by this push."""
+def pushed_prs(
+    segments: Sequence[ShellSegment],
+    result: object,
+    scanned: frozenset[tuple[str, str, str]] = frozenset(),
+) -> list[PullRequestRef]:
+    """Find open PRs whose head matches a branch positively updated by this push.
+
+    :param scanned: ``(host, repository, branch)`` pushes already looked up from git's state.
+    """
     from omnigent.runner import github_resource
     from omnigent.runner.pr_observer import _failed
 
@@ -147,8 +154,9 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
             if not match:
                 remote = None
             elif not match[1].startswith("refs/") or match[1].startswith("refs/heads/"):
-                branch = match[1].removeprefix("refs/heads/")
-                targets[(remote.host, remote.repository, branch)] = None
+                target = (remote.host, remote.repository, match[1].removeprefix("refs/heads/"))
+                if target not in scanned:
+                    targets[target] = None
     references: dict[str, PullRequestRef] = {}
     deadline = time.monotonic() + 5.0
     with github_resource._gh_deadline_scope(deadline):

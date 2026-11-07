@@ -19,6 +19,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 from fastapi import Response
@@ -70,6 +71,10 @@ from omnigent.server.schemas import (
 )
 
 _logger = logging.getLogger(__name__)
+
+# Session-PR observation reads git, so it runs off the event loop; one worker keeps call order.
+_pr_observation_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pr-observation")
+_PR_OBSERVATION_WAIT_S = 10.0
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
 _OBSERVED_TOOL_CALL_STATUS = "in_progress"
@@ -236,6 +241,7 @@ class ExecutorAdapter(HarnessApp):
         # short-circuits — so it is observed-only.
         self._observed_tool_calls: dict[str, tuple[str, str]] = {}
         self._pr_tool_calls: dict[str, tuple[str, dict[str, Any], float | None]] = {}
+        self._pr_observation: Future[None] | None = None
 
     async def run_turn(self, request: CreateResponseRequest, ctx: TurnContext) -> None:
         """Drive the inner executor for one turn, translating its events to Omnigent SSE.
@@ -447,6 +453,7 @@ class ExecutorAdapter(HarnessApp):
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):
+                        await self._record_pr_observations()
                         log_input_event(
                             _logger,
                             "native_input_execution_finished",
@@ -1074,6 +1081,13 @@ class ExecutorAdapter(HarnessApp):
             self._executor = self._executor_factory()
         return self._executor
 
+    async def _record_pr_observations(self) -> None:
+        """Let this turn's PR observations land before the runner reports them at turn end."""
+        if self._pr_observation is not None:
+            await asyncio.wait(
+                [asyncio.wrap_future(self._pr_observation)], timeout=_PR_OBSERVATION_WAIT_S
+            )
+
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""
         if isinstance(event, TextChunk):
@@ -1180,7 +1194,8 @@ class ExecutorAdapter(HarnessApp):
 
                 session_id = ctx.session_id
                 if session_id:
-                    observe_tool_completion(
+                    self._pr_observation = _pr_observation_pool.submit(
+                        observe_tool_completion,
                         session_id,
                         tool_name=pr_call[0],
                         arguments=pr_call[1],
@@ -1223,7 +1238,7 @@ class ExecutorAdapter(HarnessApp):
             if ctx.session_id:
                 from omnigent.runner.pr_observer import recheck_pending
 
-                recheck_pending(ctx.session_id)
+                self._pr_observation = _pr_observation_pool.submit(recheck_pending, ctx.session_id)
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage

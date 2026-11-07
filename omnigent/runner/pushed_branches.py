@@ -65,9 +65,19 @@ class PushedBranch:
 
 
 def _git(argv: list[str], cwd: str) -> tuple[int | None, str]:
+    # The checkout's config is agent-writable; keep it from running programs here.
     try:
         completed = subprocess.run(
-            ["git", *argv],
+            [
+                "git",
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "log.showSignature=false",
+                *argv,
+            ],
             cwd=cwd,
             env=_anchored_git_env(),
             capture_output=True,
@@ -172,11 +182,6 @@ def _git_directory(current: str | None, tokens: Sequence[str]) -> str | None:
         else:
             break
     return current
-
-
-def git_directory(segment: ShellSegment) -> str | None:
-    """Return the directory a ``git`` segment runs in after its ``-C`` options, when known."""
-    return _git_directory(segment.cwd, segment.invocation_tokens)
 
 
 def with_directories(

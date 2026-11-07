@@ -6,6 +6,7 @@ request facet recognizes its own shell commands, output objects, and MCP tools.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -16,7 +17,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from pathlib import PurePath
 
 from omnigent.git_providers import load_facet, providers, resolve_remote
 from omnigent.policies.builtins._shell import (
@@ -607,22 +607,15 @@ def _start_directory(arguments: dict[str, object], result: object, cwd: str | No
 
 def _scan_pushes(
     session_id: str,
-    segments: Sequence[ShellSegment],
     directories: Sequence[str],
     started_at: float | None,
     finished_at: float,
-) -> tuple[list[pushed_branches.BranchKey], tuple[float, float], bool]:
+) -> tuple[list[pushed_branches.BranchKey], tuple[float, float]]:
     """Read the branches a shell call pushed from the checkouts it touched.
 
-    :returns: The newly pushed branches, the call's time window, and whether a
-        ``git`` command ran where the observer cannot read the checkout.
+    :returns: The newly pushed branches and the call's time window.
     """
     checkouts = {directory: pushed_branches.checkout(directory) for directory in directories}
-    hidden = any(
-        PurePath(segment.invocation_tokens[0]).name == "git"
-        and checkouts.get(pushed_branches.git_directory(segment) or "") is None
-        for segment in segments
-    )
     own = {item.toplevel: item for item in checkouts.values() if item is not None}
     touched = list(own.values())
     for toplevel in _pushes.remember(session_id, own):
@@ -637,7 +630,7 @@ def _scan_pushes(
         key = (remote.provider, remote.host, remote.repository, push.branch)
         if _pushes.claim(session_id, (push.repository, *key, push.sha)):
             keys.append(key)
-    return keys, (since, finished_at), hidden
+    return keys, (since, finished_at)
 
 
 def _record_branch_prs(
@@ -751,7 +744,6 @@ def observe_tool_completion(
         segments: list[ShellSegment] = []
         pushed: list[pushed_branches.BranchKey] = []
         window: tuple[float, float] | None = None
-        hidden = True
         if command is not None:
             strict = _shell_segments(command)
             annotated, directories = pushed_branches.with_directories(
@@ -761,15 +753,17 @@ def observe_tool_completion(
             segments = annotated if strict else []
             if repository_visible:
                 # git's state shows a push even when the command's exit status hides it.
-                pushed, window, hidden = _scan_pushes(
-                    session_id, annotated, directories, started_at, finished_at
-                )
+                pushed, window = _scan_pushes(session_id, directories, started_at, finished_at)
         if command is not None and not failed:
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, facets, segments)
             ):
-                if op.resolve_result is None or (op.push_output and not hidden):
+                resolve = op.resolve_result
+                if resolve is None:
                     continue
+                if op.push_output and pushed:
+                    scanned = {key[1:] for key in pushed if key[0] == provider_id}
+                    resolve = functools.partial(resolve, scanned=frozenset(scanned))
                 observation_id = observation_key(
                     f"{source}:{provider_id}:{index}:resolved",
                     call_id,
@@ -785,7 +779,7 @@ def observe_tool_completion(
                         _record_resolved_prs,
                         session_id,
                         provider_id,
-                        op.resolve_result,
+                        resolve,
                         shell_result,
                         source,
                         observation_id,
