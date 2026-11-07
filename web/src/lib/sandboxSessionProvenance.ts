@@ -20,3 +20,22 @@ export function markSandboxLaunch(sessionId: string): void {
 export function takeSandboxLaunch(sessionId: string): boolean {
   return sandboxLaunchesToCheck.delete(sessionId);
 }
+
+export interface LaunchNotice {
+  kind: "info" | "error";
+  text: string;
+}
+
+const launchNotices = new Map<string, LaunchNotice[]>();
+
+/** Hold a launch-check notice until the user is back on its session. */
+export function deferLaunchNotice(sessionId: string, notice: LaunchNotice): void {
+  launchNotices.set(sessionId, [...(launchNotices.get(sessionId) ?? []), notice]);
+}
+
+/** Claim the notices held for a session. */
+export function takeLaunchNotices(sessionId: string): LaunchNotice[] {
+  const notices = launchNotices.get(sessionId) ?? [];
+  launchNotices.delete(sessionId);
+  return notices;
+}

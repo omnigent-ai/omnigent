@@ -103,6 +103,28 @@ export function useSandboxModelOptions(
   });
 }
 
+/** The server previews this agent with the provider's default catalog, not its own inference. */
+export function previewUsesProviderDefault(preview: SandboxModelOptions): boolean {
+  return (
+    !preview.configured && preview.status !== "unconfigured" && preview.status !== "unsupported"
+  );
+}
+
+/** Whether a sandbox agent runs on the provider's default inference, per the server's preview. */
+export function useSandboxAgentUsesProviderDefault(
+  provider: string | null,
+  harness: string | null,
+  agentId: string | null,
+  enabled: boolean,
+): boolean {
+  const active = enabled && provider !== null && harness !== null && agentId !== null;
+  const { data, isError } = useQuery({
+    ...sandboxModelOptionsQuery(provider ?? "", harness ?? "", agentId, getCurrentUserId()),
+    enabled: active,
+  });
+  return active && !isError && data !== undefined && previewUsesProviderDefault(data);
+}
+
 /** Preview a launching sandbox's provider catalog until the session is bound to a host. */
 export function useSandboxLaunchModelOptions(
   launch: SandboxStatus | null,

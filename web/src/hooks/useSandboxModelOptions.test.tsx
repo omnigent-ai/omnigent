@@ -9,6 +9,7 @@ import * as host from "@/lib/host";
 import type { SandboxStatus } from "@/lib/types";
 import {
   sandboxModelOptionsKey,
+  useSandboxAgentUsesProviderDefault,
   useSandboxModelOptions,
   useSandboxLaunchModelOptions,
   useSandboxUnsupportedAgents,
@@ -104,6 +105,42 @@ describe("useSandboxModelOptions", () => {
     );
     await Promise.resolve();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("useSandboxAgentUsesProviderDefault", () => {
+  const gatewayPreview = { ...catalog, configured: false, provider_label: "AI Gateway" };
+
+  it.each([
+    ["the provider's gateway catalog", gatewayPreview, true],
+    ["an empty gateway catalog", { ...gatewayPreview, models: [], status: "empty" }, true],
+    [
+      "an agent with its own provider or profile",
+      { ...gatewayPreview, status: "unconfigured" },
+      false,
+    ],
+    ["a harness the provider cannot serve", { ...gatewayPreview, status: "unsupported" }, false],
+    ["a configured inference binding", catalog, false],
+  ])("answers for %s", async (_label, preview, expected) => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify(preview)));
+    const { result } = renderHook(
+      () => useSandboxAgentUsesProviderDefault("agent_sandbox", "claude-native", "ag_1", true),
+      { wrapper: wrapper() },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await waitFor(() => expect(result.current).toBe(expected));
+  });
+
+  it("says no until the preview loads and when it fails", async () => {
+    fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+    const { result } = renderHook(
+      () => useSandboxAgentUsesProviderDefault("agent_sandbox", "claude-native", "ag_1", true),
+      { wrapper: wrapper() },
+    );
+    expect(result.current).toBe(false);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(result.current).toBe(false);
   });
 });
 

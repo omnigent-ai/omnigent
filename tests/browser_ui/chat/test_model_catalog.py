@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from playwright.sync_api import Page, Request, expect
@@ -504,6 +504,64 @@ def test_new_session_picker_offers_a_running_sandbox_catalog(
     expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_have_count(0)
     # Claude Code's own effort ladder, which the gateway rows do not describe.
     expect(page.get_by_test_id("new-chat-landing-agent-effort-xhigh")).to_be_visible()
+
+
+def test_private_provider_catalog_is_not_offered_to_default_agents(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A session whose agent brings its own provider leaves the shared catalog alone."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    _serve_landing_beside_sandbox(chat)
+    # The landing offers a default Claude Code agent; the session runs a private one.
+    default_agent = "ag_default_claude"
+    chat.contract.json(
+        "/v1/agents",
+        list_payload(
+            [
+                {
+                    "id": default_agent,
+                    "name": "claude-code-native-ui",
+                    "display_name": "Claude Code",
+                    "harness": "claude-native",
+                    "skills": [],
+                }
+            ]
+        ),
+    )
+    gateway_preview = {
+        "configured": False,
+        "models": [model_option("gateway/opus", display_name="Opus via gateway")],
+        "configuration_revision": None,
+        "provider_label": "Gateway",
+        "default_model": None,
+        "status": "ready",
+    }
+
+    def preview(request: Request) -> dict:
+        agent_id = parse_qs(urlparse(request.url).query).get("agent_id", [None])[0]
+        # The session's agent uses its own provider, so the server offers it no default catalog.
+        if agent_id == chat.agent_id:
+            return {**gateway_preview, "models": [], "status": "unconfigured"}
+        return gateway_preview
+
+    chat.contract.json(
+        "/v1/sandbox-providers/agent_sandbox/harnesses/claude-native/model-options", preview
+    )
+
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    _deliver_session_catalog(chat)
+    _open_models(page)
+    expect(page.locator('[data-model-id="haiku"]')).to_be_visible()
+    page.keyboard.press("Escape")
+
+    page.get_by_test_id("new-chat-button").click()
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+    _open_landing_models(page, default_agent)
+    expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-haiku")).to_have_count(0)
 
 
 def test_launch_pick_missing_from_the_sandbox_resets_to_default(

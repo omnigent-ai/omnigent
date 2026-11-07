@@ -3,7 +3,11 @@ import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as IdentityModule from "@/lib/identity";
 import { getCurrentUserId } from "@/lib/identity";
-import { readModelCatalogCache, sandboxSessionCatalogKey } from "@/lib/modelCatalogCache";
+import {
+  readModelCatalogCache,
+  SANDBOX_SESSION_CATALOG_MAX_AGE_MS,
+  sandboxSessionCatalogKey,
+} from "@/lib/modelCatalogCache";
 import { markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
 import type { NativeModelOption } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
@@ -169,8 +173,28 @@ describe("sandbox session catalog hooks", () => {
         "Minimal effort isn't available for this model in this sandbox. Using the default effort.",
       ),
     );
+    expect(toast.info).toHaveBeenCalledWith(
+      "gpt-5 isn't available in this sandbox. Using the default model.",
+    );
     expect(setEffort).toHaveBeenCalledWith(null);
     expect(setModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a reset's notice when the user returns to the session", async () => {
+    useChatStore.setState({ sessionReasoningEffort: null });
+    setModel.mockImplementationOnce(async () => {
+      useChatStore.setState({ conversationId: "conv_other" });
+    });
+    const { rerender } = renderCheck();
+    rerender({ models: codexModels });
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(null));
+    await act(async () => {});
+    expect(toast.info).not.toHaveBeenCalled();
+    act(() => useChatStore.setState({ conversationId: sessionId }));
+    rerender({ models: codexModels });
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(
+      "gpt-5 isn't available in this sandbox. Using the default model.",
+    );
   });
 
   it("reports a reset the server refused", async () => {
@@ -207,12 +231,29 @@ describe("sandbox session catalog hooks", () => {
     expect(readModelCatalogCache(key)).toBeNull();
     rerender({ models: codexModels, enabled: true });
     expect(readModelCatalogCache(key)?.models).toEqual(codexModels);
+    // A refetch with the same rows leaves the entry alone.
+    const stored = localStorage.getItem(key!);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 60_000);
+    rerender({ models: [...codexModels], enabled: true });
+    expect(localStorage.getItem(key!)).toBe(stored);
+    rerender({ models: [codexModels[0]], enabled: true });
+    expect(readModelCatalogCache(key)?.models).toEqual([codexModels[0]]);
+    clock.mockRestore();
   });
 
-  it("refreshes a mounted reader when a session catalog is saved", () => {
-    const reader = renderHook(() => useSavedSandboxSessionCatalog("arclet", "codex-native"));
-    expect(reader.result.current).toBeUndefined();
-    renderHook(() => useRememberSandboxSessionCatalog("arclet", "codex-native", codexModels, true));
-    expect(reader.result.current).toEqual(codexModels);
+  it("refreshes a mounted reader when a session catalog is saved or expires", () => {
+    vi.useFakeTimers();
+    try {
+      const reader = renderHook(() => useSavedSandboxSessionCatalog("arclet", "codex-native"));
+      expect(reader.result.current).toBeUndefined();
+      renderHook(() =>
+        useRememberSandboxSessionCatalog("arclet", "codex-native", codexModels, true),
+      );
+      expect(reader.result.current).toEqual(codexModels);
+      act(() => vi.advanceTimersByTime(SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1_000));
+      expect(reader.result.current).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

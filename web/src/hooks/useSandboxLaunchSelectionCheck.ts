@@ -4,7 +4,13 @@ import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { findNativeModelOption } from "@/lib/codexNativeModels";
 import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { isFusionModelUid } from "@/lib/devinFusion";
-import { markSandboxLaunch, takeSandboxLaunch } from "@/lib/sandboxSessionProvenance";
+import {
+  deferLaunchNotice,
+  type LaunchNotice,
+  markSandboxLaunch,
+  takeLaunchNotices,
+  takeSandboxLaunch,
+} from "@/lib/sandboxSessionProvenance";
 import type { NativeModelOption } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 
@@ -50,6 +56,11 @@ export function launchSelectionNotice(
   return null;
 }
 
+function showLaunchNotice(notice: LaunchNotice) {
+  if (notice.kind === "error") toast.error(notice.text);
+  else toast.info(notice.text);
+}
+
 /** Once a sandbox this tab launched reports its catalog, reset a model or effort it lacks. */
 export function useSandboxLaunchSelectionCheck(
   sessionId: string | null,
@@ -62,15 +73,29 @@ export function useSandboxLaunchSelectionCheck(
   const effort = useChatStore((state) => state.sessionReasoningEffort);
   useEffect(() => {
     if (!enabled || sessionId === null || conversationId !== sessionId) return;
+    for (const notice of takeLaunchNotices(sessionId)) showLaunchNotice(notice);
     if (harness === null || models.length === 0 || !takeSandboxLaunch(sessionId)) return;
     const resets = launchSelectionResets(harness, models, model, effort);
     if (launchSelectionNotice(resets, model, effort) === null) return;
     const stillActive = () => useChatStore.getState().conversationId === sessionId;
+    // A notice for a session the user left waits until they return to it.
+    const notify = (notice: LaunchNotice) =>
+      stillActive() ? showLaunchNotice(notice) : deferLaunchNotice(sessionId, notice);
+    const modelNotice = launchSelectionNotice(
+      { model: resets.model, effort: false },
+      model,
+      effort,
+    );
     void (async () => {
       try {
         if (resets.model) await useChatStore.getState().setModel(null);
         // Store setters act on the active session, so a switch away defers the rest until return.
-        if (resets.effort && !stillActive()) return markSandboxLaunch(sessionId);
+        if (resets.effort && !stillActive()) {
+          if (modelNotice !== null)
+            deferLaunchNotice(sessionId, { kind: "info", text: modelNotice });
+          markSandboxLaunch(sessionId);
+          return;
+        }
         // An effort picked while the model reset was pending wins.
         const clearEffort =
           resets.effort && useChatStore.getState().sessionReasoningEffort === effort;
@@ -80,9 +105,9 @@ export function useSandboxLaunchSelectionCheck(
           model,
           effort,
         );
-        if (notice !== null && stillActive()) toast.info(notice);
+        if (notice !== null) notify({ kind: "info", text: notice });
       } catch {
-        if (stillActive()) toast.error("Couldn't switch to the sandbox's default model settings.");
+        notify({ kind: "error", text: "Couldn't switch to the sandbox's default model settings." });
       }
     })();
   }, [enabled, sessionId, conversationId, harness, models, model, effort]);

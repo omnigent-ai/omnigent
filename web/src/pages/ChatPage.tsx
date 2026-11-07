@@ -252,7 +252,10 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
+import {
+  useSandboxAgentUsesProviderDefault,
+  useSandboxLaunchModelOptions,
+} from "@/hooks/useSandboxModelOptions";
 import { hasLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
 import { useSandboxLaunchSelectionCheck } from "@/hooks/useSandboxLaunchSelectionCheck";
 import { useRememberSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
@@ -956,13 +959,22 @@ export function ChatPage() {
     sandboxStatus?.provider ??
     null;
   const sessionCatalogIsActive = activeSession != null && activeConversationId === activeSession.id;
+  const liveSessionCatalog =
+    sessionCatalogIsActive &&
+    !activeSession.inferenceConfigured &&
+    hasLiveSessionCatalog(activeSession.id);
+  // Agents with their own provider or profile have private catalogs, so only default ones are shared.
+  const agentUsesProviderDefault = useSandboxAgentUsesProviderDefault(
+    sessionSandboxProvider,
+    sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
+    liveSessionCatalog,
+  );
   useRememberSandboxSessionCatalog(
     sessionSandboxProvider,
     sandboxPreviewHarness,
     sessionModelOptions,
-    sessionCatalogIsActive &&
-      !activeSession.inferenceConfigured &&
-      hasLiveSessionCatalog(activeSession.id),
+    liveSessionCatalog && agentUsesProviderDefault,
   );
   useSandboxLaunchSelectionCheck(
     activeSession?.id ?? null,
