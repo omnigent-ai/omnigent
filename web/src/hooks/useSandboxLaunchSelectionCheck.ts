@@ -22,9 +22,16 @@ export function launchSelectionResets(
   if (models.length === 0) return { model: false, effort: false };
   const resetModel =
     !!model && !isFusionModelUid(model) && findNativeModelOption(models, model) === null;
-  const efforts = nativeEffortOptions(harness, models, resetModel ? null : model);
+  const effortModel = resetModel ? null : model;
+  // Codex-style ladders depend on the running model, which is unknown without a resolvable pick.
+  const ladderDependsOnModel = harness === "codex-native" || harness === "devin-native";
+  const ladderKnown = !ladderDependsOnModel || (!!effortModel && !isFusionModelUid(effortModel));
+  const efforts = ladderKnown ? nativeEffortOptions(harness, models, effortModel) : null;
   const resetEffort =
-    !!effort && efforts !== null && !efforts.some((option) => option.value === effort);
+    !!effort &&
+    !!efforts &&
+    efforts.length > 0 &&
+    !efforts.some((option) => option.value === effort);
   return { model: resetModel, effort: resetEffort };
 }
 
@@ -64,13 +71,20 @@ export function useSandboxLaunchSelectionCheck(
     const notice = launchSelectionNotice(resets, model, effort);
     if (notice === null) return;
     const stillActive = () => useChatStore.getState().conversationId === sessionId;
+    // Store setters act on the active session, so a switch away defers the rest until return.
+    const deferUntilReturn = () => {
+      if (checked.current === sessionId) checked.current = null;
+    };
     void (async () => {
       try {
         if (resets.model) await useChatStore.getState().setModel(null);
-        if (resets.effort && stillActive()) await useChatStore.getState().setEffort(null);
+        if (resets.effort) {
+          if (!stillActive()) return deferUntilReturn();
+          await useChatStore.getState().setEffort(null);
+        }
         if (stillActive()) toast.info(notice);
       } catch {
-        // The store restores the server's setting; the picker still shows it.
+        if (stillActive()) toast.error("Couldn't switch to the sandbox's default model settings.");
       }
     })();
   }, [sessionId, conversationId, sandboxStatus, harness, models, model, effort]);

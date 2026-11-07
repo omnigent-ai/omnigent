@@ -11,9 +11,12 @@ import {
   launchSelectionResets,
   useSandboxLaunchSelectionCheck,
 } from "./useSandboxLaunchSelectionCheck";
-import { useRememberSandboxSessionCatalog } from "./useSandboxSessionCatalog";
+import {
+  useRememberSandboxSessionCatalog,
+  useSavedSandboxSessionCatalog,
+} from "./useSandboxSessionCatalog";
 
-vi.mock("sonner", () => ({ toast: { info: vi.fn() } }));
+vi.mock("sonner", () => ({ toast: { info: vi.fn(), error: vi.fn() } }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof IdentityModule>()),
   getCurrentUserId: vi.fn(),
@@ -34,9 +37,11 @@ describe("launchSelectionResets", () => {
     ["an offered model and effort", "codex-native", "gpt-6-luna", "high", false, false],
     ["no explicit choice", "codex-native", null, null, false, false],
     ["a model the session lacks", "codex-native", "gpt-5", null, true, false],
-    ["an effort the model lacks", "codex-native", "kimi-k3", "high", false, true],
-    ["an effort the default model lacks", "codex-native", "gpt-5", "minimal", true, true],
-    ["an effort the default model offers", "codex-native", "gpt-5", "low", true, false],
+    ["an effort the model lacks", "codex-native", "gpt-6-luna", "minimal", false, true],
+    ["a model with no effort ladder", "codex-native", "kimi-k3", "high", false, false],
+    ["an effort after the model resets", "codex-native", "gpt-5", "minimal", true, false],
+    ["an effort with no model override", "codex-native", null, "minimal", false, false],
+    ["a Fusion combo", "devin-native", "fusion-a1", "minimal", false, false],
     ["Claude's in-session ladder", "claude-native", null, "xhigh", false, false],
     ["an effort outside Claude's ladder", "claude-native", null, "minimal", false, true],
   ])("handles %s", (_label, harness, model, effort, resetModel, resetEffort) => {
@@ -76,12 +81,17 @@ describe("sandbox session catalog hooks", () => {
   const setModel = vi.fn(async () => {});
   const setEffort = vi.fn(async () => {});
   const original = useChatStore.getState();
+  // The store keeps settings per conversation id, so each test uses its own session.
+  let testIndex = 0;
+  let sessionId = "conv_0";
 
   beforeEach(() => {
     localStorage.clear();
     vi.mocked(getCurrentUserId).mockReturnValue("alice");
+    testIndex += 1;
+    sessionId = `conv_${testIndex}`;
     useChatStore.setState({
-      conversationId: "conv_1",
+      conversationId: sessionId,
       sessionModelOverride: "gpt-5",
       sessionReasoningEffort: "minimal",
       setModel,
@@ -93,10 +103,10 @@ describe("sandbox session catalog hooks", () => {
     vi.clearAllMocks();
   });
 
-  function renderCheck(sessionId: string | null = "conv_1") {
+  function renderCheck(harness = "codex-native") {
     return renderHook(
       ({ status, models }: { status: SandboxStatus | null; models: NativeModelOption[] }) =>
-        useSandboxLaunchSelectionCheck(sessionId, status, "codex-native", models),
+        useSandboxLaunchSelectionCheck(sessionId, status, harness, models),
       { initialProps: { status: { stage: "provisioning", provider: "arclet" }, models: [] } },
     );
   }
@@ -107,20 +117,54 @@ describe("sandbox session catalog hooks", () => {
     rerender({ status: null, models: codexModels });
     await waitFor(() =>
       expect(toast.info).toHaveBeenCalledWith(
-        "gpt-5 isn't available in this sandbox. Using the default model and effort.",
+        "gpt-5 isn't available in this sandbox. Using the default model.",
       ),
     );
     expect(setModel).toHaveBeenCalledWith(null);
-    expect(setEffort).toHaveBeenCalledWith(null);
+    expect(setEffort).not.toHaveBeenCalled();
     // Later catalog refreshes do not recheck the user's in-session choices.
     rerender({ status: null, models: [...codexModels] });
     expect(setModel).toHaveBeenCalledTimes(1);
   });
 
+  it("finishes an effort reset when the user returns to the session", async () => {
+    setModel.mockImplementationOnce(async () => {
+      useChatStore.setState({ sessionModelOverride: null });
+      useChatStore.setState({ conversationId: "conv_other" });
+    });
+    const { rerender } = renderCheck("claude-native");
+    const claudeModels = [{ id: "opus", displayName: "Opus" }];
+    rerender({ status: null, models: claudeModels });
+    await waitFor(() => expect(setModel).toHaveBeenCalledWith(null));
+    expect(setEffort).not.toHaveBeenCalled();
+    expect(toast.info).not.toHaveBeenCalled();
+    act(() => useChatStore.setState({ conversationId: sessionId }));
+    rerender({ status: null, models: claudeModels });
+    await waitFor(() =>
+      expect(toast.info).toHaveBeenCalledWith(
+        "Minimal effort isn't available for this model in this sandbox. Using the default effort.",
+      ),
+    );
+    expect(setEffort).toHaveBeenCalledWith(null);
+    expect(setModel).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a reset the server refused", async () => {
+    setModel.mockRejectedValueOnce(new Error("refused"));
+    const { rerender } = renderCheck();
+    rerender({ status: null, models: codexModels });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        "Couldn't switch to the sandbox's default model settings.",
+      ),
+    );
+    expect(toast.info).not.toHaveBeenCalled();
+  });
+
   it("leaves a session it never saw launching alone", () => {
     const { rerender } = renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
-        useSandboxLaunchSelectionCheck("conv_1", null, "codex-native", models),
+        useSandboxLaunchSelectionCheck(sessionId, null, "codex-native", models),
       { initialProps: { models: [] as NativeModelOption[] } },
     );
     rerender({ models: codexModels });
@@ -140,5 +184,12 @@ describe("sandbox session catalog hooks", () => {
     expect(readModelCatalogCache(key)).toBeNull();
     rerender({ models: codexModels, enabled: true });
     expect(readModelCatalogCache(key)?.models).toEqual(codexModels);
+  });
+
+  it("refreshes a mounted reader when a session catalog is saved", () => {
+    const reader = renderHook(() => useSavedSandboxSessionCatalog("arclet", "codex-native"));
+    expect(reader.result.current).toBeUndefined();
+    renderHook(() => useRememberSandboxSessionCatalog("arclet", "codex-native", codexModels, true));
+    expect(reader.result.current).toEqual(codexModels);
   });
 });

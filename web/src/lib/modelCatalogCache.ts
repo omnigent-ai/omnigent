@@ -54,16 +54,30 @@ export function sandboxSessionCatalogKey(
   return `omnigent:model-catalog:v1:${JSON.stringify([server, user, "sandbox-session", provider, harness])}`;
 }
 
-export function readModelCatalogCache(key: string | null, maxAgeMs = MAX_AGE_MS) {
+/** The raw stored entry, comparable across renders. */
+export function readModelCatalogCacheText(key: string | null): string | null {
   if (key === null || typeof window === "undefined") return null;
   try {
-    const result = cacheSchema.safeParse(JSON.parse(window.localStorage.getItem(key) ?? "null"));
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+export function parseModelCatalogCache(text: string | null, maxAgeMs = MAX_AGE_MS) {
+  if (text === null) return null;
+  try {
+    const result = cacheSchema.safeParse(JSON.parse(text));
     if (!result.success) return null;
     const age = Date.now() - result.data.savedAt;
     return age >= 0 && age <= maxAgeMs ? result.data : null;
   } catch {
     return null;
   }
+}
+
+export function readModelCatalogCache(key: string | null, maxAgeMs = MAX_AGE_MS) {
+  return parseModelCatalogCache(readModelCatalogCacheText(key), maxAgeMs);
 }
 
 /** Store catalog data only; live queries always own launch availability. */
