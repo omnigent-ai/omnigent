@@ -599,7 +599,9 @@ describe("agent picker readiness (needs-setup badges)", () => {
     fireEvent.click(submit);
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0].agentId).toBe("ag_codex");
-    for (const override of ["permissionMode", "modelOverride", "reasoningEffort"]) {
+    // A new automation starts on Approve for me; model and effort keep the agent's defaults.
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
+    for (const override of ["modelOverride", "reasoningEffort"]) {
       expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty(override);
     }
 
@@ -2045,7 +2047,7 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     expect(arg.permissionMode).toBe("acceptEdits");
   });
 
-  it("omits model + effort + permission on create when left at Default", async () => {
+  it("omits model + effort and starts permission at Auto on create", async () => {
     renderDialog();
     fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
     fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
@@ -2054,7 +2056,33 @@ describe("CreateScheduledTaskDialog model + effort controls", () => {
     const arg = mutateAsync.mock.calls[0][0];
     expect(arg).not.toHaveProperty("modelOverride");
     expect(arg).not.toHaveProperty("reasoningEffort");
-    expect(arg).not.toHaveProperty("permissionMode");
+    // Nobody watches an automation's turns, so a new one starts in an auto-approve mode.
+    expect(arg.permissionMode).toBe("auto");
+  });
+
+  it("starts on Auto again after the user picks Default and cancels", async () => {
+    const onOpenChange = vi.fn();
+    const view = renderDialog(onOpenChange);
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    view.rerender(<CreateScheduledTaskDialog open={false} onOpenChange={onOpenChange} />);
+    view.rerender(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />);
+    expect(await screen.findByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+  });
+
+  it("omits permission on create when the user picks Default", async () => {
+    renderDialog();
+    fireEvent.change(screen.getByTestId("task-name-input"), { target: { value: "N" } });
+    fireEvent.change(screen.getByTestId("task-prompt-input"), { target: { value: "P" } });
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Auto");
+    fireEvent.keyDown(screen.getByTestId("task-permission-trigger"), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("option", { name: "Default" }));
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
   });
 
   it("prefills model + effort + permission in edit mode from the loaded task", async () => {
@@ -3530,6 +3558,45 @@ describe("CreateScheduledTaskDialog trigger template", () => {
     expect(prompt).toContain("call sys_session_create");
   });
 
+  it("watches Slack DMs from listed senders, or one group DM, with prefixed scopes", async () => {
+    renderTrigger("slack");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("#");
+    // Pasted channel names keep a single, visual "#".
+    type("task-trigger-scope", "#eng-support");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("eng-support");
+    fireEvent.click(screen.getByTestId("task-trigger-add-condition"));
+    pick("task-trigger-condition-0-field", "task-trigger-condition-0-field-author");
+
+    pick("task-trigger-event", "task-trigger-event-dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where sender");
+    expect(screen.getByTestId("task-trigger-scope-prefix")).toHaveTextContent("@");
+    // Channel names aren't people, and Author repeats the sender.
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("");
+    expect(screen.queryByTestId("task-trigger-condition-0")).not.toBeInTheDocument();
+    expect(screen.getByTestId("task-trigger-untrusted-note")).toHaveTextContent(
+      "Anyone who can send you a direct message from one of these accounts may direct the agent",
+    );
+
+    pick("task-trigger-event", "task-trigger-event-group_dm");
+    expect(screen.getByTestId("task-trigger-builder")).toHaveTextContent("where group DM with");
+    expect(screen.queryByTestId("task-trigger-scope-operator")).not.toBeInTheDocument();
+    type("task-trigger-scope", "@alice");
+    type("task-trigger-instructions", "Answer the question.");
+    expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+    expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    // A trailing comma or a repeated name still lists one person.
+    for (const scope of ["alice,", "alice, @Alice"]) {
+      type("task-trigger-scope", scope);
+      expect(screen.getByTestId("task-trigger-group-hint")).toBeVisible();
+      expect(screen.getByTestId("create-scheduled-task-submit")).toBeDisabled();
+    }
+    type("task-trigger-scope", "alice, @bob");
+    expect(screen.getByTestId("task-trigger-scope")).toHaveValue("alice, bob");
+
+    const prompt = await submittedPrompt();
+    expect(prompt).toContain("Watch: new Slack messages in your group DM with @alice and @bob\n");
+  });
+
   it("builds a Linear trigger for a team, with an unassigned row and the issue link-back", async () => {
     renderTrigger("linear");
     expect(screen.getByTestId("task-name-input")).toHaveValue("Linear issues");
@@ -4225,6 +4292,43 @@ describe("automation harness settings", () => {
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", harness, model);
   });
 
+  it("starts a new Codex automation on Approve for me", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Approve for me");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0].permissionMode).toBe("approve-for-me");
+  });
+
+  it("saves no Codex override when the user picks Default", async () => {
+    mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog open onOpenChange={vi.fn()} initialName="R" initialPrompt="P" />,
+    );
+    await choose("permission", "Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    expect(mutateAsync.mock.calls[0][0]).not.toHaveProperty("permissionMode");
+  });
+
+  it("keeps an existing Codex automation with no saved mode on Default", async () => {
+    const agent = mockHarness("codex-native");
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ agentId: agent.id, permissionMode: null, hostId: "host_1" })}
+      />,
+    );
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Default");
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    expect(updateMutateAsync.mock.calls[0][0].input.permissionMode).toBeNull();
+  });
+
   it("clears Antigravity's saved skip mode, which has no picker, on edit", async () => {
     mockHarness("antigravity-native");
     render(
@@ -4261,7 +4365,7 @@ describe("automation harness settings", () => {
     await choose("model", "Model B");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("Default");
     await choose("effort", "Low");
-    await choose("permission", "Read only");
+    await choose("permission", "Read Only");
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
     expect(mutateAsync.mock.calls[0][0]).toMatchObject({
@@ -4294,7 +4398,7 @@ describe("automation harness settings", () => {
     );
     expect(screen.getByTestId("task-model-trigger")).toHaveTextContent("saved-model");
     expect(screen.getByTestId("task-effort-trigger")).toHaveTextContent("high");
-    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read only");
+    expect(screen.getByTestId("task-permission-trigger")).toHaveTextContent("Read Only");
     expect(hostsHook.useHostModelOptions).toHaveBeenLastCalledWith("host_1", "codex-native", false);
     await choose("model", "Default");
     await choose("permission", "Default");

@@ -749,7 +749,10 @@ async def test_create_rejects_invalid_reasoning_effort(
 @pytest.mark.parametrize(
     ("agent_name", "mode"),
     [(CLAUDE_NATIVE_AGENT_NAME, "acceptEdits")]
-    + [(CODEX_NATIVE_AGENT_NAME, mode) for mode in ("default", "read-only")],
+    + [
+        (CODEX_NATIVE_AGENT_NAME, mode)
+        for mode in ("default", "ask-for-approval", "approve-for-me", "read-only")
+    ],
 )
 async def test_create_persists_permission_mode(
     auth_client: httpx.AsyncClient, db_uri: str, agent_name: str, mode: str
@@ -1541,9 +1544,15 @@ async def test_update_rejects_invalid_reasoning_effort(
 
 
 @pytest.mark.parametrize("claimed", [False, True])
+@pytest.mark.parametrize("shared", [False, True])
 async def test_delete_removes_task(
-    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool, shared: bool
 ) -> None:
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.stores.host_store import HostStore
+
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
@@ -1568,8 +1577,39 @@ async def test_delete_removes_task(
             is not None
         )
 
+    hosts = HostStore(db_uri)
+    host_id = continued_sandbox_host_id(task_id, current_workspace_id())
+    hosts.register_managed_host(
+        host_id=host_id,
+        name="automation",
+        user_id="alice@example.com",
+        token="retained",
+        provider="modal",
+        sandbox_id="retained",
+        token_expires_at=2_000_000_000,
+    )
+    hosts.upsert_on_connect(host_id=host_id, name="automation", user_id="alice@example.com")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    session = conversations.create_conversation(
+        host_id=host_id, workspace="/work", labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id}
+    )
+    if shared:
+        peer = conversations.create_conversation(host_id=host_id, workspace="/work")
+        conversations.update_conversation(peer.id, archived=True)
+    assert await conversations.delete_conversation(session.id)
+    assert hosts.get_host(host_id).status == "online"
+
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
+    retained_host = hosts.get_host(host_id, include_deleted=True)
+    assert retained_host is not None
+    assert (retained_host.deleted_at is None) is shared
+    if shared:
+        assert retained_host.status == "online"
+        assert conversations.get_conversation(peer.id).host_id == host_id
+    else:
+        assert retained_host.sandbox_id == "retained"
+        assert hosts.resolve_launch_token(host_id, "retained") is None
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404

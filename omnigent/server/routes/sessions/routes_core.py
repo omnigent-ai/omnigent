@@ -8,7 +8,8 @@ import dataclasses
 import json
 import secrets
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from itertools import batched
 from typing import Any
 
 import httpx
@@ -86,6 +87,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.feature_flags import Feature
 from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
@@ -143,6 +145,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _create_session_worktree,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
     _enforce_filesystem_attachment_policy,
@@ -170,6 +173,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_session_worktree_best_effort,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
@@ -274,6 +278,7 @@ from omnigent.version import VERSION
 ClearSessionIntoFreshSession = Callable[
     [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
 ]
+_SESSION_LIST_BATCH_SIZE = 1000
 
 
 def _require_attachment_compatible_history(
@@ -1216,6 +1221,38 @@ def register_core_routes(
                         "Sender host/workspace is invalid for independent creation",
                         code=ErrorCode.INVALID_INPUT,
                     ) from exc
+        if source is not None and request.app.state.feature_flags.enabled(
+            Feature.SIBLING_SESSIONS
+        ):
+            body.sibling_source_id = source.root_conversation_id
+        if body.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                body.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=body.parent_session_id,
+                host_id=body.host_id,
+                host_type=body.host_type,
+            )
+            if body.initial_items:
+                raise OmnigentError(
+                    "Siblings start a fresh conversation", code=ErrorCode.INVALID_INPUT
+                )
+            if (
+                "project_id" in body.model_fields_set
+                and body.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            body.sibling_source_id = sibling_source.id
+            body.project_id = sibling_source.project_id
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
@@ -1356,18 +1393,19 @@ def register_core_routes(
         # own the host AND the session), atomically bind, then launch.
         # Same authorization path as POST /v1/hosts/{host_id}/runners.
         if launch_host_id is not None and resp.runner_id is None:
-            launched = await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=resp.id,
-                host_id=launch_host_id,
-                # Already written by _create_session_from_existing_agent;
-                # only runner_id still needs the atomic set inside.
-                workspace=resp.workspace,
-                # Already canonical (see _resolve_harness).
-                harness=resp.harness,
-                conversation=conv,
-            )
+            with creation_stage("create_host_launch_ms"):
+                launched = await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=resp.id,
+                    host_id=launch_host_id,
+                    # Already written by _create_session_from_existing_agent;
+                    # only runner_id still needs the atomic set inside.
+                    workspace=resp.workspace,
+                    # Already canonical (see _resolve_harness).
+                    harness=resp.harness,
+                    conversation=conv,
+                )
             if launched is not None:
                 runner_id, launch_failed = launched
                 if launch_failed and _terminal_first_create:
@@ -1382,7 +1420,12 @@ def register_core_routes(
         # Default-public grant only once every launch step has been accepted, so a
         # rejected request never leaves a public session behind. Sub-agent
         # children follow their parent's grants instead.
-        if user_id is not None and body.parent_session_id is None and orchestration_source is None:
+        if (
+            user_id is not None
+            and body.parent_session_id is None
+            and orchestration_source is None
+            and body.sibling_source_id is None
+        ):
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -1391,6 +1434,13 @@ def register_core_routes(
                 workspace=conv.workspace if conv is not None else None,
                 host_id=launch_host_id,
             )
+        if body.sibling_source_id is not None and conv is not None:
+            from omnigent.server.session_families import project_families
+
+            _, families = await asyncio.to_thread(
+                project_families, conversation_store, permission_store, [conv], user_id
+            )
+            resp.family = families.get(conv.id)
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
 
@@ -1434,6 +1484,30 @@ def register_core_routes(
         if not isinstance(bundle, StarletteUploadFile):
             raise HTTPException(status_code=422, detail=[_multipart_missing_detail("bundle")])
         parsed_metadata = _parse_session_create_metadata(metadata)
+        if parsed_metadata.sibling_source_id is not None:
+            from omnigent.server.session_families import authorize_sibling_source
+
+            sibling_source = await asyncio.to_thread(
+                authorize_sibling_source,
+                request,
+                parsed_metadata.sibling_source_id,
+                user_id,
+                conversation_store,
+                permission_store,
+                parent_id=parsed_metadata.parent_session_id,
+                host_id=parsed_metadata.host_id,
+                host_type=parsed_metadata.host_type,
+            )
+            if (
+                "project_id" in parsed_metadata.model_fields_set
+                and parsed_metadata.project_id != sibling_source.project_id
+            ):
+                raise OmnigentError(
+                    "Nested agents stay in their source session's project",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            parsed_metadata.sibling_source_id = sibling_source.id
+            parsed_metadata.project_id = sibling_source.project_id
         creation_metadata(
             parent_session_id=parsed_metadata.parent_session_id,
             host_type=parsed_metadata.host_type,
@@ -1442,6 +1516,12 @@ def register_core_routes(
             resolve_project_session_create,
         )
 
+        if (
+            parsed_metadata.sibling_source_id is None
+            and "git" not in parsed_metadata.model_fields_set
+        ):
+            # Ordinary uploads choose worktrees in their separate runner launch.
+            parsed_metadata = parsed_metadata.model_copy(update={"git": None})
         project_resolution = await resolve_project_session_create(
             body=parsed_metadata,
             user_id=user_id,
@@ -1578,21 +1658,84 @@ def register_core_routes(
             labels=parsed_metadata.labels,
             host_registry=getattr(request.app.state, "host_registry", None),
         )
-        with creation_stage("create_persistence_ms"):
-            result = await asyncio.to_thread(
-                _create_session_from_bundle,
-                conversation_store,
-                artifact_store,
-                parsed_metadata,
-                bundle_bytes,
-                inherited_runner_id,
-                spec,
-                inference_snapshot,
-                inference_model,
-                created_by=user_id,
-                agent_store=agent_store,
-            )
-        await record_profile(request, result.session_id, sandbox_profile, conversation_store)
+        git_options = parsed_metadata.git
+        git_branch: str | None = None
+        created_worktree_path: str | None = None
+        if git_options is not None:
+            if git_options.existing_worktree:
+                from omnigent.host.git_worktree import WorktreeError, validate_branch_name
+
+                try:
+                    validate_branch_name(git_options.branch_name)
+                except WorktreeError as exc:
+                    raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+                git_branch = git_options.branch_name
+            else:
+                created_worktree = await _create_session_worktree(
+                    host_id=parsed_metadata.host_id,
+                    source_repo=parsed_metadata.workspace,
+                    git=git_options,
+                    request=request,
+                )
+                created_worktree_path = created_worktree.worktree_path
+                git_branch = created_worktree.branch
+                from omnigent.server.routes._host_worktree import (
+                    WORKTREE_ROOT_LABEL_KEY,
+                    worktree_root_fingerprint,
+                )
+
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "workspace": created_worktree.workspace or created_worktree.worktree_path,
+                        "labels": {
+                            **parsed_metadata.labels,
+                            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(
+                                created_worktree.worktree_path
+                            ),
+                        },
+                    }
+                )
+        try:
+            with creation_stage("create_persistence_ms"):
+                result = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    parsed_metadata,
+                    bundle_bytes,
+                    inherited_runner_id,
+                    spec,
+                    inference_snapshot,
+                    inference_model,
+                    git_branch=git_branch,
+                    created_by=user_id,
+                    agent_store=agent_store,
+                )
+            if parsed_metadata.sibling_source_id is not None:
+                from omnigent.server.session_families import complete_sibling_creation
+
+                await complete_sibling_creation(
+                    conversation_store,
+                    parsed_metadata.sibling_source_id,
+                    result.session_id,
+                    user_id=user_id,
+                )
+            await record_profile(request, result.session_id, sandbox_profile, conversation_store)
+        except Exception:
+            if (
+                created_worktree_path is not None
+                and parsed_metadata.host_id is not None
+                and git_branch is not None
+            ):
+                await _remove_session_worktree_best_effort(
+                    host_id=parsed_metadata.host_id,
+                    worktree_path=created_worktree_path,
+                    branch=git_branch,
+                    delete_branch=git_options is None or not git_options.existing_branch,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    reason="create-rollback",
+                )
+            raise
         session_created(
             result.session_id,
             inherited_runner_id,
@@ -1638,11 +1781,7 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
-                # Bundle metadata carries a single repo; multi-repo is a
-                # web-picker (JSON) feature. Empty list = no repo.
-                workspaces=[parsed_metadata.workspace]
-                if parsed_metadata.workspace is not None
-                else [],
+                workspaces=parsed_metadata.managed_repo_workspaces(),
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic
@@ -1655,18 +1794,23 @@ def register_core_routes(
             from omnigent.models.model_catalog import spec_harness
 
             raw_harness = spec_harness(spec)
-            await _bind_and_launch_on_caller_host(
-                request,
-                user_id=user_id,
-                session_id=result.session_id,
-                host_id=parsed_metadata.host_id,
-                workspace=parsed_metadata.workspace,
-                harness=canonicalize_harness(raw_harness) or raw_harness,
-            )
+            with creation_stage("create_host_launch_ms"):
+                await _bind_and_launch_on_caller_host(
+                    request,
+                    user_id=user_id,
+                    session_id=result.session_id,
+                    host_id=parsed_metadata.host_id,
+                    workspace=parsed_metadata.workspace,
+                    harness=canonicalize_harness(raw_harness) or raw_harness,
+                )
         # Default-public grant only after the launch steps were accepted (see the
         # JSON path). Sub-agent children follow their parent's grants, whether or
         # not they inherited its runner.
-        if user_id is not None and parsed_metadata.parent_session_id is None:
+        if (
+            user_id is not None
+            and parsed_metadata.parent_session_id is None
+            and parsed_metadata.sibling_source_id is None
+        ):
             await _grant_default_public(
                 request.app.state,
                 permission_store,
@@ -1907,7 +2051,7 @@ def register_core_routes(
     # ── GET /sessions ───────────────────────────────────────────
 
     def _session_agent_metadata(
-        conversations: list[Conversation],
+        conversations: Sequence[Conversation],
     ) -> tuple[dict[str, str], dict[str, str | None]]:
         """Resolve list metadata off the event loop with one batched agent read."""
         agents = agent_store.get_many(
@@ -1952,8 +2096,9 @@ def register_core_routes(
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
         pinned: bool = Query(default=False),
+        expand_families: bool = Query(default=False),
         visibility: str = Query(default="all", pattern="^(all|mine|shared|archived)$"),
-    ) -> PaginatedList:
+    ) -> dict[str, Any]:
         """
         List sessions with cursor-based pagination.
 
@@ -2006,6 +2151,10 @@ def register_core_routes(
             has pinned (the ``omnigent.pinned`` label). Lets the
             sidebar enumerate pinned sessions that fall outside the
             loaded pagination window. ``False`` (default) disables it.
+        :param expand_families: Add owned family context to matching rows,
+            including members outside the agent, pin, and page filters.
+            Ownership and archive filters still apply; search disables expansion.
+            Pagination cursors refer to the original filtered page.
         :param visibility: Ownership/archive filter for the sidebar tabs.
             ``"mine"`` returns only sessions the caller owns (owner-level
             grant). ``"shared"`` returns only sessions accessible but not
@@ -2108,127 +2257,131 @@ def register_core_routes(
         # side-chat-labeled fork from the sidebar list (it is still a normal
         # session, just not listed as a top-level one here).
         page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
-        # list_conversations may return rows with agent_id=None for
-        # legacy conversations; skip them before building the batch IDs.
-        conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
-        if not conv_ids:
-            return PaginatedList(
-                data=[],
-                first_id=page.first_id,
-                last_id=page.last_id,
-                has_more=page.has_more,
-            )
-        # Batch-fetch permissions and agent metadata concurrently.
-        # The tasks table has been removed — status comes exclusively from
-        # the relay-fed ``_session_status_cache``.
-        perms_by_conv: dict[str, list[SessionPermission]]
-        if permission_store is not None:
-            perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(_session_agent_metadata, page.data),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-        else:
-            agent_metadata, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(_session_agent_metadata, page.data),
-                asyncio.to_thread(
-                    conversation_store.list_child_conversation_ids_by_parent,
-                    conv_ids,
-                ),
-            )
-            perms_by_conv = {}
-            user_is_admin = False
-        agent_names_by_id, harnesses_by_id = agent_metadata
-        # In-memory lookup — no I/O, so batching avoids re-acquiring
-        # the index's lock per row but otherwise has no DB cost.
-        pending_counts = pending_elicitations.counts_for(conv_ids)
-        comments_fingerprints = await _comments_fingerprints_for(conv_ids)
-        pull_requests = await _pull_requests_for(conv_ids)
-        # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
-        # A session whose persisted live_status is still running/waiting but
-        # whose runner is confirmed gone — a replica that restarted and
-        # outlived its runner, a crashed host, a graceful disconnect
-        # mid-turn — would otherwise read "running" forever: no executor is
-        # left to emit the terminal edge that clears it. Settle that exact
-        # subset here so the sidebar (and every other reader) stops showing a
-        # turn that isn't happening. The list still does NOT compute liveness
-        # for the general case (see the note below the item build): the probe
-        # is bounded to a tiny suspect set so the common path pays nothing.
-        #
-        # Suspect = a row that (a) still says running/waiting, (b) has a bound
-        # runner, (c) has NO live entry in this replica's status cache — i.e.
-        # its "running" came from the cross-replica DB mirror, not a runner
-        # this replica is actively relaying — and (d) has a stale/absent
-        # runner_last_seen heartbeat. The freshness check reads the stamp
-        # already carried on the list row (no extra query): a runner up on
-        # another replica keeps it fresh, so such a session is filtered out
-        # here and never reaches the probe. Only stamp-stale candidates fall
-        # through to liveness_lookup, which additionally rules out a runner
-        # whose tunnel is live on THIS replica before we settle.
-        if liveness_lookup is not None:
-            orphan_suspects = [
-                conv
-                for conv in page.data
-                if conv.agent_id is not None
-                and conv.runner_id is not None
-                and conv.live_status in ("running", "waiting")
-                and _session_status_cache.get(conv.id) is None
-                and not runner_seen_is_fresh(conv.runner_last_seen)
-                and (
-                    permission_store is None
-                    or _permission_level_from_grants(
-                        user_id,
-                        perms_by_conv.get(conv.id, []),
-                        user_is_admin,
-                    )
-                    == LEVEL_OWNER
+        boundary_row = page.data[-1] if page.data else None
+        page_boundary = (
+            {
+                "id": boundary_row.id,
+                "created_at": boundary_row.created_at,
+                "updated_at": boundary_row.updated_at,
+            }
+            if boundary_row
+            else None
+        )
+        from omnigent.server.session_families import project_families
+
+        page.data, family_info = await asyncio.to_thread(
+            project_families,
+            conversation_store,
+            permission_store,
+            page.data,
+            user_id,
+            expand=expand_families and not normalized_query,
+            include_archived=include_archived_param,
+            archived_only=archived_only_param,
+        )
+        items: list[SessionListItem] = []
+        user_is_admin = (
+            await asyncio.to_thread(permission_store.is_admin, user_id)
+            if page.data and permission_store is not None and user_id is not None
+            else False
+        )
+        # Expanded families can contain many more rows than the source page.
+        for list_batch in batched(page.data, _SESSION_LIST_BATCH_SIZE):
+            # list_conversations may return rows with agent_id=None for
+            # legacy conversations; skip them before building the batch IDs.
+            conv_ids = [conv.id for conv in list_batch if conv.agent_id is not None]
+            if not conv_ids:
+                continue
+            # Batch-fetch permissions and agent metadata concurrently.
+            # The tasks table has been removed — status comes exclusively from
+            # the relay-fed ``_session_status_cache``.
+            perms_by_conv: dict[str, list[SessionPermission]]
+            if permission_store is not None:
+                perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
                 )
-            ]
-            if orphan_suspects:
-                orphan_liveness = await asyncio.to_thread(
-                    liveness_lookup, [conv.id for conv in orphan_suspects]
+            else:
+                agent_metadata, child_ids_by_parent = await asyncio.gather(
+                    asyncio.to_thread(_session_agent_metadata, list_batch),
+                    asyncio.to_thread(
+                        conversation_store.list_child_conversation_ids_by_parent,
+                        conv_ids,
+                    ),
                 )
-                for conv in orphan_suspects:
-                    result = orphan_liveness.get(conv.id)
-                    # runner_online is False only once the runner is gone from
-                    # every replica (no tunnel anywhere AND runner_last_seen
-                    # stale past the TTL), so this fires for a genuinely
-                    # orphaned runner, never one mid-reconnect within grace.
-                    if result is not None and not result.runner_online:
-                        await asyncio.to_thread(
-                            reconcile_orphaned_running_status,
-                            conv.id,
-                            conversation_store,
-                            int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                perms_by_conv = {}
+            agent_names_by_id, harnesses_by_id = agent_metadata
+            # In-memory lookup — no I/O, so batching avoids re-acquiring
+            # the index's lock per row but otherwise has no DB cost.
+            pending_counts = pending_elicitations.counts_for(conv_ids)
+            comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+            pull_requests = await _pull_requests_for(conv_ids)
+            # Settle orphaned running/waiting rows only after stale heartbeats
+            # and a missing local cache entry justify a cross-replica probe.
+            if liveness_lookup is not None:
+                orphan_suspects = [
+                    conv
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                    and conv.runner_id is not None
+                    and conv.live_status in ("running", "waiting")
+                    and _session_status_cache.get(conv.id) is None
+                    and not runner_seen_is_fresh(conv.runner_last_seen)
+                    and (
+                        permission_store is None
+                        or _permission_level_from_grants(
+                            user_id,
+                            perms_by_conv.get(conv.id, []),
+                            user_is_admin,
                         )
-        # Build items after reconciliation so each settled row reads its new
-        # status straight from the (now-updated) cache.
-        items: list[SessionListItem] = [
-            _build_session_list_item(
-                conv,
-                agent_names_by_id=agent_names_by_id,
-                harness=harnesses_by_id.get(conv.id),
-                grants=perms_by_conv.get(conv.id, []),
-                user_id=user_id,
-                user_is_admin=user_is_admin,
-                permissions_enabled=permission_store is not None,
-                pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
-                pull_request=pull_requests.get(conv.id, (None, None))[0],
-                pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                        == LEVEL_OWNER
+                    )
+                ]
+                if orphan_suspects:
+                    orphan_liveness = await asyncio.to_thread(
+                        liveness_lookup, [conv.id for conv in orphan_suspects]
+                    )
+                    for conv in orphan_suspects:
+                        result = orphan_liveness.get(conv.id)
+                        # False means no replica has a tunnel and the heartbeat
+                        # expired, so reconnecting runners within grace survive.
+                        if result is not None and not result.runner_online:
+                            await asyncio.to_thread(
+                                reconcile_orphaned_running_status,
+                                conv.id,
+                                conversation_store,
+                                int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                            )
+            # Build items after reconciliation so each settled row reads its new
+            # status straight from the (now-updated) cache.
+            items.extend(
+                [
+                    _build_session_list_item(
+                        conv,
+                        agent_names_by_id=agent_names_by_id,
+                        harness=harnesses_by_id.get(conv.id),
+                        grants=perms_by_conv.get(conv.id, []),
+                        user_id=user_id,
+                        user_is_admin=user_is_admin,
+                        permissions_enabled=permission_store is not None,
+                        pending_count=pending_counts.get(conv.id, 0),
+                        child_session_ids=child_ids_by_parent[conv.id],
+                        comments_fingerprint=comments_fingerprints.get(conv.id),
+                        pull_request=pull_requests.get(conv.id, (None, None))[0],
+                        pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
+                    )
+                    for conv in list_batch
+                    if conv.agent_id is not None
+                ]
             )
-            for conv in page.data
-            if conv.agent_id is not None
-        ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
@@ -2237,12 +2390,14 @@ def register_core_routes(
         # single-session snapshot, the WS stream, and the /health poll, not
         # from list rows. Skipping it here removes the session-connectivity
         # and hosts-table queries from every GET /v1/sessions.
-        return PaginatedList(
+        result = PaginatedList(
             data=[item.model_dump(exclude_none=True) for item in items],
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
-        )
+        ).model_dump()
+        result["page_boundary"] = page_boundary
+        return result
 
     async def _comments_fingerprints_for(
         conv_ids: list[str],
@@ -2374,6 +2529,11 @@ def register_core_routes(
         convs = await asyncio.to_thread(_load_sessions, accessible)
         if not convs:
             return []
+        from omnigent.server.session_families import project_families
+
+        convs, family_info = await asyncio.to_thread(
+            project_families, conversation_store, permission_store, convs, user_id
+        )
         conv_ids = [c.id for c in convs]
         (
             agent_metadata,
@@ -2408,6 +2568,10 @@ def register_core_routes(
             )
             for conv in convs
         ]
+        for item in items:
+            item.family = family_info.get(item.id)
+            if item.family and item.family.pinned and item.family.representative_id == item.id:
+                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached
@@ -3114,7 +3278,64 @@ def register_core_routes(
                     code=ErrorCode.INVALID_INPUT,
                 )
             requested_codex_approval_mode = body.approval_mode
+        family_pin_value: str | None = None
+        if body.family_pinned is not None:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Family pins require ownership", code=ErrorCode.FORBIDDEN)
+            await asyncio.to_thread(
+                require_owned_session, session_id, user_id, conversation_store, permission_store
+            )
+            family_pin_value = str(int(time.time() * 1000)) if body.family_pinned else ""
         labels_to_set = dict(body.labels or {})
+        if PROJECT_LABEL_KEY in labels_to_set and (
+            not set_project or labels_to_set[PROJECT_LABEL_KEY]
+        ):
+            project_source = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if project_source and project_source.family_id is not None:
+                raise OmnigentError(
+                    "Move a session family through its representative's project action",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if PINNED_LABEL_KEY in labels_to_set:
+            from omnigent.stores.conversation_store import family_pinned_label_key
+
+            pin_source = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            owner_grant = (
+                await asyncio.to_thread(permission_store.get, user_id, session_id)
+                if permission_store is not None and user_id is not None
+                else None
+            )
+            if (
+                pin_source is not None
+                and pin_source.family_id is not None
+                and (
+                    permission_store is None
+                    or (
+                        user_id is not None
+                        and owner_grant is not None
+                        and owner_grant.level == LEVEL_OWNER
+                    )
+                )
+            ):
+                members = await asyncio.to_thread(
+                    conversation_store.get_session_family, session_id
+                )
+                active = [member for member in members if not member.archived]
+                retained = active or members
+                family_pin_key = family_pinned_label_key(user_id)
+                if (
+                    retained
+                    and retained[0].id == session_id
+                    and (
+                        family_pin_key in pin_source.labels
+                        or pinned_label_key(user_id) not in pin_source.labels
+                    )
+                ):
+                    family_pin_value = labels_to_set.pop(PINNED_LABEL_KEY)
         # Pins are per-user. The client writes the canonical ``omnigent.pinned``
         # key; rewrite it to the caller's per-user key so one user's pin doesn't
         # pin the session for everyone with access. Empty value (unpin) carries
@@ -3300,6 +3521,23 @@ def register_core_routes(
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
+                    if (
+                        conv.family_id is not None
+                        and runner_id != conv.runner_id
+                        and request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS)
+                    ):
+                        from omnigent.server.session_families import require_sibling_destination
+
+                        runner_hosts = await asyncio.to_thread(
+                            conversation_store.get_runner_host_ids, runner_id
+                        )
+                        await asyncio.to_thread(
+                            require_sibling_destination,
+                            request,
+                            conv.host_id,
+                            host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
+                            host_type="external",
+                        )
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,
@@ -3521,6 +3759,38 @@ def register_core_routes(
                 request, conv, conversation_store, runner_router
             )
 
+        if set_project or family_pin_value is not None:
+            members = await asyncio.to_thread(conversation_store.get_session_family, session_id)
+            if family_pin_value is not None and (conv is None or conv.family_id is None):
+                raise OmnigentError("Session has no family", code=ErrorCode.INVALID_INPUT)
+            active = [member for member in members if not member.archived]
+            if members and (active or members)[0].id != session_id:
+                raise OmnigentError(
+                    "Only the family representative can move or pin the family",
+                    code=ErrorCode.CONFLICT,
+                )
+            if set_project:
+                for member in members:
+                    await _require_access(
+                        user_id, member.id, LEVEL_OWNER, permission_store, conversation_store
+                    )
+                if body.project_id is None:
+                    raise OmnigentError(
+                        'project_id must be a project id or "" to unfile; '
+                        "omit the field to leave membership unchanged",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                if body.project_id:
+                    if project_store is None:
+                        raise OmnigentError(
+                            "Filing a session into a project is not supported by this server",
+                            code=ErrorCode.INVALID_INPUT,
+                        )
+                    owned = await asyncio.to_thread(
+                        project_store.get, body.project_id, user_id=user_id
+                    )
+                    if owned is None:
+                        raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,
@@ -3539,7 +3809,6 @@ def register_core_routes(
             # an omitted field leaves it unchanged; True/False set or clear it.
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
-            archived=body.archived,
             label_updates=(
                 {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
                 if defer_side_settings and (clear_effort or effort is not None)
@@ -3561,33 +3830,6 @@ def register_core_routes(
                     if key in body.model_fields_set
                 },
             )
-        # Archiving hides the session from the default view (and its unread
-        # dot), so drop its per-user read-state to bound in-memory growth.
-        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
-        if body.archived is True:
-            _prune_session_read_state(session_id)
-            # Defer the stop now that the flag is committed, so a request
-            # rejected after this point can't leave a live runner on a session
-            # that ends up archived. Detached, not awaited: the response must
-            # not wait out the stop's per-runner timeouts (seconds against a
-            # wedged or asleep runner). The teardown sleeps past the Undo
-            # window, then re-reads the archived flag and skips if undone, so
-            # undoing keeps the runner alive. Archive has no client-side stop,
-            # so this also carries the host-runner teardown.
-            _spawn_archive_stop(
-                session_id,
-                conversation_store,
-                runner_router,
-                getattr(request.app.state, "host_registry", None),
-                delete_worktree=body.delete_worktree,
-            )
-        elif body.archived is False:
-            # Unarchive (including Undo, which re-PATCHes archived=false within
-            # the pill's window): cancel a still-pending archive stop so the
-            # runner is kept alive instead of torn down for a session the user
-            # decided to keep. Same-replica fast path; the deferred stop's
-            # archived-flag re-check covers a cross-replica Undo.
-            _cancel_pending_archive_stop(session_id)
         # The runner applies native settings live. Silent startup metadata
         # writes skip both recovery and forwarding to avoid recursive launches.
         live_forward = not body.silent and not defer_side_settings
@@ -3836,6 +4078,39 @@ def register_core_routes(
                 _approval_result,
             )
             labels_to_set[_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY] = requested_codex_approval_mode
+        if family_pin_value is not None:
+            await asyncio.to_thread(
+                conversation_store.set_family_pin, session_id, family_pin_value, user_id=user_id
+            )
+        if set_project:
+            filed = await asyncio.to_thread(
+                conversation_store.set_conversation_project, session_id, body.project_id or None
+            )
+            if not filed:
+                raise _session_not_found()
+        if body.archived is not None:
+            await asyncio.to_thread(
+                conversation_store.update_conversation, session_id, archived=body.archived
+            )
+        # Archiving hides the session from the default view (and its unread
+        # dot), so drop its per-user read-state to bound in-memory growth.
+        # Only on archive→true; unarchiving leaves it pruned (reads as seen).
+        if body.archived is True:
+            _prune_session_read_state(session_id)
+            # Stop asynchronously after the archive commits and Undo grace elapses.
+            # The deferred archived-flag check keeps an undone session's runner alive.
+            _spawn_archive_stop(
+                session_id,
+                conversation_store,
+                runner_router,
+                getattr(request.app.state, "host_registry", None),
+                delete_worktree=body.delete_worktree,
+                host_store=getattr(request.app.state, "host_store", None),
+            )
+        elif body.archived is False:
+            # Cancel local teardown immediately; the deferred flag check handles
+            # Undo arriving on another replica.
+            _cancel_pending_archive_stop(session_id)
         # Some labels are cleared by DELETE, not by upserting an empty value:
         # the project membership (empty = "remove from project") and the pinned
         # flag (empty = "unpin"). Split any empty-valued clear keys out before
@@ -3897,46 +4172,6 @@ def register_core_routes(
                     str(exc),
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
-        # File into a first-class project (owner-only, gated above). ``""``
-        # unfiles; a non-empty id must name a project the caller owns. Filing
-        # into another owner's (or a missing) project is rejected as NOT_FOUND
-        # — the same 404 the projects API returns, so we don't leak existence.
-        if set_project:
-            # ``""`` unfiles; a non-empty id files. Explicit JSON ``null`` is
-            # not a valid value here (omitting the field is how you leave
-            # membership unchanged), so reject it rather than treating it as a
-            # destructive unfile.
-            if body.project_id is None:
-                raise OmnigentError(
-                    'project_id must be a project id or "" to unfile; '
-                    "omit the field to leave membership unchanged",
-                    code=ErrorCode.INVALID_INPUT,
-                )
-            target_project_id = body.project_id
-            if target_project_id == "":
-                unfiled = await asyncio.to_thread(
-                    conversation_store.set_conversation_project, session_id, None
-                )
-                if not unfiled:
-                    raise _session_not_found()
-            else:
-                if project_store is None:
-                    raise OmnigentError(
-                        "Filing a session into a project is not supported by this server",
-                        code=ErrorCode.INVALID_INPUT,
-                    )
-                owned = await asyncio.to_thread(
-                    project_store.get, target_project_id, user_id=user_id
-                )
-                if owned is None:
-                    raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
-                filed = await asyncio.to_thread(
-                    conversation_store.set_conversation_project,
-                    session_id,
-                    target_project_id,
-                )
-                if not filed:
-                    raise _session_not_found()
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

@@ -263,16 +263,15 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
  * body host_id pins both to the right replica like every other host-scoped
  * request. A managed-sandbox create's ``host_id`` is the id it chose for its
  * new sandbox host, so the launch runs where that host's tunnel will land.
- * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
- * are hostless here (non-string body), as is a managed create or fork without
- * one; all yield null → unkeyed (see
- * {@link isBodyHostKeyedRequest}).
+ * Multipart creates carry the same routing fields in their metadata part.
+ * Creates without a host ID stay unkeyed.
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
-  if (typeof body !== "string") return null;
+  const metadata = body instanceof FormData ? body.get("metadata") : body;
+  if (typeof metadata !== "string") return null;
   if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
   try {
-    const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
+    const hostId = (JSON.parse(metadata) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
   } catch {
     return null;
@@ -294,12 +293,11 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  *   modal host (null / a different host for a fresh user), which is why an
  *   unkeyed import lands off-replica and 409s "host is not connected".
  *
- * A bundled (multipart) create has a non-string body and is not matched: it only
- * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
- * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
+ * Multipart creates can launch on a host during creation, so they use the same
+ * routing rule as JSON creates.
  */
 function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
+  return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared

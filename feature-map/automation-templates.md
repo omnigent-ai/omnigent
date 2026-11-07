@@ -19,7 +19,10 @@ to customize.
   draft until the dialog closes, including the schedule and any custom prompt edits.
 - `scope`: **equals** matches one project, channel, repository, or team.
   Choose **in** for a comma-separated list. Equals rejects lists without losing
-  the entered values; Slack placeholders omit the optional leading `#`.
+  the entered values. Slack can watch a channel, direct messages from listed
+  senders, or the one group DM with exactly the listed people (two or more; no
+  operator). A pink `#` or `@` precedes the input, and pasted prefixes are stripped.
+  Switching between channel and people events clears the scope; DMs hide Author.
 - `link-posting`: a checkbox below the trigger controls posting the session link
   back to Jira, Slack, GitHub, or Linear. Sessions start whether it is checked or not.
 - `prompt-editing`: the detail page and edit dialog show Your prompt first. System
@@ -204,7 +207,9 @@ Minute-schedule checks use the server’s advertised sub-hour capability and `au
 - In create and edit setup, select Claude Code, Codex, Pi, and a permission-only
   harness such as Cursor below Run on. Selecting an agent keeps Advanced collapsed;
   expand it to check that only supported settings appear, model changes
-  clear unsupported effort choices, and saved selections survive reopening. Repeat
+  clear unsupported effort choices, and saved selections survive reopening. A new
+  automation starts Claude on Auto and Codex on Approve for me, because nobody
+  approves an unattended run; choosing Default saves no override. Repeat
   with a sandbox and an offline connected host; saved overrides remain readable.
 - With a provider catalog, create an automation from New automation or a template,
   choose the sandbox and a repository, save, and reopen Edit. Change the repository,

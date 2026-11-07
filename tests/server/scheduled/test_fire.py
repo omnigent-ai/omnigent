@@ -332,6 +332,9 @@ class FakeConversationStore:
     def set_labels(self, conversation_id: str, labels: dict[str, str]) -> None:
         self.label_writes[conversation_id] = dict(labels)
 
+    def clear_host_binding(self, conversation_id: str, **kwargs: Any) -> None:
+        self.updated.append({"id": conversation_id, "clear_host_binding": kwargs})
+
     def get_conversation(self, conversation_id: str) -> _FakeConversation | None:
         return _FakeConversation(id=conversation_id, agent_id="ag_1")
 
@@ -958,6 +961,32 @@ def _claude_agent_deps(
             "codex-native",
             "read-only",
             ["--sandbox", "read-only", "--ask-for-approval", "on-request"],
+            False,
+        ),
+        (
+            "codex-native",
+            "ask-for-approval",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="user"',
+            ],
+            False,
+        ),
+        (
+            "codex-native",
+            "approve-for-me",
+            [
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "-c",
+                'approvals_reviewer="auto_review"',
+            ],
             False,
         ),
         ("codex-native", "default", None, False),

@@ -38,7 +38,7 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 }
 ```
 
-`permission_mode` uses the selected native harness's vocabulary: Claude Code (for example, `acceptEdits`), Codex (`default`, `read-only`, `full-access`, `bypass`), Cursor (`default`, `auto-review`, `plan`, `ask`, `yolo`), Antigravity (`default`, `skip`), or Devin (`normal`, `accept-edits`, `smart`, `dangerous`). Omitting it uses the agent default. Saving an explicit override requires the server to resolve the agent's harness; if the bundle is unavailable, the save is rejected and can be retried once it is available. Automations are unattended, so prompting modes can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
+`permission_mode` uses the selected native harness's vocabulary: Claude Code (for example, `acceptEdits`), Codex (`default`, `ask-for-approval`, `approve-for-me`, `read-only`), Cursor (`default`, `auto-review`, `plan`, `ask`, `yolo`), Antigravity (`default`, `skip`), or Devin (`normal`, `accept-edits`, `smart`, `dangerous`). Omitting it uses the agent default; for Codex that is Codex's own default, which asks before escalations and Omnigent tool calls. The web dialog starts a new automation on Claude Code's `auto` or Codex's `approve-for-me`. Saving an explicit override requires the server to resolve the agent's harness; if the bundle is unavailable, the save is rejected and can be retried once it is available. Automations are unattended, so prompting modes can leave a run waiting for approval. Choose an auto-running mode only when its permission level is appropriate for the task.
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
@@ -218,3 +218,10 @@ All scheduler backends must support `scheduled_task_harness_settings` before usi
 
 - [Agent YAML spec](AGENT_YAML_SPEC.md) -- defining the agent an automation binds to.
 - [Policies](POLICIES.md) -- gates and spend caps that apply to sessions an automation creates.
+
+
+When `sibling_sessions` is enabled, workers created with `sys_session_create` on
+the same host or a new sandbox join the source session's family. With the flag
+off, these workers are private standalone sessions. A family holds up to 100
+retained sessions, including archived workers. Delete completed workers to release slots before a continued
+automation reaches that limit; archiving alone does not release a slot.

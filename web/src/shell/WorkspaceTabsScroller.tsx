@@ -1,5 +1,26 @@
 import { type ReactNode, useEffect, useRef } from "react";
 
+/**
+ * Scrolls the tab strip just far enough to show `tab`. Unlike `scrollIntoView`, it
+ * moves no other scroller: the rail slides in from past the window's right edge,
+ * so revealing a tab there would shift the whole page sideways.
+ */
+export function scrollTabIntoView(tab: HTMLElement | null): void {
+  const viewport = tab?.closest<HTMLElement>("[data-workspace-tabs-viewport]");
+  if (!tab || !viewport) return;
+  const left = viewport.getBoundingClientRect().left + viewport.clientLeft;
+  const right = left + viewport.clientWidth;
+  const box = tab.getBoundingClientRect();
+  if (box.left < left) {
+    // A tab wider than the strip whose end already shows keeps its close button in view.
+    if (box.right <= right && box.width > viewport.clientWidth) return;
+    viewport.scrollLeft -= left - box.left;
+  } else if (box.right > right) {
+    // A tab wider than the strip keeps its start in view.
+    viewport.scrollLeft += Math.min(box.right - right, box.left - left);
+  }
+}
+
 /** Scroll open tabs horizontally with a hidden scrollbar. */
 export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -22,9 +43,9 @@ export function WorkspaceTabsScroller({ children }: { children: ReactNode }) {
     };
     // Keep the active tab in view as the rail or tab list resizes.
     const observer = new ResizeObserver(() => {
-      content
-        .querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]')
-        ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      scrollTabIntoView(
+        content.querySelector<HTMLElement>('[aria-current="true"], [aria-selected="true"]'),
+      );
     });
     observer.observe(viewport);
     observer.observe(content);
