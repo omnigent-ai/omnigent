@@ -7,9 +7,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from omnigent.onboarding.ucode_state import (
     UcodeWorkspaceState,
     read_current_ucode_state,
+    read_ucode_config_scope,
     read_ucode_state,
 )
 
@@ -145,19 +148,23 @@ def test_read_ucode_state_refresh_cadence_precedence(tmp_path: Path) -> None:
         assert state.agent(name).auth_refresh_interval_ms is None
 
 
-def test_read_ucode_state_infers_legacy_fable_opt_in(tmp_path: Path) -> None:
-    """Older state records signal Fable opt-in through the model mapping."""
-    legacy_state = json.loads(json.dumps(_VALID_STATE))
-    workspace = legacy_state["workspaces"][_WORKSPACE_URL]
+@pytest.mark.parametrize("fable_discovered", [True, False])
+def test_read_ucode_state_derives_fable_from_discovered_models(
+    tmp_path: Path, fable_discovered: bool
+) -> None:
+    """Without a ``fable_enabled`` flag, Fable follows the models ucode discovered."""
+    discovered_state = json.loads(json.dumps(_VALID_STATE))
+    workspace = discovered_state["workspaces"][_WORKSPACE_URL]
     workspace.pop("fable_enabled")
-    workspace["claude_models"]["fable"] = "system.ai.claude-fable-5"
-    state_file = _write_state(tmp_path, legacy_state)
+    if fable_discovered:
+        workspace["claude_models"]["fable"] = "system.ai.claude-fable-5"
+    state_file = _write_state(tmp_path, discovered_state)
 
     with patch("omnigent.onboarding.ucode_state._STATE_PATH", state_file):
         state = read_ucode_state(_WORKSPACE_URL)
 
     assert state is not None
-    assert state.fable_enabled is True
+    assert state.fable_enabled is fable_discovered
 
 
 def test_read_ucode_state_returns_none_when_file_absent(tmp_path: Path) -> None:
@@ -261,3 +268,17 @@ def test_workspace_host_does_not_depend_on_claude_url() -> None:
         available_tools=[],
     )
     assert state.workspace_host == "https://example.cloud.databricks.com"
+
+
+def test_read_ucode_config_scope_reads_saved_scope(tmp_path: Path) -> None:
+    """Returns the scope ucode recorded, and ``None`` when it recorded none."""
+    scoped = _write_state(tmp_path, {**_VALID_STATE, "config_scope": "user"})
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", scoped):
+        assert read_ucode_config_scope() == "user"
+
+    unscoped = _write_state(tmp_path, _VALID_STATE)
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", unscoped):
+        assert read_ucode_config_scope() is None
+
+    with patch("omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "missing.json"):
+        assert read_ucode_config_scope() is None

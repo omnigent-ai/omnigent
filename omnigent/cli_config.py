@@ -33,9 +33,9 @@ import click
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner import ui
 from omnigent.onboarding.ucode_setup import (
-    build_ucode_configure_command,
     find_ucode_command,
     model_gateway_workspace_urls,
+    run_ucode_configure,
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
@@ -310,18 +310,8 @@ def _run_configure_databricks() -> None:
     # ucode only configures the model-serving gateway, so it gets the
     # gateway workspace(s) only — not the MCP-only profiles, which are
     # authenticated during profile onboarding and have no ucode role.
-    workspace_urls = model_gateway_workspace_urls()
-    click.echo("Running `ucode configure --workspaces ...`...")
-
-    result = subprocess.run(
-        build_ucode_configure_command(ucode_command, workspace_urls=workspace_urls),
-        check=False,
-    )
-    if result.returncode != 0:
-        raise click.ClickException(
-            f"`ucode configure` exited with code {result.returncode}; "
-            "see the command output above for details."
-        )
+    for workspace_url in model_gateway_workspace_urls():
+        run_ucode_configure(ucode_command, workspace_url)
 
     click.echo("ucode configuration complete. Omnigent will use state.json for harness setup.")
 
