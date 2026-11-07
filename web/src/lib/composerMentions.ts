@@ -2,7 +2,7 @@ import type { ComposerAttachment } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 
 /**
- * Pure ``@``-file-mention utilities shared by the in-session composer
+ * Pure ``@``-mention utilities (workspace files and other sessions) shared by the in-session composer
  * (``ChatPage``) and the new-session launcher (``NewChatDialog``). Kept free of
  * React/state so both surfaces parse, serialize, and mark up tagged paths
  * identically — and so the trigger logic is unit-testable without rendering.
@@ -132,7 +132,94 @@ export function rankMentionEntries<T extends { name: string; type: string }>(
  * harness-aware marker per tagged item, on its own line, terminated by a blank
  * line. Returns ``""`` when nothing is tagged.
  */
-export function buildMentionPreamble(items: MentionItem[], harness: string | null): string {
-  if (items.length === 0) return "";
-  return items.map((it) => mentionMarkerFor(harness, mentionItemPath(it))).join("\n") + "\n\n";
+export function buildMentionPreamble(
+  items: MentionItem[],
+  harness: string | null,
+  sessions: SessionMention[] = [],
+): string {
+  const lines = [
+    ...sessions.map(sessionMentionMarker),
+    ...(sessions.length > 0 ? [SESSION_MENTION_HINT] : []),
+    ...items.map((it) => mentionMarkerFor(harness, mentionItemPath(it))),
+  ];
+  return lines.length === 0 ? "" : lines.join("\n") + "\n\n";
+}
+
+/** Another Omnigent session tagged through the composer's ``@`` menu. */
+export interface SessionMention {
+  /** Session id the agent passes to the ``sys_session_*`` tools. */
+  id: string;
+  /** Display title; ``"Untitled session"`` when the session has none. */
+  title: string;
+  /** True for a sub-agent spawned by the current session. */
+  isSubagent: boolean;
+}
+
+/**
+ * One line telling the agent how to act on tagged sessions. It rides in the
+ * message itself because native TUI harnesses never see framework prompt
+ * text. Keep in sync with ``_SESSION_MENTION_LINE_RE`` in
+ * ``omnigent/entities/conversation.py``.
+ */
+export const SESSION_MENTION_HINT =
+  "[Tagged sessions are Omnigent sessions: read them with sys_session_get_info and " +
+  "sys_session_get_history; message a subagent with sys_session_send and any other " +
+  "session with sys_session_message]";
+
+// Characters that would break the bracketed, quoted marker shape.
+const SESSION_TITLE_UNSAFE_RE = /["[\]\r\n]+/g;
+
+/** Marker line for one tagged session, e.g. ``[Session: "Fix CI" id=abc subagent=no]``. */
+export function sessionMentionMarker(session: SessionMention): string {
+  const title = session.title.replace(SESSION_TITLE_UNSAFE_RE, " ").replace(/\s+/g, " ").trim();
+  return `[Session: "${title}" id=${session.id} subagent=${session.isSubagent ? "yes" : "no"}]`;
+}
+
+// Parses the markers ``sessionMentionMarker`` emits (and the hint line), with
+// their trailing line breaks, so a sent bubble can show chips instead.
+const SESSION_MARKER_RE =
+  /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\][ \t]*(?:\r?\n)*/g;
+const SESSION_HINT_LINE_RE = /\[Tagged sessions are Omnigent sessions:[^\]]*\][ \t]*(?:\r?\n)*/g;
+
+/** Sessions tagged in a sent message's text, in marker order. */
+export function extractSessionMentions(text: string): SessionMention[] {
+  return [...text.matchAll(SESSION_MARKER_RE)].map((m) => ({
+    title: m[1],
+    id: m[2],
+    isSubagent: m[3] === "yes",
+  }));
+}
+
+/** Remove session markers and the hint line from a sent message's text. */
+export function stripSessionMentionMarkers(text: string): string {
+  return text.replace(SESSION_MARKER_RE, "").replace(SESSION_HINT_LINE_RE, "");
+}
+
+/** Shared empty list, so default props keep a stable reference. */
+export const NO_SESSION_MENTIONS: readonly SessionMention[] = [];
+
+/** Default cap on session rows in the ``@`` menu. */
+export const SESSION_MENTION_CAP = 8;
+
+/**
+ * Filter candidate sessions by a case-insensitive title substring, keeping
+ * caller order (subagents and recency first), dropping duplicate ids and
+ * capping the list. Path-shaped queries (containing ``/``) match no session.
+ */
+export function rankSessionMentions(
+  candidates: SessionMention[],
+  query: string,
+  cap: number = SESSION_MENTION_CAP,
+): SessionMention[] {
+  if (query.includes("/")) return [];
+  const needle = query.toLowerCase();
+  const seen = new Set<string>();
+  const out: SessionMention[] = [];
+  for (const candidate of candidates) {
+    if (seen.has(candidate.id) || !candidate.title.toLowerCase().includes(needle)) continue;
+    seen.add(candidate.id);
+    out.push(candidate);
+    if (out.length >= cap) break;
+  }
+  return out;
 }

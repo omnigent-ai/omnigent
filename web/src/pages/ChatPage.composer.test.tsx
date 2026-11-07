@@ -60,8 +60,15 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
     ...actual,
     useWorkspaceAllFiles: () => ({ data: undefined }),
     useWorkspaceDirectory: () => ({ data: undefined }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
+// The "@" menu's session rows read the sidebar cache and a search query; these
+// tests don't open it, so stub the source like the workspace hooks above.
+vi.mock("@/hooks/useSessionMentionEntries", () => ({
+  MENTION_SEARCH_DEBOUNCE_MS: 300,
+  useSessionMentionEntries: () => [],
+}));
 
 // The /mcp panel's registry read and popup sign-in; the MCP cases script both.
 vi.mock("@/lib/mcpRegistry", () => ({

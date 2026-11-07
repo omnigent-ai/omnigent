@@ -115,6 +115,19 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
             [{"type": "input_text", "text": "[Attached: /tmp/omnigent/u/img.png]"}],
             None,
         ),
+        # Composer "@"-session markers and their tool hint are dropped,
+        # so a session started by tagging another is titled by the prose.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": '[Session: "Fix CI" id=s_1 subagent=no]\n'
+                    "[Tagged sessions are Omnigent sessions: read them with "
+                    "sys_session_get_history]\n\ncompare these",
+                }
+            ],
+            "compare these",
+        ),
         # A marker mid-line is user prose, not an executor-emitted
         # attachment line — it must survive into the title.
         (

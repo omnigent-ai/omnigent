@@ -752,15 +752,19 @@ export function useConversations(
 /**
  * One palette search group; keyed outside `["conversations"]`, which patches rows
  * live. Dropped once unobserved, so a later search never shows a stale row.
- * Matches archived sessions too, so a search still finds them.
+ * Matches archived sessions too unless ``includeArchived`` is false.
  */
 export function useSessionSearch(
   searchQuery: string,
   searchScope: SessionSearchScope,
-  { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
+  {
+    enabled = true,
+    limit = 10,
+    includeArchived = true,
+  }: { enabled?: boolean; limit?: number; includeArchived?: boolean } = {},
 ) {
   const queryClient = useQueryClient();
-  const queryKey = ["session-search", searchQuery, searchScope, limit];
+  const queryKey = ["session-search", searchQuery, searchScope, limit, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
     queryFn: ({ pageParam }) =>
@@ -768,7 +772,7 @@ export function useSessionSearch(
         after: pageParam,
         searchQuery,
         searchScope,
-        includeArchived: true,
+        includeArchived,
         queryClient,
         limit,
       }),

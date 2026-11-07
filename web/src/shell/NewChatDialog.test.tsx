@@ -10462,6 +10462,45 @@ describe("NewChatLandingScreen @-file-mention", () => {
     expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
   });
 
+  it("tags a loaded session for any agent and delivers its marker", async () => {
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} },
+              { id: "s_old", object: "conversation", title: "Old", labels: {}, archived: true },
+            ],
+          },
+        ],
+      },
+    });
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+
+    // A bare "@" lists cached sessions only: no files for an SDK agent, no archived rows.
+    fireEvent.change(input(), { target: { value: "@", selectionStart: 1 } });
+    expect(screen.queryByTitle("Open omnigent")).not.toBeInTheDocument();
+    expect(screen.queryByTitle("Tag session Old")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(screen.getByTestId("session-mention-chip").textContent).toBe("@Alpha planning");
+
+    fireEvent.change(input(), { target: { value: "continue it", selectionStart: 11 } });
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
+    const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
+    expect((payload as { text: string }).text).toMatch(
+      /^\[Session: "Alpha planning" id=s_alpha subagent=no\]\n\[Tagged sessions [^\]]*\]\n\ncontinue it$/,
+    );
+  });
+
   it("drills into a folder and delivers the chosen file as a workspace-relative marker", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

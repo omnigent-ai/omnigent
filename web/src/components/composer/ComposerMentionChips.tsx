@@ -1,6 +1,11 @@
-import { FileTextIcon, FolderIcon, XIcon } from "lucide-react";
+import { BotIcon, FileTextIcon, FolderIcon, MessageSquareIcon, XIcon } from "lucide-react";
 
-import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
+import {
+  mentionItemPath,
+  type MentionItem,
+  type SessionMention,
+  NO_SESSION_MENTIONS,
+} from "@/lib/composerMentions";
 import { cn } from "@/lib/utils";
 import { ComposerChipRow } from "@/components/composer/ChatComposer";
 
@@ -16,17 +21,29 @@ import { ComposerChipRow } from "@/components/composer/ChatComposer";
 export function ComposerMentionChips({
   items,
   onRemove,
+  sessions = NO_SESSION_MENTIONS,
+  onRemoveSession,
   showLineRange = false,
   className,
 }: {
   items: MentionItem[];
   onRemove: (index: number) => void;
+  /** Tagged sessions, shown before the file chips. */
+  sessions?: readonly SessionMention[];
+  onRemoveSession?: (index: number) => void;
   showLineRange?: boolean;
   className?: string;
 }) {
-  if (items.length === 0) return null;
+  if (items.length === 0 && sessions.length === 0) return null;
   return (
     <ComposerChipRow className={cn("gap-1.5", className)}>
+      {sessions.map((session, i) => (
+        <SessionMentionChip
+          key={`session:${session.id}`}
+          session={session}
+          onRemove={onRemoveSession ? () => onRemoveSession(i) : undefined}
+        />
+      ))}
       {items.map((item, i) => (
         <span
           key={mentionItemPath(item)}
@@ -57,5 +74,41 @@ export function ComposerMentionChips({
         </span>
       ))}
     </ComposerChipRow>
+  );
+}
+
+/** Chip for a tagged session, in the composer (removable) or a sent bubble. */
+export function SessionMentionChip({
+  session,
+  onRemove,
+}: {
+  session: SessionMention;
+  onRemove?: () => void;
+}) {
+  const kind = session.isSubagent ? "Subagent" : "Session";
+  return (
+    <span
+      data-testid="session-mention-chip"
+      className="flex items-center gap-1 rounded-full border border-border bg-muted px-2 py-0.5 text-sm text-muted-foreground"
+    >
+      {session.isSubagent ? (
+        <BotIcon className="size-3 shrink-0" />
+      ) : (
+        <MessageSquareIcon className="size-3 shrink-0" />
+      )}
+      <span className="max-w-[200px] truncate" title={`${kind}: ${session.title}`}>
+        @{session.title}
+      </span>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={onRemove}
+          className="ml-0.5 rounded-full hover:text-foreground"
+          aria-label={`Remove ${session.title}`}
+        >
+          <XIcon className="size-3" />
+        </button>
+      )}
+    </span>
   );
 }

@@ -30,6 +30,14 @@ _ATTACHMENT_MARKER_RE = re.compile(
     rf"^(?:\[Attached(?: file)?: .+\]|{UNRESOLVED_ATTACHMENT_MARKER_PATTERN})$"
 )
 
+# Lines the web composer prepends for "@"-tagged sessions: one marker per
+# session plus a tool hint. Keep in sync with sessionMentionMarker and
+# SESSION_MENTION_HINT in web/src/lib/composerMentions.ts.
+_SESSION_MENTION_LINE_RE = re.compile(
+    r'^(?:\[Session: ".*" id=\S+ subagent=(?:yes|no)\]'
+    r"|\[Tagged sessions are Omnigent sessions:[^\]]*\])$"
+)
+
 # Generated titles stay compact by default, while explicit user formats and
 # manually assigned titles have room for structured identifiers.
 DEFAULT_GENERATED_TITLE_MAX_CHARS = 100
@@ -391,8 +399,9 @@ def synthesize_conversation_title(
 
     Non-text blocks (``input_image``, ``input_file``) are skipped, and
     lines matching the native executors' attachment path markers
-    (:data:`_ATTACHMENT_MARKER_RE`) are dropped so attachments never
-    leak temp-file paths into the title.
+    (:data:`_ATTACHMENT_MARKER_RE`) and the composer's tagged-session lines
+    (:data:`_SESSION_MENTION_LINE_RE`) are dropped so neither leaks into
+    the title.
 
     :param content: Message content blocks, e.g.
         ``[{"type": "input_text", "text": "Hello"}]``.
@@ -409,6 +418,7 @@ def synthesize_conversation_title(
                     line
                     for line in text.splitlines()
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
+                    and not _SESSION_MENTION_LINE_RE.match(line.strip())
                 ]
                 parts.append("\n".join(kept_lines))
     collapsed = " ".join(" ".join(parts).split())

@@ -6,6 +6,8 @@ import type * as AgentLabelsModule from "@/lib/agentLabels";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type * as UseHarnessInventoryModule from "@/hooks/useHarnessInventory";
 import type * as UseAgentsModule from "@/hooks/useAgents";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseSidebarDataModule from "@/hooks/useSidebarData";
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactElement } from "react";
@@ -41,7 +43,35 @@ function resetWorkspaceMock() {
   ws.srcEntries = SRC_ENTRIES;
   ws.rootLoading = false;
   ws.dirLoading = false;
+  sessions.loaded = [];
+  sessions.children = [];
+  sessions.searchHits = [];
+  sessions.searchedQueries = [];
 }
+
+// Session rows for the "@" menu: sidebar-loaded rows, the current session's
+// subagents, and server title-search hits (recorded so tests can assert when
+// the search is skipped).
+const sessions = vi.hoisted(() => ({
+  loaded: [] as unknown[],
+  children: [] as unknown[],
+  searchHits: [] as unknown[],
+  searchedQueries: [] as string[],
+}));
+vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseSidebarDataModule>()),
+  useLoadedConversations: () => ({
+    data: { pages: [{ data: sessions.loaded }], pageParams: [undefined] },
+  }),
+}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useSessionSearch: (query: string, _scope: string, options: { enabled?: boolean }) => {
+    const active = (options.enabled ?? true) && query !== "";
+    if (active) sessions.searchedQueries.push(query);
+    return { data: active ? { pages: [{ data: sessions.searchHits }] } : undefined };
+  },
+}));
 vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
   const actual = await importOriginal<typeof UseWorkspaceChangedFilesModule>();
   return {
@@ -54,6 +84,7 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
       data: dirPath === "src" ? ws.srcEntries : undefined,
       isLoading: ws.dirLoading,
     }),
+    useWorkspaceFileSearch: () => ({ data: undefined }),
   };
 });
 
@@ -80,7 +111,7 @@ vi.mock("@/hooks/useAgents", async (importOriginal) => ({
 }));
 vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   ...(await importOriginal<typeof UseChildSessionsModule>()),
-  useChildSessions: () => ({ children: [] }),
+  useChildSessions: () => ({ children: sessions.children }),
 }));
 // HostBadge now renders in the composer's status-line tray and reads the
 // session's host binding via TanStack Query. Stub the hooks so it self-hides
@@ -514,5 +545,109 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     type("ping @nomatch");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("ping @nomatch", undefined);
+  });
+});
+
+function sessionRow(id: string, title: string | null, extra: Record<string, unknown> = {}) {
+  return { id, object: "conversation", title, created_at: 0, updated_at: 0, labels: {}, ...extra };
+}
+
+describe("Composer @-session mentions", () => {
+  let convSeq = 0;
+  let currentId = "";
+  beforeEach(() => {
+    resetWorkspaceMock();
+    localStorage.clear();
+    currentId = `conv_session_${++convSeq}`;
+    useChatStore.setState({
+      conversationId: currentId,
+      sessionHarness: "claude-sdk",
+      pendingComposerAttachments: [],
+    });
+    sessions.loaded = [
+      sessionRow(currentId, "This session"),
+      sessionRow("s_alpha", "Alpha planning"),
+      sessionRow("s_archived", "Alpha archived", { archived: true }),
+      sessionRow("s_beta", null),
+    ];
+    sessions.children = [
+      {
+        id: "s_child",
+        title: "researcher:auth",
+        task_summary: null,
+        tool: "researcher",
+        session_name: "auth",
+        current_task_status: null,
+        busy: false,
+        last_message_preview: null,
+        pending_elicitations_count: 0,
+      },
+    ];
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("lists subagents, then loaded sessions, on a non-native harness without searching", () => {
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    const rows = screen.getAllByTestId(/^session-mention-item-/).map((row) => row.textContent);
+    // The current session and archived rows are excluded; untitled rows get a label.
+    expect(rows).toEqual(["authsubagent", "Alpha planning", "Untitled session"]);
+    // Files stay native-only.
+    expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+    // A bare "@" is served from cache alone.
+    expect(sessions.searchedQueries).toEqual([]);
+  });
+
+  it("delivers tagged sessions as markers plus the tool hint", () => {
+    const onSend = vi.fn();
+    renderWithTooltips(<Composer {...composerProps({ onSend })} />);
+    type("@");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    type("@alpha");
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+    expect(screen.getAllByTestId("session-mention-chip")).toHaveLength(2);
+
+    type("summarize both");
+    fireEvent.submit(textarea().closest("form")!);
+    expect(onSend).toHaveBeenCalledWith(
+      '[Session: "auth" id=s_child subagent=yes]\n' +
+        '[Session: "Alpha planning" id=s_alpha subagent=no]\n' +
+        "[Tagged sessions are Omnigent sessions: read them with sys_session_get_info and " +
+        "sys_session_get_history; message a subagent with sys_session_send and any other " +
+        "session with sys_session_message]\n\nsummarize both",
+      undefined,
+    );
+  });
+
+  it("merges server title-search hits for typed text after the debounce", async () => {
+    sessions.searchHits = [sessionRow("s_remote", "Gamma rollout")];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@gam");
+    expect(screen.queryByTitle("Tag session Gamma rollout")).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTitle("Tag session Gamma rollout")).toBeInTheDocument());
+    expect(sessions.searchedQueries).toContain("gam");
+  });
+
+  it("lists sessions above files in a native session and navigates across both", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@");
+    expect(screen.getByTestId("session-mention-item-0")).toHaveAttribute("data-active", "true");
+    // Three session rows, then the "src" folder.
+    for (let i = 0; i < 3; i++) fireEvent.keyDown(textarea(), { key: "ArrowDown" });
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(textarea(), { key: "Tab" });
+    expect(screen.getByText("@src/")).toBeInTheDocument();
+  });
+
+  it("matches no session for a path-shaped token", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@src/");
+    expect(screen.queryAllByTestId(/^session-mention-item-/)).toHaveLength(0);
+    expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument();
   });
 });

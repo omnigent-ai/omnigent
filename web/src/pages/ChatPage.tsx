@@ -134,10 +134,17 @@ import {
   detectMentionAt,
   type MentionItem,
   mentionMarkerFor,
+  MENTION_MATCH_CAP,
   type MentionState,
   parseMentionToken,
   rankMentionEntries,
 } from "@/lib/composerMentions";
+import { useChildSessions } from "@/hooks/useChildSessions";
+import {
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
@@ -241,6 +248,7 @@ import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
 import {
   useWorkspaceAllFiles,
   useWorkspaceDirectory,
+  useWorkspaceFileSearch,
   type WorkspaceFile,
 } from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -3070,9 +3078,39 @@ function ComposerImpl(
   const mentionSourceEntries: WorkspaceFile[] = mentionDir
     ? (mentionDirQuery.data ?? [])
     : (workspaceFilesQuery.data?.data ?? []);
-  // Folders first, filtered by the typed segment, capped (see rankMentionEntries).
-  const mentionEntries: WorkspaceFile[] =
-    mentionEnabled && mention ? rankMentionEntries(mentionSourceEntries, mentionFilter) : [];
+  // Typing after "@" also searches the server, debounced like the palette.
+  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
+  // Root-level typing also finds files in unexpanded folders (files only).
+  const mentionFileSearch = useWorkspaceFileSearch(
+    conversationId ?? undefined,
+    mentionEnabled && mention && !mentionDir ? debouncedMentionQuery : "",
+  );
+  // Folders first, filtered by the typed segment, capped (see rankMentionEntries),
+  // then deeper search hits the cached listing doesn't already show.
+  const mentionEntries = ((): WorkspaceFile[] => {
+    if (!mentionEnabled || !mention) return [];
+    const listed = rankMentionEntries(mentionSourceEntries, mentionFilter);
+    if (mentionDir || !mentionFilter) return listed;
+    const listedPaths = new Set(listed.map((entry) => entry.path));
+    // The search ran on the debounced text; re-check hits against the live filter.
+    const needle = mentionFilter.toLowerCase();
+    const deeper = rankMentionEntries(
+      (mentionFileSearch.data?.files ?? []).filter(
+        (file) => !listedPaths.has(file.path) && file.path.toLowerCase().includes(needle),
+      ),
+      "",
+    );
+    return [...listed, ...deeper].slice(0, MENTION_MATCH_CAP);
+  })();
+
+  // Sessions: this session's subagents, then sidebar-loaded rows, then search hits.
+  const { children: childSessions } = useChildSessions(conversationId);
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery: debouncedMentionQuery,
+    currentSessionId: conversationId,
+    subagents: childSessions,
+  });
   // True while a mention token is active but its listing hasn't resolved yet:
   // the cold-boot root fetch, or a sub-directory's first load after drilling
   // in. During this window ``mentionEntries`` is transiently empty (so the
@@ -3097,12 +3135,17 @@ function ComposerImpl(
     attachMention,
     openMentionDir,
     removeMentionedItem,
+    mentionedSessions,
+    setMentionedSessions,
+    attachSession,
+    removeMentionedSession,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
     setMention,
     mentionEntries,
+    sessionEntries,
     text: value,
     setText: (next) => {
       setValue(next);
@@ -3113,7 +3156,8 @@ function ComposerImpl(
   });
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
-  const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
+  const hasMentions = mentionedItems.length > 0 || mentionedSessions.length > 0;
+  const hasDraft = fullText.trim().length > 0 || files.length > 0 || hasMentions;
   const showInterruptButton =
     isWorking &&
     (!hasDraft ||
@@ -3728,7 +3772,7 @@ function ComposerImpl(
     const trimmed = fullText.trim();
     // Allow send if there's text, attached files, OR "@"-tagged paths.
     if (
-      (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
+      (!trimmed && files.length === 0 && !hasMentions) ||
       disabled ||
       sendDisabledReason !== null ||
       hasPendingElicitation
@@ -3773,7 +3817,7 @@ function ComposerImpl(
       draft.quotes.length === 0 &&
       (skill !== null || isSlashCommandText(trimmed)) &&
       files.length === 0 &&
-      mentionedItems.length === 0
+      !hasMentions
     ) {
       const parts = trimmed.split(/\s+/);
       const cmd = parts[0].toLowerCase();
@@ -3859,7 +3903,7 @@ function ComposerImpl(
     // (codex says "Attached file:"). Folders carry a trailing "/" so the
     // agent knows to open the directory. The native vendor reads the on-disk
     // workspace file/folder from this marker; no upload happens.
-    const mentionPreamble = buildMentionPreamble(mentionedItems, sessionHarness);
+    const mentionPreamble = buildMentionPreamble(mentionedItems, sessionHarness, mentionedSessions);
     // Sending while a prior response is streaming is fine — the
     // server queues the message and delivers it to the running task
     // (or starts a fresh one once the current drains). Escape still
@@ -3883,6 +3927,7 @@ function ComposerImpl(
     clearComposerAfterSend(resetNativeInputSession);
     clearAttachments();
     setMentionedItems([]);
+    setMentionedSessions([]);
     setMention(null);
   };
 
@@ -3910,8 +3955,7 @@ function ComposerImpl(
   };
 
   // An empty composer with no attachments or @-mentions; ↑ recalls from the queue here.
-  const composerEmptyForRecall =
-    fullText === "" && files.length === 0 && mentionedItems.length === 0;
+  const composerEmptyForRecall = fullText === "" && files.length === 0 && !hasMentions;
   // The queued row ↑ recalls: the queue tail, only while the composer takes input and
   // is empty and quote-free.
   const arrowUpRecallQueueId =
@@ -4022,11 +4066,8 @@ function ComposerImpl(
     dirtyRef.current = true;
     if (commandError !== null) setCommandError(null);
     if (attachmentError !== null) clearError();
-    setMention(
-      mentionEnabled
-        ? detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length)
-        : null,
-    );
+    // Sessions are taggable in every harness; files only in native ones.
+    setMention(detectMentionAt(e.target.value, e.target.selectionStart ?? e.target.value.length));
     recallingRef.current = false;
     resetCursor();
   };
@@ -4150,7 +4191,7 @@ function ComposerImpl(
         appearance={isMobile ? "glass" : "default"}
         hasContent={
           files.length > 0 ||
-          mentionedItems.length > 0 ||
+          hasMentions ||
           attachmentError !== null ||
           commandError !== null ||
           Boolean(btwSidechat)
@@ -4281,6 +4322,8 @@ function ComposerImpl(
                   loading={mentionListingPending}
                   onOpenDir={openMentionDir}
                   onAttach={attachMention}
+                  sessions={sessionEntries}
+                  onAttachSession={attachSession}
                 />
               )}
               {/* /btw side-chat overlay — transient question+answer panel,
@@ -4360,6 +4403,8 @@ function ComposerImpl(
               <ComposerMentionChips
                 items={mentionedItems}
                 onRemove={removeMentionedItem}
+                sessions={mentionedSessions}
+                onRemoveSession={removeMentionedSession}
                 showLineRange
               />
               {/* Inline slash-command feedback: errors and /help output */}

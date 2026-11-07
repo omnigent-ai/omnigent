@@ -371,6 +371,11 @@ import { CLIENT_CREATE_TOKEN_LABEL, newTempConversation } from "@/lib/tempConver
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import {
+  MENTION_SEARCH_DEBOUNCE_MS,
+  useSessionMentionEntries,
+} from "@/hooks/useSessionMentionEntries";
 import {
   buildMentionPreamble,
   detectMentionAt,
@@ -5230,7 +5235,14 @@ function NewChatLandingContent({
     mentionFilter,
     workspaceRoot,
   ]);
-  const mentionOpen = mentionEntries.length > 0;
+  // Other sessions are taggable for every agent (no session exists yet, so
+  // there are no subagents to list).
+  const sessionEntries = useSessionMentionEntries({
+    mention,
+    debouncedQuery: useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS),
+    currentSessionId: null,
+  });
+  const mentionOpen = mentionEntries.length > 0 || sessionEntries.length > 0;
   // Closed-but-loading window: don't let Enter send the half-typed "@dir/".
   // ``isPlaceholderData`` covers the drill-down window where react-query is
   // still serving the previous directory's rows (``isLoading`` stays false).
@@ -5247,12 +5259,16 @@ function NewChatLandingContent({
     attachMention,
     openMentionDir,
     removeMentionedItem,
+    mentionedSessions,
+    attachSession,
+    removeMentionedSession,
     handleKeyDown: handleMentionKeyDown,
     dismiss: dismissMention,
   } = useMentionBrowser({
     mention,
     setMention,
     mentionEntries,
+    sessionEntries,
     text: message,
     setText: setMessage,
     textareaRef,
@@ -5986,7 +6002,7 @@ function NewChatLandingContent({
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
       const initialPrompt =
-        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null) +
+        buildMentionPreamble(mentionedItems, selectedAgent?.harness ?? null, mentionedSessions) +
         sanitizeInitialPrompt(message);
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`
@@ -7075,7 +7091,12 @@ function NewChatLandingContent({
           >
             <ChatComposer
               appearance={isMobileViewport ? "glass" : "default"}
-              hasContent={files.length > 0 || mentionedItems.length > 0 || attachmentError !== null}
+              hasContent={
+                files.length > 0 ||
+                mentionedItems.length > 0 ||
+                mentionedSessions.length > 0 ||
+                attachmentError !== null
+              }
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
               data-testid="new-chat-landing-composer"
@@ -7090,15 +7111,13 @@ function NewChatLandingContent({
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
-                  // Recompute the active "@"-mention from the caret each keystroke
-                  // (native terminal agents with a workspace — ``mentionEnabled``).
+                  // Recompute the active "@"-mention from the caret each keystroke.
+                  // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
-                    mentionEnabled
-                      ? detectMentionAt(
-                          e.target.value,
-                          e.target.selectionStart ?? e.target.value.length,
-                        )
-                      : null,
+                    detectMentionAt(
+                      e.target.value,
+                      e.target.selectionStart ?? e.target.value.length,
+                    ),
                   );
                 },
                 onFocus: () => {
@@ -7165,6 +7184,8 @@ function NewChatLandingContent({
                         loading={mentionListingPending}
                         onOpenDir={openMentionDir}
                         onAttach={attachMention}
+                        sessions={sessionEntries}
+                        onAttachSession={attachSession}
                       />
                     )}
                   </>
@@ -7205,7 +7226,12 @@ function NewChatLandingContent({
                     {/* "@"-mention chips — one per tagged workspace file/folder. Each is
                 delivered as an "[Attached: <path>]" marker prepended to the
                 first message at create time. */}
-                    <ComposerMentionChips items={mentionedItems} onRemove={removeMentionedItem} />
+                    <ComposerMentionChips
+                      items={mentionedItems}
+                      onRemove={removeMentionedItem}
+                      sessions={mentionedSessions}
+                      onRemoveSession={removeMentionedSession}
+                    />
                     {/* Pending attachments — image thumbnails (click to view) + file rows. */}
                     <ComposerAttachments files={files} onRemove={removeFile} />
                     {/* Rejected-attachment feedback: unsupported type or too large */}

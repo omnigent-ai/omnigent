@@ -10,7 +10,7 @@ import { useSyncExternalStore } from "react";
 // Keep in sync with _ATTACHMENT_MARKER_RE in omnigent/entities/conversation.py
 // and the preamble buildMentionPreamble emits in composerMentions.ts.
 const ATTACHMENT_MARKER_RE =
-  /^(?:\[Attached(?: file)?: .+\]|\[Attachment [^\]]+ could not be loaded\])$/;
+  /^(?:\[Attached(?: file)?: .+\]|\[Attachment [^\]]+ could not be loaded\]|\[Session: ".*" id=\S+ subagent=(?:yes|no)\]|\[Tagged sessions are Omnigent sessions:[^\]]*\])$/;
 
 // Same default limit as synthesize_conversation_title.
 export const OPTIMISTIC_TITLE_LIMIT = 60;
