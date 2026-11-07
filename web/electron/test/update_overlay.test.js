@@ -40,7 +40,7 @@ class FakeWindow extends EventEmitter {
     this.destroyed = false;
     this.visible = false;
     this.bounds = null;
-    this.ignoreMouse = [];
+    this.contentBounds = { x: 10, y: 20, width: 1000, height: 700 };
   }
 
   isDestroyed() {
@@ -48,15 +48,11 @@ class FakeWindow extends EventEmitter {
   }
 
   getContentBounds() {
-    return { x: 10, y: 20, width: 1000, height: 700 };
+    return this.contentBounds;
   }
 
   setBounds(bounds) {
     this.bounds = bounds;
-  }
-
-  setIgnoreMouseEvents(ignore, options) {
-    this.ignoreMouse.push({ ignore, options });
   }
 
   isVisible() {
@@ -65,6 +61,10 @@ class FakeWindow extends EventEmitter {
 
   showInactive() {
     this.visible = true;
+  }
+
+  hide() {
+    this.visible = false;
   }
 
   loadFile(file) {
@@ -88,7 +88,7 @@ class FakeWindow extends EventEmitter {
   }
 }
 
-function makeOverlay({ platform = process.platform } = {}) {
+function makeOverlay({ platform = process.platform, updateState } = {}) {
   const onHandlers = new Map();
   const handleHandlers = new Map();
   const windows = [];
@@ -107,7 +107,7 @@ function makeOverlay({ platform = process.platform } = {}) {
   const calls = [];
   const updater = {
     getConfig: () => ({}),
-    getStatus: () => ({}),
+    getStatus: () => ({ state: updateState }),
     setConfig: () => ({}),
     checkForUpdates: async () => {},
     downloadUpdate: async () => {
@@ -191,7 +191,7 @@ describe("update overlay", () => {
       width: OVERLAY_WIDTH,
       height: 180,
     });
-    assert.deepEqual(overlay.ignoreMouse.at(-1), { ignore: false, options: undefined });
+    assert.equal(overlay.isVisible(), true);
     assert.equal(
       await handleHandlers.get("omnigent:get-update-overlay-height")({
         sender: parent.webContents,
@@ -222,7 +222,7 @@ describe("update overlay", () => {
     assert.deepEqual(parent.webContents.sent, []);
   });
 
-  it("reports zero and keeps an empty overlay as a click-through sliver", () => {
+  it("keeps an empty overlay hidden with renderer throttling disabled", () => {
     const { controller, onHandlers } = makeOverlay();
     const parent = new FakeWindow();
     const overlay = controller.ensureOverlay(parent);
@@ -233,10 +233,33 @@ describe("update overlay", () => {
       channel: "omnigent:update-overlay-height",
       payload: 0,
     });
-    assert.equal(overlay.bounds.height, 1);
-    assert.deepEqual(overlay.ignoreMouse.at(-1), {
-      ignore: true,
-      options: { forward: true },
+    assert.equal(overlay.isVisible(), false);
+    assert.equal(overlay.options.webPreferences.backgroundThrottling, false);
+  });
+
+  it("hides a cleared update and shows the next notice", () => {
+    const { controller, onHandlers } = makeOverlay();
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+    const reportHeight = onHandlers.get("omnigent:overlay-height");
+
+    reportHeight({ sender: overlay.webContents }, 180);
+    assert.equal(overlay.isVisible(), true);
+    reportHeight({ sender: overlay.webContents }, 0);
+    assert.equal(overlay.isVisible(), false);
+
+    parent.contentBounds = { x: -1400, y: 100, width: 1000, height: 700 };
+    parent.emit("move");
+    parent.emit("resize");
+    assert.equal(overlay.isVisible(), false);
+
+    reportHeight({ sender: overlay.webContents }, 140);
+    assert.equal(overlay.isVisible(), true);
+    assert.deepEqual(overlay.bounds, {
+      x: -1400 + 1000 - OVERLAY_WIDTH - OVERLAY_INSET,
+      y: 100 + 700 - 140 - OVERLAY_INSET,
+      width: OVERLAY_WIDTH,
+      height: 140,
     });
   });
 
@@ -248,11 +271,7 @@ describe("update overlay", () => {
     await handleHandlers.get("omnigent:overlay-update-download")({ sender: overlay.webContents });
 
     assert.deepEqual(calls, [{ openAbout: parent }, "download"]);
-    assert.equal(overlay.bounds.height, 1);
-    assert.deepEqual(overlay.ignoreMouse.at(-1), {
-      ignore: true,
-      options: { forward: true },
-    });
+    assert.equal(overlay.isVisible(), false);
     assert.deepEqual(parent.webContents.sent.at(-1), {
       channel: "omnigent:update-overlay-height",
       payload: 0,
@@ -281,14 +300,56 @@ describe("update overlay", () => {
     onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
 
     controller.suppress(parent);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.isVisible(), false);
+    parent.emit("resize");
+    assert.equal(overlay.isVisible(), false);
 
     controller.unsuppress(parent);
     assert.equal(overlay.bounds.height, 180);
-    assert.deepEqual(overlay.ignoreMouse.at(-1), { ignore: false, options: undefined });
+    assert.equal(overlay.isVisible(), true);
     assert.deepEqual(parent.webContents.sent.at(-1), {
       channel: "omnigent:update-overlay-height",
       payload: 180,
     });
   });
+
+  it("keeps the overlay hidden when About closes without a notice", () => {
+    const { controller, onHandlers } = makeOverlay();
+    const parent = new FakeWindow();
+    const overlay = controller.ensureOverlay(parent);
+    onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 0);
+
+    controller.suppress(parent);
+    controller.unsuppress(parent);
+
+    assert.equal(overlay.isVisible(), false);
+    assert.deepEqual(parent.webContents.sent.at(-1), {
+      channel: "omnigent:update-overlay-height",
+      payload: 0,
+    });
+  });
+
+  for (const state of ["available", "downloading", "downloaded"]) {
+    it(`keeps the notice hidden while About handles an update in state ${state}`, () => {
+      const { controller, onHandlers } = makeOverlay({ updateState: state });
+      const parent = new FakeWindow();
+      const overlay = controller.ensureOverlay(parent);
+      const reportHeight = onHandlers.get("omnigent:overlay-height");
+      reportHeight({ sender: overlay.webContents }, 180);
+
+      controller.suppress(parent);
+      reportHeight({ sender: overlay.webContents }, 200);
+      parent.emit("move");
+      parent.emit("resize");
+      assert.equal(overlay.isVisible(), false);
+      assert.deepEqual(parent.webContents.sent.at(-1), {
+        channel: "omnigent:update-overlay-height",
+        payload: 0,
+      });
+
+      controller.unsuppress(parent);
+      assert.equal(overlay.isVisible(), true);
+      assert.equal(overlay.bounds.height, 200);
+    });
+  }
 });
