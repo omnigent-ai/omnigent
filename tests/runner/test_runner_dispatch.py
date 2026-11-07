@@ -110,7 +110,7 @@ from tests.runner.conftest import (
 from tests.runner.conftest import (
     _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, history_items_page
 
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
@@ -933,9 +933,8 @@ async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None
         if request.url.path.endswith("/items"):
             return httpx.Response(
                 200,
-                json={
-                    "object": "list",
-                    "data": [
+                json=history_items_page(
+                    [
                         {
                             "id": "item_1",
                             "type": "message",
@@ -957,10 +956,8 @@ async def test_runner_reloads_full_history_on_cold_cache_after_restart() -> None
                             "content": [{"type": "input_text", "text": new_user}],
                         },
                     ],
-                    "first_id": "item_1",
-                    "last_id": "item_3",
-                    "has_more": False,
-                },
+                    request.url.params,
+                ),
             )
         return httpx.Response(200, json={})
 
@@ -1077,9 +1074,8 @@ async def test_runner_cold_cache_appends_message_when_store_lacks_it() -> None:
         if request.url.path.endswith("/items"):
             return httpx.Response(
                 200,
-                json={
-                    "object": "list",
-                    "data": [
+                json=history_items_page(
+                    [
                         {
                             "id": "item_1",
                             "type": "message",
@@ -1095,10 +1091,8 @@ async def test_runner_cold_cache_appends_message_when_store_lacks_it() -> None:
                         # No item for ``new_user`` — the forward did not
                         # persist it before reaching the runner.
                     ],
-                    "first_id": "item_1",
-                    "last_id": "item_2",
-                    "has_more": False,
-                },
+                    request.url.params,
+                ),
             )
         return httpx.Response(200, json={})
 
@@ -1337,9 +1331,8 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
         if path.endswith("/items"):
             return httpx.Response(
                 200,
-                json={
-                    "object": "list",
-                    "data": [
+                json=history_items_page(
+                    [
                         {
                             "id": "item_1",
                             "type": "message",
@@ -1368,10 +1361,8 @@ async def test_runner_cold_cache_uses_resolved_message_not_stored_file_id() -> N
                             ],
                         },
                     ],
-                    "first_id": "item_1",
-                    "last_id": "item_3",
-                    "has_more": False,
-                },
+                    request.url.params,
+                ),
             )
         return httpx.Response(200, json={})
 
