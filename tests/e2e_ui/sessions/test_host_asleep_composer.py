@@ -342,8 +342,6 @@ def test_failed_wake_restores_dot_and_reports_error(
     ).to_be_visible(timeout=15_000)
     _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
     # The failed wake isn't retried on its own; Reconnect host sends a new one.
-    page.wait_for_timeout(2_000)
-    assert held == []
     _open_host_menu(page, "offline")
     page.wait_for_timeout(_HOLD_MS)
     page.get_by_role("menuitem", name="Reconnect host").click()

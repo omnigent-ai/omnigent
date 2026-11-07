@@ -281,7 +281,7 @@ import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
-import { startSandboxWake, useSessionReconnect } from "@/hooks/useSessionReconnect";
+import { useSessionReconnect, wakeSandboxSession } from "@/hooks/useSessionReconnect";
 import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
@@ -1831,11 +1831,9 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
       onShowReconnectHelp();
       return;
     }
-    // An asleep sandbox wakes through the same wake as Reconnect host, so the two never race.
+    // An asleep sandbox joins any wake already on its way, so Resume never races it.
     if (liveness.kind === "host_asleep") {
-      if (!(await startSandboxWake(conversationId))) {
-        throw new Error("Couldn't start the sandbox");
-      }
+      await wakeSandboxSession(conversationId);
       return;
     }
     const result = await retrySession(conversationId);

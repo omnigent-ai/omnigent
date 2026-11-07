@@ -69,9 +69,9 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 }));
 
 // The panel reads the session's host to point the directory browser at it.
-let sandboxWakePhase: "waking" | "awaiting_online" | null = null;
+let sandboxStarting = false;
 vi.mock("@/hooks/useSessionReconnect", () => ({
-  useSandboxWakePhase: () => sandboxWakePhase,
+  useSandboxStarting: () => sandboxStarting,
 }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
@@ -492,20 +492,17 @@ describe("FilesPanel on an asleep sandbox", () => {
     },
   );
 
-  it.each(["waking", "awaiting_online"] as const)(
-    "says the sandbox is starting while its wake is %s",
-    (phase) => {
-      useAsleepMock.mockReturnValue(true);
-      sandboxWakePhase = phase;
-      try {
-        renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
-        expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
-        expect(screen.queryByText("Send a message in the chat to start it again.")).toBeNull();
-      } finally {
-        sandboxWakePhase = null;
-      }
-    },
-  );
+  it("says the sandbox is starting while Reconnect host wakes it", () => {
+    useAsleepMock.mockReturnValue(true);
+    sandboxStarting = true;
+    try {
+      renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+      expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
+      expect(screen.queryByText("Send a message in the chat to start it again.")).toBeNull();
+    } finally {
+      sandboxStarting = false;
+    }
+  });
 
   it("keeps showing a list cached before the sandbox went offline", () => {
     useAsleepMock.mockReturnValue(true);

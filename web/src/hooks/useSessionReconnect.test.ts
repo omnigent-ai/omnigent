@@ -22,18 +22,11 @@ import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   SANDBOX_WAKE_ONLINE_GRACE_POLLS,
   SANDBOX_WAKE_STAGE_LIMIT_MS,
-  resetSandboxWakesForTesting,
-  startSandboxWake,
+  resetSandboxWakeRequestsForTesting,
+  useSandboxStarting,
   useSessionReconnect,
+  wakeSandboxSession,
 } from "./useSessionReconnect";
-
-const polledSessions = vi.hoisted(() => ({ current: [] as { id: string }[] }));
-vi.mock("@/hooks/RunnerHealthProvider", () => ({
-  useRunnerHealthRegistration: (sessions: { id: string }[]) => {
-    polledSessions.current = sessions;
-    return new Map();
-  },
-}));
 
 const healthPollListeners = vi.hoisted(
   () => new Set<(liveness: Map<string, SessionLiveness>, scheduled: boolean) => void>(),
@@ -116,7 +109,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   writeArcaHostId(null);
-  resetSandboxWakesForTesting();
+  resetSandboxWakeRequestsForTesting();
 });
 
 describe("useSessionReconnect", () => {
@@ -750,43 +743,6 @@ describe("useSessionReconnect", () => {
     }
   });
 
-  it("keeps the stage limit's deadline across switching to another session and back", async () => {
-    vi.useFakeTimers();
-    try {
-      vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
-      useChatStore.setState({
-        conversationId: "session",
-        sandboxStatus: { stage: "provisioning" },
-      });
-      const { result, rerender } = renderHook(useSessionReconnect, {
-        initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
-      });
-      await act(async () => {
-        void result.current.reconnect();
-      });
-      act(() => vi.advanceTimersByTime(SANDBOX_WAKE_STAGE_LIMIT_MS - 60_000));
-      useChatStore.setState({ conversationId: "other-session", sandboxStatus: null });
-      rerender({
-        ...asleepSandbox,
-        sessionId: "other-session",
-        hostId: "other-host",
-        hostOnline: false,
-      });
-      act(() => vi.advanceTimersByTime(30_000));
-      useChatStore.setState({
-        conversationId: "session",
-        sandboxStatus: { stage: "provisioning" },
-      });
-      rerender({ ...asleepSandbox, hostOnline: false });
-      expect(result.current.sandboxStarting).toBe(true);
-      // The original five minutes, not a fresh five from the return.
-      act(() => vi.advanceTimersByTime(30_000));
-      expect(result.current.sandboxStarting).toBe(false);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
   it("drops the stage limit once the launch stops reporting progress", async () => {
     vi.useFakeTimers();
     try {
@@ -815,37 +771,6 @@ describe("useSessionReconnect", () => {
 
   const timedOut = { stage: "failed", error: "Sandbox launch timed out" } as const;
   const approve = { stage: "action_required", details: "Approve the sandbox in Arclet" } as const;
-
-  it.each([approve, timedOut])(
-    "keeps a pending wake started on a $stage stage when its session is shown again",
-    async (stopped) => {
-      const pending = deferred<PostEventResponse>();
-      vi.mocked(retrySession).mockReturnValue(pending.promise);
-      useChatStore.setState({ conversationId: "session", sandboxStatus: stopped });
-      const { result, rerender } = renderHook(useSessionReconnect, {
-        initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
-      });
-      await act(async () => {
-        void result.current.reconnect();
-      });
-      useChatStore.setState({ conversationId: "other-session", sandboxStatus: null });
-      rerender({
-        ...asleepSandbox,
-        sessionId: "other-session",
-        hostId: "other-host",
-        hostOnline: false,
-      });
-      // Back on the session while the store still holds the other one...
-      rerender({ ...asleepSandbox, hostOnline: false });
-      // ...then it catches up with the same stopped stage.
-      act(() => useChatStore.setState({ conversationId: "session", sandboxStatus: stopped }));
-      expect(result.current.sandboxStarting).toBe(true);
-      await act(async () => {
-        void startSandboxWake("session");
-      });
-      expect(retrySession).toHaveBeenCalledOnce();
-    },
-  );
 
   it.each([
     ["a user action", timedOut, [approve]],
@@ -957,92 +882,61 @@ describe("useSessionReconnect", () => {
     expect(toast.loading).not.toHaveBeenCalled();
   });
 
-  it("hands a caller joining a failing wake its failure", async () => {
-    const pending = deferred<PostEventResponse>();
-    vi.mocked(retrySession).mockReturnValue(pending.promise);
-    renderHook(() => useSessionReconnect({ ...asleepSandbox, hostOnline: false }));
-    let first!: Promise<boolean>;
-    let joined!: Promise<boolean>;
-    await act(async () => {
-      first = startSandboxWake("session");
-      joined = startSandboxWake("session");
-    });
-    await act(async () => {
-      pending.reject(new Error("managed host wake timed out"));
-      await first;
-    });
-    await expect(joined).resolves.toBe(false);
-    expect(retrySession).toHaveBeenCalledOnce();
-  });
+  it.each(["resolves", "rejects"] as const)(
+    "shares one wake request that %s between Reconnect host and other callers",
+    async (outcome) => {
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      );
+      let reconnect!: Promise<void>;
+      let joined!: Promise<PostEventResponse>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+        joined = wakeSandboxSession("session");
+      });
+      expect(retrySession).toHaveBeenCalledOnce();
 
-  it("shares one sandbox wake between Reconnect host and every other caller", async () => {
-    const pending = deferred<PostEventResponse>();
-    vi.mocked(retrySession).mockReturnValue(pending.promise);
-    const { result } = renderHook(() =>
-      useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+      await act(async () => {
+        if (outcome === "resolves") pending.resolve({ queued: false, recovered: true });
+        else pending.reject(new Error("managed host wake timed out"));
+        await reconnect;
+      });
+      // The joining caller gets the same answer.
+      if (outcome === "resolves") await expect(joined).resolves.toMatchObject({ recovered: true });
+      else await expect(joined).rejects.toThrow("managed host wake timed out");
+
+      // Once answered, a new wake sends a new request.
+      vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+      await act(async () => {
+        await wakeSandboxSession("session");
+      });
+      expect(retrySession).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it("tells other panels while Reconnect host wakes the shown session's sandbox", async () => {
+    vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
+    const { result, rerender } = renderHook(
+      (props: typeof asleepSandbox) => ({
+        reconnect: useSessionReconnect({ ...props, hostOnline: false }),
+        starting: useSandboxStarting("session"),
+      }),
+      { initialProps: asleepSandbox },
     );
-    let first!: Promise<boolean>;
+    expect(result.current.starting).toBe(false);
     await act(async () => {
-      first = startSandboxWake("session");
+      void result.current.reconnect.reconnect();
     });
-    expect(result.current.sandboxStarting).toBe(true);
-    let joined!: Promise<boolean>;
-    let settled = false;
-    await act(async () => {
-      void result.current.reconnect();
-      joined = startSandboxWake("session");
-      void joined.then(() => (settled = true));
-    });
-    expect(retrySession).toHaveBeenCalledOnce();
-    // A caller joining mid-request waits for the server's answer.
-    expect(settled).toBe(false);
-
-    await act(async () => {
-      pending.resolve({ queued: false, recovered: true });
-      await first;
-    });
-    await expect(joined).resolves.toBe(true);
-    await act(async () => {
-      await result.current.reconnect();
-    });
-    // Still waiting for the host to read online: nothing new is sent.
-    expect(retrySession).toHaveBeenCalledOnce();
-    expect(result.current.sandboxStarting).toBe(true);
-  });
-
-  it("ends a wake whose host comes online while another session is open", async () => {
-    vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
-    const { result, rerender } = renderHook(useSessionReconnect, {
-      initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
-    });
-    await act(async () => {
-      await result.current.reconnect();
-    });
-    rerender({
-      ...asleepSandbox,
-      sessionId: "other-session",
-      hostId: "other-host",
-      hostOnline: false,
-    });
-    // The off-screen session stays in the health poll while its wake waits.
-    expect(polledSessions.current).toEqual([{ id: "session" }]);
-    act(() => {
-      for (const listener of healthPollListeners) {
-        listener(new Map([["session", { host_online: true } as SessionLiveness]]), true);
-      }
-    });
-    expect(polledSessions.current).toEqual([]);
-    // The host later sleeps again; returning starts a fresh wake instead of joining a stale one.
-    rerender({ ...asleepSandbox, hostOnline: false });
-    expect(result.current.sandboxStarting).toBe(false);
-    await act(async () => {
-      await result.current.reconnect();
-    });
-    expect(retrySession).toHaveBeenCalledTimes(2);
+    expect(result.current.starting).toBe(true);
+    // The wake's view state belongs to the shown session, as before.
+    rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
+    expect(result.current.starting).toBe(false);
   });
 
   it.each(["resolves", "rejects"] as const)(
-    "keeps a sandbox wake that %s while another session is open, and joins it on return",
+    "ignores a sandbox wake that %s after navigating to another session",
     async (outcome) => {
       const pending = deferred<PostEventResponse>();
       vi.mocked(retrySession).mockReturnValue(pending.promise);
@@ -1060,17 +954,9 @@ describe("useSessionReconnect", () => {
         else pending.reject(new Error("managed host wake timed out"));
         await reconnect;
       });
-      // A failure is reported only while its session is on screen.
+      expect(result.current.sandboxStarting).toBe(false);
+      expect(refreshRunnerHealth).not.toHaveBeenCalled();
       expect(toast.error).not.toHaveBeenCalled();
-
-      rerender(asleepSandbox);
-      vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
-      await act(async () => {
-        void result.current.reconnect();
-      });
-      // Returning joins the running wake instead of sending another; a failed one can retry.
-      expect(retrySession).toHaveBeenCalledTimes(outcome === "resolves" ? 1 : 2);
-      expect(result.current.sandboxStarting).toBe(true);
     },
   );
 
