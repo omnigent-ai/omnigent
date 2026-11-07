@@ -1975,7 +1975,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => onRightRailTabChange(tab)}
+                        onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
@@ -2220,6 +2220,9 @@ function WorkspacePanelImpl({
                 conversationId={contained ? conversationId : undefined}
                 frameless
                 active={railShown && !inert && filesPanelActive}
+                // A grid cell shows its panel when the cell is selected, not
+                // when the user opens Files; there only a tab pick wakes.
+                wakeWhenShown={!contained}
                 onFileSelect={openFileViewer}
                 flatView={rightRailTab === "changes"}
                 showHidden={filesPanelShowHidden}

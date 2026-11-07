@@ -88,6 +88,12 @@ interface FilesPanelProps {
    * Default true.
    */
   active?: boolean;
+  /**
+   * Whether the panel turning visible counts as the user opening it, and so
+   * wakes an asleep sandbox. False where visibility follows something else
+   * (a grid cell being selected). Default true.
+   */
+  wakeWhenShown?: boolean;
 }
 
 interface QueryStatus {
@@ -281,6 +287,7 @@ export function FilesPanel({
   onClose,
   frameless,
   active = true,
+  wakeWhenShown = true,
 }: FilesPanelProps) {
   const { conversationId: routeId } = useParams<{ conversationId: string }>();
   const conversationId = sessionId ?? routeId;
@@ -517,7 +524,7 @@ export function FilesPanel({
   // an asleep sandbox so its files load without a chat message. The
   // full-screen drawer (`onClose`) mounts only when the user opens it.
   const sandboxWake = useSandboxWake(conversationId);
-  useSandboxWakeWhenOpened(active, conversationId, sandboxWake.wakeIfAsleep, {
+  useSandboxWakeWhenOpened(wakeWhenShown && active, conversationId, sandboxWake.wakeIfAsleep, {
     mountIsOpen: onClose !== undefined,
   });
 

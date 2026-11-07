@@ -639,6 +639,13 @@ describe("FilesPanel on an asleep sandbox", () => {
     expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
   });
 
+  it("doesn't wake when a grid cell's panel is shown by selecting the cell", async () => {
+    const { rerender } = renderPanel({ ...asleepPanel, active: false });
+    await act(async () => rerender(panelAt("conv_asleep", { active: true, wakeWhenShown: false })));
+    expect(wakeSessionMock).not.toHaveBeenCalled();
+    expect(screen.getByText("Send a message in the chat to start it again.")).toBeInTheDocument();
+  });
+
   it("leaves a restored Files view on a just-opened session to the open dwell", async () => {
     vi.useFakeTimers();
     try {

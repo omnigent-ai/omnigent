@@ -69,16 +69,19 @@ vi.mock("./FilesPanel", () => ({
     flatView,
     conversationId,
     active,
+    wakeWhenShown,
   }: {
     flatView: boolean;
     conversationId: string;
     active?: boolean;
+    wakeWhenShown?: boolean;
   }) => (
     <div
       data-testid="files-panel-stub"
       data-session={conversationId}
       data-flat-view={String(flatView)}
       data-active={String(active)}
+      data-wake-when-shown={String(wakeWhenShown)}
     />
   ),
 }));
@@ -389,6 +392,10 @@ describe("WorkspacePanel surface presentation", () => {
 
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    wakeSandboxMock.mockClear();
+    fireEvent.click(screen.getByRole("tab", { name: "Changes" }));
+    // An opened unpinned tab is a pick like a pinned one.
+    expect(wakeSandboxMock).toHaveBeenCalledTimes(1);
     fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
@@ -881,6 +888,15 @@ describe("WorkspacePanel content area", () => {
     renderWorkspace({ rightRailTab: "files", selectedFilePath: null, contained });
 
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-active", active);
+  });
+
+  it.each([
+    ["the session's rail", false, "true"],
+    ["a grid cell, whose panel shows when the cell is selected", true, "false"],
+  ])("lets showing the FilesPanel wake the sandbox only in %s", (_label, contained, wakes) => {
+    renderWorkspace({ rightRailTab: "files", selectedFilePath: null, contained });
+
+    expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-wake-when-shown", wakes);
   });
 
   it("renders the FilesPanel tree scope when no file is active on the Files tab", () => {
