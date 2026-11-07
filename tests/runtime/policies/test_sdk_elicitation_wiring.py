@@ -158,11 +158,13 @@ def test_sse_parses_elicitation_request_event() -> None:
             "phase": "tool_call",
             "policy_name": "ask_search",
             "content_preview": "q=classified",
+            "ask_user_question": {"questions": [{"question": "Env?", "options": ["dev"]}]},
         },
     }
     event = _sse._parse_event("response.elicitation_request", raw)
     assert isinstance(event, ElicitationRequest)
     assert event.elicitation_id == "elicit_abc"
+    assert event.ask_user_question == {"questions": [{"question": "Env?", "options": ["dev"]}]}
     assert event.message == "approve web search?"
     assert event.requested_schema == {}
     assert event.mode == "form"
@@ -198,6 +200,7 @@ def test_sse_elicitation_request_tolerates_missing_extras() -> None:
     assert event.phase == ""
     assert event.policy_name == ""
     assert event.content_preview == ""
+    assert event.ask_user_question is None
 
 
 def test_sse_elicitation_request_skips_when_id_missing() -> None:
