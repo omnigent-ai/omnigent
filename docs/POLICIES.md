@@ -8,6 +8,18 @@ Policies are declarative gates that enforce rules on agent behavior. They evalua
 
 Policies compose: multiple policies can be active at once. The engine evaluates them in declaration order. A DENY from any policy short-circuits the rest.
 
+An ASK in a sub-agent session does not have to wait for a human. An orchestrator
+that holds the spawn grant sees its children's outstanding prompts in
+`sys_session_get_info` and can answer them with
+`sys_session_respond_elicitation`, so an unattended run is not stalled by a
+child's approval gate. The verdict is per-call: there is no "remember" option,
+because remembering retires the gate for a whole tool in that child rather than
+approving the one blocked call. Pre-authorising a shape of call is a policy
+decision, so express it in the agent's declared policies instead. The
+orchestrator's own policies still evaluate the answering tool call, so a
+guardrail can refuse a dangerous accept, and the tool only accepts direct
+children -- never a sibling or an unrelated session the caller can merely reach.
+
 ## Who configures policies
 
 Policies are set at three levels. Each level serves a different persona:
