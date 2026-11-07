@@ -33,7 +33,7 @@ status.
 | name | String(256) UNIQUE NOT NULL | Used as `model` in inference requests |
 | description | Text | nullable |
 
-**Indexes:** `uq_agents_name` (unique on name), `ix_agents_created_at`
+**Indexes:** `uq_agents_name` (unique on name), `ix_agents_kind_owner_created`
 
 ---
 
