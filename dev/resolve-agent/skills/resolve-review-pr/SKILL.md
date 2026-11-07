@@ -31,6 +31,8 @@ of the test. A passing repro alone does not prove the PR fixes the bug.
    to your handoff `recordings`. This is **not** gated on the repro handoff
    carrying footage — you have the test and the journey, which is all the recorder
    needs, so produce the after-clip whether or not any before-clip was recovered.
+   Check the driver's sends as 2B.5 describes; the same limit applies to claims
+   in your review comment.
    Burn timed step-by-step captions into each new clip and inspect the render
    using `dev/caption_recording.py`; the attachment description alone is not
    an on-screen caption. Use the same lanes as 2B.5 — see [`dev/recording-lanes.md`](../../../recording-lanes.md)

@@ -363,6 +363,15 @@ An absence check on the chat pane's indicator supports "the chat pane shows no
 working indicator", not "the session shows no activity". Check every such place
 before claiming that none shows the state.
 
+The driver's sends are user actions. Caption each message it types and any
+reload or retry it performs during the clip. A claim that the product acted
+without user input ("unprompted", "without another user message") must match
+all of the driver's sends: it holds only between them. A driver reused from a
+before-fix run may still send a step that worked around the bug, such as a
+prompt that collects a result the fix now delivers. Remove that step and assert
+the unaided outcome, or caption it and limit the claim to what happened before
+it.
+
 ### Timed captions inside the video
 
 For every newly captured clip, **burn in step-by-step captions before declaring
