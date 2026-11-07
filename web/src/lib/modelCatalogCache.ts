@@ -23,6 +23,8 @@ export const modelOptionSchema = z.object({
 });
 
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** Session catalogs are only a launch hint; the session rechecks its pick once online. */
+export const SANDBOX_SESSION_CATALOG_MAX_AGE_MS = 7 * MAX_AGE_MS;
 const cacheSchema = z.object({
   models: z.array(modelOptionSchema),
   configured: z.boolean(),
@@ -41,13 +43,29 @@ export function modelCatalogCacheKey(
   return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
 }
 
-export function readModelCatalogCache(key: string | null) {
+/**
+ * Key for the catalog a running managed-sandbox session reported for a harness.
+ *
+ * The new-session picker reads it as a hint before the sandbox exists, so it is
+ * scoped by sandbox provider and harness rather than by agent.
+ */
+export function sandboxSessionCatalogKey(
+  provider: string | null,
+  harness: string | null,
+): string | null {
+  const server = getOmnigentServerIdentity();
+  const user = getCurrentUserId();
+  if (server === null || user === null || !provider || !harness) return null;
+  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, "sandbox-session", provider, harness])}`;
+}
+
+export function readModelCatalogCache(key: string | null, maxAgeMs = MAX_AGE_MS) {
   if (key === null || typeof window === "undefined") return null;
   try {
     const result = cacheSchema.safeParse(JSON.parse(window.localStorage.getItem(key) ?? "null"));
     if (!result.success) return null;
     const age = Date.now() - result.data.savedAt;
-    return age >= 0 && age <= MAX_AGE_MS ? result.data : null;
+    return age >= 0 && age <= maxAgeMs ? result.data : null;
   } catch {
     return null;
   }

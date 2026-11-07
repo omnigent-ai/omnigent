@@ -1,5 +1,6 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
+import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
@@ -128,7 +129,11 @@ export function useSandboxLaunchModelOptions(
     getCurrentUserId(),
     enabled && offered,
   );
-  return enabled && offered && data?.status === "ready" ? data.models : undefined;
+  // Match the new-session picker: a running session's saved catalog wins.
+  const saved = useSavedSandboxSessionCatalog(enabled && offered ? provider : null, harness);
+  if (!enabled || !offered || data?.status === "unconfigured" || data?.status === "unsupported")
+    return undefined;
+  return saved ?? (data?.status === "ready" ? data.models : undefined);
 }
 
 export interface SandboxPreviewEntry {

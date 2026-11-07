@@ -115,6 +115,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
+import { sandboxSessionCatalogKey, writeModelCatalogCache } from "@/lib/modelCatalogCache";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import {
   useHostModelOptions,
@@ -13357,6 +13358,48 @@ describe("managed sandbox gateway preview", () => {
       null,
       true,
     );
+  });
+
+  it("offers a running session's saved catalog and effort ladder instead of the gateway list", async () => {
+    getCurrentUserIdMock.mockReturnValue("alice");
+    const luna = {
+      id: "gpt-6-luna",
+      displayName: "GPT 6 Luna",
+      supportedReasoningEfforts: [{ reasoningEffort: "ultra" }],
+    };
+    writeModelCatalogCache(sandboxSessionCatalogKey("arclet", "codex-native"), [luna], false);
+    writeModelCatalogCache(
+      sandboxSessionCatalogKey("arclet", "claude-native"),
+      [{ id: "opus", displayName: "Opus" }],
+      false,
+    );
+    preview();
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderGatewaySandbox();
+    selectAgent("a1");
+    openAgentModels("a1");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "Opus");
+    // Claude Code's in-session ladder, not the gateway model's metadata.
+    expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toBeInTheDocument();
+    closeMenu();
+    selectAgent("a2");
+    openAgentModels("a2");
+    expect(screen.queryByTestId(`new-chat-landing-agent-model-${astra.id}`)).toBeNull();
+    pickPrimaryOption("model", "GPT 6 Luna");
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-max")).toBeNull();
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-ultra"));
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body).toMatchObject({
+      agent_id: "a2",
+      sandbox_provider: "arclet",
+      model_override: luna.id,
+      reasoning_effort: "ultra",
+    });
   });
 
   it("drops an effort unsupported by the newly selected model", async () => {

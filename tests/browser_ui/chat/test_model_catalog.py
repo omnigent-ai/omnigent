@@ -8,7 +8,12 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Request, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
+from tests._helpers.picker_routes import OWN_AGENTS
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    list_payload,
+    model_option,
+)
 
 
 def _open_models(page: Page) -> None:
@@ -417,6 +422,121 @@ def test_bound_host_catalog_replaces_the_launch_preview(
     expect(rows).to_have_count(2)
     expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
     expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")
+
+
+_SESSION_ROWS = [
+    model_option("opus", display_name="Opus (session)", is_default=True),
+    model_option("haiku", display_name="Haiku (session)"),
+]
+
+
+def _serve_landing_beside_sandbox(chat: ChatSessionContract) -> None:
+    """Offer the session's Claude agent on the landing page with only managed sandboxes."""
+    chat.contract.json(
+        "/v1/agents",
+        list_payload(
+            [
+                {
+                    "id": chat.agent_id,
+                    "name": "claude-code-native-ui",
+                    "display_name": "Claude Code",
+                    "harness": "claude-native",
+                    "skills": [],
+                }
+            ]
+        ),
+    )
+    chat.contract.json(OWN_AGENTS, list_payload([]))
+    chat.contract.json("/v1/skills", {"skills": []})
+    chat.contract.json("/v1/hosts", {"hosts": []})
+
+
+def _deliver_session_catalog(chat: ChatSessionContract) -> None:
+    chat.set_catalog(harness="claude-native", models=_SESSION_ROWS, selected_model="opus")
+    chat.emit(
+        {
+            "event": "session.model_options",
+            "data": {"type": "session.model_options", "conversation_id": chat.session_id},
+        }
+    )
+
+
+def _open_landing_models(page: Page, agent_id: str) -> None:
+    page.get_by_test_id("new-chat-landing-agent-select").click()
+    page.get_by_test_id(f"new-chat-landing-agent-config-{agent_id}").get_by_text(
+        "Edit", exact=True
+    ).click()
+
+
+def test_new_session_picker_offers_a_running_sandbox_catalog(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A sandbox session's catalog replaces the gateway preview for the next launch."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    _serve_landing_beside_sandbox(chat)
+
+    page.goto(chat.base_url)
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible(timeout=20_000)
+    _open_landing_models(page, chat.agent_id)
+    expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-haiku")).to_have_count(0)
+    page.keyboard.press("Escape")
+    page.keyboard.press("Escape")
+
+    page.locator(f'aside [data-sidebar-session-id="{chat.session_id}"] a').click()
+    chat.wait_for_stream()
+    _deliver_session_catalog(chat)
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows).to_have_count(2)
+    page.keyboard.press("Escape")
+
+    page.get_by_test_id("new-chat-button").click()
+    expect(page.get_by_test_id("new-chat-landing-input")).to_be_visible()
+    _open_landing_models(page, chat.agent_id)
+    expect(page.get_by_test_id("new-chat-landing-agent-model-haiku")).to_contain_text(
+        "Haiku (session)"
+    )
+    expect(page.get_by_test_id("new-chat-landing-agent-model-opus")).to_be_visible()
+    expect(page.get_by_test_id("new-chat-landing-agent-model-gateway/opus")).to_have_count(0)
+    # Claude Code's own effort ladder, which the gateway rows do not describe.
+    expect(page.get_by_test_id("new-chat-landing-agent-effort-xhigh")).to_be_visible()
+
+
+def test_launch_pick_missing_from_the_sandbox_resets_to_default(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """A launch model the sandbox lacks is replaced by the default, with a notice."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    chat.update_session(model_override="gateway/sonnet", reasoning_effort="high")
+
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
+        "Provisioning sandbox"
+    )
+    _open_models(page)
+    launch_pick = page.locator('[data-model-id="gateway/sonnet"]')
+    expect(launch_pick).to_have_attribute("aria-checked", "true")
+    page.keyboard.press("Escape")
+    _deliver_session_catalog(chat)
+
+    expect(
+        page.get_by_text(
+            "gateway/sonnet isn't available in this sandbox. Using the default model."
+        )
+    ).to_be_visible()
+    # "default" is the clear alias; Claude Code offers High for every model, so effort stays.
+    assert chat.session_patches == [{"model_override": "default"}]
+    _open_models(page)
+    expect(page.locator('[data-model-id="opus"]')).to_be_visible()
+    # No off-catalog "(current)" row keeps the unavailable pick alive.
+    expect(launch_pick).to_have_count(0)
 
 
 @pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile"])

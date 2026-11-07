@@ -4,6 +4,8 @@ import { getCurrentUserId } from "./identity";
 import {
   modelCatalogCacheKey,
   readModelCatalogCache,
+  SANDBOX_SESSION_CATALOG_MAX_AGE_MS,
+  sandboxSessionCatalogKey,
   writeModelCatalogCache,
 } from "./modelCatalogCache";
 
@@ -109,4 +111,21 @@ it("tolerates unavailable browser storage", () => {
   });
   expect(() => writeModelCatalogCache(key(), models, true)).not.toThrow();
   expect(readModelCatalogCache(key())).toBeNull();
+});
+
+it("keeps running-session catalogs apart from agent previews and for a week", () => {
+  vi.useFakeTimers();
+  const now = Date.now();
+  const sessionKey = sandboxSessionCatalogKey("company", "codex-native");
+  writeModelCatalogCache(sessionKey, models, false);
+  expect(readModelCatalogCache(key())).toBeNull();
+  expect(readModelCatalogCache(sandboxSessionCatalogKey("company", "claude-native"))).toBeNull();
+  expect(readModelCatalogCache(sandboxSessionCatalogKey("other", "codex-native"))).toBeNull();
+  vi.setSystemTime(now + 2 * 24 * 60 * 60 * 1000);
+  expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)?.models).toEqual(
+    models,
+  );
+  vi.setSystemTime(now + SANDBOX_SESSION_CATALOG_MAX_AGE_MS + 1);
+  expect(readModelCatalogCache(sessionKey, SANDBOX_SESSION_CATALOG_MAX_AGE_MS)).toBeNull();
+  expect(sandboxSessionCatalogKey(null, "codex-native")).toBeNull();
 });
