@@ -1835,7 +1835,10 @@ async def test_host_launch_waits_past_the_ordinary_http_read_timeout() -> None:
     server = await asyncio.start_server(connected, "127.0.0.1", 0)
     base_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
     try:
-        async with server, httpx.AsyncClient(timeout=0.05, trust_env=False) as http:
+        async with (
+            server,
+            httpx.AsyncClient(timeout=httpx.Timeout(0.05, connect=5.0), trust_env=False) as http,
+        ):
             sessions = SessionsNamespace(http, base_url)
             launched = await sessions.create_from_agent_id("ag_abc", host_id="host_1")
             assert launched.id == "conv_abc"
