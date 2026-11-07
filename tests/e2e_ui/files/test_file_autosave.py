@@ -11,19 +11,24 @@ prove the change reaches the server:
   2. A fresh ``GET .../filesystem/{path}`` returns the edited content.
 
 Both are seeded via the filesystem PUT endpoint (no agent run), so the
-tests are deterministic.
+tests are deterministic. An open editor also follows saves made by another
+process or session in place, so the user's next edit saves alongside them.
 """
 
 from __future__ import annotations
 
+import os
 import shutil
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests.e2e_ui.conftest import switch_markdown_view_mode
 
 # Files land in ``<repo-root>/<session_id>/`` (the agent spec uses
 # ``os_env.cwd: .``), so clean that per-session dir up in teardown.
@@ -162,6 +167,84 @@ def test_markdown_edit_autosaves(page: Page, seeded_markdown: tuple[str, str]) -
     expect(editor).to_contain_text(sentinel)
 
 
+def test_open_markdown_follows_other_writers(
+    page: Page, seeded_session_pair: tuple[str, str, str]
+) -> None:
+    """An open editor shows other writers' saves in place, never over unsaved edits."""
+    base_url, session_id, other_session_id = seeded_session_pair
+    path = "shared_worklog.md"
+    _seed_file(base_url, session_id, path, "# Worklog\n\nFirst entry.\n")
+    try:
+        listing = httpx.get(
+            f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem",
+            timeout=10.0,
+        )
+        listing.raise_for_status()
+        disk_path = Path(listing.json()["base"]) / path
+
+        def replace_on_disk(content: str) -> None:
+            staged = disk_path.with_name(f".{path}.tmp")
+            staged.write_text(content)
+            os.replace(staged, disk_path)
+
+        page.goto(f"{base_url}/c/{session_id}?file={path}")
+        viewer = page.locator('[data-testid="file-viewer"]:visible')
+        editor = viewer.locator('[contenteditable="true"]')
+        first_entry = editor.locator("p", has_text="First entry.")
+        expect(first_entry).to_be_visible(timeout=10_000)
+        page.evaluate("window.__sameDocument = true")
+        # Park the caret at the end of the first entry, as a reader would.
+        box = first_entry.bounding_box()
+        assert box is not None
+        first_entry.click(position={"x": box["width"] - 2, "y": box["height"] / 2})
+
+        # Another process replaces the file on disk.
+        replace_on_disk("# Worklog\n\nFirst entry.\n\nFrom another process.\n")
+        expect(editor).to_contain_text("From another process.", timeout=10_000)
+
+        # Another session saves the same file through its own filesystem API.
+        saved = httpx.put(
+            f"{base_url}/v1/sessions/{other_session_id}/resources/environments/default"
+            f"/filesystem/{quote(str(disk_path).lstrip('/'))}?base=host",
+            json={
+                "content": "# Worklog\n\nFirst entry.\n\nFrom another process.\n\n"
+                "From another session.\n",
+                "encoding": "utf-8",
+            },
+            timeout=10.0,
+        )
+        saved.raise_for_status()
+        expect(editor).to_contain_text("From another session.", timeout=10_000)
+        assert page.evaluate("window.__sameDocument") is True
+
+        page.keyboard.type(" Still here.")
+        persisted = _wait_for_persisted(base_url, session_id, path, "Still here.")
+        entries = ["First entry. Still here.", "From another process.", "From another session."]
+        positions = [persisted.find(entry) for entry in entries]
+        assert -1 not in positions and positions == sorted(positions), persisted
+
+        # With saves failing, another writer's change must not replace unsaved
+        # text: it raises the conflict, and Keep mine saves the user's version.
+        put_only = f"**/filesystem/{path}"
+        page.route(
+            put_only,
+            lambda route: route.abort() if route.request.method == "PUT" else route.continue_(),
+        )
+        page.keyboard.type(" Unsaved.")
+        replace_on_disk(persisted + "\nFrom a later writer.\n")
+        expect(viewer.get_by_text("modified externally", exact=False)).to_be_visible(
+            timeout=10_000
+        )
+        expect(editor).to_contain_text("Still here. Unsaved.")
+        expect(editor).not_to_contain_text("From a later writer.")
+        page.unroute(put_only)
+        viewer.get_by_role("button", name="Keep mine").click()
+        kept = _wait_for_persisted(base_url, session_id, path, "Still here. Unsaved.")
+        assert "From a later writer." not in kept
+    finally:
+        _cleanup_session_workdir(session_id)
+
+
 def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, str]) -> None:
     """The full file can be viewed and edited without losing its tail on save."""
     base_url, session_id, original_content = seeded_python
@@ -200,23 +283,26 @@ def test_non_markdown_edit_autosaves(page: Page, seeded_python: tuple[str, str, 
 
 
 def test_large_markdown_source_autosaves(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Source fallback preserves the whole file and stays mounted across a smaller save."""
+    """Large Markdown opens in Preview, edits in source, and stays there across a smaller save."""
     base_url, session_id = seeded_session
     path = "large-autosave.md"
     line = "A paragraph in a large Markdown document.\n\n"
-    original = "# Large document\n\n" + line * (1024 * 1024 // len(line) + 1)
+    original = "# Large document\n\n" + line * (512 * 1024 // len(line))
     original += "Large document end.\n"
     _seed_file(base_url, session_id, path, original)
     try:
         page.goto(f"{base_url}/c/{session_id}?file={path}")
         viewer = page.locator('[data-testid="file-viewer"]:visible')
+        expect(viewer.get_by_role("heading", name="Large document")).to_be_visible(timeout=30_000)
+        expect(viewer.locator(".tiptap")).to_have_count(0)
+        expect(viewer.locator(".monaco-editor")).to_have_count(0)
+        switch_markdown_view_mode(page, viewer, "Edit")
         expect(
-            viewer.get_by_text("Large Markdown file opened as source", exact=False)
+            viewer.get_by_text("Large Markdown file edited as source", exact=False)
         ).to_be_visible()
         editor = viewer.locator(".monaco-editor")
         expect(editor).to_be_visible(timeout=30_000)
         expect(viewer.locator(".tiptap")).to_have_count(0)
-        expect(viewer.get_by_role("button", name="View mode", exact=False)).to_have_count(0)
         viewer.locator(".view-lines").click()
         page.keyboard.press("ControlOrMeta+End")
         expect(viewer.locator(".view-lines")).to_contain_text("Large document end.")
@@ -225,6 +311,10 @@ def test_large_markdown_source_autosaves(page: Page, seeded_session: tuple[str, 
         page.keyboard.type(sentinel)
         assert _wait_for_persisted(base_url, session_id, path, sentinel) == sentinel + original
         page.reload()
+        expect(viewer.get_by_role("heading", name="Saved large Markdown")).to_be_visible(
+            timeout=30_000
+        )
+        switch_markdown_view_mode(page, viewer, "Edit")
         expect(viewer.locator(".view-lines")).to_contain_text("Saved large Markdown")
         viewer.locator(".view-lines").click()
         page.keyboard.press("ControlOrMeta+f")

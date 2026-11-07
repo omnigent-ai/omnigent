@@ -1,3 +1,4 @@
+import { isIndentedSibling } from "@/lib/sessionFamilies";
 import {
   ArrowLeftIcon,
   BotIcon,
@@ -14,25 +15,29 @@ import {
   PanelLeftIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
+  SearchIcon,
   ShareIcon,
   TerminalIcon,
   UserPlusIcon,
   XIcon,
 } from "lucide-react";
 import { useCanvasWorkspace } from "@/canvas/CanvasWorkspace";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  rightSidebarToggleAriaShortcut,
+  rightSidebarToggleShortcutKeys,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -49,8 +54,9 @@ import { TAB_BADGE_BASE } from "./railTabs";
 import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
-
-const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+import { MobileHeaderButton, MobileHeaderButtonGroup } from "./MobileHeaderButton";
+import { MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
+import { SessionMenuHeader } from "./SessionMenuHeader";
 
 /**
  * Gating flags + handlers for the mobile workspace-rail entries (Files ·
@@ -103,6 +109,12 @@ interface MobileSessionMenuProps {
   githubPanelOpen: boolean;
   /** Open the mobile Pull Requests drawer. */
   onOpenGithub: () => void;
+  /** True while the mobile Content search drawer is open. */
+  contentSearchPanelOpen: boolean;
+  /** Whether workspace content search is available for this session. */
+  showContentSearch: boolean;
+  /** Open the mobile Content search drawer. */
+  onOpenContentSearch: () => void;
   /** True while the mobile side-chats drawer is open. */
   sideChatsPanelOpen: boolean;
   /** Whether the session's harness supports side chats. */
@@ -135,6 +147,8 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  workingDirectory?: string | null;
+  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -214,7 +228,7 @@ const PENDING_ACTION_TITLE = "Available when the session starts";
 function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
   if (isMobile) {
     return (
-      <Button
+      <MobileHeaderButton
         type="button"
         variant="ghost"
         size="icon"
@@ -224,7 +238,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         className="text-muted-foreground md:hidden max-md:size-11"
       >
         <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-      </Button>
+      </MobileHeaderButton>
     );
   }
 
@@ -302,10 +316,10 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
  * ChatHeader — the top action bar for the conversation region.
  *
  * Rendered as an **absolute overlay** (``z-30``) spanning the full width
- * of the chat + workspace group. The bar paints no background — the app
- * canvas shows through, and chat content dissolves before it slides
- * under the controls (the conversation viewport's ``chat-scroll-fade``
- * mask, index.css; chat reserves clearance via ``pt-20``,
+ * of the chat + workspace group. Active sessions use a glass backdrop that
+ * fades at its lower edge while chat content scrolls behind it and appears
+ * blurred. The conversation viewport keeps its bottom composer fade
+ * (``chat-scroll-fade`` in index.css); chat reserves initial clearance via ``pt-20``,
  * terminal-first via ``pt-14``). Left slot: open-sidebar + a conversation
  * breadcrumb (``[folder] / <title> [/ <sub-agent>]``, with the session-actions
  * kebab on desktop and a "Move to…" project picker on the folder tag). Right
@@ -327,6 +341,8 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  workingDirectory,
+  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -371,13 +387,14 @@ export function ChatHeader({
     !mobileMenu.subagentsPanelOpen &&
     !mobileMenu.shellsPanelOpen &&
     !mobileMenu.githubPanelOpen &&
+    !mobileMenu.contentSearchPanelOpen &&
     !mobileMenu.sideChatsPanelOpen &&
     (hasRailContent || mobileMenu.debugMode) ? (
       <>
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenFiles}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <FileIcon className="size-4" />
             Files
@@ -386,7 +403,7 @@ export function ChatHeader({
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenChanges}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <GitCompareIcon className="size-4" />
             Changes
@@ -397,10 +414,19 @@ export function ChatHeader({
             )}
           </DropdownMenuItem>
         )}
+        {mobileMenu.showContentSearch && (
+          <DropdownMenuItem
+            onSelect={mobileMenu.onOpenContentSearch}
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
+          >
+            <SearchIcon className="size-4" />
+            Content search
+          </DropdownMenuItem>
+        )}
         {showFilesPanel && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenGithub}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <GitPullRequestIcon className="size-4" />
             Pull Requests
@@ -411,7 +437,7 @@ export function ChatHeader({
             main agent included. */}
         <DropdownMenuItem
           onSelect={mobileMenu.onOpenSubagents}
-          className="gap-2.5 px-2.5 py-2 text-ui"
+          className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
         >
           <BotIcon className="size-4" />
           Agents
@@ -432,7 +458,7 @@ export function ChatHeader({
         {mobileMenu.showSideChats && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenSideChats}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <MessagesSquareIcon className="size-4" />
             Side chats
@@ -446,7 +472,7 @@ export function ChatHeader({
         {!mobileMenu.hideTerminalsTab && mobileMenu.showShellsTab && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenShells}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <TerminalIcon className="size-4" />
             Shells
@@ -460,7 +486,7 @@ export function ChatHeader({
         {mobileMenu.debugMode && (
           <DropdownMenuItem
             onSelect={mobileMenu.onOpenMainExecutionLog}
-            className="gap-2.5 px-2.5 py-2 text-ui"
+            className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
           >
             <ListIcon className="size-4" />
             Logs
@@ -478,6 +504,7 @@ export function ChatHeader({
     !pending && actionConversation ? (
       <HeaderConversationMenu
         conversation={actionConversation}
+        workingDirectory={workingDirectory}
         currentProject={projectName}
         canShare={canShare}
         canFork={canFork}
@@ -514,7 +541,11 @@ export function ChatHeader({
           /
         </span>
       </div>
-    ) : !pending && !isMobile && actionConversation && !isChildSession ? (
+    ) : !pending &&
+      !isMobile &&
+      actionConversation &&
+      !isChildSession &&
+      !isIndentedSibling(actionConversation) ? (
       <HeaderProjectTag
         conversationId={actionConversation.id}
         projectName={projectName}
@@ -535,13 +566,10 @@ export function ChatHeader({
   return (
     <header
       className={cn(
-        // h-14 fixes the bar at 56px: 12px symmetric vertical padding around
-        // the 32px controls. No own background — the app canvas shows
-        // through (a scrim can't track the canvas gradient).
-        // Scrolled chat text can't render through the controls because the
-        // conversation viewport fades its top edge instead (chat-scroll-fade
-        // in index.css, applied in ChatPage).
-        "chat-header absolute inset-x-0 top-0 z-30 flex h-14 md:h-12 items-center justify-between px-2 md:px-4 py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        // Desktop sessions fade scrolling content behind the header.
+        // Mobile keeps only the individual glass button surfaces.
+        "chat-header absolute inset-x-0 top-0 z-30 flex h-[76px] md:h-12 items-center justify-between px-4 py-4 md:py-3 md:right-[var(--workspace-panel-offset,0px)]",
+        conversationId && !isMobile && "session-header-glass",
         settingsMode && "settings-mobile-header",
       )}
     >
@@ -600,12 +628,19 @@ export function ChatHeader({
             boundAgent={boundAgent}
             wrapperLabel={wrapperLabel}
             actions={isMobile ? undefined : (conversationMenu ?? undefined)}
+            compact={isMobile}
             className="pr-1"
           />
         )}
+        {conversationId && createdBySessionId && (
+          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
+        )}
       </div>
 
-      <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
+      <MobileHeaderButtonGroup className="flex items-center gap-2 max-md:empty:hidden">
+        {isMobile && !settingsMode && (
+          <MobileHeaderControlsSlot sessionId={conversationId ?? null} />
+        )}
         {/* Other users currently viewing this session (presence).
             Self-contained — reads the chat store directly, renders
             nothing when the user is alone. */}
@@ -649,7 +684,11 @@ export function ChatHeader({
               </Button>
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="min-w-44">
-              <SessionActionMenuItem disabledReason={forkDisabledReason} onSelect={onFork}>
+              <SessionActionMenuItem
+                className="mobile-touch-target"
+                disabledReason={forkDisabledReason}
+                onSelect={onFork}
+              >
                 <GitForkIcon className="size-3.5" />
                 Fork
               </SessionActionMenuItem>
@@ -668,7 +707,7 @@ export function ChatHeader({
             // HeaderConversationMenu).
             <DropdownMenu modal={!isMobile}>
               <DropdownMenuTrigger asChild>
-                <Button
+                <MobileHeaderButton
                   type="button"
                   variant="ghost"
                   size="icon"
@@ -677,28 +716,29 @@ export function ChatHeader({
                   className="text-muted-foreground hover:text-foreground md:hidden max-md:size-11"
                 >
                   <EllipsisVerticalIcon className="size-4 max-md:size-5" />
-                </Button>
+                </MobileHeaderButton>
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="end"
-                className={cn("min-w-44 max-w-[min(20rem,calc(100vw-1rem))]", MOBILE_GLASS_SURFACE)}
+                collisionPadding={isMobile ? 16 : undefined}
+                className={cn(
+                  "min-w-44 max-w-[min(20rem,calc(100vw-1rem))]",
+                  MOBILE_GLASS_SURFACE,
+                  isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
+                )}
               >
                 {isMobile && conversationId && (
-                  <>
-                    <DropdownMenuLabel className="flex items-center gap-2 px-2.5 pb-1.5 text-foreground">
-                      <span className="min-w-0 flex-1 truncate">
-                        {conversationTitle || UNTITLED_CONVERSATION_LABEL}
-                      </span>
-                      <PresenceAvatars />
-                    </DropdownMenuLabel>
-                    <DropdownMenuSeparator />
-                  </>
+                  <SessionMenuHeader
+                    title={conversationTitle || UNTITLED_CONVERSATION_LABEL}
+                    workingDirectory={workingDirectory}
+                  />
                 )}
                 {/* Chat/Terminal switch (terminal-first sessions) — self-gates to
                   null otherwise, and renders its own trailing separator. */}
                 {isMobile && <ViewModeMenuItems />}
                 {canFork && (
                   <SessionActionMenuItem
+                    className="mobile-touch-target"
                     disabledReason={forkDisabledReason}
                     onSelect={onFork}
                     data-testid="fallback-fork-conversation"
@@ -720,7 +760,7 @@ export function ChatHeader({
                     disabled={shareDisabled}
                     data-testid="mobile-share-session"
                     title={shareDisabledReason}
-                    className="gap-2.5 px-2.5 py-2 text-ui"
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <ShareIcon className="size-4" />
                     Share
@@ -733,7 +773,7 @@ export function ChatHeader({
                       onAgentInfo();
                     }}
                     data-testid="mobile-agent-info"
-                    className="gap-2.5 px-2.5 py-2 text-ui"
+                    className="mobile-touch-target gap-2.5 px-2.5 py-2 text-ui"
                   >
                     <InfoIcon className="size-4" />
                     Agent info
@@ -796,7 +836,7 @@ export function ChatHeader({
                 variant="ghost"
                 size="icon-xs"
                 aria-label={rightPanelOpen ? "Collapse right panel" : "Expand right panel"}
-                aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+]`}
+                aria-keyshortcuts={rightSidebarToggleAriaShortcut()}
                 onClick={onToggleRightPanel}
                 componentId="chat.header.toggle_right_panel"
                 className="hidden md:inline-flex text-muted-foreground hover:text-foreground border-none"
@@ -808,7 +848,7 @@ export function ChatHeader({
                 )}
               </Button>
             </TooltipTrigger>
-            <TooltipContent shortcut={RIGHT_PANEL_KEYS}>
+            <TooltipContent shortcut={rightSidebarToggleShortcutKeys()}>
               <span>{rightPanelOpen ? "Collapse right panel" : "Expand right panel"}</span>
             </TooltipContent>
           </Tooltip>
@@ -844,7 +884,7 @@ export function ChatHeader({
             </Button>
           </>
         )}
-      </div>
+      </MobileHeaderButtonGroup>
     </header>
   );
 }

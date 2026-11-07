@@ -7,13 +7,14 @@ import contextlib
 import logging
 import threading
 import time
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import anyio
 import pytest
 from asgiref.testing import ApplicationCommunicator
-from fastapi import FastAPI
-from sqlalchemy import update
+from fastapi import FastAPI, HTTPException
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.db_models import SqlHost
@@ -21,6 +22,8 @@ from omnigent.db.utils import get_or_create_engine, now_epoch
 from omnigent.host.frames import (
     CAP_MCP_TOOLS,
     CAP_SKILL_CONTENT,
+    SERVER_CAP_TMUX_READINESS,
+    SERVER_CAPABILITIES_HEADER,
     HostConnectionErrorFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
@@ -36,6 +39,7 @@ from omnigent.host.frames import (
     decode_host_frame,
     encode_host_frame,
     encode_import_local_session_frames,
+    parse_server_capabilities,
 )
 from omnigent.runner.transports.ws_tunnel.diagnostics import OutboundFrame, TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -47,11 +51,18 @@ from omnigent.runner.transports.ws_tunnel.frames import (
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import AuthProvider
 from omnigent.server.host_registry import HostRegistry
+from omnigent.server.managed_hosts import (
+    ManagedSandboxConfig,
+    ManagedSandboxDeployment,
+    parse_sandbox_config,
+)
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.mcp_tools import create_mcp_tools_router
 from omnigent.server.routes.skill_content import create_skill_content_router
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
+from tests.server.helpers import FakeSandboxLauncher
 
 pytestmark = pytest.mark.asyncio
 
@@ -372,9 +383,15 @@ async def test_host_tunnel_heartbeat_failure_does_not_kill_ping_loop(
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
 
 
+@pytest.mark.parametrize(
+    ("managed", "offline_fails"), [(False, False), (True, False), (True, True)]
+)
 async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    managed: bool,
+    offline_fails: bool,
 ) -> None:
     """A slow store write cannot block pings or race the offline transition."""
     import omnigent.server.routes.host_tunnel as tunnel_mod
@@ -383,24 +400,51 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
 
     app, registry, store = host_app
+    token = "blocked-heartbeat-token"
+    if managed:
+        _register_managed(store, host_id=_HOST_ID, token=token)
+        config = ManagedSandboxConfig(
+            server_url="https://managed-test.example.com",
+            launcher_factory=FakeSandboxLauncher,
+            token_ttl_s=7200,
+            provider="modal",
+        )
+        app = FastAPI()
+        app.include_router(
+            create_host_tunnel_router(
+                registry, store, sandbox_config=ManagedSandboxDeployment.single(config)
+            ),
+            prefix="/v1",
+        )
+    if offline_fails:
+
+        def fail_offline(_host_id: str, **kwargs) -> None:
+            raise RuntimeError("offline persistence failed")
+
+        monkeypatch.setattr(store, "set_offline", fail_offline)
     original_heartbeat = store.heartbeat
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     calls = 0
 
-    def slow_heartbeat(host_id: str) -> None:
+    def slow_heartbeat(host_id: str, **kwargs) -> None:
         nonlocal calls
         calls += 1
         started.set()
         release.wait(timeout=budget(5.0))
         try:
-            original_heartbeat(host_id)
+            original_heartbeat(host_id, **kwargs)
         finally:
             finished.set()
 
     monkeypatch.setattr(store, "heartbeat", slow_heartbeat)
-    comm = await _connect_route(app, _TUNNEL_PATH)
+    if managed:
+        comm = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+        await comm.send_input({"type": "websocket.connect"})
+        assert (await comm.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    else:
+        comm = await _connect_route(app, _TUNNEL_PATH)
     await _send_hello_and_wait(comm, registry)
     try:
         assert await asyncio.to_thread(started.wait, budget(1.0))
@@ -408,10 +452,14 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
         await _receive_ping_and_pong(comm)
         assert registry.get(_HOST_ID) is not None
         assert calls == 1
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            before = (row.updated_at, row.token_expires_at)
 
         await comm.send_input({"type": "websocket.disconnect", "code": 1000})
         await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-        await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
+        if not offline_fails:
+            await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
         await comm.wait(timeout=budget(2.0))
     finally:
         release.set()
@@ -420,9 +468,14 @@ async def test_host_tunnel_slow_heartbeat_does_not_delay_ping_or_offline_cleanup
             await comm.wait(timeout=budget(2.0))
 
     await asyncio.wait_for(_wait_deregistered(registry, _HOST_ID), timeout=budget(2.0))
-    await asyncio.wait_for(_wait_offline(store, _HOST_ID), timeout=budget(2.0))
     assert calls == 1
-    assert not store.is_online(_HOST_ID)
+    assert store.is_online(_HOST_ID) == offline_fails
+    if managed:
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at == before[1]
+            if offline_fails:
+                assert row.updated_at == before[0]
 
 
 @pytest.mark.parametrize("wall_clock_step", [-3600.0, 0.0, 3600.0])
@@ -802,6 +855,22 @@ async def test_host_tunnel_accepts_and_registers(
     assert conn.hello.name == "test-laptop"
 
 
+async def test_host_tunnel_upgrade_advertises_server_capabilities(
+    host_app: tuple[FastAPI, HostRegistry, HostStore],
+) -> None:
+    """Hosts learn on the upgrade, before their hello, which readiness states this server takes."""
+    app, _registry, _store = host_app
+    communicator = ApplicationCommunicator(app, _websocket_scope(_TUNNEL_PATH))
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=budget(1.0))
+
+    assert accepted["type"] == "websocket.accept"
+    headers = dict(accepted.get("headers") or [])
+    advertised = headers[SERVER_CAPABILITIES_HEADER.lower().encode("ascii")].decode("ascii")
+    assert SERVER_CAP_TMUX_READINESS in parse_server_capabilities(advertised)
+    await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+
+
 @pytest.mark.parametrize("code,reason", [(1000, "done"), (1006, ""), (1012, "restart")])
 async def test_host_tunnel_deregisters_on_disconnect(
     host_app: tuple[FastAPI, HostRegistry, HostStore],
@@ -1165,6 +1234,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
         items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 400}}],
         title="giant",
         source="claude",
+        archived=True,
     )
     texts = list(encode_import_local_session_frames("req_chunked", 1, session, allow_chunks=True))
     assert len(texts) > 1  # actually exercised the chunk path
@@ -1176,6 +1246,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
     assert kind == "session"
     assert payload["external_session_id"] == "s_giant"
     assert payload["items"] == session.items
+    assert payload["archived"] is True
     assert payload["total"] == 1
 
 
@@ -1630,6 +1701,171 @@ async def test_managed_token_authenticates_as_record_owner(
     assert host.status == "online"
     # The managed binding survives the connect upsert.
     assert host.sandbox_id == "sb-tunnel-1"
+
+
+async def test_managed_heartbeat_renews_only_when_due_and_retries_failure(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Routine heartbeats skip renewal, and a failed renewal remains due."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+
+    clock = 100.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: clock)
+    monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: int(clock))
+    requested = asyncio.Event()
+    completed: asyncio.Queue[tuple[str | None, int | None]] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+    store = HostStore(db_uri)
+    fail = False
+
+    def heartbeat(
+        host_id: str,
+        *,
+        managed_token: str | None,
+        token_ttl_s: int | None,
+        observed_at: int,
+        cancelled: Callable[[], bool],
+    ) -> None:
+        assert host_id == _HOST_ID
+        assert observed_at == int(clock)
+        assert not cancelled()
+        try:
+            if fail:
+                raise RuntimeError("temporary renewal failure")
+        finally:
+            loop.call_soon_threadsafe(completed.put_nowait, (managed_token, token_ttl_s))
+
+    monkeypatch.setattr(store, "heartbeat", heartbeat)
+    task = asyncio.create_task(
+        tunnel_mod._heartbeat_loop(
+            requested, host_id=_HOST_ID, host_store=store, managed_token="token", token_ttl_s=600
+        )
+    )
+    try:
+        for clock, fail, expected_ttl in [
+            (100, False, 600),
+            (100, False, None),
+            (399, False, None),
+            (400, True, 600),
+            (400, False, 600),
+            (699, False, None),
+            (700, False, 600),
+        ]:
+            requested.set()
+            assert await asyncio.wait_for(completed.get(), timeout=budget(1.0)) == (
+                "token",
+                expected_ttl,
+            )
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+@pytest.mark.parametrize(
+    ("provider", "launcher_provider"),
+    [
+        (None, "modal"),
+        (None, "daytona"),
+        (None, None),
+        (None, "broken"),
+        ("modal", "modal"),
+        ("daytona", "daytona"),
+    ],
+)
+async def test_managed_heartbeat_renews_token_for_reconnect(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str | None,
+    launcher_provider: str | None,
+) -> None:
+    """An authenticated live tunnel keeps its token usable beyond launch expiry."""
+    import omnigent.server.routes.host_tunnel as tunnel_mod
+    import omnigent.stores.host_store as store_mod
+
+    monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
+    monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    elapsed = 0.0
+    monkeypatch.setattr(tunnel_mod, "monotonic", lambda: elapsed)
+    token_ttl_s = 600
+    launcher = FakeSandboxLauncher()
+    monkeypatch.setattr(launcher, "provider", launcher_provider)
+
+    def launcher_factory() -> FakeSandboxLauncher:
+        if launcher_provider is None:
+            raise HTTPException(status_code=400, detail="provider unavailable")
+        if launcher_provider == "broken":
+            raise ValueError("invalid launcher configuration")
+        return launcher
+
+    server_url = "https://managed-test.example.com"
+    if provider is None:
+        deployment = ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url=server_url,
+                launcher_factory=launcher_factory,
+                token_ttl_s=token_ttl_s,
+            )
+        )
+    else:
+        providers: list[dict[str, object]] = [{"provider": "daytona"}]
+        if provider == "modal":
+            providers.append({"provider": "modal", "token_ttl_s": token_ttl_s})
+        deployment = parse_sandbox_config(
+            {"server_url": server_url, "token_ttl_s": 1200, "providers": providers}
+        )
+        assert deployment is not None
+    registry, store = HostRegistry(), HostStore(db_uri)
+    app = FastAPI()
+    app.include_router(
+        create_host_tunnel_router(registry, store, sandbox_config=deployment), prefix="/v1"
+    )
+    token = "long-lived-sandbox-token"
+    should_renew = provider == "modal" or (provider is None and launcher_provider == "modal")
+    _register_managed(store, host_id=_HOST_ID, token=token)
+    communicator = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await communicator.send_input({"type": "websocket.connect"})
+    assert (await communicator.receive_output(timeout=budget(1.0)))["type"] == "websocket.accept"
+    await _send_hello_and_wait(communicator, registry)
+    try:
+        # Advance past every expiry the initial connection could have issued.
+        renewed_at = now_epoch() + 7 * 24 * 3600
+        elapsed += 7 * 24 * 3600
+        monkeypatch.setattr(store_mod, "now_epoch", lambda: renewed_at)
+        monkeypatch.setattr(tunnel_mod, "now_epoch", lambda: renewed_at)
+        await _wait_updated_at_at_least(store, _HOST_ID, renewed_at)
+        if should_renew:
+            await poll_until_async(
+                lambda: store.resolve_launch_token(_HOST_ID, token) is not None,
+                timeout_s=budget(1.0),
+            )
+        assert (store.resolve_launch_token(_HOST_ID, token) is not None) == should_renew
+        with Session(get_or_create_engine(db_uri)) as session:
+            row = session.execute(select(SqlHost).where(SqlHost.host_id == _HOST_ID)).scalar_one()
+            assert row.token_expires_at is not None
+            if should_renew:
+                assert row.token_expires_at == renewed_at + token_ttl_s
+            else:
+                assert row.token_expires_at < renewed_at
+    finally:
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+        await communicator.wait(timeout=budget(2.0))
+
+    reconnected = ApplicationCommunicator(app, _managed_scope(_TUNNEL_PATH, token))
+    await reconnected.send_input({"type": "websocket.connect"})
+    response = await reconnected.receive_output(timeout=budget(1.0))
+    if not should_renew:
+        assert response["type"] == "websocket.close"
+        assert response["code"] == 4004
+        await reconnected.wait(timeout=budget(2.0))
+        return
+    assert response["type"] == "websocket.accept"
+    try:
+        await _send_hello_and_wait(reconnected, registry)
+        assert store.is_online(_HOST_ID)
+    finally:
+        await reconnected.send_input({"type": "websocket.disconnect", "code": 1000})
+        await reconnected.wait(timeout=budget(2.0))
 
 
 async def test_managed_token_is_revalidated_after_websocket_accept(

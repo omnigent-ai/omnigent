@@ -1,3 +1,4 @@
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -13,7 +14,13 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  FileEditRequest,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -387,6 +394,8 @@ export interface TextDone {
   hasCodeBlocks: boolean;
   /** True when this persisted assistant text came from an interrupted turn. */
   interrupted?: boolean;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
   /** UI-only marker for a provisional native preview with missing live output. */
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */
@@ -467,6 +476,8 @@ export interface ErrorBlock {
    * native terminal, whose mirrored message carries no stable id.
    */
   unansweredSend?: { stableId: string; text?: string };
+  /** A client-only card for a failure carried only by a `failed` session status. */
+  fromSessionStatus?: true;
 }
 
 /**
@@ -680,6 +691,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,

@@ -66,8 +66,8 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_list",
         "sys_session_get_info",
         "sys_session_rename",
-        # Peer messaging is advertised for every agent; the server
-        # enforces the orchestration flag and source authorization.
+        # Peer messaging is advertised unless the runner disables
+        # peer_session_messaging; the server enforces its own flags.
         "sys_session_message",
         "ui_open_file",
         # Read-only agent discovery tools are likewise always available
@@ -126,11 +126,25 @@ def _non_lifecycle_schemas(
     ]
 
 
-@pytest.mark.parametrize("tool_name", ["sys_session_rename", "sys_session_message"])
-def test_session_tools_are_registered_for_every_agent(tool_name: str) -> None:
-    names = {schema["function"]["name"] for schema in ToolManager(_make_spec()).get_tool_schemas()}
+@pytest.mark.parametrize("peer_messaging", [True, False])
+@pytest.mark.parametrize("spawn", [True, False])
+def test_session_tools_are_registered_for_every_agent(
+    monkeypatch: pytest.MonkeyPatch, peer_messaging: bool, spawn: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_FEATURES", "" if peer_messaging else "-peer_session_messaging")
+    spec = _make_spec()
+    spec.spawn = spawn
+    names = {schema["function"]["name"] for schema in ToolManager(spec).get_tool_schemas()}
 
-    assert tool_name in names
+    assert ("sys_session_message" in names) is peer_messaging
+    assert {
+        "sys_session_rename",
+        "sys_session_list",
+        "sys_session_get_info",
+        "sys_session_get_history",
+    } <= names
+    assert ("sys_session_send" in names) is spawn
+    assert ("sys_session_close" in names) is spawn
 
 
 @pytest.fixture()
@@ -1263,9 +1277,19 @@ def test_local_tools_skipped_without_workdir(
 # ── web_search builtin: Databricks model does not emit web_search_preview ───
 
 
-def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> None:
+@pytest.mark.parametrize(
+    "model",
+    [
+        "databricks-gpt-5-4",
+        "system.ai.gpt-5-4",
+        "system.ai.glm-5-2",
+        "system.ai.kimi-k2-6",
+    ],
+)
+def test_web_search_does_not_emit_web_search_preview_for_databricks_model(model: str) -> None:
     """
-    When the agent's model is a ``databricks-*`` model, the ``web_search``
+    When the agent's model is a Databricks model (legacy ``databricks-*``
+    endpoint or Unity Catalog ``system.ai.*`` service), the ``web_search``
     builtin must NOT emit ``{"type": "web_search_preview"}`` in its schema.
     Databricks rejects that tool type at the API level with HTTP 400, killing
     the request before the agent runs.
@@ -1274,9 +1298,15 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
     ``ToolManager._create_web_search`` was removed or the prefix changed.
     The wrong schema would be ``{"type": "web_search_preview"}``.
     """
+    from omnigent.spec.types import ExecutorSpec
+
     spec = AgentSpec(
         spec_version=1,
-        llm=LLMConfig(model="databricks-gpt-5-4"),
+        llm=LLMConfig(model=model),
+        # An ``omnigent`` executor infers ``openai-agents`` from GPT/GLM/Kimi
+        # ids, so this exercises the passthrough guard rather than the
+        # no-model default.
+        executor=ExecutorSpec(type="omnigent", model=model),
         tools=ToolsConfig(builtins=[BuiltinToolConfig(name="web_search")]),
     )
     mgr = ToolManager(spec)
@@ -1286,7 +1316,7 @@ def test_web_search_does_not_emit_web_search_preview_for_databricks_model() -> N
     schema = tool.get_schema()
     assert schema.get("type") != "web_search_preview", (
         f'web_search emitted {{"type": "web_search_preview"}} for '
-        f"databricks-gpt-5-4 — Databricks does not support this tool type "
+        f"{model} — Databricks does not support this tool type "
         f"and rejects the request with HTTP 400. Got schema: {schema!r}"
     )
 

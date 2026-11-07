@@ -15,51 +15,55 @@
 //
 // Data comes from the runner's read-only PR resource API (see
 // hooks/usePullRequests.ts), which shells out to the provider CLI + `git`.
+// While the runner and host are offline, the server's stored PRs
+// (hooks/useSessionPullRequests.ts) keep the list and the selected PR's last
+// summary.
 // `derivePullRequestPanelState` is the single switch that turns the info query
 // into what the panel shows: an outdated host, a non-git workspace, an
 // unsupported remote, a missing provider CLI, an unresolved upstream repo, or no
 // PR each render their own empty state, and an associated PR falls through to
 // the header + stacked diff.
 
+import { createPortal } from "react-dom";
+import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
+import { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { skipToken, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ChevronDownIcon,
-  ChevronRightIcon,
-  ChevronsDownUpIcon,
-  ChevronsUpDownIcon,
+  ArrowLeftIcon,
+  CopyIcon,
+  EllipsisIcon,
   AlertCircleIcon,
   BanIcon,
   CircleCheckIcon,
   CircleDotIcon,
   CircleMinusIcon,
   CircleXIcon,
-  Columns2Icon,
   DownloadIcon,
   ExternalLinkIcon,
-  FileDiffIcon,
-  FileMinusIcon,
-  FilePlusIcon,
-  FileSymlinkIcon,
-  FolderIcon,
   GitBranchIcon,
+  GitCommitHorizontalIcon,
   GitPullRequestIcon,
   KeyRoundIcon,
   Loader2Icon,
   type LucideIcon,
-  PanelLeftCloseIcon,
-  PanelLeftOpenIcon,
   PlusIcon,
   RefreshCwIcon,
-  Rows2Icon,
   ServerOffIcon,
   TerminalIcon,
   Trash2Icon,
 } from "lucide-react";
-import { FileDiff } from "@pierre/diffs/react";
-import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
+import { toast } from "sonner";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -75,17 +79,26 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
-import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
-import { useResizableColumn } from "@/hooks/useResizableColumn";
-import { RunnerOfflineError, useWorkspaceAsleep } from "@/hooks/useWorkspaceChangedFiles";
-import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
+import {
+  RunnerOfflineError,
+  useWorkspaceAsleep,
+  useWorkspaceServeable,
+} from "@/hooks/useWorkspaceChangedFiles";
+import { useSandboxStarting } from "@/hooks/useSessionReconnect";
+import {
+  sessionPullRequestsKey,
+  type StoredPullRequests,
+  storedListToShow,
+  storesSessionPullRequests,
+  useSessionPullRequests,
+  useUnlinkSessionPr,
+} from "@/hooks/useSessionPullRequests";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
-  fetchPullRequestFileContents,
   normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
@@ -94,11 +107,11 @@ import {
   useUpdateSessionPr,
   type NormalizedPullRequestInfo,
   type PullRequestAssociation,
-  type PullRequestChangedFile,
   type PullRequestCheckRun,
   type PullRequestChecks,
   type PullRequestComment,
   type PullRequestInfo,
+  type PullRequestTimelineEvent,
 } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_MARKDOWN_COMPONENTS,
@@ -106,21 +119,12 @@ import {
   PullRequestTitle,
 } from "./PullRequestDetails";
 import { PullRequestLabels } from "./PullRequestLabels";
-import { PullRequestMerge } from "./PullRequestMerge";
+import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
+import { PanelMessage, PullRequestChangesTab } from "./PullRequestChangesTab";
+import { IconButton } from "./PullRequestFileSection";
 
-// Shiki bundled themes matching the app's editor look; the concrete side is
-// chosen by `themeType` from the app's resolved light/dark mode.
-const DIFF_THEME = { dark: "github-dark", light: "github-light" } as const;
-
-/** Centered muted message filling the panel — the shared loading/transient shell. */
-function PanelMessage({ children }: { children: React.ReactNode }) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-2 p-6 text-center text-ui text-muted-foreground">
-      {children}
-    </div>
-  );
-}
+export { LARGE_DIFF_THRESHOLD } from "./PullRequestFileSection";
 
 /** Full-panel empty state: an icon, a title, optional hint and note lines, and
  *  optional children below (the account/remote selectors). Used for every "no PR
@@ -150,15 +154,12 @@ function PullRequestEmptyState({
   );
 }
 
-/** The provider icon with the panel title, or icon-only (provider named for screen
- *  readers) where the PR picker needs the room. */
-function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
-  const Icon = copy.Icon;
+/** The panel's heading, hidden from sight (not from screen readers) where the PR
+ *  list and its controls need the room. The provider stays out of it: it belongs to
+ *  each request, so {@link PullRequestProviderIcon} carries it beside the title. */
+function PanelTitle({ showTitle = false }: { showTitle?: boolean }) {
   return (
-    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
-      <Icon size={14} className="shrink-0" aria-hidden />
-      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
-    </h2>
+    <h2 className={cn("shrink-0 font-medium text-ui", !showTitle && "sr-only")}>Pull Requests</h2>
   );
 }
 
@@ -292,60 +293,41 @@ export function derivePullRequestPanelState(info: {
   return { kind: "ready" };
 }
 
-/** A ghost icon button with a tooltip; the toolbar's shared control element.
- *  No-delay is set by the surrounding TooltipProvider. */
-function IconButton({
-  label,
-  onClick,
-  disabled,
-  className,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  className?: string;
-  children: React.ReactNode;
-}) {
+/** The request's provider, shown beside its title: a glyph, named on hover and for
+ *  screen readers. A session rarely spans providers, so it stays this quiet. */
+function PullRequestProviderIcon({ copy }: { copy: GitProviderCopy }) {
+  const Icon = copy.Icon;
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button
-          variant="ghost"
-          size="icon-xs"
-          aria-label={label}
-          onClick={onClick}
-          disabled={disabled}
-          className={cn("shrink-0", className)}
-        >
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
+    <span className="flex shrink-0 items-center text-muted-foreground" title={copy.label}>
+      <Icon size={14} className="shrink-0" aria-hidden />
+      <span className="sr-only">{copy.label}</span>
+    </span>
   );
 }
 
 /** Compact PR state shown beside the title in the shared panel header. */
-function PullRequestStatus({ state }: { state: string }) {
+function PullRequestStatus({ state, isDraft = false }: { state: string; isDraft?: boolean }) {
   const normalized = state.toUpperCase();
   const visual =
-    normalized === "OPEN"
-      ? {
-          label: "Open",
-          className: "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
-        }
-      : normalized === "MERGED"
+    normalized === "OPEN" && isDraft
+      ? { label: "Draft", className: "border-border bg-muted text-muted-foreground" }
+      : normalized === "OPEN"
         ? {
-            label: "Merged",
-            className: "border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-400",
+            label: "Open",
+            className: "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
           }
-        : normalized === "CLOSED"
+        : normalized === "MERGED"
           ? {
-              label: "Closed",
-              className: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
+              label: "Merged",
+              className:
+                "border-purple-500/25 bg-purple-500/10 text-purple-700 dark:text-purple-400",
             }
-          : { label: state, className: "border-border bg-muted text-muted-foreground" };
+          : normalized === "CLOSED"
+            ? {
+                label: "Closed",
+                className: "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
+              }
+            : { label: state, className: "border-border bg-muted text-muted-foreground" };
 
   return (
     <Badge
@@ -354,172 +336,6 @@ function PullRequestStatus({ state }: { state: string }) {
     >
       {visual.label}
     </Badge>
-  );
-}
-
-// GitHub-style status icons (a file glyph carrying the change kind) instead of
-// bare A/M/D/R letters — quicker to recognize at a glance.
-const STATUS_META: Record<
-  PullRequestChangedFile["status"],
-  { label: string; className: string; Icon: LucideIcon }
-> = {
-  created: { label: "Added", className: "text-green-600 dark:text-green-400", Icon: FilePlusIcon },
-  modified: {
-    label: "Modified",
-    className: "text-amber-600 dark:text-amber-400",
-    Icon: FileDiffIcon,
-  },
-  deleted: { label: "Deleted", className: "text-red-600 dark:text-red-400", Icon: FileMinusIcon },
-  renamed: {
-    label: "Renamed",
-    className: "text-blue-600 dark:text-blue-400",
-    Icon: FileSymlinkIcon,
-  },
-};
-
-/** Diffstat (+adds −removes) shared by the sidebar row and the section header. */
-function DiffStat({ file }: { file: PullRequestChangedFile }) {
-  if (file.lines_added === null && file.lines_removed === null) return null;
-  return (
-    <span className="shrink-0 font-mono text-xs tabular-nums">
-      {file.lines_added !== null && (
-        <span className="text-green-600 dark:text-green-400">+{file.lines_added}</span>
-      )}{" "}
-      {file.lines_removed !== null && (
-        <span className="text-red-600 dark:text-red-400">−{file.lines_removed}</span>
-      )}
-    </span>
-  );
-}
-
-/** Split a path into its directory prefix (with trailing slash) and basename. */
-function splitPath(path: string): { dir: string; name: string } {
-  const i = path.lastIndexOf("/");
-  return i === -1
-    ? { dir: "", name: path }
-    : { dir: path.slice(0, i + 1), name: path.slice(i + 1) };
-}
-
-/** How @pierre/diffs' FileDiff is configured for this read-only stacked view. */
-type DiffOptions = React.ComponentProps<typeof FileDiff>["options"];
-
-/**
- * Files with more unified diff lines than this wait for "Show diff": FileDiff
- * tokenizes on the main thread (disableWorkerPool), so a huge file freezes the app.
- */
-export const LARGE_DIFF_THRESHOLD = 2000;
-
-/**
- * One file's section in the stacked diff: a sticky grey header (chevron + status
- * + path + diffstat) and the file's rendered diff. Clicking the header toggles
- * the diff open/closed. The diff mounts lazily once the section nears the
- * viewport (a big PR doesn't build every diff at once).
- */
-function PullRequestFileSection({
-  file,
-  fileDiff,
-  options,
-  registerRef,
-  collapsed,
-  onToggleCollapsed,
-}: {
-  file: PullRequestChangedFile;
-  /** Parsed per-file diff from the whole-PR patch; absent for binary/unparsed. */
-  fileDiff: FileDiffMetadata | undefined;
-  options: DiffOptions;
-  registerRef: (path: string, el: HTMLElement | null) => void;
-  /** Whether this file's diff is hidden. Lifted so the toolbar can drive all. */
-  collapsed: boolean;
-  onToggleCollapsed: () => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const [seen, setSeen] = useState(false);
-  const [showLargeDiff, setShowLargeDiff] = useState(false);
-
-  useEffect(() => {
-    registerRef(file.path, ref.current);
-    return () => registerRef(file.path, null);
-  }, [file.path, registerRef]);
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || seen) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting)) setSeen(true);
-      },
-      { rootMargin: "400px 0px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [seen]);
-
-  const meta = STATUS_META[file.status];
-  const StatusIcon = meta.Icon;
-  const { dir, name } = splitPath(file.path);
-  const ToggleIcon = collapsed ? ChevronRightIcon : ChevronDownIcon;
-  // A rename carries its old path in the parsed patch; a pure rename (100%
-  // similarity) has no hunks, so show a note instead of an empty diff.
-  const renamedFrom =
-    fileDiff?.prevName && fileDiff.prevName !== file.path ? fileDiff.prevName : null;
-  const pureRename = fileDiff?.type === "rename-pure";
-
-  return (
-    <div ref={ref} data-github-file={file.path}>
-      <button
-        type="button"
-        onClick={onToggleCollapsed}
-        aria-expanded={!collapsed}
-        title={renamedFrom ? `${renamedFrom} → ${file.path}` : file.path}
-        className="group sticky top-0 z-10 flex w-full cursor-pointer items-center gap-2 border-b border-border bg-secondary px-3 py-1.5 text-left dark:bg-muted"
-      >
-        <ToggleIcon
-          aria-hidden="true"
-          className="size-3.5 shrink-0 text-muted-foreground transition-colors group-hover:text-foreground"
-        />
-        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
-        <span className="min-w-0 flex-1 truncate text-ui">
-          {renamedFrom ? (
-            <>
-              <span className="text-muted-foreground">{renamedFrom}</span>
-              <span className="text-muted-foreground"> → </span>
-              <span className="font-medium">{file.path}</span>
-            </>
-          ) : (
-            <>
-              {dir && <span className="text-muted-foreground">{dir}</span>}
-              <span className="font-medium">{name}</span>
-            </>
-          )}
-        </span>
-        <DiffStat file={file} />
-      </button>
-      {collapsed ? null : pureRename ? (
-        <div className="p-4 text-ui text-muted-foreground">File renamed without changes.</div>
-      ) : !seen ? (
-        <div className="flex items-center justify-center gap-2 p-6 text-ui text-muted-foreground">
-          <Loader2Icon className="size-4 animate-spin" />
-          Loading diff…
-        </div>
-      ) : fileDiff && fileDiff.unifiedLineCount > LARGE_DIFF_THRESHOLD && !showLargeDiff ? (
-        <div className="flex items-center gap-3 p-4 text-ui text-muted-foreground">
-          Large diff — {fileDiff.unifiedLineCount.toLocaleString()} lines
-          <button
-            type="button"
-            className="text-foreground underline-offset-2 hover:underline"
-            onClick={() => setShowLargeDiff(true)}
-          >
-            Show diff
-          </button>
-        </div>
-      ) : fileDiff ? (
-        <FileDiff fileDiff={fileDiff} options={options} disableWorkerPool />
-      ) : (
-        <div className="p-4 text-ui text-muted-foreground">
-          No text diff available for this file.
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -549,7 +365,9 @@ function CheckPill({
   runs,
   icon,
   className,
+  compact = false,
 }: {
+  compact?: boolean;
   label: string;
   count: number;
   /** All checks; filtered to this pill's bucket for the hover list. */
@@ -566,13 +384,14 @@ function CheckPill({
       <HoverCardTrigger asChild>
         <button
           type="button"
+          aria-label={`${count} ${label}`}
           className={cn(
             "inline-flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 py-px text-xs tabular-nums",
             className,
           )}
         >
           {icon}
-          {count} {label}
+          {count} {!compact && label}
         </button>
       </HoverCardTrigger>
       <HoverCardContent
@@ -676,7 +495,7 @@ function PullRequestCommentCard({
   const ts = comment.created_at ? Date.parse(comment.created_at) : NaN;
   const rel = relativeTime(ts);
   return (
-    <li className="rounded-lg border border-border bg-muted/20 p-3">
+    <li className="pull-request-comment-surface rounded-lg border border-border p-3">
       <div className="mb-1.5 flex items-center gap-2 text-xs">
         <PullRequestAuthorAvatar author={comment.author} hue={authorHue} />
         <span className="min-w-0 truncate font-medium text-foreground">
@@ -705,6 +524,114 @@ function PullRequestCommentCard({
         </MessageResponse>
       </div>
     </li>
+  );
+}
+
+function PullRequestTimelineRow({
+  event,
+  providerLabel,
+}: {
+  event: PullRequestTimelineEvent;
+  providerLabel: string;
+}) {
+  const timestamp = event.created_at ? Date.parse(event.created_at) : NaN;
+  const time = relativeTime(timestamp);
+  const forcePush = event.kind === "force_push";
+  const Icon = forcePush ? GitBranchIcon : GitCommitHorizontalIcon;
+  const url = event.url && parseHttpUrl(event.url);
+  return (
+    <li className="flex gap-2 px-3 py-2 text-xs text-muted-foreground">
+      <Icon aria-hidden className="mt-0.5 size-4 shrink-0" />
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-baseline gap-x-1">
+          <span className="font-medium text-foreground">{event.author ?? "unknown"}</span>
+          <span>{forcePush ? "force-pushed" : "committed"}</span>
+          {forcePush && event.previous_sha && (
+            <span>
+              from <code title={event.previous_sha}>{event.previous_sha.slice(0, 7)}</code>
+            </span>
+          )}
+          {forcePush && <span>{event.sha ? "to" : "the branch"}</span>}
+          {url ? (
+            <a
+              href={url.href}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open commit ${event.sha?.slice(0, 7) ?? ""} on ${providerLabel}`}
+              className="font-mono text-foreground hover:underline"
+              title={event.sha ?? undefined}
+            >
+              {event.sha?.slice(0, 7) ?? "View event"}
+            </a>
+          ) : (
+            event.sha && <code title={event.sha}>{event.sha.slice(0, 7)}</code>
+          )}
+          {time && (
+            <time dateTime={event.created_at!} title={absoluteTime(timestamp)} className="ml-auto">
+              {time}
+            </time>
+          )}
+        </div>
+        {event.message && (
+          <p className="mt-1 truncate" title={event.message}>
+            {event.message}
+          </p>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function PullRequestCheckCounts({
+  checks,
+  compact = false,
+}: {
+  checks: PullRequestChecks;
+  compact?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <CheckPill
+        compact={compact}
+        label="passed"
+        count={checks.passing}
+        runs={checks.runs.filter((r) => r.bucket === "passing")}
+        icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+        className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="pending"
+        count={checks.pending}
+        runs={checks.runs.filter((r) => r.bucket === "pending")}
+        icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+        className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="failed"
+        count={checks.failing}
+        runs={checks.runs.filter((r) => r.bucket === "failing")}
+        icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+        className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="cancelled"
+        count={compact ? 0 : (checks.cancelled ?? 0)}
+        runs={checks.runs.filter((r) => r.bucket === "cancelled")}
+        icon={<BanIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+      <CheckPill
+        compact={compact}
+        label="skipped"
+        count={compact ? 0 : (checks.skipped ?? 0)}
+        runs={checks.runs.filter((r) => r.bucket === "skipped")}
+        icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+    </div>
   );
 }
 
@@ -761,43 +688,7 @@ function PullRequestSummaryTab({
                   </p>
                 )
               )}
-              <div className="flex flex-wrap items-center gap-1.5">
-                <CheckPill
-                  label="passed"
-                  count={checks.passing}
-                  runs={checks.runs.filter((r) => r.bucket === "passing")}
-                  icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-                  className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-                />
-                <CheckPill
-                  label="pending"
-                  count={checks.pending}
-                  runs={checks.runs.filter((r) => r.bucket === "pending")}
-                  icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                  className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                />
-                <CheckPill
-                  label="failed"
-                  count={checks.failing}
-                  runs={checks.runs.filter((r) => r.bucket === "failing")}
-                  icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                  className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                />
-                <CheckPill
-                  label="cancelled"
-                  count={checks.cancelled ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "cancelled")}
-                  icon={<BanIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-                <CheckPill
-                  label="skipped"
-                  count={checks.skipped ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "skipped")}
-                  icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-              </div>
+              <PullRequestCheckCounts checks={checks} />
             </section>
           )}
           {merge}
@@ -811,21 +702,53 @@ function PullRequestSummaryTab({
   );
 }
 
-/** The Comments tab body: the PR's conversation comments in order. A partial
- *  list keeps what loaded and says the rest is missing rather than empty. */
+/** Comments and commit activity share a chronological feed. */
 function PullRequestCommentsTab({
   comments,
   commentsPartial,
+  events,
+  timelinePartial,
+  prUrl,
   providerLabel,
   hasComposer,
 }: {
   comments: PullRequestComment[];
   hasComposer: boolean;
   commentsPartial?: boolean;
+  events?: PullRequestTimelineEvent[];
+  timelinePartial?: boolean;
+  prUrl: string;
   providerLabel: string;
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
+  const prHref = parseHttpUrl(prUrl)?.href;
+  const entries = [
+    ...comments.map((comment, index) => ({
+      created_at: comment.created_at,
+      element: (
+        <PullRequestCommentCard
+          key={commentKeys[index]}
+          comment={comment}
+          providerLabel={providerLabel}
+          authorHue={authorHues.get(comment.author?.toLowerCase() ?? "")}
+        />
+      ),
+    })),
+    ...(events ?? []).map((event) => ({
+      created_at: event.created_at,
+      element: (
+        <PullRequestTimelineRow key={event.id} event={event} providerLabel={providerLabel} />
+      ),
+    })),
+  ];
+  if (events?.length) {
+    const timestamp = (value: string | null) => {
+      const parsed = Date.parse(value ?? "");
+      return Number.isFinite(parsed) ? parsed : Infinity;
+    };
+    entries.sort((left, right) => timestamp(left.created_at) - timestamp(right.created_at));
+  }
   return (
     <div className={cn("space-y-2 p-3", !hasComposer && "pb-16")}>
       {commentsPartial && (
@@ -833,177 +756,23 @@ function PullRequestCommentsTab({
           Some comments are unavailable.
         </p>
       )}
-      {comments.length === 0 ? (
-        !commentsPartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
+      {timelinePartial && (
+        <p role="status" className="text-ui text-muted-foreground">
+          Some commit and push history is unavailable.{" "}
+          {prHref && (
+            <a href={prHref} target="_blank" rel="noreferrer" className="underline">
+              View on {providerLabel}
+            </a>
+          )}
+        </p>
+      )}
+      {entries.length === 0 ? (
+        !commentsPartial &&
+        !timelinePartial && <p className="text-ui text-muted-foreground">No comments yet.</p>
       ) : (
-        <ul className="space-y-2">
-          {comments.map((c, i) => (
-            <PullRequestCommentCard
-              key={commentKeys[i]}
-              comment={c}
-              providerLabel={providerLabel}
-              authorHue={authorHues.get(c.author?.toLowerCase() ?? "")}
-            />
-          ))}
-        </ul>
+        <ul className="space-y-2">{entries.map((entry) => entry.element)}</ul>
       )}
     </div>
-  );
-}
-
-// ── Sidebar file tree ────────────────────────────────────────────────────
-// The changed files group into a folder tree. A single-child directory chain
-// collapses into one row (VS Code "compact folders"): a lone change under
-// omnigent/runner/x.py shows an "omnigent/runner" row, not two nested folders.
-// Files are leaves that jump the diff scroll to their section; folders toggle.
-
-interface TreeFileNode {
-  type: "file";
-  name: string;
-  file: PullRequestChangedFile;
-}
-interface TreeDirNode {
-  type: "dir";
-  /** Display name, possibly a compacted chain like "a/b/c". */
-  name: string;
-  /** Full path of the deepest folder in the chain — the collapse key. */
-  path: string;
-  children: SidebarTree[];
-}
-type SidebarTree = TreeFileNode | TreeDirNode;
-
-/** Directories before files, each group kept in first-encounter order. */
-function dirsFirst(nodes: SidebarTree[]): SidebarTree[] {
-  return [...nodes.filter((n) => n.type === "dir"), ...nodes.filter((n) => n.type === "file")];
-}
-
-/** Fold single-dir-child chains into one node (children are compacted first,
- *  so one merge per level suffices). */
-function compactNode(node: SidebarTree): SidebarTree {
-  if (node.type === "file") return node;
-  const children = node.children.map(compactNode);
-  if (children.length === 1 && children[0].type === "dir") {
-    const only = children[0];
-    return {
-      type: "dir",
-      name: `${node.name}/${only.name}`,
-      path: only.path,
-      children: only.children,
-    };
-  }
-  return { type: "dir", name: node.name, path: node.path, children: dirsFirst(children) };
-}
-
-/** Build the compacted folder tree for the changed-files sidebar. */
-function buildSidebarTree(files: PullRequestChangedFile[]): SidebarTree[] {
-  const root: TreeDirNode = { type: "dir", name: "", path: "", children: [] };
-  for (const file of files) {
-    const parts = file.path.split("/");
-    let node = root;
-    for (let i = 0; i < parts.length - 1; i++) {
-      const part = parts[i];
-      let dir = node.children.find((c): c is TreeDirNode => c.type === "dir" && c.name === part);
-      if (!dir) {
-        dir = { type: "dir", name: part, path: parts.slice(0, i + 1).join("/"), children: [] };
-        node.children.push(dir);
-      }
-      node = dir;
-    }
-    node.children.push({ type: "file", name: parts[parts.length - 1], file });
-  }
-  return dirsFirst(root.children.map(compactNode));
-}
-
-// VS Code–style tree indentation, tuned for the narrow sidebar.
-const TREE_INDENT_STEP = 10;
-const TREE_BASE_PAD = 8;
-const treeIndent = (depth: number) => depth * TREE_INDENT_STEP + TREE_BASE_PAD;
-
-/**
- * One node in the sidebar file tree — a collapsible folder or a file leaf.
- * Names truncate on the LEFT (rtl) so the end of the path — the most specific
- * part — stays visible; the name isn't `flex-1`, so short names still sit
- * beside their icon rather than drifting right.
- */
-function SidebarNode({
-  node,
-  depth,
-  activePath,
-  onSelectFile,
-  collapsedDirs,
-  onToggleDir,
-}: {
-  node: SidebarTree;
-  depth: number;
-  activePath: string | null;
-  onSelectFile: (path: string) => void;
-  collapsedDirs: ReadonlySet<string>;
-  onToggleDir: (path: string) => void;
-}) {
-  if (node.type === "file") {
-    const meta = STATUS_META[node.file.status];
-    const StatusIcon = meta.Icon;
-    return (
-      <button
-        type="button"
-        onClick={() => onSelectFile(node.file.path)}
-        title={node.file.path}
-        style={{ paddingLeft: `${treeIndent(depth)}px` }}
-        className={cn(
-          "flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60",
-          node.file.path === activePath && "bg-muted",
-        )}
-      >
-        {/* Empty chevron column so the status icon lines up under a sibling
-            folder's icon. */}
-        <span className="size-3.5 shrink-0" aria-hidden />
-        <StatusIcon aria-hidden className={cn("size-3.5 shrink-0", meta.className)} />
-        <span className="min-w-0 truncate [direction:rtl]">
-          <bdi>{node.name}</bdi>
-        </span>
-        <span className="ml-auto flex shrink-0 items-center">
-          <DiffStat file={node.file} />
-        </span>
-      </button>
-    );
-  }
-
-  const open = !collapsedDirs.has(node.path);
-  return (
-    <>
-      <button
-        type="button"
-        onClick={() => onToggleDir(node.path)}
-        aria-expanded={open}
-        title={node.path}
-        style={{ paddingLeft: `${treeIndent(depth)}px` }}
-        className="flex w-full items-center gap-1.5 py-1 pr-2 text-left text-ui hover:bg-muted/60"
-      >
-        <ChevronRightIcon
-          aria-hidden
-          className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
-            open && "rotate-90",
-          )}
-        />
-        <FolderIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 truncate font-medium [direction:rtl]">
-          <bdi>{node.name}</bdi>
-        </span>
-      </button>
-      {open &&
-        node.children.map((child) => (
-          <SidebarNode
-            key={child.type === "file" ? child.file.path : child.path}
-            node={child}
-            depth={depth + 1}
-            activePath={activePath}
-            onSelectFile={onSelectFile}
-            collapsedDirs={collapsedDirs}
-            onToggleDir={onToggleDir}
-          />
-        ))}
-    </>
   );
 }
 
@@ -1017,26 +786,285 @@ function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string |
   return title ? `${identity} — ${title}` : identity;
 }
 
-export function PullRequestPanel({ conversationId }: { conversationId: string }) {
-  const isMobileViewport = useIsMobileViewport();
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [prPickerOpen, setPrPickerOpen] = useState(false);
-  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
-  // Select focuses rows on both pointer hover and keyboard navigation.
-  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
+type Associations = Pick<
+  PullRequestInfo,
+  "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
+>;
+type PullRequestSubtab = "summary" | "comments" | "changes";
+
+function PullRequestListRow({
+  conversationId,
+  active,
+  association,
+  onSelect,
+  onUnlink,
+  unlinkPending,
+  hostOffline,
+  sandboxAsleep,
+}: {
+  conversationId: string;
+  active: boolean;
+  association: PullRequestAssociation;
+  onSelect: () => void;
+  onUnlink?: () => void;
+  unlinkPending: boolean;
+  hostOffline: boolean;
+  sandboxAsleep: boolean;
+}) {
+  const sandboxStarting = useSandboxStarting(conversationId);
+  const info = usePullRequestInfo(conversationId, {
+    poll: active ? "list" : false,
+    prUrl: association.url,
+  });
+  const canEdit = useCanEdit(conversationId);
+  const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
+  const offline = hostOffline || info.error instanceof RunnerOfflineError;
+  const cachedPr = data?.pr?.url === association.url ? data.pr : undefined;
+  const pr = !offline ? cachedPr : undefined;
+  const summary = pr ?? association;
+  const checks = pr?.checks;
+  const mergeState = pr ? mergeButtonState(pr) : undefined;
+  const ready =
+    canEdit &&
+    !info.error &&
+    data?.capabilities.merging &&
+    pr?.state === "OPEN" &&
+    !pr.is_draft &&
+    mergeState?.kind === "ready";
+  const checksUnavailable = checks?.partial || pr?.checks_supported === false;
+  const checkStatus = (
+    <>
+      {checks && <PullRequestCheckCounts checks={checks} compact />}
+      {checksUnavailable && <span title="Some checks could not be loaded">Incomplete checks</span>}
+    </>
+  );
+  const title = (pr?.title ?? association.title)?.trim();
+  const identity = pullRequestLabel({ ...association, title: null });
+  const label = title ? `${identity} — ${title}` : identity;
+  const providerCopy = gitProviderCopy(
+    association.provider,
+    undefined,
+    association.provider_display,
+  );
+  const href = /^https:\/\//.test(association.url)
+    ? parseHttpUrl(association.url)?.href
+    : undefined;
+  return (
+    <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
+      <button
+        type="button"
+        onClick={onSelect}
+        title={label}
+        aria-label={label}
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
+      >
+        <GitPullRequestIcon
+          aria-hidden
+          className={cn(
+            "size-4 shrink-0",
+            !summary.state || summary.is_draft
+              ? "text-muted-foreground"
+              : summary.state === "OPEN"
+                ? "text-green-600"
+                : summary.state === "MERGED"
+                  ? "text-purple-500"
+                  : "text-red-500",
+          )}
+        />
+        <span className="truncate">
+          <span className="text-muted-foreground">{identity}</span>
+          {title && (
+            <>
+              {" "}
+              · <span className="font-medium">{title}</span>
+            </>
+          )}
+        </span>
+      </button>
+      <div className="flex max-w-[45%] shrink-0 flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
+        {offline ? (
+          <>
+            {association.state && (
+              <PullRequestStatus
+                state={association.state}
+                isDraft={association.is_draft === true}
+              />
+            )}
+            <TooltipProvider>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <span tabIndex={0} role="status" className="inline-flex items-center gap-1">
+                    <ServerOffIcon aria-hidden className="size-3" />
+                    {sandboxAsleep
+                      ? sandboxStarting
+                        ? "Sandbox starting"
+                        : "Sandbox asleep"
+                      : "Host offline"}
+                  </span>
+                </TooltipTrigger>
+                <TooltipContent className="max-w-xs">
+                  {storedPullRequestHint(association, sandboxAsleep, sandboxStarting)}
+                </TooltipContent>
+              </Tooltip>
+            </TooltipProvider>
+          </>
+        ) : ready && pr ? (
+          (checksUnavailable || !!checks?.failing || !!checks?.pending) && checkStatus
+        ) : info.error ? (
+          <span title={String(info.error)}>Status unavailable</span>
+        ) : !pr ? (
+          <span>{info.isLoading ? "Loading…" : "Status unavailable"}</span>
+        ) : pr.state !== "OPEN" ? (
+          <PullRequestStatus state={pr.state} />
+        ) : (
+          <>
+            {pr.is_draft && <span>Draft</span>}
+            {checkStatus}
+            {!checksUnavailable && checks?.total === 0 && !pr.is_draft && (
+              <span title={mergeState && "hint" in mergeState ? mergeState.hint : undefined}>
+                No checks
+              </span>
+            )}
+          </>
+        )}
+        {cachedPr && (
+          <PullRequestMerge
+            compact
+            showTrigger={!!ready}
+            unavailable={offline || !!info.error || !canEdit || !data?.capabilities.merging}
+            conversationId={conversationId}
+            prUrl={association.url}
+            pr={cachedPr}
+          />
+        )}
+      </div>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Actions for ${identity}`}
+            className="shrink-0"
+          >
+            <EllipsisIcon aria-hidden className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canEdit && onUnlink && (
+            <>
+              <DropdownMenuItem disabled={unlinkPending} onSelect={onUnlink}>
+                <Trash2Icon aria-hidden /> Unlink PR
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          {href && (
+            <DropdownMenuItem asChild>
+              <a href={href} target="_blank" rel="noreferrer">
+                <ExternalLinkIcon aria-hidden /> Open in {providerCopy.label}
+              </a>
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            onSelect={() => {
+              void copyText(association.url).then(
+                () => toast.success("PR link copied"),
+                () => toast.error("Couldn’t copy PR link"),
+              );
+            }}
+          >
+            <CopyIcon aria-hidden /> Copy PR link
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </li>
+  );
+}
+
+interface PullRequestPanelView {
+  selected?: string;
+  showingDetails: boolean;
+  subtab: PullRequestSubtab;
+}
+
+const DEFAULT_PANEL_VIEW: PullRequestPanelView = { showingDetails: false, subtab: "summary" };
+
+export function PullRequestPanel({
+  conversationId,
+  active = true,
+}: {
+  conversationId: string;
+  /** False while the panel is mounted but hidden (collapsed rail); pauses the poll. */
+  active?: boolean;
+}) {
+  const mobileHeaderTarget = useMobilePanelHeaderTarget();
+  const inMobileDrawer = mobileHeaderTarget !== undefined;
+  const queryClient = useQueryClient();
+  const viewKey = ["pull-request-panel-view", conversationId];
+  const { data: cachedView = DEFAULT_PANEL_VIEW } = useQuery<PullRequestPanelView>({
+    queryKey: viewKey,
+    queryFn: skipToken,
+    initialData: DEFAULT_PANEL_VIEW,
+    gcTime: 30 * 60_000,
+  });
+  // Keep interactions synchronous; the shared entry restores the view on navigation.
+  const [localView, setLocalView] = useState({ conversationId, view: cachedView });
+  if (localView.conversationId !== conversationId) {
+    setLocalView({ conversationId, view: cachedView });
+  }
+  const view = localView.conversationId === conversationId ? localView.view : cachedView;
+  const selected = view.selected;
+  const showingDetails = view.showingDetails;
+  const activeTab = view.subtab;
+  const updateView = useCallback(
+    (update: Partial<typeof view>) => {
+      const next = queryClient.setQueryData<typeof view>(
+        ["pull-request-panel-view", conversationId],
+        (current) => ({
+          showingDetails: false,
+          subtab: "summary",
+          ...current,
+          ...update,
+        }),
+      );
+      setLocalView({ conversationId, view: next! });
+    },
+    [queryClient, conversationId],
+  );
+  const changeSelection = useCallback(
+    (next?: string) => updateView({ selected: next, subtab: "summary" }),
+    [updateView],
+  );
+  const setActiveTab = (value: PullRequestSubtab) => updateView({ subtab: value });
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
-  const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
-  const queryClient = useQueryClient();
+  const info = usePullRequestInfo(conversationId, {
+    poll: active ? (selected && !showingDetails ? "list" : true) : false,
+    prUrl: selected,
+  });
+  const showPullRequestList = () => {
+    updateView({ showingDetails: false, subtab: "summary" });
+  };
+  // Re-enabling the poll only restarts its timer; refresh stale info as the rail reopens.
+  const wasActive = useRef(active);
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      void queryClient.refetchQueries({ queryKey: ["github-info", conversationId], stale: true });
+    }
+    wasActive.current = active;
+  }, [active, conversationId, queryClient]);
   const [refreshing, setRefreshing] = useState(false);
   const refresh = async () => {
     setRefreshing(true);
     try {
       await Promise.all(
-        ["github-info", "github-changed-files", "github-pr-diff"].map((key) =>
-          queryClient.invalidateQueries({ queryKey: [key, conversationId] }),
-        ),
+        [
+          "github-info",
+          "github-review-threads",
+          "github-changed-files",
+          "github-pr-diff",
+          "session-pull-requests",
+        ].map((key) => queryClient.invalidateQueries({ queryKey: [key, conversationId] })),
       );
     } finally {
       setRefreshing(false);
@@ -1051,12 +1079,19 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       Refresh
     </Button>
   );
+  // Servers that store PRs decide which PRs the session links, so the controls
+  // survive a selection switch and the runner and host being offline. Live info
+  // then only supplies the selected PR's details.
+  const storesPrs = storesSessionPullRequests(useServerInfo());
+  const stored = useSessionPullRequests(conversationId, info.data);
+  const hostOffline = useHostOffline(conversationId, info);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const sandboxStarting = useSandboxStarting(conversationId);
+  // Linking verifies the PR with the host's provider account.
+  const linkNeedsHost = storesPrs && hostOffline;
   const [knownAssociations, setKnownAssociations] = useState<{
     sessionId: string;
-    data: Pick<
-      PullRequestInfo,
-      "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
-    >;
+    data: Associations;
   }>();
   useEffect(() => {
     if (info.data) {
@@ -1068,9 +1103,28 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     }
   }, [conversationId, info.data]);
   // Switching the metadata query must not unmount the session's PR controls.
-  const associations =
+  const live =
     info.data ??
     (knownAssociations?.sessionId === conversationId ? knownAssociations.data : undefined);
+  // A host that doesn't track PRs shows only its branch PR.
+  const linked =
+    storesPrs && (!live || live.tracking_available === true)
+      ? storedListToShow(stored.data, live !== undefined)
+      : undefined;
+  const associations: Associations | undefined =
+    linked === undefined
+      ? live
+      : {
+          prs: linked,
+          tracking_available: live?.tracking_available ?? true,
+          selected_pr_url: linked.some((pr) => pr.url === live?.selected_pr_url)
+            ? live?.selected_pr_url
+            : linked[0]?.url,
+          provider: live?.provider ?? linked[0]?.provider,
+          provider_display: live?.provider_display ?? linked[0]?.provider_display,
+        };
+  // Offline before the server imported the session's PRs: there may be some it can't show.
+  const notSynced = storesPrs && hostOffline && stored.data?.synced === false;
   const panelState = derivePullRequestPanelState(info);
   // No provider is known without a payload, or in a non-git workspace (older hosts omit it).
   const copy = gitProviderCopy(
@@ -1079,15 +1133,31 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     associations?.provider_display,
   );
   const update = useUpdateSessionPr(conversationId);
+  const unlink = useUnlinkSessionPr(conversationId);
   useEffect(() => {
-    if (!selected && info.data?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
+    if (linked !== undefined && selected && !linked.some((pr) => pr.url === selected)) {
+      changeSelection(associations?.selected_pr_url);
+    } else if (!selected && associations?.selected_pr_url) {
+      changeSelection(associations.selected_pr_url);
     }
-  }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  }, [selected, associations?.selected_pr_url, linked, changeSelection]);
   const prs = associations?.prs ?? [];
+  useEffect(() => {
+    if (prs.length === 1) updateView({ showingDetails: true });
+  }, [updateView, prs.length]);
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
-  const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
+  const detailsInfo =
+    linked?.length === 0 && info.data
+      ? { ...info, data: { ...info.data, pr: null, selected_pr_url: undefined } }
+      : info;
+  const linkInEmptyState =
+    prs.length === 0 && derivePullRequestPanelState(detailsInfo).kind === "no-pr";
+  const unlinkPr = (prUrl: string) =>
+    unlink.mutate(prUrl, {
+      onSuccess: (remaining) => {
+        if (prUrl === selected) changeSelection(remaining.prs[0]?.url);
+      },
+    });
   const linkControls = (
     <>
       {linking && (
@@ -1102,10 +1172,22 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           }}
           onSubmit={(event) => {
             event.preventDefault();
+            if (linkNeedsHost) return;
             update.mutate(
               { url, action: "attach" },
               {
-                onSuccess: (data) => {
+                onSuccess: async (data) => {
+                  if (storesPrs && data.prs) {
+                    const key = sessionPullRequestsKey(conversationId);
+                    await queryClient.cancelQueries({ queryKey: key });
+                    queryClient.setQueryData<StoredPullRequests>(key, (previous) => ({
+                      prs: data.prs!.map((pr) => ({
+                        ...previous?.prs.find((storedPr) => storedPr.url === pr.url),
+                        ...pr,
+                      })),
+                      synced: previous?.synced ?? false,
+                    }));
+                  }
                   changeSelection(data.selected_pr_url);
                   setLinking(false);
                   setUrl("");
@@ -1119,12 +1201,13 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
             autoFocus
             type="url"
             required
+            disabled={linkNeedsHost}
             value={url}
             onChange={(event) => setUrl(event.target.value)}
             placeholder={copy.prUrlPlaceholder}
             className="flex-1 focus-visible:ring-0"
           />
-          <Button type="submit" disabled={update.isPending}>
+          <Button type="submit" disabled={update.isPending || linkNeedsHost}>
             Link
           </Button>
           <Button type="button" variant="outline" onClick={() => setLinking(false)}>
@@ -1159,110 +1242,70 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
       </div>
     ) : undefined;
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
+  const headerActions = (
+    <TooltipProvider delayDuration={0}>
+      <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+        {refreshIcon}
+      </IconButton>
+      {showTrackingControls && (
+        <IconButton
+          label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
+          disabled={linkNeedsHost}
+          onClick={() => setLinking(!linking)}
+        >
+          <PlusIcon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+      {showTrackingControls && selectedPr && showingDetails && (
+        <IconButton
+          label="Unlink PR"
+          disabled={unlink.isPending}
+          onClick={() => unlinkPr(selectedPr.url)}
+        >
+          <Trash2Icon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+    </TooltipProvider>
+  );
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {mobileHeaderTarget?.actions && createPortal(headerActions, mobileHeaderTarget.actions)}
+      {mobileHeaderTarget?.title &&
+        showingDetails &&
+        prs.length > 1 &&
+        createPortal(
+          <div data-mobile-panel-title>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="-ml-2"
+              aria-label={`All pull requests (${prs.length})`}
+              onClick={showPullRequestList}
+            >
+              <ArrowLeftIcon className="size-3.5" /> All pull requests
+            </Button>
+          </div>,
+          mobileHeaderTarget.title,
+        )}
       {showTrackingControls ? (
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle={prs.length === 0} />
-          <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && (
-              <TooltipProvider>
-                <Select
-                  open={prPickerOpen}
-                  onOpenChange={(open) => {
-                    setPrPickerOpen(open);
-                    setPrPickerTooltipOpen(false);
-                    setFocusedPrUrl(undefined);
-                  }}
-                  value={selected ?? associations.selected_pr_url ?? ""}
-                  onValueChange={changeSelection}
-                >
-                  <Tooltip
-                    open={prPickerTooltipOpen && !prPickerOpen}
-                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
-                  >
-                    <TooltipTrigger asChild>
-                      <SelectTrigger
-                        aria-label="Session pull request"
-                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                    </TooltipTrigger>
-                    {selectedPr && (
-                      <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr, associations.provider)}
-                      </TooltipContent>
-                    )}
-                  </Tooltip>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width)"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
-                    }}
-                  >
-                    {prs.map((pr) => (
-                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
-                        <TooltipTrigger asChild>
-                          <SelectItem
-                            value={pr.url}
-                            onFocus={() => setFocusedPrUrl(pr.url)}
-                            onBlur={() =>
-                              setFocusedPrUrl((current) =>
-                                current === pr.url ? undefined : current,
-                              )
-                            }
-                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
-                          >
-                            {pullRequestLabel(pr, associations.provider)}
-                          </SelectItem>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side={isMobileViewport ? "bottom" : "left"}
-                          className="wrap-anywhere"
-                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
-                        >
-                          {pullRequestLabel(pr, associations.provider)}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </TooltipProvider>
-            )}
-            <div className="ml-auto flex shrink-0 items-center gap-1">
-              <TooltipProvider delayDuration={0}>
-                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
-                  {refreshIcon}
-                </IconButton>
-                <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
-                  <PlusIcon className="size-3.5" aria-hidden="true" />
-                </IconButton>
-                {selected && (
-                  <IconButton
-                    label="Unlink PR"
-                    disabled={update.isPending}
-                    onClick={() =>
-                      update.mutate(
-                        { url: selected, action: "remove" },
-                        {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
-                        },
-                      )
-                    }
-                  >
-                    <Trash2Icon className="size-3.5" aria-hidden="true" />
-                  </IconButton>
-                )}
-              </TooltipProvider>
+        !inMobileDrawer && (
+          <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails || prs.length <= 1} />}
+            <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
+              {prs.length > 1 && showingDetails && (
+                <Button variant="ghost" size="sm" onClick={showPullRequestList}>
+                  <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
+                </Button>
+              )}
+              <div className="ml-auto flex shrink-0 items-center gap-1">
+                {!inMobileDrawer && headerActions}
+              </div>
             </div>
           </div>
-        </div>
-      ) : panelState.kind !== "ready" ? (
+        )
+      ) : !inMobileDrawer && panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle />
+          <PanelTitle showTitle />
           {refreshButton}
         </div>
       ) : null}
@@ -1270,6 +1313,11 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         <div className="shrink-0 border-b border-border p-2 [&>:first-child]:mt-0">
           {linkControls}
         </div>
+      )}
+      {unlink.isError && (
+        <p role="alert" className="shrink-0 border-b border-border p-2 text-ui text-destructive">
+          Couldn’t unlink: {unlink.error.message}
+        </p>
       )}
       {info.data?.warnings?.length || info.data?.discovery_warnings?.length ? (
         <p
@@ -1280,217 +1328,225 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
-        <PullRequestPanelDetails
-          key={`${conversationId}:${selected ?? ""}`}
-          conversationId={conversationId}
-          info={info}
-          showProviderIcon={!showTrackingControls}
-          refreshButton={!showTrackingControls ? refreshButton : undefined}
-          emptyStateAction={
-            associations?.tracking_available && linkInEmptyState ? (
-              <div className="mt-2 w-full max-w-sm">
-                {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
-                {linkControls}
-              </div>
-            ) : (
-              openPrFallback
-            )
-          }
-        />
+        {prs.length > 1 && !showingDetails ? (
+          <ul aria-label="Pull requests" className="h-full overflow-y-auto">
+            {prs.map((pr) => (
+              <PullRequestListRow
+                key={pr.url}
+                conversationId={conversationId}
+                active={active}
+                association={{
+                  ...pr,
+                  provider: pr.provider ?? associations?.provider ?? undefined,
+                  provider_display:
+                    pr.provider_display ?? associations?.provider_display ?? undefined,
+                }}
+                hostOffline={hostOffline}
+                sandboxAsleep={sandboxAsleep}
+                unlinkPending={unlink.isPending}
+                onUnlink={associations?.tracking_available ? () => unlinkPr(pr.url) : undefined}
+                onSelect={() => {
+                  updateView({ selected: pr.url, showingDetails: true, subtab: "summary" });
+                }}
+              />
+            ))}
+          </ul>
+        ) : (
+          <PullRequestPanelDetails
+            key={`${conversationId}:${selected ?? ""}`}
+            conversationId={conversationId}
+            info={detailsInfo}
+            active={active}
+            activeTab={activeTab}
+            setActiveTab={setActiveTab}
+            storedPr={storesPrs && hostOffline ? selectedPr : undefined}
+            notSynced={notSynced && !selectedPr}
+            showHeading={!inMobileDrawer && !showTrackingControls}
+            refreshButton={!inMobileDrawer && !showTrackingControls ? refreshButton : undefined}
+            emptyStateAction={
+              associations?.tracking_available && linkInEmptyState ? (
+                <div className="mt-2 w-full max-w-sm">
+                  {linkNeedsHost ? (
+                    <p role="status" className="text-ui text-muted-foreground">
+                      {sandboxAsleep
+                        ? sandboxStarting
+                          ? "Starting the session’s sandbox. You can link a PR once it’s back online."
+                          : "To link a PR, send a message to start the session’s sandbox."
+                        : "To link a PR, please reconnect the session’s host."}
+                    </p>
+                  ) : (
+                    <>
+                      {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
+                      {linkControls}
+                    </>
+                  )}
+                </div>
+              ) : (
+                openPrFallback
+              )
+            }
+          />
+        )}
       </div>
     </div>
   );
 }
 
+/**
+ * Whether neither the runner nor the host can answer, so the panel falls back
+ * to the server's stored PRs. Live info cached before they went away counts as
+ * offline too, since its failed refetch would otherwise replace the PR.
+ */
+function useHostOffline(
+  conversationId: string,
+  info: Pick<ReturnType<typeof usePullRequestInfo>, "error">,
+): boolean {
+  const serveable = useWorkspaceServeable(conversationId);
+  const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  return serveable === false || sandboxAsleep || info.error instanceof RunnerOfflineError;
+}
+
+function storedPullRequestHint(
+  pr: PullRequestAssociation,
+  sandboxAsleep: boolean,
+  sandboxStarting: boolean,
+): string {
+  const lastSync = pr.state_checked_at
+    ? `Last sync time: ${absoluteTime(pr.state_checked_at * 1000)}. `
+    : "";
+  return (
+    lastSync +
+    (sandboxAsleep
+      ? sandboxStarting
+        ? "Starting the session’s sandbox. The PR details will load once it’s back online."
+        : "To load the PR details, send a message to start the session’s sandbox."
+      : "To load the PR details, please reconnect the session’s host.")
+  );
+}
+
+/**
+ * The selected PR as the server last stored it, while the runner and host are
+ * offline: its title, link and state. Everything else stays on the host, so the
+ * panel says when it comes back.
+ */
+function StoredPullRequestDetails({
+  pr,
+  copy,
+  sandboxAsleep,
+  sandboxStarting,
+  showHeading,
+  refreshButton,
+}: {
+  pr: PullRequestAssociation;
+  copy: GitProviderCopy;
+  sandboxAsleep: boolean;
+  sandboxStarting: boolean;
+  showHeading: boolean;
+  refreshButton?: React.ReactNode;
+}) {
+  const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
+  const href = /^https:\/\//.test(pr.url) ? pr.url : undefined;
+  const label = (
+    <>
+      <span className="truncate">{title}</span>
+      <span className="shrink-0 text-muted-foreground">
+        {copy.prNumberPrefix}
+        {pr.number}
+      </span>
+    </>
+  );
+  return (
+    <TooltipProvider delayDuration={0}>
+      <div className="flex h-full min-h-0 flex-col" data-testid="github-stored-pr">
+        <div className="shrink-0 border-b border-border px-3 pt-2 pb-2">
+          <div className="flex items-center gap-2">
+            {showHeading && <PanelTitle />}
+            <span className="block min-w-0 truncate text-xs text-muted-foreground">
+              {pr.repository}
+            </span>
+            <div className="ml-auto shrink-0">{refreshButton}</div>
+          </div>
+          <div className="mt-1 flex flex-nowrap items-center gap-2">
+            <PullRequestProviderIcon copy={copy} />
+            {href ? (
+              <a
+                href={href}
+                target="_blank"
+                rel="noreferrer"
+                className="group flex min-w-0 items-center gap-1 text-ui font-medium hover:underline"
+              >
+                {label}
+                <ExternalLinkIcon className="size-3 shrink-0 text-muted-foreground" />
+              </a>
+            ) : (
+              <span className="flex min-w-0 items-center gap-1 text-ui font-medium">{label}</span>
+            )}
+            {pr.state && <PullRequestStatus state={pr.state} isDraft={pr.is_draft === true} />}
+          </div>
+        </div>
+        <p role="status" className="p-3 text-ui text-muted-foreground">
+          {storedPullRequestHint(pr, sandboxAsleep, sandboxStarting)}
+        </p>
+      </div>
+    </TooltipProvider>
+  );
+}
+
 function PullRequestPanelDetails({
+  active,
   conversationId,
   info,
-  showProviderIcon,
+  storedPr,
+  notSynced,
+  showHeading,
   refreshButton,
   emptyStateAction,
+  activeTab,
+  setActiveTab,
 }: {
   conversationId: string;
   info: ReturnType<typeof usePullRequestInfo>;
-  showProviderIcon: boolean;
+  active: boolean;
+  /** The selected PR as the server stored it, passed while the host is offline. */
+  storedPr?: PullRequestAssociation;
+  /** Offline, and the server hasn't imported the session's PRs yet. */
+  notSynced?: boolean;
+  showHeading: boolean;
   refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
+  activeTab: PullRequestSubtab;
+  setActiveTab: (value: PullRequestSubtab) => void;
 }) {
   const baseRef = info.data?.base_ref ?? undefined;
   const prUrl = info.data?.selected_pr_url;
+  // The server's association carries the PR identity; `storedPr` is set only while offline.
+  const identity = info.data?.prs?.find((association) => association.url === prUrl) ?? null;
   const headSha = info.data?.pr?.head_sha;
   const baseSha = info.data?.pr?.base_sha;
   const revision = `${baseSha ?? ""}:${headSha ?? ""}`;
   const hasPr = !!info.data?.pr;
+  const serveable = useWorkspaceServeable(conversationId);
   const changes = usePullRequestChangedFiles(conversationId, hasPr, prUrl, revision);
   const prDiff = usePullRequestDiff(conversationId, hasPr, prUrl, revision);
   const sandboxAsleep = useWorkspaceAsleep(conversationId);
+  const sandboxStarting = useSandboxStarting(conversationId);
   const canEdit = useCanEdit(conversationId);
 
   // Summary (checks + PR body), Comments, and Changes (the stacked diff).
   // Summary is the landing tab — like GitHub's PR page opening on the
   // Conversation view.
-  const [activeTab, setActiveTab] = useState<"summary" | "comments" | "changes">("summary");
-
-  const themeType = useResolvedThemeMode();
-  // Diff layout is the app-global FileViewer preference (unified/split); seed
-  // from the persisted value and write toggles back so the choice carries over.
-  const [diffStyle, setDiffStyle] = useState<"unified" | "split">(() =>
-    readFileViewPreferences().diffLayout === "split" ? "split" : "unified",
+  const reviews = usePullRequestReviewThreads(
+    conversationId,
+    prUrl,
+    info.data?.auth?.selected_account ?? info.data?.selected_account,
+    revision,
+    active &&
+      activeTab === "changes" &&
+      !sandboxAsleep &&
+      serveable !== false &&
+      !!info.data?.capabilities?.review_threads &&
+      hasPr,
   );
-  const toggleDiffStyle = useCallback(() => {
-    setDiffStyle((prev) => {
-      const next = prev === "split" ? "unified" : "split";
-      writeFileViewPreferences({ ...readFileViewPreferences(), diffLayout: next });
-      return next;
-    });
-  }, []);
-
-  const files = useMemo<PullRequestChangedFile[]>(() => changes.data?.data ?? [], [changes.data]);
-  // The sidebar groups the flat file list into a compacted folder tree (the
-  // diff scroll below stays linear, in file order).
-  const fileTree = useMemo(() => buildSidebarTree(files), [files]);
-
-  // Per-file collapse is lifted here so the toolbar's "expand/collapse all" can
-  // drive every section; a path in the set is collapsed.
-  const [collapsedPaths, setCollapsedPaths] = useState<ReadonlySet<string>>(() => new Set());
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  // Collapsed folders in the sidebar tree (empty = all expanded).
-  const [collapsedDirs, setCollapsedDirs] = useState<ReadonlySet<string>>(() => new Set());
-  const toggleDir = useCallback((path: string) => {
-    setCollapsedDirs((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  // Drag-to-resize the file sidebar via a handle on its right edge.
-  const {
-    width: sidebarWidth,
-    containerRef: bodyRef,
-    handleProps: sidebarHandleProps,
-  } = useResizableColumn(192, 140, 560);
-
-  const toggleOne = useCallback((path: string) => {
-    setCollapsedPaths((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
-  }, []);
-
-  const allCollapsed = files.length > 0 && files.every((f) => collapsedPaths.has(f.path));
-  const toggleAll = useCallback(() => {
-    setCollapsedPaths((prev) => {
-      const everyCollapsed = files.length > 0 && files.every((f) => prev.has(f.path));
-      return everyCollapsed ? new Set<string>() : new Set(files.map((f) => f.path));
-    });
-  }, [files]);
-
-  // Parse the one whole-PR patch into per-file diffs, keyed by path.
-  const { filesByPath, parseError } = useMemo(() => {
-    const map = new Map<string, FileDiffMetadata>();
-    const patch = prDiff.data?.patch;
-    if (patch) {
-      try {
-        for (const parsed of parsePatchFiles(patch)) {
-          for (const f of parsed.files) map.set(f.name, f);
-        }
-      } catch {
-        return {
-          filesByPath: map,
-          parseError: "Couldn’t read the PR diff. Refresh or open the PR on its provider.",
-        };
-      }
-    }
-    return { filesByPath: map, parseError: undefined };
-  }, [prDiff.data]);
-
-  // Expand-context loader: fetch a file's full old/new content on demand when
-  // the reader expands unchanged regions.
-  const loadDiffFiles = useCallback(
-    async (fd: FileDiffMetadata) => {
-      const { before, after } = prUrl
-        ? await fetchPullRequestFileContents(conversationId, fd.name, baseRef, {
-            pr_url: prUrl,
-            previous_path: fd.prevName,
-            head_sha: headSha,
-            base_sha: baseSha,
-          })
-        : await fetchPullRequestFileContents(conversationId, fd.name, baseRef);
-      return {
-        oldFile: { name: fd.prevName ?? fd.name, contents: before ?? "" },
-        newFile: { name: fd.name, contents: after ?? "" },
-      };
-    },
-    [conversationId, baseRef, prUrl, headSha, baseSha],
-  );
-
-  const diffOptions = useMemo<DiffOptions>(
-    () => ({
-      theme: DIFF_THEME,
-      themeType,
-      diffStyle,
-      // The section renders its own header; the diff body has none.
-      disableFileHeader: true,
-      // Expand unchanged context 10 lines at a time (default is 100). The
-      // unchanged lines aren't in the patch, so expansion (and the exact
-      // trailing-region count) is served by loadDiffFiles on demand.
-      expansionLineCount: 10,
-      loadDiffFiles,
-    }),
-    [themeType, diffStyle, loadDiffFiles],
-  );
-
-  // The stacked diff scrolls as one; the sidebar highlights the file at the top
-  // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
-  const [activePath, setActivePath] = useState<string | null>(null);
-
-  const registerRef = useCallback((path: string, el: HTMLElement | null) => {
-    if (el) sectionEls.current.set(path, el);
-    else sectionEls.current.delete(path);
-  }, []);
-
-  const rafRef = useRef<number | null>(null);
-  const recomputeActive = useCallback(() => {
-    const container = scrollRef.current;
-    if (!container) return;
-    const top = container.getBoundingClientRect().top;
-    let current: string | null = null;
-    for (const [path, el] of sectionEls.current) {
-      if (el.getBoundingClientRect().top - top <= 8) current = path;
-    }
-    setActivePath((prev) => current ?? prev);
-  }, []);
-  const onScroll = useCallback(() => {
-    if (rafRef.current !== null) return;
-    rafRef.current = requestAnimationFrame(() => {
-      rafRef.current = null;
-      recomputeActive();
-    });
-  }, [recomputeActive]);
-
-  useEffect(() => {
-    setActivePath((prev) =>
-      prev && files.some((f) => f.path === prev) ? prev : (files[0]?.path ?? null),
-    );
-  }, [files]);
-
-  // Jumping to a collapsed file also expands it, so the click lands on its diff.
-  const jumpTo = useCallback((path: string) => {
-    setActivePath(path);
-    setCollapsedPaths((prev) => {
-      if (!prev.has(path)) return prev;
-      const next = new Set(prev);
-      next.delete(path);
-      return next;
-    });
-    sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
-  }, []);
 
   // Mutation responses seed the query cache raw, so normalize before reading.
   const normalized = info.data && normalizePullRequestInfo(info.data);
@@ -1499,6 +1555,30 @@ function PullRequestPanelDetails({
     normalized?.auth.hint,
     normalized?.provider_display,
   );
+
+  if (storedPr) {
+    return (
+      <StoredPullRequestDetails
+        pr={storedPr}
+        copy={gitProviderCopy(storedPr.provider, undefined, storedPr.provider_display)}
+        sandboxAsleep={sandboxAsleep}
+        sandboxStarting={sandboxStarting}
+        showHeading={showHeading}
+        refreshButton={refreshButton}
+      />
+    );
+  }
+  if (notSynced) {
+    return (
+      <p role="status" className="p-3 text-ui text-muted-foreground">
+        {sandboxAsleep
+          ? sandboxStarting
+            ? "This session’s PRs haven’t synced to the server yet. Starting the session’s sandbox to load them."
+            : "This session’s PRs haven’t synced to the server yet. To load them, send a message to start the session’s sandbox."
+          : "This session’s PRs haven’t synced to the server yet. To load them, please reconnect the session’s host."}
+      </p>
+    );
+  }
 
   // ── Whole-panel states (before the header + stacked diff) ───────────────
   // One central switch: every non-`ready` kind returns its own whole-panel
@@ -1527,7 +1607,11 @@ function PullRequestPanelDetails({
     case "sandbox-offline":
       return (
         <PanelMessage>
-          <p>The sandbox is offline. Send a message in the chat to start it again.</p>
+          <p>
+            {sandboxStarting
+              ? "Starting sandbox… Pull requests will load when it’s back online."
+              : "The sandbox is offline. Send a message in the chat to start it again."}
+          </p>
           {emptyStateAction}
         </PanelMessage>
       );
@@ -1668,7 +1752,7 @@ function PullRequestPanelDetails({
         <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-3 pt-2">
             <div className="flex items-center gap-2">
-              {showProviderIcon && <PanelTitle copy={copy} />}
+              {showHeading && <PanelTitle />}
               <span className="block min-w-0 truncate text-xs text-muted-foreground">
                 {data.repo?.name_with_owner ?? copy.label}
                 {data.branch && (
@@ -1682,6 +1766,7 @@ function PullRequestPanelDetails({
               <div className="ml-auto shrink-0">{refreshButton}</div>
             </div>
             <div className="mt-1 flex flex-nowrap items-center gap-2">
+              <PullRequestProviderIcon copy={copy} />
               <PullRequestTitle
                 // A different PR starts fresh, so an open title edit can't outlive its PR.
                 key={data.selected_pr_url ?? pr.url}
@@ -1692,7 +1777,7 @@ function PullRequestPanelDetails({
                 numberLabel={`${copy.prNumberPrefix}${pr.number}`}
                 editable={canEdit && !!data.capabilities.details_editing}
               />
-              <PullRequestStatus state={pr.state} />
+              <PullRequestStatus state={pr.state} isDraft={pr.is_draft === true} />
             </div>
           </div>
           {/* Tab bar (Summary | Comments | Changes); the diff controls live inside
@@ -1787,6 +1872,9 @@ function PullRequestPanelDetails({
               comments={comments}
               hasComposer={canPostComment}
               commentsPartial={pr.comments_partial}
+              events={pr.timeline_events}
+              timelinePartial={pr.timeline_partial}
+              prUrl={pr.url}
               providerLabel={copy.label}
             />
           </div>
@@ -1800,150 +1888,18 @@ function PullRequestPanelDetails({
           )}
         </TabsContent>
 
-        {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll
-            of all files' diffs. */}
-        <TabsContent value="changes" className="flex min-h-0 flex-1 flex-col">
-          {(changes.data?.has_more || changes.data?.warning) && (
-            <p
-              role="status"
-              className="shrink-0 border-b border-border p-2 text-ui text-muted-foreground"
-            >
-              {changes.data.warning || "The changed-file list is incomplete."}
-            </p>
-          )}
-          {files.length > 0 && (
-            <div className="flex w-full shrink-0 items-center justify-between gap-2 border-b border-border px-2 py-1">
-              <IconButton
-                label={sidebarCollapsed ? "Show file list" : "Hide file list"}
-                onClick={() => setSidebarCollapsed((v) => !v)}
-                className="size-5 text-muted-foreground"
-              >
-                {sidebarCollapsed ? (
-                  <PanelLeftOpenIcon className="size-3.5" />
-                ) : (
-                  <PanelLeftCloseIcon className="size-3.5" />
-                )}
-              </IconButton>
-              <div className="flex items-center gap-0.5">
-                <IconButton
-                  label={diffStyle === "split" ? "Switch to unified view" : "Switch to split view"}
-                  onClick={toggleDiffStyle}
-                  className="size-5 text-muted-foreground"
-                >
-                  {diffStyle === "split" ? (
-                    <Rows2Icon className="size-3.5" />
-                  ) : (
-                    <Columns2Icon className="size-3.5" />
-                  )}
-                </IconButton>
-                <IconButton
-                  label={allCollapsed ? "Expand all diffs" : "Collapse all diffs"}
-                  onClick={toggleAll}
-                  className="size-5 text-muted-foreground"
-                >
-                  {allCollapsed ? (
-                    <ChevronsUpDownIcon className="size-3.5" />
-                  ) : (
-                    <ChevronsDownUpIcon className="size-3.5" />
-                  )}
-                </IconButton>
-              </div>
-            </div>
-          )}
-          <div ref={bodyRef as React.RefObject<HTMLDivElement>} className="flex min-h-0 flex-1">
-            {!sidebarCollapsed && (
-              <div
-                style={{ width: `${sidebarWidth}px` }}
-                className="relative shrink-0 overflow-y-auto border-r border-border pb-1"
-              >
-                {/* Drag the right edge to resize the file list. */}
-                <div
-                  {...sidebarHandleProps}
-                  aria-label="Resize file list"
-                  className="absolute inset-y-0 right-0 z-10 w-1 cursor-col-resize transition-colors hover:bg-primary/30 active:bg-primary/50"
-                />
-                {changes.isLoading ? (
-                  <div className="flex items-center justify-center p-4 text-muted-foreground">
-                    <Loader2Icon className="size-4 animate-spin" />
-                  </div>
-                ) : changes.error ? (
-                  <p className="px-2 py-1 text-ui text-muted-foreground">
-                    {changes.error instanceof RunnerOfflineError
-                      ? "Runner offline."
-                      : (changes.error as Error).message}
-                  </p>
-                ) : files.length === 0 ? (
-                  <p className="px-2 py-1 text-ui text-muted-foreground">
-                    {changes.data?.available === false ||
-                    changes.data?.has_more ||
-                    changes.data?.warning
-                      ? "Changed files are unavailable."
-                      : "No changes vs base."}
-                  </p>
-                ) : (
-                  fileTree.map((node) => (
-                    <SidebarNode
-                      key={node.type === "file" ? node.file.path : node.path}
-                      node={node}
-                      depth={0}
-                      activePath={activePath}
-                      onSelectFile={jumpTo}
-                      collapsedDirs={collapsedDirs}
-                      onToggleDir={toggleDir}
-                    />
-                  ))
-                )}
-              </div>
-            )}
-            <div
-              ref={scrollRef}
-              onScroll={onScroll}
-              className="github-diff-stack min-w-0 flex-1 overflow-y-auto"
-            >
-              {changes.error || prDiff.error || parseError ? (
-                <PanelMessage>
-                  <p role="alert">
-                    {parseError || ((changes.error || prDiff.error) as Error).message}
-                  </p>
-                </PanelMessage>
-              ) : prDiff.data?.unavailable_reason ? (
-                <PanelMessage>
-                  {prDiff.data.message ||
-                    (prDiff.data.unavailable_reason === "pr_outside_workspace"
-                      ? "Diff unavailable for a PR outside this workspace's repository"
-                      : "Diff unavailable. Refresh or open the request on its provider.")}
-                </PanelMessage>
-              ) : files.length === 0 || prDiff.isLoading ? (
-                <PanelMessage>
-                  {changes.isLoading || prDiff.isLoading ? (
-                    <>
-                      <Loader2Icon className="size-5 animate-spin" />
-                      Loading changes…
-                    </>
-                  ) : changes.data?.available === false ||
-                    changes.data?.has_more ||
-                    changes.data?.warning ? (
-                    "Changed files are unavailable."
-                  ) : (
-                    "No changes vs base."
-                  )}
-                </PanelMessage>
-              ) : (
-                files.map((file) => (
-                  <PullRequestFileSection
-                    key={file.path}
-                    file={file}
-                    fileDiff={filesByPath.get(file.path)}
-                    options={diffOptions}
-                    registerRef={registerRef}
-                    collapsed={collapsedPaths.has(file.path)}
-                    onToggleCollapsed={() => toggleOne(file.path)}
-                  />
-                ))
-              )}
-            </div>
-          </div>
-        </TabsContent>
+        <PullRequestChangesTab
+          conversationId={conversationId}
+          data={data}
+          pr={pr}
+          prUrl={prUrl}
+          canEdit={canEdit}
+          selected={activeTab === "changes"}
+          changes={changes}
+          prDiff={prDiff}
+          reviews={reviews}
+          identity={identity}
+        />
       </Tabs>
     </TooltipProvider>
   );

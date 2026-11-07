@@ -292,6 +292,74 @@ def test_process_alive_false_for_bogus_pid() -> None:
     assert _proc.process_alive(-1) is False
 
 
+@pytest.mark.posix_only
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_pipe_supervisor_preserves_command_io_and_status(tmp_path: Path, exit_code: int) -> None:
+    """Both output pipes can exceed capacity without deadlocking the supervisor."""
+    script = (
+        "import os, sys; "
+        "data = sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data + b'o' * 200000); "
+        "sys.stderr.buffer.write(b'e' * 200000); "
+        "print(os.getcwd(), sys.argv[1], os.environ['PROBE_TEST_VALUE'], flush=True); "
+        "sys.exit(int(sys.argv[2]))"
+    )
+    literal_arg = "spaces; $literal `argument`"
+    result = subprocess.run(
+        _proc.pipe_supervised_command(sys.executable, "-c", script, literal_arg, str(exit_code)),
+        input=b"probe input\n",
+        capture_output=True,
+        cwd=tmp_path,
+        env={**os.environ, "PROBE_TEST_VALUE": "inherited"},
+        timeout=5,
+        check=False,
+        **_proc.spawn_kwargs(),
+    )
+    assert result.returncode == exit_code
+    assert result.stdout == (
+        b"probe input\n" + b"o" * 200000 + f"{tmp_path} {literal_arg} inherited\n".encode()
+    )
+    assert result.stderr == b"e" * 200000
+
+
+@pytest.mark.posix_only
+def test_pipe_supervisor_reports_missing_command(tmp_path: Path) -> None:
+    missing = str(tmp_path / "missing-command")
+    result = subprocess.run(
+        _proc.pipe_supervised_command(missing), capture_output=True, timeout=5, check=False
+    )
+    assert result.returncode == 127
+    assert missing.encode() in result.stderr
+
+
+def test_pipe_supervisor_keeps_windows_direct_launch(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_proc, "IS_POSIX", False)
+    assert _proc.pipe_supervised_command("claude", "-p", "/model") == ("claude", "-p", "/model")
+
+
+def test_process_create_time_is_stable_for_a_live_process() -> None:
+    proc = subprocess.Popen(_spin_cmd(), **_proc.spawn_kwargs())
+    try:
+        identity = _proc.process_create_time(proc.pid)
+        assert identity is not None and identity > 0
+        assert _proc.process_create_time(proc.pid) == identity
+    finally:
+        _proc.kill_tree(proc)
+        proc.wait(timeout=5)
+
+
+def test_process_create_time_is_none_for_a_bogus_pid() -> None:
+    assert _proc.process_create_time(2_000_000_000) is None
+
+
+def test_process_create_time_swallows_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _deny(pid: int) -> psutil.Process:
+        raise psutil.AccessDenied(pid)
+
+    monkeypatch.setattr(_proc.psutil, "Process", _deny)
+    assert _proc.process_create_time(1234) is None
+
+
 def test_killpg_refuses_the_broadcast_group(monkeypatch: pytest.MonkeyPatch) -> None:
     """A target pgid of 1 must never be signalled.
 
@@ -434,6 +502,7 @@ def test_kill_tree_survives_a_wall_clock_step(
     _proc.remember_process_group(proc)
     child: psutil.Process | None = None
     try:
+        identity = _proc.process_create_time(proc.pid)
         deadline = time.monotonic() + 10
         while not child_pid_path.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -441,6 +510,7 @@ def test_kill_tree_survives_a_wall_clock_step(
         _proc.refresh_process_tree(proc)
         real_boot_time = pslinux.boot_time
         monkeypatch.setattr(pslinux, "boot_time", lambda: real_boot_time() + step)
+        assert _proc.process_create_time(proc.pid) == identity
 
         _proc.kill_tree(proc)
 

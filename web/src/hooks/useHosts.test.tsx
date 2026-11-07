@@ -4,14 +4,21 @@ import { startTransition, Suspense, useState, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cancelHarnessLogin,
+  fetchHarnessLogin,
   installHarnessOnHost,
+  logoutHarnessOnHost,
+  refreshHarnessAccountsOnHost,
+  startHarnessLogin,
   useDetectedCredentials,
   useHostModelOptions,
   useHosts,
+  useRefreshHarnessAccounts,
   useInstallHarness,
   useInstallingHarnesses,
   useStoreCredential,
 } from "./useHosts";
+import * as host from "@/lib/host";
 import { ApiError } from "@/lib/sessionsApi";
 
 const fetchMock = vi.fn();
@@ -22,6 +29,7 @@ function mockResponse(body: unknown, status = 200): Response {
     status,
     statusText: status === 200 ? "OK" : "Error",
     json: async () => body,
+    clone: () => mockResponse(body, status),
   } as unknown as Response;
 }
 
@@ -43,6 +51,157 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+describe("harness account routes", () => {
+  it("uses the encoded account refresh route and ignores old servers", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: { codex: { kind: "chatgpt" } } }))
+      .mockResolvedValueOnce(mockResponse({}, 404))
+      .mockResolvedValueOnce(mockResponse({}, 405));
+
+    await expect(refreshHarnessAccountsOnHost("host/1")).resolves.toEqual({
+      harness_accounts: { codex: { kind: "chatgpt" } },
+    });
+    await expect(refreshHarnessAccountsOnHost("old-host")).resolves.toBeNull();
+    await expect(refreshHarnessAccountsOnHost("older-host")).resolves.toBeNull();
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/hosts/host%2F1/harnesses/accounts/refresh",
+      "/v1/hosts/old-host/harnesses/accounts/refresh",
+      "/v1/hosts/older-host/harnesses/accounts/refresh",
+    ]);
+  });
+
+  it("uses encoded login, poll, cancel, and logout routes", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "ABCD-EFGH",
+          expires_at: 1_798_761_600,
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ status: "pending", error: null, expired: false }))
+      .mockResolvedValueOnce(mockResponse({}, 204))
+      .mockResolvedValueOnce(mockResponse({ configured_harnesses: null, harness_accounts: null }));
+
+    await expect(startHarnessLogin("host/1", "codex-native")).resolves.toEqual({
+      kind: "started",
+      login_id: "login/1",
+      verification_url: "https://auth.example.test/device",
+      user_code: "ABCD-EFGH",
+      expires_at: 1_798_761_600,
+    });
+    await expect(fetchHarnessLogin("host/1", "codex-native", "login/1")).resolves.toEqual({
+      status: "pending",
+      error: null,
+      expired: false,
+    });
+    await cancelHarnessLogin("host/1", "codex-native", "login/1");
+    await expect(logoutHarnessOnHost("host/1", "codex-native")).resolves.toEqual({
+      configured_harnesses: null,
+      harness_accounts: null,
+    });
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/v1/hosts/host%2F1/harnesses/codex/login",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/login/login%2F1",
+      "/v1/hosts/host%2F1/harnesses/codex/logout",
+    ]);
+    expect(fetchMock.mock.calls.map(([, init]) => init.method ?? "GET")).toEqual([
+      "POST",
+      "GET",
+      "DELETE",
+      "POST",
+    ]);
+  });
+
+  it("preserves login_unsupported as an ApiError", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "login_unsupported", message: "Update the host." } }, 409),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 409,
+      code: "login_unsupported",
+      message: "Update the host.",
+    });
+  });
+
+  it("rejects a javascript verification URL", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        login_id: "login-1",
+        verification_url: "javascript:alert(1)",
+        user_code: "ABCD-EFGH",
+        expires_at: 1_798_761_600,
+      }),
+    );
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toThrow(
+      "invalid sign-in link",
+    );
+  });
+
+  it("uses the shared API error parser for non-string FastAPI detail", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ detail: [{ msg: "invalid" }] }, 422));
+
+    await expect(startHarnessLogin("host_1", "codex-native")).rejects.toMatchObject({
+      status: 422,
+      message: "422 Error",
+    });
+  });
+
+  it.each([
+    { code: "login_busy", login_id: "busy/1" },
+    { error: { code: "login_busy", login_id: "busy/1" } },
+  ])("returns an active login id from a busy response", async (body) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(body, 409));
+
+    await expect(startHarnessLogin("host_1", "native-codex")).resolves.toEqual({
+      kind: "busy",
+      login_id: "busy/1",
+    });
+  });
+});
+
+describe("useRefreshHarnessAccounts", () => {
+  it("fetches once per selected host and never while setup is disabled", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: {} }))
+      .mockResolvedValueOnce(mockResponse({ harness_accounts: {} }));
+    const { rerender } = renderHook(
+      ({ hostId, enabled }) => useRefreshHarnessAccounts(hostId, enabled),
+      {
+        initialProps: { hostId: "host-1" as string | null, enabled: false },
+        wrapper,
+      },
+    );
+
+    await Promise.resolve();
+    expect(fetchMock).not.toHaveBeenCalled();
+    rerender({ hostId: "host-1", enabled: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    rerender({ hostId: "host-1", enabled: true });
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    rerender({ hostId: "host-2", enabled: true });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
+  it("treats a 404 from an older server as a successful no-op", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, 404));
+    const { result } = renderHook(() => useRefreshHarnessAccounts("old-host", true), {
+      wrapper,
+    });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data).toBeNull();
+  });
 });
 
 describe("useHosts", () => {
@@ -83,49 +242,59 @@ describe("useHosts", () => {
     ]);
   });
 
-  it("hides server-managed sandbox hosts from the host list", async () => {
-    // Every host picker (NewChatDialog, ForkSessionDialog,
-    // ResumeWithDirectoryDialog) consumes this hook, so filtering here
-    // is what keeps sandbox-backed hosts out of all of them. A host
-    // with a non-null sandbox_provider is server-managed (created from
-    // a managed sandbox); one without the field at all comes from an
-    // older server and must be kept.
-    fetchMock.mockResolvedValueOnce(
-      mockResponse({
-        hosts: [
-          {
-            host_id: "host_sandbox",
-            name: "sandbox-abc123",
-            owner: "alice",
-            status: "online",
-            sandbox_provider: "modal",
-          },
-          {
-            host_id: "host_laptop",
-            name: "Laptop",
-            owner: "alice",
-            status: "online",
-            sandbox_provider: null,
-          },
-          {
-            host_id: "host_legacy",
-            name: "Old server host",
-            owner: "alice",
-            status: "offline",
-          },
-        ],
-      }),
-    );
+  it.each([undefined, "host_sandbox", "host_other"])(
+    "only exposes the selected sandbox alongside regular hosts (source=%s)",
+    async (sourceHostId) => {
+      // Every host picker (NewChatDialog, ForkSessionDialog,
+      // ResumeWithDirectoryDialog) consumes this hook, so filtering here
+      // is what keeps sandbox-backed hosts out of all of them. A host
+      // with a non-null sandbox_provider is server-managed (created from
+      // a managed sandbox); one without the field at all comes from an
+      // older server and must be kept.
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          hosts: [
+            {
+              host_id: "host_sandbox",
+              name: "sandbox-abc123",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: "modal",
+            },
+            {
+              host_id: "host_other",
+              name: "other",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: "modal",
+            },
+            {
+              host_id: "host_laptop",
+              name: "Laptop",
+              owner: "alice",
+              status: "online",
+              sandbox_provider: null,
+            },
+            {
+              host_id: "host_legacy",
+              name: "Old server host",
+              owner: "alice",
+              status: "offline",
+            },
+          ],
+        }),
+      );
 
-    const { result } = renderHook(() => useHosts(), { wrapper });
-    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      const { result } = renderHook(() => useHosts({ sourceHostId }), { wrapper });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    // The modal-backed host is dropped; the explicit-null and
-    // field-absent hosts both survive. If host_sandbox appears, the
-    // sandbox filter regressed; if host_legacy disappears, the filter
-    // broke old-server compatibility.
-    expect(result.current.data?.map((h) => h.host_id)).toEqual(["host_laptop", "host_legacy"]);
-  });
+      expect(result.current.data?.map((h) => h.host_id)).toEqual([
+        ...(sourceHostId ? [sourceHostId] : []),
+        "host_laptop",
+        "host_legacy",
+      ]);
+    },
+  );
 
   it("retains sandbox hosts when includeSandbox is set", async () => {
     // The chat-header HostBadge needs sandbox-backed hosts so it can
@@ -432,6 +601,24 @@ describe("useHostModelOptions", () => {
       "/v1/hosts/host_1/harnesses/claude-native/model-options",
     );
     expect(result.current.data?.map((model) => model.displayName)).toEqual(["Sonnet 4.6"]);
+  });
+
+  it("isolates identical host and harness catalogs across servers in one QueryClient", async () => {
+    const server = vi.spyOn(host, "getOmnigentServerIdentity").mockReturnValue("server-a");
+    const models = [{ id: "model-a", displayName: "Model A" }];
+    fetchMock.mockResolvedValueOnce(mockResponse({ models }));
+    const { result, rerender } = renderHook(
+      ({ enabled }) => useHostModelOptions("host_1", "codex-native", enabled),
+      { initialProps: { enabled: true }, wrapper },
+    );
+    await waitFor(() => expect(result.current.data).toEqual(models));
+    server.mockReturnValue("server-b");
+    rerender({ enabled: false });
+    expect(result.current.data).toBeUndefined();
+    server.mockReturnValue("server-a");
+    rerender({ enabled: false });
+    expect(result.current.data).toEqual(models);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("does not fetch without a selected host", async () => {

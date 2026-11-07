@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,62 @@ from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
 )
+
+
+@pytest.mark.parametrize("reused_home", [False, True], ids=["fresh", "resumed"])
+@pytest.mark.parametrize(
+    "source_url,expected_agent",
+    [
+        ("https://source.example.test/v1", None),
+        ("https://ws.cloud.databricks.com/ai-gateway/codex/v1", "codex"),
+    ],
+    ids=["generic", "gateway"],
+)
+async def test_start_keeps_selected_source_provider_available_in_private_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reused_home: bool,
+    source_url: str,
+    expected_agent: str | None,
+) -> None:
+    """A resumed private config can predate the host's selected provider."""
+    source = tmp_path / "source"
+    source.mkdir()
+    original = (
+        'model_provider = "gateway"\nmodel = "source-model"\n'
+        '[model_providers.gateway]\nname = "Gateway"\n'
+        f'base_url = "{source_url}"\nwire_api = "responses"\n'
+        'env_key = "SYNTHETIC_PROVIDER_KEY"\n'
+        '[model_providers.gateway.auth]\ncommand = "sh"\nargs = ["-c", "printf token"]\n'
+    )
+    (source / "config.toml").write_text(original)
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    _disable_codex_startup_rpc(monkeypatch)
+    private = tmp_path / "private"
+    if reused_home:
+        private.mkdir()
+        (private / "config.toml").write_text(
+            'model = "private-model"\n[model_providers.existing]\nname = "Existing"\n'
+        )
+    server = _test_app_server(tmp_path, private, tmp_path / "bridge", tmp_path)
+    server.config_overrides = ['model_provider="gateway"']
+
+    await server.start()
+    try:
+        config = tomllib.loads((private / "config.toml").read_text())
+        gateway = config["model_providers"]["gateway"]
+        assert gateway["base_url"] == source_url
+        assert gateway["auth"]["args"] == ["-c", "printf token"]
+        if expected_agent is not None:
+            assert gateway["http_headers"]["Databricks-Custom-Coding-Agent"] == expected_agent
+        else:
+            assert "http_headers" not in gateway
+        assert config["model"] == ("private-model" if reused_home else "source-model")
+        if reused_home:
+            assert config["model_providers"]["existing"]["name"] == "Existing"
+        assert (source / "config.toml").read_text() == original
+    finally:
+        await server.close()
 
 
 def test_build_codex_native_server_profile_error_names_profile(
@@ -359,6 +416,43 @@ def test_build_codex_native_server_keeps_profile_path_without_usable_ucode_entry
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
+def test_build_codex_native_server_carries_the_configured_app_server_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _no_configured_codex_app_server_command: Callable[[], tuple[str, ...]],
+) -> None:
+    """The user config's wrapper reaches the session server; Codex stays its binary."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr(codex_native_app_server, "_find_codex_cli", lambda: sys.executable)
+    monkeypatch.setattr(
+        codex_native_app_server,
+        "_configured_app_server_command",
+        _no_configured_codex_app_server_command,
+    )
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(
+        "harness:\n  codex-native:\n    app_server:\n      command: ucode\n      args: [codex]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model="test-model",
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+
+    assert app_server.app_server_command == ("ucode", "codex")
+    assert app_server.codex_path == sys.executable
+
+
 def test_native_codex_resource_attributes_reach_server_and_terminal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -485,12 +579,10 @@ def test_build_codex_native_server_pins_profile_resolved_model(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
-                model=model or "databricks-gpt-5-4-mini",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-4-mini"}"'],
+            model=model or "databricks-gpt-5-4-mini",
+            host="https://ws.example",
         ),
     )
 
@@ -551,12 +643,10 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_launch_materialization",
-        lambda *, model, profile, codex_path: (
-            codex_native_app_server._DatabricksLaunchMaterialization(
-                config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
-                model=model or "databricks-gpt-5-6-luna",
-                host="https://ws.example",
-            )
+        lambda *, model, profile: codex_native_app_server._DatabricksLaunchMaterialization(
+            config_overrides=[f'model="{model or "databricks-gpt-5-6-luna"}"'],
+            model=model or "databricks-gpt-5-6-luna",
+            host="https://ws.example",
         ),
     )
 

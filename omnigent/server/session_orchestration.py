@@ -10,17 +10,28 @@ from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
     token_bound_runner_id,
 )
-from omnigent.server.auth import LEVEL_OWNER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
+from omnigent.server.sharing_settings import peer_session_messaging_enabled
 from omnigent.stores.conversation_store import (
-    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationStore,
 )
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
+
+
+def _shared_with_editors(session_id: str, user_id: str, permissions: PermissionStore) -> bool:
+    """Whether anyone besides the owner holds a stored grant that can add input."""
+    cursor: str | None = None
+    while True:
+        grants, cursor = permissions.list_for_session(session_id, after_user_id=cursor)
+        if any(g.user_id != user_id and g.level >= LEVEL_EDIT for g in grants):
+            return True
+        if cursor is None:
+            return False
 
 
 def require_owned_session(
@@ -40,11 +51,6 @@ def require_owned_session(
             break
         if is_session_closed(current.labels, current.title):
             break
-        if private and SCHEDULED_TASK_ORIGIN_LABEL_KEY in (current.labels or {}):
-            raise OmnigentError(
-                "Scheduled sessions cannot send messages or launch independent sessions",
-                code=ErrorCode.FORBIDDEN,
-            )
         seen.add(current.id)
         if current.parent_conversation_id is not None:
             current = conversations.get_conversation(current.parent_conversation_id)
@@ -53,11 +59,12 @@ def require_owned_session(
         if grant is None or grant.level != LEVEL_OWNER:
             break
         if private:
-            # Child access comes from the root, including public/read-only grants.
-            grants, cursor = permissions.list_for_session(current.id, limit=2)
-            if cursor is not None or any(g.user_id != user_id for g in grants):
+            # Child access comes from the root. Read-only viewers, including the
+            # public grant, cannot add input, so they cannot steer other sessions.
+            if _shared_with_editors(current.id, user_id, permissions):
                 raise OmnigentError(
-                    "Shared sessions cannot send messages or launch independent sessions",
+                    "Sessions shared with edit access cannot send messages or launch "
+                    "independent sessions",
                     code=ErrorCode.FORBIDDEN,
                 )
             if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
@@ -81,6 +88,10 @@ def require_orchestration_source(
     """Check the bound runner, private sender and optional same-owner destination."""
     if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
         raise OmnigentError("Session orchestration is disabled", code=ErrorCode.FORBIDDEN)
+    if target_id is not None and not peer_session_messaging_enabled(
+        request.app.state.feature_flags
+    ):
+        raise OmnigentError("Messaging other sessions is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
         raise OmnigentError("Session orchestration requires ownership", code=ErrorCode.FORBIDDEN)
     source = require_owned_session(

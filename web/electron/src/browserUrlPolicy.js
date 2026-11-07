@@ -1,21 +1,19 @@
-// Allowlist for AGENT-driven browser navigation (the URL-bar path
-// stays permissive — it's a user gesture). An unguarded model-issued loadURL
-// could point the view at file:// / cloud-metadata / loopback / private hosts
-// and read the bytes back via screenshot (SSRF + local-file read + exfil).
-// Runs in the main process (gate holds regardless of caller); Electron-free,
-// with DNS injectable, so `node --test` can exercise it without Electron.
+// Policy for all renderer-issued browser navigation, including the URL bar.
+// Main enforces URL, DNS and connected-address checks so pages cannot expose
+// private hosts or privileged schemes through browser actions such as screenshots.
 
 "use strict";
 
 const dns = require("node:dns");
 
-// Schemes the agent may navigate to; everything else (file:, chrome:, data:,
+// Schemes a policy-enforced view may navigate to; everything else (file:, chrome:, data:,
 // javascript:, ...) is a privileged surface or code channel and is rejected.
 const ALLOWED_SCHEMES = new Set(["http:", "https:"]);
 
-// The exact loopback hosts an eligible Arca agent context may open. Other
-// loopback spellings and DNS names that resolve to loopback stay blocked.
-const ARCA_LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+// Exact loopback hosts an eligible context may open without an IP check; its
+// `*.localhost` subdomains must also connect to loopback (isAgentConnectionAllowed).
+// Other loopback spellings and DNS names that resolve to loopback stay blocked.
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 /**
  * Parse a dotted-quad IPv4 host into four octets, or null if not IPv4. The
@@ -169,9 +167,34 @@ function isBlockedHostname(hostname) {
   return isIpLiteral(host) && isInternalAddress(host);
 }
 
+/** True for an RFC 6761 `*.localhost` subdomain without empty labels or a trailing dot. */
+function isLocalhostSubdomain(hostname) {
+  if (!hostname.endsWith(".localhost")) return false;
+  const labels = hostname.slice(0, -".localhost".length).split(".");
+  return labels.every((label) => label !== "");
+}
+
+/** True for a host an eligible context may open as a loopback preview. */
+function isLoopbackName(hostname) {
+  return LOOPBACK_HOSTS.has(hostname) || isLocalhostSubdomain(hostname);
+}
+
+/** True for an http(s) URL whose host is a loopback preview name, including `*.localhost`. */
+function isLoopbackPreviewUrl(url) {
+  if (typeof url !== "string" || !URL.canParse(url)) return false;
+  const { protocol, hostname } = new URL(url);
+  return ALLOWED_SCHEMES.has(protocol) && isLoopbackName(hostname);
+}
+
+/** True if an IP address is in 127.0.0.0/8 or is ::1 (including IPv4-mapped forms). */
+function isLoopbackAddress(address) {
+  const canonical = canonicalAddress(address);
+  return canonical === "0:0:0:0:0:0:0:1" || (canonical?.startsWith("127.") ?? false);
+}
+
 /**
- * Decide whether an AGENT-issued navigation to `url` is allowed: `{ ok: true }`
- * for an http(s) URL to a non-internal host (or eligible Arca loopback), else
+ * Decide whether a renderer-issued navigation to `url` is allowed: `{ ok: true }`
+ * for an http(s) URL to a non-internal host (or eligible loopback), else
  * `{ ok: false, error }`. Never throws — an unparseable URL is a rejection.
  * Judges the URL alone; `checkAgentNavigation` adds DNS resolution.
  *
@@ -195,7 +218,7 @@ function isAgentNavigationAllowed(url, { allowLocalhost = false } = {}) {
     };
   }
   const hostname = parsed.hostname;
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) {
+  if (allowLocalhost && isLoopbackName(hostname)) {
     return { ok: true };
   }
   if (isBlockedHostname(hostname)) {
@@ -234,7 +257,7 @@ async function checkAgentNavigation(
   const verdict = isAgentNavigationAllowed(url, { allowLocalhost });
   if (!verdict.ok) return verdict;
   const { hostname } = new URL(url);
-  if ((allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) || isIpLiteral(hostname)) {
+  if ((allowLocalhost && isLoopbackName(hostname)) || isIpLiteral(hostname)) {
     return verdict;
   }
   let addresses = [];
@@ -271,7 +294,16 @@ function isAgentConnectionAllowed(url, ip, { allowLocalhost = false } = {}) {
   } catch {
     // Judge the address alone.
   }
-  if (allowLocalhost && ARCA_LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowLocalhost && LOOPBACK_HOSTS.has(hostname)) return { ok: true };
+  if (allowLocalhost && isLocalhostSubdomain(hostname)) {
+    // Chromium connects these names to loopback itself; anything else means a
+    // resolver or proxy sent the request elsewhere.
+    if (ip && isLoopbackAddress(ip)) return { ok: true };
+    return {
+      ok: false,
+      error: `navigation blocked: host "${hostname}" did not connect to a loopback address`,
+    };
+  }
   if (!ip) {
     return {
       ok: false,
@@ -306,6 +338,15 @@ function proxyHosts(pacResult) {
   return hosts;
 }
 
+/** True if a PAC-style `resolveProxy` result lists only DIRECT entries. */
+function isDirectOnly(pacResult) {
+  const entries = String(pacResult ?? "")
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  return entries.length > 0 && entries.every((entry) => entry.toUpperCase() === "DIRECT");
+}
+
 /**
  * True if `ip` is an address of a proxy in `pacResult`. Configuration alone
  * proves nothing about a connection — "PROXY a:3128; DIRECT" may fall back to
@@ -335,6 +376,9 @@ module.exports = {
   checkAgentNavigation,
   isAgentConnectionAllowed,
   isProxyAddress,
+  isLoopbackPreviewUrl,
+  isDirectOnly,
+  isLocalhostSubdomain,
   lookupHostAddresses,
   // Exported for focused unit tests.
   proxyHosts,
@@ -344,5 +388,7 @@ module.exports = {
   isBlockedIpv6,
   isInternalAddress,
   isBlockedHostname,
+  isLoopbackName,
+  isLoopbackAddress,
   ALLOWED_SCHEMES,
 };

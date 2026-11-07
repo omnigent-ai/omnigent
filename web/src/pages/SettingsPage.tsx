@@ -29,6 +29,7 @@
  *   Unarchive opens the restored session.
  */
 
+import { toast } from "sonner";
 import {
   type ComponentType,
   lazy,
@@ -141,8 +142,8 @@ import {
   applyStoredUiFontSize,
   applyUiFontFamily,
   clampUiFontSizePx,
+  readAppliedUiFontSizePx,
   readUiFontFamily,
-  readUiFontSizePx,
   UI_FONT_FAMILY_DEFAULT,
   UI_FONT_SIZE_MAX,
   UI_FONT_SIZE_MIN,
@@ -200,6 +201,19 @@ import {
   writeFoldAssistantNarration,
 } from "@/lib/foldNarrationPreferences";
 import {
+  DEFAULT_PROJECT_FOLDER_COLLAPSE,
+  parseProjectFolderPageSize,
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_MAX,
+  PROJECT_FOLDER_PAGE_SIZE_MIN,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+  writeProjectFolderCollapse,
+  writeProjectFolderPageSize,
+} from "@/lib/projectFolderPaginationPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -211,6 +225,10 @@ import {
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
 import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import {
+  readOpenSubagentsInPanel,
+  writeOpenSubagentsInPanel,
+} from "@/lib/subagentPanelPreferences";
 import {
   readSubmitWithModEnter,
   writeSubmitWithModEnter,
@@ -231,6 +249,10 @@ import {
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
 import {
+  HIDDEN_PICKER_AGENTS_STORAGE_KEY,
+  notifyHiddenPickerAgentsChanged,
+} from "@/lib/pickerEntryVisibility";
+import {
   applyThemePalette,
   DEFAULT_PALETTE,
   isThemeSelection,
@@ -248,7 +270,7 @@ import {
   type CustomTheme,
   writeCustomTheme,
 } from "@/lib/customTheme";
-import { useIsEmbedded } from "@/lib/embedded";
+import { useHostTheme } from "@/lib/embedded";
 import { getOmnigentThemeSettingsUrl } from "@/lib/host";
 import {
   applyImportedSettings,
@@ -262,6 +284,7 @@ import {
   isElectronShell,
   resetCliPath,
   supportsBrowser,
+  supportsGlobalShortcut,
   type UpdateConfig,
   type UpdateMode,
   updateBridge,
@@ -274,6 +297,8 @@ import {
 } from "@/lib/backgroundSessionTitlesPreferences";
 import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
 import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSection";
+import { PickerVisibilitySetting } from "./settings/PickerVisibilitySetting";
+import { GlobalShortcutControl } from "./settings/GlobalShortcutControl";
 
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
@@ -286,6 +311,9 @@ const PoliciesPage = lazy(() =>
 );
 const SharingPage = lazy(() =>
   import("@/pages/SharingPage").then((m) => ({ default: m.SharingPage })),
+);
+const AdminGeneralPage = lazy(() =>
+  import("@/pages/AdminGeneralPage").then((m) => ({ default: m.AdminGeneralPage })),
 );
 
 /**
@@ -306,16 +334,6 @@ export function SettingsPage() {
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
-  const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses" || section === "custom-agents") {
-      return {
-        maxWidthClassName: "max-w-4xl",
-        contentClassName: "px-4 md:px-8",
-      };
-    }
-    return undefined;
-  }, [section]);
-
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
   // NOT inside the shared section PageScroll below, which would nest two
@@ -323,10 +341,17 @@ export function SettingsPage() {
   // Rendered in ANY multi-user mode (accounts AND OIDC), not gated on
   // `accountsEnabled` — the nav + pages handle admin gating, and Members runs
   // read-only under OIDC (no password actions).
-  if (section === "members" || section === "policies" || section === "sharing") {
+  if (
+    section === "admin" ||
+    section === "members" ||
+    section === "policies" ||
+    section === "sharing"
+  ) {
     return (
       <Suspense fallback={null}>
-        {section === "members" ? (
+        {section === "admin" ? (
+          <AdminGeneralPage />
+        ) : section === "members" ? (
           <MembersPage />
         ) : section === "policies" ? (
           <PoliciesPage />
@@ -339,12 +364,12 @@ export function SettingsPage() {
 
   return (
     <PageScroll
+      maxWidthClassName="max-w-4xl"
       contentClassName="px-4 md:px-8"
       extraBottom="2.5rem"
       // Reserve the scrollbar's width so the centered column doesn't shift when
       // switching between a page or tab that scrolls and one that doesn't.
       className="[scrollbar-gutter:stable]"
-      {...pageWrapperSettings}
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
@@ -379,26 +404,17 @@ export function SettingsPage() {
 function Section({
   title,
   description,
-  descriptionClassName,
   children,
 }: {
   title: string;
   description?: string;
-  descriptionClassName?: string;
   children: ReactNode;
 }) {
   return (
     <section>
-      <h1 className="settings-page-title text-2xl font-semibold">{title}</h1>
+      <h1 className="settings-page-title text-2xl font-medium">{title}</h1>
       {description && (
-        <p
-          className={cn(
-            "mt-1 text-muted-foreground max-md:hidden",
-            descriptionClassName ?? "text-ui",
-          )}
-        >
-          {description}
-        </p>
+        <p className="mt-1 text-sm text-muted-foreground max-md:hidden">{description}</p>
       )}
       <div className="mt-6">{children}</div>
     </section>
@@ -446,11 +462,11 @@ const workspaceTabCards: {
   { value: "subagents", label: "Agents", icon: BotIcon },
 ];
 
-/** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
+/** Inline icon and label for compact settings choices. */
+function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
     <>
-      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
       <span className="text-ui font-normal md:font-medium">{label}</span>
     </>
   );
@@ -480,15 +496,32 @@ function ThemeSubsection({
 function ModeControl() {
   const { theme, setTheme } = useTheme();
   const mode = normalizeThemeMode(theme);
+  const followsHost = useHostTheme() !== undefined;
+  const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
   const labelId = useId();
   return (
     <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Mode"
-        labelId={labelId}
-        description="Follow your system, or force light or dark."
-        className="flex-1"
-      />
+      <div className="flex-1">
+        <SettingsLabel
+          label="Mode"
+          labelId={labelId}
+          description={
+            followsHost
+              ? "Follow Databricks, or force light or dark."
+              : "Follow your system, or force light or dark."
+          }
+        />
+        {themeSettingsUrl && (
+          <a
+            href={themeSettingsUrl}
+            target="_blank"
+            rel="noreferrer"
+            className="text-sm font-medium text-primary underline underline-offset-2 hover:text-primary/80"
+          >
+            Databricks appearance settings
+          </a>
+        )}
+      </div>
       <IconSegmentedControl<ThemeMode>
         labelledBy={labelId}
         value={mode}
@@ -497,7 +530,7 @@ function ModeControl() {
         items={themeCards.map((card) => ({
           value: card.mode,
           testId: `theme-${card.mode}`,
-          label: card.label,
+          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
           icon: card.icon,
         }))}
       />
@@ -549,19 +582,19 @@ function TranscriptViewDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Default transcript view"
-      helper="Choose whether terminal-backed chats open in Chat or Terminal view. A view selected in a chat is remembered for the current tab."
+      helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
     >
       <CardRadioGroup<TranscriptViewDefault>
+        compact
         labelledBy={labelId}
         value={value}
         onSelect={choose}
         componentId="settings.appearance.transcript_view"
-        className="grid grid-cols-2 gap-3"
-        cardClassName="items-center gap-2 p-4"
+        className="flex flex-wrap gap-2"
         items={transcriptViewCards.map((card) => ({
           value: card.value,
           testId: `transcript-view-default-${card.value}`,
-          body: iconCardBody(card.icon, card.label),
+          body: iconButtonBody(card.icon, card.label),
         }))}
       />
     </ThemeSubsection>
@@ -584,19 +617,19 @@ function WorkspacePanelDefaultControl() {
     <ThemeSubsection
       labelId={labelId}
       title="Workspace panel"
-      helper="Whether new chats open with the Files / Agents / Shells panel visible. Collapsing or expanding the panel updates this. Existing chats keep their last layout."
+      helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
     >
       <CardRadioGroup<WorkspacePanelDefault>
+        compact
         labelledBy={labelId}
         value={value}
         onSelect={choose}
         componentId="settings.appearance.workspace_panel"
-        className="grid grid-cols-2 gap-3"
-        cardClassName="items-center gap-2 p-4"
+        className="flex flex-wrap gap-2"
         items={workspacePanelCards.map((card) => ({
           value: card.value,
           testId: `workspace-panel-default-${card.value}`,
-          body: iconCardBody(card.icon, card.label),
+          body: iconButtonBody(card.icon, card.label),
         }))}
       />
     </ThemeSubsection>
@@ -695,23 +728,18 @@ function WorkspaceTabsControl() {
           <ThemeSubsection
             labelId={labelId}
             title="Default Workspace tab"
-            helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+            helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
           >
             <CardRadioGroup<DefaultWorkspaceTab>
+              compact
               labelledBy={labelId}
               value={firstTab.value}
               onSelect={choose}
-              className={cn(
-                "grid gap-3",
-                pinnedCards.length > 1 && "grid-cols-2",
-                pinnedCards.length === 3 && "sm:grid-cols-3",
-                pinnedCards.length === 4 && "sm:grid-cols-4",
-              )}
-              cardClassName="items-center gap-2 p-4"
+              className="flex flex-wrap gap-2"
               items={pinnedCards.map((card) => ({
                 value: card.value,
                 testId: `workspace-tab-default-${card.value}`,
-                body: iconCardBody(card.icon, card.label),
+                body: iconButtonBody(card.icon, card.label),
               }))}
             />
           </ThemeSubsection>
@@ -786,7 +814,10 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55">
+      <div
+        data-testid="color-theme-editor"
+        className="overflow-hidden rounded-xl border bg-transparent"
+      >
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -838,15 +869,15 @@ function ColorThemeControl() {
         <div className="px-4">
           <ThemeColorPicker
             label="Accent"
-            value={editableTheme.accent}
+            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
             testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme({ accent, darkAccent: accent })}
+            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
           />
           <ThemeColorPicker
             label="Background tint"
-            value={editableTheme.tint}
+            value={isDark ? editableTheme.darkTint : editableTheme.tint}
             testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme({ tint })}
+            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
           />
           <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
             <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
@@ -875,7 +906,7 @@ function ColorThemeControl() {
           <div className="flex items-center justify-between gap-4 py-4">
             <SettingsLabel
               label="Translucent sidebars"
-              description="Lets the canvas show through the conversation and workspace rails."
+              description="Show the canvas through the conversation and Workspace sidebars."
             />
             <Switch
               aria-label="Translucent sidebars"
@@ -909,7 +940,7 @@ function HideUnconfiguredHarnessesControl() {
       <SettingsLabel
         label="Hide unconfigured harnesses"
         labelId={labelId}
-        description="Only show harnesses that are set up on the selected host in the new-chat picker. Harnesses needing a CLI install or sign-in are hidden instead of badged."
+        description="Hide harnesses that need a CLI install or sign-in on the selected host from the new-chat picker."
       />
       <Switch
         aria-labelledby={labelId}
@@ -923,7 +954,7 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
-/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+/** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
   const labelId = useId();
@@ -932,7 +963,7 @@ function FoldAssistantNarrationControl() {
       <SettingsLabel
         label="Show only the final answer"
         labelId={labelId}
-        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
+        description="Fold other agents' progress into the Worked row, keeping each turn's last message visible. Codex already folds completed turns."
       />
       <Switch
         aria-labelledby={labelId}
@@ -946,15 +977,65 @@ function FoldAssistantNarrationControl() {
   );
 }
 
+/** On by default: expanded project folders list a page of sessions behind "Show more". */
+function ProjectFolderPaginationControl() {
+  const collapse = useProjectFolderCollapse();
+  const pageSize = useProjectFolderPageSize();
+  // The text being typed; null shows the saved size, so a bad entry reverts on blur.
+  const [draft, setDraft] = useState<string | null>(null);
+  const collapseLabelId = useId();
+  const pageSizeLabelId = useId();
+  return (
+    <>
+      <div className="flex items-start justify-between gap-6">
+        <SettingsLabel
+          label='Collapse project sessions behind "Show more"'
+          labelId={collapseLabelId}
+          description="An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll."
+        />
+        <Switch
+          aria-labelledby={collapseLabelId}
+          checked={collapse}
+          onCheckedChange={writeProjectFolderCollapse}
+          data-testid="project-folder-collapse-toggle"
+          className="mt-0.5 shrink-0"
+          componentId="settings.appearance.project_folder_collapse"
+        />
+      </div>
+      {collapse && (
+        <div className="mt-4 flex items-center justify-between gap-6 border-t border-border pt-4">
+          <SettingsLabel
+            label='Sessions to show before "Show more"'
+            labelId={pageSizeLabelId}
+            description={`Each Show more click reveals this many more. Use a whole number from ${PROJECT_FOLDER_PAGE_SIZE_MIN} to ${PROJECT_FOLDER_PAGE_SIZE_MAX}.`}
+          />
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={PROJECT_FOLDER_PAGE_SIZE_MIN}
+            max={PROJECT_FOLDER_PAGE_SIZE_MAX}
+            step={1}
+            aria-labelledby={pageSizeLabelId}
+            data-testid="project-folder-page-size-input"
+            className="h-9 w-20 shrink-0 tabular-nums"
+            value={draft ?? String(pageSize)}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              const next = parseProjectFolderPageSize(e.target.value);
+              if (next !== undefined) writeProjectFolderPageSize(next);
+            }}
+            onBlur={() => setDraft(null)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") e.currentTarget.blur();
+            }}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
 function AppearanceSection() {
-  // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
-  // replace it with a note (plus a link to the host's own theme settings when
-  // one is provided). The color palette, terminal theme, and font controls are
-  // per-device prefs that don't conflict with host light/dark, so they stay.
-  // The link opens a new tab: in place, it would replace the app with the
-  // host page, and desktop windows have no Back control.
-  const isEmbedded = useIsEmbedded();
-  const themeSettingsUrl = getOmnigentThemeSettingsUrl();
   const { setTheme } = useTheme();
   const [resetKey, setResetKey] = useState(0);
   const [isResetDialogOpen, setIsResetDialogOpen] = useState(false);
@@ -982,6 +1063,8 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
     writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
+    writeProjectFolderCollapse(DEFAULT_PROJECT_FOLDER_COLLAPSE);
+    writeProjectFolderPageSize(PROJECT_FOLDER_PAGE_SIZE);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -1010,12 +1093,17 @@ function AppearanceSection() {
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
           FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+          PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+          HIDDEN_PICKER_AGENTS_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
       } catch {
         // localStorage access errors are non-fatal.
       }
+      // As with import: a same-tab write fires no storage event.
+      notifyHiddenPickerAgentsChanged();
     }
     applyStoredUiFontSize();
 
@@ -1057,53 +1145,11 @@ function AppearanceSection() {
   };
 
   return (
-    <Section
-      title="Appearance"
-      description="Choose how Omnigent looks on this device."
-      descriptionClassName="text-sm"
-    >
+    <Section title="Appearance" description="Choose how Omnigent looks on this device.">
       <div className="flex flex-col gap-6">
         <div key={resetKey} className="flex flex-col gap-6">
           <SettingsGroup title="Theme" testId="settings-group-theme">
-            {isEmbedded ? (
-              <div className="flex flex-col gap-3">
-                <SettingsLabel
-                  label="Theme"
-                  tooltipDescription="Light and dark mode are configured in Databricks preferences."
-                  description={
-                    <>
-                      Light and dark mode are configured in Databricks preferences.
-                      {themeSettingsUrl ? (
-                        <>
-                          {" "}
-                          <a
-                            href={themeSettingsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="font-medium text-primary underline underline-offset-2 hover:text-primary/80"
-                          >
-                            Click to open Databricks user preferences page.
-                          </a>
-                          .
-                        </>
-                      ) : null}
-                    </>
-                  }
-                />
-                {themeSettingsUrl && (
-                  <a
-                    href={themeSettingsUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="text-sm font-medium text-primary underline underline-offset-2 md:hidden"
-                  >
-                    Open Databricks preferences
-                  </a>
-                )}
-              </div>
-            ) : (
-              <ModeControl />
-            )}
+            <ModeControl />
             <div className="mt-4 border-t border-border pt-4">
               <TerminalThemeControl />
             </div>
@@ -1118,6 +1164,9 @@ function AppearanceSection() {
               <HideUnconfiguredHarnessesControl />
             </div>
             <div className="mt-4 border-t border-border pt-4">
+              <PickerVisibilitySetting />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
               <FoldAssistantNarrationControl />
             </div>
           </SettingsGroup>
@@ -1127,6 +1176,10 @@ function AppearanceSection() {
             <div className="mt-4 border-t border-border pt-4">
               <WorkspaceTabsControl />
             </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Sidebar" testId="settings-group-sidebar">
+            <ProjectFolderPaginationControl />
           </SettingsGroup>
 
           <SettingsGroup title="Interface typography" testId="settings-group-interface-type">
@@ -1148,7 +1201,7 @@ function AppearanceSection() {
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">
-          <div className="flex flex-wrap items-center justify-end gap-2">
+          <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end">
             <Button
               variant="outline"
               size="sm"
@@ -1400,8 +1453,8 @@ function GithubIntegrationControl() {
           className="flex-1"
           description={
             status.connected && status.login
-              ? `Connected as ${status.login}. New sandboxes authenticate gh and git as you, and your public SSH keys are added so you can SSH in.`
-              : "Connect your GitHub account so new sandboxes authenticate gh and git as you, and your public SSH keys are injected."
+              ? `Connected as ${status.login}. New sandboxes use your gh and git credentials and add your public SSH keys for SSH access.`
+              : "Connect GitHub to use your gh and git credentials and add your public SSH keys in new sandboxes."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1468,8 +1521,7 @@ function AlwaysUseWorktreeControl() {
         label="Always use a random worktree"
         labelId={labelId}
         className="flex-1"
-        description="Start new sessions in a fresh randomly-named git worktree in any git workspace. A project's own Random worktree setting overrides this."
-        descriptionClassName="text-ui"
+        description="Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1500,8 +1552,7 @@ function DeleteWorktreesOnArchiveControl() {
         label="Delete worktrees for archived sessions"
         labelId={labelId}
         className="flex-1"
-        description="Remove a session's git worktree directory, including uncommitted changes, when you archive it. The branch is kept."
-        descriptionClassName="text-ui"
+        description="Delete the session's worktree and any uncommitted changes when archived. The branch is kept."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1598,8 +1649,8 @@ function DatabricksIntegrationControl() {
           className="flex-1"
           description={
             status.connected && status.workspace_host
-              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes reach the Databricks Unity Gateway (MCP + model serving) as you.`
-              : "Connect your Databricks workspace so new sandboxes reach its Unity Gateway (MCP + model serving) as you."
+              ? `Connected to ${status.workspace_host}${status.databricks_user ? ` as ${status.databricks_user}` : ""}. New sandboxes access Unity Gateway (MCP and model serving) as you.`
+              : "Connect a Databricks workspace to access Unity Gateway (MCP and model serving) as you in new sandboxes."
           }
         />
         <div className="flex shrink-0 items-center gap-2">
@@ -1643,7 +1694,7 @@ function DatabricksIntegrationControl() {
 }
 
 /**
- * Opt-in dispatch for messages sent while the agent is working.
+ * Dispatch for messages sent while the agent is working (on by default).
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
@@ -1658,8 +1709,7 @@ function AlwaysSteerControl() {
         label="Always steer"
         labelId={labelId}
         className="flex-1"
-        description="Send follow-ups straight into the running turn instead of queuing them. The agent folds each one into its current work where the harness supports it, otherwise at the next turn."
-        descriptionClassName="text-ui"
+        description="Send follow-ups into the running turn. Harnesses without steering support use them on the next turn."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1695,7 +1745,6 @@ function ComposerSendShortcutControl() {
             <p>On: Enter inserts a newline and {MOD_KEY}+Enter submits.</p>
           </>
         }
-        descriptionClassName="text-ui"
       />
       <Switch
         aria-labelledby={labelId}
@@ -1714,7 +1763,7 @@ function ComposerSendShortcutControl() {
  * Where a plain click on a web link in chat content opens — desktop shells
  * with the embedded browser only. Off keeps the current behavior (the
  * default external browser); on routes the link into the conversation's
- * in-app Browser tab. Modified clicks always stay external.
+ * in-app browser tabs. Shift-click always stays external.
  */
 function OpenLinksInAppControl() {
   const [enabled, setEnabled] = useState(readOpenLinksInApp);
@@ -1732,8 +1781,7 @@ function OpenLinksInAppControl() {
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
-        description={`Open web links from chat in this conversation's Browser tab instead of your default browser. ${MOD_KEY}+click always opens the external browser.`}
-        descriptionClassName="text-ui"
+        description={`Open chat links in-app, reusing matching tabs. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
       />
       <Switch
         aria-labelledby={labelId}
@@ -1765,8 +1813,7 @@ function BackgroundSessionTitlesControl() {
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
-        description="Generate a concise title in the background after the first message. Turn this off to keep the default session name."
-        descriptionClassName="text-ui"
+        description="Name sessions after the first message. Turn off to keep default names."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1776,6 +1823,39 @@ function BackgroundSessionTitlesControl() {
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.background_session_titles"
+      />
+    </div>
+  );
+}
+
+function OpenSubagentsInPanelControl() {
+  const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    // Sub-agent clicks read the stored value, so only show what was saved.
+    if (writeOpenSubagentsInPanel(next)) setEnabled(next);
+    else toast.error("Couldn't save this setting. Check that your browser allows site storage.");
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Open sub-agents in the Workspace panel"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Open sub-agent chats beside the main chat. On phones, they still open full screen."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="open-subagents-in-panel-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.open_subagents_in_panel"
       />
     </div>
   );
@@ -1816,7 +1896,7 @@ function TerminalClipboardControl() {
           descriptionId={descriptionId}
           description={
             canRemember
-              ? "Controls copying text from all sessions and terminals on this server in this browser or app. Allowing copying also lets terminal programs silently replace your clipboard with text or commands you didn’t intend to paste."
+              ? "Control copying from all sessions and terminals on this server, in this browser or app. Allowing it lets terminal programs silently replace your clipboard with unwanted text or commands."
               : "This connection can’t remember clipboard permissions. You can still allow or block copying for each open terminal."
           }
         />
@@ -1865,6 +1945,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <OpenSubagentsInPanelControl />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />
@@ -1872,6 +1955,11 @@ function GeneralSection() {
         {supportsBrowser() && (
           <SettingsGroup title="Links" testId="settings-group-links">
             <OpenLinksInAppControl />
+          </SettingsGroup>
+        )}
+        {supportsGlobalShortcut() && (
+          <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
+            <GlobalShortcutControl />
           </SettingsGroup>
         )}
       </div>
@@ -1898,8 +1986,7 @@ function DefaultBaseBranchControl() {
       <SettingsLabel
         label="Default base branch"
         className="flex-1"
-        description="Auto-filled as the base when you name a new worktree branch. Leave blank to not auto-fill."
-        descriptionClassName="text-ui"
+        description="Prefill the base branch for new worktree branches. Leave blank for no prefill."
       />
       <Input
         type="text"
@@ -1918,12 +2005,8 @@ function DefaultBaseBranchControl() {
   );
 }
 
-/**
- * UI font size stepper. Maps one of the supported discrete px values into
- * typography tokens via --desktop-ui-font-size (see lib/uiFontPreferences.ts)
- * without resizing layout or icons. The chosen value applies directly on
- * every viewport; only the unset default differs between desktop and mobile.
- */
+/** Interface and conversation font size stepper. Updates --desktop-ui-font-size
+ * without resizing layout or icons. */
 function UiFontSizeControl() {
   // `px` is the committed value: clamped, persisted, and applied to the UI.
   // `draft` is the raw text in the box, kept separate so mid-edit states the
@@ -1931,14 +2014,14 @@ function UiFontSizeControl() {
   // the way to "18") or an empty field while retyping — don't get clamped on
   // every keystroke. We only commit while typing when the draft is already a
   // valid in-range size; blur/Enter clamps and re-syncs the text.
-  const [px, setPx] = useState(() => readUiFontSizePx());
+  const [px, setPx] = useState(() => readAppliedUiFontSizePx());
   const [draft, setDraft] = useState(() => String(px));
 
   useEffect(() => {
     if (typeof window.matchMedia !== "function") return;
     const media = window.matchMedia(UI_FONT_SIZE_MOBILE_QUERY);
     const syncViewportDefault = () => {
-      const next = readUiFontSizePx();
+      const next = readAppliedUiFontSizePx();
       setPx(next);
       setDraft(String(next));
     };
@@ -1972,17 +2055,20 @@ function UiFontSizeControl() {
   // draft reverts to the last committed size rather than a bogus one.
   const commitDraft = useCallback(() => {
     const value = Number(draft);
-    commit(Number.isFinite(value) && draft.trim() !== "" ? value : px);
+    const next = Number.isFinite(value) && draft.trim() !== "" ? clampUiFontSizePx(value) : px;
+    if (next !== px) commit(next);
+    else setDraft(String(px));
   }, [commit, draft, px]);
 
   const atMin = px <= UI_FONT_SIZE_MIN;
   const atMax = px >= UI_FONT_SIZE_MAX;
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+    <div className="flex items-center justify-between gap-6">
       <SettingsLabel
+        className="flex-1"
         label="Interface font size"
-        description="Set text across the interface. Icons and spacing stay fixed."
+        description="Sets interface and conversation text. Icons and spacing stay fixed."
       />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
@@ -1990,7 +2076,7 @@ function UiFontSizeControl() {
         role="group"
         aria-label="Interface font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 shrink-0 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
@@ -2055,44 +2141,40 @@ function UiFontFamilyControl() {
   const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
-      {/* Take the remaining width (and let the longer description wrap within
-          this column) so the input stays inline instead of dropping to its own
-          row — matches the font-size row's alignment. */}
+    <div
+      role="group"
+      aria-label="Font family"
+      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
+    >
       <SettingsLabel
         label="Font family"
-        className="flex-1"
-        description="Use any font installed on this device. Leave blank for the system default."
+        className="md:mr-4"
+        description="Use an installed font. Leave blank for the system default."
       />
-      {/* Reset sits left of the input so the input is the rightmost element and
-          its right edge lines up flush with the font-size stepper above.
-          `invisible` (not removed) at the default keeps the row from shifting. */}
-      <div role="group" aria-label="Font family" className="flex shrink-0 items-center gap-2">
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="ui-font-family-reset"
-          disabled={isDefault}
-          className={cn("h-9", isDefault && "invisible")}
-          onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
-          componentId="settings.appearance.ui_font_family_reset"
-        >
-          Reset
-        </Button>
-        <Input
-          type="text"
-          aria-label="UI font family"
-          data-testid="ui-font-family-input"
-          placeholder="System default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
-          value={family}
-          onChange={(e) => update(e.target.value)}
-        />
-      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        data-testid="ui-font-family-reset"
+        disabled={isDefault}
+        className={cn("h-9", isDefault && "invisible")}
+        onClick={() => update(UI_FONT_FAMILY_DEFAULT)}
+        componentId="settings.appearance.ui_font_family_reset"
+      >
+        Reset
+      </Button>
+      <Input
+        type="text"
+        aria-label="UI font family"
+        data-testid="ui-font-family-input"
+        placeholder="System default"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        className="col-span-2 h-9 w-full md:col-span-1 md:w-56"
+        value={family}
+        onChange={(e) => update(e.target.value)}
+      />
     </div>
   );
 }
@@ -2143,9 +2225,10 @@ function UiCodeFontSizeControl() {
   const atMax = px >= CODE_FONT_SIZE_MAX;
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+    <div className="flex items-center justify-between gap-6">
       <SettingsLabel
         label="Code font size"
+        className="flex-1"
         description="Size of code in the editor and terminal."
       />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
@@ -2154,7 +2237,7 @@ function UiCodeFontSizeControl() {
         role="group"
         aria-label="Code font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 shrink-0 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
@@ -2216,41 +2299,40 @@ function UiCodeFontFamilyControl() {
   const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3">
+    <div
+      role="group"
+      aria-label="Code font family"
+      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
+    >
       <SettingsLabel
         label="Code font family"
-        className="flex-1"
-        description="Font for the code editor and terminal. Leave blank for the default."
+        className="md:mr-4"
+        description="Font for the editor and terminal. Leave blank for the default."
       />
-      {/* Reset sits left of the input so the input's right edge lines up flush
-          with the size stepper above. `invisible` (not removed) at the default
-          keeps the row from shifting. */}
-      <div role="group" aria-label="Code font family" className="flex shrink-0 items-center gap-2">
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          data-testid="code-font-family-reset"
-          disabled={isDefault}
-          className={cn("h-9", isDefault && "invisible")}
-          onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
-          componentId="settings.appearance.code_font_family_reset"
-        >
-          Reset
-        </Button>
-        <Input
-          type="text"
-          aria-label="Code font family"
-          data-testid="code-font-family-input"
-          placeholder="Editor default"
-          spellCheck={false}
-          autoCapitalize="off"
-          autoCorrect="off"
-          className="h-9 w-56"
-          value={family}
-          onChange={(e) => update(e.target.value)}
-        />
-      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        data-testid="code-font-family-reset"
+        disabled={isDefault}
+        className={cn("h-9", isDefault && "invisible")}
+        onClick={() => update(CODE_FONT_FAMILY_DEFAULT)}
+        componentId="settings.appearance.code_font_family_reset"
+      >
+        Reset
+      </Button>
+      <Input
+        type="text"
+        aria-label="Code font family"
+        data-testid="code-font-family-input"
+        placeholder="Editor default"
+        spellCheck={false}
+        autoCapitalize="off"
+        autoCorrect="off"
+        className="col-span-2 h-9 w-full md:col-span-1 md:w-56"
+        value={family}
+        onChange={(e) => update(e.target.value)}
+      />
     </div>
   );
 }
@@ -2269,7 +2351,7 @@ function UiCodeFontWeightControl() {
       <SettingsLabel
         label="Heavier code font"
         className="flex-1"
-        description="Use a slightly heavier font weight in the code editor and terminal."
+        description="Use heavier text in the editor and terminal."
       />
       <Switch
         aria-label="Use heavier code text"
@@ -2364,7 +2446,7 @@ function LocalCliSection() {
   return (
     <Section
       title="Local CLI"
-      description="The Omnigent command-line tool this app uses to run a local server and connect this machine as a runner."
+      description="Run a local server and connect this machine as a runner with the Omnigent CLI."
     >
       <SettingsGroup title="CLI status">
         {status === null ? (
@@ -2397,9 +2479,8 @@ function LocalCliSection() {
               </div>
             ) : (
               <div className="flex flex-col gap-2">
-                <p className="text-ui text-muted-foreground">
-                  The Omnigent CLI wasn't found. Install it, then set its path from the connect
-                  screen:
+                <p className="text-sm text-muted-foreground">
+                  Install the Omnigent CLI, then set its path from the connect screen:
                 </p>
                 {status.installCommand && (
                   <code className="block overflow-x-auto rounded-md border border-border bg-muted/40 px-3 py-2 text-sm">
@@ -2416,9 +2497,8 @@ function LocalCliSection() {
             ) : (
               <>
                 <p className="text-sm text-muted-foreground">
-                  For security, a custom path can only be set from the connect screen — this
-                  prevents a connected server from pointing the app at a different binary. Open it
-                  from the Server menu (Change Server…) and use the settings gear.
+                  Set a custom path from Server → Change Server… → settings gear. This keeps
+                  connected servers from changing the app's CLI binary.
                 </p>
 
                 {status.source === "configured" && (
@@ -2528,10 +2608,7 @@ function UpdatesSection() {
   }
 
   return (
-    <Section
-      title="Updates"
-      description="Desktop app update preferences for this installed Omnigent shell."
-    >
+    <Section title="Updates" description="Manage desktop app updates on this device.">
       {config === null ? (
         <SettingsGroup title="Preferences">
           <p className="text-ui text-muted-foreground">Update settings are unavailable.</p>
@@ -2870,7 +2947,7 @@ function ImportSection() {
   return (
     <Section
       title="Import sessions"
-      description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+      description="Import local chats from a connected machine. Already imported sessions are skipped."
     >
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Import from a machine</h2>
@@ -3005,7 +3082,7 @@ function ArchivedSection() {
   return (
     <Section
       title="Archived sessions"
-      description="Sessions you've archived. Restore one to the sidebar, or delete it for good."
+      description="Restore archived sessions to the sidebar or delete them permanently."
     >
       <div className="mb-4 flex flex-wrap items-center gap-x-6 gap-y-2">
         <div className="flex items-center gap-2">

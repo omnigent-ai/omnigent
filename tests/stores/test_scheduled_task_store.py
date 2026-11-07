@@ -8,6 +8,7 @@ SQLite database.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 import pytest
 
@@ -55,8 +56,13 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        session_mode="continue",
+        session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
+        base_branch="HEAD",
         host_id=_uid("host_abc123"),
+        project_id=_uid("proj_abc"),
+        delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
     )
     assert task.id == _uid("st_1")
     assert task.workspace_id == 0
@@ -69,10 +75,16 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.session_mode == "continue"
+    assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch is None
+    assert task.base_branch == "HEAD"
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
+    assert task.project_id == _uid("proj_abc")
+    assert task.delegation_ref == "workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner"
+    stored = store.get(_uid("st_1"))
+    assert stored is not None and stored.delegation_ref == task.delegation_ref
     assert task.state == "active"
     assert task.last_run_at is None
     assert task.last_run_conversation_id is None
@@ -94,10 +106,13 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.model_override is None
     assert task.reasoning_effort is None
     assert task.permission_mode is None
+    assert task.session_mode == "new"
+    assert task.session_id is None
     assert task.workspace is None
     assert task.base_branch is None
     assert task.execution_target == "connected_host"
     assert task.host_id is None
+    assert task.delegation_ref is None
     assert task.state == "active"
 
 
@@ -196,15 +211,18 @@ def test_update_workspace_explicit_null_clears_it(
         agent_id=_uid("ag"),
         timezone="UTC",
         workspace="/repo",
+        base_branch="HEAD",
         host_id=_uid("h"),
     )
     # Omitting workspace leaves it unchanged.
     unchanged = store.update(_uid("st_ws"), name="renamed")
     assert unchanged is not None and unchanged.workspace == "/repo"
+    assert unchanged.base_branch == "HEAD"
     # Explicit None clears both host and workspace (the managed-switch shape).
-    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None, base_branch=None)
     assert cleared is not None
     assert cleared.workspace is None
+    assert cleared.base_branch is None
     assert cleared.host_id is None
 
 
@@ -750,6 +768,49 @@ def test_update_host_id_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskSto
     fetched = store.get(_uid("st_clear_host"))
     assert fetched is not None
     assert fetched.host_id is None
+
+
+def test_update_project_id_moves_and_clears(store: SqlAlchemyScheduledTaskStore) -> None:
+    store.create(
+        scheduled_task_id=_uid("st_project"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_a"),
+    )
+    moved = store.update(_uid("st_project"), project_id=_uid("proj_b"))
+    assert moved is not None and moved.project_id == _uid("proj_b")
+    untouched = store.update(_uid("st_project"), name="renamed")
+    assert untouched is not None and untouched.project_id == _uid("proj_b")
+    store.update(_uid("st_project"), project_id=None)
+    fetched = store.get(_uid("st_project"))
+    assert fetched is not None and fetched.project_id is None
+
+
+def test_clear_project_id_only_clears_the_expected_project(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    store.create(
+        scheduled_task_id=_uid("st_clear_project"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=_uid("proj_new"),
+    )
+    # The task was moved off the stale project, so the conditional clear is a no-op.
+    assert store.clear_project_id(_uid("st_clear_project"), _uid("proj_stale")) is False
+    kept = store.get(_uid("st_clear_project"))
+    assert kept is not None and kept.project_id == _uid("proj_new")
+
+    assert store.clear_project_id(_uid("st_clear_project"), _uid("proj_new")) is True
+    cleared = store.get(_uid("st_clear_project"))
+    assert cleared is not None and cleared.project_id is None
 
 
 def test_update_overrides_can_be_cleared_to_null(store: SqlAlchemyScheduledTaskStore) -> None:
@@ -1485,6 +1546,101 @@ def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
     )
 
 
+def test_recovery_records_a_session_that_already_finished(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    # Only recovery can tell that a session finished before startup was recorded.
+    with pytest.raises(ValueError, match="An executor records 'succeeded'"):
+        store.transition_starting_run(run, now=lambda: now + 30, status="succeeded")
+    succeeded = store.transition_starting_run(
+        run, now=lambda: now + 120, status="succeeded", expired=True
+    )
+    assert succeeded.status == "succeeded"
+    assert succeeded.finished_at == now + 120
+    assert succeeded.lease_expires_at is None
+    assert store.list_expired_starting_runs(now + 300) == []
+
+
+def test_run_now_requests_wait_as_pending_runs_until_claimed(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    paused = store.update(task.id, state="paused")
+    now = task.created_at + 10
+    first, second = (
+        store.request_manual_run(paused, now=now, trigger_key=key, host_id=paused.host_id)
+        for key in ("manual:first", "manual:second")
+    )
+    assert (first.status, first.fired_at, first.lease_expires_at) == ("scheduled", None, None)
+    assert (first.trigger_key, first.host_id) == ("manual:first", paused.host_id)
+    page = store.list_pending_runs(limit=1)
+    rest = store.list_pending_runs(after=(page[0].workspace_id, page[0].id))
+    assert sorted(run.id for run in [*page, *rest]) == sorted([first.id, second.id])
+
+    # Run now is a manual override, so a paused task still starts.
+    claimed_task, claimed = store.claim_pending_run(first, now=now + 5, lease_seconds=120)
+    assert (claimed_task.id, claimed_task.state) == (task.id, "paused")
+    assert (claimed.status, claimed.fired_at, claimed.lease_expires_at) == (
+        "starting",
+        now + 5,
+        now + 125,
+    )
+    assert store.claim_pending_run(first, now=now + 6, lease_seconds=120) is None
+    assert [run.id for run in store.list_pending_runs()] == [second.id]
+    assert store.list_expired_starting_runs(now + 125) == [claimed]
+
+
+def test_run_now_requests_for_a_deleted_task_never_start(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.created_at + 10
+    pending = store.request_manual_run(task, now=now, trigger_key="manual:a", host_id=None)
+    # A deletion that has not purged history yet: the claim records the skip.
+    store.update(task.id, state="deleted")
+    assert store.claim_pending_run(pending, now=now + 1, lease_seconds=120) is None
+    assert store.list_pending_runs() == []
+    assert store.get(task.id) is None
+    assert store.request_manual_run(task, now=now, trigger_key="manual:b", host_id=None) is None
+
+
+def test_run_now_request_follows_a_target_change_before_its_claim(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from omnigent.server.scheduled.schedule import sandbox_host_id
+
+    task = _due_task(store)
+    now = task.created_at + 10
+    pending = store.request_manual_run(task, now=now, trigger_key="manual:a", host_id=task.host_id)
+    store.update(task.id, execution_target="managed_sandbox", host_id=None, workspace=None)
+    # The request moves to its new sandbox host and waits for that host's owner.
+    assert store.claim_pending_run(pending, now=now + 1, lease_seconds=120) is None
+    [moved] = store.list_pending_runs()
+    assert moved.host_id == sandbox_host_id(task.id, task.workspace_id, "manual:a")
+    claimed_task, claimed = store.claim_pending_run(moved, now=now + 2, lease_seconds=120)
+    assert claimed_task.execution_target == "managed_sandbox"
+    assert (claimed.status, claimed.host_id) == ("starting", moved.host_id)
+
+
+def test_switching_to_legacy_timers_skips_pending_run_now_requests(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    pending = store.request_manual_run(
+        task, now=task.created_at + 10, trigger_key="manual:a", host_id=task.host_id
+    )
+    store.reset_dispatch_cursors()
+    assert store.list_pending_runs() == []
+    [run] = store.list_runs(task.id)[0]
+    assert (run.id, run.status, run.error_code) == (pending.id, "skipped", "dispatch_disabled")
+    assert store.claim_pending_run(pending, now=task.created_at + 11, lease_seconds=120) is None
+
+
 def test_schedule_edits_and_run_now_metadata(store: SqlAlchemyScheduledTaskStore) -> None:
     task = _due_task(store)
     assert task.next_run_at > task.created_at
@@ -1927,3 +2083,452 @@ def test_deleted_cleanup_passes_failing_task_and_retries_on_next_scan(
     assert attempted[2:] == retried_workspaces
     with workspace_scope(31):
         assert store.get(tasks[0].id) is None
+
+
+def test_final_claim_completes_schedule_and_schedule_edits_reopen_it(store):
+    task = _due_task(store, "finishing")
+    now = task.next_run_at
+    assert store.claim_scheduled_run(
+        task, now=now, next_run_at=None, host_id=task.host_id, lease_seconds=120
+    )
+    completed = store.get(task.id)
+    assert (completed.state, completed.next_run_at, completed.updated_at) == (
+        "completed",
+        None,
+        now,
+    )
+    assert store.list_uninitialized_tasks() == []
+    assert store.list_due_tasks(now + 7200) == []
+    assert store.update(task.id, prompt="edited").state == "completed"
+    # Resuming re-evaluates the rule; this one still has future occurrences.
+    resumed = store.update(task.id, state="active")
+    assert resumed.state == "active" and resumed.next_run_at is not None
+
+    exhausted = store.update(task.id, rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
+    assert (exhausted.state, exhausted.next_run_at) == ("completed", None)
+    assert store.update(task.id, state="active").state == "completed"
+    assert store.update(task.id, state="paused").state == "paused"
+    assert store.update(task.id, state="active").state == "completed"
+    reopened = store.update(task.id, rrule="FREQ=DAILY")
+    assert reopened.state == "active" and reopened.next_run_at is not None
+
+    # A time zone edit also re-evaluates a completed schedule.
+    store.update(task.id, rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=30")
+    daily = store.get(task.id)
+    assert store.claim_scheduled_run(
+        daily, now=daily.next_run_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
+    )
+    assert store.get(task.id).state == "completed"
+    retimed = store.update(task.id, timezone="America/New_York")
+    assert retimed.state == "active" and retimed.next_run_at not in (None, daily.next_run_at)
+
+    # A schedule that has already ended is completed as soon as it is created.
+    ended = store.create(
+        _uid("ended_at_creation"),
+        "ended",
+        "prompt",
+        "FREQ=HOURLY;UNTIL=20200101T000000Z",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+    )
+    assert (ended.state, ended.next_run_at) == ("completed", None)
+
+    # Legacy timers never complete schedules; an edit returns the task to them.
+    store.update(task.id, rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
+    store.configure_dispatch(False)
+    legacy = store.update(task.id, rrule="FREQ=DAILY")
+    assert (legacy.state, legacy.next_run_at) == ("active", None)
+    legacy = store.update(task.id, rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
+    assert (legacy.state, legacy.next_run_at) == ("active", None)
+
+
+def test_final_claim_of_recorded_occurrence_still_completes_schedule(store):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    task = _due_task(store, "recorded_final")
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    # A stale cursor revisits the recorded occurrence, which is now the final one.
+    with store._session_immediate("test_revisited_final_occurrence") as session:
+        session.execute(
+            update(SqlScheduledTask).where(SqlScheduledTask.id == task.id).values(next_run_at=now)
+        )
+    assert (
+        store.claim_scheduled_run(
+            store.get(task.id), now=now, next_run_at=None, host_id=task.host_id, lease_seconds=120
+        )
+        is None
+    )
+    completed = store.get(task.id)
+    assert (completed.state, completed.next_run_at) == ("completed", None)
+    assert store.list_runs(task.id)[0] == [run]
+
+
+def test_schedule_completion_does_not_overwrite_edits_or_other_workspace(store, monkeypatch):
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store.configure_dispatch(False)
+    created = store.create(
+        _uid("ended"),
+        "ended",
+        "prompt",
+        "FREQ=HOURLY;UNTIL=20200101T000000Z",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+    )
+    store.configure_dispatch(True)
+    snapshot = store.get(created.id)
+    with workspace_scope(42):
+        assert not store.complete_schedule(snapshot)
+    store.update(created.id, prompt="edited")
+    assert not store.complete_schedule(snapshot)
+    edited = store.get(created.id)
+    assert edited.state == "active"
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: edited.updated_at + 60)
+    assert store.complete_schedule(edited)
+    completed = store.get(created.id)
+    assert (completed.state, completed.updated_at) == ("completed", edited.updated_at + 60)
+    assert not store.complete_schedule(completed)
+
+
+def _session_task(store: SqlAlchemyScheduledTaskStore, seed: str, **kwargs: Any):
+    return store.create(
+        scheduled_task_id=_uid(seed),
+        name=seed,
+        prompt="continue",
+        rrule="FREQ=DAILY",
+        user_id="bob@example.com",
+        agent_id=_uid(f"ag_{seed}"),
+        timezone="UTC",
+        **kwargs,
+    )
+
+
+def test_adopting_a_session_pins_its_host_only_on_an_unpinned_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    unpinned = _session_task(store, "st_pin_none", session_mode="continue")
+    assert (
+        store.adopt_session(unpinned.id, _uid("c1"), snapshot=unpinned, host_id=_uid("h1"))
+        == "adopted"
+    )
+    assert store.get(unpinned.id).host_id == _uid("h1")
+
+    pinned = _session_task(store, "st_pin_kept", session_mode="continue", host_id=_uid("h0"))
+    assert (
+        store.adopt_session(pinned.id, _uid("c2"), snapshot=pinned, host_id=_uid("h1"))
+        == "adopted"
+    )
+    assert store.get(pinned.id).host_id == _uid("h0")
+
+
+def test_update_sets_and_clears_the_continued_session(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Omitting ``session_id`` leaves it; ``None`` clears it."""
+    task = _session_task(store, "st_continue")
+    picked = store.update(task.id, session_mode="continue", session_id=_uid("conv_picked"))
+    assert picked is not None
+    assert (picked.session_mode, picked.session_id) == ("continue", _uid("conv_picked"))
+    renamed = store.update(task.id, name="still continuing")
+    assert renamed is not None and renamed.session_id == _uid("conv_picked")
+    cleared = store.update(task.id, session_id=None)
+    assert cleared is not None
+    assert (cleared.session_mode, cleared.session_id) == ("continue", None)
+    back_to_new = store.update(task.id, session_mode="new")
+    assert back_to_new is not None and back_to_new.session_mode == "new"
+
+
+def test_release_session_clears_only_the_session_it_was_given(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_release", session_mode="continue")
+    assert store.adopt_session(task.id, _uid("c1"), snapshot=task) == "adopted"
+    before = store.get(task.id)
+
+    # Another run replaced it, or the caller was looking at a stale id: no change.
+    assert store.release_session(task.id, _uid("other")) is False
+    assert store.get(task.id).session_id == _uid("c1")
+
+    assert store.release_session(task.id, _uid("c1")) is True
+    after = store.get(task.id)
+    assert after.session_id is None
+    # Housekeeping, not an edit: a firing compares updated_at with its own read.
+    assert after.updated_at == before.updated_at
+    assert store.release_session(task.id, _uid("c1")) is False
+    assert store.release_session(_uid("missing"), _uid("c1")) is False
+
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
+
+    # A deleted task releases nothing.
+    store.delete(task.id)
+    assert store.release_session(task.id, _uid("c2")) is False
+
+
+def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent run, pick or edit wins over the first run's session."""
+    new_mode = _session_task(store, "st_adopt_new")
+    assert store.adopt_session(new_mode.id, _uid("c1"), snapshot=new_mode) == "stale"
+    assert store.get(new_mode.id).session_id is None
+
+    continuing = _session_task(store, "st_adopt", session_mode="continue")
+    snapshot = store.get(continuing.id)
+    assert store.adopt_session(continuing.id, _uid("c1"), snapshot=snapshot) == "adopted"
+    adopted = store.get(continuing.id)
+    assert adopted.session_id == _uid("c1")
+    # A second first run from the same snapshot finds the session already recorded.
+    assert store.adopt_session(continuing.id, _uid("c2"), snapshot=snapshot) == "taken"
+    assert store.get(continuing.id).session_id == _uid("c1")
+
+    # An edit in the same second as the snapshot is still caught, for every
+    # setting the session was created with and keeps. The clock is frozen so
+    # updated_at cannot tell the edit apart.
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000)
+    for name, value in (
+        ("workspace", "/elsewhere"),
+        ("base_branch", "HEAD"),
+        ("model_override", "claude-opus"),
+        ("reasoning_effort", "high"),
+        ("permission_mode", "acceptEdits"),
+        ("project_id", _uid("proj")),
+    ):
+        edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")
+        store.update(edited.id, name="renamed")
+        before_edit = store.get(edited.id)
+        store.update(edited.id, **{name: value})
+        assert store.get(edited.id).updated_at == before_edit.updated_at, name
+        assert store.adopt_session(edited.id, _uid(f"c3{name}"), snapshot=before_edit) == (
+            "stale"
+        ), name
+        assert store.get(edited.id).session_id is None, name
+
+    store.delete(continuing.id)
+    assert store.adopt_session(continuing.id, _uid("c4"), snapshot=adopted) == "stale"
+
+
+def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    delivered = store.transition_starting_run(
+        run, now=lambda: now + 30, status="succeeded", conversation_id=_uid("c1")
+    )
+    assert (delivered.status, delivered.conversation_id) == ("succeeded", _uid("c1"))
+    assert delivered.finished_at == now + 30
+    assert delivered.lease_expires_at is None
+
+
+@pytest.mark.parametrize("state", ["active", "paused"])
+@pytest.mark.parametrize(
+    "latest_status, conversation_id",
+    [("failed", _uid("session")), ("starting", None), ("running", None), ("succeeded", None)],
+    ids=["linked-failure", "starting", "running", "succeeded"],
+)
+def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status, conversation_id):
+    task = _session_task(store, "inbox", state=state)
+    run_id = _uid("inbox-failure")
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private error must not be returned",
+    )
+    failures, cursor = store.list_inbox_failures(owner_user_id=task.user_id)
+    assert cursor is None
+    assert [item.run_id for item in failures] == [run_id]
+    assert failures[0].error_code == "host_offline"
+    assert not hasattr(failures[0], "error")
+    assert not hasattr(failures[0], "prompt")
+
+    # Each newer state independently replaces the visible sessionless failure.
+    store.create_run(
+        run_id=_uid("latest"),
+        scheduled_task_id=task.id,
+        status=latest_status,
+        scheduled_at=200,
+        conversation_id=conversation_id,
+    )
+    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+
+
+def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.db.db_models import SqlScheduledTask
+
+    tasks = [_session_task(store, f"inbox-page-{i}") for i in range(4)]
+    for task in tasks:
+        store.create_run(
+            run_id=_uid(task.id),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            error_code="no_online_host",
+        )
+    ordered = sorted(tasks, key=lambda task: (task.created_at, task.id), reverse=True)
+    with store._session("test_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[0].id)).state = 3  # deleted, retained history
+        session.get(SqlScheduledTask, (0, ordered[1].id)).account_generation = "old"
+    # Post-page filtering must still advance through empty pages.
+    first, cursor = store.list_inbox_failures(owner_user_id=tasks[0].user_id, limit=1)
+    assert first == [] and cursor is not None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        second, next_cursor = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id,
+            generation="current",
+            check_generation=True,
+            after=cursor,
+            limit=1,
+        )
+    assert second == [] and next_cursor is not None and next_cursor != cursor
+    remaining, final = store.list_inbox_failures(
+        owner_user_id=tasks[0].user_id,
+        after=next_cursor,
+        limit=2,
+    )
+    assert [item.task_id for item in remaining] == [task.id for task in ordered[2:]]
+    assert final is None
+    assert store.list_inbox_failures(owner_user_id="someone-else") == ([], None)
+    assert store.list_inbox_failures(owner_user_id=None) == ([], None)
+    with store._session("test_matching_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[2].id)).account_generation = "current"
+        session.get(SqlScheduledTask, (0, ordered[3].id)).user_id = None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        matching, _ = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id, generation="current", check_generation=True
+        )
+    assert [item.task_id for item in matching] == [ordered[2].id]
+    local, _ = store.list_inbox_failures(owner_user_id=None)
+    assert [item.task_id for item in local] == [ordered[3].id]
+    with workspace_scope(99):
+        assert store.list_inbox_failures(owner_user_id=tasks[0].user_id) == ([], None)
+
+
+def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
+    from sqlalchemy import event
+
+    task = _session_task(store, "inbox-plan")
+    store.create_run(
+        run_id=_uid("plan-run"), scheduled_task_id=task.id, scheduled_at=100, status="failed"
+    )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list_inbox_failures(owner_user_id=task.user_id, limit=1)
+        store.list_inbox_failures(
+            owner_user_id=task.user_id, after=(task.created_at + 1, task.id), limit=1
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 4
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            index = (
+                "ix_scheduled_task_runs_scheduled_task_id"
+                if "FROM scheduled_task_runs" in statement
+                else "ix_scheduled_tasks_user_scope"
+            )
+            assert index in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
+            assert "LIMIT" in statement
+
+
+@pytest.mark.parametrize("returned_owner", ["OWNER", "owner ", "ownér"])
+def test_inbox_rechecks_exact_owner_before_reading_runs(store, monkeypatch, returned_owner):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # Simulate rows already matched by a case/accent-insensitive SQL collation.
+    candidate = SimpleNamespace(id=_uid("candidate"), created_at=100, user_id=returned_owner)
+    session = MagicMock()
+    session.execute.return_value.all.return_value = [candidate, candidate]
+    session_context = MagicMock()
+    session_context.return_value.__enter__.return_value = session
+    monkeypatch.setattr(store, "_session", session_context)
+    assert store.list_inbox_failures(owner_user_id="owner", limit=1) == (
+        [],
+        (candidate.created_at, candidate.id),
+    )
+    assert session.execute.call_count == 1  # Rejected owners never trigger run reads.
+
+
+def test_inbox_mysql_deep_page_seeks_to_cursor(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTask),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "workspace_id": 0,
+                    "user_id": "plan-owner",
+                    "name": "Report",
+                    "prompt": "Report",
+                    "rrule": "FREQ=DAILY",
+                    "agent_id": _uid("agent"),
+                    "created_at": index // 10,
+                }
+                for index in range(10_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_tasks").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_tasks."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        failures, cursor = store.list_inbox_failures(
+            owner_user_id="plan-owner", after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert failures == [] and cursor == (95, f"{955:032x}")
+    assert len(plans) == 1
+    assert "Index range scan" in plans[0] and "ix_scheduled_tasks_user_scope" in plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]

@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from omnigent.harnesses.codex_native import skill_discovery
+from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 from omnigent.spec.skill_sources import SkillSourceContext, resolve_harness_skills
 from tests._helpers.codex_plugins import install_codex_plugin
 
@@ -24,7 +26,16 @@ async def test_catalog_query_closes_client_and_process(
     start = AsyncMock()
     stop = AsyncMock()
     client = Mock(connect=AsyncMock(), close=AsyncMock(), request=AsyncMock())
-    client.request.return_value = {"result": {"data": [{"skills": [{"name": "plugin:skill"}]}]}}
+    client.request.return_value = {
+        "result": {
+            "data": [
+                {
+                    "skills": [{"name": "plugin:skill"}],
+                    "errors": [{"path": "/test/config.toml", "message": "bad config"}],
+                }
+            ]
+        }
+    }
     if isinstance(failure, ValueError):
         client.request.return_value = {"result": {"data": None}}
     elif failure is not None:
@@ -35,9 +46,11 @@ async def test_catalog_query_closes_client_and_process(
     monkeypatch.setattr(skill_discovery, "CodexAppServerClient", Mock(return_value=client))
 
     if failure is None:
-        assert skill_discovery.loaded_codex_skills("/test/codex", tmp_path, tmp_path) == [
-            {"name": "plugin:skill"}
-        ]
+        errors: list[str] = []
+        assert skill_discovery.loaded_codex_skills(
+            "/test/codex", tmp_path, tmp_path, errors=errors
+        ) == [{"name": "plugin:skill"}]
+        assert errors == ["/test/config.toml: bad config"]
     else:
         with pytest.raises(type(failure)):
             skill_discovery.loaded_codex_skills("/test/codex", tmp_path, tmp_path)
@@ -109,3 +122,75 @@ def test_installed_plugin_survives_marketplace_failure(
     assert selected_version() == "local"
     config.write_text("")
     assert selected_version() is None
+    # An unreadable config fails `plugin list`. Codex 0.158 and later still answer
+    # skills/list and report the failure in its errors; 0.142 rejects the request.
+    # Either way the menu must say the plugin skills are missing.
+    config.write_text(f'{enabled_config}model = "unterminated\n')
+    warnings: list[str] = []
+    broken = SkillSourceContext(
+        (workspace,), tmp_path, "all", None, codex_home=home, warnings=warnings
+    )
+    assert resolve_harness_skills(broken, "codex-native") == []
+    failed = "`codex plugin list` exited 1 and `codex app-server`"
+    assert warnings in (
+        [
+            f"Codex plugin skills may be incomplete: {failed} reported errors loading skills; "
+            "see the host log for details."
+        ],
+        [
+            f"Codex plugin skills unavailable: {failed} could not list skills; "
+            "see the host log for details."
+        ],
+    )
+
+
+def test_menu_matches_codex_repo_skill_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    codex = os.environ.get("OMNIGENT_CODEX_PATH") or shutil.which("codex")
+    if not codex:
+        pytest.skip("Codex CLI required for the real skill-precedence contract")
+    home = tmp_path / "home"
+    codex_home = home / ".codex"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    workspace.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    repo_skills = repo / ".agents" / "skills"
+    copies = [
+        repo_skills / "dup",
+        codex_home / "skills" / "dup",
+        home / ".agents" / "skills" / "dup",
+    ]
+    for skill_dir in [*copies, repo_skills / "repo-only"]:
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {skill_dir.name}\ndescription: {skill_dir}\n---\nbody\n"
+        )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+
+    def codex_skill_dirs(launch_home: Path, name: str) -> list[Path]:
+        loaded = skill_discovery.loaded_codex_skills(codex, launch_home, workspace)
+        return [Path(skill["path"]).parent for skill in loaded if skill["name"] == name]
+
+    # Codex lists every same-named copy and ranks the repo copy above the user ones.
+    listed = codex_skill_dirs(codex_home, "dup")
+    assert sorted(listed) == sorted(copy.resolve() for copy in copies)
+    assert listed[0] == copies[0].resolve()
+    ctx = SkillSourceContext((workspace,), home, "all", None, codex_home=codex_home)
+    for harness in ("codex", "codex-native"):
+        menu = {skill.name: skill.skill_dir for skill in resolve_harness_skills(ctx, harness)}
+        assert menu["dup"].resolve() == listed[0]
+
+    # A "none" launch links nothing, yet Codex still loads the repo skills.
+    private_home = tmp_path / "private-codex-home"
+    private_home.mkdir()
+    populate_codex_skills_from_bundle(private_home, None, "none")
+    assert codex_skill_dirs(private_home, "repo-only") == [(repo_skills / "repo-only").resolve()]
+    unfiltered = replace(ctx, skills_filter="none")
+    for harness in ("codex", "codex-native"):
+        assert {skill.name for skill in resolve_harness_skills(unfiltered, harness)} == {
+            "dup",
+            "repo-only",
+        }

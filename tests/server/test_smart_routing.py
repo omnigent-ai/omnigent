@@ -173,7 +173,7 @@ def test_model_lists_cover_current_claude_generations() -> None:
     """A stale list turns a live model into an unservable arm (sonnet-5 → haiku)."""
     models = infer_models("claude-sdk")
     assert models is not None
-    assert "databricks-claude-sonnet-5" in models
+    assert "system.ai.claude-sonnet-5" in models
 
 
 def test_substitute_model_applies_the_pick_when_the_catalog_serves_it() -> None:
@@ -409,6 +409,34 @@ async def test_llm_routing_client_returns_none_on_error() -> None:
     assert models is not None
     result = await client.route("hello", {"claude-sdk": models})
     assert result is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_text", "expected_error"),
+    [
+        ("null", "routing judge returned a non-object verdict"),
+        ("[]", "routing judge returned a non-object verdict"),
+        ('"model"', "routing judge returned a non-object verdict"),
+        ("1", "routing judge returned a non-object verdict"),
+        ("true", "routing judge returned a non-object verdict"),
+        ("{", "routing judge call failed:"),
+    ],
+)
+async def test_llm_routing_client_rejects_invalid_verdict_shape(
+    response_text: str, expected_error: str
+) -> None:
+    llm = _FakeLLMClient({})
+    response = _FakeResponse(
+        output=[_FakeMessageOutput(content=[_FakeOutputText(text=response_text)])]
+    )
+    with patch.object(llm, "create", return_value=response):
+        client = LLMRoutingClient(llm)
+        result = await client.route("hello", {"claude-sdk": _TEST_MODELS["claude-sdk"]})
+
+    assert result is None
+    assert client.last_error is not None
+    assert client.last_error.startswith(expected_error)
 
 
 # ── fetch_runner_models ────────────────────────────────────────────
@@ -712,7 +740,7 @@ async def test_route_turn_offers_and_applies_a_glm_pick_on_codex() -> None:
             ]
         }
     ]
-    assert model == "databricks-glm-5-2"
+    assert model == "system.ai.glm-5-2"
 
 
 @pytest.mark.asyncio
@@ -737,7 +765,7 @@ async def test_route_turn_falls_back_to_static_when_runner_unavailable() -> None
             runner_client=mock_client,
         )
     # Still routes — fell back to the static infer_models table.
-    assert model == "databricks-claude-haiku-4-5"
+    assert model == "system.ai.claude-haiku-4-5"
 
 
 # ── ExternalRoutingClient ─────────────────────────────────────────────
@@ -1430,6 +1458,140 @@ async def test_an_ordinary_404_is_not_latched() -> None:
     with _patch_httpx(httpx.MockTransport(handler)):
         assert await client.route("hi", {"h": ["m"]}) is None
     assert client.permanently_unavailable is False
+
+
+# The gateway relaying that the router's own extraction call 404d: its
+# selection model (unset here, so the frozen default) is not served.
+_SELF_CALL_404_BODY = {
+    "error_code": "ENDPOINT_NOT_FOUND",
+    "message": (
+        'responses self-call returned status 404: {"error_code":"ENDPOINT_NOT_FOUND",'
+        '"message":"The given endpoint does not exist, please retry after checking '
+        'the specified model and version deployment exists."}'
+    ),
+}
+
+
+def test_router_permanently_disabled_matches_the_self_call_config_404() -> None:
+    """A relayed self-call 404 is configuration; anything else is retriable."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    assert router_permanently_disabled(404, json.dumps(_SELF_CALL_404_BODY)) is True
+    # Only a 404 answer carries the config shape; the same body elsewhere isn't one.
+    assert router_permanently_disabled(200, json.dumps(_SELF_CALL_404_BODY)) is False
+    # The extraction model erroring out is an outage, not configuration.
+    flaky = {"message": "responses self-call returned status 500: upstream overloaded"}
+    assert router_permanently_disabled(404, json.dumps(flaky)) is False
+
+
+def test_a_relayed_transient_self_call_4xx_is_not_latched() -> None:
+    """Only a relayed 404 proves the selection model is unserved; a relayed
+    rate limit, timeout, or request-specific error may clear on its own."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    for inner in (
+        "responses self-call returned status 429: too many requests",
+        "responses self-call returned status 408: request timeout",
+        "responses self-call returned status 400: bad request",
+    ):
+        assert router_permanently_disabled(404, json.dumps({"message": inner})) is False
+
+
+def test_the_self_call_404_is_read_from_the_gateways_own_message() -> None:
+    """The relayed 404 is read from the gateway's own message, including a
+    nested ``error.message``; the phrase quoted in another field, a longer
+    status, or a non-dict body does not latch, and a plain-text relay is its
+    own message."""
+    from omnigent.server.smart_routing import router_permanently_disabled
+
+    quoted = {"message": "no route", "details": _SELF_CALL_404_BODY["message"]}
+    assert router_permanently_disabled(404, json.dumps(quoted)) is False
+    longer = {"message": "responses self-call returned status 4040: odd"}
+    assert router_permanently_disabled(404, json.dumps(longer)) is False
+    array_body = json.dumps([_SELF_CALL_404_BODY["message"]])
+    assert router_permanently_disabled(404, array_body) is False
+    nested = {"error": {"message": _SELF_CALL_404_BODY["message"]}}
+    assert router_permanently_disabled(404, json.dumps(nested)) is True
+    assert router_permanently_disabled(404, _SELF_CALL_404_BODY["message"]) is True
+
+
+@pytest.mark.asyncio
+async def test_a_relayed_self_call_429_is_retried_on_the_next_turn() -> None:
+    """A rate-limited extraction call must not disable routing for the process."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(
+            404, json={"message": "responses self-call returned status 429: rate limited"}
+        )
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is False
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 2
+    assert client.permanently_unavailable is False
+
+
+@pytest.mark.asyncio
+async def test_an_unserved_selection_model_404_is_latched_and_asked_exactly_once() -> None:
+    """The self-call config 404 recurs identically, so it must latch like the
+    account-level one, with the config knob named in the reason."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    served = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        nonlocal served
+        served += 1
+        return httpx.Response(404, json=_SELF_CALL_404_BODY)
+
+    client = ExternalRoutingClient(base_url="https://host/v1", router_name="task_v1")
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+        assert client.permanently_unavailable is True
+        assert await client.route("hi again", {"h": ["m"]}) is None
+    assert served == 1
+    # The reason survives the short circuit and says how to fix it.
+    assert client.last_error is not None
+    assert "routing.selection_model" in client.last_error
+    assert "default selection model" in client.last_error
+    assert "restart the server" in client.last_error
+    assert "404" in client.last_error
+
+
+@pytest.mark.asyncio
+async def test_a_latched_selection_model_error_names_the_pinned_model() -> None:
+    """With ``selection_model`` set, the latched reason blames that model."""
+    import httpx
+
+    from omnigent.server.smart_routing import ExternalRoutingClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        del request
+        return httpx.Response(404, json=_SELF_CALL_404_BODY)
+
+    client = ExternalRoutingClient(
+        base_url="https://host/v1",
+        router_name="task_v1",
+        selection_model="system.ai.absent-model",
+    )
+    with _patch_httpx(httpx.MockTransport(handler)):
+        assert await client.route("hi", {"h": ["m"]}) is None
+    assert client.permanently_unavailable is True
+    assert client.last_error is not None
+    assert "system.ai.absent-model" in client.last_error
 
 
 def test_router_error_detail_unwraps_nested_message() -> None:
@@ -2443,9 +2605,9 @@ def test_infer_models_takes_the_current_generation_arms_from_the_settings() -> N
         models = infer_models("codex")
     assert models is not None
     assert models[-1] == "databricks-acme-1"
-    assert "databricks-glm-5-2" not in models
+    assert "system.ai.glm-5-2" not in models
     # The curated cost/capability spread is not a deployment knob.
-    assert models[0] == "databricks-gpt-5-4-nano"
+    assert models[0] == "system.ai.gpt-5-4-nano"
 
 
 def test_task_v1_claude_arms_follows_a_configured_menu() -> None:
@@ -2773,7 +2935,7 @@ async def test_route_turn_substitutes_a_model_the_harness_gateway_bars() -> None
     with patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)):
         model, verdict = await route_turn("pi", "quick lookup")
     # haiku 400s on pi's completions path; the claude fallback (sonnet-5) does not.
-    assert model == "databricks-claude-sonnet-5"
+    assert model == "system.ai.claude-sonnet-5"
     assert verdict is not None and verdict["raw_model"] == "claude-haiku-4-5"
 
 
@@ -2957,7 +3119,7 @@ async def test_route_turn_keeps_the_rationale_off_info(
         patch("omnigent.runtime._globals._caps", new=FakeCaps(routing_client=client)),
     ):
         model, _verdict = await route_turn("codex", "hello")
-    assert model == "databricks-gpt-5-4"
+    assert model == "system.ai.gpt-5-4"
     assert "secret prompt paraphrase" not in caplog.text
 
 
@@ -2980,10 +3142,9 @@ async def test_route_session_harness_keeps_the_rationale_off_info(
 # ── Router source selection ─────────────────────────────────────────────────
 #
 # Gateway backing selects WHICH router answers, not whether Smart Routing is
-# offered. Off the gateway the external client's ``databricks-*`` picks are
-# unreachable from the pane, so the built-in judge answers instead — and the
-# static ``infer_models`` table, which is nothing but ``databricks-*`` ids, must
-# not be offered as candidates at all.
+# offered. Off the gateway the external client's UC model picks are unreachable
+# from the pane, so the built-in judge answers instead — and the static
+# ``infer_models`` table must not be offered as candidates at all.
 
 
 def _both_backends(external: FakeRoutingClient, local: FakeRoutingClient) -> RoutingBackends:
@@ -3081,9 +3242,9 @@ async def test_route_turn_picks_the_router_gateway_backing_allows(
     assert verdict is not None
     assert verdict["router_source"] == expected_source
     if gateway_backed:
-        assert (model, local.offered) == ("databricks-gpt-5-4", [])
+        assert (model, local.offered) == ("system.ai.gpt-5-4", [])
     else:
-        assert (model, external.offered) == ("databricks-gpt-5-5", [])
+        assert (model, external.offered) == ("system.ai.gpt-5-5", [])
 
 
 @pytest.mark.asyncio

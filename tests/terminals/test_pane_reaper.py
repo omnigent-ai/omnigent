@@ -28,6 +28,7 @@ from omnigent.terminals.pane_reaper import (
     NativePaneReaper,
     PaneRef,
     resolve_native_pane_idle_timeout_s,
+    resolve_sub_agent_pane_idle_timeout_s,
 )
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -153,25 +154,54 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
-def test_resolve_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_default_when_unset(
+    monkeypatch: pytest.MonkeyPatch, default_timeout_s: float
+) -> None:
     monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
-    assert resolve_native_pane_idle_timeout_s() == float(_DEFAULT_IDLE_TIMEOUT_S)
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
 
 
-def test_resolve_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_reads_env(monkeypatch: pytest.MonkeyPatch, default_timeout_s: float) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, "120")
-    assert resolve_native_pane_idle_timeout_s() == 120.0
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == 120.0
 
 
-def test_resolve_zero_disables(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_zero_disables(monkeypatch: pytest.MonkeyPatch, default_timeout_s: float) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, "0")
-    assert resolve_native_pane_idle_timeout_s() == 0.0
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == 0.0
 
 
 @pytest.mark.parametrize("bad", ["abc", "-5", ""])
-def test_resolve_invalid_falls_back(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+def test_resolve_invalid_falls_back(
+    monkeypatch: pytest.MonkeyPatch, bad: str, default_timeout_s: float
+) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, bad)
-    assert resolve_native_pane_idle_timeout_s() == float(_DEFAULT_IDLE_TIMEOUT_S)
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
+
+
+@pytest.mark.parametrize(
+    ("env", "session_timeout_s", "expected"),
+    [
+        (None, 86400.0, _DEFAULT_IDLE_TIMEOUT_S),
+        (None, 600.0, 600.0),
+        (None, 0.0, 0.0),
+        ("120", 86400.0, 120.0),
+        ("7200", 7200.0, 7200.0),
+        ("0", 0.0, 0.0),
+    ],
+)
+def test_resolve_sub_agent_window_caps_session_window_at_native_default(
+    monkeypatch: pytest.MonkeyPatch, env: str | None, session_timeout_s: float, expected: float
+) -> None:
+    if env is None:
+        monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(_IDLE_TIMEOUT_ENV, env)
+    assert resolve_sub_agent_pane_idle_timeout_s(session_timeout_s) == expected
 
 
 # ── Loop smoke (start/shutdown + disable) ───────────────────────────────────
@@ -194,7 +224,7 @@ async def test_loop_reaps_idle_pane() -> None:
 
 async def test_loop_disabled_when_timeout_non_positive() -> None:
     f = _Fakes()
-    f.panes = [_pane("conv_a")]
+    f.panes = [_pane("conv_a"), _pane("conv_child")._replace(sub_agent=True)]
     r = _make(f, timeout=0.0, interval=0.01)  # 0 disables
     await r.start()
     try:
@@ -202,6 +232,7 @@ async def test_loop_disabled_when_timeout_non_positive() -> None:
     finally:
         await r.shutdown()
     assert f.reaped == []
+    assert f.busy_calls == 0
 
 
 def test_every_native_harness_but_kimi_is_offered_to_the_reaper() -> None:

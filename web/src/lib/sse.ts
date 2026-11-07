@@ -9,6 +9,7 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // reducer never seeing certain events, which the reducer's tests can't
 // catch — please add an SSE-parser test when you touch this.
 
+import { assistantMessagePhase } from "./conversationItems";
 import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
@@ -54,6 +55,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
@@ -73,6 +75,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { fileEditRequestFromWire } from "./toolEditDiff";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
   AgyPermission,
@@ -699,6 +702,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       permissionMode,
     } satisfies SessionPermissionModeEvent;
   }
+  if (eventType === "session.background_tasks") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const backgroundTaskCount = data.background_task_count;
+    if (
+      typeof backgroundTaskCount !== "number" ||
+      !Number.isInteger(backgroundTaskCount) ||
+      backgroundTaskCount < 0
+    ) {
+      return null;
+    }
+    return {
+      type: "session_background_tasks",
+      conversationId,
+      backgroundTaskCount,
+      backgroundTasks: parseBackgroundTasks(data.background_tasks) ?? [],
+    } satisfies SessionBackgroundTasksEvent;
+  }
   if (eventType === "session.codex_approval_mode") {
     const conversationId = data.conversation_id;
     if (typeof conversationId !== "string" || !conversationId) return null;
@@ -1130,6 +1151,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
           : null,
+      fileEdit: fileEditRequestFromWire(p.file_edit),
       codexCommand:
         phase === "codex_command_approval" && typeof command === "string" && command
           ? {
@@ -1248,12 +1270,14 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   if (itemType === "message") {
     if (rec.is_meta === true) return null;
     const content = rec.content;
+    const phase = assistantMessagePhase(rec.phase);
     return {
       type: "message_done",
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
       ...(messageId !== undefined ? { messageId } : {}),
+      ...(phase !== undefined ? { phase } : {}),
     } satisfies MessageDone;
   }
 
