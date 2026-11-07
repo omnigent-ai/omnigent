@@ -126,7 +126,7 @@ require(extensionPath)(pi);
     sendAttempts,
     Array.from({ length: 5 }, () => ({
       content: "follow up",
-      options: { deliverAs: "followUp" },
+      options: { deliverAs: "followUp", expandPromptTemplates: true },
     })),
   );
   assert.equal(fs.existsSync(payloadPath), false);
@@ -4650,7 +4650,7 @@ def test_mid_turn_send_now_is_steered_into_active_turn() -> None:
   enqueue("steer me");
   await drain();
   assert.deepEqual(sends, [
-    { content: "steer me", options: { deliverAs: "steer" } },
+    { content: "steer me", options: { deliverAs: "steer", expandPromptTemplates: true } },
   ]);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
@@ -4680,7 +4680,8 @@ def test_idle_send_stays_a_follow_up() -> None:
   enqueue("start a new turn");
   await drain();
   assert.deepEqual(sends, [
-    { content: "start a new turn", options: { deliverAs: "followUp" } },
+    { content: "start a new turn",
+      options: { deliverAs: "followUp", expandPromptTemplates: true } },
   ]);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
@@ -4719,8 +4720,8 @@ def test_send_delivery_falls_back_to_agent_loop_state() -> None:
   await drain();
 
   assert.deepEqual(sends, [
-    { content: "mid-loop", options: { deliverAs: "steer" } },
-    { content: "after-loop", options: { deliverAs: "followUp" } },
+    { content: "mid-loop", options: { deliverAs: "steer", expandPromptTemplates: true } },
+    { content: "after-loop", options: { deliverAs: "followUp", expandPromptTemplates: true } },
   ]);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);

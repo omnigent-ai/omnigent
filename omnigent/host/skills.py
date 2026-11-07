@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -11,6 +12,8 @@ from pathlib import Path
 
 import httpx
 
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.harnesses.pi_native.bridge import read_command_catalog
 from omnigent.host.frames import HostSkillsFrame
 from omnigent.spec import load
 from omnigent.spec.skill_sources import (
@@ -62,6 +65,7 @@ class HostSkillDiscovery:
         Sources a provider could not read are reported through ``warnings``.
         Such incomplete catalogs are cached only briefly, so a retry rescans soon.
         """
+        pi_commands = read_command_catalog(frame.session_id) if frame.session_id else None
         key = (
             str(root),
             frame.harness,
@@ -72,6 +76,7 @@ class HostSkillDiscovery:
             tuple(frame.skills_filter)
             if isinstance(frame.skills_filter, list)
             else frame.skills_filter,
+            json.dumps(pi_commands, sort_keys=True),
         )
         with self._lock:
             cached = self._cache.get(key)
@@ -81,6 +86,7 @@ class HostSkillDiscovery:
                     warnings.extend(cached[2])
                 return list(cached[1])
             problems: list[str] = []
+            native_pi = False
             if frame.session_id is None:
                 ctx = skill_source_context_from_env(
                     roots=(root,),
@@ -108,6 +114,7 @@ class HostSkillDiscovery:
                     )
                     if frame.sub_agent_name:
                         spec, directory = _subagent_bundle(spec, directory, frame.sub_agent_name)
+                    native_pi = canonicalize_harness(spec.executor.harness_kind) == "pi-native"
                     skills = resolve_session_skills(
                         spec, (root, directory), directory, warnings=problems
                     )
@@ -116,6 +123,13 @@ class HostSkillDiscovery:
                 | ({"display_name": skill.display_name} if skill.display_name else {})
                 for skill in skills
             ]
+            if native_pi:
+                result = pi_commands if pi_commands is not None else []
+                if pi_commands is None:
+                    problems.append(
+                        "Pi command catalog unavailable: wait for the native Pi terminal to "
+                        "start, then retry. Older Pi versions may require using the terminal."
+                    )
             if warnings is not None:
                 warnings.extend(problems)
             ttl = INCOMPLETE_CATALOG_TTL_SECONDS if problems else SKILLS_CACHE_TTL_SECONDS

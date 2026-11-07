@@ -1004,8 +1004,17 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
+async function readEventReceipt(response) {
+  try {
+    return await response?.json?.();
+  } catch (_err) {
+    // An accepted write must not be retried when its receipt cannot be read.
+    return;
+  }
+}
+
 // History and completion delivery share bounded retries.
-async function postEventWithRetry(config, body, signal, readReceipt = false) {
+async function postEventWithRetry(config, body, signal, readResponse = (response) => response) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
@@ -1024,13 +1033,8 @@ async function postEventWithRetry(config, body, signal, readReceipt = false) {
         body,
         signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       );
-      if (!readReceipt) return response;
-      try {
-        // Receipt reads share the POST timeout; an accepted write is never retried.
-        return await response?.json?.();
-      } catch (_err) {
-        return;
-      }
+      // Response reads share the POST timeout.
+      return await readResponse(response);
     } catch (err) {
       lastError = err;
     } finally {
@@ -1070,7 +1074,7 @@ function createHistoryQueue(config) {
     const receipt = await postEventWithRetry(config, {
       type: "external_conversation_item",
       data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
-    }, controller.signal, true);
+    }, controller.signal, readEventReceipt);
     lastItemId = typeof receipt?.item_id === "string" ? receipt.item_id : null;
     item.accepted = true;
     item.onAccepted?.();
@@ -1295,12 +1299,12 @@ async function applyModelChange(pi, config, ctx, modelId, thinkingLevel) {
   // would fail every switch on a hypothetical Pi build exposing only
   // getAvailable. getAll (the full catalog) is a superset of getAvailable, so
   // prefer it to resolve; fall back to getAvailable when getAll is absent.
-  const listModels =
-    registry && typeof registry.getAll === "function"
-      ? () => registry.getAll()
-      : registry && typeof registry.getAvailable === "function"
-        ? () => registry.getAvailable()
-        : null;
+  let listModels = null;
+  if (registry && typeof registry.getAll === "function") {
+    listModels = () => registry.getAll();
+  } else if (registry && typeof registry.getAvailable === "function") {
+    listModels = () => registry.getAvailable();
+  }
   if (!pi || typeof pi.setModel !== "function" || !listModels) {
     await postModelChangeError(
       config,
@@ -1478,6 +1482,26 @@ async function postModelOptions(config, ctx) {
   });
 }
 
+/** Publish only the names and descriptions Pi actually loaded. */
+function publishCommandCatalog(pi, config) {
+  if (!config?.bridgeDir || typeof pi.getCommands !== "function") return;
+  const catalogPath = path.join(config.bridgeDir, "commands.json");
+  const temporaryPath = `${catalogPath}.${process.pid}.tmp`;
+  try {
+    const commands = pi.getCommands().map(({ name, description }) => ({
+      name,
+      description: typeof description === "string" ? description : "",
+    }));
+    fs.writeFileSync(temporaryPath, JSON.stringify({ commands }), { mode: 0o600 });
+    fs.renameSync(temporaryPath, catalogPath);
+  } catch (error) {
+    console.error("[pi-native] Could not publish command catalog:", error);
+    for (const file of [temporaryPath, catalogPath]) {
+      try { fs.unlinkSync(file); } catch (_err) {}
+    }
+  }
+}
+
 /**
  * Tell the runner's terminal watcher that Pi now accepts input: the inbox
  * poller is armed, so queued web messages will be delivered. The runner
@@ -1569,7 +1593,7 @@ function startInboxPoller(
             ? "steer"
             : "followUp";
         try {
-          pi.sendUserMessage(payload.content, { deliverAs });
+          pi.sendUserMessage(payload.content, { deliverAs, expandPromptTemplates: true });
         } catch (_err) {
           // Leave the file to retry next tick, capped by attempt count.
           const key = id ?? fullPath;
@@ -1586,12 +1610,8 @@ function startInboxPoller(
           // what was lost (data loss; the file is unlinked below).
           deliverAttempts.delete(key);
           const droppedId = id ?? "(no id)";
-          const preview =
-            typeof payload.content === "string"
-              ? payload.content.length > 80
-                ? `${payload.content.slice(0, 80)}…`
-                : payload.content
-              : "";
+          let preview = typeof payload.content === "string" ? payload.content : "";
+          if (preview.length > 80) preview = `${preview.slice(0, 80)}…`;
           postEvent(config, {
             type: "external_conversation_item",
             data: {
@@ -2394,6 +2414,7 @@ module.exports = function (pi) {
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
     restoreCumulativeUsage();
+    publishCommandCatalog(pi, config);
     wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
@@ -2567,9 +2588,9 @@ module.exports = function (pi) {
     if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
     const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
     const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
-    const output = deliveryFailed
-      ? "Omnigent could not save the Pi turn output; see host logs."
-      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
+    let output = result?.output;
+    if (output == null) output = cancelled ? "" : "Pi turn ended without a final response.";
+    if (deliveryFailed) output = "Omnigent could not save the Pi turn output; see host logs.";
     try {
       await postEventWithRetry(config, {
         type: "external_session_status",
@@ -2774,8 +2795,9 @@ module.exports = function (pi) {
       return;
     }
     const text = textFromMessage(message);
-    const outcome = stopReason === "aborted" ? "cancelled"
-      : stopReason === "toolUse" || stopReason === "error" ? "failed" : "completed";
+    let outcome = "completed";
+    if (stopReason === "aborted") outcome = "cancelled";
+    else if (stopReason === "toolUse" || stopReason === "error") outcome = "failed";
     if (!text) {
       turnResult = { outcome, output: "", item: null };
       return;
