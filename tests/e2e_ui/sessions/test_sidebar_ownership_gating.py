@@ -46,6 +46,7 @@ from tests.e2e_ui.collaboration._multi_user_server import (
     MultiUserServer,
     spawn_multi_user_server,
 )
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
 
 # Edit access (2) is the interesting non-owner case: it proves the sidebar gates
 # on ownership, not level — an EDIT holder still can't rename/share from the
@@ -53,7 +54,6 @@ from tests.e2e_ui.collaboration._multi_user_server import (
 _LEVEL_EDIT = 2
 
 _FILTER = '[data-testid="session-filter"]'
-_FILTER_SHARED = '[data-testid="session-filter-shared"]'
 
 
 @pytest.fixture(scope="module")
@@ -152,8 +152,7 @@ def test_shared_viewer_sees_session_under_shared_filter_with_owner_only_actions(
         # The shared session is not the viewer's own, so the default "My
         # sessions" filter hides it; it shows under the "Shared with me" filter.
         expect(page.locator(_FILTER)).to_be_visible(timeout=30_000)
-        page.locator(_FILTER).click()
-        page.locator(_FILTER_SHARED).click()
+        choose_session_filter(page, "shared")
         expect(_row(page, sid)).to_be_visible(timeout=30_000)
 
         _open_row_menu(page, sid)

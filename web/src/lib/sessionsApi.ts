@@ -29,6 +29,7 @@ import type {
   SandboxStatus,
   Session,
   SessionEventInput,
+  SessionFamily,
   SessionItem,
   SessionStatus,
 } from "./types";
@@ -108,6 +109,7 @@ interface ModelUsageWire {
  * camelCase `Session` type at the parse boundary.
  */
 interface SessionResponseWire {
+  family?: SessionFamily | null;
   sandbox_profile?: SandboxProfile | null;
   id: string;
   agent_id: string;
@@ -347,6 +349,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
+    family: wire.family,
     agentId: wire.agent_id,
     agentName: wire.agent_name ?? null,
     runnerId: wire.runner_id,
@@ -801,18 +804,26 @@ export async function createBundledSession(
   metadata: {
     host_id?: string;
     host_type?: string;
-    workspace?: string;
+    workspace?: string | null;
+    workspaces?: string[];
+    sandbox_provider?: string;
+    sandbox_profile_id?: string;
+    sandbox_profile_revision?: string;
     project_id?: string;
+    sibling_source_id?: string;
     /** Initial labels; a `null` value leaves that project default off the session. */
     labels?: Record<string, string | null>;
+    initial_input?: SessionEventInput;
     terminal_launch_args?: string[];
-    git?: { branch_name: string; base_branch?: string };
+    git?: { branch_name: string; base_branch?: string; existing_worktree?: boolean } | null;
     mcp_registry_services?: string[];
   } = {},
+  initialFiles: File[] = [],
 ): Promise<{ id: string; agentId?: string }> {
   const form = new FormData();
   form.append("metadata", JSON.stringify(metadata));
   form.append("bundle", bundle);
+  for (const file of initialFiles) form.append("initial_files", file, file.name);
   const res = await authenticatedFetch("/v1/sessions", {
     method: "POST",
     headers: {
@@ -1491,6 +1502,8 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 
 /** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
 export const HOST_OFFLINE_CODE = "host_offline";
+/** A request answered by a sign-in page instead of the API. */
+export const SIGN_IN_EXPIRED_CODE = "sign_in_expired";
 
 /** Tells the server this client resends a message once its offline host reconnects. */
 const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
@@ -1520,17 +1533,27 @@ export async function postEvent(
   // on `code` — e.g. surface a friendly "runner didn't come online" message
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
-  return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-      session_id?: string;
-    },
-  );
+  const body = (await res.json().catch((error: unknown): never => {
+    // An auth layer's login page answers the POST with a 200 HTML page: an expired
+    // sign-in, not a malformed reply.
+    if ((res.headers.get("content-type") ?? "").toLowerCase().includes("text/html")) {
+      throw new ApiError(
+        "Your sign-in expired. Reload the page to sign in again.",
+        401,
+        SIGN_IN_EXPIRED_CODE,
+      );
+    }
+    throw error;
+  })) as {
+    queued: boolean;
+    item_id?: string;
+    denied?: boolean;
+    pending_id?: string;
+    recovered?: boolean;
+    recovery?: PostEventResponse["recovery"];
+    session_id?: string;
+  };
+  return postEventResponseFromWire(body);
 }
 
 /**

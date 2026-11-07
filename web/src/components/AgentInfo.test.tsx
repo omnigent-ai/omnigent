@@ -8,6 +8,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Agent } from "@/hooks/useAgents";
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { useChatStore } from "@/store/chatStore";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Mock the policies data layer so SessionPoliciesSection and AddPolicyDialog
 // render deterministically without network. The add/delete mutations expose
@@ -79,7 +80,10 @@ vi.mock("@/hooks/useSessionLabels", () => ({
 // AgentInfoContent for codex sessions; stub its routing + fork deps so it
 // renders without a Router/network in jsdom.
 vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
-vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  forkSession: vi.fn(),
+}));
 
 // The version footer reads the server version (capabilities probe) and the
 // per-session host version (health poll). Mock both hooks so the footer

@@ -110,7 +110,8 @@ async def resolve_project_session_create(
     if project is None:
         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
 
-    config = project.config
+    # Nested agents inherit filing, while the composer or MCP chooses their placement.
+    config = {} if getattr(body, "sibling_source_id", None) else project.config
     updates: dict[str, Any] = {}
     for field in ("agent_id", "workspace", "git"):
         if field not in fields_set and field in config and field in body.__class__.model_fields:
