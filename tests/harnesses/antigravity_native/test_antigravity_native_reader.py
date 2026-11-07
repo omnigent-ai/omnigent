@@ -3863,7 +3863,7 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
 ) -> None:
     """``_rotate_session_for_cascade`` runs claude's exact session-rotation sequence.
 
-    Asserts: GET old snapshot → POST /v1/sessions (agent_id + inherited labels) →
+    Asserts: GET old snapshot → POST /v1/sessions (agent_id, title, project + labels) →
     PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the
     ``/clear`` notice to the OLD session — and that bridge state is rewritten with
     the new session id + new cascade id. Crucially,
@@ -3884,6 +3884,8 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
         "agent_id": "agent_xyz",
         "runner_id": "runner_abc",
         "labels": {ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY: "bridge-123"},
+        "title": "Fix login flow",
+        "project_id": "proj_alpha",
     }
     calls: list[tuple[str, str, dict[str, object]]] = []
     async with _rotation_client(monkeypatch, calls=calls, snapshot=snapshot) as client:
@@ -3925,12 +3927,16 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     assert all("external_session_id" not in body for (_m, _p, body) in calls), (
         f"rotation must not PATCH external_session_id (claude parity); calls={calls!r}"
     )
-    # The create POST inherited the old agent_id + bridge-id label (so the new
-    # session resolves to the same bridge_dir).
+    # The create POST inherited the old agent_id, title, project + bridge-id label
+    # (so the new session resolves to the same bridge_dir).
     create_body = calls[1][2]
     assert create_body["agent_id"] == "agent_xyz"
     assert isinstance(create_body["labels"], dict)
     assert create_body["labels"][ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] == "bridge-123"
+    assert create_body.get("title") == "Fix login flow"
+    assert create_body.get("project_id") == "proj_alpha"
+    assert create_body.get("workspace", "missing") is None
+    assert create_body.get("git", "missing") is None
     # The runner_id bind carried the old runner; the new session is owned by it.
     assert calls[2][2] == {"runner_id": "runner_abc"}
     # The terminal transfer targeted the new session (the SAME agy moves over).

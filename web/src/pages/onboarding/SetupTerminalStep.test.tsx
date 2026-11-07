@@ -28,6 +28,25 @@ describe("SetupTerminalStep", () => {
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
   });
 
+  it("shows the error and its existing recovery action on separate lines", async () => {
+    const errorMessage = "Sign-in to https://team.example.com/ didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const onRun = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText(errorMessage)).toHaveClass("text-destructive");
+    expect(screen.queryByText(`${errorMessage} ${errorAction}`)).toBeNull();
+    const actionLine = screen.getByText(errorAction);
+    expect(actionLine).toHaveClass("text-cyan-700");
+    expect(actionLine.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+  });
+
   it("installs first when onInstallCli is present, then runs the action", async () => {
     const calls: string[] = [];
     const onInstallCli = vi.fn(async () => {

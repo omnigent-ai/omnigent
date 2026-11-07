@@ -131,7 +131,9 @@ The launcher uses the following controller operations:
 - query allocation and runtime-agent readiness;
 - release the allocation idempotently.
 
-The Omnigent launch token lasts seven days. Sandbox release is safe to retry,
+The Omnigent host token defaults to a seven-day validity window, renewed while
+connected; [`sandbox.token_ttl_s`](../README.md#run-hosts-in-cloud-sandboxes)
+overrides it. Sandbox release is safe to retry,
 which lets session deletion and the deployment-wide reaper recover from
 temporary control-plane failures. The reaper is disabled unless configured;
 see the main [deployment guide](../README.md#run-hosts-in-cloud-sandboxes).
