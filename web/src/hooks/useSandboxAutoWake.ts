@@ -11,9 +11,9 @@ const wakeRequests = new Set<(sessionId: string) => void>();
 
 /**
  * Whether opening a session may wake its asleep sandbox: only an idle session
- * with no error and no launch already running, so the wake (the same
- * `retry_session` as Reconnect host) has no interrupted turn or failed input to
- * resume. Anything else keeps its Resume or error card.
+ * with no error, no undelivered input and no launch already running, so the
+ * wake (the same `retry_session` as Reconnect host) has no interrupted turn or
+ * failed input to resume or deliver. Anything else keeps its Resume or error card.
  */
 export function canAutoWakeSandbox({
   asleep,
@@ -21,14 +21,16 @@ export function canAutoWakeSandbox({
   canEdit,
   status,
   failed,
+  undelivered,
 }: {
   asleep: boolean;
   launching: boolean;
   canEdit: boolean;
   status: string;
   failed: boolean;
+  undelivered: boolean;
 }): boolean {
-  return asleep && !launching && canEdit && status === "idle" && !failed;
+  return asleep && !launching && canEdit && status === "idle" && !failed && !undelivered;
 }
 
 /** Ask the open session's view to wake its asleep sandbox, as picking the Files tab does. */

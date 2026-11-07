@@ -107,7 +107,14 @@ describe("useSandboxAutoWake", () => {
 });
 
 describe("canAutoWakeSandbox", () => {
-  const safe = { asleep: true, launching: false, canEdit: true, status: "idle", failed: false };
+  const safe = {
+    asleep: true,
+    launching: false,
+    canEdit: true,
+    status: "idle",
+    failed: false,
+    undelivered: false,
+  };
 
   it("wakes an idle, healthy, asleep session for an editor", () => {
     expect(canAutoWakeSandbox(safe)).toBe(true);
@@ -120,6 +127,7 @@ describe("canAutoWakeSandbox", () => {
     ["is running a turn", { status: "running" }],
     ["failed", { status: "failed" }],
     ["has an error or a failed sandbox launch", { failed: true }],
+    ["still has a message marked Not delivered", { undelivered: true }],
   ])("leaves a session that %s to its own controls", (_label, override) => {
     expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(false);
   });
