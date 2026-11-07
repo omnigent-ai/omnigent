@@ -48,8 +48,10 @@ import { NewChatLandingScreen } from "./NewChatDialog";
 import { MobileHeaderButtonGroup } from "./MobileHeaderButton";
 import { MobileHeaderControlsProvider, MobileHeaderControlsSlot } from "./MobileHeaderControlsSlot";
 
+const replaceSearchParamsMock = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useLocation: () => ({ hash: "", state: null }),
+  useReplaceSearchParams: () => replaceSearchParamsMock,
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));

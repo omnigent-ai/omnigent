@@ -203,6 +203,17 @@ export const useSearchParams: typeof useRRSearchParams = (defaultInit) =>
 
 export const useLocation: typeof useRRLocation = () => useRouting().useLocation();
 
+/** Replace this page's query without host navigation, which may reload the app. */
+export function useReplaceSearchParams() {
+  const navigate = useRRNavigate();
+  const { hash, state } = useRRLocation();
+  return useCallback(
+    (params: URLSearchParams) =>
+      navigate({ search: params.toString(), hash }, { replace: true, state }),
+    [navigate, hash, state],
+  );
+}
+
 /**
  * The active `rebasePath` primitive. Identity standalone; prepends `basename`
  * in the embed. Use to construct absolute URLs that respect the mount path.
