@@ -935,6 +935,9 @@ async def test_null_project_arguments_count_as_absent(arguments):
     creates = [r for r in requests if r.url.path in ("/v1/sessions", "/v1/sessions/orchestrated")]
     assert len(creates) == 1
     assert not {"project_id", "workspace", "git"} & json.loads(creates[0].content).keys()
+    if arguments.get("placement") == "same_host":
+        # Without a project name, a same_host create needs no capability read.
+        assert "/v1/info" not in [r.url.path for r in requests]
     if arguments.get("placement") in ("same_host", "managed"):
         # The handle reports the project the server filed the session in, here the creator's.
         assert result["project_id"] == "inherited"
