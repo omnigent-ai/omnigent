@@ -4183,6 +4183,7 @@ function ComposerImpl(
             // Keep the overlay's scroll position locked to the textarea's.
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
           },
+          "data-testid": "chat-input",
           "aria-label": "Message the agent",
           "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
@@ -4534,6 +4535,7 @@ function ComposerImpl(
                       }
                       title={showInterruptButton ? undefined : (sendDisabledReason ?? undefined)}
                       label={showInterruptButton ? "Interrupt" : "Send"}
+                      data-testid="chat-send-button"
                     />
                   </TooltipTrigger>
                   {showInterruptButton ? (

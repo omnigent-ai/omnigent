@@ -71,6 +71,7 @@ export const Conversation = ({ className, children, ...props }: ConversationProp
     initial="instant"
     resize="instant"
     role="log"
+    data-testid="chat-message-list"
     {...props}
   >
     {typeof children === "function" ? children : <ScrollLockBridge>{children}</ScrollLockBridge>}
@@ -145,6 +146,7 @@ export const ConversationScrollButton = ({
         size="icon-sm"
         type="button"
         variant="outline"
+        data-testid="chat-scroll-to-bottom"
         {...props}
       >
         <ArrowDownIcon className="size-4" />
