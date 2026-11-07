@@ -14,7 +14,7 @@ mock mode only (no ``--llm-api-key``)::
     uv run pytest tests/e2e/test_host_opencode_native_mock_e2e.py --reruns 0 -v
 
 Set ``OMNIGENT_E2E_OPENCODE_REQUIRED=1`` to fail instead of skip when the CLI
-is missing or unsupported.
+is missing or unsupported, as CI's ``E2E Harness (opencode)`` job does.
 """
 
 from __future__ import annotations

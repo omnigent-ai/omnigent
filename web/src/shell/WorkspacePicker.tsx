@@ -353,7 +353,7 @@ function PickerIconButton({
               onClick={onClick}
               disabled={disabled}
               aria-label={label}
-              className="text-muted-foreground"
+              className="mobile-touch-target text-muted-foreground"
               data-testid={testId}
             >
               {icon}
@@ -836,7 +836,7 @@ export function WorkspacePicker({
       data-testid="workspace-picker"
     >
       <div
-        className="flex h-12 min-h-12 shrink-0 items-center gap-1 border-b px-3 py-0"
+        className="flex h-12 min-h-12 shrink-0 items-center gap-1 border-b px-3 py-0 mobile-app:h-auto mobile-app:flex-wrap mobile-app:py-1"
         data-testid="workspace-picker-header"
       >
         <PickerIconButton
@@ -855,7 +855,10 @@ export function WorkspacePicker({
             testId="workspace-picker-workspace"
           />
         )}
-        <div className="min-w-0 flex-1" data-testid="workspace-picker-breadcrumbs">
+        <div
+          className="min-w-0 flex-1 mobile-app:order-first mobile-app:basis-full"
+          data-testid="workspace-picker-breadcrumbs"
+        >
           {!pathEditing && (
             <div
               className={cn(
@@ -877,7 +880,7 @@ export function WorkspacePicker({
                     )}
                     <button
                       type="button"
-                      className={`truncate rounded px-1 py-0.5 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring ${
+                      className={`mobile-touch-target truncate rounded px-1 py-0.5 text-left outline-none transition-colors hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring ${
                         isLast ? "font-medium text-foreground" : "text-muted-foreground"
                       }`}
                       onClick={() => {
@@ -930,12 +933,12 @@ export function WorkspacePicker({
             aria-label="Current folder path"
             tabIndex={pathEditing ? 0 : -1}
             className={`min-w-0 w-full rounded-md bg-muted/60 px-2 py-1 text-base font-medium text-foreground outline-none transition-colors placeholder:text-muted-foreground focus:ring-2 focus:ring-ring ${
-              pathEditing ? "block" : "sr-only"
+              pathEditing ? "block mobile-touch-target" : "sr-only"
             }`}
             data-testid="workspace-picker-path-input"
           />
         </div>
-        <div className="flex items-center gap-px">
+        <div className="flex items-center gap-px mobile-app:ml-auto mobile-app:max-w-full mobile-app:flex-wrap">
           {canChooseNatively && (
             <PickerIconButton
               label={`Choose in ${fileManagerName()}…`}
@@ -1007,7 +1010,7 @@ export function WorkspacePicker({
             data-testid="workspace-picker-search-row"
           >
             <div
-              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input"
+              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input mobile-app:h-auto"
               data-testid="workspace-picker-search-field"
             >
               <SearchIcon
@@ -1045,7 +1048,7 @@ export function WorkspacePicker({
                 }
                 autoComplete="off"
                 spellCheck={false}
-                className="min-w-0 flex-1 bg-transparent text-ui text-foreground outline-none placeholder:text-muted-foreground"
+                className="mobile-touch-target min-w-0 flex-1 bg-transparent text-ui text-foreground outline-none placeholder:text-muted-foreground"
                 data-testid="workspace-picker-search-input"
               />
             </div>
@@ -1079,7 +1082,7 @@ export function WorkspacePicker({
                   spellCheck={false}
                   autoCapitalize="off"
                   autoCorrect="off"
-                  className="min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="mobile-touch-target min-w-0 flex-1 rounded-md border border-input bg-background px-2.5 py-1.5 text-sm text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   data-testid="workspace-picker-new-folder-input"
                 />
                 <button
@@ -1088,7 +1091,7 @@ export function WorkspacePicker({
                   onClick={() => void commitNewFolder()}
                   aria-label="Create folder"
                   title="Create folder"
-                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
+                  className="mobile-touch-target shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-30"
                   data-testid="workspace-picker-new-folder-create"
                 >
                   {createDir.isPending ? (
@@ -1102,7 +1105,7 @@ export function WorkspacePicker({
                   onClick={cancelNewFolder}
                   aria-label="Cancel new folder"
                   title="Cancel"
-                  className="shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  className="mobile-touch-target shrink-0 rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                   data-testid="workspace-picker-new-folder-cancel"
                 >
                   <XIcon className="size-4" />
@@ -1277,7 +1280,7 @@ export function WorkspacePicker({
       </div>
       {hasCommitActions && (
         <div
-          className="flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-2"
+          className="flex min-h-16 shrink-0 items-center justify-end gap-2 border-t px-5 py-2 mobile-app:flex-wrap"
           data-testid="workspace-picker-footer"
         >
           {onClose && (
@@ -1286,6 +1289,7 @@ export function WorkspacePicker({
               variant="outline"
               onClick={onClose}
               data-testid="workspace-picker-cancel"
+              className="mobile-touch-target"
             >
               Cancel
             </Button>
@@ -1302,6 +1306,7 @@ export function WorkspacePicker({
               onClick={handleSelect}
               title={`Confirm folder: ${basename(selectedWorktreePath ?? currentAbsolute)}`}
               data-testid="workspace-picker-select"
+              className="mobile-touch-target"
             >
               Confirm
             </Button>

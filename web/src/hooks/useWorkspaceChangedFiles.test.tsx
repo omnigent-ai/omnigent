@@ -248,6 +248,21 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
+  it("preserves optional repository identity and workspace-relative paths", async () => {
+    onlineMock.mockReturnValue(true);
+    const entries = [
+      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "notes.md", name: "notes.md" },
+    ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
+    fetchMock
+      .mockResolvedValueOnce(environmentResponse())
+      .mockResolvedValueOnce(jsonResponse({ object: "list", data: entries, has_more: false }));
+    const { result } = renderHook(() => useWorkspaceChangedFiles("conv_repos"), { wrapper: Wrap });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(result.current.data?.data).toMatchObject(entries);
+    expect(result.current.data?.data[1].repository_root).toBeUndefined();
+  });
+
   it("does not fetch when the runner is offline and the host is also down", async () => {
     onlineMock.mockReturnValue(false);
     hostOnlineMock.mockReturnValue(false);

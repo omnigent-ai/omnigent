@@ -4,9 +4,18 @@ import type { MermaidErrorComponentProps, MermaidOptions } from "streamdown";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";
 
+// Mermaid 11 wraps an HTML label only when its one-line width measures exactly
+// the 200px maximum, but fractional zoom or display scaling measures it a
+// sub-pixel wider, so long labels stay on one line and are clipped. Forcing the
+// wrapped layout matches what Mermaid picks at 100%. themeCSS is written into
+// the SVG, so it applies while Mermaid measures and in downloaded diagrams.
+// Drop once a Mermaid release fixes mermaid-js/mermaid#7794.
+const MERMAID_LABEL_WRAP_CSS =
+  "foreignObject > div { display: table !important; white-space: break-spaces !important; }";
+
 const MERMAID_THEMES = {
-  light: { theme: "default" },
-  dark: { theme: "dark" },
+  light: { theme: "default", themeCSS: MERMAID_LABEL_WRAP_CSS },
+  dark: { theme: "dark", themeCSS: MERMAID_LABEL_WRAP_CSS },
 } as const;
 
 export function mermaidOptionsForTheme(mode: ResolvedThemeMode): MermaidOptions {
