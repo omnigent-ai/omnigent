@@ -395,9 +395,10 @@ def test_subagent_cancellation_guidance_present() -> None:
     assert (
         "`sys_cancel_task` with `task_id` set to that sub-agent's recorded `conversation_id`"
     ) in config_compact
-    assert "`claude_code` workers are hard-stopped" in config_compact
+    assert (
+        "`claude_code`, `agy`, `cursor`, and `hermes` workers are hard-stopped"
+    ) in config_compact
     assert "`codex` cancellation is currently best-effort" in config_compact
-    assert "`agy` (`antigravity-native`) has no dedicated interrupt handler" in config_compact
 
     assert (
         "`sys_cancel_task` with `task_id` set to the recorded `conversation_id`"

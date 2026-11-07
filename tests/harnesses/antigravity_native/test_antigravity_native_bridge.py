@@ -26,6 +26,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     ensure_agy_feedback_survey_disabled,
     ensure_agy_onboarding_complete,
     inject_user_message_via_tui,
+    kill_session,
     prepare_bridge_dir,
     read_bridge_state,
     read_tmux_info,
@@ -2398,6 +2399,32 @@ def test_send_interaction_keys_via_tui_rejects_empty_keys(tmp_path: Path) -> Non
     """No keys is a programming error, not an empty send-keys call."""
     with pytest.raises(RuntimeError, match="at least one key"):
         send_interaction_keys_via_tui(tmp_path / "bridge")
+
+
+# ---------------------------------------------------------------------------
+# Hard stop (kill_session) — sys_cancel_task runner-side hard-stop
+# ---------------------------------------------------------------------------
+
+
+def test_kill_session_kills_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``kill_session`` kills the advertised tmux target via ``kill-session``."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(
+        _mod,
+        "_wait_for_tmux_info",
+        lambda *_a, **_k: {"socket_path": "/s", "tmux_target": "t"},
+    )
+    monkeypatch.setattr(_mod, "_run_tmux", lambda _sock, *args: calls.append(args))
+
+    kill_session(tmp_path)
+
+    assert calls == [("kill-session", "-t", "t")]
+
+
+def test_kill_session_raises_without_target(tmp_path: Path) -> None:
+    """No advertised tmux target → a clear RuntimeError (no silent no-op)."""
+    with pytest.raises(RuntimeError, match="not advertised"):
+        kill_session(tmp_path, timeout_s=0.01)
 
 
 def _agy_settings_path(home: Path) -> Path:
