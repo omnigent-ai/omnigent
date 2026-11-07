@@ -1943,6 +1943,7 @@ class HarnessApp:
                 output_tokens=u.get("output_tokens") or 0,
                 total_tokens=u.get("total_tokens") or 0,
                 context_tokens=u.get("context_tokens"),
+                context_window=u.get("context_window"),
                 # Carry the cache breakdown through to response.completed
                 # so the server-side cost path can price cache reads /
                 # writes at their own rates. Anthropic-style executors
