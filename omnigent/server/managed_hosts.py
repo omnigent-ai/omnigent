@@ -719,6 +719,8 @@ class ManagedSandboxConfig:
     :param agent_images: Built-in agent name → runner image from
         ``sandbox.kubernetes.agents``; empty for other providers. Kept here
         only so startup can warn about names that match no built-in agent.
+    :param agent_service_accounts: Built-in agent name → runner ServiceAccount
+        from ``sandbox.kubernetes.agents``; kept for the same startup warning.
     :param default_model_options: Optional, request-scoped provider catalog used
         when no host catalog is available for the selected harness and user.
         Supplies choices without selecting a default or provisioning a host.
@@ -737,6 +739,7 @@ class ManagedSandboxConfig:
     model_discovery: dict[str, object] = dataclass_field(default_factory=dict)
     git_clone: GitCloneOptions = dataclass_field(default_factory=GitCloneOptions)
     agent_images: dict[str, str] = dataclass_field(default_factory=dict)
+    agent_service_accounts: dict[str, str] = dataclass_field(default_factory=dict)
     default_model_options: Callable[[str, str | None], Awaitable[list[dict[str, Any]]]] | None = (
         None
     )
@@ -1686,6 +1689,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     if provider == "agent_sandbox":
         host_config = _apply_keep_warm(host_config, _parse_keep_warm_s(raw))
     agent_images: dict[str, str] | None = None
+    agent_service_accounts: dict[str, str] | None = None
     manages_profiles = False
     if provider == "modal":
         launcher_factory = _modal_launcher_factory(
@@ -1899,7 +1903,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         pvc_mounts = _parse_kubernetes_pvc_mounts(raw)
         secret_mounts = _parse_kubernetes_secret_mounts(raw)
         _reject_overlapping_kubernetes_mounts(pvc_mounts, secret_mounts)
-        agent_images = _parse_kubernetes_agent_images(raw)
+        agent_images, agent_service_accounts = _parse_kubernetes_agents(raw)
         launcher_factory = _kubernetes_launcher_factory(
             agent_sandbox=provider == "agent_sandbox",
             warm_pool=warm_pool,
@@ -1921,6 +1925,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             runtime_class=_parse_provider_string(raw, "kubernetes", "runtime_class"),
             home_size_limit=_parse_kubernetes_home_size_limit(raw),
             agent_images=agent_images,
+            agent_service_accounts=agent_service_accounts,
         )
         token_ttl_s = KUBERNETES_MANAGED_TOKEN_TTL_S
     elif provider == "microsandbox":
@@ -1990,6 +1995,7 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
         model_discovery=model_discovery,
         git_clone=git_clone,
         agent_images=agent_images or {},
+        agent_service_accounts=agent_service_accounts or {},
         manages_profiles=manages_profiles,
     )
 
@@ -3409,32 +3415,37 @@ def _parse_kubernetes_home_size_limit(raw: dict[str, object]) -> str | None:
     return quantity
 
 
-def _parse_kubernetes_agent_images(raw: dict[str, object]) -> dict[str, str] | None:
+def _parse_kubernetes_agents(
+    raw: dict[str, object],
+) -> tuple[dict[str, str] | None, dict[str, str] | None]:
     """
     Extract and validate the optional ``sandbox.kubernetes.agents`` mapping.
 
-    Maps a built-in agent name to the runner image its sessions launch from,
-    overriding the fleet ``image``. Operator-owned on purpose: the image decides
-    what code runs next to the agent's credentials, so agent specs cannot set it.
+    Maps a built-in agent name to the runner image and/or ServiceAccount its
+    sessions launch with, overriding the fleet ``image`` / ``service_account``.
+    Operator-owned on purpose: the image decides what code runs next to the
+    agent's credentials and the ServiceAccount decides its cloud identity, so
+    agent specs cannot set either.
 
     :param raw: The raw ``sandbox`` mapping.
-    :returns: Agent name → image, or ``None`` when omitted or empty.
-    :raises ValueError: When the mapping, a name, an entry, or an image is malformed.
+    :returns: ``(agent → image, agent → service_account)``, each ``None`` when empty.
+    :raises ValueError: When the mapping, a name, an entry, or a value is malformed.
     """
     section = _parse_provider_section(raw, "kubernetes")
     if section is None:
-        return None
+        return None, None
     value = section.get("agents")
     if value is None:
-        return None
+        return None, None
     if not isinstance(value, dict):
         raise ValueError(
             "server config 'sandbox.kubernetes.agents' must be a mapping of built-in "
-            "agent name to {image: ...}"
+            "agent name to {image: ..., service_account: ...}"
         )
     from omnigent.onboarding.sandboxes.kubernetes import _is_valid_label_value
 
     images: dict[str, str] = {}
+    service_accounts: dict[str, str] = {}
     for name, entry in value.items():
         # The image follows the agent the runner is classified as, so a key
         # that cannot be that label value could never match.
@@ -3447,15 +3458,27 @@ def _parse_kubernetes_agent_images(raw: dict[str, object]) -> dict[str, str] | N
         path = f"sandbox.kubernetes.agents.{name}"
         if not isinstance(entry, dict):
             raise ValueError(f"server config '{path}' must be a mapping, e.g. {{image: ...}}")
-        _reject_unknown_keys(entry, {"image"}, path)
-        image = entry.get("image")
-        if not isinstance(image, str) or not image.strip():
-            raise ValueError(
-                f"server config '{path}.image' must be a registry image reference "
-                "with omnigent pre-installed, e.g. 'registry.example.com/omnigent-host:v1'"
-            )
-        images[name] = image.strip()
-    return images or None
+        _reject_unknown_keys(entry, {"image", "service_account"}, path)
+        if "image" not in entry and "service_account" not in entry:
+            raise ValueError(f"server config '{path}' must set image and/or service_account")
+        if "image" in entry:
+            image = entry["image"]
+            if not isinstance(image, str) or not image.strip():
+                raise ValueError(
+                    f"server config '{path}.image' must be a registry image reference "
+                    "with omnigent pre-installed, e.g. 'registry.example.com/omnigent-host:v1'"
+                )
+            images[name] = image.strip()
+        if "service_account" in entry:
+            service_account = entry["service_account"]
+            if not isinstance(service_account, str) or not service_account.strip():
+                raise ValueError(
+                    f"server config '{path}.service_account' must be a ServiceAccount name"
+                )
+            service_account = service_account.strip()
+            _validate_dns1123_subdomain(service_account, f"agents.{name}.service_account")
+            service_accounts[name] = service_account
+    return images or None, service_accounts or None
 
 
 def warn_unknown_agent_images(
@@ -3474,12 +3497,12 @@ def warn_unknown_agent_images(
     from omnigent.db.utils import builtin_agent_id
 
     for config in deployment.configs:
-        for name in config.agent_images:
+        for name in sorted({*config.agent_images, *config.agent_service_accounts}):
             agent = agent_store.get(builtin_agent_id(name))
             if agent is None or agent.session_id is not None:
                 _logger.warning(
                     "sandbox.kubernetes.agents.%s matches no built-in agent; its "
-                    "image is never used. Built-in agents are the packaged ones "
+                    "overrides are never used. Built-in agents are the packaged ones "
                     "and those seeded from OMNIGENT_BUILTIN_AGENT_DIRS.",
                     name,
                 )
@@ -3747,6 +3770,7 @@ def _kubernetes_launcher_factory(
     runtime_class: str | None,
     home_size_limit: str | None,
     agent_images: dict[str, str] | None = None,
+    agent_service_accounts: dict[str, str] | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: kubernetes`` path.
@@ -3790,6 +3814,8 @@ def _kubernetes_launcher_factory(
         writable-HOME emptyDir, or ``None`` for an unbounded emptyDir.
     :param agent_images: Built-in agent name → image overriding *image* for
         that agent's runners, or ``None``.
+    :param agent_service_accounts: Built-in agent name → ServiceAccount
+        overriding *service_account* for that agent's runners, or ``None``.
     :returns: A factory producing parameterized Kubernetes launchers.
     :raises ValueError: When a name or node-selector label is malformed.
     """
@@ -3825,6 +3851,7 @@ def _kubernetes_launcher_factory(
             runtime_class=runtime_class,
             home_size_limit=home_size_limit,
             agent_images=agent_images,
+            agent_service_accounts=agent_service_accounts,
         )
 
     return _build

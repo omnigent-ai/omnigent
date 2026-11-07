@@ -1665,6 +1665,37 @@ def test_launch_host_uses_per_agent_image(
     }
 
 
+@pytest.mark.parametrize(
+    ("agent_name", "expected_sa"),
+    [("researcher", "researcher-runner"), ("coder", "omnigent-runner"), (None, "omnigent-runner")],
+)
+def test_launch_host_uses_per_agent_service_account(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    agent_name: str | None,
+    expected_sa: str,
+) -> None:
+    """A mapped agent runs as its own ServiceAccount; others keep the fleet one."""
+    core, batch = fake_clients
+    _setup_pod_discovery(core)
+    launcher = KubernetesSandboxLauncher(
+        in_cluster=True,
+        namespace="omnigent-sandboxes",
+        env=(),
+        service_account="omnigent-runner",
+        agent_service_accounts={"researcher": "researcher-runner"},
+    )
+    launcher.start_host(
+        "omnigent-job-1",
+        token=_TOKEN,
+        host_id="host_1",
+        host_name="managed-1",
+        server_url="http://srv.example.com",
+        agent_name=agent_name,
+    )
+    pod_spec = batch.created_jobs[0]["spec"]["template"]["spec"]
+    assert pod_spec["serviceAccountName"] == expected_sa
+
+
 def test_launch_host_without_agent_label_keeps_reserved_labels(
     fake_clients: tuple[_FakeCore, _FakeBatch],
 ) -> None:

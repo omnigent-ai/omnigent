@@ -1038,6 +1038,52 @@ def test_parse_kubernetes_without_agents_passes_none(monkeypatch: pytest.MonkeyP
     install_fake_kubernetes_launcher(monkeypatch, fake)
     cfg.default.launcher_factory()
     assert fake.agent_images is None
+    assert fake.agent_service_accounts is None
+
+
+def test_parse_kubernetes_agent_service_account_reaches_launcher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`agents.<name>.service_account` alone is accepted and reaches the launcher and config."""
+    cfg = parse_sandbox_config(
+        {
+            "provider": "kubernetes",
+            "server_url": "http://s.svc.cluster.local",
+            "kubernetes": {
+                "agents": {
+                    "researcher": {"service_account": " researcher-runner "},
+                    "coder": {"image": "x:1", "service_account": "coder-runner"},
+                }
+            },
+        }
+    )
+    assert cfg is not None
+    fake = FakeSandboxLauncher()
+    install_fake_kubernetes_launcher(monkeypatch, fake)
+    cfg.default.launcher_factory()
+    assert fake.agent_images == {"coder": "x:1"}
+    assert fake.agent_service_accounts == {
+        "researcher": "researcher-runner",
+        "coder": "coder-runner",
+    }
+    assert cfg.default.agent_service_accounts == fake.agent_service_accounts
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [{}, {"service_account": ""}, {"service_account": "Bad_Name"}, {"service_account": 1}],
+)
+def test_parse_kubernetes_agent_service_account_rejects_malformed(
+    entry: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match=r"agents\.researcher"):
+        parse_sandbox_config(
+            {
+                "provider": "kubernetes",
+                "server_url": "http://s.svc.cluster.local",
+                "kubernetes": {"agents": {"researcher": entry}},
+            }
+        )
 
 
 def test_parse_host_config_threads_verbatim_without_resolving_secrets(
@@ -1189,7 +1235,7 @@ def test_parse_host_config_lossy_json_key_collision_fails_loud() -> None:
         ({"agents": {"my agent": {"image": "x:1"}}}, "valid Kubernetes label values"),
         ({"agents": {"a" * 64: {"image": "x:1"}}}, "valid Kubernetes label values"),
         ({"agents": {"researcher": "x:1"}}, r"agents\.researcher' must be a mapping"),
-        ({"agents": {"researcher": {}}}, r"agents\.researcher\.image"),
+        ({"agents": {"researcher": {}}}, r"agents\.researcher' must set image"),
         ({"agents": {"researcher": {"image": "  "}}}, r"agents\.researcher\.image"),
         ({"agents": {"researcher": {"image": 3}}}, r"agents\.researcher\.image"),
         (

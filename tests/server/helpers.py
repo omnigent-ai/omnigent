@@ -229,6 +229,7 @@ class FakeSandboxLauncher(SandboxLauncher):
         self.runtime_class: str | None = None
         self.home_size_limit: str | None = None
         self.agent_images: dict[str, str] | None = None
+        self.agent_service_accounts: dict[str, str] | None = None
         self.prepared = False
         self.provisioned_names: list[str] = []
         self.commands: list[str] = []
@@ -639,6 +640,7 @@ def install_fake_kubernetes_launcher(
         runtime_class: str | None = None,
         home_size_limit: str | None = None,
         agent_images: dict[str, str] | None = None,
+        agent_service_accounts: dict[str, str] | None = None,
     ) -> FakeSandboxLauncher:
         """Stand-in constructor recording the construction wiring."""
         fake.image = image
@@ -657,6 +659,7 @@ def install_fake_kubernetes_launcher(
         fake.runtime_class = runtime_class
         fake.home_size_limit = home_size_limit
         fake.agent_images = agent_images
+        fake.agent_service_accounts = agent_service_accounts
         return fake
 
     monkeypatch.setattr(kubernetes_mod, "KubernetesSandboxLauncher", _ctor)

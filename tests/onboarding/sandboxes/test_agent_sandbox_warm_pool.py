@@ -415,6 +415,30 @@ def test_per_agent_image_lands_in_classified_template_but_not_shared() -> None:
     assert images(launcher.template_spec(shared=True)) == {"host-image:test"}
 
 
+def test_per_agent_service_account_lands_in_classified_template_but_not_shared() -> None:
+    launcher = _launcher(agent_service_accounts={"researcher": "researcher-runner"})
+    fleet = launcher.template_spec(shared=True)["podTemplate"]["spec"]["serviceAccountName"]
+
+    def sa(spec: dict[str, Any]) -> str:
+        return spec["podTemplate"]["spec"]["serviceAccountName"]
+
+    assert sa(launcher.template_spec(agent_name="researcher")) == "researcher-runner"
+    assert sa(launcher.template_spec(agent_name="coder")) == fleet != "researcher-runner"
+
+
+def test_shared_pool_does_not_serve_agent_with_its_own_service_account(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.launcher._agent_service_accounts = {"researcher": "researcher-runner"}
+    _set_profile(harness, harness.launcher.template_spec(shared=True))
+    harness.launcher.prepare_for_launch(agent_name="researcher")
+    direct = MagicMock(return_value="direct-sandbox")
+    monkeypatch.setattr(AgentSandboxLauncher, "provision", direct)
+    assert harness.launcher.provision("managed-test") == "direct-sandbox"
+    harness.custom.create_namespaced_custom_object.assert_not_called()
+    direct.assert_called_once_with("managed-test")
+
+
 def test_shared_pool_does_not_serve_agent_with_its_own_image(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:

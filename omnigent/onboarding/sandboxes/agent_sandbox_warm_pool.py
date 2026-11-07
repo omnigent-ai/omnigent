@@ -187,7 +187,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             job_name="warm-template",
             namespace=self._resolve_namespace(),
             image=self._resolve_image(agent_name),
-            service_account=self._resolve_service_account(),
+            service_account=self._resolve_service_account(agent_name),
             host_id="",
             host_name="",
             server_url="http://localhost",
@@ -365,10 +365,11 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                     "No warm profile for agent %r; using direct Sandbox launch", self._agent_name
                 )
                 return super().provision(name)
-            if shared and self._has_agent_image(self._agent_name):
-                # Shared pools run the fleet image; this agent needs its own.
+            if shared and self._has_agent_override(self._agent_name):
+                # Shared pools run the fleet image and ServiceAccount; this agent needs its own.
                 _logger.info(
-                    "Agent %r has its own image; using direct Sandbox launch", self._agent_name
+                    "Agent %r has its own image or ServiceAccount; using direct Sandbox launch",
+                    self._agent_name,
                 )
                 return super().provision(name)
             self._validate_profile(template["spec"], agent_name=self._agent_name, shared=shared)
