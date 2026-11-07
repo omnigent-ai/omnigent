@@ -979,6 +979,7 @@ export function CodeViewer({
         // A different file, or the same path in another conversation, starts at 100% zoom.
         key={`${conversationId}:${path}`}
         conversationId={conversationId}
+        scrollKey={conversationId && path ? `html-preview:${conversationId}:${path}` : null}
         content={content}
         truncated={truncated}
         comments={previewComments}

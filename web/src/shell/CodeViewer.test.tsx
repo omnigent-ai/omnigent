@@ -8,7 +8,7 @@ import { FileViewerContext } from "./FileViewerContext";
 import { ImageLightboxProvider } from "@/components/ImageLightbox";
 import { HTML_PREVIEW_SANDBOX, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { BRIDGE_MSG } from "./htmlCommentBridge";
-import { connectHtmlPreviewBridge } from "@/test/htmlPreviewBridge";
+import { connectHtmlPreviewBridge, requestedScrollRestore } from "@/test/htmlPreviewBridge";
 import { highlightCode } from "@/components/ai-elements/code-block";
 
 const pdfRendering = vi.hoisted(() => ({ error: null as Error | null, mounts: 0 }));
@@ -856,29 +856,37 @@ describe("CodeViewer HTML preview sandbox", () => {
     expect(iframe!.getAttribute("srcdoc")).toContain('<base target="_blank">');
   });
 
+  // Each case starts from its own path: the scroll cache is module-level and outlives a test.
   it.each([
-    ["another file", "b.html", "conv_1"],
-    ["the same path in another conversation", "a.html", "conv_2"],
-  ])("opens %s at 100% zoom", async (_, nextPath, nextConversationId) => {
-    const html = "<html><head></head><body><p>report</p></body></html>";
-    const { rerender } = renderViewer(html, true, "a.html", { viewMode: "preview" });
-    const { port, send } = await connectHtmlPreviewBridge(
-      screen.getByTitle<HTMLIFrameElement>("HTML preview"),
-    );
-    send({ type: BRIDGE_MSG.zoom, action: "in" });
-    const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
-    await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
+    ["another file", "a.html", "b.html", "conv_1"],
+    ["the same path in another conversation", "shared.html", "shared.html", "conv_2"],
+  ])(
+    "opens %s at 100% zoom and without the first preview's scroll offset",
+    async (_, path, nextPath, nextConversationId) => {
+      const html = "<html><head></head><body><p>report</p></body></html>";
+      const opened = (filePath: string, conversationId: string) =>
+        viewerElement(html, true, filePath, { viewMode: "preview", conversationId });
+      const { rerender } = render(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toBeNull();
+      const { port, send } = await connectHtmlPreviewBridge(
+        screen.getByTitle<HTMLIFrameElement>("HTML preview"),
+      );
+      send({ type: BRIDGE_MSG.scroll, top: 760 });
+      // Port messages arrive in order, so the zoom also shows the offset was handled.
+      send({ type: BRIDGE_MSG.zoom, action: "in" });
+      const zoomBox = () => screen.getByTitle("HTML preview").parentElement as HTMLElement;
+      await waitFor(() => expect(zoomBox().style.transform).toBe("scale(1.1)"));
 
-    // The content stays loaded, as it does for a cached file.
-    rerender(
-      viewerElement(html, true, nextPath, {
-        viewMode: "preview",
-        conversationId: nextConversationId,
-      }),
-    );
-    expect(zoomBox().style.transform).toBe("");
-    port.close();
-  });
+      // The content stays loaded, as it does for a cached file.
+      rerender(opened(nextPath, nextConversationId));
+      expect(zoomBox().style.transform).toBe("");
+      expect(requestedScrollRestore()).toBeNull();
+      port.close();
+
+      rerender(opened(path, "conv_1"));
+      expect(requestedScrollRestore()).toMatchObject({ top: 760 });
+    },
+  );
 });
 
 describe("CodeViewer rendered previews skip Shiki highlighting", () => {

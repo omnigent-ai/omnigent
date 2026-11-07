@@ -310,7 +310,10 @@ def _commit_updated_ats(repo_root: str, heads: list[str | None]) -> dict[str, in
     unique_heads = list(dict.fromkeys(head for head in heads if head is not None))
     if not unique_heads:
         return {}
-    result = _run_git(["show", "-s", "--format=%H%x00%ct", *unique_heads], cwd=repo_root)
+    result = _run_git(
+        ["log", "--no-walk=unsorted", "--format=%H%x00%ct", *unique_heads, "--"],
+        cwd=repo_root,
+    )
     if result.returncode != 0:
         return {}
     timestamps: dict[str, int] = {}

@@ -45,7 +45,7 @@ const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
 
 // The request is valid but reached a replica without its host tunnel.
 // Unlike runner_unavailable, wrong_replica can recover by re-addressing.
-const WRONG_REPLICA_CODE = "wrong_replica";
+export const WRONG_REPLICA_CODE = "wrong_replica";
 
 /**
  * Classify a request URL for slice-key routing. A host-scoped request must key

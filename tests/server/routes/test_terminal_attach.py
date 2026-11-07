@@ -19,23 +19,28 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from omnigent.entities import Conversation, SessionPermission
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner.routing import RunnerRouter
+from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 from omnigent.runtime import (
     _globals,
     set_runner_client,
     set_runner_router,
     set_runner_ws_factory,
 )
-from omnigent.server._runner_ws_tunnel import WrongReplicaWSError
+from omnigent.server._runner_ws_tunnel import (
+    RunnerUnavailableWSError,
+    make_tunnel_ws_factory,
+)
 from omnigent.server.auth import (
     LEVEL_EDIT,
     LEVEL_OWNER,
@@ -43,9 +48,11 @@ from omnigent.server.auth import (
     RESERVED_USER_PUBLIC,
     UnifiedAuthProvider,
 )
+from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.terminals import TerminalRegistry
-from omnigent.terminals.ws_common import WS_CLOSE_WRONG_REPLICA
+from omnigent.terminals.ws_common import WS_CLOSE_INTERNAL_ERROR, WS_CLOSE_WRONG_REPLICA
+from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -113,12 +120,13 @@ class _StubConversationStore:
     def get_conversation(self, conversation_id: str) -> Conversation | None:
         return self._conversations.get(conversation_id)
 
-    def add(self, conversation_id: str) -> None:
+    def add(self, conversation_id: str, **fields: Any) -> None:
         self._conversations[conversation_id] = Conversation(
             id=conversation_id,
             created_at=0,
             updated_at=0,
             root_conversation_id=conversation_id,
+            **fields,
         )
 
 
@@ -559,18 +567,45 @@ async def test_attach_terminal_read_grant_only_allows_read_only_proxy() -> None:
     assert interactive_factory.calls == []
 
 
-async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI) -> None:
+@pytest.mark.parametrize(
+    ("runner_id", "host_live_elsewhere", "expected_code"),
+    [
+        ("runner_reconnecting", True, WS_CLOSE_WRONG_REPLICA),
+        ("runner_reconnecting", False, 1013),
+        (None, False, WS_CLOSE_INTERNAL_ERROR),
+    ],
+    ids=["wrong_replica", "runner_tunnel_not_connected", "no_runner_pinned"],
+)
+async def test_attach_terminal_tunnel_factory_failure_close_code(
+    app: FastAPI, runner_id: str | None, host_live_elsewhere: bool, expected_code: int
+) -> None:
     """
-    A wrong-replica routing miss closes with the retryable code so the browser
-    re-dials without its slice key instead of reporting the runner offline.
+    A tunnel-factory failure closes with a code matching its cause: 4400
+    re-dials without the slice key when the host lives on another replica,
+    1013 re-dials with backoff while the pinned runner reconnects, and any
+    other failure, such as an unpinned session, keeps the internal error.
 
     :param app: The FastAPI app fixture.
+    :param runner_id: The session's pinned runner, or ``None`` when unpinned.
+    :param host_live_elsewhere: Whether the session's host is live on
+        another replica.
+    :param expected_code: The close code the browser must receive.
     """
 
-    def factory(path: str):
-        raise WrongReplicaWSError(f"tunnel for {path} lives on another replica")
+    class _HostLiveness:
+        def is_online(self, host_id: str) -> bool:
+            return host_live_elsewhere
 
-    set_runner_ws_factory(factory)
+    conversations = _StubConversationStore()
+    conversations.add("conv_ws", runner_id=runner_id, host_id="host_ws")
+    tunnels = TunnelRegistry()
+    router = RunnerRouter(
+        registry=tunnels,
+        conversation_store=conversations,
+        host_registry=HostRegistry(),
+        host_store=_HostLiveness(),
+    )
+    set_runner_ws_factory(make_tunnel_ws_factory(router, tunnels))
 
     with (
         TestClient(app).websocket_connect(
@@ -580,7 +615,62 @@ async def test_attach_terminal_wrong_replica_closes_with_retry_code(app: FastAPI
     ):
         ws.receive_bytes()
 
-    assert exc_info.value.code == WS_CLOSE_WRONG_REPLICA
+    assert exc_info.value.code == expected_code
+
+
+async def test_attach_terminal_await_launch_waits_for_waking_runner(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ``await_launch`` attach waits out a runner the shell create is waking.
+
+    Without the flag the same miss closes 1013 at once and the browser re-dials
+    on its backoff; with it, the relay retries until the runner's tunnel is up.
+    """
+    monkeypatch.setattr("omnigent.server.routes.terminal_attach._RUNNER_WS_RETRY_S", 0.01)
+    pty_bytes = b"$ "
+    connected = _FakeRunnerWSFactory(_FakeRunnerWSConn(outgoing=[pty_bytes]))
+    attempts: list[str] = []
+
+    def waking_factory(runner_path: str) -> object:
+        attempts.append(runner_path)
+        if len(attempts) < 3:
+            raise RunnerUnavailableWSError("runner is offline")
+        return connected(runner_path)
+
+    set_runner_ws_factory(waking_factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+    ) as ws:
+        assert ws.receive_bytes() == pty_bytes
+
+    assert len(attempts) == 3
+
+
+async def test_attach_terminal_await_launch_gives_up_on_a_runner_that_never_connects(
+    app: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the launch wait, an unavailable runner still closes 1013 for a re-dial."""
+    monkeypatch.setattr("omnigent.server.routes.terminal_attach._RUNNER_WS_RETRY_S", 0.01)
+    monkeypatch.setattr("omnigent.entities.session_resources.TERMINAL_LAUNCH_ATTACH_WAIT_S", 0.1)
+    attempts: list[str] = []
+
+    def offline_factory(runner_path: str) -> object:
+        attempts.append(runner_path)
+        raise RunnerUnavailableWSError("runner is offline")
+
+    set_runner_ws_factory(offline_factory)
+
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    assert exc_info.value.code == 1013
+    assert len(attempts) > 1
 
 
 async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> None:
@@ -594,22 +684,67 @@ async def test_attach_terminal_proxies_to_runner_ws_factory(app: FastAPI) -> Non
 
     :param app: The FastAPI app fixture.
     """
+    control = '{"type": "tmux-replies", "replies": []}'
     pty_bytes = b"\x1b[31mhello\x1b[0m"
-    conn = _FakeRunnerWSConn(outgoing=[pty_bytes])
+    more_bytes = b" world"
+    conn = _FakeRunnerWSConn(outgoing=[control, pty_bytes, more_bytes])
     factory = _FakeRunnerWSFactory(conn)
     set_runner_ws_factory(factory)
 
-    with TestClient(app).websocket_connect(
-        "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
-    ) as ws:
-        # The runner emits one binary frame, then closes cleanly.
-        msg = ws.receive_bytes()
-        assert msg == pty_bytes
+    with (
+        capture_debug_rows("server") as rows,
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+        ) as ws,
+    ):
+        # Control JSON leads, then two output frames, then a clean close.
+        assert ws.receive_text() == control
+        assert ws.receive_bytes() == pty_bytes
+        assert ws.receive_bytes() == more_bytes
         with pytest.raises(WebSocketDisconnect):
             ws.receive_bytes()
 
     assert factory.calls == [
         "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach?read_only=true"
+    ]
+    # One timing row per attach, for terminal output rather than the control frame.
+    (first_output,) = [row for row in rows if row["event_name"] == "terminal_attach_first_output"]
+    assert first_output["session_id"] == "conv_ws"
+    assert int(cast(dict[str, str], first_output["attributes"])["first_output_ms"]) >= 0
+
+
+async def test_attach_terminal_control_only_attach_logs_no_first_output(app: FastAPI) -> None:
+    """An attach that relays only control JSON reports no first-output timing."""
+    control = '{"type": "tmux-replies", "replies": []}'
+    set_runner_ws_factory(_FakeRunnerWSFactory(_FakeRunnerWSConn(outgoing=[control])))
+
+    with (
+        capture_debug_rows("server") as rows,
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+        ) as ws,
+    ):
+        assert ws.receive_text() == control
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert [row for row in rows if row["event_name"] == "terminal_attach_first_output"] == []
+
+
+async def test_attach_terminal_proxy_forwards_await_launch(app: FastAPI) -> None:
+    """``?await_launch=true`` reaches the runner so it waits for the launch."""
+    factory = _FakeRunnerWSFactory(_FakeRunnerWSConn())
+    set_runner_ws_factory(factory)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach?await_launch=true"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert factory.calls == [
+        "/v1/sessions/conv_ws/resources/terminals/terminal_zsh_u-ab12cd/attach"
+        "?read_only=false&await_launch=true"
     ]
 
 
@@ -736,3 +871,48 @@ async def test_attach_terminal_local_fallback_uses_control_mode(
         pass
 
     assert calls == [(str(tmp_path / "bash-s1.sock"), "main", True)]
+
+
+async def test_attach_terminal_local_fallback_await_launch_waits_for_registration(
+    app: FastAPI,
+    server_registry: TerminalRegistry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The in-process path also waits for an in-flight launch to register."""
+    calls: list[str] = []
+
+    async def fake_control(websocket: WebSocket, *, socket_path: str, **_: object) -> None:
+        calls.append(socket_path)
+        await websocket.close()
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.terminal_attach.bridge_tmux_control_to_websocket",
+        fake_control,
+    )
+    from omnigent.entities import session_resources
+
+    real_lookup = session_resources.resolve_terminal_entry_by_resource_id
+    lookups: list[str] = []
+
+    def lookup(session_id: str, terminal_id: str, terminal_registry: object) -> object:
+        # The route's own lookup misses and registers the terminal, as a
+        # launch finishing just after the attach arrived would.
+        lookups.append(terminal_id)
+        if len(lookups) == 1:
+            _seed_registry(
+                server_registry, "conv_local_wait", [_make_running_instance("zsh", "u1", tmp_path)]
+            )
+            return None
+        return real_lookup(session_id, terminal_id, terminal_registry)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_resources, "resolve_terminal_entry_by_resource_id", lookup)
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/conv_local_wait/resources/terminals/terminal_zsh_u1/attach?await_launch=true"
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_bytes()
+
+    assert calls == [str(tmp_path / "zsh-u1.sock")]
+    assert len(lookups) == 2
