@@ -58,6 +58,7 @@ from omnigent.onboarding.harness_install import (
     PI_KEY,
     QWEN_KEY,
     READINESS_CLI_PROBE_TIMEOUT_S,
+    configured_native_claude_launcher,
     harness_cli_binary,
     harness_cli_installed,
     required_cli_for_harness,
@@ -234,6 +235,10 @@ def _harness_availability_core(harness: str) -> HarnessAvailability:
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
         # Native harnesses require tmux/PTY, which the runner does not support on Windows.
         return False
+    launcher = configured_native_claude_launcher(canonical)
+    if launcher is not None:
+        # The configured launcher installs the Claude Code it starts.
+        return launcher.resolved_path is not None
     if canonical == "acp":
         # The generic ACP harness has no fixed binary — "configured" means at
         # least one agent is registered in the ``acp:`` config block. Each
@@ -959,6 +964,10 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     """Return picker-facing availability for one canonical harness spelling."""
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
         return False
+    launcher = configured_native_claude_launcher(canonical)
+    if launcher is not None:
+        # The configured launcher owns Claude Code's install and sign-in.
+        return True if launcher.resolved_path is not None else HARNESS_BINARY_MISSING
     if _is_codex_family_harness(canonical):
         from omnigent.harnesses.codex_native.main import _codex_auth_unavailable_reason
 
