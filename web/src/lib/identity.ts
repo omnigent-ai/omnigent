@@ -263,16 +263,15 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
  * body host_id pins both to the right replica like every other host-scoped
  * request. A managed-sandbox create's ``host_id`` is the id it chose for its
  * new sandbox host, so the launch runs where that host's tunnel will land.
- * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
- * are hostless here (non-string body), as is a managed create or fork without
- * one; all yield null → unkeyed (see
- * {@link isBodyHostKeyedRequest}).
+ * Multipart creates carry the same routing fields in their metadata part.
+ * Creates without a host ID stay unkeyed.
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
-  if (typeof body !== "string") return null;
+  const metadata = body instanceof FormData ? body.get("metadata") : body;
+  if (typeof metadata !== "string") return null;
   if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
   try {
-    const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
+    const hostId = (JSON.parse(metadata) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
   } catch {
     return null;
@@ -294,12 +293,11 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  *   modal host (null / a different host for a fresh user), which is why an
  *   unkeyed import lands off-replica and 409s "host is not connected".
  *
- * A bundled (multipart) create has a non-string body and is not matched: it only
- * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
- * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
+ * Multipart creates can launch on a host during creation, so they use the same
+ * routing rule as JSON creates.
  */
 function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
+  return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -713,4 +711,28 @@ export async function authenticatedFetch(
     if (loginUrl) redirectToLogin(loginUrl);
   }
   return res;
+}
+
+// A light authenticated read the SPA already makes at boot. It reaches the same
+// auth edge as the stream and the sends, so its answer speaks for them.
+const SIGN_IN_PROBE_PATH = "/v1/me";
+
+/**
+ * Whether the sign-in has expired, judged from one request that does not follow
+ * redirects. A redirect to a login page or a 401/403 means a retry cannot renew the
+ * sign-in. The edge answers an invalid session with a redirect, never an HTML 200,
+ * so a 200 (such as a maintenance page) reads as not expired. A failed probe also
+ * reads as not expired, and the caller keeps retrying.
+ */
+export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await hostFetch(SIGN_IN_PROBE_PATH, {
+      redirect: "manual",
+      cache: "no-store",
+      signal,
+    });
+    return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
+  } catch {
+    return false;
+  }
 }
