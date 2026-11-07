@@ -610,7 +610,7 @@ def _scan_pushes(
     directories: Sequence[str],
     started_at: float | None,
     finished_at: float,
-) -> tuple[list[pushed_branches.BranchKey], tuple[float, float]]:
+) -> tuple[list[pushed_branches.BranchKey], pushed_branches.Window]:
     """Read the branches a shell call pushed from the checkouts it touched.
 
     :returns: The newly pushed branches and the call's time window.
@@ -636,17 +636,15 @@ def _scan_pushes(
 def _record_branch_prs(
     session_id: str,
     facets: Sequence[_ProviderFacet],
-    keys: Sequence[pushed_branches.BranchKey],
+    branches: Sequence[tuple[pushed_branches.BranchKey, pushed_branches.Window | None]],
     source: str,
-    *,
-    window: tuple[float, float] | None = None,
 ) -> None:
     """Record the open PRs of pending branches the session updated; the rest stay pending.
 
-    A PR opened inside *window*, the updating call's, counts as created by it.
+    A PR opened inside a branch's window, its pushing call's, counts as created by it.
     """
     by_provider = {facet.provider_id: facet for facet in facets}
-    for key in keys:
+    for key, window in branches:
         provider_id, host, repository, branch = key
         facet = by_provider.get(provider_id)
         if facet is None:
@@ -659,7 +657,6 @@ def _record_branch_prs(
             ]
             if not found:
                 continue
-            _pushes.resolved(session_id, key)
             created = {
                 pr.reference.url
                 for pr in found
@@ -675,6 +672,7 @@ def _record_branch_prs(
                 ("worked_on", [pr.reference for pr in found if pr.reference.url not in created]),
             ):
                 registry.record(references, relationship=relationship, source=source)
+            _pushes.resolved(session_id, key)
             pr_reports.notify(session_id)
         except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution
             _log_provider_failure(provider_id, "branch_prs")
@@ -683,8 +681,8 @@ def _record_branch_prs(
 def _recheck(
     session_id: str, facets: Sequence[_ProviderFacet], now: float, *, force: bool = False
 ) -> None:
-    if keys := _pushes.due(session_id, now, force=force):
-        _lookup_pool.submit(_record_branch_prs, session_id, facets, keys, "branch_recheck")
+    if branches := _pushes.due(session_id, now, force=force):
+        _lookup_pool.submit(_record_branch_prs, session_id, facets, branches, "branch_recheck")
 
 
 def start_observing(session_id: str) -> None:
@@ -745,7 +743,7 @@ def observe_tool_completion(
         command = _shell_command(tool_name, arguments)
         segments: list[ShellSegment] = []
         pushed: list[pushed_branches.BranchKey] = []
-        window: tuple[float, float] | None = None
+        window: pushed_branches.Window | None = None
         if command is not None:
             strict = _shell_segments(command)
             annotated, directories = pushed_branches.with_directories(
@@ -804,15 +802,12 @@ def observe_tool_completion(
                 )
             ]
         )
+        branches = [*((key, window) for key in pushed), *((key, None) for key in writes)]
         # Pending before the first lookup, so a recheck while it runs still covers them.
-        for key in [*pushed, *writes]:
-            _pushes.add_pending(session_id, key, finished_at)
-        if pushed:
-            _lookup_pool.submit(
-                _record_branch_prs, session_id, facets, pushed, source, window=window
-            )
-        if writes:
-            _lookup_pool.submit(_record_branch_prs, session_id, facets, writes, source)
+        for key, branch_window in branches:
+            _pushes.add_pending(session_id, key, finished_at, branch_window)
+        if branches:
+            _lookup_pool.submit(_record_branch_prs, session_id, facets, branches, source)
         _recheck(session_id, facets, finished_at)
     except Exception:
         _logger.warning(

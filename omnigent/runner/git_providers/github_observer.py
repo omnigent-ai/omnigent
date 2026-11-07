@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import functools
 import json
+import os
 import re
 from collections import Counter
 from collections.abc import Sequence
@@ -559,6 +560,15 @@ def _gh_arguments(segment: ShellSegment) -> list[str] | None:
     return [*args, *prefix]
 
 
+def _inferred_checkout(segments: Sequence[ShellSegment], segment: ShellSegment) -> str | None:
+    """Return *segment*'s checkout unless an exported or inherited ``GH_REPO`` may override it."""
+    if os.environ.get("GH_REPO") or any(
+        "GH_REPO" in token for other in segments for token in other.raw_tokens
+    ):
+        return None
+    return segment.cwd
+
+
 def _checkout_repository(cwd: str) -> tuple[str, str] | None:
     """Return the ``(host, owner/name)`` that gh uses as the base repository in *cwd*.
 
@@ -676,7 +686,7 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         field = _graphql_create_field(tokens)
         projection = (_flag(tokens, "--jq", "-q", last=True) or "").strip()
         commands.append((tokens, field, projection))
-        if op := _checkout_pr_operation(tokens, segment.cwd):
+        if op := _checkout_pr_operation(tokens, _inferred_checkout(segments, segment)):
             checkout_ops.append(op)
     output_eligible = not any(field for _, field, _ in commands) or _graphql_output_eligible(
         segments
@@ -797,7 +807,7 @@ def shell_branch_writes(segments: Sequence[ShellSegment]) -> list[BranchWrite]:
         endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0].strip("/")
         host = _flag(tokens, "--hostname") or "github.com"
         if re.search(r"\{(?:owner|repo|branch)\}", endpoint):
-            filled = _fill_placeholders(endpoint, tokens, segment.cwd)
+            filled = _fill_placeholders(endpoint, tokens, _inferred_checkout(segments, segment))
             if filled is None:
                 continue
             host, endpoint = filled

@@ -17,6 +17,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from filelock import Timeout as FileLockTimeout
 
 from omnigent.runner import github_resource, pr_observer
 from omnigent.runner.git_providers import github_push
@@ -499,6 +500,7 @@ class _Forge:
 @pytest.fixture
 def forge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Forge:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.delenv("GH_REPO", raising=False)
     monkeypatch.setattr(pr_observer, "_pushes", pr_observer.pushed_branches.SessionPushes())
     stub = _Forge()
     monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=stub.gh))
@@ -574,6 +576,7 @@ def test_push_without_upstream_to_a_fork_tracks_the_upstream_pr(
     assert _tracked("conv_fork") == [(UPSTREAM_PR_URL, "worked_on")]
 
 
+@pytest.mark.parametrize("found_by", ["first-lookup", "turn-end-recheck"])
 @pytest.mark.parametrize(
     "opened_after_start,relationship",
     [
@@ -587,6 +590,7 @@ def test_pr_opened_during_the_pushing_call_counts_as_created(
     forge: _Forge,
     opened_after_start: float,
     relationship: str,
+    found_by: str,
 ) -> None:
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
@@ -594,9 +598,9 @@ def test_pr_opened_during_the_pushing_call_counts_as_created(
     started_at = time.time() - 10
     git("push", "-q", cwd=worktree)
     opened = datetime.fromtimestamp(started_at + opened_after_start, UTC).isoformat()
-    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
-        _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", opened)
-    ]
+    pulls = [_branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", opened)]
+    if found_by == "first-lookup":
+        forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = pulls
     result = {"stdout": "", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
     _observe_shell(
         monkeypatch,
@@ -606,6 +610,12 @@ def test_pr_opened_during_the_pushing_call_counts_as_created(
         started_at=started_at,
         finished_at=started_at + 20,
     )
+    if found_by == "turn-end-recheck":
+        assert _tracked("conv_created") == []
+        forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = pulls
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+            pr_observer.recheck_pending("conv_created")
     assert _tracked("conv_created") == [(CHECKOUT_PR_URL, relationship)]
 
 
@@ -716,30 +726,71 @@ def test_turn_end_recheck_during_the_first_lookup_finds_a_pr_opened_meanwhile(
     assert _tracked("conv_race") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
+def test_pr_found_while_the_registry_is_busy_is_recorded_at_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+        _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")
+    ]
+    record = SessionPrRegistry.record
+    attempts: list[object] = []
+
+    def busy(self: SessionPrRegistry, references: list[object], **options: object) -> None:
+        if references:
+            attempts.append(references)
+            raise FileLockTimeout("session-prs.json.lock")
+        record(self, references, **options)
+
+    monkeypatch.setattr(SessionPrRegistry, "record", busy)
+    _run_and_observe(monkeypatch, "conv_busy", "git push -q", worktree)
+    assert attempts
+    assert _tracked("conv_busy") == []
+    monkeypatch.setattr(SessionPrRegistry, "record", record)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        pr_observer.recheck_pending("conv_busy")
+    assert _tracked("conv_busy") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
 @pytest.mark.parametrize(
-    "resolved,repository",
+    "command,inherited,resolved,repository",
     [
-        pytest.param(None, "upstream/project", id="upstream-remote"),
-        pytest.param("base", CHECKOUT_REPO, id="gh-resolved-default"),
+        pytest.param("gh pr ready 42", None, None, "upstream/project", id="upstream-remote"),
+        pytest.param("gh pr ready 42", None, "base", CHECKOUT_REPO, id="gh-resolved-default"),
+        pytest.param(
+            "export GH_REPO=other/repo && gh pr ready 42", None, None, None, id="exported-gh-repo"
+        ),
+        pytest.param("gh pr ready 42", "other/repo", None, None, id="inherited-gh-repo"),
     ],
 )
 def test_numbered_pr_write_without_repo_uses_the_checkout_base_repository(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     forge: _Forge,
+    command: str,
+    inherited: str | None,
     resolved: str | None,
-    repository: str,
+    repository: str | None,
 ) -> None:
+    if inherited:
+        monkeypatch.setenv("GH_REPO", inherited)
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
     git("remote", "add", "upstream", "git@github.com:upstream/project.git", cwd=worktree)
     if resolved:
         git("config", "remote.origin.gh-resolved", resolved, cwd=worktree)
-    url = f"https://github.com/{repository}/pull/42"
-    forge.responses[f"repos/{repository}/pulls/42"] = {**CHECKOUT_PR, "html_url": url}
+    for candidate in ("upstream/project", CHECKOUT_REPO):
+        forge.responses[f"repos/{candidate}/pulls/42"] = {
+            **CHECKOUT_PR,
+            "html_url": f"https://github.com/{candidate}/pull/42",
+        }
     result = {"stdout": "", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
-    _observe_shell(monkeypatch, "conv_ready", "gh pr ready 42", result)
-    assert _tracked("conv_ready") == [(url, "worked_on")]
+    _observe_shell(monkeypatch, "conv_ready", command, result)
+    url = f"https://github.com/{repository}/pull/42"
+    assert _tracked("conv_ready") == ([(url, "worked_on")] if repository else [])
 
 
 @pytest.mark.parametrize(
@@ -771,6 +822,8 @@ def test_push_output_finds_pushes_the_checkout_state_does_not_show(
     }
     if reports_cwd:
         result["cwd"] = str(worktree)
+    scan = Mock(wraps=pr_observer._scan_pushes)
+    monkeypatch.setattr(pr_observer, "_scan_pushes", scan)
     _observe_shell(
         monkeypatch,
         "conv_output",
@@ -779,6 +832,7 @@ def test_push_output_finds_pushes_the_checkout_state_does_not_show(
         started_at=time.time(),
         repository_visible=visible,
     )
+    assert scan.called is visible
     assert _tracked("conv_output") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
@@ -864,42 +918,57 @@ async def test_native_hook_ignores_a_push_made_before_the_session_relay_started(
     assert _tracked("conv_before") == []
 
 
+CONTENTS_WRITE = (
+    "gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
+    " -f message='Update notes' -f content=bm90ZXMK -f branch=topic"
+)
+REF_WRITE = "gh api -X PATCH 'repos/{owner}/{repo}/git/refs/heads/{branch}' -f sha=abc1234"
+
+
 @pytest.mark.parametrize(
-    "command,repository",
+    "command,inherited,repository",
     [
+        pytest.param(CONTENTS_WRITE, None, CHECKOUT_REPO, id="checkout-repository"),
         pytest.param(
-            "gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
-            " -f message='Update notes' -f content=bm90ZXMK -f branch=topic",
-            CHECKOUT_REPO,
-            id="checkout-repository",
-        ),
-        pytest.param(
-            "GH_REPO=upstream/project gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
-            " -f message='Update notes' -f content=bm90ZXMK -f branch=topic",
+            f"GH_REPO=upstream/project {CONTENTS_WRITE}",
+            None,
             "upstream/project",
             id="gh-repo-override",
         ),
+        pytest.param(REF_WRITE, None, CHECKOUT_REPO, id="current-branch"),
         pytest.param(
-            "gh api -X PATCH 'repos/{owner}/{repo}/git/refs/heads/{branch}' -f sha=abc1234",
-            CHECKOUT_REPO,
-            id="current-branch",
+            f"export GH_REPO=upstream/project; {CONTENTS_WRITE}", None, None, id="exported-gh-repo"
         ),
+        pytest.param(REF_WRITE, "upstream/project", None, id="inherited-gh-repo"),
     ],
 )
 def test_gh_api_branch_write_fills_placeholders_as_gh_does(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, command: str, repository: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    forge: _Forge,
+    command: str,
+    inherited: str | None,
+    repository: str | None,
 ) -> None:
+    if inherited:
+        monkeypatch.setenv("GH_REPO", inherited)
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
     git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
-    url = f"https://github.com/{repository}/pull/42"
-    forge.responses[f"repos/{repository}/commits/topic/pulls"] = [
-        _branch_pr(url, repository, "topic", "2020-01-01T00:00:00Z")
-    ]
+    for candidate in ("upstream/project", CHECKOUT_REPO):
+        forge.responses[f"repos/{candidate}/commits/topic/pulls"] = [
+            _branch_pr(
+                f"https://github.com/{candidate}/pull/42",
+                candidate,
+                "topic",
+                "2020-01-01T00:00:00Z",
+            )
+        ]
     result = {"stdout": "{}", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
     _observe_shell(monkeypatch, "conv_placeholder", command, result)
-    assert forge.lookups == [f"repos/{repository}/commits/topic/pulls"]
-    assert _tracked("conv_placeholder") == [(url, "worked_on")]
+    url = f"https://github.com/{repository}/pull/42"
+    assert forge.lookups == ([f"repos/{repository}/commits/topic/pulls"] if repository else [])
+    assert _tracked("conv_placeholder") == ([(url, "worked_on")] if repository else [])
 
 
 @pytest.mark.parametrize("configured", [False, True], ids=["unknown-host", "configured-host"])

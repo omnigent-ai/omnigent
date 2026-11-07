@@ -4,9 +4,10 @@
 it updates, whichever alias, wrapper, pipe, or redirection ran it. A branch counts
 as pushed by the call when that entry falls inside the call's time window and the
 ref now points at the HEAD of a checkout the call touched. The HEAD match keeps
-other worktrees' pushes out, and fetches such as ``gh pr checkout`` write no push
-entry. A push to a URL that matches no remote, or of a branch other than HEAD, is
-not seen.
+out pushes from sibling worktrees at other commits, though one at the same commit
+shares the refs and is indistinguishable. Fetches such as ``gh pr checkout`` write
+no push entry. A push to a URL that matches no remote, or of a branch other than
+HEAD, is not seen.
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ _SESSIONS = 256
 _GIT_VALUE_OPTIONS = frozenset({"-c", "--git-dir", "--work-tree", "--namespace", "--config-env"})
 # ``(provider, host, repository, branch)``.
 BranchKey = tuple[str, str, str, str]
+# The ``(start, end)`` times of the call that pushed a branch.
+Window = tuple[float, float]
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,7 @@ class PendingBranch:
 
     expires_at: float
     next_check: float
+    window: Window | None = None
 
 
 @dataclass
@@ -283,28 +287,32 @@ class SessionPushes:
                 handled.popitem(last=False)
             return True
 
-    def add_pending(self, session_id: str, key: BranchKey, now: float) -> None:
-        """Recheck *key* later for a PR it does not have yet."""
+    def add_pending(
+        self, session_id: str, key: BranchKey, now: float, window: Window | None = None
+    ) -> None:
+        """Recheck *key* later for a PR it does not have yet, keeping its call's *window*."""
         with self._lock:
             pending = self._session(session_id).pending
             pending.pop(key, None)
-            pending[key] = PendingBranch(now + PENDING_TTL_S, now + RECHECK_INTERVAL_S)
+            pending[key] = PendingBranch(now + PENDING_TTL_S, now + RECHECK_INTERVAL_S, window)
             while len(pending) > _PENDING_BRANCHES:
                 pending.popitem(last=False)
 
-    def due(self, session_id: str, now: float, *, force: bool = False) -> list[BranchKey]:
-        """Return the pending branches to check now, deferring their next check."""
+    def due(
+        self, session_id: str, now: float, *, force: bool = False
+    ) -> list[tuple[BranchKey, Window | None]]:
+        """Return the pending branches due now with their windows, deferring their next check."""
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 return []
-            due: list[BranchKey] = []
+            due: list[tuple[BranchKey, Window | None]] = []
             for key, entry in list(session.pending.items()):
                 if entry.expires_at <= now:
                     del session.pending[key]
                 elif force or entry.next_check <= now:
                     entry.next_check = now + RECHECK_INTERVAL_S
-                    due.append(key)
+                    due.append((key, entry.window))
             return due
 
     def resolved(self, session_id: str, key: BranchKey) -> None:

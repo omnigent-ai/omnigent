@@ -1100,7 +1100,7 @@ class ExecutorAdapter(HarnessApp):
         self._pr_observation = finished
 
     async def _record_pr_observations(self) -> None:
-        """Let this turn's PR observations land before the runner reports them at turn end."""
+        """Let this turn's observations record output PRs and queue branch lookups by turn end."""
         if self._pr_observation is not None:
             await asyncio.wait(
                 [asyncio.wrap_future(self._pr_observation)], timeout=_PR_OBSERVATION_WAIT_S
