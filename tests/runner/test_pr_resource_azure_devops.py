@@ -53,6 +53,7 @@ NO_CAPABILITIES = {
     "review_thread_creation": False,
     "details_editing": False,
     "attachment_uploads": False,
+    "commit_history": False,
 }
 LEGACY_FIELDS = {"gh_available", "authenticated", "accounts", "selected_account"}
 CHANGES = [
@@ -368,6 +369,21 @@ def test_changed_files_of_a_tracked_pr_come_from_azure_devops(
 
     assert result == {"object": "list", "data": CHANGED_FILES, "has_more": False}
     assert paths(ado_transport) == [f"{PULL}/iterations", f"{PULL}/iterations/2/changes"]
+
+
+def test_commit_history_is_refused_for_azure_devops_pull_requests(workspace: Path) -> None:
+    track(PR_URL)
+
+    assert AzureDevOpsPullRequests().capabilities.commit_history is False
+    message = "Listing commits is not supported for Azure DevOps pull request"
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commits(
+            str(workspace), session_id=SESSION, pr_url=PR_URL, head_sha="a" * 40
+        )
+    with pytest.raises(ValueError, match=message):
+        pr_resource.pr_commit_diff(
+            str(workspace), session_id=SESSION, pr_url=PR_URL, commit_sha="a" * 40
+        )
 
 
 def test_changed_files_of_the_branch_pr_come_from_azure_devops(
