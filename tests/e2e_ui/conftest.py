@@ -222,6 +222,16 @@ def open_previewable_files_in_preview(page: Page) -> None:
     )
 
 
+# Turns off the "Start a new session in…" project picker, which otherwise
+# opens in front of the composer whenever the shared server holds a project.
+# Install it with ``page.add_init_script`` before ``page.goto`` in any test that
+# starts a session through the New session link, button, or hotkey and expects
+# the plain composer; the picker's own test leaves it out.
+DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT = (
+    'window.localStorage.setItem("omnigent:new-chat-project-prompt", "off");'
+)
+
+
 # Populated by live_server for fixtures that need the server PID or runner ID.
 _server_state: dict[str, object] = ServerState()
 
