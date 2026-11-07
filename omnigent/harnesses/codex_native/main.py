@@ -2398,6 +2398,7 @@ def _codex_rollout_records_from_session_items(
         event_msg = _codex_event_msg_record_for_message(payload, timestamp=timestamp)
         if event_msg is not None:
             records.append(event_msg)
+    _bound_codex_replay_argument_bytes(records, source_items=items)
     return records
 
 
@@ -2727,6 +2728,131 @@ def _codex_message_payload_from_session_item(item: _JsonObject) -> _JsonObject |
 # The Responses API rejects a function_call whose arguments exceed 1,048,576
 # characters, and a rebuilt thread replays every call; leave headroom.
 _MAX_REPLAYED_ARGUMENTS_CHARS = 900_000
+# Reserve space below the 32 MiB request cap for instructions, tools and new input.
+_MAX_REPLAYED_HISTORY_BYTES = 24 * 1024 * 1024
+
+
+def _bound_codex_replay_argument_bytes(
+    records: list[_JsonObject], *, source_items: Sequence[_JsonObject] = ()
+) -> None:
+    """Bound completed arguments in the owned reconstruction, retaining recent context."""
+    history: list[object] = []
+    for record in records:
+        payload = record["payload"]
+        if not isinstance(payload, dict):
+            continue
+        if record["type"] == "compacted":
+            replacement_history = payload.get("replacement_history")
+            if isinstance(replacement_history, list):
+                history = list(replacement_history)
+        elif record["type"] == "response_item":
+            history.append(payload)
+
+    def encoded_bytes(value: object) -> int:
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8", errors="backslashreplace"
+            )
+        )
+
+    history_bytes = 2 + sum(encoded_bytes(item) + 1 for item in history) - bool(history)
+    if history_bytes <= _MAX_REPLAYED_HISTORY_BYTES:
+        return
+    original_bytes = history_bytes
+    calls: Counter[str] = Counter()
+    outputs: Counter[str] = Counter()
+    output_positions: dict[str, int] = {}
+    # Conversion can drop orphan outputs or merge carried calls, so check source evidence too.
+    source_counts: dict[str, Counter[str]] = {}
+    for source_item in source_items:
+        compacted_messages = source_item.get("compacted_messages")
+        is_snapshot = source_item.get("type") == "compaction" and isinstance(
+            compacted_messages, list
+        )
+        item_counts: dict[str, Counter[str]] = {}
+        for item in compacted_messages if is_snapshot else [source_item]:
+            if not isinstance(item, dict) or not isinstance(call_id := item.get("call_id"), str):
+                continue
+            counts = item_counts.setdefault(call_id, Counter())
+            if "status" in item and item["status"] != "completed":
+                counts["pending"] += 1
+            if (item_type := item.get("type")) in ("function_call", "function_call_output"):
+                counts[item_type] += 1
+        if is_snapshot:
+            # A snapshot replaces only the calls it contains; conversion carries other open calls.
+            source_counts.update(item_counts)
+        else:
+            for call_id, counts in item_counts.items():
+                source_counts.setdefault(call_id, Counter()).update(counts)
+    ambiguous = {
+        call_id
+        for call_id, counts in source_counts.items()
+        if counts["pending"] or counts["function_call"] > 1 or counts["function_call_output"] > 1
+    }
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if "status" in item and item["status"] != "completed":
+            ambiguous.add(call_id)
+        if item.get("type") == "function_call":
+            calls[call_id] += 1
+        elif item.get("type") == "function_call_output":
+            outputs[call_id] += 1
+            output_positions[call_id] = index
+            if not isinstance(item.get("output"), (str, list)):
+                ambiguous.add(call_id)
+        else:
+            ambiguous.add(call_id)
+    omitted = 0
+    for index, item in enumerate(history):
+        if history_bytes <= _MAX_REPLAYED_HISTORY_BYTES:
+            break
+        if not isinstance(item, dict):
+            continue
+        call_id = item.get("call_id")
+        arguments = item.get("arguments")
+        if (
+            item.get("type") != "function_call"
+            or not isinstance(call_id, str)
+            or calls[call_id] != 1
+            or outputs[call_id] != 1
+            or call_id in ambiguous
+            or output_positions[call_id] <= index
+            or not isinstance(arguments, str)
+            or _CODEX_OMITTED_ARGUMENTS_MARKER.fullmatch(arguments)
+            or not isinstance(item.get("name"), str)
+            or not item["name"]
+            or ("namespace" in item and not isinstance(item["namespace"], str))
+        ):
+            continue
+        replacement = _codex_omitted_arguments(arguments)
+        savings = encoded_bytes(arguments) - encoded_bytes(replacement)
+        if savings > 0:
+            item["arguments"] = replacement
+            history_bytes -= savings
+            omitted += 1
+    _logger.warning(
+        "Bound Codex reconstructed history arguments: "
+        "before_bytes=%d after_bytes=%d omitted_calls=%d",
+        original_bytes,
+        history_bytes,
+        omitted,
+    )
+
+
+_CODEX_OMITTED_ARGUMENTS_MARKER = re.compile(
+    r'\{"omitted": "\d+ characters of arguments, too large to replay"\}'
+)
+
+
+def _codex_omitted_arguments(arguments: str) -> str:
+    """Return a valid JSON marker without retaining the omitted arguments."""
+    return json.dumps(
+        {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
+    )
 
 
 def _codex_replayed_arguments(arguments: str) -> str:
@@ -2736,9 +2862,7 @@ def _codex_replayed_arguments(arguments: str) -> str:
     _logger.warning(
         "Replaying oversized Codex function_call arguments as a stub: chars=%d", len(arguments)
     )
-    return json.dumps(
-        {"omitted": f"{len(arguments)} characters of arguments, too large to replay"}
-    )
+    return _codex_omitted_arguments(arguments)
 
 
 def _codex_function_call_payload_from_session_item(
