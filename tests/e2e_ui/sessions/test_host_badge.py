@@ -81,7 +81,6 @@ def _patch_host_view(
     host_online: bool,
     runner_online: bool = False,
     host_resumable: bool = True,
-    snapshot: dict | None = None,
 ) -> None:
     """Patch the browser's view of ``session_id`` into a host-bound shape.
 
@@ -102,7 +101,6 @@ def _patch_host_view(
         ``True`` (the default) keeps an offline host out of the ``host_offline``
         dead-end so the chat view renders normally; ``False`` is a real
         laptop/external host the user reconnects with ``omnigent host``.
-    :param snapshot: Extra fields to set on the session snapshot.
     """
     host = {**host, "host_id": _FAKE_HOST_ID}
 
@@ -116,7 +114,6 @@ def _patch_host_view(
         payload["host_id"] = _FAKE_HOST_ID
         payload["host_resumable"] = host_resumable
         payload["created_at"] = _OLD_CREATED_AT
-        payload.update(snapshot or {})
         route.fulfill(
             status=200,
             headers={**response.headers, "content-type": "application/json"},
@@ -235,9 +232,16 @@ def test_host_badge_shows_offline_when_host_unreachable(
         host={"name": "e2e-host", "owner": "e2e", "status": "offline", "sandbox_provider": None},
         host_online=False,
         host_resumable=True,
-        # An earlier error keeps opening the session from waking the sandbox,
-        # so the badge stays asleep (the automatic wake is in test_host_asleep_composer.py).
-        snapshot={"last_task_error": {"code": "runner_disconnected", "message": "Disconnected"}},
+    )
+    # Opening the session presses Reconnect host after a second; failing that wake
+    # keeps the badge asleep (the wake itself is in test_host_asleep_composer.py).
+    page.route(
+        re.compile(rf"/v1/sessions/{re.escape(session_id)}/events(\?|$)"),
+        lambda route: (
+            route.fulfill(status=503, json={"error": {"message": "Sandbox is asleep."}})
+            if "retry_session" in (route.request.post_data or "")
+            else route.continue_()
+        ),
     )
 
     page.goto(f"{base_url}/c/{session_id}")

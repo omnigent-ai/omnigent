@@ -2,23 +2,11 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
-  resetSandboxWakeRequestsForTesting,
-  wakeSandboxSession,
-} from "@/hooks/useSessionReconnect";
-import { retrySession } from "@/lib/sessionsApi";
-import type * as SessionsApiModule from "@/lib/sessionsApi";
-
-import {
   canAutoWakeSandbox,
   requestSandboxWake,
   SANDBOX_AUTO_WAKE_DWELL_MS,
   useSandboxAutoWake,
 } from "./useSandboxAutoWake";
-
-vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof SessionsApiModule>()),
-  retrySession: vi.fn(),
-}));
 
 function setVisibility(value: DocumentVisibilityState) {
   Object.defineProperty(document, "visibilityState", { configurable: true, get: () => value });
@@ -45,7 +33,6 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
-  resetSandboxWakeRequestsForTesting();
   vi.useRealTimers();
 });
 
@@ -107,26 +94,9 @@ describe("useSandboxAutoWake", () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
-  it("doesn't wake again after the dwell when any wake already ran for the opening", async () => {
-    vi.mocked(retrySession).mockRejectedValue(new Error("transport failed"));
+  it("doesn't wake again after the dwell when a tab's wake already ran", () => {
     const { wake } = renderAutoWake({ id: "a", canWake: true });
-    // Reconnect host or Resume, failing fast before the dwell ends.
-    await act(async () => {
-      await wakeSandboxSession("a").catch(() => {});
-    });
-    act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
-    expect(wake).not.toHaveBeenCalled();
-    // An explicit retry still goes out.
     act(() => requestSandboxWake("a"));
-    expect(wake).toHaveBeenCalledTimes(1);
-  });
-
-  it("ignores wakes of other sessions", async () => {
-    vi.mocked(retrySession).mockRejectedValue(new Error("transport failed"));
-    const { wake } = renderAutoWake({ id: "a", canWake: true });
-    await act(async () => {
-      await wakeSandboxSession("b").catch(() => {});
-    });
     act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
     expect(wake).toHaveBeenCalledTimes(1);
   });
@@ -144,33 +114,17 @@ describe("useSandboxAutoWake", () => {
 });
 
 describe("canAutoWakeSandbox", () => {
-  const safe = {
-    asleep: true,
-    launching: false,
-    permissionLevel: null as number | null,
-    isChild: false,
-    status: "idle",
-    failed: false,
-    undelivered: false,
-  };
+  const safe = { asleep: true, launching: false, canEdit: true, status: "idle" };
 
-  it.each<[string, Partial<typeof safe>]>([
-    ["the owner of an unshared session", {}],
-    ["an editor", { permissionLevel: 2 }],
-    ["an editor of a child", { permissionLevel: 2, isChild: true }],
-  ])("wakes an idle, healthy, asleep session for %s", (_label, override) => {
-    expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(true);
+  it("wakes an idle, asleep session for someone who can edit it", () => {
+    expect(canAutoWakeSandbox(safe)).toBe(true);
   });
 
   it.each<[string, Partial<typeof safe>]>([
     ["isn't asleep", { asleep: false }],
     ["is already launching", { launching: true }],
-    ["the viewer can only read", { permissionLevel: 1 }],
-    ["is a child the viewer has no known edit grant on", { isChild: true }],
+    ["the viewer can't edit", { canEdit: false }],
     ["is running a turn", { status: "running" }],
-    ["failed", { status: "failed" }],
-    ["has an error or a failed sandbox launch", { failed: true }],
-    ["still has a message marked Not delivered", { undelivered: true }],
   ])("leaves a session that %s to its own controls", (_label, override) => {
     expect(canAutoWakeSandbox({ ...safe, ...override })).toBe(false);
   });

@@ -460,9 +460,9 @@ Reloading during the wake keeps it spinning, with the stage (for example
 stays in the menu then, in case that stage never finishes.
 Opening such a session presses Reconnect host for the user once the session
 has stayed open for a second in a visible tab, and so does picking Files,
-Changes or Pull Requests in the Workspace rail. This only happens for editors, on an idle
-session with no error or launch already running; any other session keeps its
-Resume or error card. Each opening checks once, so a session that sleeps again
+Changes or Pull Requests in the Workspace rail. This only happens for editors,
+on an idle session whose launch isn't already running, and does exactly what
+pressing Reconnect host does. Each opening checks once, so a session that sleeps again
 while it stays open waits for Reconnect host, a Files, Changes or Pull
 Requests pick, or a message. Every way of waking
 the sandbox (Reconnect host, opening the session, Files or Changes, the

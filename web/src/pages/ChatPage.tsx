@@ -85,6 +85,7 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
   derivePermissionLevel,
+  isEditorLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
@@ -282,6 +283,7 @@ import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect, wakeSandboxSession } from "@/hooks/useSessionReconnect";
 import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
+import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -996,12 +998,9 @@ export function ChatPage() {
       ? null
       : canAutoWakeSandbox({
           asleep: liveness.kind === "host_asleep",
-          launching: autoWakeLaunch !== null && autoWakeLaunch.stage !== "failed",
-          permissionLevel,
-          isChild: activeSession.parentSessionId != null,
+          launching: autoWakeLaunch !== null && !isSandboxLaunchStopped(autoWakeLaunch),
+          canEdit: isEditorLevel(permissionLevel),
           status: activeSession.status,
-          failed: Boolean(activeSession.lastTaskError) || autoWakeLaunch?.stage === "failed",
-          undelivered: (activeSession.failedInputs?.length ?? 0) > 0,
         });
   useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // A message to an offline Arca host reconnects it from the desktop and waits

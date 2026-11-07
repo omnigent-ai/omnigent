@@ -1,8 +1,5 @@
 import { useEffect, useRef } from "react";
 
-import { onSandboxWakeStarted } from "@/hooks/useSessionReconnect";
-import { isEditorLevel } from "@/lib/permissionsApi";
-
 /**
  * How long a session must stay open in a visible tab before its asleep
  * sandbox wakes, so stepping through sessions (⌘[ / ⌘], the recent-session
@@ -13,31 +10,22 @@ export const SANDBOX_AUTO_WAKE_DWELL_MS = 1_000;
 const wakeRequests = new Set<(sessionId: string) => void>();
 
 /**
- * Whether opening a session may wake its asleep sandbox. The wake is Reconnect
- * host's `retry_session`, so it must not resume failed work or redeliver
- * undelivered input; such sessions keep their Resume or error card.
+ * Whether opening a session may press Reconnect host for the user: its
+ * sandbox is asleep, no turn is running, the viewer can edit, and no launch is
+ * already under way.
  */
 export function canAutoWakeSandbox({
   asleep,
   launching,
-  permissionLevel,
-  isChild,
+  canEdit,
   status,
-  failed,
-  undelivered,
 }: {
   asleep: boolean;
   launching: boolean;
-  /** The viewer's level on this session; `null` means unshared, which for a root is its owner. */
-  permissionLevel: number | null;
-  /** A child's `null` level only means no direct grant, so edit access isn't known. */
-  isChild: boolean;
+  canEdit: boolean;
   status: string;
-  failed: boolean;
-  undelivered: boolean;
 }): boolean {
-  const canEdit = permissionLevel === null ? !isChild : isEditorLevel(permissionLevel);
-  return asleep && !launching && canEdit && status === "idle" && !failed && !undelivered;
+  return asleep && !launching && canEdit && status === "idle";
 }
 
 /** Ask the open session's view to wake its asleep sandbox, as picking the Files tab does. */
@@ -116,17 +104,14 @@ export function useSandboxAutoWake(
   useEffect(() => {
     if (!sessionId) return;
     const onRequest = (requested: string) => {
-      if (requested === sessionId && latest.current.canWake) latest.current.wake();
+      if (requested !== sessionId || !latest.current.canWake) return;
+      // This is the opening's wake; the dwell mustn't send another after it.
+      opening.current.checked = true;
+      latest.current.wake();
     };
     wakeRequests.add(onRequest);
-    // Any wake of this session (Reconnect host, Resume, a tab) is this opening's:
-    // the dwell mustn't send another after it fails.
-    const stopListening = onSandboxWakeStarted((started) => {
-      if (started === sessionId) opening.current.checked = true;
-    });
     return () => {
       wakeRequests.delete(onRequest);
-      stopListening();
     };
   }, [sessionId]);
 }

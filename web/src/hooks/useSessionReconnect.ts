@@ -26,13 +26,6 @@ export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
 // (Reconnect host, opening the session, the Files and Changes tabs, the
 // terminal's Resume): a caller during the request joins it and gets its answer.
 const sandboxWakeRequests = new Map<string, Promise<PostEventResponse>>();
-const wakeStartListeners = new Set<(sessionId: string) => void>();
-
-/** Hear about every wake request sent for a session, whoever sent it. */
-export function onSandboxWakeStarted(listener: (sessionId: string) => void): () => void {
-  wakeStartListeners.add(listener);
-  return () => wakeStartListeners.delete(listener);
-}
 
 /** Forget every in-flight wake request. */
 export function resetSandboxWakeRequestsForTesting(): void {
@@ -47,7 +40,6 @@ export function wakeSandboxSession(sessionId: string): Promise<PostEventResponse
     if (sandboxWakeRequests.get(sessionId) === request) sandboxWakeRequests.delete(sessionId);
   });
   sandboxWakeRequests.set(sessionId, request);
-  for (const listener of wakeStartListeners) listener(sessionId);
   return request;
 }
 
