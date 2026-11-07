@@ -1756,6 +1756,7 @@ const aboutWindow = createAboutWindow({
   BrowserWindow,
   ipcMain,
   nativeTheme,
+  shell,
   updater,
   getDesktopVersion: () => currentDesktopVersion,
   getAppIconDataUrl: () =>
