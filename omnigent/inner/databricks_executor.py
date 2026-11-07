@@ -27,14 +27,13 @@ import subprocess
 import time
 from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
-from functools import partial
-from inspect import getattr_static
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from omnigent.models import model_catalog
+from omnigent.util.databricks_sdk import with_cli_cache_policy
 
 if TYPE_CHECKING:
     import configparser
@@ -101,12 +100,7 @@ def _sdk_config_constructor() -> Callable[..., Any]:  # type: ignore[explicit-an
     """Let the CLI manage cache freshness when the SDK supports that policy."""
     from databricks.sdk.config import Config
 
-    # SDK descriptors return None on class access, so inspect the declaration.
-    try:
-        getattr_static(Config, "databricks_cli_force_refresh")
-    except AttributeError:
-        return Config
-    return partial(Config, databricks_cli_force_refresh=False)
+    return with_cli_cache_policy(Config)
 
 
 def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | None:

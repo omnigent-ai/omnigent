@@ -962,7 +962,16 @@ def _ensure_bound(args: argparse.Namespace) -> None:
     from databricks.sdk import WorkspaceClient
     from databricks.sdk.errors.platform import NotFound
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    if __package__:
+        from .src.databricks_sdk_policy import workspace_client_with_cli_cache
+    else:
+        from src.databricks_sdk_policy import workspace_client_with_cli_cache
+
+    wc = (
+        workspace_client_with_cli_cache(WorkspaceClient, profile=args.profile)
+        if args.profile
+        else workspace_client_with_cli_cache(WorkspaceClient)
+    )
     try:
         wc.apps.get(name=args.app_name)
     except NotFound:
@@ -1195,7 +1204,16 @@ def main() -> int:
     # Late-import the SDK so `--help` works without it installed.
     from databricks.sdk import WorkspaceClient
 
-    wc = WorkspaceClient(profile=args.profile) if args.profile else WorkspaceClient()
+    if __package__:
+        from .src.databricks_sdk_policy import workspace_client_with_cli_cache
+    else:
+        from src.databricks_sdk_policy import workspace_client_with_cli_cache
+
+    wc = (
+        workspace_client_with_cli_cache(WorkspaceClient, profile=args.profile)
+        if args.profile
+        else workspace_client_with_cli_cache(WorkspaceClient)
+    )
 
     # 1) Prep the bundle's source_code_path (src/) — sweep stale
     # wheels locally, then copy the new small wheels in.

@@ -33,6 +33,7 @@ from omnigent.onboarding.sandboxes.base import (
     supervise_host_command,
 )
 from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+from omnigent.util.databricks_sdk import with_cli_cache_policy
 from omnigent.util.proxy_bearer import (
     PROXY_BEARER_FILE_ENV_VAR,
     PROXY_BEARER_SERVER_URL_ENV_VAR,
@@ -332,7 +333,7 @@ class DatabricksSandboxLauncher(SandboxLauncher):
             # integration. This is deterministic, unlike the meta-harness/omnigent
             # User-Agent marker, which is set only inside the in-sandbox runner
             # (runner/_entry.py) and so is absent from these server-side calls.
-            config = Config(
+            config = with_cli_cache_policy(Config)(
                 host=host,
                 credentials_strategy=_owner_token_strategy(self._owner_access_token),
                 http_timeout_seconds=_EXEC_HTTP_TIMEOUT_S,

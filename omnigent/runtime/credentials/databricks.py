@@ -53,6 +53,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from omnigent.util.databricks_sdk import with_cli_cache_policy
+
 _logger = logging.getLogger(__name__)
 
 # Default location of the Databricks CLI config file when
@@ -309,7 +311,7 @@ def _call_sdk_authenticate(profile: str | None) -> WorkspaceCreds | None:
     # ``None`` means "let the SDK decide" (env var / DEFAULT section).
     sdk_profile = profile or os.environ.get("DATABRICKS_CONFIG_PROFILE")
     try:
-        cfg = Config(profile=sdk_profile)
+        cfg = with_cli_cache_policy(Config)(profile=sdk_profile)
         headers = cfg.authenticate()
     except ValueError as exc:
         # INFO (not WARNING): expired tokens raise here. WARNING would

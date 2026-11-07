@@ -7,6 +7,7 @@ from databricks.sdk.service.serving import ChatMessage, ChatMessageRole, QueryEn
 
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.classification import PromptClassifier
+from issue_prioritization.databricks_sdk_policy import workspace_client_with_cli_cache
 
 
 def serving_endpoint_classifier(
@@ -19,7 +20,7 @@ def serving_endpoint_classifier(
 ) -> PromptClassifier:
     if not endpoint:
         raise ValueError("model_endpoint is required when issue classifications are missing")
-    workspace = workspace or WorkspaceClient()
+    workspace = workspace or workspace_client_with_cli_cache(WorkspaceClient)
     gateway_url = None
     gateway_headers = {}
     if os.environ.get("OMNIGENT_CI_PIPELINE") or os.environ.get("OMNIGENT_CI_CONTEXT"):

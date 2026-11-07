@@ -116,7 +116,9 @@ try:
 
     # ── Lakebase token injection ──────────────────────────────
 
-    _workspace_client = WorkspaceClient()
+    from databricks_sdk_policy import workspace_client_with_cli_cache
+
+    _workspace_client = workspace_client_with_cli_cache(WorkspaceClient)
 
     def _get_cached_token(endpoint: str) -> str:
         """Return a cached Lakebase token for ``endpoint``, minting if needed.

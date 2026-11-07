@@ -33,6 +33,7 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution,
 )
 from omnigent.models import model_catalog
+from omnigent.util.databricks_sdk import with_cli_cache_policy
 
 if TYPE_CHECKING:
     from databricks.sdk.core import Config
@@ -479,7 +480,7 @@ def _databricks_bearer_token(profile: str) -> str | None:
     try:
         from databricks.sdk.core import Config
 
-        headers = Config(profile=profile).authenticate() or {}
+        headers = with_cli_cache_policy(Config)(profile=profile).authenticate() or {}
         authz = headers.get("Authorization", "")
         return authz.split(" ", 1)[1] if authz.lower().startswith("bearer ") else None
     except Exception as exc:  # noqa: BLE001 - SDK absent / bad profile / auth failure.
@@ -512,7 +513,7 @@ def resolve_databricks_gateway(
     try:
         from databricks.sdk.core import Config
 
-        config = Config(profile=profile)
+        config = with_cli_cache_policy(Config)(profile=profile)
         host = (config.host or "").rstrip("/")
         if not host:
             return None

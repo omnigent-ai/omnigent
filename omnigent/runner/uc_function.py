@@ -37,6 +37,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.util.databricks_sdk import workspace_client_with_cli_cache
 
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
@@ -74,8 +75,8 @@ def _get_workspace_client(
     from databricks.sdk import WorkspaceClient as _WSC
 
     if profile is not None:
-        return _WSC(profile=profile)
-    return _WSC()
+        return workspace_client_with_cli_cache(_WSC, profile=profile)
+    return workspace_client_with_cli_cache(_WSC)
 
 
 def _build_select_statement(

@@ -38,6 +38,8 @@ import os
 import socket
 import sys
 
+from omnigent.util.databricks_sdk import with_cli_cache_policy
+
 # Bound the SDK's network (OIDC metadata discovery + token exchange) to parity
 # with the timeout-bounded CLI mint (``--timeout 15s``) and broker (15s). The SDK
 # path is otherwise unbounded; ``Config.__init__``'s metadata probe was observed
@@ -89,13 +91,17 @@ def _sdk_bearer(profile: str | None, host: str | None) -> tuple[str, str] | None
             # mirroring the CLI mint's ``env -u``.
             for name in _ambient_credential_env_vars():
                 os.environ.pop(name, None)
-            cfg = Config(profile=profile)
+            cfg = with_cli_cache_policy(Config)(profile=profile)
         else:
             # Unprofiled: mirror ``databricks auth token --host`` — drop any
             # ambient profile and pin the SDK to this workspace so env / OIDC
             # service-principal credentials mint against it.
             os.environ.pop("DATABRICKS_CONFIG_PROFILE", None)
-            cfg = Config(host=host) if host else Config()
+            cfg = (
+                with_cli_cache_policy(Config)(host=host)
+                if host
+                else with_cli_cache_policy(Config)()
+            )
         auth = cfg.authenticate().get("Authorization", "")
         if not cfg.host or not auth.startswith("Bearer "):
             return None

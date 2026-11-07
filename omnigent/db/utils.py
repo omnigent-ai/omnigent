@@ -20,6 +20,8 @@ from sqlalchemy import Engine, create_engine, event, inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError, NoSuchModuleError
 
+from omnigent.util.databricks_sdk import workspace_client_with_cli_cache
+
 if TYPE_CHECKING:
     from alembic.config import Config
 from sqlalchemy.orm import Session, sessionmaker
@@ -126,7 +128,7 @@ def _databricks_lakebase_token_provider(instance_name: str) -> str:
     """
     from databricks.sdk import WorkspaceClient
 
-    workspace_client = WorkspaceClient()
+    workspace_client = workspace_client_with_cli_cache(WorkspaceClient)
     credential = workspace_client.database.generate_database_credential(
         request_id=str(uuid.uuid4()),
         instance_names=[instance_name],

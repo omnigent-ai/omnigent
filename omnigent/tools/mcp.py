@@ -57,6 +57,7 @@ from mcp.types import Tool as McpToolDef
 from omnigent.runner.identity import strip_runner_auth_secrets
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
+from omnigent.util.databricks_sdk import workspace_client_with_cli_cache
 
 _T = TypeVar("_T")
 
@@ -111,7 +112,7 @@ def _resolve_databricks_token(profile: str) -> str:
         ) from None
 
     try:
-        client = WorkspaceClient(profile=profile)
+        client = workspace_client_with_cli_cache(WorkspaceClient, profile=profile)
         result = client.config.authenticate()
         # SDK returns either a dict (newer versions) or a callable
         # that produces headers (older versions).

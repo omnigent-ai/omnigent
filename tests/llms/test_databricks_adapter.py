@@ -2,7 +2,37 @@
 
 from typing import Any
 
+import pytest
+
 from omnigent.llms.adapters.databricks import DatabricksAdapter
+
+
+@pytest.mark.parametrize("supports_policy", [False, True], ids=["legacy", "supported"])
+@pytest.mark.parametrize("profile", [None, "owned"])
+def test_sdk_config_cache_preserves_profile_and_refresh_policy(
+    monkeypatch, supports_policy, profile
+):
+    from tests._helpers.databricks_sdk import sdk_config_double
+
+    calls = []
+    config = sdk_config_double(
+        supports_policy=supports_policy,
+        resolved_host="https://example.databricks.com",
+        headers={"Authorization": "Bearer synthetic"},
+        on_construct=calls.append,
+    )
+    monkeypatch.setattr("databricks.sdk.config.Config", config)
+    monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "ambient-profile")
+    adapter = DatabricksAdapter()
+
+    resolved = adapter._get_sdk_config(profile)
+
+    assert resolved is not None
+    assert adapter._get_sdk_config(profile) is resolved
+    expected = {"profile": profile or "ambient-profile", "host": None}
+    if supports_policy:
+        expected["databricks_cli_force_refresh"] = False
+    assert calls == [expected]
 
 
 def test_stream_options_stripped_from_streaming_payload() -> None:

@@ -33,6 +33,7 @@ from omnigent.models.model_fallbacks import (
     SMART_ROUTING_TASK_V1_CODEX_ARMS,
 )
 from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
+from omnigent.util.databricks_sdk import with_cli_cache_policy
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -1830,7 +1831,7 @@ class ExternalRoutingClient:
             try:
                 from databricks.sdk.config import Config
 
-                self._sdk_config = Config(profile=self._databricks_profile)
+                self._sdk_config = with_cli_cache_policy(Config)(profile=self._databricks_profile)
             except Exception:  # auth failure degrades to unauthenticated
                 _logger.warning(
                     "ExternalRoutingClient: could not resolve auth for profile %r",
@@ -1864,7 +1865,7 @@ class ExternalRoutingClient:
             try:
                 from databricks.sdk.config import Config
 
-                config = Config()
+                config = with_cli_cache_policy(Config)()
             except Exception:  # no ambient credential is the normal case
                 _logger.debug(
                     "ExternalRoutingClient: no ambient Databricks credential", exc_info=True
