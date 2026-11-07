@@ -1077,6 +1077,32 @@ def test_session_metadata_managed_accepts_repo_url_workspace(workspace: str) -> 
     assert meta.workspace == workspace
 
 
+def test_session_metadata_managed_accepts_multiple_repo_workspaces() -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    workspaces = ["https://github.com/org/one", "git@github.com:org/two.git#release"]
+    meta = SessionCreateMetadata(host_type="managed", workspaces=workspaces)
+    assert meta.managed_repo_workspaces() == workspaces
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"host_type": "managed", "workspace": "https://github.com/org/one", "workspaces": []},
+        {"host_type": "managed", "workspaces": ["https://github.com/org/one"] * 11},
+        {"host_type": "managed", "workspaces": ["/tmp/local"]},
+        {"host_type": "external", "workspaces": ["https://github.com/org/one"]},
+        {"host_type": "managed", "git": {"branch_name": "new"}},
+        {"git": {"branch_name": "new"}},
+    ],
+)
+def test_bundled_workspace_metadata_rejects_incompatible_options(metadata) -> None:
+    from omnigent.server.schemas import SessionCreateMetadata
+
+    with pytest.raises(ValidationError):
+        SessionCreateMetadata.model_validate(metadata)
+
+
 def test_session_metadata_managed_accepts_sandbox_provider() -> None:
     """
     ``sandbox_provider`` is accepted with ``host_type="managed"`` (chooses

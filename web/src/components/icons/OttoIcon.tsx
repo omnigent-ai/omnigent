@@ -1,7 +1,7 @@
 import { forwardRef, type SVGProps } from "react";
 
 // Otto mascot (same art as the favicon), inlined so CSS/JS can animate parts:
-// - Pass className="otto-working" for the bob + blink (see index.css). Each eye
+// - Pass className="otto-working" for the blink (see index.css). Each eye
 //   (Otto's two and the buddy starfish's two) is a `g.otto-eye` group of
 //   sclera + pupil + glint so the blink collapses each eye in place.
 // - Otto's two pupils (black disc + glint) are additionally wrapped in
