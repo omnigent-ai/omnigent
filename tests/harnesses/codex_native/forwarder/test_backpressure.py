@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import json
 from collections.abc import Callable, Coroutine
@@ -156,6 +157,22 @@ def _register_child_response(body: dict[str, Any], request: httpx.Request) -> ht
     return httpx.Response(200, json={"child_session_id": f"session_{thread_id}"}, request=request)
 
 
+def _is_parent_idle_status(path: str, body: dict[str, Any]) -> bool:
+    return (
+        path == f"/v1/sessions/{_SESSION_ID}/events"
+        and body.get("type") == "external_session_status"
+        and body.get("data", {}).get("status") == "idle"
+    )
+
+
+def _live_child_delivery_workers() -> list[asyncio.Task[Any]]:
+    return [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "codex-native-child-delivery" and not task.done()
+    ]
+
+
 def _child_tool_items(
     posts: list[tuple[str, dict[str, Any]]], child: str
 ) -> list[tuple[str, str]]:
@@ -172,15 +189,14 @@ async def test_parent_turn_completion_is_not_delayed_by_subagent_flood(tmp_path:
     _write_parent_bridge(tmp_path)
     codex = _StreamingCodexClient()
     posts: list[tuple[str, dict[str, Any]]] = []
-    parent_turn_cleared = asyncio.Event()
+    parent_idle_received = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(_POST_LATENCY_SECONDS)
         body = json.loads(request.content) if request.content else {}
         posts.append((request.url.path, body))
-        state = read_bridge_state(tmp_path)
-        if state is not None and state.active_turn_id is None:
-            parent_turn_cleared.set()
+        if _is_parent_idle_status(request.url.path, body):
+            parent_idle_received.set()
         if body.get("type") == "external_codex_subagent_start":
             return _register_child_response(body, request)
         return httpx.Response(200, json={}, request=request)
@@ -204,17 +220,19 @@ async def test_parent_turn_completion_is_not_delayed_by_subagent_flood(tmp_path:
             marker="parent_turn_completed",
         )
         async with asyncio.timeout(60):
-            await parent_turn_cleared.wait()
-        cleared_at = asyncio.get_running_loop().time()
+            await parent_idle_received.wait()
+        idle_received_at = asyncio.get_running_loop().time()
     finally:
         codex.queue.put_nowait(None)
-        await asyncio.gather(forwarder, return_exceptions=True)
+    async with asyncio.timeout(30):
+        await forwarder
 
-    lag = cleared_at - codex.emitted_at["parent_turn_completed"]
+    lag = idle_received_at - codex.emitted_at["parent_turn_completed"]
     child_posts = sum(1 for path, _ in posts if path.startswith("/v1/sessions/session_"))
+    assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]
     assert lag < _MAX_PARENT_COMPLETION_LAG_SECONDS, (
-        f"parent turn/completed was handled {lag:.2f}s after Codex emitted it, "
-        f"behind {child_posts} sub-agent posts"
+        f"the server received the parent's idle status {lag:.2f}s after Codex emitted "
+        f"turn/completed, behind {child_posts} sub-agent posts"
     )
     # Shutdown drains every lane, and each child's calls and outputs keep Codex order.
     for child in children:
@@ -273,6 +291,87 @@ async def test_shutdown_drains_child_questions_before_closing_the_hook_tracker(
         if task.get_name() == "codex-native-elicitation-hook" and not task.done()
     ]
     assert leaked == []
+
+
+async def test_cancelled_child_lane_drain_cancels_worker(tmp_path: Path) -> None:
+    _write_parent_bridge(tmp_path)
+    codex = _StreamingCodexClient()
+    child = _child_thread(0)
+    child_post_started = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if body.get("type") == "external_codex_subagent_start":
+            return _register_child_response(body, request)
+        if request.url.path == f"/v1/sessions/session_{child}/events":
+            child_post_started.set()
+            await asyncio.Event().wait()  # the server never answers this child post
+        return httpx.Response(200, json={}, request=request)
+
+    forwarder = _start_forwarder(tmp_path, codex, handler)
+    _spawn_children(codex, [child])
+    _emit_command(codex, child, 0)
+    async with asyncio.timeout(5):
+        await child_post_started.wait()
+    codex.queue.put_nowait(None)  # stream EOF: shutdown starts draining the stuck lane
+    await asyncio.sleep(0.1)
+    assert not forwarder.done(), "shutdown should still be draining the stuck lane"
+    forwarder.cancel()
+    async with asyncio.timeout(5):
+        with contextlib.suppress(asyncio.CancelledError):
+            await forwarder
+
+    assert _live_child_delivery_workers() == []
+
+
+async def test_child_delivery_slots_are_shared_and_released_after_failure() -> None:
+    client = httpx.AsyncClient(base_url="http://test")
+    state = fwd._CodexForwarderState(parent_session_id=_SESSION_ID, mcp_startup_settled=True)
+    state.child_delivery_slots = asyncio.Semaphore(2)
+    for child in ("a", "b", "c", "d"):
+        state.note_child_thread(f"thread_{child}", f"conv_{child}")
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+    delivered: list[str] = []
+
+    def deliver(name: str, *, fail: bool = False) -> Callable[[], Coroutine[Any, Any, None]]:
+        async def run() -> None:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                if fail:
+                    raise RuntimeError("child handler failed")
+                await release.wait()
+                delivered.append(name)
+            finally:
+                active -= 1
+
+        return run
+
+    lane_events = [
+        ("thread_a", deliver("a1", fail=True)),
+        ("thread_a", deliver("a2")),
+        ("thread_b", deliver("b1")),
+        ("thread_c", deliver("c1")),
+        ("thread_d", deliver("d1")),
+    ]
+    try:
+        for thread_id, handle in lane_events:
+            event = _event("item/completed", thread_id, f"turn_{thread_id}")
+            assert state.enqueue_child_event(client, event, handle, parent_thread_id=None)
+        await asyncio.sleep(0.1)
+        assert peak == 2
+        release.set()
+        async with asyncio.timeout(5):
+            await state.close_child_streams()
+    finally:
+        release.set()
+        await client.aclose()
+
+    assert peak == 2
+    assert sorted(delivered) == ["a2", "b1", "c1", "d1"]
 
 
 async def test_nested_child_usage_baseline_follows_connection_order(tmp_path: Path) -> None:

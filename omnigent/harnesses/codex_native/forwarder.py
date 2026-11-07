@@ -442,9 +442,19 @@ class _CodexChildStream:
                 "Codex child delivery drain timed out: dropped=%d",
                 self.delivery_queue.qsize(),
             )
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+            await self._stop_worker(worker)
+        except asyncio.CancelledError:
+            # The shield keeps a timeout from killing delivery mid-post; a
+            # cancelled shutdown must still stop the worker before resources close.
+            await self._stop_worker(worker)
+            raise
+
+    @staticmethod
+    async def _stop_worker(worker: asyncio.Task[None]) -> None:
+        """Cancel the lane worker and wait until it has finished."""
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
 
     def accepts_event(self, method: str, params: _JsonObject) -> bool:
         turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
@@ -991,11 +1001,13 @@ class _CodexForwarderState:
 
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
-        await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
-        await asyncio.gather(
-            *(stream.delta_coalescer.close() for stream in self.child_streams.values())
-        )
-        self.child_streams.clear()
+        try:
+            await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
+        finally:
+            await asyncio.gather(
+                *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+            )
+            self.child_streams.clear()
 
     def note_parent_rotation(self, session_id: str) -> None:
         """
