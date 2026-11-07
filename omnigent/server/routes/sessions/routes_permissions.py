@@ -236,6 +236,11 @@ def register_permissions_routes(
             target holds the owner grant, 400 when leaving a sub-agent
             session, 401 if unauthenticated.
         """
+        target_user_id = (
+            target_user_id.strip()
+            if target_user_id.strip() == RESERVED_USER_PUBLIC
+            else target_user_id.strip().lower()
+        )
         user_id = _require_user(request, auth_provider)
         # Leaving is self-service; revoking someone else is management. Read
         # access is the floor for the self case — enough to prove the session
