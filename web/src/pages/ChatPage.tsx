@@ -253,7 +253,13 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
+import {
+  useSandboxAgentUsesProviderDefault,
+  useSandboxLaunchModelOptions,
+} from "@/hooks/useSandboxModelOptions";
+import { hasLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
+import { useSandboxLaunchSelectionCheck } from "@/hooks/useSandboxLaunchSelectionCheck";
+import { useRememberSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import {
   ComposerConfigSections,
@@ -948,6 +954,37 @@ export function ChatPage() {
       : sessionModelOptions;
   const modelsFromLaunchPreview =
     sandboxPreviewOptions !== undefined && codexModelOptions === sandboxPreviewOptions;
+  // Teach the new-session picker what this sandbox's harness really offers,
+  // and drop a launch pick it cannot run once its catalog arrives.
+  const { data: sandboxHostRows } = useHosts({ includeSandbox: true });
+  const sessionSandboxProvider =
+    sandboxHostRows?.find((row) => row.host_id === activeSession?.hostId)?.sandbox_provider ??
+    sandboxStatus?.provider ??
+    null;
+  const sessionCatalogIsActive = activeSession != null && activeConversationId === activeSession.id;
+  const liveSessionCatalog =
+    sessionCatalogIsActive &&
+    !activeSession.inferenceConfigured &&
+    hasLiveSessionCatalog(activeSession.id);
+  // Agents with their own provider or profile have private catalogs, so only default ones are shared.
+  const agentUsesProviderDefault = useSandboxAgentUsesProviderDefault(
+    sessionSandboxProvider,
+    sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
+    liveSessionCatalog,
+  );
+  useRememberSandboxSessionCatalog(
+    sessionSandboxProvider,
+    sandboxPreviewHarness,
+    activeSession?.id ?? null,
+    liveSessionCatalog && agentUsesProviderDefault,
+  );
+  useSandboxLaunchSelectionCheck(
+    activeSession?.id ?? null,
+    sandboxPreviewHarness,
+    sessionModelOptions,
+    sessionCatalogIsActive && !activeSession.inferenceConfigured,
+  );
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.

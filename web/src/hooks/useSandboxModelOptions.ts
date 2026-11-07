@@ -1,5 +1,6 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
+import { useSavedSandboxSessionCatalog } from "@/hooks/useSandboxSessionCatalog";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
@@ -102,6 +103,36 @@ export function useSandboxModelOptions(
   });
 }
 
+/** The server previews this agent with the provider's default catalog, not its own inference. */
+export function previewUsesProviderDefault(preview: SandboxModelOptions): boolean {
+  return (
+    !preview.configured && preview.status !== "unconfigured" && preview.status !== "unsupported"
+  );
+}
+
+/** A settled, successful preview says the agent shares running sessions' saved catalog. */
+export function previewSharesSessionCatalog(preview: {
+  data?: SandboxModelOptions;
+  error?: unknown;
+}): boolean {
+  return preview.data !== undefined && !preview.error && previewUsesProviderDefault(preview.data);
+}
+
+/** Whether a sandbox agent runs on the provider's default inference, per the server's preview. */
+export function useSandboxAgentUsesProviderDefault(
+  provider: string | null,
+  harness: string | null,
+  agentId: string | null,
+  enabled: boolean,
+): boolean {
+  const active = enabled && provider !== null && harness !== null && agentId !== null;
+  const preview = useQuery({
+    ...sandboxModelOptionsQuery(provider ?? "", harness ?? "", agentId, getCurrentUserId()),
+    enabled: active,
+  });
+  return active && previewSharesSessionCatalog(preview);
+}
+
 /** Preview a launching sandbox's provider catalog until the session is bound to a host. */
 export function useSandboxLaunchModelOptions(
   launch: SandboxStatus | null,
@@ -121,14 +152,19 @@ export function useSandboxLaunchModelOptions(
     provider !== null &&
     info !== "loading" &&
     info.sandbox_provider_capabilities?.[provider]?.default_models === true;
-  const { data } = useSandboxModelOptions(
+  const preview = useSandboxModelOptions(
     provider,
     harness,
     agentId,
     getCurrentUserId(),
     enabled && offered,
   );
-  return enabled && offered && data?.status === "ready" ? data.models : undefined;
+  const data = preview.data;
+  // Match the new-session picker: a running session's saved catalog wins.
+  const saved = useSavedSandboxSessionCatalog(enabled && offered ? provider : null, harness);
+  if (!enabled || !offered || data === undefined) return undefined;
+  const previewModels = data.status === "ready" ? data.models : undefined;
+  return previewSharesSessionCatalog(preview) ? (saved ?? previewModels) : previewModels;
 }
 
 export interface SandboxPreviewEntry {

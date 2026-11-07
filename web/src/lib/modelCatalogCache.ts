@@ -23,11 +23,16 @@ export const modelOptionSchema = z.object({
 });
 
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/** Session catalogs are only a launch hint; the session rechecks its pick once online. */
+export const SANDBOX_SESSION_CATALOG_MAX_AGE_MS = 7 * MAX_AGE_MS;
 const cacheSchema = z.object({
   models: z.array(modelOptionSchema),
   configured: z.boolean(),
   savedAt: z.number(),
 });
+
+/** Prefix of every stored catalog key, for listeners that watch storage events. */
+export const MODEL_CATALOG_CACHE_PREFIX = "omnigent:model-catalog:v1:";
 
 export function modelCatalogCacheKey(
   target: "host" | "sandbox",
@@ -38,19 +43,44 @@ export function modelCatalogCacheKey(
   const server = getOmnigentServerIdentity();
   const user = getCurrentUserId();
   if (server === null || user === null || !targetId || !harness) return null;
-  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
+  return `${MODEL_CATALOG_CACHE_PREFIX}${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
 }
 
-export function readModelCatalogCache(key: string | null) {
+/** Key for a running sandbox session's catalog, scoped by provider and harness, not agent. */
+export function sandboxSessionCatalogKey(
+  provider: string | null,
+  harness: string | null,
+): string | null {
+  const server = getOmnigentServerIdentity();
+  const user = getCurrentUserId();
+  if (server === null || user === null || !provider || !harness) return null;
+  return `${MODEL_CATALOG_CACHE_PREFIX}${JSON.stringify([server, user, "sandbox-session", provider, harness])}`;
+}
+
+/** The raw stored entry, comparable across renders. */
+export function readModelCatalogCacheText(key: string | null): string | null {
   if (key === null || typeof window === "undefined") return null;
   try {
-    const result = cacheSchema.safeParse(JSON.parse(window.localStorage.getItem(key) ?? "null"));
-    if (!result.success) return null;
-    const age = Date.now() - result.data.savedAt;
-    return age >= 0 && age <= MAX_AGE_MS ? result.data : null;
+    return window.localStorage.getItem(key);
   } catch {
     return null;
   }
+}
+
+export function parseModelCatalogCache(text: string | null, maxAgeMs = MAX_AGE_MS) {
+  if (text === null) return null;
+  try {
+    const result = cacheSchema.safeParse(JSON.parse(text));
+    if (!result.success) return null;
+    const age = Date.now() - result.data.savedAt;
+    return age >= 0 && age <= maxAgeMs ? result.data : null;
+  } catch {
+    return null;
+  }
+}
+
+export function readModelCatalogCache(key: string | null, maxAgeMs = MAX_AGE_MS) {
+  return parseModelCatalogCache(readModelCatalogCacheText(key), maxAgeMs);
 }
 
 /** Store catalog data only; live queries always own launch availability. */

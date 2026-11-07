@@ -183,6 +183,7 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
+import { markLiveSessionCatalog } from "@/lib/sandboxSessionProvenance";
 import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
@@ -8404,6 +8405,7 @@ async function refetchRunnerBackedSessionState(
   if (currentState === null) return;
   if (options.modelOptionsResolved === true && (session.codexModelOptions ?? []).length > 0) {
     racedNativeModelOptions.set(conversationId, session.codexModelOptions ?? []);
+    markLiveSessionCatalog(conversationId, session.codexModelOptions ?? []);
   }
   // A delayed catalog only hydrates this session's runner-backed state.
   const statePatch: Partial<ConversationState> =
