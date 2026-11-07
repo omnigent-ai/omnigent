@@ -307,7 +307,8 @@ def test_drag_reorders_pinned_sessions(
     page: Page,
     seeded_session_pair: tuple[str, str, str],
 ) -> None:
-    """Drag a pinned row above another and verify the order persists after reload.
+    """Drag a row just below the last pin to pin it at the bottom, then drag it
+    above that pin and verify the order persists after reload.
 
     :param page: Playwright page fixture (fresh context per test).
     :param seeded_session_pair: ``(base_url, session_a, session_b)`` — two
@@ -318,16 +319,36 @@ def test_drag_reorders_pinned_sessions(
     _set_title(base_url, session_b, f"e2e-drag-B-{uuid.uuid4().hex[:8]}")
     page.goto(f"{base_url}/c/{session_a}")
 
-    for session_id in (session_a, session_b):
-        row = _row(page, session_id)
-        expect(row).to_be_visible()
-        _pin_and_wait(page, row, session_id)
-        expect(_section(page, "Pinned").locator(f'a[href="/c/{session_id}"]')).to_be_visible()
+    row_a = _row(page, session_a)
+    expect(row_a).to_be_visible()
+    _pin_and_wait(page, row_a, session_a)
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_a}"]')).to_be_visible()
+
+    # dnd-kit's mouse sensor needs a real press-move-release past its 5px threshold.
+    # Releasing in the gap just below the last pin still pins at the bottom.
+    unpinned_box = _row(page, session_b).bounding_box()
+    last_pin_box = (
+        _section(page, "Pinned")
+        .locator("li")
+        .filter(has=page.locator(f'a[href="/c/{session_a}"]'))
+        .bounding_box()
+    )
+    assert unpinned_box and last_pin_box
+    page.mouse.move(unpinned_box["x"] + 20, unpinned_box["y"] + unpinned_box["height"] / 2)
+    page.mouse.down()
+    page.mouse.move(
+        last_pin_box["x"] + 20, last_pin_box["y"] + last_pin_box["height"] + 6, steps=10
+    )
+    with page.expect_response(
+        lambda r: r.request.method == "PATCH" and r.url.endswith(f"/v1/sessions/{session_b}")
+    ) as pin_info:
+        page.mouse.up()
+    assert pin_info.value.ok, pin_info.value.status
+    expect(_section(page, "Pinned").locator(f'a[href="/c/{session_b}"]')).to_be_visible()
 
     order = _pinned_session_order(page)
     assert order.index(f"/c/{session_a}") < order.index(f"/c/{session_b}"), order
 
-    # dnd-kit's mouse sensor needs a real press-move-release past its 5px threshold.
     source = (
         _section(page, "Pinned")
         .locator("li")

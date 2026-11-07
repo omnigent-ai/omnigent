@@ -422,11 +422,13 @@ const RowActivationContext = createContext<
 // True while a pin, unpin, or reorder is saving; pin controls are disabled then.
 const PinSavingContext = createContext(false);
 // Set only around the Pinned section, so its rows become drag-to-reorder targets.
-// `draggingId` is the session being dragged; `overId` the row it's over.
+// `draggingId` is the session being dragged; `overId` the row it's over, and
+// `below` whether the pointer is in that row's lower half.
 const PinOrderContext = createContext<{
   ids: string[];
   draggingId: string | null;
   overId: string | null;
+  below: boolean;
 } | null>(null);
 // Rows report an in-progress inline-rename edit here so ConversationList can
 // hold the sort order for the edit's whole duration — the pointer often
@@ -2148,6 +2150,7 @@ function ConversationList({
   const dragOrigin = useRef<{ left: number; top: number; width: number } | undefined>(undefined);
   const [overProject, setOverProject] = useState<string | null>(null);
   const [overPin, setOverPin] = useState<string | null>(null);
+  const [pinBelow, setPinBelow] = useState(false);
   const { mutateAsync: pinAt } = useTogglePinnedConversation();
   // Pin writes don't overlap (the hooks refuse one while another saves), so the
   // pinned rows stop taking drops until the current write settles.
@@ -2687,10 +2690,11 @@ function ConversationList({
         return;
       }
       if (action.kind === "pin" && action.targetId) {
-        // Pin into the dropped-on slot; the new pin goes through the pin toggle
-        // (cap / ownership checks), and only once it's accepted are any
-        // renumbered neighbours rewritten through the batch.
-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
+        // Pin into the dropped-on slot, below the row from its lower half; the
+        // new pin goes through the pin toggle (cap / ownership checks), and only
+        // once it's accepted are any renumbered neighbours rewritten through the batch.
+        const below = event.collisions?.[0]?.data?.below === true;
+        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId, below);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
         // Chain on this call's own promise: per-call mutate callbacks are dropped
@@ -2929,9 +2933,10 @@ function ConversationList({
             ids: sections.pinned.filter(isPinOrderUnit).map((c) => c.id),
             draggingId: activeDrag?.id ?? null,
             overId: overPin,
+            below: pinBelow,
           }
         : null,
-    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin],
+    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin, pinBelow],
   );
 
   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
@@ -3111,7 +3116,19 @@ function ConversationList({
             const row = collisions.find(
               (hit) => hit.data?.droppableContainer.data.current?.type === "session-order",
             );
-            return row ? [row] : collisions;
+            if (row) return [row];
+            // Over a pinned row, note which half the pointer is in: a new pin lands on that side.
+            const [first, ...rest] = collisions;
+            const rect = first && args.droppableRects.get(first.id);
+            if (
+              first?.data?.droppableContainer.data.current?.type === "pin-order" &&
+              rect &&
+              args.pointerCoordinates
+            ) {
+              const below = args.pointerCoordinates.y > rect.top + rect.height / 2;
+              return [{ ...first, data: { ...first.data, below } }, ...rest];
+            }
+            return collisions;
           }
           // Restrict project drops to the project list inside the sidebar.
           if (args.pointerCoordinates) {
@@ -3141,6 +3158,7 @@ function ConversationList({
           setOverProject(over?.type === "project-order" ? (over.name as string) : null);
           setOverPin(over?.type === "pin-order" ? (over.id as string) : null);
         }}
+        onDragMove={(event) => setPinBelow(event.collisions?.[0]?.data?.below === true)}
         onDragCancel={() => {
           setActiveDrag(null);
           setOverPin(null);
@@ -3514,8 +3532,10 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
     <div
       ref={setNodeRef}
       data-testid="sidebar-pin-drop-zone"
+      // The padding reaches into the list gap so a drop just below the last pin
+      // still pins it at the bottom; the negative margin keeps the layout unchanged.
       className={cn(
-        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        "-mb-3 rounded-[var(--radius-otto-sm)] pb-3 transition-colors duration-200 ease-[var(--ease-otto)]",
         active && isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
@@ -5586,11 +5606,13 @@ function ConversationRowImpl({
     data: { type: "pin-order", id: conversation.id },
     disabled: !pinOrder || !isPinned || !pinOrder.ids.includes(conversation.id),
   });
-  // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
+  // A pin dragged down lands below this row and one dragged up above it; a new
+  // pin lands on the side of the row the pointer is on.
   let pinInsertion: "before" | "after" | undefined;
   if (pinOrder?.draggingId && pinOrder.overId === conversation.id) {
     const from = pinOrder.ids.indexOf(pinOrder.draggingId);
-    pinInsertion = from >= 0 && from < pinOrder.ids.indexOf(conversation.id) ? "after" : "before";
+    const after = from < 0 ? pinOrder.below : from < pinOrder.ids.indexOf(conversation.id);
+    pinInsertion = after ? "after" : "before";
   }
   const insertion = (pinOrder?.draggingId !== conversation.id && pinInsertion) || reorderInsertion;
   // Merge the drag/drop node refs with the row ref used for scroll-into-view.

@@ -66,13 +66,14 @@ function rowCenter(id: string) {
 async function dropOnto(
   sourceId: string,
   targetId: string,
-  { expectTarget = true, whileOver = () => {} } = {},
+  { expectTarget = true, whileOver = () => {}, offsetY = 0 } = {},
 ) {
   const sources = document.querySelectorAll(`li[data-sidebar-session-id="${sourceId}"]`);
   expect(sources).toHaveLength(1);
   const source = sources[0];
   const start = rowCenter(sourceId);
-  const target = rowCenter(targetId);
+  const center = rowCenter(targetId);
+  const target = { ...center, clientY: center.clientY + offsetY };
   fireEvent.mouseDown(source, { button: 0, ...start });
   fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
   await act(async () => {
@@ -129,6 +130,28 @@ describe("dropping an unpinned session onto a pinned row", () => {
     await dropOnto("conv_peer", "conv_a", { expectTarget: false });
     expect(mocks.pinFn).toHaveBeenCalledOnce();
     expect(mocks.reorderPins).toHaveBeenCalledOnce();
+  });
+
+  it("pins it below the last pinned row when dropped on that row's lower half", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    mocks.pinFn.mockResolvedValue({});
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b", {
+      offsetY: ROW_HEIGHT / 4,
+      whileOver: () => {
+        const line = screen.getByTestId("pin-order-insertion");
+        expect(screen.getByRole("link", { name: "conv_b" }).closest("li")).toContainElement(line);
+        expect(line).toHaveAttribute("style", "bottom: 0px;");
+      },
+    });
+
+    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
+    const [write] = mocks.pinFn.mock.calls[0];
+    expect(write).toMatchObject({ id: "conv_c", pinned: true });
+    // An omitted pinnedAt is stamped Date.now(), which also sorts last.
+    expect(write.pinnedAt ?? Infinity).toBeGreaterThan(2000);
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
   it.each([false, true])(

@@ -289,6 +289,19 @@ describe("pinOrderWrites", () => {
     ]);
   });
 
+  it("inserts a not-yet-pinned session below the row with below", () => {
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_1", true)).toEqual([
+      { id: "new", pinnedAt: 2001 },
+    ]);
+    expect(pinOrderWrites(pins(1000, 2000), "new", "conv_0", true)).toEqual([
+      { id: "new", pinnedAt: 1500 },
+    ]);
+    // An existing pin still moves into the row's slot.
+    expect(pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1", true)).toEqual(
+      pinOrderWrites(pins(1000, 2000, 3000), "conv_0", "conv_1"),
+    );
+  });
+
   it("is a no-op for a drop on itself or an unknown row", () => {
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "conv_0")).toEqual([]);
     expect(pinOrderWrites(pins(1000, 2000), "conv_0", "missing")).toEqual([]);

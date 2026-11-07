@@ -492,21 +492,23 @@ export function isPinOrderUnit(conversation: Conversation): boolean {
 /**
  * The pin label writes that move `fromId` into `toId`'s slot of the (already
  * pin-ordered) Pinned list. A `fromId` that isn't pinned yet is inserted just
- * above `toId`. The label value is the list's sort key, so a move normally
- * rewrites only the moved session, to a value between its new neighbours. When
- * there's no room between them (equal or missing values), every pin is
- * renumbered from the lowest existing value (rows already at their new value
- * are skipped). Returns `[]` for a no-op.
+ * above `toId`, or just below it with `below`. The label value is the list's
+ * sort key, so a move normally rewrites only the moved session, to a value
+ * between its new neighbours. When there's no room between them (equal or
+ * missing values), every pin is renumbered from the lowest existing value (rows
+ * already at their new value are skipped). Returns `[]` for a no-op.
  */
 export function pinOrderWrites(
   rows: readonly Conversation[],
   fromId: string,
   toId: string,
+  below = false,
 ): PinOrderWrite[] {
   const pinned = rows.filter(isPinOrderUnit);
   const from = pinned.findIndex((c) => c.id === fromId);
-  const to = pinned.findIndex((c) => c.id === toId);
-  if (to < 0 || from === to) return [];
+  const target = pinned.findIndex((c) => c.id === toId);
+  if (target < 0 || from === target) return [];
+  const to = from < 0 && below ? target + 1 : target;
   const moved = [...pinned];
   const [row] = from < 0 ? [{ id: fromId } as Conversation] : moved.splice(from, 1);
   moved.splice(to, 0, row);
