@@ -990,19 +990,6 @@ export function ChatPage() {
     hostOnline: reconnectHostOnline,
     isOwner: isOwnerLevel(permissionLevel),
   });
-  // Opening an asleep sandbox's session presses Reconnect host for the user. The
-  // snapshot's launch stage counts too: the chat store may not have loaded it yet.
-  const autoWakeLaunch = sandboxStatus ?? activeSession?.sandboxStatus ?? null;
-  const sandboxAutoWakeAllowed: boolean | null =
-    !sessionConvId || !activeSession || liveness.kind === "unknown"
-      ? null
-      : canAutoWakeSandbox({
-          asleep: liveness.kind === "host_asleep",
-          launching: autoWakeLaunch !== null && !isSandboxLaunchStopped(autoWakeLaunch),
-          canEdit: isEditorLevel(permissionLevel),
-          status: activeSession.status,
-        });
-  useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // A message to an offline Arca host reconnects it from the desktop and waits
   // in the queue until the host is back.
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
@@ -1122,6 +1109,21 @@ export function ChatPage() {
   // but gate submission until the temp id is promoted below.
   const sendDisabledReason = isTempConvId(urlConvId) ? "Starting the session…" : null;
   const readOnlyReason = readOnlyReasonForSessionLabels(activeSession, activeConv);
+  // Opening an asleep sandbox's session presses Reconnect host for the user. The
+  // snapshot's launch stage counts too: the chat store may not have loaded it yet.
+  const autoWakeLaunch = sandboxStatus ?? activeSession?.sandboxStatus ?? null;
+  const sandboxAutoWakeAllowed: boolean | null =
+    !sessionConvId || !activeSession || liveness.kind === "unknown"
+      ? null
+      : canAutoWakeSandbox({
+          asleep: liveness.kind === "host_asleep",
+          launching: autoWakeLaunch !== null && !isSandboxLaunchStopped(autoWakeLaunch),
+          // Only where Reconnect host itself is offered and enabled: the composer
+          // hides it in a sub-agent view and disables it when read-only (closed, viewer).
+          canEdit: isEditorLevel(permissionLevel) && readOnlyReason === null && !subAgentLabel,
+          status: activeSession.status,
+        });
+  useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // Once present, the live session snapshot is authoritative. Memoized so the
   // derived props it feeds (modelPickerKind, effortLevels, wrapperLabel) keep a
   // stable identity across the switch's re-render burst.
