@@ -35,11 +35,13 @@ from omnigent.runner.transports.ws_tunnel.diagnostics import TunnelDiagnostics
 from omnigent.runner.transports.ws_tunnel.frames import (
     RUNNER_IDLE_SHUTDOWN_CLOSE_REASON,
     PingFrame,
+    PongFrame,
     RequestCancelFrame,
     RequestFrame,
     WSCloseFrame,
     WSFrame,
     WSOpenFrame,
+    decode_frame,
     encode_frame,
 )
 from omnigent.runner.transports.ws_tunnel.serve import (
@@ -2070,6 +2072,47 @@ async def test_handle_tunnel_frame_drops_malformed_frame(
 
     assert dispatch_tasks == {}
     assert sent == []
+
+
+def _report_keep_warm_failure() -> bool:
+    raise RuntimeError("activity state unavailable")
+
+
+@pytest.mark.parametrize(
+    ("report_keep_warm", "expected"),
+    [
+        pytest.param(None, None, id="not-reported"),
+        pytest.param(lambda: True, True, id="keep-warm"),
+        pytest.param(lambda: False, False, id="let-it-stop"),
+        # Keeping a sandbox warm one extra interval beats stopping an in-use one.
+        pytest.param(_report_keep_warm_failure, True, id="failing-report-keeps-warm"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pong_carries_the_runners_keep_warm_report(
+    report_keep_warm: Callable[[], bool] | None, expected: bool | None
+) -> None:
+    """A ping is answered with a pong carrying the runner's keep-warm report.
+
+    :param report_keep_warm: The runner's keep-warm callback, or ``None``.
+    :param expected: The ``keep_warm`` value the pong must carry.
+    :returns: None.
+    """
+    sent: list[str] = []
+
+    async def _send_text(text: str) -> None:
+        sent.append(text)
+
+    await _handle_tunnel_frame(
+        _noop_app,
+        encode_frame(PingFrame(ts=123)),
+        _send_text,
+        {},
+        {},
+        report_keep_warm=report_keep_warm,
+    )
+
+    assert [decode_frame(text) for text in sent] == [PongFrame(ts=123, keep_warm=expected)]
 
 
 @pytest.mark.asyncio

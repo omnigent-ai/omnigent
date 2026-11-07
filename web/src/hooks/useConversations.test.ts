@@ -314,6 +314,7 @@ describe("useSessionSearch", () => {
       const params = new URL(url, "http://localhost").searchParams;
       expect(params.get("search_query")).toBe("kestrel");
       expect(params.get("search_scope")).toBe(scope);
+      expect(params.has("expand_families")).toBe(false);
       expect(params.get("include_archived")).toBe("true");
       expect(params.get("limit")).toBe("8");
     },
@@ -2085,6 +2086,38 @@ describe("overlapping pin writes", () => {
   );
 });
 
+it.each(["pin", "reorder"])("refreshes every family list after a %s", async (action) => {
+  const family = { id: "family", representative_id: "conv_a", pinned: true, pinned_at: "1000" };
+  const row = conversation({ id: "conv_a", labels: { [PINNED_LABEL_KEY]: "1000" }, family });
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  const listKeys = [
+    ["conversations", "", false],
+    ["project-sessions", "Project", "updated_at", false],
+  ];
+  for (const key of listKeys) queryClient.setQueryData(key, infinitePage([row]));
+  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations: [row], filterHonored: true });
+  const wrapper = ({ children }: { children: ReactNode }) =>
+    createElement(QueryClientProvider, { client: queryClient }, children);
+  const { result } = renderHook(
+    () => ({ toggle: useTogglePinnedConversation(), reorder: useReorderPinnedConversations() }),
+    { wrapper },
+  );
+  fetchMock.mockResolvedValueOnce(
+    mockResponse({
+      ...row,
+      labels: { [PINNED_LABEL_KEY]: "2000" },
+      family: { ...family, pinned_at: "2000" },
+    }),
+  );
+  await act(async () => {
+    if (action === "pin") await result.current.toggle.mutateAsync({ id: row.id, pinned: true });
+    else await result.current.reorder.mutateAsync([{ id: row.id, pinnedAt: 2000 }]);
+  });
+  for (const key of [...listKeys, PINNED_CONVERSATIONS_KEY]) {
+    expect(queryClient.getQueryState(key)?.isInvalidated).toBe(true);
+  }
+});
+
 describe("useTogglePinnedConversation failure rollback", () => {
   it.each([
     ["unpin", "3000", false, "Couldn't unpin the session."],
@@ -2297,6 +2330,62 @@ describe("fetchPinnedConversations filter-honored detection", () => {
     expect(result.filterHonored).toBe(true);
     expect(result.conversations.map((c) => c.id)).toEqual(["conv_b", "conv_a"]);
   });
+
+  it.each(["archive", "delete"] as const)(
+    "follows pinned pages and reconciles family context on %s",
+    async (operation) => {
+      const family = { id: "family", representative_id: "a", pinned: true };
+      const members = ["a", "b", "c"].map((id) => ({
+        id,
+        title: id,
+        created_at: 0,
+        updated_at: 1,
+        labels: id === "a" ? { "omnigent.pinned": "1" } : {},
+        family,
+      }));
+      fetchMock
+        .mockResolvedValueOnce(mockResponse({ data: members, has_more: true, last_id: "b" }))
+        .mockResolvedValueOnce(
+          mockResponse({ data: [members[2], pinnedRow("old")], has_more: false, last_id: "old" }),
+        );
+
+      const result = await fetchPinnedConversations(false, 2);
+
+      expect(result.conversations.map((row) => row.id)).toEqual(["old", "a", "c", "b"]);
+      expect(result.filterHonored).toBe(true);
+      expect(
+        new URL(String(fetchMock.mock.calls[1][0]), "http://test").searchParams.get("after"),
+      ).toBe("b");
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      client.setQueryData(PINNED_CONVERSATIONS_KEY, result);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const hook = renderHook(
+        () => ({ archive: useArchiveConversation(), remove: useStopAndDeleteConversation() }),
+        { wrapper },
+      );
+      const mutate = () =>
+        operation === "archive"
+          ? hook.result.current.archive.mutateAsync({ id: "b", archived: true })
+          : hook.result.current.remove.mutateAsync({ id: "b" });
+      fetchMock.mockResolvedValue(mockResponse({}, { ok: false, status: 500 }));
+      await act(async () => {
+        await expect(mutate()).rejects.toThrow();
+      });
+      expect(client.getQueryData(PINNED_CONVERSATIONS_KEY)).toEqual(result);
+      fetchMock.mockResolvedValue(mockResponse({ id: "b", archived: true, deleted: true }));
+      await act(async () => {
+        await mutate();
+      });
+      expect(
+        client
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.map((item) => item.id),
+      ).toEqual(["old", "a", "c"]);
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: PINNED_CONVERSATIONS_KEY });
+    },
+  );
 
   it("fails with the response's status and Retry-After so the retry policy can read them", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -2804,6 +2893,7 @@ describe("useProjectSessions", () => {
       const url = fetchMock.mock.calls[0][0] as string;
       expect(url).toContain("/v1/sessions?");
       expect(url).toContain("project=Sprint+42");
+      expect(url).toContain("expand_families=true");
       expect(url).toContain("order=desc");
       expect(url).toContain(`sort_by=${sortBy}`);
       expect(url).toContain("limit=20");
@@ -3959,6 +4049,39 @@ describe("useDeleteProject", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["projects"] });
   });
 
+  it("unfiles the family through its representative before archiving peers", async () => {
+    const family = { id: "family", representative_id: "a", pinned: false };
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          data: [
+            { id: "b", family },
+            { id: "a", family },
+          ],
+          has_more: false,
+        }),
+      )
+      .mockResolvedValueOnce(archivedConv("a"))
+      .mockResolvedValueOnce(archivedConv("b"))
+      .mockResolvedValueOnce(mockResponse({ deleted: true }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+    result.current.mutate({ id: "p_1", name: "Sprint 42" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/sessions/a");
+    expect(JSON.parse((fetchMock.mock.calls[1][1] as RequestInit).body as string)).toEqual({
+      archived: true,
+      project_id: "",
+      labels: { omni_project: "" },
+    });
+    expect(fetchMock.mock.calls[2][0]).toBe("/v1/sessions/b");
+    expect(JSON.parse((fetchMock.mock.calls[2][1] as RequestInit).body as string)).toEqual({
+      archived: true,
+    });
+  });
+
   it("throws with succeeded/failed split when some archives fail", async () => {
     fetchMock
       .mockResolvedValueOnce(
@@ -4091,10 +4214,10 @@ it("fetches and deduplicates pins across mine and shared scopes", async () => {
   expect(params.every((p) => p.get("limit") === "30" && p.get("pinned") === "true")).toBe(true);
 });
 
-it("rejects a pin at the cap without sending a request or changing membership", async () => {
+it.each([29, 30])("counts %s pin units without charging for family context", async (count) => {
   const queryClient = new QueryClient();
   const conversations = Array.from(
-    { length: 30 },
+    { length: count },
     (_, i) =>
       ({
         id: `pin-${i}`,
@@ -4106,16 +4229,24 @@ it("rejects a pin at the cap without sending a request or changing membership", 
         permission_level: 4,
       }) as Conversation,
   );
+  const family = { id: "family", representative_id: "pin-0", pinned: true };
+  conversations[0].family = family;
+  conversations.push(conversation({ id: "context", family }));
   queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, { conversations, filterHonored: true });
+  const added = conversation({ id: "new-pin", labels: { [PINNED_LABEL_KEY]: "2" } });
+  queryClient.setQueryData(["conversations", "", false], infinitePage([added]));
+  fetchMock.mockResolvedValue(mockResponse(added));
   const wrapper = ({ children }: { children: ReactNode }) =>
     createElement(QueryClientProvider, { client: queryClient }, children);
   const { result } = renderHook(useTogglePinnedConversation, { wrapper });
-  act(() => result.current.mutate({ id: "too-many", pinned: true }));
-  await waitFor(() => expect(result.current.isError).toBe(true));
-  expect(fetchMock).not.toHaveBeenCalled();
+  act(() => result.current.mutate({ id: "new-pin", pinned: true }));
+  await waitFor(() =>
+    expect(count === 30 ? result.current.isError : result.current.isSuccess).toBe(true),
+  );
+  expect(fetchMock).toHaveBeenCalledTimes(count === 30 ? 0 : 1);
   expect(
     queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)?.conversations,
-  ).toEqual(conversations);
+  ).toEqual(count === 30 ? conversations : [...conversations, added]);
 });
 
 describe("opaque pagination during optimistic removal", () => {

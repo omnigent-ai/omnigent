@@ -119,7 +119,10 @@ import {
   detectLang,
   isBinaryPath,
   isImageFile,
+  isMarkdownTooLargeForPreview,
   isMarkdownTooLargeForRichView,
+  type PreviewableViewMode,
+  resolveFileViewMode,
   isModelFile,
   isNotebookPath,
   isPdfFile,
@@ -795,10 +798,19 @@ function FileViewerBody({
     conversationId: string;
     path: string;
     source: boolean | undefined;
-  }>({ conversationId, path, source: undefined });
+    noPreview: boolean;
+  }>({ conversationId, path, source: undefined, noPreview: false });
+  // Large Markdown has no rich editor, so its Preview/Edit choice lasts only for
+  // this file visit; persisting it would change how every small file opens.
+  const [largeMarkdownMode, setLargeMarkdownMode] = useState<{
+    conversationId: string;
+    path: string;
+    mode: "preview" | "source";
+  } | null>(null);
   // Choose once per file visit so an autosave crossing the limit cannot
   // replace the editor while it contains newer unsaved edits.
   let markdownSourceFallback = markdownRouting.source;
+  let markdownPreviewFallback = markdownRouting.noPreview;
   if (
     markdownRouting.conversationId !== conversationId ||
     markdownRouting.path !== path ||
@@ -807,10 +819,23 @@ function FileViewerBody({
     markdownSourceFallback = fileQuery.data
       ? isMarkdownTooLargeForRichView(lang, fileContent)
       : undefined;
-    setMarkdownRouting({ conversationId, path, source: markdownSourceFallback });
+    markdownPreviewFallback =
+      !!fileQuery.data &&
+      lang === "markdown" &&
+      (!!fileQuery.data.truncated || isMarkdownTooLargeForPreview(lang, fileContent));
+    setMarkdownRouting({
+      conversationId,
+      path,
+      source: markdownSourceFallback,
+      noPreview: markdownPreviewFallback,
+    });
+    // Reset the per-visit Preview/Edit choice when the file changes.
+    if (markdownRouting.conversationId !== conversationId || markdownRouting.path !== path) {
+      setLargeMarkdownMode(null);
+    }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownSourceFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -904,8 +929,12 @@ function FileViewerBody({
   // directly (mirrors the toolbar's switchTo for the non-editor case).
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
-    setPreviewableViewMode("editor");
-  }, []);
+    if (markdownSourceFallback) {
+      setLargeMarkdownMode({ conversationId, path, mode: "source" });
+    } else {
+      setPreviewableViewMode("editor");
+    }
+  }, [markdownSourceFallback, conversationId, path]);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -924,15 +953,18 @@ function FileViewerBody({
   // falls back to the rendered preview; "preview" / "source" pass through. The shared
   // preference still carries across file types — opening markdown in source
   // then switching to an HTML file keeps you in source, etc.
-  const fileViewMode: "editor" | "preview" | "source" = isPreviewable
-    ? lang === "markdown"
-      ? deepLinkBiasPath === path
-        ? "editor"
-        : previewableViewMode
-      : previewableViewMode === "editor"
-        ? "preview"
-        : previewableViewMode
-    : "source";
+  const largeMarkdownVisitMode =
+    largeMarkdownMode?.conversationId === conversationId && largeMarkdownMode.path === path
+      ? largeMarkdownMode.mode
+      : undefined;
+  const fileViewMode = resolveFileViewMode({
+    isPreviewable,
+    lang,
+    largeMarkdown: markdownSourceFallback ?? false,
+    largeMarkdownVisitMode,
+    deepLinkedComment: deepLinkBiasPath === path,
+    preference: previewableViewMode,
+  });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
   const [dismissedPosition, setDismissedPosition] = useState<FilePosition>();
   const [appliedNavigation, setAppliedNavigation] = useState({ conversationId, path, position });
@@ -949,6 +981,14 @@ function FileViewerBody({
   const viewMode: "editor" | "preview" | "source" | "diff" =
     effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
   const diffViewActive = viewMode === "diff";
+  // A citation opens large Markdown in editable source; keep source for the visit
+  // so clearing the citation cannot drop unsaved edits by returning to Preview.
+  const citedLargeMarkdownSource = viewMode === "source" && fileViewMode === "preview";
+  useEffect(() => {
+    if (citedLargeMarkdownSource && markdownSourceFallback) {
+      setLargeMarkdownMode({ conversationId, path, mode: "source" });
+    }
+  }, [citedLargeMarkdownSource, markdownSourceFallback, conversationId, path]);
 
   const registerNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
   useLayoutEffect(() => {
@@ -1184,59 +1224,79 @@ function FileViewerBody({
     splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
-  if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
-    // Markdown is a segmented control over three reachable modes: the rich-text
-    // Editor (default), the rendered Preview, and raw Source. Switching away
-    // from the editor must guard unsaved edits; the read-only preview/source
-    // surfaces carry no edits, so they switch freely.
-    const switchTo = (mode: "preview" | "editor" | "source") => {
-      // No-op when already on this surface — re-selecting the active tab must
-      // not run the dirty guard (which would pop a discard dialog for nothing).
+  if (lang === "markdown" && isPreviewable && viewMode !== "diff") {
+    // Markdown is a "view mode" picker over Preview, the rich-text Editor, and raw
+    // Source. Large Markdown has no rich editor: Edit opens editable source for
+    // this visit. Leaving the editable surface guards its unsaved edits.
+    const largeMarkdown = !!markdownSourceFallback;
+    const editableMode = largeMarkdown ? "source" : "editor";
+    const switchTo = (mode: PreviewableViewMode) => {
+      // Re-selecting the active mode must not pop a discard dialog for nothing.
       if (mode === viewMode) return;
-      // Clear the deep-link bias and set the absolute mode together, and only
-      // when the switch actually proceeds — so a guarded (dirty) switch the user
-      // cancels leaves both the bias and the editor intact.
+      // Apply only when the switch proceeds, so a cancelled guard keeps the bias and editor.
       const apply = () => {
         setDeepLinkBiasPath(null);
         dismissFilePosition(position);
         setDismissedPosition(position);
-        setPreviewableViewMode(mode);
+        if (largeMarkdown) {
+          setLargeMarkdownMode({
+            conversationId,
+            path,
+            mode: mode === "preview" ? "preview" : "source",
+          });
+        } else {
+          setPreviewableViewMode(mode);
+        }
       };
-      if (viewMode === "editor") {
+      if (viewMode === editableMode) {
         guardDirty(apply);
       } else {
         apply();
       }
     };
-    // One toolbar slot: a "view mode" picker rather than three side-by-side
-    // buttons (the toolbar is tight once nav/diff/comment actions are present).
-    // The trigger shows the current surface's icon so the active mode reads at
-    // a glance; the menu lets the user pick another.
+    const modeOption = (
+      key: string,
+      label: string,
+      tooltip: string,
+      icon: ReactNode,
+      mode: PreviewableViewMode,
+    ): ToolbarOption => ({
+      key,
+      label,
+      tooltip,
+      icon,
+      active: viewMode === mode,
+      onSelect: () => switchTo(mode),
+    });
+    const editIcon = <PencilLineIcon className="size-4" />;
     const modeOptions: ToolbarOption[] = [
-      {
-        key: "md-preview",
-        label: "Preview",
-        tooltip: "Rendered preview",
-        icon: <EyeIcon className="size-4" />,
-        active: viewMode === "preview",
-        onSelect: () => switchTo("preview"),
-      },
-      {
-        key: "md-edit",
-        label: "Edit",
-        tooltip: "Rich text editor",
-        icon: <PencilLineIcon className="size-4" />,
-        active: viewMode === "editor",
-        onSelect: () => switchTo("editor"),
-      },
-      {
-        key: "md-source",
-        label: "Source",
-        tooltip: "Raw Markdown source",
-        icon: <CodeIcon className="size-4" />,
-        active: viewMode === "source",
-        onSelect: () => switchTo("source"),
-      },
+      modeOption(
+        "md-preview",
+        "Preview",
+        "Rendered preview",
+        <EyeIcon className="size-4" />,
+        "preview",
+      ),
+      largeMarkdown
+        ? modeOption(
+            "md-edit",
+            "Edit",
+            "Edit Markdown source (too large for the rich text editor)",
+            editIcon,
+            "source",
+          )
+        : modeOption("md-edit", "Edit", "Rich text editor", editIcon, "editor"),
+      ...(largeMarkdown
+        ? []
+        : [
+            modeOption(
+              "md-source",
+              "Source",
+              "Raw Markdown source",
+              <CodeIcon className="size-4" />,
+              "source",
+            ),
+          ]),
     ];
     const activeMode = modeOptions.find((o) => o.active) ?? modeOptions[0];
     toolbarActions.push({
