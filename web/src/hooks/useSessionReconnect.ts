@@ -27,11 +27,6 @@ export const SANDBOX_WAKE_STAGE_LIMIT_MS = 5 * 60_000;
 // terminal's Resume): a caller during the request joins it and gets its answer.
 const sandboxWakeRequests = new Map<string, Promise<PostEventResponse>>();
 
-/** Forget every in-flight wake request. */
-export function resetSandboxWakeRequestsForTesting(): void {
-  sandboxWakeRequests.clear();
-}
-
 /** Send `retry_session` to wake *sessionId*'s sandbox, or join the one in flight. */
 export function wakeSandboxSession(sessionId: string): Promise<PostEventResponse> {
   const running = sandboxWakeRequests.get(sessionId);

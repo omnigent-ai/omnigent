@@ -22,7 +22,6 @@ import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   SANDBOX_WAKE_ONLINE_GRACE_POLLS,
   SANDBOX_WAKE_STAGE_LIMIT_MS,
-  resetSandboxWakeRequestsForTesting,
   useSandboxStarting,
   useSessionReconnect,
   wakeSandboxSession,
@@ -84,13 +83,26 @@ function finishHealthPolls(
   }
 }
 
+// A test that leaves a wake request unanswered would leave it shared with the
+// next test's wakes of the same session, so every one is settled after each test.
+const unsettled = new Set<() => void>();
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
   const promise = new Promise<T>((done, fail) => {
-    resolve = done;
-    reject = fail;
+    resolve = (value) => {
+      unsettled.delete(settle);
+      done(value);
+    };
+    reject = (error) => {
+      unsettled.delete(settle);
+      fail(error);
+    };
   });
+  promise.catch(() => {});
+  const settle = () => reject(new Error("test ended"));
+  unsettled.add(settle);
   return { promise, resolve, reject };
 }
 
@@ -106,10 +118,14 @@ beforeEach(() => {
   useChatStore.setState({ conversationId: null, sandboxStatus: null });
   conversationRegistry.clear();
 });
-afterEach(() => {
+afterEach(async () => {
   cleanup();
   writeArcaHostId(null);
-  resetSandboxWakeRequestsForTesting();
+  for (const settle of [...unsettled]) settle();
+  // Let the shared wake requests see their answers and drop out.
+  await new Promise<void>((done) => {
+    setTimeout(done, 0);
+  });
 });
 
 describe("useSessionReconnect", () => {
