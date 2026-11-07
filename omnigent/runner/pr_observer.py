@@ -640,9 +640,8 @@ def _record_branch_prs(
     source: str,
     *,
     window: tuple[float, float] | None = None,
-    recheck: bool = False,
 ) -> None:
-    """Record the open PRs of branches the session updated, and recheck those without one.
+    """Record the open PRs of pending branches the session updated; the rest stay pending.
 
     A PR opened inside *window*, the updating call's, counts as created by it.
     """
@@ -659,8 +658,6 @@ def _record_branch_prs(
                 if pr.reference.provider == provider_id
             ]
             if not found:
-                if not recheck:
-                    _pushes.add_pending(session_id, key, time.time())
                 continue
             _pushes.resolved(session_id, key)
             created = {
@@ -687,9 +684,12 @@ def _recheck(
     session_id: str, facets: Sequence[_ProviderFacet], now: float, *, force: bool = False
 ) -> None:
     if keys := _pushes.due(session_id, now, force=force):
-        _lookup_pool.submit(
-            _record_branch_prs, session_id, facets, keys, "branch_recheck", recheck=True
-        )
+        _lookup_pool.submit(_record_branch_prs, session_id, facets, keys, "branch_recheck")
+
+
+def start_observing(session_id: str) -> None:
+    """Attribute only pushes from now on to the session's calls that report no start time."""
+    _pushes.start(session_id, time.time())
 
 
 def recheck_pending(session_id: str) -> None:
@@ -715,18 +715,20 @@ def observe_tool_completion(
     successful: bool = True,
     cwd: str | None = None,
     started_at: float | None = None,
+    finished_at: float | None = None,
     repository_visible: bool = True,
 ) -> None:
     """Best-effort observer; failures never change execution or tool results.
 
     :param cwd: The directory a shell call started in, when its result does not say.
     :param started_at: When the call started, as a Unix timestamp, when known.
+    :param finished_at: When the call finished, if before this observation runs.
     :param repository_visible: Whether the runner sees the call's writes to its checkouts.
         Pushes are read from git's own state when it does, else from ``git push`` output.
     """
     if not successful or not session_id:
         return
-    finished_at = time.time()
+    finished_at = time.time() if finished_at is None else finished_at
     try:
         references, created = extract_prs(tool_name, arguments, result)
         SessionPrRegistry(session_id).record(
@@ -789,10 +791,6 @@ def observe_tool_completion(
                     with _pending_lookups_lock:
                         _pending_lookups.discard(key)
                     raise
-        if pushed:
-            _lookup_pool.submit(
-                _record_branch_prs, session_id, facets, pushed, source, window=window
-            )
         writes = (
             []
             if failed
@@ -806,6 +804,13 @@ def observe_tool_completion(
                 )
             ]
         )
+        # Pending before the first lookup, so a recheck while it runs still covers them.
+        for key in [*pushed, *writes]:
+            _pushes.add_pending(session_id, key, finished_at)
+        if pushed:
+            _lookup_pool.submit(
+                _record_branch_prs, session_id, facets, pushed, source, window=window
+            )
         if writes:
             _lookup_pool.submit(_record_branch_prs, session_id, facets, writes, source)
         _recheck(session_id, facets, finished_at)

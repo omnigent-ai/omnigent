@@ -18,6 +18,7 @@ import contextlib
 import json
 import shutil
 import threading
+import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
@@ -1681,7 +1682,7 @@ def test_dispatched_call_does_not_reemit_a_completed_function_call() -> None:
 async def test_pr_observation_leaves_the_event_loop_free_until_the_turn_completes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A slow git read behind PR tracking holds the turn's end, not the event loop."""
+    """A slow git read behind PR tracking holds its turn's end, not the loop or other sessions."""
     from omnigent.inner.executor import (
         ToolCallComplete,
         ToolCallRequest,
@@ -1693,34 +1694,49 @@ async def test_pr_observation_leaves_the_event_loop_free_until_the_turn_complete
 
     release = threading.Event()
     observed: list[str] = []
+    finished_at: list[object] = []
 
     def observe_tool_completion(session_id: str, **call: object) -> None:
-        release.wait(timeout=10)
+        if session_id == "conv_push":
+            release.wait(timeout=10)
+        finished_at.append(call["finished_at"])
         observed.append(f"{session_id}:{call['tool_name']}")
 
     monkeypatch.setattr(pr_observer, "observe_tool_completion", observe_tool_completion)
-    monkeypatch.setattr(pr_observer, "recheck_pending", lambda session_id: observed.append("end"))
-    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
-    ctx = _RecordingTurnContext()
-    ctx.session_id = "conv_push"  # type: ignore[assignment]
-    adapter._current_ctx = ctx  # type: ignore[assignment]
-    for event in (
-        ToolCallRequest(name="Bash", args={"command": "git pp"}, metadata={"call_id": "p1"}),
-        ToolCallComplete(
-            name="Bash", status=ToolCallStatus.SUCCESS, result="", metadata={"call_id": "p1"}
-        ),
-        TurnComplete(response=None),
-    ):
-        adapter._translate_event(event, ctx)  # type: ignore[arg-type]
-    assert _fc_items(ctx)[-1]["type"] == "function_call_output"
+    monkeypatch.setattr(
+        pr_observer, "recheck_pending", lambda session_id: observed.append(f"{session_id}:end")
+    )
 
+    def run_turn(session_id: str) -> ExecutorAdapter:
+        adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+        ctx = _RecordingTurnContext()
+        ctx.session_id = session_id  # type: ignore[assignment]
+        adapter._current_ctx = ctx  # type: ignore[assignment]
+        for event in (
+            ToolCallRequest(name="Bash", args={"command": "git pp"}, metadata={"call_id": "p1"}),
+            ToolCallComplete(
+                name="Bash", status=ToolCallStatus.SUCCESS, result="", metadata={"call_id": "p1"}
+            ),
+            TurnComplete(response=None),
+        ):
+            adapter._translate_event(event, ctx)  # type: ignore[arg-type]
+        assert _fc_items(ctx)[-1]["type"] == "function_call_output"
+        return adapter
+
+    adapter = run_turn("conv_push")
+    translated_at = time.time()
     finishing = asyncio.ensure_future(adapter._record_pr_observations())
-    await asyncio.sleep(0.05)
-    assert not finishing.done()
-    assert observed == []
-    release.set()
+    try:
+        await asyncio.sleep(0.05)
+        assert not finishing.done()
+        assert observed == []
+        await asyncio.wait_for(run_turn("conv_other")._record_pr_observations(), timeout=10)
+        assert observed == ["conv_other:Bash", "conv_other:end"]
+    finally:
+        release.set()
     await asyncio.wait_for(finishing, timeout=10)
-    assert observed == ["conv_push:Bash", "end"]
+    assert observed[2:] == ["conv_push:Bash", "conv_push:end"]
+    assert isinstance(finished_at[-1], float) and finished_at[-1] <= translated_at
 
 
 def test_translate_event_mcp_request_queues_tool_use_id_for_dispatch() -> None:

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
 import subprocess
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -573,27 +575,37 @@ def test_push_without_upstream_to_a_fork_tracks_the_upstream_pr(
 
 
 @pytest.mark.parametrize(
-    "created_at,relationship",
+    "opened_after_start,relationship",
     [
-        pytest.param(None, "created", id="opened-during-the-call"),
-        pytest.param("2020-01-01T00:00:00Z", "worked_on", id="opened-earlier"),
+        pytest.param(5.0, "created", id="opened-during-the-call"),
+        pytest.param(-60.0, "worked_on", id="opened-earlier"),
     ],
 )
 def test_pr_opened_during_the_pushing_call_counts_as_created(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     forge: _Forge,
-    created_at: str | None,
+    opened_after_start: float,
     relationship: str,
 ) -> None:
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
     git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
-    opened = created_at or datetime.now(UTC).isoformat()
+    started_at = time.time() - 10
+    git("push", "-q", cwd=worktree)
+    opened = datetime.fromtimestamp(started_at + opened_after_start, UTC).isoformat()
     forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
         _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", opened)
     ]
-    _run_and_observe(monkeypatch, "conv_created", "git push -q", worktree)
+    result = {"stdout": "", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
+    _observe_shell(
+        monkeypatch,
+        "conv_created",
+        "git push -q",
+        result,
+        started_at=started_at,
+        finished_at=started_at + 20,
+    )
     assert _tracked("conv_created") == [(CHECKOUT_PR_URL, relationship)]
 
 
@@ -662,6 +674,46 @@ def test_pushed_branch_without_a_pr_is_rechecked_later(
             monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
             pr_observer.recheck_pending("conv_late")
     assert _tracked("conv_late") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+def test_turn_end_recheck_during_the_first_lookup_finds_a_pr_opened_meanwhile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    first_lookup, release = threading.Event(), threading.Event()
+
+    def gh(args: list[str], **options: object) -> tuple[int, str, str]:
+        if first_lookup.is_set():
+            return forge.gh(args, **options)
+        first_lookup.set()
+        release.wait(30)
+        return 1, "", "not found"
+
+    monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=gh))
+    started_at = time.time()
+    git("push", "-q", cwd=worktree)
+    result = {"stdout": "", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        try:
+            observe_tool_completion(
+                "conv_race",
+                tool_name="sys_os_shell",
+                arguments={"command": "git push -q"},
+                result=json.dumps(result),
+                call_id="push",
+                started_at=started_at,
+            )
+            assert first_lookup.wait(30)
+            forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [
+                _branch_pr(CHECKOUT_PR_URL, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")
+            ]
+            pr_observer.recheck_pending("conv_race")
+        finally:
+            release.set()
+    assert _tracked("conv_race") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
 @pytest.mark.parametrize(
@@ -770,21 +822,110 @@ def test_native_hook_cwd_locates_a_quiet_push(
     assert _tracked("conv_hook") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
-def test_gh_api_branch_write_fills_repository_placeholders_from_the_checkout(
+async def test_native_hook_ignores_a_push_made_before_the_session_relay_started(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge
 ) -> None:
+    from omnigent.harnesses.claude_native import bridge
+
     worktree = tmp_path / "worktree"
     github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
     git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
     forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
-    command = (
-        "gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
-        " -f message='Update notes' -f content=bm90ZXMK -f branch=topic"
+    # A minute before the session: inside the lookback of a hook without a start time.
+    subprocess.run(
+        ["git", "push", "-q", "origin", "HEAD:topic"],
+        cwd=worktree,
+        check=True,
+        timeout=60,
+        env={**os.environ, "GIT_COMMITTER_DATE": f"@{int(time.time()) - 60} +0000"},
     )
+    relay = bridge.start_tool_relay(
+        bridge_dir=bridge.prepare_bridge_dir("conv_before", workspace=tmp_path),
+        tools=[],
+        tool_executor=None,
+        loop=asyncio.get_running_loop(),
+        session_id="conv_before",
+    )
+    relay.close()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_hook(
+            "conv_before",
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": str(worktree),
+                "tool_use_id": "list",
+                "tool_name": "Bash",
+                "tool_input": {"command": "ls"},
+                "tool_response": {"stdout": "", "stderr": "", "interrupted": False},
+            },
+        )
+    assert forge.lookups == []
+    assert _tracked("conv_before") == []
+
+
+@pytest.mark.parametrize(
+    "command,repository",
+    [
+        pytest.param(
+            "gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
+            " -f message='Update notes' -f content=bm90ZXMK -f branch=topic",
+            CHECKOUT_REPO,
+            id="checkout-repository",
+        ),
+        pytest.param(
+            "GH_REPO=upstream/project gh api -X PUT 'repos/{owner}/{repo}/contents/notes.txt'"
+            " -f message='Update notes' -f content=bm90ZXMK -f branch=topic",
+            "upstream/project",
+            id="gh-repo-override",
+        ),
+        pytest.param(
+            "gh api -X PATCH 'repos/{owner}/{repo}/git/refs/heads/{branch}' -f sha=abc1234",
+            CHECKOUT_REPO,
+            id="current-branch",
+        ),
+    ],
+)
+def test_gh_api_branch_write_fills_placeholders_as_gh_does(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, command: str, repository: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    url = f"https://github.com/{repository}/pull/42"
+    forge.responses[f"repos/{repository}/commits/topic/pulls"] = [
+        _branch_pr(url, repository, "topic", "2020-01-01T00:00:00Z")
+    ]
     result = {"stdout": "{}", "stderr": "", "exit_code": 0, "cwd": str(worktree)}
     _observe_shell(monkeypatch, "conv_placeholder", command, result)
-    assert forge.lookups == [f"repos/{CHECKOUT_REPO}/commits/topic/pulls"]
-    assert _tracked("conv_placeholder") == [(CHECKOUT_PR_URL, "worked_on")]
+    assert forge.lookups == [f"repos/{repository}/commits/topic/pulls"]
+    assert _tracked("conv_placeholder") == [(url, "worked_on")]
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["unknown-host", "configured-host"])
+def test_branch_write_queries_only_a_known_github_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, configured: bool
+) -> None:
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "gh"))
+    monkeypatch.delenv("GH_HOST", raising=False)
+    monkeypatch.setenv("OMNIGENT_GIT_PROVIDER_GITHUB_HOSTS", "ghe.example" if configured else "")
+    endpoint = f"repos/{CHECKOUT_REPO}/commits/topic/pulls"
+    url = f"https://ghe.example/{CHECKOUT_REPO}/pull/42"
+    forge.responses[endpoint] = [_branch_pr(url, CHECKOUT_REPO, "topic", "2020-01-01T00:00:00Z")]
+    gh = Mock(side_effect=forge.gh)
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_host",
+            tool_name="github__push_files",
+            arguments={**PUSH_FILES, "hostname": "ghe.example"},
+            result=json.dumps(PUSHED_REF),
+            call_id="write",
+        )
+    queried = [["api", "--hostname", "ghe.example", endpoint]] if configured else []
+    assert [call.args[0] for call in gh.call_args_list] == queried
+    assert _tracked("conv_host") == ([(url, "worked_on")] if configured else [])
 
 
 def test_reading_a_push_runs_no_program_the_checkout_config_names(

@@ -747,6 +747,45 @@ def shell_pr_operations(segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
     return ops
 
 
+def _fill_placeholders(
+    endpoint: str, tokens: list[str], cwd: str | None
+) -> tuple[str, str] | None:
+    """Return the host and endpoint after gh fills ``{owner}``, ``{repo}``, and ``{branch}``.
+
+    ``GH_REPO`` (``[HOST/]OWNER/REPO``) names the repository, else the checkout in
+    *cwd* does. gh refuses ``{branch}`` when ``GH_REPO`` is set.
+    """
+    from omnigent.runner import github_resource
+
+    host = _flag(tokens, "--hostname")
+    explicit = _flag(tokens, "--repo", "-R")
+    values: dict[str, str] = {}
+    if "{owner}" in endpoint or "{repo}" in endpoint:
+        parts = explicit.split("/") if explicit is not None else []
+        if explicit is None:
+            base = _checkout_repository(cwd) if cwd else None
+        elif len(parts) in {2, 3} and all(parts):
+            base = (parts[0] if len(parts) == 3 else "github.com", "/".join(parts[-2:]))
+        else:
+            base = None
+        if base is None:
+            return None
+        host = host or base[0]
+        values["{owner}"], values["{repo}"] = base[1].split("/", 1)
+    if "{branch}" in endpoint:
+        if explicit is not None or not cwd:
+            return None
+        code, output = github_resource._git_run(cwd)(
+            ["symbolic-ref", "--quiet", "--short", "HEAD"]
+        )
+        if code != 0 or not output.strip():
+            return None
+        values["{branch}"] = output.strip()
+    for placeholder, value in values.items():
+        endpoint = endpoint.replace(placeholder, value)
+    return host or "github.com", endpoint
+
+
 def shell_branch_writes(segments: Sequence[ShellSegment]) -> list[BranchWrite]:
     """Return the branches that ``gh api`` contents and git ref writes update."""
     writes: list[BranchWrite] = []
@@ -757,14 +796,11 @@ def shell_branch_writes(segments: Sequence[ShellSegment]) -> list[BranchWrite]:
         method = _api_method(tokens)
         endpoint = (_api_endpoint(tokens[1:]) or "").split("?", 1)[0].strip("/")
         host = _flag(tokens, "--hostname") or "github.com"
-        if "{owner}" in endpoint or "{repo}" in endpoint:
-            # gh fills these from the base repository of the directory it runs in.
-            checkout = _checkout_repository(segment.cwd) if segment.cwd else None
-            if checkout is None:
+        if re.search(r"\{(?:owner|repo|branch)\}", endpoint):
+            filled = _fill_placeholders(endpoint, tokens, segment.cwd)
+            if filled is None:
                 continue
-            owner, name = checkout[1].split("/", 1)
-            endpoint = endpoint.replace("{owner}", owner).replace("{repo}", name)
-            host = _flag(tokens, "--hostname") or checkout[0]
+            host, endpoint = filled
         branch = None
         if match := re.fullmatch(r"repos/([^/]+/[^/]+)/contents/.+", endpoint):
             branch = _api_field(tokens, "branch") if method in {"PUT", "DELETE"} else None

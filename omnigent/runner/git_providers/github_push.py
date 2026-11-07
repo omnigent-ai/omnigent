@@ -12,7 +12,8 @@ from datetime import datetime
 from pathlib import PurePath
 from urllib.parse import quote
 
-from omnigent.git_providers import resolve_remote
+from omnigent.git_providers import EnvInstances, resolve_remote
+from omnigent.git_providers.github import GitHubProvider
 from omnigent.policies.builtins.github import _git_subcommand_index
 from omnigent.runner.git_providers import BranchPullRequest, ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
@@ -172,6 +173,9 @@ def branch_prs(host: str, repository: str, branch: str) -> list[BranchPullReques
     """Return the open PRs whose head is *branch* of *repository*, a fork's included."""
     from omnigent.runner import github_resource
 
+    # Tool arguments can name the host; send gh's credentials only to a known GitHub host.
+    if not GitHubProvider().matches_host(host, EnvInstances()):
+        return []
     endpoint = f"repos/{repository}/commits/{quote(branch, safe='')}/pulls"
     code, output, _ = github_resource._gh(
         ["api", "--hostname", host, endpoint], cwd=tempfile.gettempdir(), timeout=5.0

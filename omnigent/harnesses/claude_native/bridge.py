@@ -7839,7 +7839,11 @@ def start_tool_relay(
         "updated_at": time.time(),
     }
     if session_id is not None:
+        from omnigent.runner.pr_observer import start_observing
+
         relay_info["session_id"] = session_id
+        # Hooks report no start time, and none can run before the relay is advertised.
+        start_observing(session_id)
     _write_json_file(bridge_dir / _TOOL_RELAY_FILE, relay_info)
     # token_urlsafe's alphabet is [A-Za-z0-9_-], safe inside single quotes.
     # Hooks source this file whenever they run, so it is replaced whole.

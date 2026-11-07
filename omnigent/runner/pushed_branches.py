@@ -242,6 +242,12 @@ class SessionPushes:
             self._sessions.popitem(last=False)
         return session
 
+    def start(self, session_id: str, now: float) -> None:
+        """Keep pushes made before *now* out of the session's calls without a start time."""
+        with self._lock:
+            session = self._session(session_id)
+            session.cursor = max(session.cursor or now, now)
+
     def window(self, session_id: str, started_at: float | None, finished_at: float) -> float:
         """Return when the call's pushes could start, and move the session's cursor past it."""
         with self._lock:

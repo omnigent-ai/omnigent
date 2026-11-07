@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import re
@@ -72,8 +73,8 @@ from omnigent.server.schemas import (
 
 _logger = logging.getLogger(__name__)
 
-# Session-PR observation reads git, so it runs off the event loop; one worker keeps call order.
-_pr_observation_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pr-observation")
+# Session-PR observation reads git, so it runs off the event loop.
+_pr_observation_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-observation")
 _PR_OBSERVATION_WAIT_S = 10.0
 
 # Observed tool calls use "in_progress" (distinct from "action_required" for server-dispatched).
@@ -1081,6 +1082,23 @@ class ExecutorAdapter(HarnessApp):
             self._executor = self._executor_factory()
         return self._executor
 
+    def _observe_prs(self, observe: Callable[[], object]) -> None:
+        """Run PR observation after this adapter's earlier ones, keeping their call order."""
+        previous = self._pr_observation
+        finished: Future[None] = Future()
+
+        def submit(_: object = None) -> None:
+            # Submitted only once *previous* is done, so no worker waits on another.
+            _pr_observation_pool.submit(observe).add_done_callback(
+                lambda _: finished.set_result(None)
+            )
+
+        if previous is None:
+            submit()
+        else:
+            previous.add_done_callback(submit)
+        self._pr_observation = finished
+
     async def _record_pr_observations(self) -> None:
         """Let this turn's PR observations land before the runner reports them at turn end."""
         if self._pr_observation is not None:
@@ -1194,16 +1212,19 @@ class ExecutorAdapter(HarnessApp):
 
                 session_id = ctx.session_id
                 if session_id:
-                    self._pr_observation = _pr_observation_pool.submit(
-                        observe_tool_completion,
-                        session_id,
-                        tool_name=pr_call[0],
-                        arguments=pr_call[1],
-                        result=event.result,
-                        successful=event.status == "success",
-                        call_id=call_id,
-                        source="sdk",
-                        started_at=pr_call[2],
+                    self._observe_prs(
+                        functools.partial(
+                            observe_tool_completion,
+                            session_id,
+                            tool_name=pr_call[0],
+                            arguments=pr_call[1],
+                            result=event.result,
+                            successful=event.status == "success",
+                            call_id=call_id,
+                            source="sdk",
+                            started_at=pr_call[2],
+                            finished_at=time.time(),
+                        )
                     )
             if observed is not None:
                 observed_name, observed_args = observed
@@ -1238,7 +1259,7 @@ class ExecutorAdapter(HarnessApp):
             if ctx.session_id:
                 from omnigent.runner.pr_observer import recheck_pending
 
-                self._pr_observation = _pr_observation_pool.submit(recheck_pending, ctx.session_id)
+                self._observe_prs(functools.partial(recheck_pending, ctx.session_id))
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
