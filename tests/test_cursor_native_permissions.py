@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json as _json
+import os
 import sqlite3 as _sqlite3
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -349,6 +352,504 @@ def test_read_pending_detects_multiple_distinct_gated_calls(tmp_path: Path) -> N
     assert names == ["Delete", "Write"]
 
 
+def _append_cursor_blobs(path: Path, blobs: list[bytes]) -> None:
+    """Write *blobs* the way cursor-agent does: content-hash ids, ``INSERT OR REPLACE``.
+
+    Re-writing an existing blob deletes its row and appends it at a new rowid.
+    """
+    con = _sqlite3.connect(str(path))
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS blobs (id TEXT PRIMARY KEY, data BLOB)")
+        con.executemany(
+            "INSERT OR REPLACE INTO blobs (id, data) VALUES (?, ?)",
+            [(hashlib.sha256(data).hexdigest(), data) for data in blobs],
+        )
+        con.commit()
+    finally:
+        con.close()
+
+
+def _committed_tool_call_obj(tool_call_id: str, tool_name: str) -> dict:
+    return {
+        "role": "assistant",
+        "content": [
+            {"type": "tool-call", "toolCallId": tool_call_id, "toolName": tool_name, "args": {}}
+        ],
+    }
+
+
+def _count_parsed_blobs(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count calls to the per-blob JSON scanner; returns a one-item counter."""
+    parsed = [0]
+    real = cnp._iter_embedded_json_objects
+
+    def _counting(raw: bytes) -> list[dict[str, object]]:
+        parsed[0] += 1
+        return real(raw)
+
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", _counting)
+    return parsed
+
+
+def _pending_names(calls: list[CursorPendingToolCall]) -> list[str]:
+    return [call.tool_name for call in calls]
+
+
+@pytest.fixture
+def scan() -> Iterator[cnp.CursorPendingScan]:
+    """A scan whose kept store connection is closed after the test."""
+    pending_scan = cnp.CursorPendingScan()
+    yield pending_scan
+    pending_scan.close()
+
+
+def _trace_store_connections(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[list[str], list[_sqlite3.Connection]]:
+    """Record every connection the scan opens and every statement it runs."""
+    statements: list[str] = []
+    connections: list[_sqlite3.Connection] = []
+    real_connect = _sqlite3.connect
+
+    def _connect(
+        database: str,
+        timeout: float = 5.0,
+        *,
+        uri: bool = False,
+        isolation_level: str | None = "",
+        check_same_thread: bool = True,
+    ) -> _sqlite3.Connection:
+        connection = real_connect(
+            database,
+            timeout=timeout,
+            uri=uri,
+            isolation_level=isolation_level,
+            check_same_thread=check_same_thread,
+        )
+        connection.set_trace_callback(statements.append)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(cnp, "sqlite3", SimpleNamespace(**{**vars(_sqlite3), "connect": _connect}))
+    return statements, connections
+
+
+def _is_closed(connection: _sqlite3.Connection) -> bool:
+    try:
+        connection.execute("SELECT 1")
+    except _sqlite3.ProgrammingError:
+        return True
+    return False
+
+
+def test_incremental_scan_matches_full_scan_as_rows_append(
+    tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A kept scan gives the full-scan answer at every step of a call's life."""
+    store = tmp_path / "store.db"
+    steps: list[tuple[list[bytes], list[str]]] = [
+        ([b'{"role":"user","content":"<user_query>go</user_query>"}'], []),
+        ([_framed(_pending_tool_call_obj("call_a\nfc", "Delete", {"path": "/a"}))], ["Delete"]),
+        ([b'{"role":"assistant","content":"thinking"}'], ["Delete"]),
+        (
+            [_framed(_pending_tool_call_obj("call_b\nfc", "Write", {"path": "/b"}))],
+            ["Delete", "Write"],
+        ),
+        ([_json.dumps(_committed_tool_call_obj("call_a\nfc", "Delete")).encode()], ["Write"]),
+        ([_json.dumps(_tool_result_obj("call_a\nfc")).encode()], ["Write"]),
+        ([_json.dumps(_tool_result_obj("call_b\nfc")).encode()], []),
+        # A late marker for a finished call must not bring it back.
+        ([_framed(_pending_tool_call_obj("call_b\nfc", "Write", {"path": "/b2"}))], []),
+    ]
+    for blobs, expected in steps:
+        _append_cursor_blobs(store, blobs)
+        incremental = read_cursor_pending_tool_calls(store, scan)
+        assert incremental == read_cursor_pending_tool_calls(store)
+        assert _pending_names(incremental) == expected
+        # A second poll with nothing new returns the same answer.
+        assert read_cursor_pending_tool_calls(store, scan) == incremental
+
+
+def test_incremental_scan_keeps_latest_args_for_a_still_pending_call(
+    tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A newer checkpoint of the same pending call updates its args in place."""
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(
+        store, [_framed(_pending_tool_call_obj("call_a", "Shell", {"command": "ls"}))]
+    )
+    assert read_cursor_pending_tool_calls(store, scan)[0].args == {"command": "ls"}
+    _append_cursor_blobs(
+        store, [_framed(_pending_tool_call_obj("call_a", "Shell", {"command": "pwd"}))]
+    )
+    calls = read_cursor_pending_tool_calls(store, scan)
+    assert calls == read_cursor_pending_tool_calls(store)
+    assert [call.args for call in calls] == [{"command": "pwd"}]
+
+
+def _newest_blob(store: Path) -> bytes:
+    con = _sqlite3.connect(str(store))
+    try:
+        (newest,) = con.execute("SELECT data FROM blobs ORDER BY rowid DESC LIMIT 1").fetchone()
+    finally:
+        con.close()
+    return bytes(newest)
+
+
+def _replace_store(store: Path, blobs: list[bytes]) -> None:
+    """Swap in a new file (new inode) with the same row count and newest row."""
+    fresh = store.with_name("fresh.db")
+    _append_cursor_blobs(fresh, [*blobs, _newest_blob(store)])
+    fresh.replace(store)
+
+
+_APPENDED_CALL = _framed(_pending_tool_call_obj("call_c", "Shell", {"command": "ls"}))
+
+
+def _rebuild_rows(store: Path, blobs: list[bytes], *, truncate: bool, append: bool) -> None:
+    """Rebuild the same file with the old row count and newest blob kept.
+
+    Only the rows below the newest one change, so a count or last-blob check
+    alone cannot see it.
+    """
+    newest = _newest_blob(store)
+    if truncate:
+        with store.open("r+b") as handle:
+            handle.truncate(0)
+    else:
+        con = _sqlite3.connect(str(store))
+        try:
+            con.execute("DELETE FROM blobs")
+            con.commit()
+        finally:
+            con.close()
+    _append_cursor_blobs(store, [*blobs, newest, *([_APPENDED_CALL] if append else [])])
+
+
+def _rows_rebuilt(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=False, append=False)
+
+
+def _rows_rebuilt_then_appended(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=False, append=True)
+
+
+def _truncated_rebuilt_then_appended(store: Path, blobs: list[bytes]) -> None:
+    _rebuild_rows(store, blobs, truncate=True, append=True)
+
+
+def _truncate_store(store: Path, blobs: list[bytes]) -> None:
+    """Empty the file in place (same inode) and rebuild it with fewer rows."""
+    with store.open("r+b") as handle:
+        handle.truncate(0)
+    _append_cursor_blobs(store, blobs)
+
+
+def _reuse_last_rowid(store: Path, blobs: list[bytes]) -> None:
+    """Delete the newest row so the next insert reuses its rowid."""
+    con = _sqlite3.connect(str(store))
+    try:
+        con.execute("DELETE FROM blobs WHERE rowid = (SELECT MAX(rowid) FROM blobs)")
+        con.commit()
+    finally:
+        con.close()
+    _append_cursor_blobs(store, blobs)
+
+
+def _rewrite_first_blob(store: Path, _blobs: list[bytes]) -> None:
+    """Re-write an existing blob, as cursor does: its row moves to a new rowid."""
+    con = _sqlite3.connect(str(store))
+    try:
+        (data,) = con.execute("SELECT data FROM blobs ORDER BY rowid LIMIT 1").fetchone()
+    finally:
+        con.close()
+    _append_cursor_blobs(store, [bytes(data)])
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected"),
+    [
+        (_replace_store, ["Write"]),
+        (_truncate_store, []),
+        (_reuse_last_rowid, []),
+        (_rewrite_first_blob, ["Write", "Delete"]),
+        (_rows_rebuilt, ["Write"]),
+        (_rows_rebuilt_then_appended, ["Write", "Shell"]),
+        (_truncated_rebuilt_then_appended, ["Write", "Shell"]),
+    ],
+    ids=[
+        "replaced",
+        "truncated",
+        "rowid-reused",
+        "blob-rewritten",
+        "rows-rebuilt",
+        "rows-rebuilt-then-appended",
+        "truncated-rebuilt-then-appended",
+    ],
+)
+def test_incremental_scan_rescans_when_earlier_rows_change(
+    tmp_path: Path,
+    scan: cnp.CursorPendingScan,
+    mutate: Callable[[Path, list[bytes]], None],
+    expected: list[str],
+) -> None:
+    """Any change at or below the last rowid read forces a full, correct rescan.
+
+    Folding only the new rows would keep stale calls (replaced, truncated,
+    reused rowid, rebuilt) or the wrong order (a re-written blob moves to the
+    end).
+    """
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_a", "Delete", {"path": "/a"})),
+            _framed(_pending_tool_call_obj("call_b", "Write", {"path": "/b"})),
+        ],
+    )
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete", "Write"]
+
+    mutate(store, [_json.dumps(_tool_result_obj("call_a")).encode()])
+
+    incremental = read_cursor_pending_tool_calls(store, scan)
+    assert incremental == read_cursor_pending_tool_calls(store)
+    assert _pending_names(incremental) == expected
+
+
+def test_incremental_scan_rescans_after_a_rebuild_that_restores_mtime(
+    tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A same-inode rebuild that keeps size and mtime is still caught, by ctime.
+
+    The rebuild also lands on the same change counter, so ``data_version`` on
+    the kept connection does not move either.
+    """
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_a", "Delete", {"path": "/a"})),
+            _framed(_pending_tool_call_obj("call_b", "Write", {"path": "/b"})),
+        ],
+    )
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete", "Write"]
+    before = store.stat()
+
+    _rebuild_rows(
+        store, [_json.dumps(_tool_result_obj("call_a")).encode()], truncate=True, append=False
+    )
+    # Restoring the times sets ctime to now; repeat until the clock has ticked.
+    for _ in range(1_000_000):
+        os.utime(store, ns=(before.st_atime_ns, before.st_mtime_ns))
+        if store.stat().st_ctime_ns != before.st_ctime_ns:
+            break
+    after = store.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert after.st_ctime_ns != before.st_ctime_ns
+
+    incremental = read_cursor_pending_tool_calls(store, scan)
+    assert incremental == read_cursor_pending_tool_calls(store)
+    assert _pending_names(incremental) == ["Write"]
+
+
+def test_incremental_scan_rescans_after_a_parse_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A poll that fails mid-fold drops its state so the next poll starts over."""
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_a", "Delete", {}))])
+    read_cursor_pending_tool_calls(store, scan)
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_b", "Write", {}))])
+    real = cnp._iter_embedded_json_objects
+
+    def _boom(_raw: bytes) -> list[dict[str, object]]:
+        raise ValueError("unexpected blob")
+
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", _boom)
+    with pytest.raises(ValueError):
+        read_cursor_pending_tool_calls(store, scan)
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", real)
+    parsed = _count_parsed_blobs(monkeypatch)
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete", "Write"]
+    assert parsed[0] == 2
+
+
+def test_incremental_scan_parses_only_new_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """Polling a large store with no new rows parses no blobs at all."""
+    store = tmp_path / "store.db"
+    rows = 500
+    blobs: list[bytes] = []
+    for i in range(rows // 2):
+        blobs.append(_framed(_pending_tool_call_obj(f"call_{i}", "Shell", {"command": "x" * 512})))
+        blobs.append(_json.dumps(_tool_result_obj(f"call_{i}")).encode())
+    _append_cursor_blobs(store, blobs)
+    parsed = _count_parsed_blobs(monkeypatch)
+
+    assert read_cursor_pending_tool_calls(store, scan) == []
+    assert parsed[0] == rows
+    for _ in range(5):
+        assert read_cursor_pending_tool_calls(store, scan) == []
+    assert parsed[0] == rows
+
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_new", "Delete", {}))])
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+    assert parsed[0] == rows + 1
+
+
+def test_incremental_scan_does_constant_work_while_store_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """Idle polls run one ``PRAGMA data_version`` and nothing else.
+
+    No connection is opened, no digest or blob query runs and no blob is
+    parsed, however long the chat is. A commit by another connection brings
+    the full validation back on the next poll, on a fresh connection.
+    """
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(
+        store, [_json.dumps(_tool_result_obj(f"call_{i}")).encode() for i in range(300)]
+    )
+    statements, connections = _trace_store_connections(monkeypatch)
+    parsed = _count_parsed_blobs(monkeypatch)
+    assert read_cursor_pending_tool_calls(store, scan) == []
+    assert (len(connections), parsed[0]) == (1, 300)
+
+    statements.clear()
+    for _ in range(5):
+        assert read_cursor_pending_tool_calls(store, scan) == []
+    assert statements == ["PRAGMA data_version"] * 5
+    assert (len(connections), parsed[0]) == (1, 300)
+
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_new", "Delete", {}))])
+    statements.clear()
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+    assert "SELECT rowid, id FROM blobs" in statements
+    assert any(sql.startswith("SELECT rowid, id, data FROM blobs") for sql in statements)
+    assert (len(connections), parsed[0]) == (2, 301)
+    assert _is_closed(connections[0]) and not _is_closed(connections[1])
+
+
+def test_incremental_scan_sees_a_commit_that_leaves_stat_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """``data_version`` alone catches a commit that size and mtime miss.
+
+    A WAL reset can rewrite frames without growing the file, inside one
+    mtime tick; pinning the stat signature models that.
+    """
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_a", "Delete", {}))])
+    first_signature = cnp._store_signature(store)
+    monkeypatch.setattr(cnp, "_store_signature", lambda _path: first_signature)
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+
+    _append_cursor_blobs(store, [_json.dumps(_tool_result_obj("call_a")).encode()])
+
+    assert read_cursor_pending_tool_calls(store, scan) == []
+
+
+def test_scan_closed_as_a_read_releases_its_lock_still_closes_the_connection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """A close landing after the read's last check, just before it unlocks, still closes."""
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_a", "Delete", {}))])
+    _statements, connections = _trace_store_connections(monkeypatch)
+    read_lock = scan._lock
+
+    class _CloseBeforeRelease:
+        """The read lock, with a close (e.g. supervisor cancellation) just before release."""
+
+        def acquire(self, blocking: bool = True) -> bool:
+            return read_lock.acquire(blocking)
+
+        def release(self) -> None:
+            read_lock.release()
+
+        def __enter__(self) -> None:
+            read_lock.acquire()
+
+        def __exit__(self, *_exc: object) -> None:
+            scan.close()
+            read_lock.release()
+
+    monkeypatch.setattr(scan, "_lock", _CloseBeforeRelease())
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+    assert len(connections) == 1 and _is_closed(connections[0])
+
+
+def test_scan_closed_during_a_read_releases_the_connection_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scan: cnp.CursorPendingScan
+) -> None:
+    """Closing mid-read (supervisor exit while a poll thread runs) defers the close."""
+    store = tmp_path / "store.db"
+    _append_cursor_blobs(store, [_framed(_pending_tool_call_obj("call_a", "Delete", {}))])
+    _statements, connections = _trace_store_connections(monkeypatch)
+    real_fold = scan.fold
+
+    def _fold_then_close(rows: list[tuple[int, str, object]]) -> None:
+        real_fold(rows)
+        scan.close()
+        assert not _is_closed(connections[-1])
+
+    monkeypatch.setattr(scan, "fold", _fold_then_close)
+    assert _pending_names(read_cursor_pending_tool_calls(store, scan)) == ["Delete"]
+    assert len(connections) == 1 and _is_closed(connections[0])
+
+
+async def test_supervise_transcript_reuses_scan_between_polls(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The supervisor keeps one scan, so idle polls re-parse nothing, and closes it."""
+    _install_supervisor_fakes(monkeypatch, tmp_path, pending=[], pane=None)
+    store = tmp_path / "store.db"
+    store.unlink()
+    _append_cursor_blobs(
+        store,
+        [_json.dumps(_tool_result_obj(f"call_{i}")).encode() for i in range(20)],
+    )
+    # Polls run in worker threads; count finished and running ones, never time them.
+    progress = threading.Condition()
+    polls = in_flight = 0
+
+    def _read(store_path: Path, scan: cnp.CursorPendingScan | None = None) -> list:
+        nonlocal polls, in_flight
+        with progress:
+            in_flight += 1
+        try:
+            return read_cursor_pending_tool_calls(store_path, scan)
+        finally:
+            with progress:
+                in_flight -= 1
+                polls += 1
+                progress.notify_all()
+
+    def _wait_until(predicate: Callable[[], bool]) -> bool:
+        # The timeout only guards against a hang; it never decides the result.
+        with progress:
+            return progress.wait_for(predicate, timeout=120)
+
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", _read)
+    parsed = _count_parsed_blobs(monkeypatch)
+    _statements, connections = _trace_store_connections(monkeypatch)
+    task = _start_supervisor(tmp_path, session_id="conv_idle", auto_accept_approvals=False)
+    try:
+        assert await asyncio.to_thread(_wait_until, lambda: polls >= 5)
+    finally:
+        await _stop(task)
+    # A poll cancelled mid-read keeps running in its thread; let it finish.
+    assert await asyncio.to_thread(_wait_until, lambda: in_flight == 0)
+    assert parsed[0] == 20
+    # The kept store connection does not outlive the supervisor.
+    assert len(connections) == 1 and _is_closed(connections[0])
+
+
 def test_tool_call_elicitation_id_is_stable_and_scoped(tmp_path: Path) -> None:
     """The id is deterministic per (session, toolCallId) and embeds the session."""
     a = cursor_tool_call_elicitation_id("conv_x", "call_1\nfc")
@@ -370,7 +871,9 @@ async def test_supervise_transcript_parks_new_call_then_releases_on_resolve(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")  # exists() check
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+    monkeypatch.setattr(
+        cnp, "read_cursor_pending_tool_calls", lambda _s, _scan=None: list(pending_now)
+    )
     # Keystroke + park boundaries faked.
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
 
@@ -508,7 +1011,9 @@ async def test_supervise_transcript_debounces_autoapproved_call(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+    monkeypatch.setattr(
+        cnp, "read_cursor_pending_tool_calls", lambda _s, _scan=None: list(pending_now)
+    )
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
 
     class _Resp:
@@ -625,7 +1130,9 @@ def _install_supervisor_fakes(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending))
+    monkeypatch.setattr(
+        cnp, "read_cursor_pending_tool_calls", lambda _s, _scan=None: list(pending)
+    )
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: pane)
 
     async def _fake_send(_bridge: Path, _session: str, *keys: str) -> bool:
@@ -732,7 +1239,7 @@ async def test_supervise_transcript_yolo_waits_through_stale_pending_burst(
     )
     polls = 0
 
-    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+    def read_pending(_store: Path, _scan: object = None) -> list[CursorPendingToolCall]:
         nonlocal polls
         polls += 1
         return pending if polls <= 6 else []
@@ -770,7 +1277,7 @@ async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     polls = 0
     sent_at: list[float] = []
 
-    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+    def read_pending(_store: Path, _scan: object = None) -> list[CursorPendingToolCall]:
         nonlocal polls
         polls += 1
         return pending_now
