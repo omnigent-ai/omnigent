@@ -4555,6 +4555,7 @@ def create_app(
             _publish_sandbox_status,
             prefetch_session_routing_catalogs,
         )
+        from omnigent.stores.conversation_store import RECONNECT_RECOVERY_HELD_LABEL_KEY
 
         if tunnel_registry.get(runner_id) is not connection:
             return
@@ -4619,6 +4620,10 @@ def create_app(
         # A wake-only retry initializes its tree itself, without resuming work.
         wake_only_root_ids: set[str] = set()
         skipped_resume_ids_by_root: dict[str, set[str]] = {}
+        # Roots fenced by a held descendant. Their own skip record is an
+        # evictable cache entry, so they take a durable hold as well: work given
+        # to the root then knows it owes the tree's recovery, and releases it.
+        held_by_descendant_root_ids: set[str] = set()
         for conv in convs:
             deferred = reconnect_recovery_deferred(conv)
             if not deferred and skipped_resume_runner(conv.id) is None:
@@ -4632,7 +4637,19 @@ def create_app(
                 # Leave the tree's deferred resume for its next plain retry.
                 note_skipped_resume(conv.id, runner_id)
                 note_skipped_resume(root_id, runner_id)
+                if root_id != conv.id:
+                    held_by_descendant_root_ids.add(root_id)
 
+        for root_id in held_by_descendant_root_ids:
+            if RECONNECT_RECOVERY_HELD_LABEL_KEY not in by_id[root_id].labels:
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        root_id,
+                        {RECONNECT_RECOVERY_HELD_LABEL_KEY: "true"},
+                    )
+                except Exception:
+                    _logger.exception("Failed to hold reconnect recovery of root %s", root_id)
         # Attach independent roots first; their recovery restores dependent sessions.
         convs.sort(key=lambda conv: not is_independent(conv))
         _logger.info("_on_runner_connect: runner=%s, %d bound session(s)", runner_id, len(convs))

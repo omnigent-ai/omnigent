@@ -8200,8 +8200,11 @@ describe("Composer config gear", () => {
       expect(screen.getByTestId("composer-agent-models")).toHaveTextContent("claude-opus-4-8");
     });
 
-    it("pins nothing when opening and closing the model picker", async () => {
+    it("pins nothing when opening and closing the model picker, but wakes the sandbox", async () => {
+      wakeSandboxMock.mockClear();
       const setModel = await openModalOnRoutedSession();
+      // The picker's model list comes from the host, so opening it wakes an asleep sandbox.
+      expect(wakeSandboxMock).toHaveBeenCalled();
       fireEvent.keyDown(screen.getByTestId("composer-agent-config-menu"), { key: "Escape" });
       expect(setModel).not.toHaveBeenCalled();
     });

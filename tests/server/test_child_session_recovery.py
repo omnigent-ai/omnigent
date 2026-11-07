@@ -497,6 +497,41 @@ async def test_requested_work_on_a_child_releases_the_ancestors_that_recover_it(
 
 
 @pytest.mark.asyncio
+async def test_work_on_a_held_root_releases_the_descendants_that_fence_its_tree(
+    recovery_tree: Any,
+) -> None:
+    """Runner connect fences a tree on any held member, so root work releases its tree."""
+    store, parent, _, _, _, _ = recovery_tree
+
+    def child_of(owner_id: str, runner_id: str | None = None) -> Any:
+        return store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=owner_id,
+            agent_id=parent.agent_id,
+            runner_id=runner_id or parent.runner_id,
+        )
+
+    dependent = child_of(parent.id)
+    grandchild = child_of(dependent.id)
+    hosted = child_of(parent.id)
+    store.set_host_id(hosted.id, "a" * 32, workspace="/tmp")
+    elsewhere = child_of(parent.id, runner_id="another_runner")
+    for row in (parent, grandchild, hosted, elsewhere):
+        await hold_reconnect_recovery(row.id, store)
+
+    await release_reconnect_recovery(parent.id, store)
+
+    def held(row: Any) -> bool:
+        return reconnect_recovery_deferred(store.get_conversation(row.id))  # type: ignore[arg-type]
+
+    assert not held(parent)
+    assert not held(grandchild)
+    # Independent trees keep their own holds.
+    assert held(hosted)
+    assert held(elsewhere)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("hosted_above_budget", "page_size", "page_reads"),
     [(False, 2000, 1), (True, 2000, 1), (False, 4, 6)],

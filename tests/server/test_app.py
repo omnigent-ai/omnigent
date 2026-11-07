@@ -2878,6 +2878,10 @@ async def test_on_runner_connect_leaves_a_wake_only_tree_to_its_retry(
     if not retry_in_flight:
         assert reconnect_recovery_deferred(store.get_conversation(woken_id))  # type: ignore[arg-type]
     assert reconnect_recovery_deferred(store.get_conversation(woken_child_id))  # type: ignore[arg-type]
+    # A held child's tree owes recovery durably at its root too, not only in the
+    # evictable skip record, so work on the root restores and releases the tree.
+    assert reconnect_recovery_deferred(store.get_conversation(woken_child_root_id))  # type: ignore[arg-type]
+    assert not reconnect_recovery_deferred(store.get_conversation(other_id))  # type: ignore[arg-type]
 
 
 @pytest.mark.asyncio

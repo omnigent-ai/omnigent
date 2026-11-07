@@ -840,3 +840,62 @@ async def test_reconnect_recovers_a_child_messaged_during_or_after_its_parent_wa
 
     # The child's input ended the wake's hold, so its tree recovers as usual.
     assert inits == [(row.id, row is child) for row in lineage]
+
+
+async def test_root_work_after_a_held_child_fenced_its_tree_recovers_the_root_later(
+    app: FastAPI,
+    agent: Agent,
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A woken child fences its tree; root work releases it even with the skip record gone."""
+    from omnigent.server import child_session_recovery
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.server.routes.sessions import routes_events
+    from tests._helpers.polling import poll_until_async
+
+    for module in (routes_events, orchestration):
+        monkeypatch.setattr(module, "_ensure_runner_relay_ready", AsyncMock(return_value=None))
+    store = app.state.runner_router._conversation_store
+    root = _create_session(app, agent.id, interrupted=False)
+    child = _create_session(
+        app, agent.id, interrupted=False, kind="sub_agent", parent_conversation_id=root.id
+    )
+    # The child's wake fails before its runner is up; its hold stays.
+    wake = await client.post(
+        f"/v1/sessions/{child.id}/events", json={"type": "wake_session", "data": {}}
+    )
+    assert wake.status_code == 503, wake.text
+    inits: list[tuple[str, bool]] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/v1/sessions":
+            return httpx.Response(202, json={})
+        body = json.loads(request.content)
+        inits.append((body["session_id"], body["session_init"]["resume_interrupted_turn"]))
+        return httpx.Response(201, json={"id": body["session_id"]})
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        # The root's in-memory skip record is evicted while its runner stays connected.
+        child_session_recovery.clear_skipped_resume(root.id)
+        message = await client.post(
+            f"/v1/sessions/{root.id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        assert message.status_code == 202, message.text
+    assert not child_session_recovery.reconnect_recovery_deferred(store.get_conversation(child.id))
+    assert not child_session_recovery.reconnect_recovery_deferred(store.get_conversation(root.id))
+    # The runner drops during the root's requested turn.
+    _interrupt(app, root.id)
+    inits.clear()
+
+    async with _recover(app, monkeypatch, respond) as (_relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        # The child's hold no longer fences the tree, so the root recovers.
+        await poll_until_async(
+            lambda: root.id in [session_id for session_id, _ in inits], timeout_s=budget(5)
+        )
