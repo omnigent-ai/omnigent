@@ -137,7 +137,7 @@ async def _file(auth_client, db_uri, session_id: str, project_id: str) -> None:
 
 
 _DEFAULTS_THAT_WOULD_CHANGE_THE_WORKER = {"workspace": "/project-default", "git": {"base": "main"}}
-# A nested agent stays in its source session's project, so project_name applies only without them.
+# Nested agents stay in their source session's project, so project_name is for standalone mode.
 _STANDALONE_ONLY = pytest.mark.parametrize(
     "orchestration_environment", [False], ids=["standalone"], indirect=True
 )

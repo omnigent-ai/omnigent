@@ -948,6 +948,8 @@ async def test_a_failed_project_lookup_creates_no_session(status):
 
     def respond(request):
         requests.append(request)
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={})
         if request.url.path.startswith("/v1/projects"):
             if status == "connect_error":
                 raise httpx.ConnectError("Server unreachable")
