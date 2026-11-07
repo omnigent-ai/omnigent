@@ -49,7 +49,8 @@ os_env:
   type: caller_process
   cwd: .
   sandbox:
-    type: none
+    write_paths: [.]
+    cwd_allow_hidden: [.agents, .claude, .codex, .git, .github, .polly, .venv, .worktrees]
 
 # Implementers open their own PRs, so push / gh pr create are allowed
 # (gate_pushes: false). Only the catastrophic set (force-push, rm -rf /,
