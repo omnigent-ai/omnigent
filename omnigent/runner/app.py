@@ -5699,13 +5699,9 @@ def create_runner_app(
                     elif resolved is not None:
                         cached_spec = resolved
                         _session_spec_cache[conv] = resolved
-                except (httpx.HTTPError, RuntimeError):
-                    _logger.warning(
-                        "Spec resolution failed for %s",
-                        conv,
-                        exc_info=True,
-                        extra={"session_id": conv},
-                    )
+                except (httpx.HTTPError, RuntimeError) as exc:
+                    # Without the spec the turn would run with no harness selected.
+                    raise RuntimeError(_spec_resolve_error_detail(exc)) from exc
             else:
                 try:
                     cached_spec = await _resolve_session_agent_spec(conv)

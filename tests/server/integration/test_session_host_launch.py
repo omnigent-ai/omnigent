@@ -3402,6 +3402,80 @@ async def test_relaunch_posts_session_init_before_forwarding_message(
     assert envelope is not None and envelope.suppress_recovery_turn
 
 
+async def test_message_is_refused_when_the_runner_rejects_deferred_session_setup(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A native session whose runner rejects setup refuses the message; the next send retries."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm, harness="claude-native")
+    session_id = session["id"]
+    runner_paths: list[str] = []
+    init_statuses = [503, 201]
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            runner_paths.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            if init_statuses.pop(0) == 503:
+                return httpx.Response(
+                    503,
+                    json={
+                        "error": "spec_resolver_failed",
+                        "detail": "Could not load the agent spec (ConnectError).",
+                    },
+                )
+            return httpx.Response(
+                201, json={"session_init_protocol_version": 2, "terminal_ready": True}
+            )
+        return httpx.Response(202, json={"queued": True})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+    monkeypatch.setattr(sessions_module, "_get_runner_client", AsyncMock(return_value=fake_runner))
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", AsyncMock())
+
+    def _send(text: str) -> Any:
+        return client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+            },
+        )
+
+    try:
+        refused = await _send("what are the updates?")
+        assert refused.status_code == 503, refused.text
+        assert refused.json()["error"] == {
+            "code": "runner_unavailable",
+            "message": (
+                "The runner could not set up this session, so the message was not sent: "
+                "spec_resolver_failed: Could not load the agent spec (ConnectError)."
+            ),
+        }
+        assert runner_paths == ["/v1/sessions"]
+
+        retried = await _send("hi")
+        assert retried.status_code < 300, retried.text
+    finally:
+        await fake_runner.aclose()
+
+    assert runner_paths == ["/v1/sessions", "/v1/sessions", f"/v1/sessions/{session_id}/events"]
+    items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+    texts = [
+        part.get("text")
+        for item in items
+        if item["type"] == "message"
+        for part in item.get("content", [])
+    ]
+    assert "what are the updates?" not in texts
+
+
 async def test_codex_goal_relaunch_posts_session_init_before_goal_event(
     client: httpx.AsyncClient,
     app: FastAPI,
