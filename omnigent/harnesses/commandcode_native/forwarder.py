@@ -66,11 +66,39 @@ class _MirroredItem:
 
 @dataclass
 class _ForwardState:
-    """Durable cursor into the session transcript."""
+    """Durable cursor into the session transcript + cumulative usage."""
 
     path: str | None = None
     offset: int = 0
     line: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    context_tokens: int = 0
+    cost_usd: float = 0.0
+    model: str | None = None
+
+
+@dataclass
+class _UsageDelta:
+    """Usage summed over newly-read transcript entries."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    context_tokens: int = 0
+    cost_usd: float = 0.0
+    model: str | None = None
+
+    @property
+    def advanced(self) -> bool:
+        """:returns: ``True`` when any token count or cost advanced."""
+        return bool(
+            self.input_tokens
+            or self.output_tokens
+            or self.cache_read_tokens
+            or self.cost_usd
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +206,7 @@ async def forward_commandcode_transcript_to_session(
                     external_session_id=external_id,
                 )
                 mirrored_external_id = external_id
-            items, next_offset, next_line = _read_new_items(
+            items, usage, next_offset, next_line = _read_new_items(
                 Path(path), state.offset, state.line
             )
             if items:
@@ -191,6 +219,22 @@ async def forward_commandcode_transcript_to_session(
                         item=item,
                         agent_name=agent_name,
                     )
+            if usage.advanced:
+                state.input_tokens += usage.input_tokens
+                state.output_tokens += usage.output_tokens
+                state.cache_read_tokens += usage.cache_read_tokens
+                state.context_tokens = max(state.context_tokens, usage.context_tokens)
+                state.cost_usd += usage.cost_usd
+                if usage.model:
+                    state.model = usage.model
+                await _post_usage(
+                    client,
+                    base_url=base,
+                    headers=headers,
+                    session_id=session_id,
+                    state=state,
+                )
+            if next_offset != state.offset or next_line != state.line:
                 state.offset = next_offset
                 state.line = next_line
                 _write_state(bridge_dir, state)
@@ -261,26 +305,28 @@ def _external_session_id(path: Path) -> str | None:
 
 def _read_new_items(
     path: Path, last_offset: int, last_line: int
-) -> tuple[list[_MirroredItem], int, int]:
+) -> tuple[list[_MirroredItem], _UsageDelta, int, int]:
     """Read transcript entries appended after the cursor and map them.
 
-    :returns: ``(items, next_offset, next_line)``. ``next_*`` equal the inputs
-        when the file is missing or unchanged.
+    :returns: ``(items, usage, next_offset, next_line)``. ``usage`` sums the
+        token usage of the newly-read message entries. ``next_*`` equal the
+        inputs when the file is missing or unchanged.
     """
     try:
         size = path.stat().st_size
     except OSError:
-        return [], last_offset, last_line
+        return [], _UsageDelta(), last_offset, last_line
     if size <= last_offset:
-        return [], last_offset, last_line
+        return [], _UsageDelta(), last_offset, last_line
 
     items: list[_MirroredItem] = []
+    usage = _UsageDelta()
     try:
         with path.open("r", encoding="utf-8") as handle:
             handle.seek(last_offset)
             consumed = handle.read()
     except OSError:
-        return [], last_offset, last_line
+        return [], _UsageDelta(), last_offset, last_line
 
     # Keep a trailing partial line unconsumed so it is re-read once complete.
     if consumed.endswith("\n"):
@@ -299,10 +345,49 @@ def _read_new_items(
             row = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if not isinstance(row, dict) or row.get("type") != "message":
+        if not isinstance(row, dict):
+            continue
+        # Usage rides on the top-level entry (message entries carry it), even
+        # for rows whose content we don't mirror.
+        _accumulate_usage(row, usage)
+        if row.get("type") != "message":
             continue
         items.extend(_row_to_items(row))
-    return items, offset, line_no
+    return items, usage, offset, line_no
+
+
+def _accumulate_usage(row: dict[str, Any], usage: _UsageDelta) -> None:
+    """Add one entry's top-level ``usage``/``model`` fields into *usage*."""
+    raw = row.get("usage")
+    if isinstance(raw, dict):
+        inp = _as_int(raw.get("inputTokens"))
+        usage.input_tokens += inp
+        usage.output_tokens += _as_int(raw.get("outputTokens"))
+        usage.cache_read_tokens += _as_int(raw.get("cacheReadTokens"))
+        usage.cost_usd += _as_float(raw.get("costUsd"))
+        # The latest request's prompt size approximates the live context size.
+        usage.context_tokens = max(usage.context_tokens, inp)
+    model = row.get("model")
+    if isinstance(model, str) and model:
+        usage.model = model
+
+
+def _as_int(value: Any) -> int:
+    """Coerce a JSON number to ``int`` (booleans/others → 0)."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return int(value)
+    return 0
+
+
+def _as_float(value: Any) -> float:
+    """Coerce a JSON number to ``float`` (booleans/others → 0.0)."""
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    return 0.0
 
 
 def _row_to_items(row: dict[str, Any]) -> list[_MirroredItem]:
@@ -508,6 +593,38 @@ async def _post_status(
     resp.raise_for_status()
 
 
+async def _post_usage(
+    client: httpx.AsyncClient,
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    state: _ForwardState,
+) -> None:
+    """POST cumulative token usage as an ``external_session_usage`` event.
+
+    Mirrors the shared contract claude-/codex-/cursor-native use: cumulative
+    SESSION totals (not per-turn deltas) with the model, so the server prices
+    the tokens via the model catalog and the web cost badge lights up.
+    """
+    data: dict[str, Any] = {
+        "cumulative_input_tokens": state.input_tokens,
+        "cumulative_output_tokens": state.output_tokens,
+        "cumulative_cache_read_input_tokens": state.cache_read_tokens,
+    }
+    if state.context_tokens:
+        data["context_tokens"] = state.context_tokens
+    if state.cost_usd > 0:
+        data["cumulative_cost_usd"] = state.cost_usd
+    if state.model:
+        data["model"] = state.model
+    url = f"{base_url}/v1/sessions/{session_id}/events"
+    resp = await client.post(
+        url, headers=headers, json={"type": "external_session_usage", "data": data}
+    )
+    resp.raise_for_status()
+
+
 async def _patch_external_session_id(
     client: httpx.AsyncClient,
     *,
@@ -558,16 +675,33 @@ def _read_state(bridge_dir: Path) -> _ForwardState:
     if not isinstance(data, dict):
         return _ForwardState()
     path = data.get("path")
+    model = data.get("model")
     return _ForwardState(
         path=path if isinstance(path, str) and path else None,
         offset=int(data.get("offset") or 0),
         line=int(data.get("line") or 0),
+        input_tokens=int(data.get("input_tokens") or 0),
+        output_tokens=int(data.get("output_tokens") or 0),
+        cache_read_tokens=int(data.get("cache_read_tokens") or 0),
+        context_tokens=int(data.get("context_tokens") or 0),
+        cost_usd=float(data.get("cost_usd") or 0.0),
+        model=model if isinstance(model, str) and model else None,
     )
 
 
 def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
-    """Persist the cursor atomically."""
-    payload = {"path": state.path, "offset": state.offset, "line": state.line}
+    """Persist the cursor + cumulative usage atomically."""
+    payload = {
+        "path": state.path,
+        "offset": state.offset,
+        "line": state.line,
+        "input_tokens": state.input_tokens,
+        "output_tokens": state.output_tokens,
+        "cache_read_tokens": state.cache_read_tokens,
+        "context_tokens": state.context_tokens,
+        "cost_usd": state.cost_usd,
+        "model": state.model,
+    }
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     tmp.write_text(json.dumps(payload), encoding="utf-8")
     tmp.replace(bridge_dir / _STATE_FILE)

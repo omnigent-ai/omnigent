@@ -92,7 +92,7 @@ def test_read_new_items_maps_user_assistant_and_reasoning(tmp_path: Path) -> Non
             ),
         ],
     )
-    items, offset, line = fwd._read_new_items(path, 0, 0)
+    items, _usage, offset, line = fwd._read_new_items(path, 0, 0)
     assert [(i.kind, i.role, i.text) for i in items] == [
         ("message", "user", "do the thing"),
         ("reasoning", "assistant", "pondering"),
@@ -107,7 +107,7 @@ def test_read_new_items_maps_user_assistant_and_reasoning(tmp_path: Path) -> Non
     assert offset > 0 and line == 4
 
     # Re-reading from the new cursor yields nothing (idempotent).
-    again, offset2, _ = fwd._read_new_items(path, offset, line)
+    again, _usage2, offset2, _line = fwd._read_new_items(path, offset, line)
     assert again == []
     assert offset2 == offset
 
@@ -118,14 +118,34 @@ def test_read_new_items_holds_back_partial_trailing_line(tmp_path: Path) -> None
     half = len(full) // 2
     with path.open("a", encoding="utf-8") as handle:
         handle.write(full[:half])  # partial line, no trailing newline
-    items, offset, _ = fwd._read_new_items(path, 0, 0)
+    items, _u1, offset, _l1 = fwd._read_new_items(path, 0, 0)
     assert items == []
     # Completing the partial line surfaces the item on the next read.
     with path.open("a", encoding="utf-8") as handle:
         handle.write(full[half:] + "\n")
-    items, offset2, _ = fwd._read_new_items(path, offset, 1)
+    items, _u2, offset2, _l2 = fwd._read_new_items(path, offset, 1)
     assert [i.text for i in items] == ["hello"]
     assert offset2 > offset
+
+
+def test_read_new_items_accumulates_usage_and_model(tmp_path: Path) -> None:
+    entry = _msg("assistant", "model", [{"type": "text", "text": "hi"}], "a1")
+    entry["usage"] = {
+        "inputTokens": 100,
+        "outputTokens": 7,
+        "cacheReadTokens": 40,
+        "cacheWriteTokens": 0,
+        "costUsd": 0.01,
+    }
+    entry["model"] = "deepseek/deepseek-v4.1-flash"
+    path = _write_session(tmp_path, "/work/repo", "sess", [entry])
+    items, usage, _offset, _line = fwd._read_new_items(path, 0, 0)
+    assert usage.advanced is True
+    assert (usage.input_tokens, usage.output_tokens, usage.cache_read_tokens) == (100, 7, 40)
+    assert usage.context_tokens == 100
+    assert abs(usage.cost_usd - 0.01) < 1e-9
+    assert usage.model == "deepseek/deepseek-v4.1-flash"
+    assert [i.text for i in items] == ["hi"]
 
 
 def test_clear_state_removes_cursor(tmp_path: Path) -> None:
