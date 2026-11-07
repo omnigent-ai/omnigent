@@ -6,6 +6,10 @@ which the push's output alone cannot show. A push counts only when that entry is
 recent and the ref points at the HEAD of a checkout the call ran in, so pushes
 from other worktrees of the same repository are not picked up. Pushes to a URL
 with no configured remote, and of a branch other than HEAD, are not seen.
+
+Recency does not prove which session pushed: a session working in a checkout
+at the same HEAD as a recent push from elsewhere (a person or another session)
+also reports that push.
 """
 
 from __future__ import annotations
@@ -34,7 +38,16 @@ def _git(directory: str, *argv: str) -> str | None:
     # The checkout's config is agent-writable, so keep it from running programs here.
     try:
         completed = subprocess.run(
-            ["git", "--no-pager", "--no-optional-locks", "-c", "core.fsmonitor=false", *argv],
+            [
+                "git",
+                "--no-pager",
+                "--no-optional-locks",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "log.showSignature=false",
+                *argv,
+            ],
             cwd=directory,
             env=_anchored_git_env(),
             capture_output=True,
@@ -91,6 +104,7 @@ def recent_pushes(directories: Iterable[str]) -> list[tuple[str, str]]:
                 directory,
                 "reflog",
                 "show",
+                "--no-show-signature",
                 "-n",
                 "1",
                 "--date=unix",

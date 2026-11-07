@@ -275,11 +275,12 @@ def _prepare_shell_text(command: str, *, model_syntax: bool = True) -> tuple[str
     return "".join(result), redirected
 
 
-def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
+def _shell_segments(command: str, depth: int = 0, *, split_or: bool = False) -> list[ShellSegment]:
     """Split a command into simple commands, unwrapping nested shell strings in place.
 
     A command with ``||`` or one that cannot be lexed has no segments, since
-    which of its commands ran is unknown.
+    which of its commands ran is unknown. With *split_or*, ``||`` separates
+    segments instead, and none of them is output-eligible.
     """
     if depth > MAX_SHELL_NESTING:
         return []
@@ -292,7 +293,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
     output_eligible = not redirected
     try:
         for token in lexer:
-            if token == "||":
+            if token == "||" and not split_or:
                 return []
             if token and all(char in ";&|\n" for char in token):
                 if token.strip(";\n") not in {"", "&&"}:
@@ -308,7 +309,7 @@ def _shell_segments(command: str, depth: int = 0) -> list[ShellSegment]:
             continue
         inner = unwrap_shell_command(tokens)
         if inner is not None:
-            nested = _shell_segments(inner, depth + 1)
+            nested = _shell_segments(inner, depth + 1, split_or=split_or)
             if not nested:
                 output_eligible = False
             found.extend(nested)
@@ -468,6 +469,18 @@ def _shell_operations(
     workdir = arguments.get("workdir")
     start = cwd or (workdir if isinstance(workdir, str) else None)
     segments = _with_directories(_shell_segments(command), start)
+    if not segments and start:
+        # Output attribution rejects this command, but the checkouts it ran in
+        # still record its pushes, so pass only those on, as plain ``cd`` steps.
+        directories = [start] + [
+            segment.cwd
+            for segment in _with_directories(_shell_segments(command, split_or=True), start)
+            if segment.cwd
+        ]
+        segments = [
+            ShellSegment(("cd", path), ("cd", path), output_eligible=False, cwd=path)
+            for path in dict.fromkeys(directories)
+        ]
     return [
         (facet.provider_id, op) for facet in facets for op in facet.shell_pr_operations(segments)
     ]

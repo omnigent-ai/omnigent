@@ -338,6 +338,7 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
 ) -> None:
     remote, work = checkout
     _git("push", "-q", "--dry-run", "origin", "HEAD:feature/dry-run", cwd=work)
+    assert push_reflog.recent_pushes([str(work)]) == []
     # Another worktree of the same repository pushes a different commit.
     other = work.parent / "other"
     _git("worktree", "add", "-q", "-b", "other", str(other), cwd=work)
@@ -366,6 +367,9 @@ def test_reflog_ignores_pushes_this_checkout_did_not_make(
         ("/work", "cd repo && git pp | tail -3", ["/work/repo"]),
         (None, "git -C /work/repo pp && echo done", ["/work/repo"]),
         (None, "git pp", []),
+        # Output attribution rejects "||", but the checkouts still get checked.
+        ("/work/repo", "git pp || true", ["/work/repo"]),
+        ("/work", "cd repo && git pp || echo failed", ["/work", "/work/repo"]),
     ],
 )
 def test_native_hook_checks_the_directories_the_command_ran_in(
@@ -405,3 +409,36 @@ def test_native_hook_checks_the_directories_the_command_ran_in(
     assert list(dict.fromkeys(checked)) == directories
     entries = SessionPrRegistry("conv_hook").list()
     assert [entry.url for entry in entries] == ([PR_URL] if directories else [])
+
+
+def test_reflog_read_does_not_run_a_configured_signature_verifier(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    remote, work = checkout
+    marker = tmp_path / "verifier-ran"
+    verifier = tmp_path / "verifier.sh"
+    verifier.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    verifier.chmod(0o755)
+    # An agent can write the checkout's config and commit a signature header.
+    tree = _git("hash-object", "-t", "tree", "/dev/null", cwd=work).strip()
+    head = _git("rev-parse", "HEAD", cwd=work).strip()
+    signed = subprocess.run(
+        ["git", "hash-object", "-t", "commit", "-w", "--stdin"],
+        cwd=work,
+        input=(
+            f"tree {tree}\nparent {head}\n"
+            "author Test <test@example.com> 1700000000 +0000\n"
+            "committer Test <test@example.com> 1700000000 +0000\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n \n -----END PGP SIGNATURE-----\n"
+            "\nsigned\n"
+        ),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    _git("reset", "-q", "--hard", signed, cwd=work)
+    _git("push", "-q", "origin", "HEAD:feature/signed", cwd=work)
+    _git("config", "log.showSignature", "true", cwd=work)
+    _git("config", "gpg.program", str(verifier), cwd=work)
+    assert push_reflog.recent_pushes([str(work)]) == [(str(remote), "feature/signed")]
+    assert not marker.exists()
