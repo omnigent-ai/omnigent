@@ -676,8 +676,9 @@ def build_token_secret_manifest(
 
     The token rides this Secret (referenced by the Pod's ``secretKeyRef``)
     instead of the Pod spec, so it never lands in an audit-logged surface. The
-    Secret is labeled like its Pod for GC and deleted alongside it by
-    :meth:`KubernetesSandboxLauncher.terminate`. It carries only the
+    Secret is labeled like its Pod for GC, deleted alongside it by
+    :meth:`KubernetesSandboxLauncher.terminate`, and owned by the workload once
+    it exists (:meth:`KubernetesSandboxLauncher._adopt_token_secret`). It carries only the
     ``managed-by``/``role`` GC pair — the ``omnigent.ai/agent`` classifier is
     stamped on the Pod alone, since it is an admission selector, not a GC one.
 
@@ -1050,6 +1051,35 @@ def build_job_manifest(
             },
         },
     }
+
+
+def owner_reference(api_version: str, kind: str, obj: object) -> dict[str, object] | None:
+    """
+    Build an ``ownerReferences`` entry for an object the apiserver just returned.
+
+    Accepts both shapes the client hands back: a typed model (``V1Job``,
+    attribute access) and a plain dict (custom objects). ``blockOwnerDeletion``
+    and ``controller`` are left unset on purpose: setting ``blockOwnerDeletion``
+    needs ``update`` on the owner's ``finalizers`` subresource, which the
+    sandbox Role does not grant, and the Secret only needs to be *collected*
+    with its owner, not to gate the owner's deletion.
+
+    :param api_version: The owner's ``apiVersion`` (e.g. ``"batch/v1"``).
+    :param kind: The owner's ``kind`` (e.g. ``"Job"``).
+    :param obj: The created/patched object as returned by the client.
+    :returns: The owner reference, or ``None`` when ``obj`` carries no
+        ``metadata.name``/``metadata.uid`` (nothing to own the Secret).
+    """
+    metadata = obj.get("metadata") if isinstance(obj, Mapping) else getattr(obj, "metadata", None)
+    if metadata is None:
+        return None
+    if isinstance(metadata, Mapping):
+        name, uid = metadata.get("name"), metadata.get("uid")
+    else:
+        name, uid = getattr(metadata, "name", None), getattr(metadata, "uid", None)
+    if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+        return None
+    return {"apiVersion": api_version, "kind": kind, "name": name, "uid": uid}
 
 
 def _api_reason(exc: Exception) -> str:
@@ -1614,7 +1644,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                     ),
                     _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
                 )
-                self._create_workload(namespace, manifest)
+                owner = self._create_workload(namespace, manifest)
             except (ApiException, HTTPError) as exc:
                 self._best_effort_delete(namespace, sandbox_id, secret_name)
                 if isinstance(exc, ApiException):
@@ -1624,6 +1654,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 raise click.ClickException(
                     f"timed out creating Kubernetes job '{sandbox_id}' ({_api_reason(exc)})"
                 ) from exc
+            if owner is not None:
+                self._adopt_token_secret(namespace, secret_name, owner)
 
             try:
                 self._wait_for_pod_running(namespace, sandbox_id)
@@ -1637,7 +1669,9 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         # workspace root that parents every clone.
         return f"{workspace}/{repos[0].repo_name}" if len(repos) == 1 else workspace
 
-    def _create_workload(self, namespace: str, manifest: dict[str, object]) -> None:
+    def _create_workload(
+        self, namespace: str, manifest: dict[str, object]
+    ) -> dict[str, object] | None:
         """
         Create the object that runs the sandbox host from a Job manifest.
 
@@ -1647,12 +1681,66 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
 
         :param namespace: Namespace to create the object in.
         :param manifest: The manifest from :func:`build_job_manifest`.
+        :returns: An owner reference to the created object (see
+            :func:`owner_reference`), or ``None`` when the response carries no
+            uid.
         """
-        self._load_batch().create_namespaced_job(
+        job = self._load_batch().create_namespaced_job(
             namespace,
             cast("k8s_client.V1Job", manifest),
             _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
         )
+        return owner_reference("batch/v1", "Job", job)
+
+    def _adopt_token_secret(
+        self, namespace: str, secret_name: str, owner: dict[str, object]
+    ) -> None:
+        """
+        Make the workload own its token Secret, so Kubernetes collects them together.
+
+        The Secret has to exist before the workload (the Pod's ``secretKeyRef``
+        must resolve on first start), so it cannot carry the owner at creation;
+        it is patched on right after. Without this the Secret outlives any
+        workload that ends without :meth:`terminate` — a Job that reaches
+        ``activeDeadlineSeconds`` or fails is removed by
+        ``ttlSecondsAfterFinished`` and strands its Secret forever, eventually
+        exhausting a namespace ``count/secrets`` quota so that every new
+        launch fails with ``403 exceeded quota``.
+
+        Best effort: a failure here (most likely a Role without ``patch`` on
+        ``secrets``) is logged and the launch continues — the Secret is still
+        deleted by :meth:`terminate`, exactly as before.
+
+        :param namespace: Namespace of the Secret and its owner.
+        :param secret_name: The token Secret to adopt.
+        :param owner: The owner reference from :meth:`_create_workload`.
+        """
+        from kubernetes.client.rest import ApiException
+        from urllib3.exceptions import HTTPError
+
+        try:
+            self._load_core().patch_namespaced_secret(
+                secret_name,
+                namespace,
+                {"metadata": {"ownerReferences": [owner]}},
+                _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+            )
+        except (ApiException, HTTPError) as exc:
+            hint = (
+                " (grant `patch` on `secrets` to the server's sandbox Role)"
+                if getattr(exc, "status", None) == 403
+                else ""
+            )
+            _logger.warning(
+                "could not set owner %s/%s on token Secret %s/%s: %s%s; "
+                "it will be removed only by terminate()",
+                owner.get("kind"),
+                owner.get("name"),
+                namespace,
+                secret_name,
+                _api_reason(exc),
+                hint,
+            )
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:
         """
