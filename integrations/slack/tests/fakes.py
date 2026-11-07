@@ -27,6 +27,8 @@ from typing import Any
 import httpx
 import respx
 from omnigent_slack.omnigent import ClientAuth
+from slack_sdk.errors import SlackApiError
+from slack_sdk.web.async_slack_response import AsyncSlackResponse
 
 # The placeholder text the bot posts as its "Working on it…" ack. Kept in sync
 # with the service module so a recorded ack is recognizable.
@@ -52,12 +54,19 @@ class FakeStream:
         self.appended: list[str] = []
         self.stopped = False
         self.stop_text: str | None = None
+        # Extra ``chat.stopStream`` arguments, e.g. the agent ``session_status``.
+        self.stop_kwargs: dict[str, Any] = {}
+        # Set when Slack stopped the message itself (the agent stop button):
+        # further calls fail as they do on a finalized streaming message.
+        self.stopped_by_slack = False
         self._buffer_size = 256
         self._pending = 0
 
     async def append(
         self, *, markdown_text: str | None = None, chunks: Any = None
     ) -> dict[str, Any] | None:
+        if self.stopped_by_slack:
+            raise slack_api_error("chat.appendStream", "message_not_in_streaming_state")
         if markdown_text is not None:
             self.appended.append(markdown_text)
             self._pending += len(markdown_text)
@@ -68,15 +77,34 @@ class FakeStream:
         self._pending = 0
         return {"ok": True}
 
-    async def stop(self, *, markdown_text: str | None = None) -> dict[str, Any]:
+    async def stop(self, *, markdown_text: str | None = None, **kwargs: Any) -> dict[str, Any]:
+        if self.stopped_by_slack:
+            raise slack_api_error("chat.stopStream", "message_not_in_streaming_state")
         self.stopped = True
         self.stop_text = markdown_text
+        self.stop_kwargs = kwargs
         return {"ok": True}
 
     @property
     def text(self) -> str:
         """The full delivered message: streamed deltas plus any stop tail."""
         return "".join(self.appended) + (self.stop_text or "")
+
+
+def slack_api_error(api_method: str, error: str) -> SlackApiError:
+    """The ``SlackApiError`` the SDK raises when Slack answers ``ok: false``."""
+    return SlackApiError(
+        error,
+        AsyncSlackResponse(  # type: ignore[arg-type]
+            client=None,
+            http_verb="POST",
+            api_url=f"https://slack.com/api/{api_method}",
+            req_args={},
+            data={"ok": False, "error": error},
+            headers={},
+            status_code=200,
+        ),
+    )
 
 
 class RecordingSlackClient:
@@ -96,6 +124,10 @@ class RecordingSlackClient:
         self.opened_views: list[dict[str, Any]] = []
         self.updated_views: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
+        # Generic Web-API calls (agent sessions): (method, JSON body).
+        self.api_calls: list[tuple[str, dict[str, Any]]] = []
+        # When set, every ``api_call`` fails with this Slack error code.
+        self.api_call_error: str | None = None
         self._next_ts = 0
 
     # ── turn path ────────────────────────────────────────────────────────
@@ -138,6 +170,12 @@ class RecordingSlackClient:
         stream = FakeStream(self, kwargs)
         self.streams.append(stream)
         return stream
+
+    async def api_call(self, api_method: str, *, json: dict[str, Any] | None = None) -> Any:
+        self.api_calls.append((api_method, dict(json or {})))
+        if self.api_call_error is not None:
+            raise slack_api_error(api_method, self.api_call_error)
+        return {"ok": True}
 
     # ── setup path ───────────────────────────────────────────────────────
     async def views_open(self, **kwargs: Any) -> dict[str, Any]:

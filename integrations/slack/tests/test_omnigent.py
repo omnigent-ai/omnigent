@@ -153,6 +153,22 @@ async def test_client_create_and_submit_request_shapes() -> None:
 
 
 @respx.mock
+async def test_interrupt_posts_the_interrupt_event() -> None:
+    # Slack's stop button cancels the session's turn as the web UI's stop does.
+    route = respx.post("http://omnigent.test/v1/sessions/conv_1/events").mock(
+        return_value=httpx.Response(200, json={"queued": False})
+    )
+    client = OmnigentClient("http://omnigent.test")
+
+    try:
+        await client.interrupt("conv_1")
+    finally:
+        await client.aclose()
+
+    assert route.calls.last.request.read() == b'{"type":"interrupt","data":{}}'
+
+
+@respx.mock
 async def test_create_session_managed_asks_the_server_to_provision_a_host() -> None:
     # A managed session sends ONLY the host_type switch: the server picks the
     # sandbox's host and workspace, and 422s a caller that supplies either.

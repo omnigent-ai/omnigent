@@ -62,6 +62,7 @@ required for the bot's core behaviour:
 | `commands` | Register and receive the `/omnigent` slash command. |
 | `team:read` | Read the workspace name (`team.info`) to label the delegated-login request. |
 | `users:read`, `users:read.email` | Read the user's email (`users.info`) — **required only for Databricks web-auth mode**, where it's signed into the enrollment link and matched against the OAuth-authenticated email to bind the token to the right person. Omit for `accounts`/`oidc` mode. |
+| `assistant:write` | Given by Slack to an app declared an agent — **only for [agent sessions](#agent-sessions-optional)**. |
 
 **Channel history — add per channel type where the bot will run.** These back
 the plain-`message` event; add only the ones matching where you'll use the bot:
@@ -89,6 +90,7 @@ Under **Event Subscriptions → Subscribe to bot events**, add:
 - `message.im` (DMs)
 - `message.channels` / `message.groups` / `message.mpim` — only for the channel
   types whose history scope you added above.
+- `agent_session_stopped` — only for [agent sessions](#agent-sessions-optional).
 
 
 
@@ -113,7 +115,7 @@ while it's already up is a no-op that reports the existing process.
 
 All configuration (the two Slack tokens, `OMNIGENT_SERVER_URL`, and the
 optional `OMNIGENT_DEVICE_CLIENT_SECRET` / `OMNIGENT_SLACK_TOKEN_ENCRYPTION_KEY`
-/ the setup defaults below) comes from **real environment variables** — the bot does **not** read a `.env`
+/ the setup defaults below / `OMNIGENT_SLACK_AGENT_SESSIONS`) comes from **real environment variables** — the bot does **not** read a `.env`
 file itself. For local dev, either export the vars, or launch under a tool that
 injects a `.env` — e.g. `uv run --env-file .env omni integration slack`, or
 `export $(grep -v '^#' .env | xargs)` before running. In production the
@@ -355,6 +357,43 @@ For the full set of user-facing behaviours — setup, DM vs channel routing,
 ownership, and error handling — see **[docs/CUJS.md](docs/CUJS.md)**. The
 under-the-hood details (streaming, turn-end detection, elicitation handling,
 concurrency, ordering) live in the module docstrings and inline comments.
+
+## Agent sessions (optional)
+
+Slack can show the bot as an **agent**: each thread it answers becomes a
+session in the user's list of agent sessions, with a title, a status, and a
+stop button. This is off by default. To turn it on:
+
+1. In [`deploy/slack-app-manifest.yaml`](deploy/slack-app-manifest.yaml),
+   uncomment the lines marked *Agent sessions ONLY*: `agent_view`, the
+   `assistant:write` scope, and the `agent_session_stopped` event. Update the
+   app's manifest and reinstall the app for the new scope; a workspace that
+   needs approval for installs asks an admin again.
+2. Set `OMNIGENT_SLACK_AGENT_SESSIONS=true` in the bot's environment.
+
+Each turn then sets its thread's session status:
+
+| When | Status |
+| --- | --- |
+| A turn starts | `processing`: Slack shows "Working…" and the stop button. A new session is titled from the message that started it, and its author is the initiator. |
+| An approval or question card waits | `suspended` |
+| The card is answered | `processing` |
+| The turn ends, errors included | `active` |
+
+The stop button belongs to the thread's owner, like the thread itself. When
+the owner clicks it, the bot cancels its turn, asks the server to interrupt
+the session, and replies "Stopped." in the thread. A click from anyone else
+stops nothing: they get a private note, and the reply carries on.
+
+Every session call is best-effort. A workspace without agent sessions answers
+`feature_disabled`; the bot logs a warning and the turn goes on as before.
+
+Before declaring the app an agent:
+
+- Slack documents no way to undo the declaration. Try it on a test app first.
+- Slack says guests can't use agents.
+- The bot does not handle `app_context_changed`, does not sync a title someone
+  renames in Slack, and never closes a session.
 
 ## Development
 
