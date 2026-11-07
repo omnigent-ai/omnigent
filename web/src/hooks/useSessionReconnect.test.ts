@@ -1,3 +1,4 @@
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
@@ -45,7 +46,10 @@ vi.mock("@/lib/nativeBridge", () => ({
   isElectronShell: vi.fn(),
   supportsArcaConnect: vi.fn(),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ retrySession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  retrySession: vi.fn(),
+}));
 vi.mock("sonner", () => ({
   toast: { loading: vi.fn(() => "progress"), success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
 }));
