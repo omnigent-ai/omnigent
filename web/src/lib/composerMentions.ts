@@ -156,15 +156,15 @@ export interface SessionMention {
 }
 
 /**
- * One line telling the agent how to act on tagged sessions. It rides in the
+ * One line telling the agent how to act on tagged sessions. Parsers key on
+ * the ``[Tagged sessions:`` prefix only, so the wording can be tuned freely. It rides in the
  * message itself because native TUI harnesses never see framework prompt
  * text. Keep in sync with ``_SESSION_MENTION_LINE_RE`` in
  * ``omnigent/entities/conversation.py``.
  */
 export const SESSION_MENTION_HINT =
-  "[Tagged sessions are Omnigent sessions: read them with sys_session_get_info and " +
-  "sys_session_get_history; message a subagent with sys_session_send and any other " +
-  "session with sys_session_message]";
+  "[Tagged sessions: read with sys_session_get_history; message a subagent with " +
+  "sys_session_send, any other session with sys_session_message]";
 
 // Characters that would break the bracketed, quoted marker shape.
 const SESSION_TITLE_UNSAFE_RE = /["[\]\r\n]+/g;
@@ -179,7 +179,7 @@ export function sessionMentionMarker(session: SessionMention): string {
 // their trailing line breaks, so a sent bubble can show chips instead.
 const SESSION_MARKER_RE =
   /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\][ \t]*(?:\r?\n)*/g;
-const SESSION_HINT_LINE_RE = /\[Tagged sessions are Omnigent sessions:[^\]]*\][ \t]*(?:\r?\n)*/g;
+const SESSION_HINT_LINE_RE = /\[Tagged sessions:[^\]]*\][ \t]*(?:\r?\n)*/g;
 
 /** Sessions tagged in a sent message's text, in marker order. */
 export function extractSessionMentions(text: string): SessionMention[] {

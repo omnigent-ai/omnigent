@@ -141,6 +141,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
 }));
 
 import { Composer, detectMentionAt, mentionMarkerFor } from "./ChatPage";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 
 function composerProps(overrides: Partial<Parameters<typeof Composer>[0]> = {}) {
   return {
@@ -615,9 +616,7 @@ describe("Composer @-session mentions", () => {
     expect(onSend).toHaveBeenCalledWith(
       '[Session: "auth" id=s_child subagent=yes]\n' +
         '[Session: "Alpha planning" id=s_alpha subagent=no]\n' +
-        "[Tagged sessions are Omnigent sessions: read them with sys_session_get_info and " +
-        "sys_session_get_history; message a subagent with sys_session_send and any other " +
-        "session with sys_session_message]\n\nsummarize both",
+        `${SESSION_MENTION_HINT}\n\nsummarize both`,
       undefined,
     );
   });

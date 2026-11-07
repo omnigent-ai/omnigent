@@ -10497,7 +10497,7 @@ describe("NewChatLandingScreen @-file-mention", () => {
     await waitFor(() => expect(setPendingInitialPromptMock).toHaveBeenCalled());
     const [, payload] = setPendingInitialPromptMock.mock.calls[0]!;
     expect((payload as { text: string }).text).toMatch(
-      /^\[Session: "Alpha planning" id=s_alpha subagent=no\]\n\[Tagged sessions [^\]]*\]\n\ncontinue it$/,
+      /^\[Session: "Alpha planning" id=s_alpha subagent=no\]\n\[Tagged sessions:[^\]]*\]\n\ncontinue it$/,
     );
   });
 

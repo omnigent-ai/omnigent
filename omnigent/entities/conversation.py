@@ -34,9 +34,21 @@ _ATTACHMENT_MARKER_RE = re.compile(
 # session plus a tool hint. Keep in sync with sessionMentionMarker and
 # SESSION_MENTION_HINT in web/src/lib/composerMentions.ts.
 _SESSION_MENTION_LINE_RE = re.compile(
-    r'^(?:\[Session: ".*" id=\S+ subagent=(?:yes|no)\]'
-    r"|\[Tagged sessions are Omnigent sessions:[^\]]*\])$"
+    r'^(?:\[Session: ".*" id=\S+ subagent=(?:yes|no)\]|\[Tagged sessions:[^\]]*\])$'
 )
+
+
+def strip_session_mention_lines(text: str) -> str:
+    """
+    Drop the composer's tagged-session marker and hint lines from ``text``.
+
+    :param text: Message text, e.g. ``'[Session: "Fix CI" id=s1 subagent=no]\\nhi'``.
+    :returns: The remaining lines, e.g. ``"hi"``.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not _SESSION_MENTION_LINE_RE.match(line.strip())
+    )
+
 
 # Generated titles stay compact by default, while explicit user formats and
 # manually assigned titles have room for structured identifiers.
@@ -416,9 +428,8 @@ def synthesize_conversation_title(
             if isinstance(text, str):
                 kept_lines = [
                     line
-                    for line in text.splitlines()
+                    for line in strip_session_mention_lines(text).splitlines()
                     if not _ATTACHMENT_MARKER_RE.match(line.strip())
-                    and not _SESSION_MENTION_LINE_RE.match(line.strip())
                 ]
                 parts.append("\n".join(kept_lines))
     collapsed = " ".join(" ".join(parts).split())
