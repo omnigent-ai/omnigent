@@ -30,6 +30,7 @@ _DELIVERED = [
         "path": "/hook/observe-tool",
         "authorization": f"Bearer {_TOKEN}",
         "content_type": "application/json",
+        "expect": None,
         "body": _PAYLOAD.encode(),
     }
 ]
@@ -49,6 +50,7 @@ def _recording_server() -> Iterator[tuple[str, list[dict[str, object]]]]:
                     "path": self.path,
                     "authorization": self.headers.get("Authorization"),
                     "content_type": self.headers.get("Content-Type"),
+                    "expect": self.headers.get("Expect"),
                     "body": self.rfile.read(int(self.headers.get("Content-Length", "0"))),
                 }
             )
@@ -129,11 +131,13 @@ def _wrapped(command: str) -> str:
     return f"env OMNIGENT_TEST_WRAPPED=1 {command}"
 
 
-def _run(command: object, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: object, env: dict[str, str] | None = None, payload: str = _PAYLOAD
+) -> subprocess.CompletedProcess[str]:
     """Run a hook command as the harnesses do: through a shell, payload on stdin."""
     return subprocess.run(
         ["/bin/sh", "-c", str(command)],
-        input=_PAYLOAD,
+        input=payload,
         capture_output=True,
         text=True,
         timeout=10,
@@ -183,6 +187,28 @@ def test_posts_the_event_directly_when_all_proxy_is_set(
     assert result.returncode == 0, result.stderr
     assert received == _DELIVERED
     assert proxied == []
+
+
+@requires_curl
+def test_posts_a_large_event_without_waiting_for_100_continue(
+    tmp_path: Path, relay: tuple[str, list[dict[str, object]]]
+) -> None:
+    """curl holds a large body for a ``100 Continue`` that the relay never sends.
+
+    curl 7.68 and older wait like that for bodies over 1 KiB, newer curl over
+    1 MiB, so this body is over both. The one-second wait used up the hook's
+    whole ``--max-time`` and the event never arrived.
+    """
+    url, received = relay
+    _write_relay_env(tmp_path, url)
+    payload = json.dumps({**json.loads(_PAYLOAD), "tool_response": "x" * (1 << 20)})
+    hook = hook_settings(tmp_path, str(tmp_path / "unused-python"), _POLICY_HOOK_MODULE)
+
+    result = _run(hook["command"], payload=payload)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stderr == ""
+    assert received == [{**_DELIVERED[0], "body": payload.encode()}]
 
 
 def test_runs_the_hook_module_until_the_relay_writes_its_env_file(tmp_path: Path) -> None:

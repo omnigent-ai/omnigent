@@ -12,8 +12,10 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal
 
+from cachetools import LRUCache
+
 from omnigent.db.db_models import workspace_scope
-from omnigent.debug_logging import debug_event
+from omnigent.debug_logging import current_session_id_scope, debug_event, log_attributes_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
@@ -23,6 +25,11 @@ from omnigent.server.scheduled.schedule import (
     next_scheduled_time,
     occurrence_host_id,
     scheduled_trigger_key,
+)
+from omnigent.server.scheduled.telemetry import (
+    run_log_context,
+    scheduled_run_scope,
+    startup_failure_stage,
 )
 from omnigent.stores.scheduled_task_store.dispatch import (
     DeletedTaskCursor,
@@ -34,6 +41,16 @@ from omnigent.stores.scheduled_task_store.dispatch import (
 _logger = logging.getLogger(__name__)
 
 
+def _run_attributes(run: ScheduledTaskRun) -> dict[str, object]:
+    return {
+        "task_id": run.scheduled_task_id,
+        "run_id": run.id,
+        "task_workspace_id": run.workspace_id,
+        "scheduled_at": run.scheduled_at,
+        "trigger_key": run.trigger_key,
+    }
+
+
 def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> dict[str, object]:
     """Structured debug-log event for one scheduled run, keyed by its session when known."""
     return debug_event(
@@ -42,10 +59,7 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
         # Explicit so a clashing attribute raises and type checks don't match **attributes.
         turn_id=None,
         user_id=None,
-        task_id=run.scheduled_task_id,
-        run_id=run.id,
-        task_workspace_id=run.workspace_id,
-        scheduled_at=run.scheduled_at,
+        **_run_attributes(run),
         **attributes,
     )
 
@@ -122,6 +136,11 @@ def _claim_failure_event(task: ScheduledTask) -> dict[str, object]:
         operation="claim",
         task_id=task.id,
         task_workspace_id=task.workspace_id,
+        scheduled_at=task.next_run_at,
+        trigger_key=scheduled_trigger_key(task.next_run_at)
+        if task.next_run_at is not None
+        else None,
+        failure_stage="claim",
     )
 
 
@@ -192,6 +211,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        failure_stage: str | None = None,
     ) -> None:
         """Record prompt delivery or a known startup failure, with a live lease.
 
@@ -219,6 +239,8 @@ class StartupLease:
                     target=self._target,
                     outcome=status,
                     error_code=error_code,
+                    failure_stage=failure_stage or startup_failure_stage(error_code),
+                    startup_delay_seconds=_seconds(finished_at - self.run.scheduled_at),
                     prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
                     if status in ("running", "succeeded")
                     else None,
@@ -431,6 +453,7 @@ class PersistentTaskScheduler:
         self._loop: asyncio.Task[None] | None = None
         self._recovery: asyncio.Task[None] | None = None
         self._startups: dict[tuple[int, str], asyncio.Task[None]] = {}
+        self._last_observed_due: LRUCache[tuple[int, str], int] = LRUCache(maxsize=4096)
         self._poll_lock = asyncio.Lock()
         self._stopped = False
         self._initialization_cursor: TaskCursor | None = None
@@ -630,7 +653,12 @@ class PersistentTaskScheduler:
 
     async def _validate_schedule(self, task: ScheduledTask) -> bool:
         try:
-            await asyncio.to_thread(validate_rrule, task.rrule)
+            await asyncio.to_thread(
+                validate_rrule,
+                task.rrule,
+                session_mode=task.session_mode,
+                execution_target=task.execution_target,
+            )
         except RRuleSearchError:
             raise
         except RRuleValidationError:
@@ -687,7 +715,11 @@ class PersistentTaskScheduler:
                         if local is not None:
                             local.cancel()
                             await asyncio.gather(local, return_exceptions=True)
-                        with workspace_scope(run.workspace_id):
+                        with (
+                            workspace_scope(run.workspace_id),
+                            log_attributes_scope(**_run_attributes(run)),
+                            current_session_id_scope(run.conversation_id),
+                        ):
                             status = await self._on_expired(run)
                             if status is None:
                                 _log_event(
@@ -780,6 +812,27 @@ class PersistentTaskScheduler:
                 if self._stopped:
                     return
                 assert task.next_run_at is not None
+                observation_key = (task.workspace_id, task.id)
+                if self._last_observed_due.get(observation_key) != task.next_run_at:
+                    self._last_observed_due[observation_key] = task.next_run_at
+                    _log_event(
+                        _logger.info,
+                        "Observed due occurrence %s of task %s",
+                        task.next_run_at,
+                        task.id,
+                        extra=debug_event(
+                            "scheduled_run_occurrence_observed",
+                            task_id=task.id,
+                            task_workspace_id=task.workspace_id,
+                            scheduled_at=task.next_run_at,
+                            trigger_key=scheduled_trigger_key(task.next_run_at),
+                            target=task.execution_target,
+                            observed_at=cutoff,
+                            rrule=task.rrule,
+                            timezone=task.timezone,
+                            schedule_anchor=task.created_at,
+                        ),
+                    )
                 try:
                     if await self._validate_schedule(task):
                         host_id = occurrence_host_id(task, scheduled_trigger_key(task.next_run_at))
@@ -800,6 +853,20 @@ class PersistentTaskScheduler:
                 assert task.next_run_at is not None
                 try:
                     now = int(self._now())
+                    _log_event(
+                        _logger.info,
+                        "Attempting occurrence %s of task %s",
+                        task.next_run_at,
+                        task.id,
+                        extra=debug_event(
+                            "scheduled_run_claim_attempted",
+                            task_id=task.id,
+                            task_workspace_id=task.workspace_id,
+                            scheduled_at=task.next_run_at,
+                            trigger_key=scheduled_trigger_key(task.next_run_at),
+                            target=task.execution_target,
+                        ),
+                    )
                     next_run = await asyncio.to_thread(next_scheduled_time, task, now)
                     if self._stopped:
                         return
@@ -824,6 +891,7 @@ class PersistentTaskScheduler:
                                 task_id=task.id,
                                 task_workspace_id=task.workspace_id,
                                 scheduled_at=task.next_run_at,
+                                trigger_key=scheduled_trigger_key(task.next_run_at),
                                 target=task.execution_target,
                             ),
                         )
@@ -882,7 +950,10 @@ class PersistentTaskScheduler:
         )
         # Logged only if startup ends without a final status from the executor.
         outcome = "unfinished"
-        with workspace_scope(run.workspace_id):
+        with (
+            workspace_scope(run.workspace_id),
+            scheduled_run_scope(run_log_context(task, run)),
+        ):
             fire = asyncio.create_task(self._fire(task, lease))
             heartbeat = asyncio.create_task(self._heartbeat(lease))
             try:

@@ -48,4 +48,18 @@ describe("SidebarHeaderActions shortcut hints", () => {
       Array.from(content.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
     ).toEqual(keys);
   });
+
+  it("omits Search when the Electron brand row owns it", () => {
+    render(
+      <MemoryRouter>
+        <TooltipProvider>
+          <SidebarHeaderActions expanded showSearch={false} onToggle={vi.fn()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByLabelText("Search")).toBeNull();
+    expect(screen.getByLabelText("Settings")).toBeInTheDocument();
+    expect(screen.getByLabelText("Close sidebar")).toBeInTheDocument();
+  });
 });

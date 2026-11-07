@@ -16,10 +16,11 @@ import pathlib
 import re
 import sys
 import tempfile
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
     BlockContext,
@@ -37,6 +38,7 @@ from omnigent_client import (
     ToolGroup,
     ToolHandler,
     ToolResultBlock,
+    child_summary_busy,
     format_tool_args_brief,
 )
 from omnigent_ui_sdk import (
@@ -237,6 +239,14 @@ _LIST_ITEMS_PAGE_SIZE = 100
 # Full re-walks allowed when a page cursor's item is deleted mid-enumeration
 # before the overlay settles for whatever it managed to fetch.
 _LIST_ITEMS_MAX_RESTARTS = 3
+# How long the Ctrl+O overview reuses earlier pages before walking every page
+# again, so an edit to an older item still shows up.
+_OVERVIEW_FULL_REFRESH_SECONDS = 30.0
+
+# Turn-completion backstop: the stream normally ends a turn, so the snapshot is
+# checked after the first second and then less often.
+_TURN_BACKSTOP_FIRST_SECONDS = 1.0
+_TURN_BACKSTOP_MAX_SECONDS = 5.0
 
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
@@ -244,6 +254,14 @@ _LIST_ITEMS_MAX_RESTARTS = 3
 # session's direct children) while sub-agents are active.
 _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
+# The poll doubles its wait after each fetch that changed nothing (or failed),
+# up to this cap, and snaps back to _SUBAGENT_POLL_SECONDS on any change, any
+# child-session event, or user input.
+_SUBAGENT_POLL_MAX_SECONDS = 10.0
+# Fetches skip the children of subtrees that have settled. While the poll runs
+# (see _should_discover_subagents), a periodic full walk still catches a
+# settled grandchild that resumed without an event the REPL can see.
+_SUBAGENT_FULL_SWEEP_SECONDS = 60.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -1937,7 +1955,7 @@ class _SessionsChatReplAdapter:
         """
         Apply a pre-session ``/model`` pick to a freshly created session.
 
-        Neither create route carries a ``model_override`` field, so a
+        The adapter's create request does not carry the pending pick, so a
         ``/model`` typed before the first turn has to be PATCHed after
         create for the first event to pick it up via
         ``conv.model_override``. ``silent`` skips the tmux ``/model``
@@ -2425,6 +2443,34 @@ class _SessionsChatReplAdapter:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
 
+    async def _wait_for_turn_done(self, session_id: str) -> None:
+        """Wait for the in-flight turn, checking the snapshot as a backstop.
+
+        The stream pump sets ``_turn_done`` on the terminal status event. If the
+        subscription missed it, the snapshot's status settles the turn: checked
+        after the first second, then with a growing interval, since a missed
+        event is caught by the early checks and later ones only cost requests.
+
+        :param session_id: Session whose turn is in flight.
+        """
+        interval = _TURN_BACKSTOP_FIRST_SECONDS
+        while not self._turn_done.is_set():
+            try:
+                # Event.wait() is cancellation-safe (its finally block removes
+                # the waiter from Event._waiters), so no asyncio.shield() is
+                # needed — shield leaks orphaned Tasks on each timeout iteration.
+                await asyncio.wait_for(self._turn_done.wait(), timeout=interval)
+            except TimeoutError:
+                snap = await self._client.sessions.get(
+                    session_id,
+                    include_items=False,
+                    include_liveness=False,
+                    include_usage=False,
+                )
+                if snap.status in ("idle", "failed"):
+                    self._turn_done.set()
+                interval = min(interval * 2, _TURN_BACKSTOP_MAX_SECONDS)
+
     async def send(
         self,
         input: str | list[dict[str, object]],
@@ -2518,21 +2564,7 @@ class _SessionsChatReplAdapter:
             # flush streaming body chunks eagerly, so the pump's
             # SSE subscription may not be active when the workflow
             # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot every second as a backstop.
-            while not self._turn_done.is_set():
-                try:
-                    # Event.wait() is cancellation-safe (its finally block
-                    # removes the waiter from Event._waiters), so no
-                    # asyncio.shield() is needed — shield leaks orphaned
-                    # Tasks on each timeout iteration.
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._wait_for_turn_done(session_id)
             # Yield a terminal event so callers iterating send()
             # observe completion. Rendering already happened via
             # _on_event.
@@ -2603,16 +2635,7 @@ class _SessionsChatReplAdapter:
                     flush=True,
                 )
             await self._client.sessions.post_event(session_id, event_payload)
-            while not self._turn_done.is_set():
-                try:
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._wait_for_turn_done(session_id)
             from omnigent_client._events import ResponseCompleted
             from omnigent_client._types import Response as SDKResponse
 
@@ -3594,6 +3617,13 @@ async def run_repl(
         _background_event_tasks.add(_refresh_task)
         _refresh_task.add_done_callback(_background_event_tasks.discard)
 
+    # Wakes the sub-agent poll early and resets its backoff. Set by child-session
+    # stream events and by user input; ``subagent_force_expand`` collects parents
+    # whose children an event says changed, so the next fetch re-reads them even
+    # if their subtree had settled.
+    subagent_poll_wake = asyncio.Event()
+    subagent_force_expand: set[str] = set()
+
     def _render_session_event(event: object) -> None:
         """Push-based renderer for all session stream events.
 
@@ -3789,6 +3819,12 @@ async def run_repl(
             active_conversation_id=session.session_id,
             host=host,
         ):
+            # A relayed event about a deeper level names its parent as the
+            # carrier: re-read that parent's children on the woken fetch.
+            carrier = getattr(event, "conversation_id", None)
+            if isinstance(carrier, str) and carrier != session.session_id:
+                subagent_force_expand.add(carrier)
+            subagent_poll_wake.set()
             if tape_entry is not None:
                 _event_tape.update_translation(tape_entry, event)  # type: ignore[union-attr]
                 _maybe_log_tape_entry(tape_entry)
@@ -4199,6 +4235,9 @@ async def run_repl(
 
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
+        # Input can restart a settled sub-agent (e.g. chatting with a finished
+        # child), so refresh the tree at the fast cadence again.
+        subagent_poll_wake.set()
 
         # Pending schema field input: consume this line as the
         # current field's value before any other routing.
@@ -4435,6 +4474,10 @@ async def run_repl(
     # Warp) and prompt-toolkit binds it cleanly.
     from omnigent_ui_sdk import Overlay
 
+    # Items the Ctrl+O overview already fetched, per conversation, so each
+    # refresh tick re-reads only the newest page instead of the whole history.
+    overview_items_cache: dict[str, _OverviewItems] = {}
+
     async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
         from omnigent.cli_diagnostics import current_cli_log_path
 
@@ -4442,6 +4485,7 @@ async def run_repl(
             return Text.from_markup("[dim]No debug target available.[/dim]")
         return await _build_debug_overview(
             target,
+            items_cache=overview_items_cache,
             client=client,
             session=session,
             agent_name=agent_name,
@@ -4537,14 +4581,28 @@ async def run_repl(
         if not observing_child and session.session_id is not None:
             subagent_root[0] = session.session_id
 
-    async def _refresh_subagents() -> None:
+    async def _refresh_subagents(*, expand_all: bool) -> str | None:
         root_id = subagent_root[0]
         if root_id is None:
-            return
+            return None
+        # Re-read the ancestors of a sub-agent the user is viewing, so its own
+        # row stays fresh even when the branch above it has settled.
+        viewed = session.session_id if session.session_id != root_id else None
+        force = set(subagent_force_expand) | {root_id}
+        if viewed is not None:
+            force |= host.subagent_ancestors(viewed)
+        subagent_force_expand.clear()
         # Capture the generation BEFORE the fetch so a clear-during-poll
         # (``/switch`` / ``/new`` / ``/clear`` re-rooting mid-fetch) makes the
         # resulting seed a no-op instead of resurrecting cleared nodes.
-        await _refresh_subagent_tree(client, host, root_id, generation=host.subagent_generation)
+        return await _refresh_subagent_tree(
+            client,
+            host,
+            root_id,
+            generation=host.subagent_generation,
+            expand_all=expand_all,
+            force_expand=force,
+        )
 
     async def _subagent_poll_loop() -> None:
         # Periodically re-fetch the tree so nested (grandchild) levels + live
@@ -4560,6 +4618,16 @@ async def run_repl(
         # sub-agent's status no longer changes, so polling retained-but-terminal
         # nodes forever is pure waste; a child that later resumes re-arms the
         # poll via the active stream's ``session.child_session.updated``.
+        #
+        # Each fetch skips settled subtrees, and the wait between fetches backs
+        # off while nothing changes; see _SUBAGENT_POLL_MAX_SECONDS.
+        delay = _SUBAGENT_POLL_SECONDS
+        # Keyed by full_sweep: a full walk returns rows a partial fetch skips, so
+        # only fetches of the same kind are comparable.
+        last_fingerprint: dict[bool, str] = {}
+        last_full_sweep = 0.0
+        last_fetch = 0.0
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 _sync_subagent_root()
@@ -4573,13 +4641,41 @@ async def run_repl(
                     observing_subagent=observing_subagent,
                     last_polled_root=polled_root[0],
                 ):
-                    await _refresh_subagents()
+                    root_changed = polled_root[0] != root_id
+                    last_fetch = loop.time()
+                    full_sweep = (
+                        root_changed
+                        or loop.time() - last_full_sweep >= _SUBAGENT_FULL_SWEEP_SECONDS
+                    )
+                    fingerprint = await _refresh_subagents(expand_all=full_sweep)
                     polled_root[0] = root_id
+                    if full_sweep and fingerprint is not None:
+                        last_full_sweep = loop.time()
+                    changed = fingerprint is not None and (
+                        root_changed
+                        or fingerprint != last_fingerprint.get(full_sweep, fingerprint)
+                    )
+                    delay = _next_subagent_poll_delay(delay, changed=changed)
+                    if root_changed:
+                        last_fingerprint.clear()
+                    if fingerprint is not None:
+                        last_fingerprint[full_sweep] = fingerprint
+                else:
+                    delay = _SUBAGENT_POLL_SECONDS
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
+                delay = _next_subagent_poll_delay(delay, changed=False)
+            try:
+                await asyncio.wait_for(subagent_poll_wake.wait(), timeout=delay)
+            except TimeoutError:
                 pass
-            await asyncio.sleep(_SUBAGENT_POLL_SECONDS)
+            else:
+                # A wake resets the backoff but never fetches more often than
+                # the base cadence, so a burst of events costs one fetch.
+                delay = _SUBAGENT_POLL_SECONDS
+                await asyncio.sleep(max(0.0, last_fetch + _SUBAGENT_POLL_SECONDS - loop.time()))
+            subagent_poll_wake.clear()
 
     async def _open_subagent_by_id(target_id: str) -> None:
         # Invoked by the host when the user picks a row in the inline ↓ menu
@@ -4637,7 +4733,8 @@ async def run_repl(
                     f"  [{fmt.muted}]read-only (closed sub-agent) — ← back to main[/{fmt.muted}]"
                 )
             )
-        await _refresh_subagents()
+        await _refresh_subagents(expand_all=True)
+        subagent_poll_wake.set()
 
     host.on_subagent_select = _open_subagent_by_id
     # Let the host see the active session id so Left-arrow can return to the
@@ -6653,6 +6750,90 @@ async def _list_all_conversation_items(
     return all_items
 
 
+@dataclass
+class _OverviewItems:
+    """One conversation's items as last fetched for the Ctrl+O overview."""
+
+    items: list[dict[str, object]]
+    fetched_full_at: float
+
+
+async def _list_overview_items(
+    client: OmnigentClient,
+    conv_id: str,
+    cache: dict[str, _OverviewItems],
+) -> list[dict[str, object]]:
+    """
+    Return *conv_id*'s items for the overview, re-reading only the newest page.
+
+    The overview refreshes every second while open. Walking every page each
+    tick costs one request per 100 items, so after a full walk later ticks
+    keep all but the newest page and re-read from there: one request for a
+    long conversation, and the newest page (where items still change, e.g. a
+    tool call gaining its output) stays fresh. A full walk runs again every
+    :data:`_OVERVIEW_FULL_REFRESH_SECONDS`, or when a cursor goes stale.
+
+    :param client: Agent-plane HTTP client.
+    :param conv_id: Session to enumerate, e.g. ``"conv_abc123"``.
+    :param cache: Per-conversation cache owned by the overview, updated in place.
+    :returns: All items in chronological order.
+    """
+    now = time.monotonic()
+    entry = cache.get(conv_id)
+    # Keep all but the newest page-minus-one items, so re-reading the tail of an
+    # unchanged conversation returns a short page and stops after one request.
+    settled = 0 if entry is None else len(entry.items) - _LIST_ITEMS_PAGE_SIZE + 1
+    anchor = entry.items[settled - 1].get("id") if entry is not None and settled > 0 else None
+    if (
+        entry is None
+        or not isinstance(anchor, str)
+        or now - entry.fetched_full_at >= _OVERVIEW_FULL_REFRESH_SECONDS
+    ):
+        items = await _list_all_conversation_items(client, conv_id)
+        cache[conv_id] = _OverviewItems(items=items, fetched_full_at=now)
+        return items
+    tail: list[dict[str, object]] = []
+    after: str = anchor
+    while True:
+        try:
+            raw_page = await client.sessions.list_items(
+                conv_id,
+                limit=_LIST_ITEMS_PAGE_SIZE,
+                after=after,
+                order="asc",
+            )
+        except StaleCursorError:
+            # An item before the cursor was deleted; rebuild from the start.
+            items = await _list_all_conversation_items(client, conv_id)
+            cache[conv_id] = _OverviewItems(items=items, fetched_full_at=now)
+            return items
+        except Exception:  # noqa: BLE001 — overlay builder: keep showing the last fetch
+            return entry.items
+        page: list[dict[str, object]] = raw_page.data
+        tail.extend(page)
+        last_id = page[-1].get("id") if page and isinstance(page[-1], dict) else None
+        if len(page) < _LIST_ITEMS_PAGE_SIZE or not isinstance(last_id, str):
+            break
+        after = last_id
+    entry.items = entry.items[:settled] + tail
+    return entry.items
+
+
+def _next_subagent_poll_delay(delay: float, *, changed: bool) -> float:
+    """Return the wait before the next sub-agent tree fetch.
+
+    Back to the base cadence after a fetch that saw a change; otherwise (no
+    change, or a failed fetch) double the wait up to the cap.
+
+    :param delay: The wait used before the fetch that just ran.
+    :param changed: Whether that fetch saw a different tree.
+    :returns: Seconds to wait before the next fetch.
+    """
+    if changed:
+        return _SUBAGENT_POLL_SECONDS
+    return min(delay * 2, _SUBAGENT_POLL_MAX_SECONDS)
+
+
 def _should_discover_subagents(
     root_id: str | None,
     *,
@@ -6751,7 +6932,9 @@ async def _refresh_subagent_tree(
     *,
     max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
     generation: int | None = None,
-) -> None:
+    expand_all: bool = True,
+    force_expand: Collection[str] = (),
+) -> str | None:
     """Recursively fetch the sub-agent tree under *root_id* and push it into
     the host registry.
 
@@ -6767,14 +6950,39 @@ async def _refresh_subagent_tree(
         the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
         so a snapshot whose tree was cleared (``/switch`` / ``/new`` / ``/clear``)
         mid-fetch is dropped instead of resurrecting the cleared nodes.
+    :param expand_all: ``False`` skips the children of rows whose known subtree
+        has settled (:meth:`TerminalHost.subagent_subtree_settled`), unless the
+        row is busy or listed in *force_expand*. The skipped subtrees keep their
+        last-seen rows.
+    :param force_expand: Session ids whose children are fetched regardless, e.g.
+        the ancestors of a sub-agent the user is viewing.
+    :returns: A fingerprint of the fetched rows, equal across fetches that saw
+        no change, or ``None`` when the fetch failed.
     """
+    forced = set(force_expand)
+    unexpanded: set[str] = set()
+
+    def _expand(row: Mapping[str, Any]) -> bool:
+        sid = row.get("id")
+        if not isinstance(sid, str):
+            return False
+        if expand_all or sid in forced or child_summary_busy(row):
+            return True
+        if host.subagent_subtree_settled(sid):
+            unexpanded.add(sid)
+            return False
+        return True
+
     try:
         # Recursion + parent_id tagging now live in the shared SDK helper so the
         # CLI tree and the SDK rollup (subtree_busy) walk identical data.
-        nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
+        nodes = await client.sessions.child_sessions_tree(
+            root_id, max_depth=max_depth, expand=_expand
+        )
     except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
-        return
-    host.seed_subagent_tree(root_id, nodes, generation=generation)
+        return None
+    host.seed_subagent_tree(root_id, nodes, generation=generation, unexpanded=unexpanded)
+    return json.dumps(nodes, sort_keys=True, default=str)
 
 
 async def _collect_overview_targets(
@@ -7695,6 +7903,7 @@ async def _build_debug_overview(
     runner_log_path: pathlib.Path | None = None,
     event_log_path: pathlib.Path | None = None,
     cli_log_path: pathlib.Path | None = None,
+    items_cache: dict[str, _OverviewItems] | None = None,
 ) -> RenderableType:
     """
     Assemble the Ctrl+O debug overview for the REPL.
@@ -7873,15 +8082,23 @@ async def _build_debug_overview(
     items: list[dict[str, object]] = []
     items_error: str | None = None
     try:
-        snap = await client.sessions.get(conv_id)
+        # Only labels are read from the snapshot; the items come from the
+        # paginated walk below.
+        snap = await client.sessions.get(
+            conv_id,
+            include_items=False,
+            include_liveness=False,
+            include_live_status=False,
+            include_usage=False,
+        )
         labels = snap.labels
     except Exception as exc:  # noqa: BLE001 — overlay content builder
         labels_error = f"{type(exc).__name__}: {exc}"
     try:
-        items = await _list_all_conversation_items(
-            client,
-            conv_id,
-        )
+        if items_cache is None:
+            items = await _list_all_conversation_items(client, conv_id)
+        else:
+            items = await _list_overview_items(client, conv_id, items_cache)
     except Exception as exc:  # noqa: BLE001 — overlay content builder
         items_error = f"{type(exc).__name__}: {exc}"
     if items_error is not None:
