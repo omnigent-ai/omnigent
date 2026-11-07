@@ -266,7 +266,7 @@ _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
 _CODEX_CHILD_REGISTRATION_ITEM_TYPES = frozenset(
     {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
 )
-# Child posts in flight at once across all sub-agent lanes.
+# Child events handled at once across all sub-agent lanes.
 _CHILD_DELIVERY_CONCURRENCY = 8
 # A child event older than this when delivered means its lane is backlogged.
 _CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
@@ -437,8 +437,10 @@ class _CodexChildStream:
             async with asyncio.timeout(_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS):
                 await asyncio.shield(worker)
         except TimeoutError:
+            # The unread sentinel offsets the dequeued event the cancel drops.
             _logger.warning(
-                "Codex child delivery drain timed out: dropped=%d", self.delivery_queue.qsize()
+                "Codex child delivery drain timed out: dropped=%d",
+                self.delivery_queue.qsize(),
             )
             worker.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -955,13 +957,18 @@ class _CodexForwarderState:
         client: httpx.AsyncClient,
         event: CodexMessage,
         deliver: Callable[[], Awaitable[None]],
+        parent_thread_id: str | None,
     ) -> bool:
         """
         Hand a registered child's notification to that child's ordered lane.
 
+        Usage frames are recorded here, in connection order, because a child's
+        inherited baseline depends on frames other lanes have not delivered yet.
+
         :param client: HTTP client the child's coalescer posts through.
         :param event: Codex app-server notification envelope.
-        :param deliver: Handles ``event`` exactly as the parent loop would.
+        :param deliver: Handles ``event`` with its usage frame already recorded.
+        :param parent_thread_id: Current parent Codex thread id.
         :returns: ``True`` when queued; ``False`` when the caller must handle
             it inline (parent, unregistered, or child-registration events).
         """
@@ -976,6 +983,8 @@ class _CodexForwarderState:
         session_id = self.session_for_child_thread(thread_id) if thread_id is not None else None
         if thread_id is None or session_id is None:
             return False
+        if method == "thread/tokenUsage/updated":
+            self.note_usage_frame(params, parent_thread_id)
         queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
         self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
         return True
@@ -2719,7 +2728,12 @@ async def supervise_forwarder(
                         forwarder_state=forwarder_state,
                     )
                     # Sub-agents share this socket; their posts must not delay the parent.
-                    if not forwarder_state.enqueue_child_event(ap_client, event, handle):
+                    if not forwarder_state.enqueue_child_event(
+                        ap_client,
+                        event,
+                        functools.partial(handle, usage_frame_recorded=True),
+                        parent_thread_id=target.thread_id,
+                    ):
                         await handle()
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
@@ -2742,11 +2756,12 @@ async def supervise_forwarder(
                 if isinstance(result, BaseException)
                 and not isinstance(result, asyncio.CancelledError)
             ]
+            # Child lanes run first: their queued handlers use the shared tracker.
             for close in (
+                forwarder_state.close_child_streams,
                 target.delta_coalescer.close,
                 target.usage_coalescer.close,
                 target.elicitation_tracker.close,
-                forwarder_state.close_child_streams,
                 client.close,
             ):
                 try:
@@ -3568,6 +3583,7 @@ async def _handle_event(
     expected_thread_id: str | None = None,
     codex_client: CodexAppServerClient | None = None,
     forwarder_state: _CodexForwarderState | None = None,
+    usage_frame_recorded: bool = False,
 ) -> None:
     """
     Forward one Codex app-server notification.
@@ -3588,6 +3604,8 @@ async def _handle_event(
         JSON-RPC response.
     :param forwarder_state: Optional mutable state for Plan-mode prompt
         synthesis and thread setting tracking.
+    :param usage_frame_recorded: Whether a usage frame was already recorded in
+        connection order before the event was queued on a child lane.
     :returns: None.
     """
     method = event.get("method")
@@ -3654,7 +3672,11 @@ async def _handle_event(
         await _settle_mcp_startup(
             client, session_id=session_id, bridge_dir=bridge_dir, reason="thread went idle"
         )
-    if method == "thread/tokenUsage/updated" and forwarder_state is not None:
+    if (
+        method == "thread/tokenUsage/updated"
+        and forwarder_state is not None
+        and not usage_frame_recorded
+    ):
         forwarder_state.note_usage_frame(params, expected_thread_id)
     # Resolve routing: parent thread, known child thread, or stale/ignored.
     route_session_id, is_child = _resolve_event_session(
