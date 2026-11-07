@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 from omnigent.cli_invocation import cli_invocation
 from omnigent.errors import SESSION_AGENT_MISSING_MESSAGE, ErrorCategory
-from omnigent.llms.errors import detect_request_size_overflow
+from omnigent.llms.errors import detect_request_size_overflow, is_prompt_too_long
 
 __all__ = [
     "TERMINAL_CLOSED_OUTSIDE_OMNIGENT",
@@ -397,7 +397,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return code
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
-    if detect_request_size_overflow(message) is not None:
+    if detect_request_size_overflow(message) is not None or is_prompt_too_long(message):
         return "context_length_exceeded"
     status_match = _NATIVE_ERROR_HTTP_STATUS.search(message)
     status = status_match.group(1) if status_match else None

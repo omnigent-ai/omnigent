@@ -92,6 +92,22 @@ class RequestSizeOverflow:
         return max(self.limit_bytes // _APPROX_BYTES_PER_TOKEN, 1)
 
 
+# Anthropic token-window rejection: "prompt is too long: {actual} tokens > {limit} maximum".
+# Uses search (not anchored) so it matches both the bare terminal-status form and the same
+# phrase embedded inside an HTTP error envelope such as
+# `400 {"message":"prompt is too long: 1070450 tokens > 1000000 maximum"}`.
+_PROMPT_TOO_LONG_RE = re.compile(r"prompt is too long:\s*\d+\s*tokens", re.IGNORECASE)
+
+
+def is_prompt_too_long(message: str) -> bool:
+    """Return ``True`` when *message* contains Anthropic's token-window rejection.
+
+    :param message: Error text from a native harness or HTTP response body.
+    :returns: ``True`` when the Anthropic ``"prompt is too long: N tokens"`` pattern is present.
+    """
+    return _PROMPT_TOO_LONG_RE.search(message) is not None
+
+
 def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
     """Parse a content-length cap rejection from an error *message*.
 

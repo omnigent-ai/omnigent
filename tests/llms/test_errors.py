@@ -1,10 +1,12 @@
-"""Unit tests for the byte-cap request-size overflow parser."""
+"""Unit tests for the byte-cap request-size overflow parser and prompt-too-long detector."""
 
 from __future__ import annotations
 
 import time
 
-from omnigent.llms.errors import detect_request_size_overflow
+import pytest
+
+from omnigent.llms.errors import detect_request_size_overflow, is_prompt_too_long
 
 # Enough repeated request fields that a backtracking parser takes many seconds;
 # the linear scanner needs milliseconds. The budget is deliberately generous so
@@ -105,3 +107,42 @@ def test_detect_request_size_overflow_overlong_limit_field_is_none() -> None:
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Bare terminal-status form (Claude Code's own refusal before any model call).
+        "prompt is too long: 1070450 tokens > 1000000 maximum",
+        "Prompt is too long: 250000 tokens > 200000 maximum",
+        # HTTP status + JSON envelope (Anthropic API rejection forwarded by Claude Code).
+        '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}',
+        # Nested API error envelope.
+        (
+            'API Error: 400 {"error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 1028000 tokens > 1000000 maximum"}}'
+        ),
+    ],
+)
+def test_is_prompt_too_long_recognizes_anthropic_token_window_rejection(message: str) -> None:
+    assert is_prompt_too_long(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Bare phrase without a token count must not match (could be prose).
+        "prompt is too long",
+        "The prompt is too long for this model.",
+        # Unrelated size rejection.
+        (
+            "Server received a request which exceeds maximum allowed content "
+            "length. RequestSize(bytes): 33967957, Limit(bytes): 33554432"
+        ),
+        # Different overflow form (Anthropic sum shape, no "prompt is too long").
+        "1050000 + 50000 > 1000000",
+        "",
+    ],
+)
+def test_is_prompt_too_long_rejects_non_matching_messages(message: str) -> None:
+    assert is_prompt_too_long(message) is False

@@ -612,7 +612,6 @@ def test_transient_messages_do_not_override_specific_failure_codes(code: str) ->
     "message",
     [
         # Deterministic failures must keep the generic, non-retryable code.
-        "prompt is too long: 250000 tokens > 200000 maximum",
         "API Error: 400 · context_length_exceeded: maximum context window reached",
         "There's an issue with the selected model. It may not exist.",
         "API Error: Request rejected (404) · model not found",
@@ -622,6 +621,33 @@ def test_transient_messages_do_not_override_specific_failure_codes(code: str) ->
 )
 def test_deterministic_native_errors_are_not_transient(message: str) -> None:
     assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Bare terminal-status form: Claude Code's own refusal before calling the model.
+        "prompt is too long: 250000 tokens > 200000 maximum",
+        "Prompt is too long: 1070450 tokens > 1000000 maximum",
+        # HTTP status + JSON envelope: Anthropic API rejection forwarded by Claude Code.
+        '400 {"message":"prompt is too long: 2100000 tokens > 1000000 maximum"}',
+        (
+            'API Error: 400 {"error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 1028000 tokens > 1000000 maximum"}}'
+        ),
+    ],
+)
+def test_prompt_too_long_classifies_as_context_length_exceeded(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "context_length_exceeded"
+
+
+@pytest.mark.parametrize("code", ["workspace_missing", "invalid_input"])
+def test_prompt_too_long_does_not_override_specific_failure_codes(code: str) -> None:
+    assert (
+        classify_native_turn_error(code, "prompt is too long: 500000 tokens > 200000 maximum")
+        == code
+    )
 
 
 def test_429_still_classifies_as_rate_limit_not_transient() -> None:
