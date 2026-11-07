@@ -69,6 +69,7 @@ import {
   detectLang,
   getSelectionOffsets,
   indexToLine,
+  hasRawHtmlNode,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -151,6 +152,13 @@ const MARKDOWN_SANITIZE_SCHEMA = {
   },
 };
 
+/** rehype-raw re-parses the whole tree through parse5, so skip it when there is no raw HTML. */
+function rehypeRawWhenPresent() {
+  const transform = rehypeRaw();
+  return (tree: Parameters<typeof transform>[0], file: Parameters<typeof transform>[1]) =>
+    hasRawHtmlNode(tree) ? transform(tree, file) : tree;
+}
+
 // Markdown files routinely embed raw HTML that GitHub renders — <details>,
 // <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
@@ -160,7 +168,7 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
-  rehypeRaw,
+  rehypeRawWhenPresent,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
@@ -270,8 +278,11 @@ function MarkdownPreview({
   onScroll,
   tocOpen,
   onTocOpenChange,
+  deferOffscreen = false,
 }: {
   content: string;
+  /** Skip layout of off-screen blocks; large documents otherwise lay out in full on open. */
+  deferOffscreen?: boolean;
   /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
   path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
@@ -279,26 +290,34 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
-  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
-  // rendering, the same as chat, so agent-authored formulas render here too;
-  // remark-math only honours `$` delimiters. Safe outside code/existing math.
-  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
+  // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
+  // Memoized so resizes and toolbar re-renders skip re-parsing the document.
+  const markdown = useMemo(
+    () => (
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
+      >
+        {normalizeExplicitMathDelimiters(content)}
+      </ReactMarkdown>
+    ),
+    [content],
+  );
   return (
     <div className="flex h-full">
       <div
         ref={rootRef}
         data-preview-scroll
         onScroll={onScroll}
-        className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
+        className={cn(
+          "markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none",
+          deferOffscreen &&
+            "[&>*]:[content-visibility:auto] [&>*]:[contain-intrinsic-size:auto_2.5rem]",
+        )}
       >
         <MarkdownPreviewPathContext.Provider value={path}>
-          <ReactMarkdown
-            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-            rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-            components={MARKDOWN_COMPONENTS}
-          >
-            {rendered}
-          </ReactMarkdown>
+          {markdown}
         </MarkdownPreviewPathContext.Provider>
       </div>
       {tocOpen && (
@@ -332,8 +351,10 @@ function PreviewWithSearch({
   tocOpen,
   onTocOpenChange,
   commentHint,
+  deferOffscreen,
 }: {
   content: string;
+  deferOffscreen?: boolean;
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
   isNotebook: boolean;
@@ -377,6 +398,7 @@ function PreviewWithSearch({
       onScroll={handleScroll}
       tocOpen={tocOpen}
       onTocOpenChange={onTocOpenChange}
+      deferOffscreen={deferOffscreen}
     />
   );
   // The find bar sits above the preview; a truncated preview also shows the
@@ -601,14 +623,13 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
-  // Large Markdown shares the virtualized code editor and its save/permission rules.
-  const showMonaco = markdownSourceFallback || (lang !== "markdown" && viewMode !== "preview");
+  // Large Markdown edits in the virtualized code editor and shares its save/permission rules.
+  const showMonaco = viewMode !== "preview" && (markdownSourceFallback || lang !== "markdown");
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
-    viewMode === "preview" &&
-    ((lang === "markdown" && !markdownSourceFallback) || isNotebookPath(path));
+    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
   const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
@@ -1001,6 +1022,7 @@ export function CodeViewer({
         scrollReady={fileQuery.data !== undefined}
         tocOpen={tocOpen}
         onTocOpenChange={(open) => !open && onTocToggle?.()}
+        deferOffscreen={markdownSourceFallback}
         commentHint={
           !isNotebook && onRequestEditMode
             ? { conversationId, onSwitchToEdit: onRequestEditMode }

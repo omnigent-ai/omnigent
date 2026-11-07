@@ -1155,28 +1155,66 @@ describe("SessionUpdatesProvider projects_changed frames", () => {
   });
 });
 
-it("updates pending counts on a pinned row outside the scope windows", () => {
-  const client = new QueryClient();
-  client.setQueryData(["pinned-conversations"], {
-    conversations: [
-      { ...conv("old-pin"), labels: { "omnigent.pinned": "123" }, pending_elicitations_count: 0 },
-    ],
-    filterHonored: true,
-  });
-  renderProvider(client, ["/"]);
-  act(() =>
-    frameHandler()({
-      type: "changed",
-      items: [{ ...wireItem("old-pin", 2, 100), pending_elicitations_count: 3 }],
-    }),
-  );
-  const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
-  expect(data?.conversations[0]).toMatchObject({
-    pending_elicitations_count: 3,
-    comments_count: 2,
-    labels: { "omnigent.pinned": "123" },
-  });
-});
+it.each(["pin", "family"])(
+  "reconciles streamed updates and removals for an off-window %s row",
+  (kind) => {
+    const client = new QueryClient();
+    const family = { id: "family", representative_id: "older", pinned: true };
+    const original = {
+      conversations: [
+        {
+          ...conv("old-pin"),
+          family: kind === "family" ? family : undefined,
+          labels: kind === "family" ? {} : { "omnigent.pinned": "123" },
+          pending_elicitations_count: 0,
+        },
+      ],
+      filterHonored: true,
+    };
+    client.setQueryData(["pinned-conversations"], original);
+    renderProvider(client, ["/"]);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [
+          {
+            ...wireItem("old-pin", 2, 100),
+            pending_elicitations_count: 3,
+            ...(kind === "family"
+              ? {
+                  family: { ...family, representative_id: "old-pin" },
+                  labels: { "omnigent.pinned": "456" },
+                }
+              : {}),
+          },
+        ],
+      }),
+    );
+    const data = client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"]);
+    expect(data?.conversations[0]).toMatchObject({
+      pending_elicitations_count: 3,
+      comments_count: 2,
+      labels: { "omnigent.pinned": kind === "family" ? "456" : "123" },
+    });
+    if (kind === "family") expect(data?.conversations[0].family?.representative_id).toBe("old-pin");
+    act(() => frameHandler()({ type: "removed", ids: ["old-pin"] }));
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+    client.setQueryData(["pinned-conversations"], original);
+    act(() =>
+      frameHandler()({
+        type: "changed",
+        items: [{ ...wireItem("old-pin", 2, 100), archived: true }],
+      }),
+    );
+    expect(
+      client.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])
+        ?.conversations,
+    ).toEqual([]);
+  },
+);
 
 it("keeps a directly opened shared session watched and permission-aware with the Shared list inactive", async () => {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });

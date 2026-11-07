@@ -37,6 +37,7 @@ export function SidebarHeaderActions({
   expanded,
   onToggle,
   onOpenSearch,
+  showSearch = true,
   onSettingsClick,
   onTogglePointerEnter,
   onTogglePointerDown,
@@ -51,6 +52,8 @@ export function SidebarHeaderActions({
   onToggle: () => void;
   /** Open the command palette (search). Optional so the cluster can render standalone. */
   onOpenSearch?: () => void;
+  /** Keep Search out when another surface owns it, such as the Electron brand row. */
+  showSearch?: boolean;
   /**
    * Extra handler for the Settings link. The in-sidebar copy passes nothing (on
    * mobile, entering Settings keeps the drawer open and swaps it to the section
@@ -68,7 +71,7 @@ export function SidebarHeaderActions({
 }) {
   return (
     <div className="flex items-center gap-1" data-testid="sidebar-header-actions">
-      <SidebarSearchButton onOpenSearch={onOpenSearch} />
+      {showSearch && <SidebarSearchButton onOpenSearch={onOpenSearch} />}
       <SidebarSettingsButton onSettingsClick={onSettingsClick} className="max-md:hidden" />
       <Tooltip>
         <TooltipTrigger asChild>
@@ -126,9 +129,11 @@ const SIDEBAR_FLOAT_ICON = "size-4 max-md:size-[22px]";
 export function SidebarSearchButton({
   onOpenSearch,
   className,
+  testId = "sidebar-search-button",
 }: {
   onOpenSearch?: () => void;
   className?: string;
+  testId?: string;
 }) {
   return (
     <Tooltip>
@@ -141,7 +146,7 @@ export function SidebarSearchButton({
           aria-keyshortcuts={`${ARIA_MOD_KEY}+K`}
           onClick={() => onOpenSearch?.()}
           className={cn(SIDEBAR_FLOAT_BUTTON, className)}
-          data-testid="sidebar-search-button"
+          data-testid={testId}
         >
           <SearchIcon className={SIDEBAR_FLOAT_ICON} />
         </MobileHeaderButton>

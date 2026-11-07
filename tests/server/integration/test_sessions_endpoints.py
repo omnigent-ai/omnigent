@@ -11832,6 +11832,7 @@ async def test_patch_approval_mode_forwards_and_persists_label(
 @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
 async def test_patch_approval_mode_requires_live_runner_before_persisting(
     client: httpx.AsyncClient,
+    db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
     runner_status: int | None,
 ) -> None:
@@ -11878,10 +11879,25 @@ async def test_patch_approval_mode_requires_live_runner_before_persisting(
             },
         )
 
+        from omnigent.stores.conversation_store import FAMILY_PIN_LABEL_PREFIX
+        from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+        store = SqlAlchemyConversationStore(db_uri)
+        sibling = store.create_conversation(agent_id=agent["id"])
+        store.add_new_sibling(session["id"], sibling.id, user_id=None)
+        project_id = "a" * 32
+        store.set_conversation_project(session["id"], project_id)
         resp = await client.patch(
             f"/v1/sessions/{session['id']}",
-            json={"approval_mode": "full-access"},
+            json={
+                "approval_mode": "full-access",
+                "project_id": "",
+                "labels": {"omnigent.pinned": "1"},
+            },
         )
+        for member in store.get_session_family(session["id"]):
+            assert member.project_id == project_id
+            assert not any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in member.labels)
         snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
     finally:
         if fake_runner is not None:
