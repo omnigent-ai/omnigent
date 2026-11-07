@@ -94,8 +94,11 @@ export function detectNewElicitations(
  *   * \`isUnseen\` says it has activity since the user last had it open (the
  *     sidebar's unread dot — see \`isConversationUnseen\`).
  *
- * \`isUnseen\` is injected rather than imported so this module stays free of
- * localStorage and directly unit-testable.
+ * An explicit "Mark as unread" lifts the active-session suppression, as it
+ * does for the sidebar dot, so flagging the open session counts it at once.
+ *
+ * \`isUnseen\` and \`isExplicitlyUnread\` are injected rather than imported so
+ * this module stays free of localStorage and directly unit-testable.
  *
  * :param conversations: The current conversation list.
  * :param activeId: The conversation currently open in the UI, or undefined
@@ -104,6 +107,8 @@ export function detectNewElicitations(
  * :param isUnseen: Predicate matching \`isConversationUnseen\`'s signature —
  *   whether a session has unseen activity, given its id, \`updated_at\`, and
  *   status.
+ * :param isExplicitlyUnread: Predicate matching \`isExplicitlyUnread\` —
+ *   whether the user marked the session unread and hasn't reopened it since.
  * :returns: The unread-session id set; its size is the badge number.
  */
 export function computeUnreadBadgeIds(
@@ -111,11 +116,13 @@ export function computeUnreadBadgeIds(
   activeId: string | undefined,
   windowFocused: boolean,
   isUnseen: (id: string, updatedAt: number, status: string | undefined) => boolean,
+  isExplicitlyUnread: (id: string) => boolean,
 ): Set<string> {
   const unread = new Set<string>();
   for (const conversation of conversations) {
     if (conversation.archived) continue;
-    if (windowFocused && conversation.id === activeId) continue;
+    const activelyViewed = windowFocused && conversation.id === activeId;
+    if (activelyViewed && !isExplicitlyUnread(conversation.id)) continue;
     const awaiting = (conversation.pending_elicitations_count ?? 0) > 0;
     if (awaiting || isUnseen(conversation.id, conversation.updated_at, conversation.status)) {
       unread.add(conversation.id);
