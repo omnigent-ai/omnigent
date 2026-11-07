@@ -74,7 +74,7 @@ import {
   writeDefaultWorkspacePanelOpen,
 } from "@/lib/workspacePanelPreferences";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
-import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
+import { toasterOffsets } from "@/lib/updateOverlayInset";
 import {
   type DefaultWorkspaceTab,
   isDefaultWorkspaceTab,
@@ -3175,14 +3175,8 @@ function AppShellImpl() {
           <Toaster
             position="top-center"
             visibleToasts={100}
-            offset={{
-              right: "1rem",
-              bottom: updateOverlayToastOffset(updateOverlayHeight),
-            }}
-            mobileOffset={{
-              right: "1rem",
-              bottom: updateOverlayToastOffset(updateOverlayHeight),
-            }}
+            // Keep top toasts below the native status bar / Dynamic Island.
+            {...toasterOffsets(updateOverlayHeight)}
           />
         </ForkDialogContextProvider>
       </TerminalFirstContextProvider>
