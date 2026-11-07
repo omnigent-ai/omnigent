@@ -2714,6 +2714,118 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
         assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
 
 
+@pytest.mark.parametrize(
+    "original,calls,statuses,read_cap,baseline",
+    [
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="edit-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            [],
+            None,
+            "one\ntwo\n",
+            id="write-reverted",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_edit", {"oldText": "one", "newText": "uno"}),
+                ("sys_os_edit", {"oldText": "two", "newText": "dos"}),
+                ("sys_os_edit", {"oldText": "uno", "newText": "one"}),
+            ],
+            ["modified"],
+            None,
+            "one\ntwo\n",
+            id="partially-reverted",
+        ),
+        pytest.param(
+            b"one\r\ntwo\r\n",
+            [
+                ("sys_os_edit", {"oldText": "two", "newText": "three"}),
+                ("sys_os_edit", {"oldText": "three", "newText": "two"}),
+            ],
+            ["modified"],
+            None,
+            "one\r\ntwo\r\n",
+            id="line-endings-changed",
+        ),
+        pytest.param(
+            b"\x89PNG\r\n\x1a\n\x00\xff",
+            [("sys_os_write", {"content": ""}), ("sys_os_write", {"content": ""})],
+            ["modified"],
+            None,
+            None,
+            id="binary-original",
+        ),
+        pytest.param(
+            b"one\ntwo\n",
+            [
+                ("sys_os_write", {"content": "replaced\n"}),
+                ("sys_os_write", {"content": "one\ntwo\n"}),
+            ],
+            ["modified"],
+            4,
+            None,
+            id="original-beyond-read-cap",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_runner_os_env_change_restoring_the_original_leaves_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    original: bytes,
+    calls: list[tuple[str, dict[str, str]]],
+    statuses: list[str],
+    read_cap: int | None,
+    baseline: str | None,
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime.filesystem_registry import AgentEditFilesystemRegistry
+    from omnigent.spec.types import AgentSpec
+
+    if read_cap is not None:
+        monkeypatch.setattr("omnigent.runner.environment_filesystem._MAX_READ_BYTES", read_cap)
+    (tmp_path / "file.txt").write_bytes(original)
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    filesystem_registry = AgentEditFilesystemRegistry(watch_path=tmp_path)
+
+    for step, (tool_name, args) in enumerate(calls, start=1):
+        result = await _execute_os_env_tool(
+            tool_name,
+            {"path": "file.txt", **args},
+            agent_spec=spec,
+            conversation_id="conv_revert",
+            filesystem_registry=filesystem_registry,
+        )
+        assert "error" not in json.loads(result)
+        if step < len(calls):
+            assert filesystem_registry.list_changed_files("conv_revert", limit=10)
+
+    listed = filesystem_registry.list_changed_files("conv_revert", limit=10)
+    assert [entry["status"] for entry in listed] == statuses
+    assert filesystem_registry.get_baseline("file.txt") == baseline
+
+
 @pytest.mark.asyncio
 async def test_runner_os_env_cleanup_is_off_loop_and_cancellation_safe(
     monkeypatch: pytest.MonkeyPatch,
@@ -3775,9 +3887,11 @@ def test_subagent_read_tools_are_runner_local() -> None:
         pytest.param({"input": "continue"}, id="object-input-contract"),
     ],
 )
+@pytest.mark.parametrize("runner_features", [None, "-peer_session_messaging"])
 async def test_sys_session_send_reuses_existing_child_session(
     monkeypatch: pytest.MonkeyPatch,
     subagent_args: str | dict[str, str],
+    runner_features: str | None,
 ) -> None:
     """
     Re-sending to the same ``(agent, title)`` continues the existing child.
@@ -3791,10 +3905,15 @@ async def test_sys_session_send_reuses_existing_child_session(
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param subagent_args: ``sys_session_send`` ``args`` payload.
+    :param runner_features: Local feature override; ``None`` uses defaults.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.tool_dispatch import execute_tool
 
+    if runner_features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", runner_features)
     create_posts = 0
     event_posts: list[dict[str, Any]] = []
     dispatch_stamps: list[dict[str, Any]] = []
@@ -8166,6 +8285,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": "conv_x",
+            "family": None,
         },
         {
             "session_id": "s2",
@@ -8176,6 +8296,7 @@ async def test_session_list_global_sessions_filter_and_connectivity() -> None:
             "runner_online": True,
             "parent_session_id": None,
             "created_by_session_id": None,
+            "family": None,
         },
     ]
     # Connectivity resolved once per UNIQUE runner — two sessions share
@@ -8517,18 +8638,33 @@ async def test_sys_session_create_maps_agent_not_found() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sys_session_create_spawns_child_under_caller() -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [None, "message-post", "parent-snapshot", "child-snapshot"],
+    ids=[
+        "message-sent",
+        "message-failed",
+        "malformed-parent-snapshot",
+        "malformed-child-snapshot",
+    ],
+)
+async def test_sys_session_create_spawns_child_under_caller(failure: str | None) -> None:
     """
     ``sys_session_create`` POSTs a JSON create with
     ``parent_session_id`` forced to the caller (child-only), passes the
-    agent_id, title, and a queued initial message, and returns a handle
-    carrying the new child's id. If parent_session_id weren't forced to
-    the caller, an orchestrator could create top-level/sibling sessions —
-    so the asserted request body is the security-critical check.
+    agent_id and title, and returns a handle carrying the new child's id.
+    If parent_session_id weren't forced to the caller, an orchestrator could
+    create top-level/sibling sessions — so the asserted request body is the
+    security-critical check. The initial message is sent like a by-id
+    ``sys_session_send`` so the child's completion is tracked as sub-agent
+    work that reaches the caller's inbox and wakes it. A failed send, including
+    a malformed snapshot while preparing it, leaves no tracked work and reports
+    the error with the created child's id.
     """
     from omnigent.runner.tool_dispatch import execute_tool
 
     captured: dict[str, Any] = {}
+    posted: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
         if request.method == "POST" and request.url.path == "/v1/sessions":
@@ -8542,29 +8678,74 @@ async def test_sys_session_create_spawns_child_under_caller() -> None:
                     "status": "idle",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_caller":
+            if failure == "parent-snapshot":
+                return httpx.Response(200, content=b"<html>proxy error</html>")
+            return httpx.Response(404, json={"error": "not found"})
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            if failure == "child-snapshot":
+                return httpx.Response(200, json=["conv_child"])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "researcher",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
+        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+            posted.append(json.loads(request.content))
+            if failure == "message-post":
+                return httpx.Response(500, json={"error": "events unavailable"})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
-            server_client=server_client,
-            conversation_id="conv_caller",
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "ag_x", "title": "auth", "message": "start"}),
+                server_client=server_client,
+                conversation_id="conv_caller",
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
-    # Child-only: parent forced to the caller; agent + title + queued
-    # message threaded through to the create body.
+    # Child-only: parent forced to the caller; agent + title threaded
+    # through to the create body.
     assert captured["parent_session_id"] == "conv_caller"
     assert captured["agent_id"] == "ag_x"
     assert captured["title"] == "auth"
-    assert captured["initial_items"][0]["data"]["content"][0]["text"] == "start"
+    assert "initial_items" not in captured
+    assert [event["data"]["content"][0]["text"] for event in posted] == (
+        [] if failure in ("parent-snapshot", "child-snapshot") else ["start"]
+    )
     handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
+    assert handle["conversation_id"] == "conv_child", output
+    if failure is not None:
+        assert handle["error"].startswith("child session created but message failed"), output
+        assert "Do not create a replacement" in handle["error"]
+        assert entry is None
+        return
+    assert entry is not None, output
+    assert (entry.parent_session_id, entry.agent, entry.title) == (
+        "conv_caller",
+        "researcher",
+        "auth",
+    )
     assert handle["agent_id"] == "ag_x"
     assert handle["agent_name"] == "researcher"
+    assert handle["handle_id"] == "conv_child"
+    assert handle["status"] == "launching"
 
 
 @pytest.mark.asyncio
@@ -8641,8 +8822,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
 ) -> None:
     """
     Bundle mode bundles a local agent config, POSTs the multipart
-    create with ``parent_session_id`` forced to the caller, queues the
-    optional message as the child's first event, and returns a handle
+    create with ``parent_session_id`` forced to the caller, sends the
+    optional message as tracked sub-agent work, and returns a handle
     built from the server's created-agent identifiers.
 
     The asserted multipart metadata is the security-critical check
@@ -8662,6 +8843,8 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     event_bodies: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v1/info":
+            return httpx.Response(200, json={"session_bundle_model_override": True})
         if request.method == "POST" and request.url.path == "/v1/sessions":
             create_requests.append(request)
             return httpx.Response(
@@ -8672,6 +8855,20 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
                     "agent_name": "helper",
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_child",
+                    "title": "auth",
+                    "agent_name": "helper",
+                    "parent_session_id": "conv_caller",
+                    "labels": {},
+                    "busy": False,
+                },
+            )
+        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+            return httpx.Response(200, json={"ok": True})
         if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
             event_bodies.append(json.loads(request.content))
             return httpx.Response(200, json={})
@@ -8681,23 +8878,39 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
-        output = await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps(
-                {"config_path": "helper.yaml", "title": "auth", "message": "start"}
-            ),
-            server_client=server_client,
-            conversation_id="conv_caller",
-            runner_workspace=tmp_path,
-        )
+        try:
+            output = await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "config_path": "helper.yaml",
+                        "title": "auth",
+                        "message": "start",
+                        "model": "databricks-claude-sonnet-4-6",
+                        "reasoning_effort": "low",
+                    }
+                ),
+                server_client=server_client,
+                conversation_id="conv_caller",
+                runner_workspace=tmp_path,
+            )
+            entry = subagent_work.get_subagent_work("conv_child")
+        finally:
+            subagent_work.unregister_subagent_work("conv_child")
 
     # Exactly one multipart create; parent forced to the caller
-    # (child-only) and the title threaded into the metadata part.
+    # (child-only), and title, model and effort threaded into the
+    # metadata part as the agent_id create sends them.
     assert len(create_requests) == 1, (
         f"expected exactly one create POST, got {len(create_requests)}"
     )
     parts = _parse_multipart_create(create_requests[0])
-    assert parts["metadata"] == {"parent_session_id": "conv_caller", "title": "auth"}
+    assert parts["metadata"] == {
+        "parent_session_id": "conv_caller",
+        "title": "auth",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "low",
+    }
 
     # The uploaded bundle is a gzipped tar holding the authored config
     # verbatim — proves the local file traversed materialize → tar.
@@ -8708,10 +8921,12 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
         assert member is not None
         assert member.read().decode() == config_text
 
-    # The optional message was queued as the child's first user event —
-    # this is what starts the child's turn (same pattern as named send).
+    # The optional message is the child's first user event and its turn is
+    # tracked, so the completion reaches the caller like a by-id send.
     assert len(event_bodies) == 1
     assert event_bodies[0]["data"]["content"][0]["text"] == "start"
+    assert entry is not None, output
+    assert entry.parent_session_id == "conv_caller"
 
     handle = json.loads(output)
     assert handle["conversation_id"] == "conv_child"
@@ -8719,6 +8934,111 @@ async def test_sys_session_create_bundle_mode_uploads_child_under_caller(
     # not the caller's args — the orchestrator needs the NEW agent's id.
     assert handle["agent_id"] == "ag_new"
     assert handle["agent_name"] == "helper"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("info", "args", "error"),
+    [
+        pytest.param(
+            {}, {"model": "databricks-claude-sonnet-4-6"}, "server_too_old", id="old-server"
+        ),
+        pytest.param(
+            None, {"model": "databricks-claude-sonnet-4-6"}, "could not check", id="no-info"
+        ),
+        pytest.param(
+            {"session_bundle_model_override": True},
+            {"reasoning_effort": 3},
+            "must be a string",
+            id="non-string-effort",
+        ),
+    ],
+)
+async def test_sys_session_create_config_path_refuses_unsendable_overrides(
+    tmp_path: Path, info: dict[str, Any] | None, args: dict[str, Any], error: str
+) -> None:
+    """
+    A config_path create never drops a requested override: a server that does
+    not report ``session_bundle_model_override`` (or whose info cannot be read)
+    and a non-string value both fail with a named error before any upload.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    (tmp_path / "helper.yaml").write_text("name: helper\nprompt: help\n")
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json=info) if info is not None else httpx.Response(503)
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", **args}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    assert error in output
+    assert creates == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "effort", "sent"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+        pytest.param(None, "low", "low", id="unclassified-harness-passes"),
+    ],
+)
+async def test_sys_session_create_config_path_checks_effort_against_the_bundle_harness(
+    tmp_path: Path, harness: str | None, effort: str, sent: str | None
+) -> None:
+    """
+    A config_path effort the bundled child's harness cannot use fails before
+    any upload instead of being stored and dropped at every turn; an alias
+    folds to the harness's value, and an unclassified harness passes through.
+
+    :param harness: The local config's harness, or ``None`` for none set.
+    :param effort: The requested effort.
+    :param sent: The effort the metadata carries, or ``None`` when refused.
+    """
+    from omnigent.runner.tool_dispatch import execute_tool
+
+    config = "name: helper\nprompt: help\n"
+    if harness is not None:
+        config += f"executor:\n  harness: {harness}\n"
+    (tmp_path / "helper.yaml").write_text(config)
+    creates: list[httpx.Request] = []
+
+    async def _server_handler(request: httpx.Request) -> httpx.Response:
+        creates.append(request)
+        return httpx.Response(201, json={"session_id": "conv_child", "agent_id": "ag_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_server_handler), base_url="http://server"
+    ) as server_client:
+        output = await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"config_path": "helper.yaml", "reasoning_effort": effort}),
+            server_client=server_client,
+            conversation_id="conv_caller",
+            runner_workspace=tmp_path,
+        )
+
+    if sent is None:
+        assert "invalid 'reasoning_effort'" in output
+        assert creates == []
+        return
+    assert len(creates) == 1, output
+    assert _parse_multipart_create(creates[0])["metadata"]["reasoning_effort"] == sent
 
 
 @pytest.mark.asyncio
@@ -10176,6 +10496,68 @@ async def test_spawn_async_tool_cancels_losing_future_no_leak(
     await asyncio.sleep(0)
     assert inbox.get_nowait()["status"] == "cancelled"
     assert _leaked(before) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled"])
+async def test_spawn_async_tool_requests_wake_for_uncancelled_results(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """
+    A completed or failed background result asks the runner to wake its
+    session once the result is in the inbox. A cancelled task does not: the
+    caller that cancelled it is not waiting for the result.
+    """
+    from omnigent.runner import tool_dispatch
+
+    release = asyncio.Event()
+
+    async def _tool(**_kw: Any) -> str:
+        await release.wait()
+        if outcome == "failed":
+            raise RuntimeError("tool broke")
+        return "ok"
+
+    monkeypatch.setattr(tool_dispatch, "execute_tool", _tool)
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] = {}
+    wakes: list[tuple[str, str, str, str, int]] = []
+
+    def _wake(session_id: str, handle_id: str, tool_name: str, status: str) -> None:
+        wakes.append((session_id, handle_id, tool_name, status, inbox.qsize()))
+
+    handle = json.loads(
+        tool_dispatch._spawn_async_tool(
+            {"tool": "slow", "args": "{}"},
+            session_inbox=inbox,
+            session_async_tasks=tasks,
+            wake_on_async_result=_wake,
+            server_client=None,
+            terminal_registry=None,
+            resource_registry=None,
+            agent_spec=None,
+            conversation_id="conv_wake",
+            task_id=None,
+            agent_id=None,
+            agent_name=None,
+            runner_workspace=None,
+            mcp_manager=None,
+            filesystem_registry=None,
+        )
+    )
+    bg_task, cancel_event = tasks[handle["handle_id"]]
+    await asyncio.sleep(0)  # let _bg reach asyncio.wait
+    if outcome == "cancelled":
+        cancel_event.set()
+    else:
+        release.set()
+    await bg_task
+
+    assert inbox.get_nowait()["status"] == outcome
+    expected = (
+        [] if outcome == "cancelled" else [("conv_wake", handle["handle_id"], "slow", outcome, 1)]
+    )
+    assert wakes == expected
 
 
 @pytest.mark.asyncio

@@ -70,6 +70,9 @@ _GPT_ID_RE = re.compile(r"^(gpt|codex)-(\d+)(?:-(\d+))?(?:-([a-z0-9]+))?$")
 #: under, which is also the id the gateway serves the model as.
 _GLM_ARM = "glm-5-2"
 EXTENDED_CATALOG_MODELS: dict[str, str] = {_GLM_ARM: f"{_MODEL_ROUTE_PREFIX}{_GLM_ARM}"}
+# MLflow reports this arm as text-only. Codex otherwise clones the GPT image
+# capability into its extended catalog and lets view_image poison the next turn.
+EXTENDED_MODEL_INPUT_MODALITIES: dict[str, tuple[str, ...]] = {_GLM_ARM: ("text",)}
 
 #: Efforts each extended model's catalog entry declares. Codex refuses any
 #: other value for that model, so this is both the entry's ladder and the

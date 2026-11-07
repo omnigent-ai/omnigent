@@ -22,6 +22,8 @@ export interface SharingState {
   /** False when the deployment manages this default itself (not file-backed). */
   default_public_sessions_editable: boolean;
   default_public_sessions_options: DefaultPublicSessions[];
+  peer_session_messaging_enabled?: boolean;
+  peer_session_messaging_editable?: boolean;
 }
 
 /** ``off`` = all private, ``sandbox`` = cloud sandbox sessions public, ``all`` = every session. */
@@ -33,6 +35,7 @@ export interface SharingUpdate {
   public_sharing?: boolean;
   public_sharing_max_level?: "read" | "edit";
   default_public_sessions?: DefaultPublicSessions;
+  peer_session_messaging?: boolean;
 }
 
 const QUERY_KEY = ["sharing"];

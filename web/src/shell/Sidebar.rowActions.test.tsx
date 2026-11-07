@@ -1374,28 +1374,38 @@ describe("right-click context menu", () => {
     },
   );
 
-  it("opens the same action items as the kebab and drives the same handlers", () => {
-    renderSidebar();
+  it.each(["kebab", "context"])(
+    "opens the shared actions from %s and drives their handlers",
+    (menu) => {
+      renderSidebar(undefined, serverInfo({ sibling_sessions: true }));
 
-    // Nothing in the DOM until the row is right-clicked (the kebab menu is
-    // closed, so its items aren't rendered either).
-    expect(screen.queryByTestId("rename-conversation")).toBeNull();
+      // Nothing in the DOM until the row is right-clicked (the kebab menu is
+      // closed, so its items aren't rendered either).
+      expect(screen.queryByTestId("rename-conversation")).toBeNull();
 
-    fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      if (menu === "kebab") {
+        fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
+      } else {
+        fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      }
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
 
-    // The context menu carries the full set of kebab actions — same testids,
-    // so it renders from the shared ConversationMenuItems body.
-    expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
-    expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
-    expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
+      // The context menu carries the full set of kebab actions — same testids,
+      // so it renders from the shared ConversationMenuItems body.
+      expect(screen.getByTestId("share-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("move-to-project")).toBeInTheDocument();
+      expect(screen.getByTestId("archive-conversation")).toBeInTheDocument();
+      expect(screen.getByTestId("delete-conversation")).toBeInTheDocument();
 
-    // Selecting Rename runs the same path as the kebab / double-click: the
-    // inline rename input appears.
-    fireEvent.click(screen.getByTestId("rename-conversation"));
-    expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
-  });
+      // Selecting Rename runs the same path as the kebab / double-click: the
+      // inline rename input appears.
+      fireEvent.click(screen.getByTestId("rename-conversation"));
+      expect(screen.getByTestId("rename-conversation-input")).toBeInTheDocument();
+    },
+  );
 
   it("holds the list order under the pointer so a right-click rename hits the aimed row", () => {
     // A right-click is a single event, so nothing can cross-check it like the

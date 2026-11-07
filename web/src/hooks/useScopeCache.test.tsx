@@ -43,7 +43,9 @@ let client: QueryClient;
 beforeEach(() => {
   identity.viewerId = "alice";
   identity.resolution = Promise.resolve("alice");
-  client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } });
+  client = new QueryClient({
+    defaultOptions: { queries: { retry: false, retryDelay: 0, gcTime: Infinity } },
+  });
   fetchPage
     .mockReset()
     .mockImplementation(async ({ after, limit = 30, visibility }) =>
@@ -305,7 +307,7 @@ it.each(["disabled", "exhausted", "failed", "replaced"])(
     }
     await act(async () => {
       if (scenario === "replaced") await result.current.refetch();
-      if (scenario === "failed") fail(new Error("offline"));
+      if (scenario === "failed") fail(new ApiError("Bad request", 400, null));
       else finish(sessionRowsPage(rows(2, 30), scenario !== "exhausted"));
       await refresh;
       await next;
@@ -323,7 +325,7 @@ it("preserves loaded rows after a failed refresh and recovers on retry", async (
   await act(async () => {
     await result.current.fetchNextPage();
   });
-  fetchPage.mockRejectedValueOnce(new Error("offline"));
+  fetchPage.mockRejectedValueOnce(new ApiError("Bad request", 400, null));
   await act(async () => {
     await result.current.refetch();
   });
@@ -333,6 +335,26 @@ it("preserves loaded rows after a failed refresh and recovers on retry", async (
     await result.current.refetch();
   });
   await waitFor(() => expect(result.current.isError).toBe(false));
+});
+
+it("retries a transient refresh failure but not a client error", async () => {
+  const { result } = renderHook(() => useScopeCache("mine", 60_000), { wrapper });
+  await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+  fetchPage.mockClear().mockRejectedValueOnce(new Error("offline"));
+  await act(async () => {
+    await result.current.refetch();
+  });
+  await waitFor(() => expect(result.current.isFetching).toBe(false));
+  expect(fetchPage).toHaveBeenCalledTimes(2);
+  expect(result.current.isError).toBe(false);
+
+  fetchPage.mockClear().mockRejectedValueOnce(new ApiError("Forbidden", 403, null));
+  await act(async () => {
+    await result.current.refetch();
+  });
+  await waitFor(() => expect(result.current.isError).toBe(true));
+  expect(fetchPage).toHaveBeenCalledTimes(1);
 });
 
 it("recovers a stale pagination cursor by restarting the window", async () => {

@@ -41,7 +41,7 @@ import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import type { Host } from "@/hooks/useHosts";
@@ -49,7 +49,11 @@ import { useHosts } from "@/hooks/useHosts";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import type { ProjectConfig } from "@/lib/projectsApi";
-import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
+import {
+  readLastHostChoice,
+  writeLastHostChoice,
+  SANDBOX_HOST_CHOICE,
+} from "@/lib/hostPreferences";
 import {
   readProjectLaunchDefaults,
   writeProjectLaunchDefaults,
@@ -71,6 +75,22 @@ const RECENT_KEY = "omnigent:recent-workspaces";
 const RECENT_WORKSPACE = "/Users/corey/universe/src/foo";
 const REPO = "/Users/corey/projects/alpha";
 const EXISTING_WORKTREE = "/Users/corey/worktrees/alpha-feature";
+
+const SOURCE_SESSION: Awaited<ReturnType<typeof getSessionSlim>> = {
+  id: "source",
+  title: "Coordinator",
+  agentId: "ag_source",
+  agentName: "source",
+  permissionLevel: 4,
+  parentSessionId: null,
+  subAgentName: null,
+  kind: "default",
+  status: "idle",
+  createdAt: 1,
+  items: [],
+  hostId: "host_1",
+  workspace: REPO,
+};
 
 // Mutable so a test can choose a project-driven or plain visit.
 let searchParams = new URLSearchParams("project=Alpha");
@@ -142,6 +162,7 @@ vi.mock("@/lib/agentBundle", () => ({
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),
   createBundledSession: vi.fn(),
+  getSessionSlim: vi.fn(),
   launchRunner: vi.fn(),
 }));
 vi.mock("./CreateAgentDialog", () => ({
@@ -301,12 +322,15 @@ beforeEach(() => {
   vi.mocked(showToast).mockReset();
   vi.mocked(createBundledSession).mockReset();
   vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new" });
+  vi.mocked(getSessionSlim).mockReset();
+  vi.mocked(getSessionSlim).mockResolvedValue(SOURCE_SESSION);
   vi.mocked(launchRunner).mockReset();
   vi.mocked(launchRunner).mockResolvedValue(undefined as never);
   searchParams = new URLSearchParams("project=Alpha");
   resetLandingDraft();
   localStorage.clear();
   localStorage.setItem(RECENT_KEY, JSON.stringify({ host_1: [RECENT_WORKSPACE] }));
+  vi.mocked(useHosts).mockClear();
   vi.mocked(useHosts).mockReturnValue({ data: [host()] } as ReturnType<typeof useHosts>);
   vi.mocked(useAvailableAgents).mockReturnValue({
     data: [agent(), agent({ id: "ag_other", name: "other", display_name: "Other" })],
@@ -599,4 +623,165 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
       workspace: REPO,
     });
   });
+});
+
+describe("NewChatLandingScreen nested agent creation", () => {
+  it.each(["", "Nested task"])(
+    "preserves drafts across composer scopes: %s",
+    async (nestedText) => {
+      vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
+      const drafts = [
+        { source: null, text: "Standalone task", file: "standalone.txt" },
+        { source: "first", text: nestedText, file: nestedText ? "first.txt" : null },
+        { source: "second", text: "Another nested task", file: "second.txt" },
+      ];
+      for (const draft of drafts) {
+        searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
+        renderLanding({ sibling_sessions: true });
+        // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
+        const input = await screen.findByTestId("new-chat-landing-input");
+        expect(input).toHaveValue("");
+        fireEvent.change(input, { target: { value: draft.text } });
+        if (draft.file) {
+          fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+            target: { files: [new File(["notes"], draft.file, { type: "text/plain" })] },
+          });
+        }
+        cleanup();
+      }
+      for (const draft of drafts) {
+        searchParams = new URLSearchParams(draft.source ? `sibling=${draft.source}` : "");
+        renderLanding({ sibling_sessions: true });
+        // oxlint-disable-next-line no-await-in-loop -- Each visit must unmount before the next.
+        expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(draft.text);
+        for (const other of drafts) {
+          if (!other.file) continue;
+          expect(screen.queryByText(other.file) !== null).toBe(other === draft);
+        }
+        cleanup();
+      }
+    },
+  );
+
+  it("keeps the ordinary host preference when explicitly selecting the source sandbox", async () => {
+    const regular = host({ host_id: "regular", name: "Regular host" });
+    const sandbox = host({ sandbox_provider: "modal" });
+    vi.mocked(useHosts).mockImplementation(
+      (options) =>
+        ({
+          data: options?.sourceHostId ? [regular, sandbox] : [regular],
+        }) as ReturnType<typeof useHosts>,
+    );
+    writeLastHostChoice("regular");
+    localStorage.setItem(RECENT_KEY, JSON.stringify({ regular: [RECENT_WORKSPACE] }));
+    searchParams = new URLSearchParams("sibling=source");
+    renderLanding({ sibling_sessions: true });
+    await screen.findByRole("heading", { name: "Add nested agent" });
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(await screen.findByTestId("new-chat-landing-host-host_1"));
+    expect(readLastHostChoice()).toBe("regular");
+    cleanup();
+    resetLandingDraft();
+    searchParams = new URLSearchParams();
+    renderLanding({ sibling_sessions: true });
+    expect(await submitAndReadBody()).toMatchObject({ host_id: "regular" });
+  });
+
+  it("waits for the source, resets on source changes, and refuses an unavailable host", async () => {
+    const source = SOURCE_SESSION;
+    let resolveSource!: (session: typeof source) => void;
+    vi.mocked(getSessionSlim).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveSource = resolve;
+        }),
+    );
+    searchParams = new URLSearchParams("sibling=source");
+    const { rerender } = renderLanding({ sibling_sessions: true });
+    expect(screen.getByRole("status")).toHaveTextContent("Loading source session");
+    expect(screen.queryByTestId("new-chat-landing-submit")).toBeNull();
+    await waitFor(() => expect(resolveSource).toBeDefined());
+    resolveSource(source);
+    await screen.findByRole("heading", { name: "Add nested agent" });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "For the first session only" },
+    });
+    vi.mocked(getSessionSlim).mockResolvedValue({ ...source, id: "other", hostId: "offline" });
+    searchParams = new URLSearchParams("sibling=other");
+    rerender(<NewChatLandingScreen />);
+    await screen.findByRole("heading", { name: "Add nested agent" });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Cannot start on a missing host" },
+    });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-submit").parentElement!);
+    expect(screen.getByTestId("new-chat-landing-submit-error-tooltip")).toHaveTextContent(
+      "Selected host is unavailable",
+    );
+    expect(createBundledSession).not.toHaveBeenCalled();
+    expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "offline" });
+  });
+
+  it.each([false, true])(
+    "submits the clicked source for JSON and uploaded agents (bundle=%s)",
+    async (bundled) => {
+      vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
+      searchParams = new URLSearchParams("sibling=other");
+      renderLanding({ sibling_sessions: true });
+      fireEvent.change(await screen.findByTestId("new-chat-landing-input"), {
+        target: { value: "Keep this other draft" },
+      });
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [new File(["other"], "other.txt", { type: "text/plain" })] },
+      });
+      cleanup();
+      searchParams = new URLSearchParams("sibling=source");
+      renderLanding({ sibling_sessions: true });
+      await screen.findByRole("heading", { name: "Add nested agent" });
+      expect(useHosts).toHaveBeenCalledWith({ refetchOnFocus: true, sourceHostId: "host_1" });
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
+        "aria-label",
+        "Host: This machine, Online",
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+        target: { files: [new File(["submitted"], "submitted.txt", { type: "text/plain" })] },
+      });
+      if (bundled) {
+        fireEvent.click(screen.getByTestId("test-create-pending"));
+        fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+          target: { value: "Review the API" },
+        });
+        fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+        await waitFor(() => expect(createBundledSession).toHaveBeenCalled());
+        expect(vi.mocked(createBundledSession).mock.calls[0][1]).toMatchObject({
+          sibling_source_id: "source",
+          workspace: REPO,
+        });
+
+        await waitFor(() =>
+          expect(launchRunner).toHaveBeenCalledWith("host_1", "conv_new", REPO, undefined),
+        );
+      } else {
+        expect(await submitAndReadBody()).toMatchObject({
+          sibling_source_id: "source",
+          host_id: "host_1",
+          workspace: REPO,
+        });
+      }
+      await waitFor(() => expect(navigateMock).toHaveBeenCalled());
+      cleanup();
+      renderLanding({ sibling_sessions: true });
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue("");
+      expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      cleanup();
+      searchParams = new URLSearchParams("sibling=other");
+      renderLanding({ sibling_sessions: true });
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(
+        "Keep this other draft",
+      );
+      expect(screen.getByText("other.txt")).toBeVisible();
+      expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+    },
+  );
 });

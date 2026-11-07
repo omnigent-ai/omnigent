@@ -449,8 +449,9 @@ class ToolManager:
 
         Send/close remain child-only. Create also supports independent
         placements behind the orchestration gate. ``sys_session_message``
-        is always advertised; the deployment flag and server ownership/privacy
-        checks authorize peer sends. Sharing retains its separate opt-in.
+        is advertised unless this runner disables ``peer_session_messaging``;
+        the server's flags and ownership/privacy checks authorize peer sends.
+        Sharing retains its separate opt-in.
         Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
@@ -461,9 +462,13 @@ class ToolManager:
         child's ``agy_permission`` prompt — without a human in the loop.
         Child-only, same as send/close.
         """
-        from omnigent.tools.builtins.session_message import SysSessionMessageTool
+        from omnigent.tools.builtins.session_message import (
+            SysSessionMessageTool,
+            peer_session_messaging_enabled,
+        )
 
-        self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
+        if peer_session_messaging_enabled():
+            self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
