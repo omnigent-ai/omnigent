@@ -178,6 +178,7 @@ final class AppPrivacyInfoTests: XCTestCase {
     for key in [
       "NSCameraUsageDescription",
       "NSMicrophoneUsageDescription",
+      "NSPhotoLibraryAddUsageDescription",
       "NSSpeechRecognitionUsageDescription",
     ] {
       let value = try XCTUnwrap(Bundle.main.object(forInfoDictionaryKey: key) as? String)
