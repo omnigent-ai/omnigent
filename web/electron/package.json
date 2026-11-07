@@ -132,17 +132,17 @@
       "background": "dmg/background.tiff",
       "window": {
         "width": 640,
-        "height": 465
+        "height": 537
       },
       "iconSize": 96,
       "contents": [
         {
           "x": 170,
-          "y": 100
+          "y": 72
         },
         {
           "x": 470,
-          "y": 100,
+          "y": 72,
           "type": "link",
           "path": "/Applications"
         }
