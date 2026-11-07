@@ -322,6 +322,7 @@ def _github(args: list[str], **_: object) -> tuple[int, str, str]:
 @pytest.fixture
 def observed_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(pr_observer, "_pushes", pr_observer.pushed_branches.SessionPushes())
     monkeypatch.setattr(github_resource, "_gh", Mock(side_effect=_github))
     return "conv_write"
 
@@ -739,6 +740,34 @@ def test_push_in_both_output_and_checkout_state_is_looked_up_once(
     _run_and_observe(monkeypatch, "conv_once", "git push origin HEAD:topic", worktree)
     assert forge.lookups == [f"repos/{CHECKOUT_REPO}/commits/topic/pulls"]
     assert _tracked("conv_once") == [(CHECKOUT_PR_URL, "worked_on")]
+
+
+@pytest.mark.parametrize(
+    "tool_name,argument", [("Bash", "command"), ("exec_command", "cmd")], ids=["claude", "codex"]
+)
+def test_native_hook_cwd_locates_a_quiet_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, forge: _Forge, tool_name: str, argument: str
+) -> None:
+    worktree = tmp_path / "worktree"
+    github_checkout(worktree, tmp_path / "github", CHECKOUT_REPO, "topic")
+    git("commit", "-q", "--allow-empty", "-m", "Change", cwd=worktree)
+    forge.responses[f"repos/{CHECKOUT_REPO}/commits/topic/pulls"] = [CHECKOUT_PR]
+    command = "git push -q origin HEAD:topic"
+    subprocess.run(["/bin/sh", "-c", command], cwd=worktree, check=True, timeout=60)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_hook(
+            "conv_hook",
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": str(worktree),
+                "tool_use_id": "push",
+                "tool_name": tool_name,
+                "tool_input": {argument: command},
+                "tool_response": {"stdout": "", "stderr": "", "exit_code": 0},
+            },
+        )
+    assert _tracked("conv_hook") == [(CHECKOUT_PR_URL, "worked_on")]
 
 
 def test_gh_api_branch_write_fills_repository_placeholders_from_the_checkout(
