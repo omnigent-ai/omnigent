@@ -482,7 +482,15 @@ def _shell_operations(
     if isinstance(workdir, str) and workdir:
         # An explicit workdir (``exec_command``) is where the command ran.
         start = _resolve_directory(cwd, workdir) or start
-    segments = _with_directories(_shell_segments(command), start)
+    parsed = _shell_segments(command)
+    if parsed and start:
+        # A native hook reports where the shell was after the command, which can be
+        # where it pushed, so the caller's directory is always a candidate.
+        parsed = [
+            ShellSegment(("cd", start), ("cd", start), parsed[0].output_eligible),
+            *parsed,
+        ]
+    segments = _with_directories(parsed, start)
     if not segments:
         # Output attribution rejects this command, but the checkouts it ran in
         # still record its pushes, so pass only those on, as plain ``cd`` steps.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import json
+import logging
 import re
 import tempfile
 import time
@@ -18,6 +19,7 @@ from omnigent.runner.git_providers.push_reflog import mark_reported, recent_push
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
 from omnigent.runner.session_prs import PullRequestRef
 
+_logger = logging.getLogger(__name__)
 _NORMAL_UPDATE = re.compile(
     r"^[ \t]*[+*]?[ \t]*(?:[0-9a-f]{4,64}\.\.\.?[0-9a-f]{4,64}|\[new branch\])"
     r"\s+\S+\s+->\s+(\S+)(?:\s+\(forced update\))?\s*$"
@@ -126,7 +128,12 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
     # Output names a push only when the call succeeded; the reflog records one either way.
     targets = dict.fromkeys(() if _failed(result) else _output_targets(segments, result))
     pushes: dict[tuple[str, str, str], list[tuple[str, str, str, int]]] = {}
-    for push in recent_pushes(segment.cwd for segment in segments if segment.cwd):
+    try:
+        found = recent_pushes(segment.cwd for segment in segments if segment.cwd)
+    except Exception:  # noqa: BLE001 — the reflog scan must not cost the output's targets
+        _logger.warning("Reflog push scan failed", exc_info=True)
+        found = []
+    for push in found:
         remote = resolve_remote(push.url)
         if remote is not None and remote.provider == "github":
             target = (remote.host, remote.repository, push.branch)

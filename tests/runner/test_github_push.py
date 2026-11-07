@@ -405,7 +405,17 @@ def checked_directories(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iter
             "/work/repo", {"command": "git pp 2>&1 | tail -3"}, ["/work/repo"], id="hook-cwd"
         ),
         pytest.param(
-            "/work", {"command": "cd repo && git pp | tail -3"}, ["/work/repo"], id="relative-cd"
+            "/work",
+            {"command": "cd repo && git pp | tail -3"},
+            ["/work", "/work/repo"],
+            id="relative-cd",
+        ),
+        # Claude Code reports its cwd after the command, so "cd repo" already happened.
+        pytest.param(
+            "/work/repo",
+            {"command": "cd repo && ./push.sh"},
+            ["/work/repo", "/work/repo/repo"],
+            id="post-command-hook-cwd",
         ),
         pytest.param(
             None,
@@ -472,7 +482,7 @@ def test_runner_shell_checks_the_directory_it_reports_running_in(
         source="runner_shell",
     )
     pr_observer._lookup_pool.shutdown(wait=True)
-    assert checked_directories == ["/repo"]
+    assert list(dict.fromkeys(checked_directories)) == ["/repo"]
     assert [entry.url for entry in SessionPrRegistry("conv_shell").list()] == [PR_URL]
 
 
@@ -746,3 +756,35 @@ def test_finished_shell_calls_are_scanned_even_when_they_fail(
         )
     entries = SessionPrRegistry("conv_failed_push").list()
     assert [entry.url for entry in entries] == ([PR_URL] if recorded else [])
+
+
+def test_reflog_scan_failure_keeps_the_output_parsed_push(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A session without an environment to read in still records a literal push."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    row = {
+        "state": "open",
+        "head": {"ref": "feature/topic", "repo": {"full_name": "contributor/project"}},
+        "html_url": PR_URL,
+    }
+    monkeypatch.setattr(github_resource, "_gh", Mock(return_value=(0, json.dumps([row]), "")))
+
+    def no_environment(
+        argv: list[str], cwd: Path, timeout: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        raise ValueError("Session has no os_env to resolve")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        monkeypatch.setattr(pr_observer, "_lookup_pool", pool)
+        observe_tool_completion(
+            "conv_no_env",
+            tool_name="sys_os_shell",
+            arguments={"command": "git push origin local:feature/topic"},
+            result=json.dumps(
+                {"stdout": "", "stderr": PUSH_OUTPUT, "exit_code": 0, "cwd": str(tmp_path)}
+            ),
+            call_id="push",
+            git_runner=no_environment,
+        )
+    assert [entry.url for entry in SessionPrRegistry("conv_no_env").list()] == [PR_URL]
