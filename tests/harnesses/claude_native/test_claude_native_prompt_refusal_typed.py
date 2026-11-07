@@ -237,3 +237,114 @@ def test_the_settings_pre_check_refuses_before_typing(
         claude_native_bridge.inject_slash_command(bridge_dir, command="/model opus")
 
     assert raised.value.nothing_typed is True
+
+
+@pytest.mark.parametrize(
+    "mismatch", ["owner", "bridge", "binding", "receipt", "later-write", "legacy"]
+)
+def test_original_input_failure_requires_matching_producer_and_attempt(
+    bridge_dir, monkeypatch, mismatch
+):
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+
+    module = claude_native_bridge
+    (bridge_dir / "bridge.json").write_text('{"active_session_id":"synthetic-session"}')
+    receipt = build_native_input_receipt(
+        [{"type": "input_text", "text": "Synthetic input"}],
+        {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32},
+    )
+    error = module.ClaudeUserPromptPending("Synthetic question", nothing_typed=True)
+
+    @module._track_input_delivery(original=True)
+    def refuse(directory):
+        raise error
+
+    with native_input_receipt_scope(receipt):
+        owner = module._OriginalInputAttempt(bridge_dir, "synthetic-session")
+        with module._original_input_scope(owner):
+            with pytest.raises(module.ClaudeUserPromptPending) as raised:
+                refuse(bridge_dir.parent if mismatch == "bridge" else bridge_dir)
+        assert raised.value is error
+        if mismatch != "bridge":
+            assert owner.undelivered(error)
+        if mismatch == "owner":
+            assert not module._OriginalInputAttempt(bridge_dir, "synthetic-session").undelivered(
+                error
+            )
+        elif mismatch == "binding":
+            (bridge_dir / "bridge.json").write_text('{"active_session_id":"replacement"}')
+            assert not owner.undelivered(error)
+            (bridge_dir / "bridge.json").write_text('{"active_session_id":"synthetic-session"}')
+            assert not owner.undelivered(error)
+        elif mismatch == "receipt":
+            with native_input_receipt_scope(None):
+                assert not owner.undelivered(error)
+            assert not owner.undelivered(error)
+        elif mismatch == "later-write":
+            with module._original_input_scope(owner):
+
+                @module._track_input_delivery(original=True)
+                def write(directory):
+                    module._mark_input_payload_write()
+
+                write(bridge_dir)
+            assert not owner.undelivered(error)
+        elif mismatch == "legacy":
+            raw = module.ClaudeUserPromptPending("same reported text", nothing_typed=True)
+            assert not owner.undelivered(raw)
+            assert not owner.can_hold(raw)
+            raw.__dict__["_claude_original_input_failure"] = error.__dict__[
+                "_claude_original_input_failure"
+            ]
+            assert not owner.undelivered(raw)
+            raw.__dict__["_claude_original_input_failure"] = {"nothing_typed": True}
+            assert not owner.undelivered(raw)
+        else:
+            assert not owner.undelivered(error)
+    assert module._INPUT_OPERATION.get() is None
+    assert module._ORIGINAL_INPUT_ATTEMPT.get() is None
+
+
+def test_completed_settings_leave_the_original_prewrite_hold_available(bridge_dir):
+    module = claude_native_bridge
+    owner = module._OriginalInputAttempt(bridge_dir, None)
+
+    @module._track_input_delivery(original=False)
+    def setting(directory):
+        module._mark_input_payload_write()
+
+    @module._track_input_delivery(original=True)
+    def question(directory):
+        raise module.ClaudeUserPromptPending("Synthetic original question", nothing_typed=True)
+
+    with module._original_input_scope(owner):
+        setting(bridge_dir)
+        with pytest.raises(module.ClaudeUserPromptPending) as raised:
+            question(bridge_dir)
+    assert owner.undelivered(raised.value)
+    assert owner.can_hold(raised.value)
+    assert owner.auxiliary_pending is None
+    assert not owner.payload_may_have_been_written
+
+
+def test_a_changed_target_cannot_revive_an_original_certificate(bridge_dir):
+    module = claude_native_bridge
+    owner = module._OriginalInputAttempt(bridge_dir, None)
+
+    @module._track_input_delivery(original=True)
+    def question(directory):
+        module._bind_input_target({"socket_path": "synthetic.sock", "tmux_target": "first"})
+        module._bind_input_target({"socket_path": "synthetic.sock", "tmux_target": "replacement"})
+        module._bind_input_target({"socket_path": "synthetic.sock", "tmux_target": "first"})
+        raise module.ClaudeUserPromptPending("Synthetic original question", nothing_typed=True)
+
+    with (
+        module._original_input_scope(owner),
+        pytest.raises(module.ClaudeUserPromptPending) as raised,
+    ):
+        question(bridge_dir)
+    assert not owner.undelivered(raised.value)
+    assert not owner.can_hold(raised.value)

@@ -781,6 +781,7 @@ async def test_failed_injection_clears_framework_context(
 ) -> None:
     from omnigent.inner.native_attachments import framework_notice_block
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(*args: Any, **kwargs: Any) -> None:
         assert (tmp_path / "pending_framework_context.txt").exists()
         raise error
@@ -1700,14 +1701,15 @@ async def test_a_routed_first_message_switches_the_model_exactly_once(
 
 
 @pytest.mark.asyncio
-async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
+async def test_run_turn_does_not_reap_unleased_tmux_after_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A readiness timeout cannot leave a failed turn's pane alive."""
+    """No original write does not provide a physical terminal generation lease."""
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
@@ -1729,25 +1731,20 @@ async def test_run_turn_reaps_tmux_before_reporting_prompt_timeout(
         )
     ]
 
-    assert killed == [bridge_dir]
+    assert killed == []
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
 
 
 @pytest.mark.asyncio
-async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
+async def test_run_turn_does_not_mark_an_unleased_timeout_as_expected_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """
-    The runner must read the reap as Omnigent's close, not a terminal crash.
-
-    The pane is alive when the readiness wait times out, and the reap ends it
-    moments before the runner would otherwise report the exit as a failure.
-    The turn's own error is the one failure the person should see.
-    """
+    """An error must not mark a possible replacement as Omnigent's close."""
     kill_flags: list[bool] = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
@@ -1771,7 +1768,7 @@ async def test_run_turn_marks_its_timeout_reap_as_an_expected_close(
         )
     ]
 
-    assert kill_flags == [True]
+    assert kill_flags == []
     assert isinstance(events[0], ExecutorError)
 
 
@@ -1783,6 +1780,7 @@ async def test_run_turn_does_not_mark_a_pane_that_exited_on_its_own(
     """A pane that already exited was not closed by Omnigent, so its exit still counts."""
     kill_flags: list[bool] = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalExited("terminal exited", exit_status="1")
@@ -1806,7 +1804,7 @@ async def test_run_turn_does_not_mark_a_pane_that_exited_on_its_own(
         )
     ]
 
-    assert kill_flags == [False]
+    assert kill_flags == []
 
 
 @pytest.mark.asyncio
@@ -1825,6 +1823,7 @@ async def test_run_turn_keeps_the_pane_when_a_terminal_dialog_blocks_delivery(
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalDialog(
@@ -1877,6 +1876,7 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
     messages: list[str] = []
     killed: list[Path] = []
 
+    @claude_bridge._track_input_delivery(original=False)
     def refuse_slash_command(bridge_dir_arg: Path, *, command: str, **kwargs: object) -> None:
         """Refuse the switch the way the bridge does at a surface Escape cannot clear."""
         del bridge_dir_arg, kwargs
@@ -2027,7 +2027,7 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
-    assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
+    assert error.undelivered is (refusal == "missing_target")
 
 
 @pytest.mark.asyncio
@@ -2045,6 +2045,7 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeSignInPending(
@@ -2106,6 +2107,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     """
     bridge_dir = tmp_path / "bridge"
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudeTerminalExited(
@@ -2270,19 +2272,22 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
-async def test_run_turn_reports_reap_failure_with_prompt_timeout(
+async def test_run_turn_does_not_attempt_unleased_cleanup_for_delivery_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     failure: type[ClaudePromptTimeout],
 ) -> None:
-    """A failed hard-stop remains visible beside the delivery error."""
+    """Unknown physical lifetime prevents cleanup without hiding the delivery failure."""
+    attempted = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise failure("terminal did not become ready")
 
     def fail_kill(bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False) -> None:
-        del bridge_dir_arg, timeout_s, expected_close
+        del timeout_s, expected_close
+        attempted.append(bridge_dir_arg)
         raise RuntimeError("tmux kill failed")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
@@ -2300,17 +2305,20 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
 
     assert isinstance(events[0], ExecutorError)
     assert "terminal did not become ready" in events[0].message
-    assert "Cleanup also failed: tmux kill failed" in events[0].message
+    assert attempted == []
+    assert "Cleanup also failed" not in events[0].message
     assert events[0].undelivered is True
 
 
 @pytest.mark.asyncio
-async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
+async def test_delivery_failure_does_not_wait_for_a_new_tmux_advertisement(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A pane that exited during readiness polling needs no cleanup error."""
+    """Error cleanup cannot select a fresh advertisement for an old failure."""
+    attempted = []
 
+    @claude_bridge._track_input_delivery(original=True)
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
         raise ClaudePromptTimeout("terminal did not become ready")
@@ -2318,7 +2326,8 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
     def absent_kill(
         bridge_dir_arg: Path, *, timeout_s: float, expected_close: bool = False
     ) -> None:
-        del bridge_dir_arg, timeout_s, expected_close
+        del timeout_s, expected_close
+        attempted.append(bridge_dir_arg)
         raise TmuxSessionNotAdvertised("not advertised")
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
@@ -2334,5 +2343,562 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
         )
     ]
 
+    assert attempted == []
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.fixture
+def source_delivery_terminal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Run actual bridge delivery against the existing synthetic composer."""
+    import subprocess
+
+    from tests.harnesses.claude_native import test_claude_native_bridge as scenarios
+    from tests.harnesses.claude_native import test_claude_native_prompt_refusal_typed as prompts
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "source-delivery-session")
+    directory = scenarios._picker_bridge_dir(tmp_path)
+    (directory / "bridge.json").write_text(
+        json.dumps({"active_session_id": "source-delivery-session"}), encoding="utf-8"
+    )
+    composer = scenarios._EditableComposer("", cursor=0)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(claude_bridge.delivery_diagnostics, "time", claude_bridge.time)
+    state = SimpleNamespace(
+        fault="exit",
+        pastes=0,
+        loads=0,
+        enters=0,
+        ready_returns=0,
+        recovery=False,
+        recovered=False,
+        resized=False,
+        settings=False,
+        replace_binding=False,
+        slash_retry=False,
+        holds=[],
+        commands=[],
+        reaped=[],
+    )
+    original_wait = claude_bridge._wait_for_claude_prompt_ready
+
+    def wait(*args, **kwargs):
+        state.recovery = bool(state.pastes)
+        original_wait(*args, **kwargs)
+        state.ready_returns += 1
+        if state.recovery:
+            state.recovered = True
+
+    def capture(*args, **kwargs):
+        if state.replace_binding and state.pastes:
+            (directory / "bridge.json").write_text('{"active_session_id":"synthetic-replacement"}')
+        if state.fault == "initial-exit":
+            return ""
+        if state.fault == "before-space" and state.ready_returns:
+            return ""
+        if state.fault == "after-space" and any(c[-1] == "Space" for c in state.commands):
+            return ""
+        if state.fault == "settings" and state.settings:
+            return prompts._PERMISSION_PROMPT
+        if state.fault == "slash":
+            if state.slash_retry:
+                return ""
+            if state.enters:
+                return "Unknown command: /synthetic-command\n" + scenarios._composer_pane()
+            return composer._capture_pane(*args)
+        if not state.pastes or state.resized:
+            return scenarios._composer_pane()
+        if state.fault in {"draft", "enter", "normal"}:
+            return composer._capture_pane(*args)
+        if not state.recovery:
+            return scenarios._composer_pane()
+        if state.fault == "clearer":
+            return "unreadable synthetic frame" if state.recovered else scenarios._composer_pane()
+        if state.fault == "question":
+            return prompts._PERMISSION_PROMPT
+        if state.fault == "dialog":
+            return prompts._SETTINGS_ERROR_DIALOG
+        return "" if state.fault == "exit" else "Synthetic startup still unready"
+
+    def send(socket_path, *args, **kwargs):
+        state.commands.append(args)
+        state.loads += args[0] == "load-buffer"
+        state.pastes += args[0] == "paste-buffer"
+        state.enters += args[0] == "send-keys" and args[-1] == "Enter"
+        state.settings |= args[0] == "send-keys" and args[-1].startswith("/model ")
+        if (
+            (state.fault == "load" and args[0] == "load-buffer")
+            or (state.fault == "paste" and args[0] == "paste-buffer")
+            or (state.fault == "enter" and args[-1] == "Enter")
+        ):
+            raise RuntimeError("Synthetic write reply lost")
+        if args[0] == "resize-window":
+            state.resized |= "24" in args
+            return
+        if state.fault == "draft" and args[-1] == "Enter":
+            return
+        composer._run_tmux(socket_path, *args)
+
+    def metadata(command, **kwargs):
+        assert command[3] == "display-message", command
+        return subprocess.CompletedProcess(command, 0, stdout="120 7 manual\nmanual\n")
+
+    monkeypatch.setattr(claude_bridge, "_wait_for_claude_prompt_ready", wait)
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_bridge, "_run_tmux", send)
+    monkeypatch.setattr(
+        claude_bridge,
+        "_claude_pane_state",
+        lambda *_: claude_bridge._ClaudePaneState(
+            not (
+                state.fault in {"initial-exit", "before-space", "after-space"}
+                or state.slash_retry
+                or (state.fault == "exit" and state.pastes)
+            ),
+            exit_status="7",
+        ),
+    )
+    original_rejection = claude_bridge._unknown_command_rejection_appeared
+
+    def rejection(*args, **kwargs):
+        result = original_rejection(*args, **kwargs)
+        state.slash_retry = result
+        return result
+
+    monkeypatch.setattr(claude_bridge, "_unknown_command_rejection_appeared", rejection)
+    monkeypatch.setattr("subprocess.run", metadata)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "kill_session",
+        lambda *args, **kwargs: state.reaped.append((args, kwargs)),
+    )
+    executor = ClaudeNativeExecutor(directory)
+
+    async def observe_hold(refusal, deadline):
+        state.holds.append(type(refusal).__name__)
+        return False
+
+    monkeypatch.setattr(executor, "_hold_message", observe_hold)
+    return executor, composer, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["exit", "timeout", "question", "dialog", "clearer", "draft"])
+async def test_written_original_is_never_reported_undelivered_or_held(
+    source_delivery_terminal, fault
+):
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+
+    executor, composer, state = source_delivery_terminal
+    state.fault = fault
+    receipt = build_native_input_receipt(
+        [{"type": "input_text", "text": "Synthetic original input"}],
+        {
+            "input_stable_id": "a" * 32,
+            "pending_id": "pending_" + "b" * 32,
+            "delivery_attempt_id": "c" * 32,
+        },
+    )
+    assert receipt is not None
+    with native_input_receipt_scope(receipt):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "Synthetic original input"}], [], ""
+            )
+        ]
+    assert state.ready_returns >= 1
+    assert state.loads >= 1 and state.pastes >= 1
+    if fault != "draft":
+        assert state.recovery
+    else:
+        assert state.enters >= 1
+        assert "Synthetic original input" in composer.text
+    assert len(events) == 1 and isinstance(events[0], ExecutorError), (events, vars(state))
+    assert events[0].undelivered is False, vars(state)
+    assert events[0].preserve_session is True
+    assert state.reaped == []
+    assert state.holds == []
+    assert state.pastes == 1
+    if fault != "draft":
+        assert state.enters == 0
+
+
+@pytest.mark.asyncio
+async def test_written_steering_failure_is_ambiguous_instead_of_refused(source_delivery_terminal):
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+
+    executor, _, state = source_delivery_terminal
+    with pytest.raises(InjectionDeliveryAmbiguous):
+        await executor.enqueue_session_message("source-delivery-session", "Synthetic steering")
+    assert state.ready_returns == 1
+    assert state.loads == state.pastes == 1
+    assert state.recovery and state.enters == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["initial-exit", "before-space", "after-space"])
+async def test_source_prewrite_refusals_certify_only_original_payload(
+    source_delivery_terminal, fault
+):
+    executor, _, state = source_delivery_terminal
+    state.fault = fault
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "Synthetic not dispatched"}], [], ""
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
+    assert state.loads == state.pastes == state.enters == 0
+    assert bool(state.commands) is (fault == "after-space")
+    assert state.holds == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["load", "paste", "enter", "slash"])
+async def test_attempted_writes_never_regain_prewrite_authority(source_delivery_terminal, fault):
+    executor, _, state = source_delivery_terminal
+    state.fault = fault
+    text = "/synthetic-command" if fault == "slash" else "Synthetic original input"
+    events = [
+        event async for event in executor.run_turn([{"role": "user", "content": text}], [], "")
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is False
+    assert state.loads == 1
+    assert state.pastes == int(fault != "load")
+    assert state.enters == int(fault in {"enter", "slash"})
+    assert state.holds == []
+    if fault == "slash":
+        assert state.slash_retry
+
+
+@pytest.mark.asyncio
+async def test_incomplete_settings_do_not_certify_a_settings_retry(
+    source_delivery_terminal, monkeypatch
+):
+    executor, _, state = source_delivery_terminal
+    state.fault = "settings"
+    monkeypatch.setattr(executor, "_model_command_arg", lambda _: "sonnet")
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "Synthetic original input"}],
+            [],
+            "",
+            ExecutorConfig(model="sonnet"),
+        )
+    ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
+    assert events[0].preserve_session is True
+    assert state.reaped == []
+    assert state.settings and state.loads == state.pastes == state.enters == 0
+    assert state.holds == []
+
+
+@pytest.mark.asyncio
+async def test_original_evidence_does_not_change_normal_delivery(source_delivery_terminal):
+    executor, composer, state = source_delivery_terminal
+    state.fault = "normal"
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "Synthetic normal input"}], [], ""
+        )
+    ]
+    assert events == [TurnComplete(response=None)]
+    assert state.loads == state.pastes == state.enters == 1
+    assert composer.submitted == ["Synthetic normal input\n"]
+
+
+@pytest.mark.asyncio
+async def test_postpaste_binding_replacement_does_not_reap_the_new_pane(source_delivery_terminal):
+    executor, _, state = source_delivery_terminal
+    state.replace_binding = True
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "Synthetic replaced input"}], [], ""
+        )
+    ]
+    assert state.loads == state.pastes == 1
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is False
+    assert state.reaped == []
+    assert state.holds == []
+
+
+def test_control_keys_are_not_original_payload_evidence(source_delivery_terminal):
+    executor, _, state = source_delivery_terminal
+    state.fault = "after-space"
+    owner = claude_bridge._OriginalInputAttempt(executor._bridge_dir, "source-delivery-session")
+    with claude_bridge._original_input_scope(owner), pytest.raises(ClaudeTerminalExited) as raised:
+        claude_bridge.inject_user_message(executor._bridge_dir, content="Synthetic original")
+    assert owner.undelivered(raised.value)
+    assert owner.control_input_attempted
+    assert not owner.payload_may_have_been_written
+    assert state.loads == state.pastes == state.enters == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["unchanged", "new-socket", "new-pane", "missing"])
+async def test_prewrite_cleanup_cannot_follow_a_replaced_tmux_binding(
+    source_delivery_terminal, tmp_path, monkeypatch, replacement
+):
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        native_input_receipt_scope,
+    )
+
+    executor, _, state = source_delivery_terminal
+    state.fault = "before-space"
+    directory = executor._bridge_dir
+    old_private, new_private = tmp_path / "old-terminal", tmp_path / "new-terminal"
+    old_private.mkdir()
+    new_private.mkdir()
+    old_socket = old_private / "tmux.sock"
+    new_socket = old_socket if replacement == "new-pane" else new_private / "tmux.sock"
+    old_target, new_target = "old:0.0", "replacement:0.0"
+    claude_bridge.write_tmux_target(directory, socket_path=old_socket, tmux_target=old_target)
+    observed = []
+
+    def gone(socket_path, target):
+        assert state.ready_returns == 1
+        assert (socket_path, target) == (str(old_socket), old_target)
+        if replacement == "missing":
+            (directory / "tmux.json").unlink()
+        elif replacement != "unchanged":
+            claude_bridge.write_tmux_target(
+                directory, socket_path=new_socket, tmux_target=new_target
+            )
+        return claude_bridge._ClaudePaneState(False, exited=True, exit_status="7")
+
+    def tmux(socket_path, *args, **kwargs):
+        observed.append((socket_path, args))
+        assert args[0] == "kill-session"
+
+    monkeypatch.setattr(claude_bridge, "_claude_pane_state", gone)
+    monkeypatch.setattr(claude_bridge, "_run_tmux", tmux)
+    monkeypatch.setattr(claude_native_executor, "kill_session", claude_bridge.kill_session)
+    receipt = build_native_input_receipt(
+        [{"type": "input_text", "text": "Synthetic original"}],
+        {"pending_id": "pending_" + "d" * 32, "delivery_attempt_id": "e" * 32},
+    )
+    assert receipt is not None
+    with native_input_receipt_scope(receipt):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "Synthetic original"}], [], ""
+            )
+        ]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert claude_bridge.read_active_session_id(directory) == "source-delivery-session"
+    assert state.loads == state.pastes == state.enters == 0
+    markers = {
+        str(private): (
+            claude_bridge.pane_killed_by_omnigent(private),
+            claude_bridge.pane_closed_by_omnigent(private),
+        )
+        for private in (old_private, new_private)
+    }
+    if replacement == "unchanged":
+        assert events[0].undelivered is True
+        assert observed == []
+        assert not any(killed or expected for killed, expected in markers.values()), markers
+    else:
+        assert observed == [], (observed, markers)
+        assert not any(killed or expected for killed, expected in markers.values()), markers
+        assert events[0].undelivered is False
+
+
+@pytest.mark.asyncio
+async def test_unpublished_same_target_relaunch_cannot_be_reaped_by_old_failure(
+    source_delivery_terminal, tmp_path, monkeypatch
+):
+    from omnigent.inner import terminal
+
+    executor, _, state = source_delivery_terminal
+    state.fault = "before-space"
+    private = tmp_path / "reused-terminal"
+    private.mkdir()
+    socket_path = private / "tmux.sock"
+    instance = terminal.TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=socket_path,
+        private_dir=private,
+        command="synthetic-cli",
+        inherit_env=False,
+    )
+    launches = []
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def create_process(*args, **kwargs):
+        assert kwargs["env"] == {"TERM": "synthetic"}
+        launches.append(args)
+        return Process()
+
+    monkeypatch.setattr(terminal, "terminal_pane_environment", lambda **_: {"TERM": "synthetic"})
+    launch_asyncio = SimpleNamespace(**vars(asyncio))
+    launch_asyncio.create_subprocess_exec = create_process
+    monkeypatch.setattr(terminal, "asyncio", launch_asyncio)
+    claude_bridge.write_tmux_target(
+        executor._bridge_dir, socket_path=socket_path, tmux_target=instance.tmux_target
+    )
+    advertisement = (executor._bridge_dir / "tmux.json").read_bytes()
+    await instance.launch()
+    loop = asyncio.get_running_loop()
+
+    def gone(socket, target):
+        assert state.ready_returns == 1
+        assert (socket, target) == (str(socket_path), "main")
+        instance.running = False
+        asyncio.run_coroutine_threadsafe(instance.launch(), loop).result(timeout=5)
+        assert instance.running and len(launches) == 2
+        assert (executor._bridge_dir / "tmux.json").read_bytes() == advertisement
+        return claude_bridge._ClaudePaneState(False, exited=True, exit_status="7")
+
+    observed = []
+    monkeypatch.setattr(claude_bridge, "_claude_pane_state", gone)
+    monkeypatch.setattr(
+        claude_bridge, "_run_tmux", lambda socket, *args, **_: observed.append((socket, args))
+    )
+    monkeypatch.setattr(claude_native_executor, "kill_session", claude_bridge.kill_session)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [{"role": "user", "content": "Synthetic original"}], [], ""
+        )
+    ]
+    assert len(launches) == 2 and launches[0] == launches[1]
+    assert "new-session" in launches[0] and str(socket_path) in launches[0]
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert state.loads == state.pastes == state.enters == 0
+    assert observed == []
+    assert not claude_bridge.pane_killed_by_omnigent(private)
+    assert not claude_bridge.pane_closed_by_omnigent(private)
+
+
+@pytest.mark.asyncio
+async def test_prewrite_logical_hold_keeps_input_identity_across_endpoint_change(
+    source_delivery_terminal, tmp_path, monkeypatch
+):
+    from omnigent.native.input_receipt import (
+        build_native_input_receipt,
+        current_native_input_receipt,
+        native_input_receipt_scope,
+    )
+    from tests.harnesses.claude_native import test_claude_native_bridge as scenarios
+
+    executor, original_composer, _ = source_delivery_terminal
+    original_composer.text = "Synthetic terminal-owned draft"
+    original_composer.cursor = len(original_composer.text)
+    replacement = scenarios._EditableComposer("", cursor=0)
+    old_socket, new_socket = tmp_path / "old.sock", tmp_path / "new.sock"
+    claude_bridge.write_tmux_target(
+        executor._bridge_dir, socket_path=old_socket, tmux_target="main"
+    )
+    sent = []
+    held = []
+
+    def composer(socket):
+        assert socket in {str(old_socket), str(new_socket)}
+        return original_composer if socket == str(old_socket) else replacement
+
+    def capture(socket, target, **kwargs):
+        assert target == "main"
+        return composer(socket)._capture_pane(socket, target)
+
+    def send(socket, *args, **kwargs):
+        sent.append((socket, args))
+        if args[0] != "resize-window":
+            composer(socket)._run_tmux(socket, *args)
+
+    real_hold = ClaudeNativeExecutor._hold_message
+
+    async def hold(refusal, deadline):
+        owner = refusal.__dict__["_claude_original_input_failure"].owner
+        assert owner.undelivered(refusal)
+        held.append((owner, refusal, current_native_input_receipt()))
+        claude_bridge.write_tmux_target(
+            executor._bridge_dir, socket_path=new_socket, tmux_target="main"
+        )
+        return await real_hold(executor, refusal, deadline)
+
+    monkeypatch.setattr(claude_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_bridge, "_run_tmux", send)
+    monkeypatch.setattr(executor, "_hold_message", hold)
+    receipt = build_native_input_receipt(
+        [{"type": "input_text", "text": "Synthetic held web input"}],
+        {"pending_id": "pending_" + "d" * 32, "delivery_attempt_id": "e" * 32},
+    )
+    assert receipt is not None
+    with native_input_receipt_scope(receipt):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "Synthetic held web input"}], [], ""
+            )
+        ]
+        assert current_native_input_receipt() == receipt
+        assert len(held) == 1 and held[0][2] == receipt
+        assert not held[0][0].undelivered(held[0][1])
+    assert events == [TurnComplete(response=None)]
+    assert original_composer.text == "Synthetic terminal-owned draft"
+    assert replacement.submitted == ["Synthetic held web input\n"]
+    payloads = [
+        (socket, args[0]) for socket, args in sent if args[0] in {"load-buffer", "paste-buffer"}
+    ]
+    assert payloads == [(str(new_socket), "load-buffer"), (str(new_socket), "paste-buffer")]
+    assert not any(args[0] == "kill-session" for _, args in sent)
+
+
+@pytest.mark.asyncio
+async def test_steering_inactive_guard_after_load_boundary_is_still_ambiguous(
+    source_delivery_terminal, monkeypatch
+):
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+
+    executor, _, state = source_delivery_terminal
+    state.fault = "normal"
+    attempted = []
+    send = claude_bridge._run_tmux
+
+    def change_binding(socket, *args, **kwargs):
+        if args[0] == "load-buffer":
+            attempted.append(args[0])
+            (executor._bridge_dir / "bridge.json").write_text(
+                '{"active_session_id":"synthetic-replacement"}'
+            )
+            executor._check_active_session()
+        return send(socket, *args, **kwargs)
+
+    monkeypatch.setattr(claude_bridge, "_run_tmux", change_binding)
+    with pytest.raises(InjectionDeliveryAmbiguous):
+        await executor.enqueue_session_message("source-delivery-session", "Synthetic steering")
+    assert state.ready_returns == 1
+    assert attempted == ["load-buffer"]
+    assert state.pastes == state.enters == 0
+
+
+@pytest.mark.asyncio
+async def test_source_steering_success_keeps_its_one_owned_write(source_delivery_terminal):
+    executor, composer, state = source_delivery_terminal
+    state.fault = "normal"
+    assert await executor.enqueue_session_message("source-delivery-session", "Synthetic steering")
+    assert state.loads == state.pastes == state.enters == 1
+    assert composer.submitted == ["Synthetic steering\n"]

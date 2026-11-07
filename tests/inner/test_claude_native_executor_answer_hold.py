@@ -19,6 +19,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeInputBoxOccupied,
     ClaudeTerminalDialog,
     ClaudeUserPromptPending,
+    _mark_input_payload_write,
+    _track_input_delivery,
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
@@ -70,6 +72,8 @@ class _Pane:
             refusal = self.refusals.pop(0)
             if isinstance(refusal, Exception):
                 raise refusal
+            if not refusal:
+                _mark_input_payload_write()
             prompt = ClaudeUserPromptPending(_REFUSAL)
             prompt.nothing_typed = refusal
             raise prompt
@@ -110,7 +114,11 @@ class _Pane:
 @pytest.fixture
 def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     fake = _Pane(refusals=[True], pending_polls=2)
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake.inject_user_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        _track_input_delivery(original=True)(fake.inject_user_message),
+    )
     # raising=False: main has neither, so these tests fail there on behaviour.
     monkeypatch.setattr(
         claude_native_executor,
@@ -189,7 +197,7 @@ async def test_a_refusal_after_typing_began_is_reported_at_once(
 
     assert len(events) == 1 and isinstance(events[0], ExecutorError)
     assert events[0].message == _REFUSAL
-    assert events[0].undelivered is True
+    assert events[0].undelivered is False
     assert pane.deliveries == 1
     assert pane.polls == 0
 
@@ -516,6 +524,7 @@ async def test_a_safe_hold_keeps_the_original_input_identity(pane, tmp_path, mon
     pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
     inject = pane.inject_user_message
 
+    @_track_input_delivery(original=True)
     def record(*args, **kwargs):
         observed.append(current_input_attributes())
         inject(*args, **kwargs)
