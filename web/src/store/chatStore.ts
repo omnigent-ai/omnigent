@@ -5246,8 +5246,8 @@ async function bindStream(
     // the reader sees as the transcript shifting seconds after it settled.
     const client = queryClient;
     // Each request retries on its own, so a failed one doesn't repeat the other.
-    // Set when the last session read timed out, so its retry can tell that the shared
-    // read it may have joined is the one that never answers.
+    // Set once a session read times out, and kept set through later failures: the shared
+    // read it may have joined is still the one that never answers.
     let sessionReadTimedOut = false;
     const [session, page] = await Promise.all([
       withSnapshotRetries(id, (attempt) =>
@@ -5279,7 +5279,9 @@ async function bindStream(
             retry: false,
           });
         }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
-          sessionReadTimedOut = error instanceof DOMException && error.name === "TimeoutError";
+          if (error instanceof DOMException && error.name === "TimeoutError") {
+            sessionReadTimedOut = true;
+          }
           throw error;
         }),
       ),

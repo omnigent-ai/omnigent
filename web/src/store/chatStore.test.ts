@@ -3293,13 +3293,23 @@ describe("chatStore — send (first-send ordering)", () => {
       expect(client.isFetching({ queryKey: ["session", "conv_joined_load"], exact: true })).toBe(1);
     });
 
-    it("recovers a load stuck on a shared read that never answers after its first deadline", async () => {
+    it("recovers a load stuck on a shared read that never answers, even past a transient 503", async () => {
       vi.useFakeTimers();
       seedSession("conv_stuck_join", []);
       // Another caller's read of the same session, which the server never answers.
       void client.fetchQuery({
         queryKey: ["session", "conv_stuck_join"],
         queryFn: () => new Promise(() => {}),
+      });
+      // The first direct read after the timeout gets a temporary 503; later reads succeed.
+      let directReads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input).split("?")[0];
+        if (path === "/v1/sessions/conv_stuck_join" && (init?.method ?? "GET") === "GET") {
+          directReads += 1;
+          if (directReads === 1) return mockResponse({}, { ok: false, status: 503 });
+        }
+        return defaultFetchHandler(input, init);
       });
 
       void useChatStore.getState().switchTo("conv_stuck_join");
@@ -3308,7 +3318,8 @@ describe("chatStore — send (first-send ordering)", () => {
         loadingConversation: true,
       });
 
-      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(SESSION_READ_TIMEOUT_MS);
+      expect(directReads).toBeGreaterThanOrEqual(2);
       expect(conversationRegistry.peek("conv_stuck_join")!.getState()).toMatchObject({
         loadingConversation: false,
         conversationLoadError: null,
