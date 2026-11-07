@@ -1237,6 +1237,7 @@ def register_core_routes(
                 permission_store,
                 parent_id=body.parent_session_id,
                 host_id=body.host_id,
+                host_type=body.host_type,
             )
             if body.initial_items:
                 raise OmnigentError(
@@ -1495,6 +1496,7 @@ def register_core_routes(
                 permission_store,
                 parent_id=parsed_metadata.parent_session_id,
                 host_id=parsed_metadata.host_id,
+                host_type=parsed_metadata.host_type,
             )
             if (
                 "project_id" in parsed_metadata.model_fields_set
@@ -3519,6 +3521,23 @@ def register_core_routes(
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
+                    if (
+                        conv.family_id is not None
+                        and runner_id != conv.runner_id
+                        and request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS)
+                    ):
+                        from omnigent.server.session_families import require_sibling_destination
+
+                        runner_hosts = await asyncio.to_thread(
+                            conversation_store.get_runner_host_ids, runner_id
+                        )
+                        await asyncio.to_thread(
+                            require_sibling_destination,
+                            request,
+                            conv.host_id,
+                            host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
+                            host_type="external",
+                        )
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,

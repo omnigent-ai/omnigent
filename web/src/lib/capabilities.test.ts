@@ -333,6 +333,19 @@ describe("resolveServerInfo session_bundle_workspaces", () => {
   });
 });
 
+describe("resolveServerInfo sibling_session_destinations", () => {
+  it.each([
+    ["current_host", "current_host"],
+    ["current_host_or_new_sandbox", "current_host_or_new_sandbox"],
+    ["any_host", "any_host"],
+    [undefined, "any_host"],
+    ["connected_hosts", "current_host"],
+  ])("parses %s as %s", async (advertised, expected) => {
+    const parsed = await probe({ sibling_session_destinations: advertised });
+    expect(parsed.sibling_session_destinations).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo session_fork_workspaces", () => {
   it.each([
     [true, true],
