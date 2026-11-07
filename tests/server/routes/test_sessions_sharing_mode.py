@@ -44,11 +44,14 @@ from omnigent.server.auth import (
 )
 from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.sharing_settings import (
+    SiblingSessionDestinations,
     read_public_sharing_override,
     read_sharing_mode_override,
+    read_sibling_session_destinations_override,
     resolve_sharing_mode_path,
     write_public_sharing_override,
     write_sharing_mode_override,
+    write_sibling_session_destinations_override,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -841,6 +844,83 @@ def test_peer_messaging_override_values(
     assert sharing_settings.peer_session_messaging_enabled(resolve_feature_flags({})) is enabled
 
 
+def test_sibling_destination_override_is_live_and_defaults_to_any_host(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _build_app(db_uri, tmp_path)
+    assert app.state.sibling_session_destinations() is SiblingSessionDestinations.ANY_HOST
+    assert read_sibling_session_destinations_override() is None
+
+    write_sibling_session_destinations_override(
+        SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+    )
+    assert (
+        app.state.sibling_session_destinations()
+        is SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+    )
+
+
+@pytest.mark.parametrize("operation", ["stat", "read_text"])
+def test_unreadable_sibling_destination_override_stays_restricted(
+    tmp_path, monkeypatch, operation
+):
+    monkeypatch.setattr(sharing_settings, "resolve_data_dir", lambda: tmp_path)
+    write_sibling_session_destinations_override(SiblingSessionDestinations.ANY_HOST)
+    assert read_sibling_session_destinations_override() is SiblingSessionDestinations.ANY_HOST
+
+    def unreadable(*args, **kwargs):
+        raise PermissionError("policy unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, operation, unreadable)
+        assert (
+            read_sibling_session_destinations_override() is SiblingSessionDestinations.CURRENT_HOST
+        )
+
+
+@pytest.mark.parametrize("contents", [b"", b"typo", b"\xff"])
+def test_invalid_sibling_destination_file_stays_restricted(tmp_path, monkeypatch, contents):
+    monkeypatch.setattr(sharing_settings, "resolve_data_dir", lambda: tmp_path)
+    (tmp_path / "sibling_session_destinations").write_bytes(contents)
+    assert read_sibling_session_destinations_override() is SiblingSessionDestinations.CURRENT_HOST
+
+
+async def test_admin_updates_sibling_destinations_and_info_live(
+    db_uri: str, tmp_path: Path
+) -> None:
+    app = _admin_app(db_uri, tmp_path)
+    async with _client(app, _ADMIN) as client:
+        state = (await client.get("/v1/sharing")).json()
+        assert state["sibling_session_destinations"] == "any_host"
+        assert state["sibling_session_destinations_options"] == [
+            "current_host",
+            "current_host_or_new_sandbox",
+            "any_host",
+        ]
+
+        updated = await client.put(
+            "/v1/sharing",
+            json={"sibling_session_destinations": "current_host_or_new_sandbox"},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["sibling_session_destinations"] == ("current_host_or_new_sandbox")
+        assert (await client.get("/v1/info")).json()["sibling_session_destinations"] == (
+            "current_host_or_new_sandbox"
+        )
+        assert (
+            read_sibling_session_destinations_override()
+            is SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+        )
+
+        invalid = await client.put(
+            "/v1/sharing", json={"sibling_session_destinations": "other_sandbox"}
+        )
+        assert invalid.status_code == 400, invalid.text
+        assert app.state.sibling_session_destinations() is (
+            SiblingSessionDestinations.CURRENT_HOST_OR_NEW_SANDBOX
+        )
+
+
 # ── Public-access switch (OMNIGENT_PUBLIC_SHARING) ───────────────────
 
 
@@ -1083,3 +1163,8 @@ async def test_read_only_grantee_cannot_edit_other_labels(db_uri: str, tmp_path:
             json={"labels": {"omnigent.pinned": "1721760000000", "omni_project": "Moonshot"}},
         )
         assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.parametrize("value", [None, "", "typo", 7])
+def test_sibling_destinations_coerce_fails_closed(value) -> None:
+    assert SiblingSessionDestinations.coerce(value) is SiblingSessionDestinations.CURRENT_HOST

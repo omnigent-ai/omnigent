@@ -9717,6 +9717,40 @@ def test_profiled_host_rollback_preserves_prior_and_newer_bindings(
         assert profiles.get_session_host_id(conversation.id) is None
 
 
+@pytest.mark.parametrize("sandbox_id", [None, "sandbox"])
+def test_host_transfer_rollback_keeps_session_rebindable_after_source_deletion(
+    conversation_store, db_uri, sandbox_id
+):
+    hosts = HostStore(db_uri)
+    previous_host_id, target_host_id = uuid.uuid4().hex, uuid.uuid4().hex
+    hosts.register_managed_host(
+        host_id=previous_host_id,
+        name="previous-host",
+        user_id=RESERVED_USER_LOCAL,
+        token="launch-token",
+        provider="modal",
+        sandbox_id=sandbox_id,
+        token_expires_at=2_000_000_000,
+    )
+    hosts.upsert_on_connect(target_host_id, "target-host", RESERVED_USER_LOCAL)
+    conversation = conversation_store.create_conversation(
+        host_id=previous_host_id, workspace="/previous"
+    )
+    previous = conversation_store.get_profile_host_binding(conversation.id)
+    assert conversation_store.set_runner_id(conversation.id, "attempt")
+    conversation_store.set_host_id(conversation.id, target_host_id, "/workspace", "launch")
+    hosts.delete_host(previous_host_id)
+
+    assert conversation_store.rollback_profiled_host(
+        previous, expected_host_id=target_host_id, expected_runner_id="attempt"
+    )
+    current = conversation_store.get_conversation(conversation.id)
+    assert current.runner_id is None and current.host_id is None
+    assert current.workspace is None and current.git_branch is None
+    assert conversation_store.set_runner_id(conversation.id, "retry")
+    conversation_store.set_host_id(conversation.id, target_host_id, "/workspace")
+
+
 @pytest.mark.parametrize("change", ["profile", "workspace"])
 def test_profiled_host_binding_rejects_stale_rollback_state(conversation_store, db_uri, change):
     from omnigent.stores.sandbox_profile_store import SandboxProfileStore

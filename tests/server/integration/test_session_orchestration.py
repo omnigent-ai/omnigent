@@ -1668,6 +1668,171 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert response.status_code == 403, response.text
 
 
+@pytest.mark.parametrize(
+    "policy,target,allowed,transport",
+    [
+        (policy, target, allowed, transport)
+        for policy, target, allowed in [
+            ("current_host", "current", True),
+            ("current_host", "other", False),
+            ("current_host", "managed", False),
+            ("current_host", "unbound", False),
+            ("current_host_or_new_sandbox", "current", True),
+            ("current_host_or_new_sandbox", "other", False),
+            ("current_host_or_new_sandbox", "managed", True),
+            ("current_host_or_new_sandbox", "unbound", False),
+            ("any_host", "current", True),
+            ("any_host", "other", True),
+            ("any_host", "managed", True),
+            ("any_host", "unbound", True),
+        ]
+        for transport in ("json", "bundled", "orchestrated")
+        if transport != "orchestrated" or target in {"current", "managed"}
+    ],
+)
+async def test_sibling_destination_policy_is_enforced_before_creation(
+    auth_client, auth_app, peers, db_uri, monkeypatch, policy, target, allowed, transport
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, _, _ = peers
+    source_host, other_host = uuid4().hex, uuid4().hex
+    for host_id in (source_host, other_host):
+        _register_online_host(auth_app, host_id, "alice")
+        auth_app.state.host_store.upsert_on_connect(host_id, host_id, "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(source["id"], source_host, workspace="/source")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+
+    traffic = []
+
+    def answer_host(connection, payload):
+        traffic.append(payload)
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+
+    async def finish_managed_launch(**kwargs):
+        traffic.append(kwargs)
+
+    monkeypatch.setattr(routes_core, "_run_managed_launch", finish_managed_launch)
+    body = {"agent_id": source["agent_id"], "sibling_source_id": source["id"]}
+    if target in {"current", "other"}:
+        body.update(
+            {
+                "host_id": source_host if target == "current" else other_host,
+                "workspace": f"/{target}",
+            }
+        )
+    elif target == "managed":
+        body["host_type"] = "managed"
+
+    before = {session.id for session in store.list_conversations().data}
+    if transport == "bundled":
+        from tests.server.integration.test_sessions_permissions import build_agent_bundle
+
+        body.pop("agent_id")
+        response = await auth_client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(body)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(name="policy-worker"),
+                    "application/gzip",
+                )
+            },
+        )
+    elif transport == "orchestrated":
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        # Runners identify the source through the header; the server derives placement.
+        for key in ("sibling_source_id", "host_id", "workspace"):
+            body.pop(key, None)
+        response = await auth_client.post(
+            "/v1/sessions/orchestrated",
+            json=body,
+            headers={
+                ORCHESTRATION_SOURCE_HEADER: source["id"],
+            },
+        )
+    else:
+        response = await auth_client.post("/v1/sessions", json=body)
+    assert response.status_code == (201 if allowed else 403), response.text
+    created = {session.id for session in store.list_conversations().data} - before
+    assert len(created) == int(allowed)
+    if not allowed:
+        assert "server policy" in response.text
+        assert traffic == []
+
+
+@pytest.mark.parametrize(
+    "policy,binding,enabled,allowed",
+    [
+        (policy, binding, True, binding == "same")
+        for policy in ("current_host", "current_host_or_new_sandbox")
+        for binding in ("same", "other", "unbound", "unknown", "ambiguous")
+    ]
+    + [
+        ("any_host", "unbound", True, True),
+        ("current_host", "unbound", False, True),
+    ],
+)
+async def test_sibling_destination_policy_checks_runner_reassignment(
+    auth_client, auth_app, peers, db_uri, policy, binding, enabled, allowed
+):
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+
+    source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    if binding != "unknown":
+        store.set_host_id(source["id"], host_id, workspace="/source")
+    if binding != "unbound":
+        target_host = uuid4().hex if binding == "other" else host_id
+        store.set_host_id(target["id"], target_host, workspace="/target")
+    runner_id = store.get_conversation(source["id"]).runner_id
+    if binding == "ambiguous":
+        store.create_conversation(
+            agent_id=None, host_id=uuid4().hex, workspace="/other", runner_id=runner_id
+        )
+    store.add_new_sibling(source["id"], target["id"], user_id="alice")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+    if not enabled:
+        auth_app.state.feature_flags = resolve_feature_flags(
+            {FEATURES_ENV_VAR: "-sibling_sessions"}
+        )
+    previous = store.get_conversation(target["id"])
+    captured.clear()
+
+    response = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"runner_id": runner_id}
+    )
+
+    assert response.status_code == (200 if allowed else 403), response.text
+    saved = store.get_conversation(target["id"])
+    assert saved.host_id == previous.host_id
+    assert saved.workspace == previous.workspace
+    if allowed:
+        assert saved.runner_id == runner_id
+        assert captured.get("posts")
+    else:
+        assert saved.runner_id == previous.runner_id
+        assert "server policy" in response.text
+        assert not captured.get("posts")
+
+
 async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):
     source, _, _ = peers
     response = await auth_client.post(

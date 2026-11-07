@@ -450,6 +450,7 @@ struct OmnigentWebView: UIViewRepresentable {
     private let contextResult: Result<DatabricksWebContext?, Error>
     fileprivate let webStore: DatabricksWebStore?
     private let workspaceBootstrap: DatabricksWorkspaceBootstrap
+    private let workspaceSessionClient = DatabricksSessionClient()
     private var workspaceSession: DatabricksWebSession?
     private var authenticationTask: Task<Void, Never>?
     private var navigationID = UUID()
@@ -769,12 +770,25 @@ struct OmnigentWebView: UIViewRepresentable {
         let cookies = await webStore.cookies()
         guard let self, !Task.isCancelled, navigationID == id, let view = webView, isCurrent(view)
         else { return }
-        activationTask = nil
-        if !cookies.contains(where: {
-          $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
-            && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
-        }) {
+        defer { if navigationID == id { activationTask = nil } }
+        guard
+          let cookie = cookies.first(where: {
+            $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
+              && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
+          })
+        else {
           requestWorkspaceRecovery()
+          return
+        }
+        // A cookie outlives its server session (idle timeout, revocation), so ask the workspace.
+        let verdict = await workspaceSessionClient.verify(pageURL: pageURL, cookie: cookie)
+        guard !Task.isCancelled, navigationID == id, authenticationTask == nil,
+          let view = webView, isCurrent(view)
+        else { return }
+        switch verdict {
+        case .expired: requestWorkspaceRecovery()
+        case .forbidden: showWorkspaceFailure(DatabricksSessionError.rejected(403))
+        case .accepted, .unknown: break
         }
       }
     }
