@@ -74,6 +74,7 @@ from omnigent.onboarding.sandboxes.kubernetes import (
     _ensure_sdk,
     _format_api_error,
     _token_secret_name,
+    owner_reference,
 )
 
 if TYPE_CHECKING:
@@ -357,7 +358,9 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
     # ── lifecycle ───────────────────────────────────────────
 
-    def _create_workload(self, namespace: str, manifest: dict[str, object]) -> None:
+    def _create_workload(
+        self, namespace: str, manifest: dict[str, object]
+    ) -> dict[str, object] | None:
         """
         Create the ``Sandbox`` custom resource, or wake the one already there.
 
@@ -372,6 +375,9 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
 
         :param namespace: Namespace to create the ``Sandbox`` in.
         :param manifest: The manifest from ``build_job_manifest``.
+        :returns: An owner reference to the ``Sandbox`` (created or woken), so
+            its token Secret is collected with it, or ``None`` when the
+            response carries no uid.
         """
         from kubernetes.client.rest import ApiException
 
@@ -382,7 +388,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
         )
         custom = self._load_custom()
         try:
-            custom.create_namespaced_custom_object(
+            created = custom.create_namespaced_custom_object(
                 API_GROUP,
                 API_VERSION,
                 namespace,
@@ -390,14 +396,14 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                 body,
                 _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
             )
-            return
+            return owner_reference(f"{API_GROUP}/{API_VERSION}", "Sandbox", created)
         except ApiException as exc:
             if getattr(exc, "status", None) != 409:
                 raise
         spec = dict(body["spec"])  # type: ignore[arg-type]
         spec.pop("volumeClaimTemplates", None)
         click.echo(f"  → waking suspended agent-sandbox '{body['metadata']['name']}'")  # type: ignore[index]
-        custom.patch_namespaced_custom_object(
+        woken = custom.patch_namespaced_custom_object(
             API_GROUP,
             API_VERSION,
             namespace,
@@ -412,6 +418,7 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             "patched agent-sandbox '%s' back to Running (idle wake)",
             body["metadata"]["name"],  # type: ignore[index]
         )
+        return owner_reference(f"{API_GROUP}/{API_VERSION}", "Sandbox", woken)
 
     def _find_job_pod(self, namespace: str, job_name: str) -> str | None:
         """
