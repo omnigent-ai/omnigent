@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -54,19 +55,19 @@ def _make_runner(
     ),
     *,
     safe_detail: str = "safe detail",
-    bridge_is_inactive: Callable[[str, object], bool] | None = None,
+    bridge_is_inactive: Callable[[str, object | None, Path], bool] | None = None,
 ) -> CodexGoalRunner:
-    async def _bridge_state_for_session(
+    async def _bridge_state_and_dir_for_session(
         conv_id: str,
         *,
         action: str,
         missing_state_log_level: int = logging.WARNING,
-    ) -> object | None:
+    ) -> tuple[object | None, Path]:
         del conv_id, action, missing_state_log_level
-        return bridge_state
+        return bridge_state, Path("/tmp/codex-bridge")
 
     return CodexGoalRunner(
-        bridge_state_for_session=_bridge_state_for_session,
+        bridge_state_and_dir_for_session=_bridge_state_and_dir_for_session,
         client_safe_error_detail=lambda exc, *, context: f"{safe_detail}: {context}: {exc}",
         logger=logging.getLogger("tests.codex_goal_runner"),
         bridge_is_inactive=bridge_is_inactive,
@@ -164,6 +165,35 @@ async def test_request_returns_bridge_error_without_loaded_bridge() -> None:
         "error": "codex_native_goal_failed",
         "detail": "Codex-native goal read requires a loaded Codex bridge.",
     }
+
+
+@pytest.mark.parametrize(
+    ("method", "inactive", "empty"),
+    [
+        ("thread/goal/get", True, True),
+        ("thread/goal/get", False, False),
+        ("thread/goal/set", True, False),
+    ],
+)
+async def test_missing_inactive_bridge_only_changes_read(
+    method: str,
+    inactive: bool,
+    empty: bool,
+) -> None:
+    def bridge_is_inactive(_conv_id: str, state: object | None, _bridge_dir: Path) -> bool:
+        assert state is None
+        return inactive
+
+    result = await _make_runner(
+        None,
+        bridge_is_inactive=bridge_is_inactive,
+    )._request("conv_1", action="read", method=method, params={})
+
+    if empty:
+        assert result == {"goal": None}
+    else:
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 502
 
 
 @pytest.mark.asyncio
@@ -269,7 +299,15 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
         "omnigent.harnesses.codex_native.app_server",
         SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
     )
-    runner = _make_runner(bridge_is_inactive=lambda _conv_id, _state: True)
+
+    def bridge_is_inactive(
+        _conv_id: str,
+        _state: object | None,
+        _bridge_dir: Path,
+    ) -> bool:
+        return True
+
+    runner = _make_runner(bridge_is_inactive=bridge_is_inactive)
 
     result = await runner._request("conv_1", action="read", method=method, params={})
 
