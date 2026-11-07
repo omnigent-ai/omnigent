@@ -64,6 +64,8 @@ _APPROVAL_SETTLE_TIMEOUT_S = 0.5
 _CLEAR_SETTLE_TIMEOUT_S = 2.0
 _DRAFT_NEEDLE_MAX_CHARS = 24
 _PASTE_PLACEHOLDER_RE = re.compile(r"\[paste #(\d+) (?:(?:\+(\d+) lines?)|(?:(\d+) chars))\]")
+# Kimi labels the editor frame's border with the rows scrolled out of view.
+_EDITOR_SCROLL_MARKER_RE = re.compile(r"([↑↓])\s*\d+\s*more")
 _TRUST_HEADER = "Trust this folder?"
 # Anchor on the accept-option label, not the modal's body prose: the body copy
 # has been reworded between kimi releases while the option row has stayed put.
@@ -110,6 +112,7 @@ class _KimiPaneState:
     input_line: str | None
     input_content: str | None
     editor_content: str | None
+    editor_scrolled_to_end: bool
     footer_visible: bool
     menu_visible: bool
     menu_chrome_visible: bool
@@ -377,6 +380,19 @@ def _is_box_row(line: str) -> bool:
     return stripped.startswith("│") and stripped.endswith("│")
 
 
+def _editor_scrolled_to_end(lines: tuple[str, ...], bounds: tuple[int, int] | None) -> bool:
+    """True when the frame labels hide rows above the editor viewport but none below."""
+    if bounds is None:
+        return False
+    markers = {
+        match.group(1)
+        for index in bounds
+        if lines[index].strip()[:1] in ("╭", "╰")
+        for match in _EDITOR_SCROLL_MARKER_RE.finditer(lines[index])
+    }
+    return markers == {"↑"}
+
+
 def _input_box_frame_bounds(pane: str) -> tuple[int, int] | None:
     lines = pane.splitlines()
     frame_start: int | None = None
@@ -546,6 +562,7 @@ def _parse_pane(pane: str, *, turn_streaming: bool = False) -> _KimiPaneState:
         input_line=input_line,
         input_content=_input_content_from_line(input_line),
         editor_content=_editor_content_from_frame(lines, bounds),
+        editor_scrolled_to_end=_editor_scrolled_to_end(lines, bounds),
         footer_visible=footer_visible,
         menu_visible=menu_visible,
         menu_chrome_visible=menu_chrome_visible,
@@ -634,6 +651,15 @@ def _normalized_contains(content: str, expected: str) -> bool:
     return normalized_expected.replace(" ", "") in normalized_content.replace(" ", "")
 
 
+def _normalized_endswith(text: str, tail: str) -> bool:
+    """True when *text* ends with *tail*, with the same wrap tolerance as above."""
+    normalized_text = _normalize_screen_text(text)
+    normalized_tail = _normalize_screen_text(tail)
+    if normalized_text.endswith(normalized_tail):
+        return True
+    return normalized_text.replace(" ", "").endswith(normalized_tail.replace(" ", ""))
+
+
 def _draft_visible_in_editor(
     state: _KimiPaneState,
     needle: str,
@@ -661,7 +687,11 @@ def _draft_visible_in_editor(
         )
     if expected_content is not None:
         expected = _paste_payload_bytes(expected_content).decode("utf-8")
-        return _normalized_contains(content, expected)
+        if _normalized_contains(content, expected):
+            return True
+        # A scrolled editor shows only the rows at the cursor, which sits at the end
+        # of a landed paste: accept the visible tail when rows are hidden above only.
+        return state.editor_scrolled_to_end and _normalized_endswith(expected, content)
     if needle:
         return _normalized_contains(content, needle)
     return not needle

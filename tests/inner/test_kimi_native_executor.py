@@ -542,6 +542,26 @@ class TestSettlePaneReadiness:
         assert kimi_native_bridge._draft_in_input_box(draft, "literal $ and ✨ marker")
         assert not kimi_native_bridge._draft_in_input_box(submitted, "literal $ and ✨ marker")
 
+    def test_scrolled_editor_frame_is_ready_and_flagged(self) -> None:
+        state = kimi_native_bridge._parse_pane(_fixture("editor_scrolled_10_more.txt"))
+        assert state.ready
+        assert state.editor_scrolled_to_end
+        assert state.editor_content is not None
+        assert state.editor_content.startswith("Section 2:")
+        unscrolled = kimi_native_bridge._parse_pane(_fixture("first_boot_empty.txt"))
+        assert not unscrolled.editor_scrolled_to_end
+
+    def test_scroll_marker_inside_draft_text_is_not_a_scrolled_frame(self) -> None:
+        pane = "\n".join(
+            [
+                " ╭────────────────────╮",
+                " │ > show ↑ 3 more rows │",
+                " ╰────────────────────╯",
+                " context: 0%",
+            ]
+        )
+        assert not kimi_native_bridge._parse_pane(pane).editor_scrolled_to_end
+
     def test_editor_frame_context_ignores_menu_text_and_anchors_first_marker(self) -> None:
         pane = "\n".join(
             [
@@ -1032,6 +1052,81 @@ class TestUserMessageInjection:
         )
         inject_user_message(tmp_path / "bridge", content=content)
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_submits_long_paste_when_editor_scrolls(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Real 80-column pane: the editor scrolled ("↑ 10 more") and shows only the tail.
+        sentence = "Receive this harmless dispatch and preserve all its words. "
+        sections = "\n".join(f"Section {index}: " + sentence * 5 for index in range(3))
+        content = f"{sections}\nReply only ACK."
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("editor_scrolled_10_more.txt"),),
+            sticky_post_paste=True,
+        )
+        inject_user_message(tmp_path / "bridge", content=content)
+        assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter"]
+
+    def test_submits_long_paste_when_editor_scrolls_during_running_turn(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sentence = "Receive this harmless dispatch and preserve all its words. "
+        sections = "\n".join(f"Section {index}: " + sentence * 5 for index in range(3))
+        content = f"{sections}\nReply only ACK."
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("editor_scrolled_10_more.txt"),),
+            sticky_post_paste=True,
+        )
+        inject_user_message(tmp_path / "bridge", content=content, turn_streaming=True)
+        assert [args[-1] for args in sent if args[0] == "send-keys"] == ["Enter", "C-s"]
+
+    @pytest.mark.parametrize("case", ["stale", "wrong-tail", "no-scroll", "hidden-below"])
+    def test_scrolled_editor_tail_must_belong_to_the_paste(self, case: str) -> None:
+        pane = _fixture("editor_scrolled_10_more.txt")
+        state = kimi_native_bridge._parse_pane(pane)
+        assert state.editor_bounds is not None and state.editor_content
+        top, bottom = state.editor_bounds
+        lines = pane.splitlines()
+        expected = "Hidden prefix\n" + state.editor_content
+        previous = ""
+        if case == "stale":
+            previous = state.editor_content
+        elif case == "wrong-tail":
+            expected += "\nmissing closing line"
+        elif case == "no-scroll":
+            lines[top] = lines[top].replace(" ↑ 10 more ", "─" * 11)
+        else:
+            lines[bottom] = lines[bottom].replace("─" * 10, " ↓ 2 more ", 1)
+        assert not kimi_native_bridge._draft_visible_in_editor(
+            kimi_native_bridge._parse_pane("\n".join(lines)),
+            "Hidden prefix",
+            expected_content=expected,
+            pre_paste_content=previous,
+        )
+
+    def test_scrolled_editor_showing_another_draft_does_not_verify_paste(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        content = "\n".join(f"line {index} with enough text" for index in range(1, 11))
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=1,
+            content=content,
+            post_paste_captures=(_fixture("editor_scrolled_10_more.txt"),),
+            sticky_post_paste=True,
+        )
+        with pytest.raises(RuntimeError, match="not delivered"):
+            inject_user_message(tmp_path / "bridge", content=content)
+        assert not any(args[-1] == "Enter" for args in sent)
 
     def test_stale_paste_placeholder_does_not_verify_new_paste(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
