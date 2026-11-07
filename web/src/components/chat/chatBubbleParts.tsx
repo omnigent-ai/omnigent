@@ -72,6 +72,7 @@ import {
 } from "@/lib/blocks";
 import { type Bubble, type RenderItem, bubblesEqual } from "@/lib/renderItems";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
 import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
@@ -232,6 +233,7 @@ export function buildPendingBubbles(
       itemId: p.tempId,
       pending: true,
       ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
+      ...(p.stillSending && p.posted !== true ? { stillSending: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -525,6 +527,11 @@ export function workingIndicatorLabel(
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
+    }
+    if (blockedOn === TERMINAL_PROMPT_BLOCKED_ON) {
+      // Inferred from the terminal's screen, so the hint stays tentative.
+      const hint = "Something in the agent's terminal may need your input.";
+      return terminalView ? `${hint} Open the Terminal view to check.` : hint;
     }
     if (answerableInChat) return `Blocked on: ${blockedOn}`;
     const waiting =
@@ -1154,6 +1161,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
         </div>
         {bubble.undelivered && (
           <UndeliveredMessageNotice sessionId={sessionId} text={text} content={bubble.content} />
+        )}
+        {bubble.pending && bubble.stillSending && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-still-sending"
+          >
+            <Loader2Icon size={12} className="animate-spin" aria-hidden />
+            Still sending…
+          </div>
         )}
         {visibilityToggle}
         <div
