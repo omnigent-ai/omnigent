@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import sqlite3
 import sys
@@ -107,7 +108,9 @@ def test_inject_user_message_single_delivery_when_store_confirms(tmp_path, monke
 
 
 def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, monkeypatch) -> None:
-    """No new store row after delivery #1 → re-deliver once, then confirm."""
+    """No new store row after delivery #1 → re-deliver once, then confirm. The pane
+    showed the needle before the paste, so that stale echo must not pass for a
+    committed draft: the retry pastes again rather than pressing Enter alone."""
     calls: list[tuple[str, ...]] = []
     settle_calls: list[tuple] = []
     _patch_inject_tmux(monkeypatch, calls)
@@ -126,19 +129,147 @@ def test_inject_user_message_retries_once_when_first_not_confirmed(tmp_path, mon
     assert sum(1 for a in calls if a[-1] == "Enter") == 2
 
 
-def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) -> None:
-    """Store row never appears after two deliveries → raise (FIFO-safe failure)."""
-    calls: list[tuple[str, ...]] = []
-    _patch_inject_tmux(monkeypatch, calls)
-    monkeypatch.setattr(b, "_DELIVERY_CONFIRM_TIMEOUT_S", 0.0)
+class _FakeClock:
+    """Virtual monotonic clock whose ``sleep`` advances it instantly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class _FakeHermesPane:
+    """Hermes TUI behind tmux: a boot banner that discards keystrokes until ``ready_at``,
+    then a prompt_toolkit-like draft. An Enter within ``enter_folds_within`` seconds of a
+    paste coalesces into the draft as a newline (one pty burst) instead of submitting."""
+
+    def __init__(
+        self, clock: _FakeClock, *, ready_at: float = 0.0, enter_folds_within: float = 0.0
+    ) -> None:
+        self._clock = clock
+        self._ready_at = ready_at
+        self._enter_folds_within = enter_folds_within
+        self._buffers: dict[str, bytes] = {}
+        self._pasted_at = -math.inf
+        self.draft = ""
+        self.deliveries = 0
+        self.submissions: list[str] = []
+
+    @property
+    def ready(self) -> bool:
+        return self._clock.monotonic() >= self._ready_at
+
+    def capture_pane(self, *_a: object, **_k: object) -> str:
+        if not self.ready:
+            return "Hermes Agent - starting up...\nDiscovering plugins and MCP servers...\n"
+        return f"Welcome to Hermes Agent!\n❯ {self.draft}\n"
+
+    def run_tmux(self, _socket: str, *args: str) -> None:
+        if args[0] == "load-buffer":
+            self.deliveries += 1
+            self._buffers[args[2]] = Path(args[3]).read_bytes()
+            return
+        if not self.ready:
+            return
+        if args[0] == "paste-buffer":
+            payload = self._buffers.pop(args[args.index("-b") + 1])
+            self.draft += payload.decode().replace("\r", "\n").rstrip("\n")
+            self._pasted_at = self._clock.monotonic()
+        elif args[0] == "send-keys":
+            key = args[-1]
+            if key == "C-k":
+                # Emacs kill-line clears only the line under the cursor (the last one).
+                self.draft = self.draft[: self.draft.rfind("\n") + 1]
+            elif key == "Enter":
+                if self._clock.monotonic() - self._pasted_at < self._enter_folds_within:
+                    self.draft += "\n"
+                elif self.draft.strip():
+                    self.submissions.append(self.draft.strip())
+                    self.draft = ""
+
+    def max_message_id(self, _db: Path) -> int:
+        return len(self.submissions)
+
+
+def _patch_inject_pane(monkeypatch, tmp_path, pane: _FakeHermesPane, clock: _FakeClock) -> None:
+    """Route the bridge's clock, tmux commands, and store reads through a fake pane."""
+    monkeypatch.setattr(b, "time", clock)
+    b.write_tmux_target(tmp_path, socket_path=Path("/s"), tmux_target="t")
+    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: True)
+    monkeypatch.setattr(b, "_capture_pane", pane.capture_pane)
+    monkeypatch.setattr(b, "_run_tmux", pane.run_tmux)
     monkeypatch.setattr(b, "_state_db_path", lambda _bd: tmp_path / "state.db")
-    monkeypatch.setattr(b, "_max_message_id", lambda _p: 0)  # never advances
+    monkeypatch.setattr(b, "_max_message_id", pane.max_message_id)
+
+
+def test_inject_user_message_delivers_once_when_tui_input_loop_starts_late(
+    tmp_path, monkeypatch
+) -> None:
+    """A fresh Hermes TUI that only reads input ~20s after launch still gets the first
+    message exactly once instead of a failed turn (or a doubled draft)."""
+    clock = _FakeClock()
+    pane = _FakeHermesPane(clock, ready_at=22.0)
+    _patch_inject_pane(monkeypatch, tmp_path, pane, clock)
+
+    b.inject_user_message(tmp_path, content="do something now")
+
+    assert pane.submissions == ["do something now"]
+    assert pane.draft == ""
+
+
+def test_inject_user_message_resubmits_a_committed_draft_with_enter_only(
+    tmp_path, monkeypatch
+) -> None:
+    """When the paste committed but its Enter folded into the draft, the retry presses
+    Enter alone instead of pasting a second copy."""
+    clock = _FakeClock()
+    pane = _FakeHermesPane(clock, enter_folds_within=1.0)
+    _patch_inject_pane(monkeypatch, tmp_path, pane, clock)
+
+    b.inject_user_message(tmp_path, content="do something now")
+
+    assert pane.submissions == ["do something now"]
+    assert pane.deliveries == 1
+    assert pane.draft == ""
+
+
+def test_inject_user_message_raises_when_never_confirmed(tmp_path, monkeypatch) -> None:
+    """A TUI that never reads input is re-delivered to until the deadline, then the
+    turn fails cleanly (FIFO-safe) instead of hanging forever."""
+    clock = _FakeClock()
+    pane = _FakeHermesPane(clock, ready_at=math.inf)
+    _patch_inject_pane(monkeypatch, tmp_path, pane, clock)
 
     with pytest.raises(RuntimeError, match="did not accept"):
         b.inject_user_message(tmp_path, content="do something now")
 
-    # Both attempts ran (two pastes) before giving up.
-    assert sum(1 for a in calls if a[0] == "load-buffer") == 2
+    assert pane.deliveries > 2, "kept re-delivering past the old two attempts"
+    assert pane.submissions == []
+    # Gives up only once the deadline has passed, within one more delivery round.
+    assert b._DELIVERY_DEADLINE_S <= clock.now < b._DELIVERY_DEADLINE_S + 30.0
+
+
+def test_inject_user_message_stops_when_the_tui_exits(tmp_path, monkeypatch) -> None:
+    """A TUI that dies while the message is still unconfirmed fails the turn at once
+    instead of pasting into a dead pane until the deadline."""
+    clock = _FakeClock()
+    pane = _FakeHermesPane(clock, ready_at=math.inf)
+    _patch_inject_pane(monkeypatch, tmp_path, pane, clock)
+    alive = iter([True, False])
+    monkeypatch.setattr(b, "_session_alive", lambda *_a, **_k: next(alive))
+
+    with pytest.raises(RuntimeError, match="exited"):
+        b.inject_user_message(tmp_path, content="do something now")
+
+    assert pane.deliveries == 1
+    assert clock.now < b._DELIVERY_DEADLINE_S
 
 
 def test_inject_user_message_requires_content(tmp_path) -> None:
