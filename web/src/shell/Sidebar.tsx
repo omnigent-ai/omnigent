@@ -278,6 +278,7 @@ import {
   groupConversations,
   moveCustomOrder,
   orderByPinnedTimestamp,
+  appendPinWrites,
   pinOrderWrites,
   isPinOrderUnit,
   readPinnedConversationIds,
@@ -2691,20 +2692,13 @@ function ConversationList({
         if (writes.length > 0) reorderPins(writes);
         return;
       }
-      const lastPinId = pinReorderEnabled
-        ? sections.pinned.filter(isPinOrderUnit).at(-1)?.id
-        : undefined;
-      const pinTargetId = action.kind === "pin" ? (action.targetId ?? lastPinId) : undefined;
-      if (action.kind === "pin" && pinTargetId) {
-        // Pin into the dropped-on slot (below a row from its lower half), else after the
-        // last pin when the server stores pin order. The new pin goes through the toggle
+      if (action.kind === "pin" && (action.targetId || pinReorderEnabled)) {
+        // Pin into the dropped-on slot (below a row from its lower half), else at the
+        // bottom when the server stores pin order. The new pin goes through the toggle
         // (cap / ownership checks); once it's accepted, renumbered neighbours follow.
-        const writes = pinOrderWrites(
-          sections.pinned,
-          dragged.id,
-          pinTargetId,
-          !action.targetId || below,
-        );
+        const writes = action.targetId
+          ? pinOrderWrites(sections.pinned, dragged.id, action.targetId, below)
+          : appendPinWrites(sections.pinned, dragged.id);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
         // Chain on this call's own promise: per-call mutate callbacks are dropped
@@ -2715,8 +2709,9 @@ function ConversationList({
               if (rest.length > 0) reorderPins(rest);
             })
             .catch(() => {});
+          return;
         }
-        return;
+        if (action.targetId) return;
       }
       if (action.kind === "pin" || action.kind === "unpin") {
         // Toggle the pin: `pin` is only emitted for an unpinned session, `unpin`

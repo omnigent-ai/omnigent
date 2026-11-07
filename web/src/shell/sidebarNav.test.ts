@@ -4,6 +4,7 @@ import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTi
 import { orderSessionFamilies } from "@/lib/sessionFamilies";
 import {
   type ActiveChatOverride,
+  appendPinWrites,
   bareConversationId,
   computeNextActiveOverride,
   conversationDisplayLabel,
@@ -333,6 +334,18 @@ describe("pinOrderWrites", () => {
       "conv_1",
       "conv_2",
     ]);
+  });
+
+  it("appends a new pin past every shown row's value with appendPinWrites", () => {
+    const rows = pins(1000, 2000, undefined);
+    rows[2].family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    expect(appendPinWrites(rows, "new")).toEqual([{ id: "new", pinnedAt: 3001 }]);
+    // A row without a value sorts last, so the pins are renumbered instead.
+    expect(appendPinWrites(pins(1000, undefined), "new")).toEqual([
+      { id: "conv_1", pinnedAt: 1001 },
+      { id: "new", pinnedAt: 1002 },
+    ]);
+    expect(appendPinWrites([], "new")).toEqual([]);
   });
 });
 

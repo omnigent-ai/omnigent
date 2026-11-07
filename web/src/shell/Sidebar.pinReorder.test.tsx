@@ -188,6 +188,26 @@ describe("dropping an unpinned session onto a pinned row", () => {
     expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
+  it("pins it below a pinned family shown without its representative", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    const family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    mocks.pinned.push(conv("conv_member", { family }));
+    mocks.pinFn.mockResolvedValue({});
+    stubPinZoneRect(3);
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_member", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: 3001,
+      }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])(
     "reorders an individually pinned sibling (family pinned: %s)",
     async (pinned) => {
