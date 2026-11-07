@@ -388,6 +388,31 @@ async def test_llm_routing_client_clamps_hallucinated_model() -> None:
     assert result.model == models[0]  # clamped to cheapest
 
 
+# A judge whose classification and model field disagree is applied by its
+# classification: the rubric defines each class by list position.
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("verdict_model", "rationale", "expect_model"),
+    [
+        ("sonnet", "This is a COMPLEX task (setup); selected most capable model opus.", "opus"),
+        ("sonnet", "This is a SIMPLE task (greeting); selected cheapest model haiku.", "haiku"),
+        ("haiku", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("sonnet", "This is a MODERATE task (one file); selected mid-range model.", "sonnet"),
+        ("opus", "This is a COMPLEX task (refactor); selected most capable model opus.", "opus"),
+        ("sonnet", "no classification given", "sonnet"),
+    ],
+)
+async def test_llm_routing_client_applies_the_stated_tier(
+    verdict_model: str, rationale: str, expect_model: str
+) -> None:
+    verdict = {"harness": "claude-native", "model": verdict_model, "rationale": rationale}
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    result = await client.route("task", {"claude-native": ["haiku", "sonnet", "opus"]})
+    assert result is not None
+    assert result.model == expect_model
+    assert result.rationale == rationale
+
+
 @pytest.mark.asyncio
 async def test_llm_routing_client_rejects_empty_model() -> None:
     verdict = {"harness": "claude-sdk", "model": "", "rationale": "x"}

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -541,6 +542,46 @@ def _build_rubric(available_models: dict[str, list[str]]) -> str:
     )
 
 
+_STATED_TIER = re.compile(r"\bThis is an? (SIMPLE|MODERATE|COMPLEX) task\b")
+
+
+def _reconcile_with_stated_tier(model: str, rationale: str, models: list[str]) -> str:
+    """Apply the list position the judge's own classification names.
+
+    A small judge can classify a task COMPLEX ("most capable model") yet put
+    a cheaper id in its ``model`` field. The rubric defines each class by
+    position, so the class decides; a verdict with no class keeps its model.
+
+    :param model: The verdict's model, already known to be in *models*.
+    :param rationale: The verdict's rationale, e.g. ``"This is a COMPLEX task (...)"``.
+    :param models: The chosen harness's models, cheapest first.
+    :returns: *model*, or the model at the position its stated class names.
+    """
+    match = _STATED_TIER.search(rationale)
+    if match is None or model not in models:
+        return model
+    tier = match.group(1)
+    position = models.index(model)
+    last = len(models) - 1
+    if tier == "SIMPLE":
+        expected = 0
+    elif tier == "COMPLEX":
+        expected = last
+    elif 0 < position < last or last < 2:
+        # Any interior model is "middle"; with fewer than three there is none.
+        return model
+    else:
+        expected = last // 2
+    if expected != position:
+        _logger.info(
+            "routing judge: %s verdict named %r; applying %r",
+            tier,
+            model,
+            models[expected],
+        )
+    return models[expected]
+
+
 _VERDICT_SCHEMA: dict[str, object] = {
     "type": "object",
     "properties": {
@@ -663,6 +704,10 @@ class LLMRoutingClient:
                 None,
             )
 
+        if chosen_harness is not None:
+            model = _reconcile_with_stated_tier(
+                model, str(rationale), available_models[chosen_harness]
+            )
         return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
 
 
