@@ -580,15 +580,24 @@ async def test_native_clear_replacement_body_suppresses_workspace_and_git_defaul
     assert resolved.body.git is None
 
 
+@pytest.mark.parametrize("git_defaults", [None, {"branch_name": "project-default"}])
+@pytest.mark.parametrize("explicit_git", [False, True])
 async def test_multipart_create_defaults_workspace_and_files_atomically(
     project_create_client: httpx.AsyncClient,
+    git_defaults,
+    explicit_git: bool,
 ) -> None:
     project_id = await _project(
-        project_create_client, {"workspace": "/work/upload", "labels": {"team": "ml"}}
+        project_create_client,
+        {"workspace": "/work/upload", "git": git_defaults, "labels": {"team": "ml"}},
     )
     response = await project_create_client.post(
         "/v1/sessions",
-        data={"metadata": f'{{"project_id":"{project_id}"}}'},
+        data={
+            "metadata": json.dumps(
+                {"project_id": project_id, **({"git": None} if explicit_git else {})}
+            )
+        },
         files={
             "bundle": (
                 "agent.tar.gz",

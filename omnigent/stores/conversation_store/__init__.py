@@ -159,14 +159,12 @@ SIDE_CHAT_COPY_ID_PREFIX_LEN = 12
 # reserved ``"local"`` identity used elsewhere (see ``RESERVED_USER_LOCAL``).
 _PINNED_LABEL_LOCAL_USER = "local"
 
-# ``conversation_labels.key`` is ``String(128)``. The prefix ``omnigent.pinned.``
-# is 16 chars, so a raw ``user_id`` suffix must stay ≤ 112 chars to fit. User ids
-# are ``String(128)`` elsewhere (SSO subject ids can be long), so a raw suffix
-# could overflow the key column — Postgres errors, MySQL silently truncates (and
-# two long ids could then collide on the truncated key). To stay safe while
-# keeping the common case (emails) human-readable in the DB, ids that don't fit
-# are replaced with a fixed-width hash suffix.
-_PINNED_LABEL_MAX_SUFFIX_LEN = 128 - len(PINNED_LABEL_KEY) - 1  # minus the "." joiner
+
+def _scoped_pin_key(prefix: str, user_id: str | None) -> str:
+    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
+    if len(suffix) > 128 - len(prefix):
+        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
+    return prefix + suffix
 
 
 def pinned_label_key(user_id: str | None) -> str:
@@ -184,11 +182,7 @@ def pinned_label_key(user_id: str | None) -> str:
     :returns: ``"omnigent.pinned.<suffix>"`` (suffix = the id, or its hash when
         the id is too long).
     """
-    suffix = user_id if user_id is not None else _PINNED_LABEL_LOCAL_USER
-    if len(suffix) > _PINNED_LABEL_MAX_SUFFIX_LEN:
-        # 64 hex chars — well within the budget and collision-safe.
-        suffix = "h:" + hashlib.sha256(suffix.encode("utf-8")).hexdigest()
-    return f"{PINNED_LABEL_KEY}.{suffix}"
+    return _scoped_pin_key(PINNED_LABEL_KEY + ".", user_id)
 
 
 # Epoch-SECONDS time a session was archived, written on archive and deleted on
@@ -204,6 +198,13 @@ SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY = "omnigent.scheduled_task_worktree_sou
 
 # Creation provenance only; this does not confer parentage or permissions.
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
+FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
+MAX_SESSION_FAMILY_MEMBERS = 100
+
+
+def family_pinned_label_key(user_id: str | None) -> str:
+    """Derive the caller's family pin key within the label column's length limit."""
+    return _scoped_pin_key(FAMILY_PIN_LABEL_PREFIX, user_id)
 
 
 # Labels that must NOT cross into a new session context — deliberately
@@ -1450,6 +1451,22 @@ class ConversationStore(ABC):
         """Persist the native Plan snapshot; empty clears, missing metadata returns false."""
         raise NotImplementedError
 
+    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+        """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def get_session_family(self, session_id: str) -> list[Conversation]:
+        """Return family members in stable creation order, including archived members."""
+        raise NotImplementedError
+
+    def get_session_families(self, family_ids: list[str]) -> dict[str, list[Conversation]]:
+        """Batch-load bounded families in stable creation order, including archived members."""
+        raise NotImplementedError
+
+    def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
+        """Pin a representative's family without changing individual session pins."""
+        raise NotImplementedError
+
     @abstractmethod
     def set_conversation_project(
         self,
@@ -1468,7 +1485,6 @@ class ConversationStore(ABC):
         :returns: ``True`` if a metadata row was updated; ``False`` if the
             conversation has no metadata row.
         """
-        ...
 
     @abstractmethod
     def increment_session_usage(
@@ -1880,6 +1896,7 @@ class ConversationStore(ABC):
         conversation_id: str,
         *,
         expected_host_id: str | None = None,
+        expected_sandbox_id: str | None = None,
         clear_profile: bool = False,
     ) -> Conversation:
         """
@@ -2145,6 +2162,7 @@ class ConversationStore(ABC):
         reasoning_effort: str | None = None,
         model_override: str | None = None,
         workspace: str | None = None,
+        git_branch: str | None = None,
         terminal_launch_args: list[str] | None = None,
         parent_conversation_id: str | None = None,
         runner_id: str | None = None,
@@ -2178,6 +2196,7 @@ class ConversationStore(ABC):
         :param workspace: Optional starting cwd to record on the
             session, e.g. ``"/Users/corey/projects/myapp"``.
             ``None`` leaves the column NULL.
+        :param git_branch: Optional branch associated with ``workspace``.
         :param terminal_launch_args: Optional pass-through CLI args
             for a native terminal wrapper (claude / codex), e.g.
             ``["--dangerously-skip-permissions"]``. ``None`` leaves
@@ -2420,18 +2439,18 @@ class ConversationStore(ABC):
         workspace: str,
         exclude_conversation_id: str,
         include_subdirectories: bool = False,
+        include_archived: bool = False,
     ) -> bool:
         """
-        Is another non-archived conversation sitting in this ``(host_id, workspace)``?
+        Does another conversation use this workspace (active only unless ``include_archived``)?
 
         Sessions routinely share one directory: a fork reusing the source's
         worktree, or several sessions attached to the same existing worktree
         via the picker. Worktree cleanup must not remove a directory a live
         session still runs in, so this is the "is it in use?" gate.
 
-        Archived sessions do not count. They run nothing, so removing the
-        directory cannot wedge them, and counting them would mean a worktree
-        shared by two forks is never cleaned up once either is archived.
+        Archived sessions count only with ``include_archived=True``. Cleanup uses
+        that flag to preserve files needed when an archived session resumes.
 
         :param host_id: Host owning the worktree, e.g. ``"host_a1b2..."``.
         :param workspace: Absolute worktree path, e.g. ``"/w/feature-login"``.
@@ -2444,7 +2463,9 @@ class ConversationStore(ABC):
         ...
 
     @abstractmethod
-    async def delete_conversation(self, conversation_id: str) -> bool:
+    async def delete_conversation(
+        self, conversation_id: str, *, preserve_host_binding: str | None = None
+    ) -> bool:
         """
         Delete a conversation and all its items.
 
@@ -2453,6 +2474,8 @@ class ConversationStore(ABC):
 
         :param conversation_id: Unique conversation identifier,
             e.g. ``"conv_abc123"``.
+        :param preserve_host_binding: Keep the root's metadata reservation when
+            it is bound to this host, for replacement under the same session id.
         :returns: ``True`` if the conversation existed,
             ``False`` otherwise.
         """
