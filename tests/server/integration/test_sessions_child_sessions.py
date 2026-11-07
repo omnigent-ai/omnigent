@@ -1709,10 +1709,24 @@ async def test_native_subagent_message_uses_native_terminal_forward(
     assert re.fullmatch(r"[0-9a-f]{32}", forwarded_event["delivery_attempt_id"])
     assert isinstance(forwarded_event["input_enqueued_at_ms"], int)
     assert forwarded_event["input_enqueued_at_ms"] > 0
-    from omnigent.runtime import get_agent_store
+    from omnigent.runtime import get_agent_store, pending_inputs
 
     parent_agent = get_agent_store().get(parent["agent_id"])
     assert parent_agent is not None
+    receipt_context = {}
+    if harness == "codex-native":
+        delivery = pending_inputs.delivery_attributes_for(child["id"], message_body["pending_id"])
+        assert delivery["delivery_attempt_id"] == forwarded_event["delivery_attempt_id"]
+        receipt_context = {
+            "native_input_receipt": {
+                "version": 1,
+                "identity": {
+                    "pending_id": message_body["pending_id"],
+                    "delivery_attempt_id": delivery["delivery_attempt_id"],
+                },
+                "content": [{"type": "input_text", "text": "build the patch"}],
+            }
+        }
     assert forwarded == [
         {
             "path": f"/v1/sessions/{child['id']}/resources/terminals",
@@ -1736,6 +1750,7 @@ async def test_native_subagent_message_uses_native_terminal_forward(
                 "pending_id": message_body["pending_id"],
                 "delivery_attempt_id": forwarded_event["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded_event["input_enqueued_at_ms"],
+                **receipt_context,
             },
         },
     ]

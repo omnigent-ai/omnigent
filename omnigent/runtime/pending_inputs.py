@@ -250,6 +250,8 @@ class DrainedInput:
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
     uncertain: bool = False
+    restored: bool = False
+    strict_restore: bool = False
 
 
 @dataclass
@@ -327,6 +329,7 @@ class _Entry:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    restored: bool = False
 
 
 # Per-conversation mapping conversation_id → {pending_id: entry}. The
@@ -376,6 +379,7 @@ def record(
     stable_id: str | None = None,
     *,
     background_titles_enabled: bool = True,
+    restored: bool = False,
 ) -> str:
     """
     Record an un-consumed web-composer user message.
@@ -414,6 +418,11 @@ def record(
         if stable_id is not None:
             for existing in _pending.get(conversation_id, {}).values():
                 if existing.stable_id == stable_id:
+                    if existing.restored and not restored:
+                        existing.restored = False
+                        existing.delivery_attempt_id = uuid.uuid4().hex
+                        existing.input_enqueued_at_ms = int(time.time() * 1000)
+                        existing.last_delivery_stage = "server_queued"
                     return existing.pending_id
         pending_id = make_pending_id(conversation_id, stable_id)
         entry = _Entry(
@@ -422,6 +431,8 @@ def record(
             created_by=created_by,
             stable_id=stable_id,
             background_titles_enabled=background_titles_enabled,
+            restored=restored,
+            delivery_attempt_id=None if restored else uuid.uuid4().hex,
         )
         entries = _pending.setdefault(conversation_id, {})
         entries[pending_id] = entry
@@ -500,6 +511,14 @@ def delivery_attributes_for(conversation_id: str, pending_id: str) -> dict[str, 
         entry = _pending.get(conversation_id, {}).get(pending_id)
         snapshot = copy.copy(entry) if entry is not None else None
     return delivery_attributes(snapshot) if snapshot is not None else {}
+
+
+def peek(conversation_id: str, pending_id: str) -> DrainedInput | None:
+    """Copy one pending input without changing its hold or queue position."""
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entry = _pending.get(conversation_id, {}).get(pending_id)
+        return _drained_input(entry) if entry is not None else None
 
 
 def mark_delivery_stage(
@@ -619,7 +638,12 @@ def classify_missing_native_record(entry: DrainedInput) -> DrainedInput:
     return replace(entry, cause_class="unknown", reason_code=reason_code)
 
 
-def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
+def resolve(
+    conversation_id: str,
+    pending_id: str,
+    *,
+    delivery_attempt_id: str | None = None,
+) -> DrainedInput | None:
     """
     Drop a pending entry by id and return it.
 
@@ -632,16 +656,72 @@ def resolve(conversation_id: str, pending_id: str) -> DrainedInput | None:
         ``"conv_abc123"``.
     :param pending_id: The id returned by :func:`record`, e.g.
         ``"pending_a1b2c3"``.
+    :param delivery_attempt_id: When supplied, only drain this attempt; a late
+        failure must not consume a newer retry with the same pending id.
     :returns: The dropped entry, or ``None`` when no entry had that id.
     """
     with _lock:
         entries = _pending.get(conversation_id)
         if entries is None:
             return None
+        if delivery_attempt_id is not None:
+            entry = entries.get(pending_id)
+            if entry is None or entry.delivery_attempt_id != delivery_attempt_id:
+                return None
         entry = entries.pop(pending_id, None)
         if not entries:
             _pending.pop(conversation_id, None)
         return _drained_input(entry) if entry is not None else None
+
+
+def resolve_delivery_attempt(
+    conversation_id: str,
+    pending_id: str,
+    delivery_attempt_id: str | None,
+    *,
+    stable_id: str | None = None,
+    hold: bool = False,
+) -> DrainedInput | None:
+    """Resolve one receipt without using text or consuming older queued inputs."""
+    identity = {
+        "pending_id": pending_id,
+        **(
+            {"delivery_attempt_id": delivery_attempt_id} if delivery_attempt_id is not None else {}
+        ),
+        **({"input_stable_id": stable_id} if stable_id is not None else {}),
+    }
+    if input_attributes(identity) != identity:
+        raise ValueError("Invalid native input receipt identity")
+    with _lock:
+        _evict_stale_locked(conversation_id, _now())
+        entries = _pending.get(conversation_id)
+        entry = entries.get(pending_id) if entries is not None else None
+        if entry is None:
+            return None
+        restored_match = (
+            entry.restored
+            and entry.delivery_attempt_id is None
+            and stable_id is not None
+            and entry.stable_id == stable_id
+        )
+        if (
+            entry.held
+            or (stable_id is not None and entry.stable_id != stable_id)
+            or (
+                not restored_match
+                and (
+                    delivery_attempt_id is None or entry.delivery_attempt_id != delivery_attempt_id
+                )
+            )
+        ):
+            raise ValueError("Native input delivery attempt changed")
+        if hold:
+            entry.held = True
+        elif entries is not None:
+            entries.pop(pending_id)
+            if not entries:
+                _pending.pop(conversation_id, None)
+        return replace(_drained_input(entry), strict_restore=hold)
 
 
 def resolve_oldest(conversation_id: str, *, hold: bool = False) -> DrainedInput | None:
@@ -767,8 +847,9 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
     An entry drained with ``hold=True`` never left the queue, so it is
     simply unheld in place, keeping its slot and order. One that is gone
     (drained without ``hold``, or evicted by the TTL meanwhile) returns to
-    the FRONT, since it was the oldest when drained. Compensation never
-    evicts: a queue that refilled meanwhile may exceed the cap by the
+    the FRONT, since it was the oldest when drained. Identity-linked held
+    snapshots cannot recreate missing slots retired while persistence waited.
+    Compensation never evicts: a queue that refilled meanwhile may exceed the cap by the
     restored entries until the next :func:`record` trims unheld ones.
     A reconstructed entry keeps its uncertainty so a later mirror cannot
     declare a possibly recorded message undelivered.
@@ -793,12 +874,16 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         reason_code=drained.reason_code,
         native_turn_id=drained.native_turn_id,
         lifecycle_response_id=drained.lifecycle_response_id,
+        restored=drained.restored,
     )
     with _lock:
         entries = _pending.get(conversation_id, {})
         current = entries.get(drained.pending_id)
         if current is not None:
-            current.held = False
+            if current.delivery_attempt_id == drained.delivery_attempt_id:
+                current.held = False
+            return
+        if drained.strict_restore:
             return
         _pending[conversation_id] = {drained.pending_id: entry, **entries}
 
@@ -818,7 +903,9 @@ def release(conversation_id: str, drained: DrainedInput) -> None:
         entries = _pending.get(conversation_id)
         if entries is None:
             return
-        entries.pop(drained.pending_id, None)
+        current = entries.get(drained.pending_id)
+        if current is not None and current.delivery_attempt_id == drained.delivery_attempt_id:
+            entries.pop(drained.pending_id)
         if not entries:
             _pending.pop(conversation_id, None)
 
@@ -1019,6 +1106,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         reason_code=entry.reason_code,
         native_turn_id=entry.native_turn_id,
         lifecycle_response_id=entry.lifecycle_response_id,
+        restored=entry.restored,
     )
 
 

@@ -90,6 +90,9 @@ implements them separately, so a fix for one harness does not reach the others.
   calls, ahead of messages sent while a tool ran. Unmatched outputs become
   labeled recovery text so missing calls do not block continuation.
 - `steer`: sending while the harness is mid-turn steers the active turn.
+- `codex-large-input`: large text sent from Chat reaches Codex through complete
+  file references and keeps its authored history. Unsafe or unsupported paste
+  delivery is refused before handoff; typed cache references remain literal.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
@@ -319,6 +322,11 @@ turn, and Stop separately. For an offline host use the reconnect paths in
 **Codex side chat:** type `/side <question>` in the parent composer, send a
 follow-up in the side pane, then close its tab. The parent conversation stays
 separate. See [sessions](./sessions.md) for all side-chat entry points.
+
+**Large Codex inputs:** paste text in the new-session or existing-session Chat
+composer, or send it while Codex is working. Attach a text file with the button,
+paste, or drop. For literal-reference checks, type a generated cache-reference
+line into Chat or the native Terminal view.
 
 **Matrix.** "Mock" means the verification instance can drive the harness with
 the mock model; the others need their real CLI and vendor credentials. Test
@@ -978,6 +986,21 @@ Cross-harness journeys:
   After a greeting, run `!echo "hi"`, `!ls`, and `!echo "hi"` again. Each shell
   prompt must remain a separate user turn outside the assistant's folded work,
   including after reload. This browser contract does not launch the Claude CLI.
+- **`codex-large-input` (own environment):**
+  `tests/e2e/test_codex_native_supported_efforts_e2e.py::test_oversized_input_survives_real_codex_transport`
+  uses real server, runner, Codex and tmux with local mock Responses. Its paste,
+  aggregate and uploaded-resource cases check bounded native input, complete
+  inline/file contents and original history blocks. Codex 0.142 refuses every
+  spill before native submission; 0.166 echoes the receipt and prepared files.
+  Provider completion is outside this transport proof. Start/steer refusal and cache
+  integrity matrices are in `tests/inner/test_codex_native_executor.py`;
+  `tests/harnesses/codex_native/forwarder/test_user_messages.py` and
+  `tests/server/routes/test_session_resources.py` cover literal references,
+  replay and exact pending-input ownership. These component/process checks do
+  not prove browser controls, live model file-reading permissions or a literal
+  reference typed into the real TUI. Manually check both composers, a mid-turn
+  send, each attachment control and a literal reference in Chat and Terminal;
+  confirm one complete history entry and no duplicate delivery after reconnect.
 - **`chat-render`, `steer`, Codex shell commands from the web composer:**
   A standalone `!command` runs in the session's shell. Its pending bubble settles
   and its output appears below it; attachments, multiple content blocks and `!!`
