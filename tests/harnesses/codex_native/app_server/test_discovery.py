@@ -965,6 +965,60 @@ async def test_provider_attribution_uses_effective_codex_config_and_cleans_up(
     assert "inherited-secret" not in text
 
 
+@pytest.mark.parametrize("disk_name", ["", " \t"])
+async def test_provider_attribution_repairs_active_blank_name_from_same_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, disk_name: str
+) -> None:
+    """A launcher-completed name must also validate when hook trust writes disk config."""
+    from omnigent.harnesses.codex_native import app_server
+
+    home = tmp_path / "private-home"
+    home.mkdir()
+    config_path = home / "config.toml"
+    config_path.write_text(
+        f"[model_providers.Managed]\nname = {json.dumps(disk_name)}\n"
+        'base_url = "https://workspace.cloud.databricks.com/ai-gateway/codex/v1"\n'
+    )
+    client = AsyncMock(spec=CodexAppServerClient)
+    client.request.return_value = {
+        "result": {
+            "config": {
+                "model_provider": "Managed",
+                "model_providers": {
+                    "Managed": {
+                        "name": "Canonical Gateway",
+                        "base_url": "https://workspace.cloud.databricks.com/ai-gateway/codex/v1",
+                    }
+                },
+            }
+        }
+    }
+    monkeypatch.setattr(app_server, "_allocate_loopback_port", lambda: 12345)
+    monkeypatch.setattr(
+        app_server, "_start_codex_model_discovery_process", AsyncMock(return_value=Mock())
+    )
+    monkeypatch.setattr(app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(app_server, "_stop_codex_model_discovery_process", AsyncMock())
+    monkeypatch.setattr(app_server, "CodexAppServerClient", lambda **kwargs: client)
+
+    result = await app_server.prepare_codex_provider_config(
+        home,
+        ['model="owned-model"'],
+        codex_path="/codex",
+        cwd=tmp_path,
+        env={},
+        app_server_command=("/wrapped/codex",),
+    )
+
+    assert result == ['model="owned-model"']
+    assert tomllib.loads(config_path.read_text())["model_providers"]["Managed"]["name"] == (
+        "Canonical Gateway"
+    )
+    client.request.assert_awaited_once_with(
+        "config/read", {"includeLayers": False, "cwd": str(tmp_path)}
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "app_server_command", "probed"),
     [
