@@ -242,6 +242,24 @@ def test_output_outcomes_include_repro_audit_blockers() -> None:
     assert "choice in `remaining_work`" in outcomes
 
 
+def test_requested_design_deliverables_return_to_a_person() -> None:
+    skills = {skill.name: skill.content for skill in load(_RESOLVE_AGENT).skills}
+    investigate = " ".join(skills["resolve-investigate"].split())
+    handoff = " ".join(skills["resolve-handoff"].split())
+    remaining = handoff.split("- `remaining_work`", 1)[1].split("- `hermetic_check`", 1)[0]
+
+    assert "deliverable the report explicitly requests or rules out" in investigate
+    for requirement in (
+        "comparison of options, or prototype is work outside authorization",
+        "rules out symptom or papercut fixes conflicts with a narrow fix",
+        "report `partially_fixed`, name the conflict",
+        "the unmet request the first `remaining_work` item",
+        "Never recommend the narrow fix as the resolution of the report",
+    ):
+        assert requirement in investigate
+    assert "List first any deliverable the report explicitly requested" in remaining
+
+
 def test_repro_audit_preserves_non_repro_mode_contracts() -> None:
     instructions = _normalized_resolve_instructions()
     assert (
