@@ -8,6 +8,8 @@ import {
   harnessReadinessOnHost,
   harnessUnavailableReasonOnHost,
   harnessUnconfiguredOnHost,
+  harnessWarningBadgeText,
+  isNativeOpenCodeHarness,
   missingHarnessCredentialCopy,
   resolveSetupSteps,
   skillInvocationPrefix,
@@ -278,6 +280,34 @@ describe("harnessReadinessOnHost", () => {
   });
 });
 
+describe("tmux-unavailable readiness", () => {
+  const host = hostWith({ "claude-native": "tmux-unavailable", "claude-sdk": true });
+
+  it("blocks the native harness with tmux repair copy", () => {
+    expect(harnessReadinessOnHost("claude-native", host)).toEqual({
+      state: "setup-required",
+      reason: "tmux-unavailable",
+      selectable: false,
+      fallbackRelevant: true,
+      explanation: {
+        label: "tmux is required",
+        description: "Install tmux 3.3 or newer on the selected host, then check again.",
+      },
+    });
+    expect(harnessUnavailableReasonOnHost("claude-native", host)).toBe("tmux-unavailable");
+    expect(harnessWarningBadgeText("tmux-unavailable")).toBe("needs tmux");
+    expect(harnessWarningBadgeText("tmux-unavailable", true)).toBe("needs setup");
+  });
+
+  it("leaves SDK harnesses on the same host ready", () => {
+    expect(harnessReadinessOnHost("claude-sdk", host)).toMatchObject({
+      state: "available",
+      reason: "ready",
+    });
+    expect(harnessUnavailableReasonOnHost("claude-sdk", host)).toBeNull();
+  });
+});
+
 describe("harnessInstallableOnHost", () => {
   const online = hostWith({ codex: false });
 
@@ -350,7 +380,7 @@ describe("harnessAuthableOnHost", () => {
   });
 
   it("false for env-auth / own-login harnesses, flag off, offline, or loading", () => {
-    // OpenCode/Qwen (env-auth) and Cursor (own-login) are NOT UI-authable.
+    // OpenCode/Cursor (own CLI login) and Qwen (env-auth) are NOT UI-authable.
     expect(harnessAuthableOnHost(info(), "opencode-native", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "qwen", online)).toBe(false);
     expect(harnessAuthableOnHost(info(), "cursor-native", online)).toBe(false);
@@ -432,9 +462,80 @@ describe("resolveSetupSteps", () => {
     expect(steps[0].command).toBe("omni setup");
   });
 
+  it("adds a tmux step after the done CLI steps when only tmux is missing", () => {
+    const steps = resolveSetupSteps(
+      CODEX_STEPS,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "done"],
+      ["auth", "done"],
+      ["tmux", "todo"],
+    ]);
+    expect(steps[2].title).toBe("Install tmux 3.3 or newer");
+    expect(steps[2].command).toBe("brew install tmux");
+  });
+
+  it("shows the tmux step even when the server publishes no steps", () => {
+    const steps = resolveSetupSteps(
+      undefined,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["tmux", "todo"]]);
+  });
+
   it("returns [] with no descriptor or no harness", () => {
     expect(resolveSetupSteps(undefined, "codex", hostWith({ codex: false }))).toEqual([]);
     expect(resolveSetupSteps(CODEX_STEPS, null, hostWith({ codex: false }))).toEqual([]);
+  });
+});
+
+// The server's opencode descriptor: install, then an optional run-on-host CLI
+// login. Free models need no login, so that step is informational (no status key).
+const OPENCODE_STEPS: SetupStepWire[] = [
+  {
+    kind: "install",
+    title: "Install OpenCode",
+    detail: "We'll install OpenCode on the host for you.",
+    action: "install",
+    command: null,
+    status_key: "installed",
+  },
+  {
+    kind: "auth",
+    title: "Sign in to a provider (optional)",
+    detail:
+      "OpenCode's free models work without signing in. Sign in on the host to use your own providers.",
+    action: "command",
+    command: "opencode auth login",
+    status_key: null,
+  },
+];
+
+describe("OpenCode setup", () => {
+  it("recognizes every OpenCode harness spelling", () => {
+    expect(isNativeOpenCodeHarness("opencode-native")).toBe(true);
+    expect(isNativeOpenCodeHarness("native-opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("opencode")).toBe(true);
+    expect(isNativeOpenCodeHarness("codex-native")).toBe(false);
+    expect(isNativeOpenCodeHarness("cursor-native")).toBe(false);
+  });
+
+  it("flags a 1.x OpenCode host as outdated with only the install to do", () => {
+    const host = hostWith({ "opencode-native": "version-too-low" });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBe("version-too-low");
+    expect(harnessWarningBadgeText("version-too-low")).toBe("outdated");
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "todo"]]);
+  });
+
+  it("treats an installed OpenCode with no provider login as ready", () => {
+    const host = hostWith({ "opencode-native": true });
+    expect(harnessUnavailableReasonOnHost("opencode-native", host)).toBeNull();
+    const steps = resolveSetupSteps(OPENCODE_STEPS, "opencode-native", host);
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["install", "done"]]);
   });
 });
 
