@@ -115,6 +115,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   })),
 }));
 // The "+" menu reads the agent's declared terminals to gate the Shell entry.
+const requestSandboxWakeMock = vi.fn();
+vi.mock("@/hooks/useSandboxAutoWake", () => ({
+  requestSandboxWake: (id: string) => requestSandboxWakeMock(id),
+}));
 vi.mock("@/hooks/useAgents", () => ({
   useSessionAgent: vi.fn(() => ({ data: undefined })),
 }));
@@ -376,6 +380,10 @@ describe("WorkspacePanel surface presentation", () => {
 
     expect(screen.getByRole("tab", { name: "Changes" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByTestId("files-panel-stub")).toHaveAttribute("data-flat-view", "true");
+    requestSandboxWakeMock.mockClear();
+    // An opened unpinned tab is a pick like a pinned one.
+    fireEvent.click(screen.getByRole("tab", { name: "Changes" }));
+    expect(requestSandboxWakeMock).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Close Changes" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
@@ -559,6 +567,19 @@ describe("WorkspacePanel surface presentation", () => {
 
     await waitFor(() => expect(screen.getByRole("tab", { name: "Files" })).toHaveFocus());
     expect(onRightRailTabChange).toHaveBeenCalledWith("files");
+  });
+
+  it("asks to wake the sandbox when Files or Changes is picked, not other tabs", () => {
+    requestSandboxWakeMock.mockClear();
+    writeDefaultWorkspaceTab("changes");
+    renderWorkspace({ showGithubTab: true, showBrowserTab: true, rightRailTab: "changes" });
+
+    expect(pressTabNumber(2)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(4)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(1);
+    expect(pressTabNumber(1)).toBe(false);
+    expect(requestSandboxWakeMock).toHaveBeenCalledTimes(2);
   });
 
   it("selects fixed tabs by their visible number from anywhere, revealing the rail", () => {

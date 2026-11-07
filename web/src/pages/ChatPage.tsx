@@ -85,6 +85,7 @@ import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import {
   derivePermissionLevel,
+  isEditorLevel,
   isOwnerLevel,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
@@ -280,7 +281,8 @@ import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
-import { useSessionReconnect } from "@/hooks/useSessionReconnect";
+import { startSandboxWake, useSessionReconnect } from "@/hooks/useSessionReconnect";
+import { useSandboxAutoWake } from "@/hooks/useSandboxAutoWake";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
@@ -987,6 +989,18 @@ export function ChatPage() {
     hostOnline: reconnectHostOnline,
     isOwner: isOwnerLevel(permissionLevel),
   });
+  // Opening an asleep sandbox's session presses Reconnect host for the user, but
+  // only on an idle, healthy session: there the wake has no interrupted turn or
+  // failed input to resume. Anything else keeps its Resume or error card.
+  const sandboxAutoWakeAllowed: boolean | null =
+    !sessionConvId || !activeSession || liveness.kind === "unknown"
+      ? null
+      : liveness.kind === "host_asleep" &&
+        !sandboxLaunching &&
+        isEditorLevel(permissionLevel) &&
+        activeSession.status === "idle" &&
+        !activeSession.lastTaskError;
+  useSandboxAutoWake(sessionConvId, sandboxAutoWakeAllowed, () => void reconnect());
   // A message to an offline Arca host reconnects it from the desktop and waits
   // in the queue until the host is back.
   const sendReconnectsArca = isUnreachable && liveness.kind === "host_offline" && reconnectsArca;
@@ -1812,6 +1826,13 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
     if (!conversationId) throw new Error("Session is not available");
     if (liveness.kind === "host_offline" || liveness.kind === "local_stranded") {
       onShowReconnectHelp();
+      return;
+    }
+    // An asleep sandbox wakes through the same wake as Reconnect host, so the two never race.
+    if (liveness.kind === "host_asleep") {
+      if (!(await startSandboxWake(conversationId))) {
+        throw new Error("Couldn't start the sandbox");
+      }
       return;
     }
     const result = await retrySession(conversationId);

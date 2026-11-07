@@ -27,7 +27,10 @@ session is patched into the ``host_asleep`` shape via route interception:
   "Arclet Sandbox".
 
 The same view also offers **Reconnect host**, which asks the real server to
-wake the host with a ``retry_session`` event instead of sending a message. The
+wake the host with a ``retry_session`` event instead of sending a message.
+Opening an idle session on such a host presses it automatically after a
+second; a session whose wake is already running (the server reports a launch
+stage) is left to it. The
 wake's progress shows only in the composer's host status dot, which spins until
 the host is online; there is no toast unless the wake fails.
 """
@@ -263,13 +266,15 @@ def test_host_asleep_keeps_composer_open(
     expect(composer).not_to_be_disabled()
 
 
-def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
+def test_opening_asleep_session_wakes_sandbox_in_status_dot(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Reconnect host spins the host dot, then turns it green, with no toast.
+    """Opening an idle session on an asleep sandbox presses Reconnect host for the user.
 
-    The wake request reaches the real server, which answers once the runner is
+    About a second after the session opens, the same wake Reconnect host sends
+    spins the host dot, then turns it green, with no toast and no message. The
+    wake request reaches the real server, which answers once the runner is
     connected; the test holds it so the starting state can be observed, then
     reports the host online before releasing it.
 
@@ -287,10 +292,7 @@ def test_reconnect_host_wakes_asleep_sandbox_in_status_dot(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
-    _open_host_menu(page, "offline")
-    page.get_by_role("menuitem", name="Reconnect host").click()
-    wake = _next_held(page, held)
+    wake = _next_held(page, held, timeout_ms=30_000)
     assert wake.request.post_data_json == {"type": "retry_session", "data": {}}
 
     _expect_host_status(page, "starting", tooltip="Starting")
@@ -311,7 +313,7 @@ def test_failed_wake_restores_dot_and_reports_error(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A failed wake stops the spinner, explains why, and offers Reconnect again.
+    """A failed automatic wake stops the spinner, explains why, and Reconnect host retries.
 
     :param request: Supplies the recorded ``page`` after server setup.
     :param seeded_session: ``(base_url, session_id)`` for a real server-backed
@@ -325,10 +327,7 @@ def test_failed_wake_restores_dot_and_reports_error(
 
     page.goto(f"{base_url}/c/{session_id}")
 
-    _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
-    _open_host_menu(page, "offline")
-    page.get_by_role("menuitem", name="Reconnect host").click()
-    wake = _next_held(page, held)
+    wake = _next_held(page, held, timeout_ms=30_000)
     _expect_host_status(page, "starting", tooltip="Starting")
 
     wake.fulfill(
@@ -343,9 +342,12 @@ def test_failed_wake_restores_dot_and_reports_error(
     ).to_be_visible(timeout=15_000)
     _expect_host_status(page, "offline", tooltip="Asleep — wakes on next message")
     _open_host_menu(page, "offline")
-    expect(page.get_by_role("menuitem", name="Reconnect host")).to_be_visible()
     page.wait_for_timeout(_HOLD_MS)
-    page.keyboard.press("Escape")
+    # The failed wake isn't retried on its own; Reconnect host sends a new one.
+    page.get_by_role("menuitem", name="Reconnect host").click()
+    retry = _next_held(page, held)
+    assert retry.request.post_data_json == {"type": "retry_session", "data": {}}
+    _expect_host_status(page, "starting", tooltip="Starting")
 
 
 def test_session_opened_mid_wake_spins_dot_through_server_stage(

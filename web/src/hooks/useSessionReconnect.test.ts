@@ -22,6 +22,8 @@ import { conversationRegistry } from "@/store/conversationRegistry";
 import {
   SANDBOX_WAKE_ONLINE_GRACE_POLLS,
   SANDBOX_WAKE_STAGE_LIMIT_MS,
+  resetSandboxWakesForTesting,
+  startSandboxWake,
   useSessionReconnect,
 } from "./useSessionReconnect";
 
@@ -106,6 +108,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   writeArcaHostId(null);
+  resetSandboxWakesForTesting();
 });
 
 describe("useSessionReconnect", () => {
@@ -878,8 +881,37 @@ describe("useSessionReconnect", () => {
     expect(toast.loading).not.toHaveBeenCalled();
   });
 
+  it("shares one sandbox wake between Reconnect host and every other caller", async () => {
+    const pending = deferred<PostEventResponse>();
+    vi.mocked(retrySession).mockReturnValue(pending.promise);
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...asleepSandbox, hostOnline: false }),
+    );
+    let first!: Promise<boolean>;
+    await act(async () => {
+      first = startSandboxWake("session");
+    });
+    expect(result.current.sandboxStarting).toBe(true);
+    await act(async () => {
+      void result.current.reconnect();
+      void startSandboxWake("session");
+    });
+    expect(retrySession).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      pending.resolve({ queued: false, recovered: true });
+      await first;
+    });
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    // Still waiting for the host to read online: nothing new is sent.
+    expect(retrySession).toHaveBeenCalledOnce();
+    expect(result.current.sandboxStarting).toBe(true);
+  });
+
   it.each(["resolves", "rejects"] as const)(
-    "ignores a sandbox wake that %s after navigating to another session",
+    "keeps a sandbox wake that %s while another session is open, and joins it on return",
     async (outcome) => {
       const pending = deferred<PostEventResponse>();
       vi.mocked(retrySession).mockReturnValue(pending.promise);
@@ -897,9 +929,17 @@ describe("useSessionReconnect", () => {
         else pending.reject(new Error("managed host wake timed out"));
         await reconnect;
       });
-      expect(result.current.sandboxStarting).toBe(false);
-      expect(refreshRunnerHealth).not.toHaveBeenCalled();
+      // A failure is reported only while its session is on screen.
       expect(toast.error).not.toHaveBeenCalled();
+
+      rerender(asleepSandbox);
+      vi.mocked(retrySession).mockReturnValue(deferred<PostEventResponse>().promise);
+      await act(async () => {
+        void result.current.reconnect();
+      });
+      // Returning joins the running wake instead of sending another; a failed one can retry.
+      expect(retrySession).toHaveBeenCalledTimes(outcome === "resolves" ? 1 : 2);
+      expect(result.current.sandboxStarting).toBe(true);
     },
   );
 

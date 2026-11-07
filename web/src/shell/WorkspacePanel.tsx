@@ -70,6 +70,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
 import { browserViewId, useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useInertRef } from "@/hooks/useInertRef";
+import { requestSandboxWake } from "@/hooks/useSandboxAutoWake";
 import { useWorkspaceTabHotkeys } from "@/hooks/useWorkspaceTabHotkeys";
 import { useSideChats } from "@/hooks/useSideChats";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -1454,6 +1455,10 @@ function WorkspacePanelImpl({
     return index === -1 ? undefined : String(index + 1);
   };
   const selectPermanentTab = (tab: RightRailTab) => {
+    // Files and Changes need the session's host, so picking one wakes an asleep sandbox.
+    if ((tab === "files" || tab === "changes") && conversationId) {
+      requestSandboxWake(conversationId);
+    }
     onRightRailTabChange(tab);
   };
   const tabAriaShortcut = (tab: RightRailTab) => {
@@ -1968,7 +1973,7 @@ function WorkspacePanelImpl({
                         aria-label={label}
                         aria-selected={active}
                         className="flex items-center gap-1"
-                        onClick={() => onRightRailTabChange(tab)}
+                        onClick={() => selectPermanentTab(tab)}
                         onAuxClick={(event) => {
                           if (event.button === 1) {
                             event.preventDefault();
