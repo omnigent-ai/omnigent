@@ -388,6 +388,8 @@ def test_changes_lists_git_working_tree_modifications(tmp_path: Path) -> None:
     assert by_path["committed.txt"]["lines_removed"] == 1
     assert by_path["new.txt"]["lines_added"] is None
     assert by_path["new.txt"]["lines_removed"] is None
+    assert by_path["committed.txt"]["staged"] is False
+    assert by_path["committed.txt"]["unstaged"] is True
 
 
 def test_diff_returns_before_and_after_for_modified_file(tmp_path: Path) -> None:
