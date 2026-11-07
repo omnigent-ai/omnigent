@@ -156,15 +156,17 @@ export interface SessionMention {
 }
 
 /**
- * One line telling the agent how to act on tagged sessions. Parsers key on
+ * One line telling the agent how to act on tagged sessions. ``sys_session_send``
+ * exists only for agents that can spawn, hence the fallback. Parsers key on
  * the ``[Tagged sessions:`` prefix only, so the wording can be tuned freely. It rides in the
  * message itself because native TUI harnesses never see framework prompt
  * text. Keep in sync with ``_SESSION_MENTION_LINE_RE`` in
  * ``omnigent/entities/conversation.py``.
  */
 export const SESSION_MENTION_HINT =
-  "[Tagged sessions: read with sys_session_get_history; message a subagent with " +
-  "sys_session_send, any other session with sys_session_message]";
+  "[Tagged sessions: read with sys_session_get_history; to message one, use " +
+  "sys_session_send if it is your own subagent and that tool is available, " +
+  "otherwise sys_session_message]";
 
 // Characters that would break the bracketed, quoted marker shape.
 const SESSION_TITLE_UNSAFE_RE = /["[\]\r\n]+/g;
