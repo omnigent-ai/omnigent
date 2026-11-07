@@ -281,6 +281,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
+    # Uploaded-agent sessions accept repository lists and worktree options.
+    session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True

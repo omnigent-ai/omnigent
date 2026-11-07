@@ -602,40 +602,45 @@ describe("authenticatedFetch", () => {
       },
     );
 
-    it("keys /v1/imports/local by its body host_id, not the modal host", async () => {
-      // The import reads the CHOSEN host's transcripts over that host's tunnel,
-      // so it must route to the replica keyed by the body host_id — never the
-      // importing user's modal host (a different host, or null for a fresh user),
-      // which would land off-replica and 409 "host is not connected".
-      vi.doMock("./sessionHost", () => ({
-        getSessionHost: vi.fn(() => null),
-        setSessionHost: vi.fn(),
-        isHostKeyless: vi.fn(() => false),
-        markHostKeyless: vi.fn(),
-        clearHostKeyless: vi.fn(),
-        modalHostId: vi.fn(() => "host_modal"),
-        resolveModalHost: vi.fn(),
-        isModalHostResolved: vi.fn(() => true),
-      }));
-      vi.doMock("./host", () => ({
-        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
-        hostFetch: fetchMock,
-        isDatabricksWorkspace: vi.fn(() => true),
-        isHostRoutingEnabled: vi.fn(() => true),
-      }));
+    it.each(["import", "bundle", "hostless_bundle"])(
+      "keys %s by its own destination",
+      async (kind) => {
+        // Requests route by their own host_id; hostless creates stay unkeyed.
+        vi.doMock("./sessionHost", () => ({
+          getSessionHost: vi.fn(() => null),
+          setSessionHost: vi.fn(),
+          isHostKeyless: vi.fn(() => false),
+          markHostKeyless: vi.fn(),
+          clearHostKeyless: vi.fn(),
+          modalHostId: vi.fn(() => "host_modal"),
+          resolveModalHost: vi.fn(),
+          isModalHostResolved: vi.fn(() => true),
+        }));
+        vi.doMock("./host", () => ({
+          getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+          hostFetch: fetchMock,
+          isDatabricksWorkspace: vi.fn(() => true),
+          isHostRoutingEnabled: vi.fn(() => true),
+        }));
 
-      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
-      const { authenticatedFetch } = await import("./identity");
+        fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+        const { authenticatedFetch } = await import("./identity");
 
-      await authenticatedFetch("/v1/imports/local/stream", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ host_id: "host_target", source: "all", limit: 5 }),
-      });
+        const metadata =
+          kind === "hostless_bundle" ? { host_type: "managed" } : { host_id: "host_target" };
+        const bundle = new FormData();
+        bundle.append("metadata", JSON.stringify(metadata));
+        await authenticatedFetch(kind === "import" ? "/v1/imports/local/stream" : "/v1/sessions", {
+          method: "POST",
+          body: kind === "import" ? JSON.stringify(metadata) : bundle,
+        });
 
-      const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
-      expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_target");
-    });
+        const headers = new Headers((fetchMock.mock.calls[0][1] as RequestInit).headers);
+        expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe(
+          kind === "hostless_bundle" ? null : "host_target",
+        );
+      },
+    );
 
     it.each([
       [{ host_type: "managed", host_id: "host_fork" }, "host_fork"],

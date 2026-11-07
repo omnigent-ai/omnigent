@@ -6296,6 +6296,11 @@
             "title": "Session Bundle Model Override",
             "type": "boolean"
           },
+          "session_bundle_workspaces": {
+            "default": true,
+            "title": "Session Bundle Workspaces",
+            "type": "boolean"
+          },
           "session_claude_sdk_clear": {
             "default": false,
             "title": "Session Claude Sdk Clear",
