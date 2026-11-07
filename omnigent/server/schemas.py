@@ -1923,6 +1923,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
         uploaded agent's ``os_env.cwd`` boundary at session create
         (per designs/SESSION_WORKSPACE_SELECTION.md). Optional
         otherwise.
+    :param workspaces: Repository URLs to clone into a managed sandbox.
+    :param git: Optional external-host worktree creation or binding options.
     :param terminal_launch_args: Optional pass-through CLI args for a
         native terminal wrapper (claude / codex), e.g.
         ``["--dangerously-skip-permissions"]``. Set at create-time so
@@ -1958,6 +1960,8 @@ class SessionCreateMetadata(_SandboxProfileSelection):
     model_override: str | None = None
     host_id: str | None = None
     workspace: str | None = None
+    workspaces: list[str] | None = None
+    git: SessionGitOptions | None = None
     terminal_launch_args: list[str] | None = None
     sibling_source_id: str | None = None
     parent_session_id: str | None = None
@@ -2005,13 +2009,25 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                     "host_type 'managed' lets the server provision the host; "
                     "host_id must not be set"
                 )
-            if self.workspace is not None:
+            if self.git is not None:
+                raise ValueError("git worktrees require an existing external host")
+            if self.workspace is not None and self.workspaces is not None:
+                raise ValueError(
+                    "set either 'workspace' (one repository) or 'workspaces' "
+                    "(several) for host_type 'managed', not both"
+                )
+            if self.workspaces is not None and len(self.workspaces) > _MAX_MANAGED_WORKSPACES:
+                raise ValueError(
+                    f"host_type 'managed' takes at most {_MAX_MANAGED_WORKSPACES} "
+                    f"repositories in 'workspaces' (got {len(self.workspaces)})"
+                )
+            for candidate in self.managed_repo_workspaces():
                 try:
-                    parse_repo_workspace(self.workspace)
+                    parse_repo_workspace(candidate)
                 except ValueError as exc:
                     raise ValueError(
                         "host_type 'managed' takes a git repository URL "
-                        f"(optionally '#<branch>') as workspace: {exc}"
+                        f"(optionally '#<branch>') in each workspace: {exc}"
                     ) from exc
             return self
         if self.sandbox_provider is not None:
@@ -2019,12 +2035,26 @@ class SessionCreateMetadata(_SandboxProfileSelection):
                 "sandbox_provider only applies to host_type 'managed' — "
                 "external hosts are not server-provisioned"
             )
+        if self.workspaces:
+            raise ValueError(
+                "'workspaces' (multi-repo clone) requires host_type 'managed' — "
+                "external hosts take a single absolute path in 'workspace'"
+            )
         if self.workspace is not None and is_repo_workspace(self.workspace):
             raise ValueError(
                 "a repository-URL workspace requires host_type 'managed' — "
                 "external hosts take an absolute path on the host"
             )
+        if self.git is not None and self.host_id is None:
+            raise ValueError("git worktree creation requires host_id")
         return self
+
+    def managed_repo_workspaces(self) -> list[str]:
+        if self.workspaces:
+            return list(self.workspaces)
+        if self.workspace is not None:
+            return [self.workspace]
+        return []
 
 
 class CreatedSessionResponse(BaseModel):
