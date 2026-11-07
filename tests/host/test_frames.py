@@ -21,6 +21,7 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
+    HostFrame,
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
@@ -1182,6 +1183,66 @@ def test_harness_readiness_frame_round_trip() -> None:
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHarnessReadinessFrame)
     assert decoded.configured_harnesses == {"pi": True, "codex": "needs-auth"}
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        HostHelloFrame(
+            version="0.1.0",
+            frame_protocol_version=1,
+            name="laptop",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostHarnessReadinessFrame(
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostRefreshHarnessesResultFrame(
+            request_id="refresh-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostInstallHarnessResultFrame(
+            request_id="install-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+        HostStoreSecretResultFrame(
+            request_id="secret-1",
+            status="ok",
+            configured_harnesses={"pi": "cli-unresponsive", "codex": "binary-missing"},
+        ),
+    ],
+)
+def test_unresponsive_cli_readiness_stays_decodable_by_older_servers(
+    frame: HostFrame,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An older server still applies the other harnesses' readiness in the same update."""
+    encoded = encode_host_frame(frame)
+    assert decode_host_frame(encoded) == frame
+
+    legacy_payload = json.loads(encoded)
+    legacy_payload.pop("cli_unresponsive_harnesses", None)
+    monkeypatch.setattr(
+        "omnigent.host.frames.is_harness_availability",
+        lambda value: (
+            isinstance(value, bool) or value in ("binary-missing", "needs-auth", "version-too-low")
+        ),
+    )
+    legacy = decode_host_frame(json.dumps(legacy_payload))
+    assert isinstance(legacy, type(frame))
+    assert legacy.configured_harnesses == {"pi": "version-too-low", "codex": "binary-missing"}
 
 
 def test_tmux_unavailable_readiness_survives_hello_and_live_refresh() -> None:

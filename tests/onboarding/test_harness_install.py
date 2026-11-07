@@ -2103,3 +2103,28 @@ def test_missing_harness_cli_flags_outdated_version(
     spec = hi.missing_harness_cli("opencode-native")
     assert spec is not None
     assert spec.binary == "opencode"
+
+
+def test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A present ``kimi`` whose ``--version`` outlasts the dispatch budget isn't "missing".
+
+    Sub-agent dispatch calls ``missing_harness_cli(child_harness)`` with the
+    default 30s budget. On a CPU-starved sandbox the probe can time out for a
+    current kimi, which was reported as missing or outdated (#12299).
+    """
+    monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/bin/{name}")
+    probe_timeouts: list[object] = []
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["--version"]:
+            probe_timeouts.append(k.get("timeout"))
+            raise subprocess.TimeoutExpired(argv, k.get("timeout"))
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi.subprocess, "run", _run)
+    assert hi.missing_harness_cli("kimi-native") is None
+    assert probe_timeouts == [hi._DEFAULT_CLI_PROBE_TIMEOUT_S]
+    # The probe stays inconclusive for callers that need a verified CLI.
+    assert hi.harness_cli_installed(hi.KIMI_KEY) is False
