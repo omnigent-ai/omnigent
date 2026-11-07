@@ -2689,12 +2689,16 @@ function ConversationList({
         if (writes.length > 0) reorderPins(writes);
         return;
       }
-      if (action.kind === "pin" && action.targetId) {
-        // Pin into the dropped-on slot, below the row from its lower half; the
-        // new pin goes through the pin toggle (cap / ownership checks), and only
+      const pinTargetId =
+        action.kind === "pin"
+          ? (action.targetId ?? sections.pinned.filter(isPinOrderUnit).at(-1)?.id)
+          : undefined;
+      if (action.kind === "pin" && pinTargetId) {
+        // Pin into the dropped-on slot (below a row from its lower half), else after the
+        // last pin. The new pin goes through the toggle (cap / ownership checks); only
         // once it's accepted are any renumbered neighbours rewritten through the batch.
-        const below = event.collisions?.[0]?.data?.below === true;
-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId, below);
+        const below = !action.targetId || event.collisions?.[0]?.data?.below === true;
+        const writes = pinOrderWrites(sections.pinned, dragged.id, pinTargetId, below);
         const pin = writes.find((w) => w.id === dragged.id);
         const rest = writes.filter((w) => w.id !== dragged.id);
         // Chain on this call's own promise: per-call mutate callbacks are dropped

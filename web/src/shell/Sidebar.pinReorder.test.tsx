@@ -146,11 +146,39 @@ describe("dropping an unpinned session onto a pinned row", () => {
       },
     });
 
-    await waitFor(() => expect(mocks.pinFn).toHaveBeenCalledOnce());
-    const [write] = mocks.pinFn.mock.calls[0];
-    expect(write).toMatchObject({ id: "conv_c", pinned: true });
-    // An omitted pinnedAt is stamped Date.now(), which also sorts last.
-    expect(write.pinnedAt ?? Infinity).toBeGreaterThan(2000);
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: 2001,
+      }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it("pins it after the last pin when released in the gap below it, even ahead of the clock", async () => {
+    const last = Date.now() + 60_000;
+    mocks.pinned[1].labels = { "omnigent.pinned": String(last) };
+    mocks.pinFn.mockResolvedValue({});
+    // The Pinned zone reaches 12px below the last pin, over the dragged row (never a target).
+    const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+    vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+      if (this.matches('[data-testid="sidebar-pin-drop-zone"]')) {
+        return new DOMRect(0, 0, 200, 2 * ROW_HEIGHT + 12);
+      }
+      return rowRect.call(this);
+    });
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: last + 1,
+      }),
+    );
     expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
