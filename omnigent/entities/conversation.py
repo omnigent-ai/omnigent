@@ -34,7 +34,8 @@ _ATTACHMENT_MARKER_RE = re.compile(
 # the one tool hint a tagged session adds. Keep in sync with
 # sessionMentionMarker, SESSION_MENTION_HINT and readableSentText in
 # web/src/lib/composerMentions.ts.
-_SESSION_MENTION_HINT_RE = re.compile(r"\[Tagged sessions:[^\]]*\]")
+# The hint is only ever appended last; anywhere else it is the user's text.
+_SESSION_MENTION_HINT_RE = re.compile(r"\s*\[Tagged sessions:[^\]]*\]\s*$")
 _SESSION_MENTION_MARKER_RE = re.compile(
     r'\[Session: "([^"\]]*)" id=[A-Za-z0-9_:-]+ subagent=(?:yes|no)\]'
 )

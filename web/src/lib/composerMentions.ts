@@ -279,7 +279,8 @@ export function isAbsolutePath(path: string): boolean {
 
 const SENT_SESSION_RE = /\[Session: "([^"\]]*)" id=([A-Za-z0-9_:-]+) subagent=(yes|no)\]/g;
 const SENT_ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]([ \t]*(?:\r?\n)*)/g;
-const SENT_HINT_RE = /(?:\r?\n)*[ \t]*\[Tagged sessions:[^\]]*\][ \t]*/g;
+// The hint is only ever appended at the very end; elsewhere it is user text.
+const SENT_HINT_RE = /(?:\r?\n)*[ \t]*\[Tagged sessions:[^\]]*\]\s*$/;
 
 /**
  * Rewrite the markers in a sent message with ``render``: drops the tool hint,

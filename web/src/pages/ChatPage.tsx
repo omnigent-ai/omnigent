@@ -3076,7 +3076,7 @@ function ComposerImpl(
   const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
   // Root-level typing also finds files in unexpanded folders (files only).
   const mentionFileSearch = useWorkspaceFileSearch(
-    conversationId ?? undefined,
+    composerSessionId ?? undefined,
     mentionEnabled && mention && !mentionDir ? debouncedMentionQuery : "",
   );
   // Folders first, filtered by the typed segment, capped (see rankMentionEntries),

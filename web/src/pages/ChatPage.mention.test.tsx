@@ -29,6 +29,7 @@ const ws = vi.hoisted(() => ({
   srcEntries: [] as unknown[],
   rootLoading: false,
   dirLoading: false,
+  searchFiles: [] as unknown[],
 }));
 const ROOT_ENTRIES: WorkspaceFile[] = [
   { path: "src", name: "src", type: "directory", bytes: null, modified_at: null },
@@ -43,6 +44,7 @@ function resetWorkspaceMock() {
   ws.srcEntries = SRC_ENTRIES;
   ws.rootLoading = false;
   ws.dirLoading = false;
+  ws.searchFiles = [];
   sessions.loaded = [];
   sessions.children = [];
   sessions.searchHits = [];
@@ -85,7 +87,9 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => {
       data: dirPath === "src" ? ws.srcEntries : undefined,
       isLoading: ws.dirLoading,
     }),
-    useWorkspaceFileSearch: () => ({ data: undefined }),
+    useWorkspaceFileSearch: (_conv: string | undefined, query: string) => ({
+      data: query ? { files: ws.searchFiles, truncated: false } : undefined,
+    }),
   };
 });
 
@@ -469,6 +473,35 @@ describe("Composer @-file-mention browser (native sessions)", () => {
     expect(screen.getByTitle("Open src")).toBeInTheDocument();
     fireEvent.keyDown(textarea(), { key: "Escape" });
     expect(screen.queryByTitle("Open src")).not.toBeInTheDocument();
+  });
+
+  it("adds deeper files from the recursive search, deduped and filtered by the live query", async () => {
+    ws.searchFiles = [
+      { path: "src/server.ts", name: "server.ts", type: "file", bytes: 1, modified_at: null },
+      // A stale hit from an earlier, shorter query no longer matches "serv".
+      { path: "src/client.ts", name: "client.ts", type: "file", bytes: 1, modified_at: null },
+    ];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@serv");
+    // The root listing has no match; the debounced search supplies the nested file.
+    await waitFor(() => expect(screen.getByTitle("Attach server.ts")).toBeInTheDocument());
+    expect(screen.queryByTitle("Attach client.ts")).not.toBeInTheDocument();
+    expect(screen.getAllByTitle("Attach server.ts")).toHaveLength(1);
+  });
+
+  it("keeps the highlighted file when session results land above it", async () => {
+    sessions.searchHits = [sessionRow("s_readme", "readme cleanup")];
+    renderWithTooltips(<Composer {...composerProps()} />);
+    type("@readme");
+    // Before the debounced search returns, the file is the top, highlighted row.
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    await waitFor(() =>
+      expect(screen.getByTitle("Tag session readme cleanup")).toBeInTheDocument(),
+    );
+    // The session row was inserted above, but the highlight stayed on the file.
+    expect(screen.getByTestId("file-mention-item-0")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(tokens()).toEqual(["@readme.md"]);
   });
 
   // ── Token lifecycle + dedup (M8, M2) ─────────────────────────────────────

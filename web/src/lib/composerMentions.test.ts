@@ -96,6 +96,11 @@ describe("reading a sent message", () => {
     expect(readableSentText(sent)).toBe("Ask @auth about @src/a.ts\nthanks");
   });
 
+  it("keeps hint-looking text the user typed mid-message", () => {
+    const typed = "why does [Tagged sessions: read] show up?";
+    expect(readableSentText(typed)).toBe(typed);
+  });
+
   it("hands each mention to the renderer", () => {
     const seen: string[] = [];
     replaceSentMentions(sent, (m) => {

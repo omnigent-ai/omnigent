@@ -96,8 +96,12 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     mentionEntryKeys.length !== prevMentionMatchesRef.current.length ||
     mentionEntryKeys.some((k, i) => k !== prevMentionMatchesRef.current[i])
   ) {
+    // Keep the highlighted row when late results (debounced search) shift it,
+    // so Enter never lands on a row inserted above the one the user saw.
+    const highlighted = prevMentionMatchesRef.current[mentionIndex];
+    const kept = highlighted === undefined ? -1 : mentionEntryKeys.indexOf(highlighted);
     prevMentionMatchesRef.current = mentionEntryKeys;
-    setMentionIndex(mentionEntryKeys.length > 0 ? 0 : -1);
+    setMentionIndex(kept >= 0 ? kept : mentionEntryKeys.length > 0 ? 0 : -1);
   }
 
   const mentionTokens = [

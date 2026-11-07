@@ -174,6 +174,20 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   working-directory selection follows the project's defaults, not the old session.
 - `attachments`: attach button, paste, and drop onto the transcript; chips can
   be removed. State: unsupported file type rejected without losing the message.
+- `at-mentions`: typing `@` in the in-session or new-session composer lists
+  other sessions, the current session's subagents first, then other sessions
+  already loaded in the sidebar. In native coding-agent sessions it also lists
+  workspace files and folders below them. Typing filters both lists and, after a
+  short pause, searches session titles and the workspace. Picking a row puts a
+  pill-styled `@name` token in the sentence; Backspace deletes a token whole, and
+  deleting it untags the item. On send each token becomes a marker in place
+  (`[Attached: path]` or `[Session: "title" id=… subagent=yes|no]`), and a
+  tagged session adds one tool hint at the end, so native terminals show the
+  markers as typed text. The sent message shows the tokens as inline pills; a
+  session pill opens that session. States: listing still loading (Enter holds),
+  no match (Enter sends the literal text), late results arriving (the
+  highlighted row stays put), Attach to agent from the file viewer (adds a token
+  at the end).
 - `dictation`: the microphone button beside the message box dictates speech
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While listening, Enter keeps the dictated text and

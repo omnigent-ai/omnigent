@@ -179,4 +179,9 @@ def test_humanize_mention_markers_reads_markers_as_names() -> None:
         "and [Attached: /tmp/upload.png]\n\n[Tagged sessions: read with sys_session_get_history]"
     )
     # Absolute paths are uploads shown as file blocks, so they drop out.
-    assert humanize_mention_markers(text) == "Ask @Fix CI about @src/a.py:3-9 and \n\n"
+    assert humanize_mention_markers(text) == "Ask @Fix CI about @src/a.py:3-9 and "
+
+
+def test_humanize_mention_markers_keeps_a_hint_typed_mid_message() -> None:
+    text = "why does [Tagged sessions: read] show up here?"
+    assert humanize_mention_markers(text) == text
