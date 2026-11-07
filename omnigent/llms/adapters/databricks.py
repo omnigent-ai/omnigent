@@ -2,7 +2,7 @@
 Databricks Model Serving adapter.
 
 Extends the OpenAI-compatible adapter with Databricks-specific
-authentication. When ``connection_params`` omits ``base_url``, the
+authentication. When ``connection_params`` omits ``base_url`` or ``api_key``, the
 adapter resolves credentials via the databricks-sdk ``Config`` object,
 which handles OAuth token refresh transparently on every call. Falls
 back to :func:`~omnigent.runtime.credentials.databricks.resolve_databricks_workspace`
@@ -16,6 +16,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.host.databricks_credential import https_url_on_workspace_host
 from omnigent.llms.adapters.openai import OpenAICompatibleAdapter
 from omnigent.runtime.credentials.databricks import resolve_databricks_workspace
 
@@ -27,7 +28,8 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
     Credentials are resolved in the following order:
 
     1. ``connection_params`` passed at call time (from the ``connection:``
-       block in the agent spec's ``llm:`` config) — used when present.
+       block in the agent spec's ``llm:`` config), with missing URL/key values
+       filled from the credential sources below.
     2. A cached ``databricks.sdk.config.Config`` object whose
        ``authenticate()`` method is called on every request. The SDK
        handles OAuth token refresh transparently — no manual expiry
@@ -129,31 +131,43 @@ class DatabricksAdapter(OpenAICompatibleAdapter):
         :param tools: Tool schemas or ``None``.
         :param stream: Enable streaming.
         :param extra: Additional kwargs.
-        :param connection_params: Optional. When provided, must contain
-            ``"base_url"``; ``"api_key"`` is also expected. When absent
-            or missing ``"base_url"``, credentials are resolved via the
-            cached SDK ``Config`` (handles OAuth refresh) then falls back
+        :param connection_params: Optional ``"base_url"``, ``"api_key"`` and
+            ``"profile"``. Missing or empty URL/key values are resolved via the
+            cached SDK ``Config`` (handles OAuth refresh), then fall back
             to :func:`~omnigent.runtime.credentials.databricks.resolve_databricks_workspace`.
+            A URL override using resolved credentials must be HTTPS on the
+            resolved workspace host.
         :param timeout: Request timeout in seconds. ``None`` uses
             the module default.
         :returns: Response dict or async iterator of chunk dicts.
-        :raises OmnigentError: If ``connection_params`` lacks
-            ``"base_url"`` and all credential resolution paths fail.
+        :raises OmnigentError: If credential resolution fails or a URL override
+            would send resolved credentials outside their workspace.
         """
-        if not connection_params or "base_url" not in connection_params:
-            profile = (connection_params or {}).get("profile")
+        connection_params = dict(connection_params or {})
+        if not connection_params.get("base_url") or not connection_params.get("api_key"):
+            profile = connection_params.get("profile")
             resolved = self._resolve_via_sdk(profile)
             if resolved is None:
                 # SDK unavailable or auth failed — fall back to configparser path.
                 try:
-                    creds = resolve_databricks_workspace(None)
+                    creds = resolve_databricks_workspace(profile)
                 except OSError as exc:
                     raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
                 resolved = {
                     "base_url": creds.host + "/serving-endpoints",
                     "api_key": creds.token,
                 }
-            connection_params = {**resolved, **(connection_params or {})}
+            base_url = connection_params.get("base_url")
+            if base_url and not connection_params.get("api_key"):
+                # A URL override must not redirect a profile's bearer to another origin.
+                if not https_url_on_workspace_host(base_url, resolved["base_url"]):
+                    raise OmnigentError(
+                        "Databricks base_url must use HTTPS and match the credential "
+                        "workspace host when api_key is resolved from a profile.",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+            connection_params["base_url"] = base_url or resolved["base_url"]
+            connection_params["api_key"] = connection_params.get("api_key") or resolved["api_key"]
         return await super().chat_completions(
             messages,
             model,
