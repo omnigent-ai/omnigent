@@ -31,6 +31,9 @@ def test_canvas_uses_standard_sidebar_navigation(
     page.get_by_role("button", name="Close sidebar", exact=True).click()
     toggle = page.get_by_role("button", name="Open sidebar", exact=True)
     expect(toggle).to_be_visible()
+    sidebar = page.locator("aside.conversations-sidebar")
+    # The toggle appears before the sidebar's closing transition has settled.
+    expect(sidebar).to_have_css("width", "0px")
     ordinary_icon = toggle.locator("svg").inner_html()
     ordinary_bounds = toggle.bounding_box()
     assert ordinary_bounds is not None
@@ -40,6 +43,7 @@ def test_canvas_uses_standard_sidebar_navigation(
     project.click()
     expect(toggle).to_have_count(1)
     expect(toggle).to_be_visible()
+    expect(sidebar).to_have_css("width", "0px")
     expect(page.get_by_role("navigation", name="Collapsed sidebar")).to_have_count(0)
     assert toggle.locator("svg").inner_html() == ordinary_icon
     canvas_bounds = toggle.bounding_box()
@@ -53,7 +57,6 @@ def test_canvas_uses_standard_sidebar_navigation(
     board_bounds = board.bounding_box()
     assert board_bounds is not None and board_bounds["x"] == 0
     toggle.hover()
-    sidebar = page.locator("aside.conversations-sidebar")
     expect(sidebar).to_have_class(re.compile(r"\bis-peek\b"))
     expect(primary).to_be_visible()
     assert board.bounding_box() == board_bounds

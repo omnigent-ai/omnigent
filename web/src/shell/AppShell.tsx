@@ -367,7 +367,11 @@ function AppShellImpl() {
       : undefined;
   const [searchParams, setSearchParams] = useSearchParams();
   const agentsPanelRequested = searchParams.get("panel") === "agents";
-  const [sidebarOpen, setSidebarOpen] = useCanvasSidebar(canvasMode, initialSidebarOpen);
+  const sidebarRequested = searchParams.get("sidebar");
+  const [sidebarOpen, setSidebarOpen] = useCanvasSidebar(
+    canvasMode,
+    () => sidebarRequested !== "closed" && initialSidebarOpen(),
+  );
   // Extension pages own their top chrome. The shell header only carries the
   // collapsed-sidebar toggle there, so skip it while the sidebar is open and
   // let the page use the full height (ExtensionViewHost drops its inset).
@@ -403,10 +407,10 @@ function AppShellImpl() {
     // Leaving /settings: restore, then clear the stash so the next visit
     // captures fresh state.
     if (sidebarOpenBeforeSettingsRef.current !== null) {
-      setSidebarOpen(sidebarOpenBeforeSettingsRef.current);
+      setSidebarOpen(sidebarRequested !== "closed" && sidebarOpenBeforeSettingsRef.current);
       sidebarOpenBeforeSettingsRef.current = null;
     }
-  }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+  }, [inSettings, location.pathname, rebasePath, sidebarRequested, setSidebarOpen]);
 
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
@@ -447,6 +451,14 @@ function AppShellImpl() {
   // Reads the same module-level store Sidebar drives, so the rail's ceiling
   // tracks the live sidebar width (including a drag) rather than a guess.
   const { width: sidebarWidth } = useResizableSidebar();
+  // Retain closed for reloads. Reapply on navigation, while allowing manual
+  // expansion and unrelated workspace query changes within the current page.
+  useLayoutEffect(() => {
+    if (sidebarRequested === "closed" && !inSettings) {
+      sidebarOpenBeforeNarrowRef.current = false;
+      setSidebarOpen(false);
+    }
+  }, [sidebarRequested, location.pathname, inSettings, setSidebarOpen]);
   // ?sidebar=open surfaces the session list on phone-width shells where the
   // sidebar is closed by default — the destination for a "N sessions need
   // your attention" notification tap, which would otherwise land on a bare
@@ -1354,7 +1366,10 @@ function AppShellImpl() {
     // If we were maximized, restore the sidebar we collapsed on entry (the
     // toggle handler won't run on a session switch).
     setRightPanelMaximized((wasMaximized) => {
-      if (wasMaximized) restoreSidebarAfterMaximize();
+      if (wasMaximized) {
+        if (sidebarRequested === "closed") setSidebarOpen(false);
+        else restoreSidebarAfterMaximize();
+      }
       return false;
     });
     // A selected file must be visible in the rail. The Files and Changes tabs
