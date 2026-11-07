@@ -37,7 +37,8 @@ _MAX_REPORTED = 1024
 
 
 def _git(directory: str, *argv: str) -> str | None:
-    # The checkout's config is agent-writable, so keep it from running programs here.
+    # The checkout's config is agent-writable, so keep it from running programs here,
+    # including a partial clone's fetch of a missing object: these reads stay local.
     try:
         completed = subprocess.run(
             [
@@ -48,10 +49,12 @@ def _git(directory: str, *argv: str) -> str | None:
                 "core.fsmonitor=false",
                 "-c",
                 "log.showSignature=false",
+                "-c",
+                "protocol.allow=never",
                 *argv,
             ],
             cwd=directory,
-            env=_anchored_git_env(),
+            env={**_anchored_git_env(), "GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0"},
             capture_output=True,
             stdin=subprocess.DEVNULL,
             timeout=_GIT_TIMEOUT_SECONDS,

@@ -293,6 +293,8 @@ def test_serialized_shell_envelope_reaches_the_push_lookup_decoded(
 def _git(*argv: str, cwd: Path) -> str:
     env = {
         **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_AUTHOR_NAME": "Test",
         "GIT_AUTHOR_EMAIL": "test@example.com",
         "GIT_COMMITTER_NAME": "Test",
@@ -593,3 +595,25 @@ def test_reflog_checks_every_directory_the_command_ran_in(
     _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
     directories = [*map(str, elsewhere), str(work)]
     assert _report(directories) == [(str(remote), "feature/topic")]
+
+
+def test_reflog_read_does_not_fetch_a_missing_object(
+    checkout: tuple[Path, Path], tmp_path: Path
+) -> None:
+    _, work = checkout
+    _git("push", "-q", "origin", "HEAD:feature/topic", cwd=work)
+    marker = tmp_path / "upload-pack-ran"
+    upload_pack = tmp_path / "upload-pack.sh"
+    upload_pack.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+    upload_pack.chmod(0o755)
+    # An agent can make the checkout a partial clone whose fetch runs its own program,
+    # then drop the pushed commit so reading the reflog would fetch it.
+    _git("config", "core.repositoryformatversion", "1", cwd=work)
+    _git("config", "extensions.partialClone", "origin", cwd=work)
+    _git("config", "remote.origin.promisor", "true", cwd=work)
+    _git("config", "remote.origin.uploadpack", str(upload_pack), cwd=work)
+    head = _git("rev-parse", "HEAD", cwd=work).strip()
+    (work / ".git" / "objects" / head[:2] / head[2:]).unlink()
+    assert not marker.exists()
+    push_reflog.recent_pushes([str(work)])
+    assert not marker.exists()
