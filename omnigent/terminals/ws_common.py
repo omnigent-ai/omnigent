@@ -28,8 +28,38 @@ WS_CLOSE_TERMINAL_DETACHED: Final[int] = 4405
 WS_CLOSE_WRONG_REPLICA: Final[int] = 4400
 WS_CLOSE_INTERNAL_ERROR: Final[int] = 4500
 
+_WS_CLOSE_UNEXPECTED_CONDITION: Final[int] = 1011
+_WS_CLOSE_APPLICATION_MIN: Final[int] = 3000
+_WS_CLOSE_APPLICATION_MAX: Final[int] = 4999
+_WS_CLOSE_REASON_MAX_BYTES: Final[int] = 123
+
 # A local tmux liveness probe should never stall bridge teardown.
 _TMUX_HAS_SESSION_TIMEOUT_S: Final[float] = 2.0
+
+
+def normalize_ws_close(code: int | None, reason: str | None) -> tuple[int, str]:
+    """Normalize runner close metadata for browser delivery.
+
+    :param code: Runner close code, or None when no close frame was received.
+    :param reason: Optional runner close reason.
+    :returns: A legal code and at most 123 complete UTF-8 reason bytes.
+        Missing or non-wire codes become retryable 1011.
+    """
+    from websockets.frames import EXTERNAL_CLOSE_CODES
+
+    if code is not None and (
+        code in EXTERNAL_CLOSE_CODES
+        or _WS_CLOSE_APPLICATION_MIN <= code <= _WS_CLOSE_APPLICATION_MAX
+    ):
+        wire_code = code
+    else:
+        wire_code = _WS_CLOSE_UNEXPECTED_CONDITION
+    wire_reason = (
+        (reason or "")
+        .encode("utf-8", errors="replace")[:_WS_CLOSE_REASON_MAX_BYTES]
+        .decode("utf-8", errors="ignore")
+    )
+    return wire_code, wire_reason
 
 
 def _monotonic() -> float:
