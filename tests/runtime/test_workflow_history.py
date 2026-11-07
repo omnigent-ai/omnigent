@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from omnigent.entities import ConversationItem, MessageData, PagedList, SlashCommandData
+from omnigent.entities import (
+    ConversationItem,
+    ErrorData,
+    MessageData,
+    PagedList,
+    SlashCommandData,
+)
 from omnigent.entities.pagination import paginate_in_memory
 from omnigent.runtime.workflow import _load_initial_history
 
@@ -15,10 +21,17 @@ class _ConversationStore:
 
     :param items: Chronological conversation items returned by
         ``list_items``.
+    :param stored_types: Stored type per item id where it differs from the
+        returned item's type, as for a row the store serves as an ``error``
+        placeholder because it cannot decode it; a ``type`` filter selects
+        by the stored type.
     """
 
-    def __init__(self, items: list[ConversationItem]) -> None:
+    def __init__(
+        self, items: list[ConversationItem], stored_types: dict[str, str] | None = None
+    ) -> None:
         self._items = items
+        self._stored_types = stored_types or {}
 
     def list_items(
         self,
@@ -45,7 +58,11 @@ class _ConversationStore:
         :returns: Paginated in-memory items.
         """
         del conversation_id, kwargs
-        items = [item for item in self._items if type is None or item.type == type]
+        items = [
+            item
+            for item in self._items
+            if type is None or self._stored_types.get(item.id, item.type) == type
+        ]
         return paginate_in_memory(
             items,
             lambda item: item.id,
@@ -105,3 +122,37 @@ def test_load_initial_history_filters_visible_slash_command_but_keeps_meta_messa
     assert [item.id for item in loaded.items] == ["msg_meta", "msg_visible"]
     assert isinstance(loaded.items[0].data, MessageData)
     assert loaded.items[0].data.is_meta is True
+
+
+def test_load_initial_history_falls_back_when_latest_compaction_is_unreadable() -> None:
+    """A compaction row the store cannot decode arrives as an error placeholder;
+    the loader treats it like a broken compaction and returns the readable
+    history without it."""
+
+    def message(item_id: str, created_at: int, text: str) -> ConversationItem:
+        return ConversationItem(
+            id=item_id,
+            type="message",
+            status="completed",
+            response_id="turn_1",
+            created_at=created_at,
+            data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+        )
+
+    unreadable = ConversationItem(
+        id="cmp_1",
+        type="error",
+        status="completed",
+        response_id="turn_1",
+        created_at=2,
+        data=ErrorData(source="execution", code="item_data_unreadable", message="unreadable"),
+    )
+    store = _ConversationStore(
+        [message("msg_1", 1, "hello"), unreadable, message("msg_2", 3, "again")],
+        stored_types={"cmp_1": "compaction"},
+    )
+
+    loaded = _load_initial_history(store, "conv_123")  # type: ignore[arg-type]
+
+    assert [item.id for item in loaded.items] == ["msg_1", "msg_2"]
+    assert loaded.last_compaction_created_at is None
