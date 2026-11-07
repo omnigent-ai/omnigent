@@ -553,6 +553,27 @@ describe("ForkSessionDialog", () => {
     await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
   });
 
+  it("does not fork on the Enter that confirms an IME candidate", async () => {
+    forkSessionMock.mockResolvedValue({
+      id: "conv_fork",
+    } as unknown as Awaited<ReturnType<typeof forkSession>>);
+
+    renderDialog();
+
+    openAdvanced();
+    const input = screen.getByTestId("fork-session-title-input");
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(input);
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.compositionEnd(input);
+    expect(forkSessionMock).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+  });
+
   it("surfaces the server error inline on failure and does not navigate", async () => {
     forkSessionMock.mockRejectedValue(new Error("403 forbidden"));
     renderDialog();
