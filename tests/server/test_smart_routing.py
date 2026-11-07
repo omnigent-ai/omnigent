@@ -389,6 +389,53 @@ async def test_llm_routing_client_clamps_hallucinated_model() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clamped_pick_does_not_advertise_the_dropped_most_capable_model() -> None:
+    # The judge's most-capable pick is unservable here, so route() clamps it to
+    # the cheapest servable model; the rationale must not keep advertising the
+    # dropped model, or the chip claims "most capable" while running the cheapest.
+    dropped = "databricks-gpt-5-6-sol"
+    verdict = {
+        "harness": "codex",
+        "model": dropped,
+        "rationale": (
+            "This is a COMPLEX task (deep multi-step reasoning); "
+            f"selected most capable model {dropped}."
+        ),
+    }
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    catalog = {"codex": ["databricks-gpt-5-4-nano", "databricks-gpt-5-4"]}
+    result = await client.route("hard task", catalog)
+    assert result is not None
+    assert result.model == "databricks-gpt-5-4-nano"  # clamped to cheapest servable
+    assert dropped not in result.rationale, (
+        f"applied {result.model!r} while rationale still advertises the dropped "
+        f"model {dropped!r}: {result.rationale!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_clamped_pick_does_not_resurface_the_dropped_model_as_raw() -> None:
+    # Leave raw_model unset so downstream substitution in route_session_harness
+    # keeps selecting from the clamped pick (``raw_model or chosen_model``);
+    # a retained pick would change which servable substitute it chooses.
+    dropped = "databricks-gpt-5-6-sol"
+    verdict = {
+        "harness": "codex",
+        "model": dropped,
+        "rationale": f"This is a COMPLEX task; selected most capable model {dropped}.",
+    }
+    client = LLMRoutingClient(_FakeLLMClient(verdict))
+    catalog = {"codex": ["databricks-gpt-5-4-nano", "databricks-gpt-5-4"]}
+    result = await client.route("hard task", catalog)
+    assert result is not None
+    assert result.model == "databricks-gpt-5-4-nano"
+    assert result.raw_model is None
+    # The rewritten rationale positively names the applied model, so a clamp
+    # cannot pass with an empty or unrelated explanation.
+    assert "databricks-gpt-5-4-nano" in result.rationale
+
+
+@pytest.mark.asyncio
 async def test_llm_routing_client_rejects_empty_model() -> None:
     verdict = {"harness": "claude-sdk", "model": "", "rationale": "x"}
     client = LLMRoutingClient(_FakeLLMClient(verdict))
