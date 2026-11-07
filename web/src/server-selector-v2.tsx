@@ -345,9 +345,10 @@ export function BridgeSetupApp() {
     // Copy via the shell's native clipboard bridge — navigator.clipboard is
     // denied on the file:// wizard page.
     onCopy: (text) => {
-      setupBridge()
-        ?.copyText(text)
-        .catch(() => {});
+      const bridge = setupBridge();
+      return bridge
+        ? Promise.resolve(bridge.copyText(text))
+        : Promise.reject(new Error("Clipboard bridge unavailable"));
     },
     // Cloud deploy docs open in the real browser: window.open on this file://
     // page is routed out by the shell's popup policy, not opened in-window.

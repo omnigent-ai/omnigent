@@ -524,6 +524,27 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
   });
 
+  it("passes the setup copy callback to the failed terminal step", async () => {
+    const errorMessage = "Arca setup didn't complete.";
+    const errorAction = "Check Arca Companion, finish browser sign-in, and try again.";
+    const onCopy = vi.fn().mockResolvedValue(undefined);
+    await installFromRunnerStep({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnectRunner: vi.fn().mockResolvedValue({
+        ok: false,
+        error: `${errorMessage} ${errorAction}`,
+        errorMessage,
+        errorAction,
+      }),
+      getRunnerOptions: vi.fn().mockResolvedValue({ remote: true, bundledCli: true }),
+      onCopy,
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Copy diagnostics" }));
+    expect(onCopy).toHaveBeenCalledExactlyOnceWith(`${errorMessage}\n${errorAction}`);
+    expect(await screen.findByRole("button", { name: "Copied" })).toBeInTheDocument();
+  });
+
   it.each(["install", "laptop", "server"])(
     "does not offer Continue anyway after a %s failure",
     async (failure) => {
