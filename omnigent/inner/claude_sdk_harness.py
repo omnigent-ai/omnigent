@@ -113,6 +113,7 @@ _ENV_GATEWAY_HOST = "HARNESS_CLAUDE_SDK_GATEWAY_HOST"
 _ENV_CWD = "HARNESS_CLAUDE_SDK_CWD"
 _ENV_PERMISSION_MODE = "HARNESS_CLAUDE_SDK_PERMISSION_MODE"
 _ENV_SYSTEM_PROMPT_PRESET = "HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"
+_ENV_SESSION_PERSISTENCE = "HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE"
 _ENV_OS_ENV = "HARNESS_CLAUDE_SDK_OS_ENV"
 _ENV_RETRY_POLICY = "HARNESS_CLAUDE_SDK_RETRY_POLICY"
 _ENV_SKILLS_FILTER = "HARNESS_CLAUDE_SDK_SKILLS_FILTER"
@@ -271,6 +272,8 @@ def _build_claude_sdk_executor() -> Executor:
     """
     gateway_raw = os.environ.get(_ENV_GATEWAY, "").strip().lower()
     gateway = gateway_raw in ("1", "true", "yes")
+    session_persistence_raw = os.environ.get(_ENV_SESSION_PERSISTENCE, "").strip().lower()
+    session_persistence = session_persistence_raw in ("1", "true", "yes")
     bundle_dir_raw = os.environ.get(_ENV_BUNDLE_DIR, "").strip()
     bundle_dir = Path(bundle_dir_raw) if bundle_dir_raw else None
     agent_name_raw = os.environ.get(_ENV_AGENT_NAME, "").strip()
@@ -289,6 +292,7 @@ def _build_claude_sdk_executor() -> Executor:
         model=os.environ.get(_ENV_MODEL),
         permission_mode=os.environ.get(_ENV_PERMISSION_MODE, _DEFAULT_PERMISSION_MODE),
         system_prompt_preset=os.environ.get(_ENV_SYSTEM_PROMPT_PRESET) or None,
+        session_persistence=session_persistence,
         gateway=gateway,
         databricks_profile=os.environ.get(_ENV_DATABRICKS_PROFILE),
         gateway_host=os.environ.get(_ENV_GATEWAY_HOST) or None,
