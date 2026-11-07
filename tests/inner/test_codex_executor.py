@@ -4697,7 +4697,7 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
 
 
 @pytest.mark.parametrize(
-    ("existing_name", "base_url"),
+    ("existing_name", "provider_base_url"),
     [
         ("", "https://ws.cloud.databricks.com/ai-gateway/codex/v1"),
         (" \t", "https://ws.cloud.databricks.com/ai-gateway/codex/v1"),
@@ -4707,7 +4707,7 @@ def test_materialize_inherited_gateway_name_preserves_explicit_values(
     ],
 )
 def test_materialize_active_provider_completes_only_its_display_name(
-    tmp_path: Path, existing_name: str | None, base_url: str
+    tmp_path: Path, existing_name: str | None, provider_base_url: str
 ) -> None:
     import tomllib
 
@@ -4719,11 +4719,11 @@ def test_materialize_active_provider_completes_only_its_display_name(
     config_path.write_text(
         "[model_providers.Managed]\n"
         + (f"name = {json.dumps(existing_name)}\n" if existing_name is not None else "")
-        + f'base_url = {json.dumps(base_url)}\nwire_api = "responses"\n'
+        + f'base_url = {json.dumps(provider_base_url)}\nwire_api = "responses"\n'
         + '[model_providers.Managed.auth]\ncommand = "owned-helper"\n'
         + '[model_providers.Inactive]\nname = ""\nbase_url = "https://other.test"\n'
     )
-    effective = {"Managed": {"name": "Canonical Gateway", "base_url": base_url}}
+    effective = {"Managed": {"name": "Canonical Gateway", "base_url": provider_base_url}}
     snapshot = json.loads(json.dumps(effective))
     overrides = ['model_provider="Managed"', 'model_reasoning_effort="high"']
     materialize_codex_provider_config(home, overrides, effective_providers=effective)
