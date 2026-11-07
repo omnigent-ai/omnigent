@@ -14,10 +14,7 @@ import {
   nativeAgentHasModelSettings,
   nativeCodingAgentForAvailableAgent,
 } from "@/lib/nativeCodingAgents";
-import {
-  nativePermissionOptions,
-  UNATTENDED_DISALLOWED_PERMISSION_MODES,
-} from "@/lib/nativeHarnessModes";
+import { nativePermissionOptions } from "@/lib/nativeHarnessModes";
 import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
 import type { NativeModelOption } from "@/lib/types";
@@ -119,11 +116,7 @@ export function useScheduledHarnessSettings(
   const supportsHarnessPermissions =
     harness === "claude-native" ||
     (info !== "loading" && info.scheduled_task_harness_settings === true);
-  const permissions = supportsHarnessPermissions
-    ? nativePermissionOptions(harness).filter(
-        (option) => !UNATTENDED_DISALLOWED_PERMISSION_MODES.has(option.value),
-      )
-    : [];
+  const permissions = supportsHarnessPermissions ? nativePermissionOptions(harness) : [];
   const loading = sandbox ? sandboxModels.isLoading : hostModels.isLoading;
   const error = sandbox
     ? (sandboxModels.error ??
