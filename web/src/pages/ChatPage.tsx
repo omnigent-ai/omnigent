@@ -4504,6 +4504,7 @@ function ComposerImpl(
                   setValue(voiceSnapshotRef.current);
                 }}
                 onListeningChange={setDictating}
+                inputRef={textareaRef}
                 onTranscript={(text) => {
                   dictation.appendFinal(text);
                   dirtyRef.current = true;

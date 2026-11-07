@@ -50,6 +50,7 @@ function loadMainHarness({
     windowCloses: 0,
     webContentsFocuses: 0,
     globalShortcuts: [],
+    firstResponderActions: [],
   };
 
   const sender = {
@@ -75,6 +76,7 @@ function loadMainHarness({
       calls.windowCloses += 1;
     },
   };
+  let focusedWindow = win;
 
   class FakeSemVer {
     constructor(version) {
@@ -127,12 +129,13 @@ function loadMainHarness({
     },
     BrowserWindow: Object.assign(function BrowserWindow() {}, {
       fromWebContents: (webContents) => (webContents === sender ? win : null),
-      getFocusedWindow: () => win,
+      getFocusedWindow: () => focusedWindow,
       getAllWindows: () => [win],
     }),
     Menu: {
       buildFromTemplate: (template) => ({ template }),
       setApplicationMenu: (menu) => calls.setApplicationMenu.push(menu),
+      sendActionToFirstResponder: (action) => calls.firstResponderActions.push(action),
     },
     Notification: { isSupported: () => false },
     clipboard: {},
@@ -309,6 +312,9 @@ function loadMainHarness({
     ipcHandlers,
     ipcListeners,
     win,
+    setFocusedWindow: (next) => {
+      focusedWindow = next;
+    },
     pendingMainImmediates: () => mainImmediates.length,
     readSettings: () => JSON.parse(fs.readFileSync(path.join(userData, "settings.json"), "utf8")),
     runMainImmediates: () => {
@@ -862,6 +868,61 @@ describe("close-window request", () => {
       false,
     );
     assert.equal(harness.calls.windowCloses, 0);
+  });
+});
+
+describe("system dictation request", () => {
+  it("starts macOS Dictation in the page's focused field", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      true,
+    );
+    assert.equal(harness.calls.webContentsFocuses, 1);
+    assert.deepEqual(harness.calls.firstResponderActions, ["startDictation:"]);
+  });
+
+  it("refuses a page off the pinned server", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.unpinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("refuses a window that isn't focused", async (t) => {
+    const harness = loadMainHarness({ platform: "darwin" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+    const start = harness.ipcHandlers.get("omnigent:start-system-dictation");
+
+    // Dictation types into the key window, so a background window must not start it.
+    for (const focused of [null, { isDestroyed: () => false }]) {
+      harness.setFocusedWindow(focused);
+      // oxlint-disable-next-line no-await-in-loop -- Each case reads the call log afterwards.
+      assert.equal(await start(harness.events.pinned), false);
+    }
+    assert.equal(harness.calls.webContentsFocuses, 0);
+    assert.deepEqual(harness.calls.firstResponderActions, []);
+  });
+
+  it("does nothing off macOS", async (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.registerIpc();
+
+    assert.equal(
+      await harness.ipcHandlers.get("omnigent:start-system-dictation")(harness.events.pinned),
+      false,
+    );
+    assert.deepEqual(harness.calls.firstResponderActions, []);
   });
 });
 

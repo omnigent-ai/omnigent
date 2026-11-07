@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
-function loadPreload() {
+function loadPreload({ platform = "linux" } = {}) {
   const exposed = new Map();
   const listeners = new Map();
   const invokes = [];
@@ -26,12 +26,15 @@ function loadPreload() {
   };
   vm.runInNewContext(PRELOAD, {
     console,
-    process: { platform: "linux" },
+    process: { platform },
+    // The macOS titlebar-zoom sync only registers listeners at load.
+    window: { addEventListener: () => {} },
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {
         contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
         ipcRenderer,
+        webFrame: { getZoomFactor: () => 1 },
         webUtils: { getPathForFile: (file) => file.path },
       };
     },
@@ -254,5 +257,19 @@ describe("global show shortcut bridge", () => {
     assert.equal(h.invokes.at(-1).channel, "omnigent:record-global-shortcut");
     await h.desktop.cancelGlobalShortcutRecording();
     assert.equal(h.invokes.at(-1).channel, "omnigent:cancel-global-shortcut-recording");
+  });
+});
+
+describe("system dictation bridge", () => {
+  it("is exposed on macOS only", async () => {
+    assert.equal(loadPreload({ platform: "linux" }).desktop.startSystemDictation, undefined);
+    assert.equal(loadPreload({ platform: "win32" }).desktop.startSystemDictation, undefined);
+
+    const h = loadPreload({ platform: "darwin" });
+    await h.desktop.startSystemDictation();
+    assert.deepEqual(h.invokes.at(-1), {
+      channel: "omnigent:start-system-dictation",
+      args: undefined,
+    });
   });
 });
