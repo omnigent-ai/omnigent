@@ -160,7 +160,7 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.runner.resource_routes import register_resource_routes
-from omnigent.runner.session_history import build_session_history
+from omnigent.runner.session_history import build_session_history, is_cancellation_marker
 from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
     parse_runner_session_init_envelope,
@@ -3352,8 +3352,13 @@ def create_runner_app(
             last = history[-1]
             last_type = last.get("type")
             last_role = last.get("role")
+            # A turn the user stopped ends on its cancellation marker: nothing to resume.
             needs_turn = (
-                (last_type == "message" and last_role == "user")
+                (
+                    last_type == "message"
+                    and last_role == "user"
+                    and not is_cancellation_marker(last)
+                )
                 or last_type == "function_call"
                 or last_type == "function_call_output"
             )
