@@ -2953,6 +2953,22 @@ describe("large Markdown file routing", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).not.toBeInTheDocument();
   });
 
+  it("keeps a citation's source editor when the citation clears, guarding unsaved edits", () => {
+    seedPreference("editor");
+    setContent(large);
+    const view = render(viewerTree({ open: true, path: "large.md", position: { line: 1 } }));
+    expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+    view.rerender(viewerTree({ open: true, path: "large.md" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(viewModeOf()).toBe("source");
+    selectMode("Preview");
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
   it("opens a comment deep link in source, where its anchor is shown", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
     setContent(large);

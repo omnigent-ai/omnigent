@@ -290,10 +290,8 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
-  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
-  // rendering, the same as chat, so agent-authored formulas render here too;
-  // remark-math only honours `$` delimiters. Safe outside code/existing math.
-  // Memoized so re-renders from resizing or toolbar state skip re-parsing the document.
+  // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
+  // Memoized so resizes and toolbar re-renders skip re-parsing the document.
   const markdown = useMemo(
     () => (
       <ReactMarkdown
