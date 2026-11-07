@@ -44,6 +44,7 @@ from omnigent.inner.executor import (
     ToolCallRequest,
     TurnCancelled,
     TurnComplete,
+    TurnRetrying,
 )
 from omnigent.inner.tracing import TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
@@ -67,6 +68,8 @@ from omnigent.server.schemas import (
     ReasoningStartedEvent,
     ReasoningSummaryTextDeltaEvent,
     ReasoningTextDeltaEvent,
+    RetryErrorDetail,
+    RetryEvent,
 )
 
 _logger = logging.getLogger(__name__)
@@ -1216,6 +1219,17 @@ class ExecutorAdapter(HarnessApp):
             # Capture provider-reported usage for the response.completed payload.
             if event.usage is not None:
                 ctx.provider_usage = event.usage
+        elif isinstance(event, TurnRetrying):
+            ctx.emit(
+                RetryEvent(
+                    type="response.retry",
+                    source="llm",
+                    attempt=event.attempt,
+                    max_attempts=event.max_attempts,
+                    delay_seconds=round(event.delay_seconds, 2),
+                    error=RetryErrorDetail(code=event.code, message=event.message),
+                )
+            )
         elif isinstance(event, CompactionStarted):
             from omnigent.server.schemas import CompactionInProgressEvent
 
@@ -1277,14 +1291,15 @@ class ExecutorAdapter(HarnessApp):
         """Map an exception to a semantic code the Omnigent retry allowlist recognizes.
 
         OmnigentError uses its own ``code``; others go through ``classify_inner_exception``,
-        then a text check for a CLI too old for the model. Unknown types fall back to base
-        class (``type(exception).__name__``).
+        then text checks for a CLI too old for the model and for a provider rate limit
+        relayed as text. Unknown types fall back to base class (``type(exception).__name__``).
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
         from omnigent.runner.launch_failure import (
             diagnose_client_update_required,
             diagnose_model_unavailable,
+            is_rate_limit_error,
         )
         from omnigent.server.schemas import ErrorDetail
 
@@ -1327,6 +1342,11 @@ class ExecutorAdapter(HarnessApp):
                 cause=diagnosis.cause,
                 remediation=diagnosis.remediation,
             )
+
+        # The codex app-server relays a provider 429 as text ("exceeded retry limit,
+        # last status: 429 Too Many Requests"), which arrives here as a bare RuntimeError.
+        if is_rate_limit_error(message):
+            return ErrorDetail(code="rate_limit_exceeded", message=message)
 
         # Preserve the failure metadata; add only the recovery guidance.
         model_diagnosis = diagnose_model_unavailable(message)
