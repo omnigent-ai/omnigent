@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import errno
+import io
 import json
 import os
 import stat
@@ -3964,18 +3965,22 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Title sidecars retain auth/provider config without loading extensions."""
+    import tomlkit
+
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
     (source / "auth.json").write_text('{"auth_mode": "chatgpt"}')
     (source / "AGENTS.md").write_text("global guidance")
+    (source / "models.json").write_text('{"models": []}')
     (source / "config.toml").write_text(
         'model_provider = "Databricks"\n'
         '[model_providers.Databricks]\nname = "Databricks"\nbase_url = "https://example"\n'
         "[plugins.example]\nenabled = true\n"
         '[mcp_servers.github]\nenabled = true\ncommand = "github-mcp"\n'
         '[marketplaces.example]\nsource = "https://example"\n'
+        '[profiles.work]\nmodel_catalog_json = "models.json"\n'
     )
     target = tmp_path / "temp_codex_home"
     target.mkdir()
@@ -3991,30 +3996,108 @@ def test_populate_codex_home_config_minimal_mode_keeps_only_provider_routing(
     assert "plugins" not in config_text
     assert "mcp_servers" not in config_text
     assert "marketplaces" not in config_text
+    config = tomlkit.parse(config_text)
+    assert config["profiles"]["work"]["model_catalog_json"] == str(source / "models.json")
 
 
-def test_populate_codex_home_config_config_toml_copy_is_isolated(tmp_path: Path) -> None:
-    """Writing to the session's ``config.toml`` copy does not affect the source.
+@pytest.mark.parametrize("catalog_layer", ["base", "inline-profile"])
+@pytest.mark.parametrize("relative_catalog", [True, False], ids=["relative", "absolute"])
+def test_populate_codex_home_config_config_toml_copy_is_isolated(
+    tmp_path: Path, catalog_layer: str, relative_catalog: bool
+) -> None:
+    """Copied config keeps its catalog's origin and session edits stay private."""
+    import tomlkit
 
-    Proves that ``/model`` inside a session cannot mutate the shared
-    ``~/.codex/config.toml`` and silently change another session's model or
-    cost-policy enforcement.
-    """
     from omnigent.inner.codex_executor import _populate_codex_home_config
 
     source = tmp_path / "real_codex_home"
     source.mkdir()
-    (source / "config.toml").write_text('[default]\nmodel = "gpt-5.4"')
+    catalog = source / "models.json"
+    catalog.write_text('{"models": []}')
+    catalog_setting = catalog.name if relative_catalog else str(catalog)
+    profile = "[profiles.work]\n" if catalog_layer == "inline-profile" else ""
+    original = f"{profile}model_catalog_json = {json.dumps(catalog_setting)} # user catalog\n"
+    (source / "config.toml").write_text(original)
     target = tmp_path / "temp_codex_home"
     target.mkdir()
 
-    _populate_codex_home_config(target, source)
+    _populate_codex_home_config(target, source, minimal_config=False)
+
+    copied = (target / "config.toml").read_text()
+    config = tomlkit.parse(copied)
+    layer = config["profiles"]["work"] if catalog_layer == "inline-profile" else config
+    assert Path(layer["model_catalog_json"]).is_absolute()
+    assert Path(layer["model_catalog_json"]).read_text() == '{"models": []}'
+    assert "# user catalog" in copied
 
     # Simulate a /model write inside the session.
     (target / "config.toml").write_text('[default]\nmodel = "gpt-4o-mini"')
+    _populate_codex_home_config(target, source, minimal_config=False)
+    assert (target / "config.toml").read_text() == '[default]\nmodel = "gpt-4o-mini"'
 
     # Source must be untouched.
-    assert (source / "config.toml").read_text() == '[default]\nmodel = "gpt-5.4"'
+    assert (source / "config.toml").read_text() == original
+
+
+@pytest.mark.parametrize("failure_stage", ["create", "write", "close", "replace"])
+def test_catalog_normalization_failure_preserves_complete_private_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_stage: str
+) -> None:
+    from omnigent.inner.codex_executor import _normalize_copied_codex_catalog_paths
+
+    source = tmp_path / "source"
+    source.mkdir()
+    original = 'model_catalog_json = "models.json" # keep my catalog\nmodel_provider = "custom"\n'
+    (source / "config.toml").write_text(original)
+    private = tmp_path / "private"
+    private.mkdir()
+    copied = private / "config.toml"
+    copied.write_text(original)
+    copied.chmod(0o600)
+    failures: list[str] = []
+    real_open = io.open
+
+    def fail(*_args: Any, **_kwargs: Any) -> None:
+        failures.append(failure_stage)
+        raise OSError(errno.ENOSPC, "injected config publication failure")
+
+    def failing_open(file: Any, mode: str = "r", *args: Any, **kwargs: Any) -> Any:
+        stream = real_open(file, mode, *args, **kwargs)
+        if mode.startswith("w"):
+            real_write, real_close = stream.write, stream.close
+
+            def write(text: str) -> int:
+                real_write(text[:8])
+                stream.flush()
+                fail()
+                return 0
+
+            def close() -> None:
+                if stream.closed:
+                    return
+                real_close()
+                fail()
+
+            if failure_stage == "write":
+                stream.write = write
+            elif failure_stage == "close":
+                stream.close = close
+        return stream
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(io, "open", failing_open)
+        if failure_stage == "create":
+            scoped.setattr(tempfile, "NamedTemporaryFile", fail)
+        elif failure_stage == "replace":
+            scoped.setattr(os, "replace", fail)
+        _normalize_copied_codex_catalog_paths(copied, source)
+
+    assert failures, "the injected publication failure must be exercised"
+    assert copied.read_text() == original
+    assert (source / "config.toml").read_text() == original
+    if os.name != "nt":
+        assert stat.S_IMODE(copied.stat().st_mode) == 0o600
+    assert sorted(path.name for path in private.iterdir()) == ["config.toml"]
 
 
 def test_populate_codex_home_config_normalizes_deprecated_effort(tmp_path: Path) -> None:
