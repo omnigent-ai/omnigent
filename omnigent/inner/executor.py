@@ -187,12 +187,17 @@ class TurnComplete(ExecutorEvent):
         ``"cache_read_input_tokens"``, ``"cache_creation_input_tokens"``.
         e.g. ``{"input_tokens": 1523, "output_tokens": 847,
         "total_tokens": 2370}``.
+    :param reasoning_effort: The reasoning effort the harness reports it
+        applied to this turn, including its own default when none was
+        requested, e.g. ``"medium"``. ``None`` when the harness does not
+        report one.
     """
 
     response: str | None = None
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+    reasoning_effort: str | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
