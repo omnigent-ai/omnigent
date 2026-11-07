@@ -54,12 +54,17 @@ function cookieMatchesOrigin(cookie, origin) {
 
 // The workspace rejected a freshly minted session: the stored credentials need a browser sign-in.
 const SESSION_REJECTED = "SESSION_REJECTED";
-// The workspace IP access list refused session-create (e.g. off the VPN): retried.
+// The workspace IP access list refused a request (e.g. off the VPN): retried.
 const IP_ACL_BLOCKED = "IP_ACL_BLOCKED";
 const sessionRejected = (message) =>
   Object.assign(new Error(message), { errorCode: SESSION_REJECTED });
 // Session-create timed out or its response was cut off (databricks-session.js).
 const SESSION_TRANSPORT = "SESSION_TRANSPORT";
+
+/** Whether an HTTP error response is the workspace IP access list refusing this network. */
+function isIpAclRefusal(status, body) {
+  return status === 403 && /is blocked by Databricks IP ACL/.test(body);
+}
 
 /** Whether a renewal failure is worth retrying: no response, HTTP 5xx/429, or an IP ACL block. */
 function isTransientRenewalError(error) {
@@ -158,10 +163,17 @@ function createDatabricksAuth({
     ctx.timer?.unref?.();
   }
 
-  function renew(ctx, { reload = false, reason = "cookie renewal" } = {}) {
+  function renew(
+    ctx,
+    { reload = false, reason = "cookie renewal", superseded = () => false } = {},
+  ) {
     if (!current(ctx)) return Promise.resolve();
     if (reload) ctx.reloadVersion = ctx.navigationVersion;
-    if (ctx.pending) return ctx.pending;
+    if (ctx.pending) {
+      ctx.supersededChecks.push(superseded);
+      return ctx.pending;
+    }
+    ctx.supersededChecks = [superseded];
     clearTimeoutFn(ctx.timer);
     console.log("[omnigent] databricks auth: silent renewal", {
       origin: ctx.origin,
@@ -192,13 +204,36 @@ function createDatabricksAuth({
           });
         }
       })
-      .catch((error) => fail(ctx, error))
+      .catch(async (error) => {
+        const replaced = () => ctx.supersededChecks.every((check) => check());
+        if (replaced() && current(ctx)) {
+          // Newer page loads replaced every waiting check: retry on the usual schedule instead.
+          console.warn("[omnigent] databricks auth: renewal failed after a newer page load", {
+            origin: ctx.origin,
+            code: error?.errorCode,
+          });
+          await schedule(ctx).catch((scheduleError) => fail(ctx, scheduleError));
+        }
+        if (!replaced()) fail(ctx, error);
+      })
       .finally(() => {
         if (renewals.get(ctx.origin) === pending) renewals.delete(ctx.origin);
         ctx.pending = null;
         ctx.reloadVersion = null;
       });
     return ctx.pending;
+  }
+
+  /**
+   * Renew `win`'s session without reloading. Resolves whether the window is still
+   * connected afterwards, or returns null when the window has no live connection.
+   * A failed renewal goes to `onAuthRequired` unless `superseded()`, and that of every
+   * other caller sharing the renewal, reports that a newer page replaced theirs.
+   */
+  function checkSession(win, reason, superseded) {
+    const ctx = connections.get(win);
+    if (!ctx || !current(ctx)) return null;
+    return renew(ctx, { reason, superseded }).then(() => current(ctx));
   }
 
   function recover(win) {
@@ -229,6 +264,7 @@ function createDatabricksAuth({
       returnUrl: loadUrl,
       timer: null,
       pending: null,
+      supersededChecks: [],
       scheduleGeneration: 0,
       navigationVersion: 0,
       reloadVersion: null,
@@ -321,6 +357,7 @@ function createDatabricksAuth({
     detach,
     rejectConnection,
     reset,
+    checkSession,
     recover,
     /** Resolves once any renewal already running for `origin` has finished. */
     async whenSettled(origin) {
@@ -341,6 +378,7 @@ module.exports = {
   usesDatabricksBrowserAuth,
   isDatabricksLoginUrl,
   cookieMatchesOrigin,
+  isIpAclRefusal,
   isTransientRenewalError,
   SESSION_REJECTED,
   IP_ACL_BLOCKED,
