@@ -3599,7 +3599,7 @@ dev = [
     { name = "pytest-xdist", specifier = ">=3.6" },
     { name = "respx", specifier = ">=0.21,<1" },
     { name = "ruff", specifier = ">=0.6" },
-    { name = "sqlalchemy-cloudflare-d1", specifier = "==0.3.10" },
+    { name = "sqlalchemy-cloudflare-d1", specifier = "==0.4.1" },
 ]
 lint = [
     { name = "grpcio-tools", specifier = ">=1.68,<=1.81.1" },
@@ -3624,7 +3624,7 @@ test = [
     { name = "pytest-timeout", specifier = "==2.4.0" },
     { name = "pytest-xdist", specifier = ">=3.6" },
     { name = "respx", specifier = ">=0.21,<1" },
-    { name = "sqlalchemy-cloudflare-d1", specifier = "==0.3.10" },
+    { name = "sqlalchemy-cloudflare-d1", specifier = "==0.4.1" },
 ]
 
 [[package]]
@@ -5869,16 +5869,16 @@ wheels = [
 
 [[package]]
 name = "sqlalchemy-cloudflare-d1"
-version = "0.3.10"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "sqlalchemy" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/93/db/b3b08fb78d56c42439d050bca1cd71811af732c332d965c2ac84feaa3a03/sqlalchemy_cloudflare_d1-0.3.10.tar.gz", hash = "sha256:7660182dd12224042d7a3eecb502107ef3979900c0459edfd77be81665be54a6", size = 420132, upload-time = "2026-05-05T20:31:55.564Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/71/c5f7cd4e8c7c1aec4393c93fefc772b14bb51b94f937a3b1499be5bae5a8/sqlalchemy_cloudflare_d1-0.4.1.tar.gz", hash = "sha256:3a2cd1b8c0ac126b4853802a9d254dd02a476fd574b99a4e5b1e4a6552f8e217", size = 485872, upload-time = "2026-10-02T03:03:25.402Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/56/437b3622d54a7a4aed3d26ee0eba590ae3e918387a3607a8509e7f30effd/sqlalchemy_cloudflare_d1-0.3.10-py3-none-any.whl", hash = "sha256:c29abda17c755bfe18a9246a67e29785d852610d0cc73bfce0ead90c4d75b274", size = 28145, upload-time = "2026-05-05T20:31:54.354Z" },
+    { url = "https://files.pythonhosted.org/packages/55/cc/d89dd775d8b8ca359c730f24278282af7a89a6289e1b890c7d91b6b36d4b/sqlalchemy_cloudflare_d1-0.4.1-py3-none-any.whl", hash = "sha256:a7c3fb0414e41136459c3e18a9a2565a8003c9a9726875128f7756b012b0594f", size = 34116, upload-time = "2026-10-02T03:03:23.669Z" },
 ]
 
 [[package]]
