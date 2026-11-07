@@ -5,7 +5,7 @@ Settings gains a Custom agents section, styled like Harnesses. The prototype is
 
 ## First PR: list, create, review, delete
 
-The section requires both the default-off `custom_agents_settings_ui` release
+The section requires both the default-on `custom_agents_settings_ui` release
 flag and `/v1/info.agent_install`. Older servers hide the navigation entry and
 send direct links to General settings. When those gates pass but
 `/v1/info.agent_detail` is absent or false, the section shows a server-update
@@ -59,9 +59,8 @@ inactive until a field changes. Existing list/detail responses and multipart ins
 The editor saves without `If-Match` when a proxy strips `ETag`. If a proxy strips
 `If-Match` from the request instead, the backend accepts the same partial edit
 without a stale-draft check. Neither revision header must survive the proxy.
-Keep the existing `custom_agents_settings_ui` flag off until both backend and UI
-support this behavior.
-Either can deploy first while the flag is off. With the flag enabled, a newer UI
+Backend and UI both support this behavior, so `custom_agents_settings_ui` is on by
+default; `OMNIGENT_FEATURES=-custom_agents_settings_ui` hides the section. A newer UI
 against an older backend can receive 428 without a tag. The editor retains the
 draft and explains that the server needs an update, without offering reload as a
 fix. Saving can be retried after the update without discarding the draft.
