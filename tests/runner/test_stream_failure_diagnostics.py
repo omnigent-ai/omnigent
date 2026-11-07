@@ -99,6 +99,50 @@ class _StreamErrorHarnessClient(_ScriptedHarnessClient):
             raise httpx.ReadError(self._cause)
 
 
+def _dropping_client(
+    cause: str, frames: list[str] | None, before_drop: Callable[[], None] | None
+) -> _StreamErrorHarnessClient:
+    """A harness client whose stream yields *frames* and then drops with *cause*."""
+    return _StreamErrorHarnessClient(
+        frames
+        if frames is not None
+        else [
+            _sse(
+                {
+                    "type": "response.created",
+                    "response": {
+                        "id": "resp_drop",
+                        "model": "plain-agent",
+                        "created_at": 1,
+                        "status": "in_progress",
+                    },
+                }
+            )
+        ],
+        cause=cause,
+        before_drop=before_drop,
+    )
+
+
+def _make_app_and_process_manager(
+    *,
+    cause: str,
+    terminal_registry: TerminalRegistry | None = None,
+    frames: list[str] | None = None,
+    before_drop: Callable[[], None] | None = None,
+) -> tuple[Any, _FakeProcessManager]:
+    """Like :func:`_make_app`, also returning the fake process manager it uses."""
+    harness_client = _dropping_client(cause, frames, before_drop)
+    process_manager = _FakeProcessManager(harness_client)
+    app = _make_app(
+        cause=cause,
+        terminal_registry=terminal_registry,
+        harness_client=harness_client,
+        process_manager=process_manager,
+    )
+    return app, process_manager
+
+
 def _make_app(
     *,
     cause: str = "",
@@ -114,25 +158,7 @@ def _make_app(
     :param process_manager: A fake manager to wrap *harness_client* instead of a new one.
     """
     if harness_client is None:
-        harness_client = _StreamErrorHarnessClient(
-            frames
-            if frames is not None
-            else [
-                _sse(
-                    {
-                        "type": "response.created",
-                        "response": {
-                            "id": "resp_drop",
-                            "model": "plain-agent",
-                            "created_at": 1,
-                            "status": "in_progress",
-                        },
-                    }
-                )
-            ],
-            cause=cause,
-            before_drop=before_drop,
-        )
+        harness_client = _dropping_client(cause, frames, before_drop)
     pm = process_manager or _FakeProcessManager(harness_client)
     spec = AgentSpec(spec_version=1, name="plain-agent")
 
@@ -406,12 +432,12 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
     handler itself publishes nothing. The stream's failure must carry the exit's
     diagnostics instead, and the turn must still surface as failed exactly that way.
     """
-    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.app import _TERMINAL_EXIT_RELEASE_GRACE_S, _session_event_queues_ref
 
     # Earlier tests in this module publish to the same conversation's queue.
     _session_event_queues_ref.pop(_CONV_ID, None)
     publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
-    app = _make_app(
+    app, pm = _make_app_and_process_manager(
         cause="ReadError(ClosedResourceError())",
         before_drop=lambda: publish["exit"](_required_terminal_exit(session_was_idle)),
     )
@@ -420,9 +446,14 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
         with caplog.at_level(logging.WARNING, logger="omnigent.runner.app"):
             failed, message = await _failed_event_message(app, _CONV_ID)
         statuses = _failed_statuses(_CONV_ID)
+        deadline = asyncio.get_running_loop().time() + _TERMINAL_EXIT_RELEASE_GRACE_S + 1.0
+        while not pm.released and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.05)
     finally:
         _session_event_queues_ref.pop(_CONV_ID, None)
 
+    assert pm.released == [_CONV_ID], "the exited terminal's harness was never released"
+    assert pm.release_guards == [(_CONV_ID, True, True)]
     assert failed["error"]["code"] == "required_terminal_exited", failed
     assert "Required terminal exited unexpectedly" in message, message
     assert "Waiting for the API key helper" in message, message
