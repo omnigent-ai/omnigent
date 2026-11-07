@@ -111,9 +111,10 @@ def test_auth_no_key_off_workspace() -> None:
 
 
 @pytest.mark.parametrize("target_host", ["host_new", None], ids=["override", "fallback"])
+@pytest.mark.parametrize("keyless", [False, True])
 @pytest.mark.asyncio
 async def test_request_routing_follows_the_target_session(
-    monkeypatch: pytest.MonkeyPatch, target_host: str | None
+    monkeypatch: pytest.MonkeyPatch, target_host: str | None, keyless: bool
 ) -> None:
     """The SDK hook overrides stale auth routing without changing shared headers."""
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
@@ -122,7 +123,7 @@ async def test_request_routing_follows_the_target_session(
     monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda _url: "1234")
     mount = "http://127.0.0.1/api/2.0/omnigent"
     set_session_host("conv_old", "host_old")
-    set_session_host("conv_new", target_host)
+    set_session_host("conv_new", target_host, keyless=keyless)
     auth = _DatabricksTokenAuth(server_url=mount, session_id="conv_old")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -133,7 +134,9 @@ async def test_request_routing_follows_the_target_session(
             assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == "host_fallback"
             return httpx.Response(200, json={"data": [], "hosts": []})
         assert route == "sessions/conv_new"
-        assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == (target_host or "host_fallback")
+        assert request.headers.get(OMNIGENT_SLICE_KEY_HEADER) == (
+            None if keyless else target_host or "host_fallback"
+        )
         return httpx.Response(
             200, json={"id": "conv_new", "agent_id": "ag_new", "status": "idle", "created_at": 0}
         )
@@ -157,13 +160,18 @@ async def test_request_routing_follows_the_target_session(
         ("/v1/sessions-other", b"", "", "host_existing"),
         ("/v1/sessions/conv%2Fencoded/events?q=1", b"", "", "host_encoded"),
         ("/v1/sessions", b'{"host_id":"host_launch"}', "application/json", "host_launch"),
+        ("/v1/sessions", b'{"host_type":"managed"}', "application/json", None),
         ("/v1/sessions", b"[]", "application/json", "host_fallback"),
         ("/v1/sessions", b"broken", "application/json", "host_fallback"),
         ("/v1/sessions", b"bundle", "multipart/form-data", "host_fallback"),
     ],
 )
 async def test_request_routing_only_interprets_session_routes(
-    monkeypatch: pytest.MonkeyPatch, path: str, body: bytes, content_type: str, expected_host: str
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: bytes,
+    content_type: str,
+    expected_host: str | None,
 ) -> None:
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
     monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_fallback")
@@ -175,5 +183,5 @@ async def test_request_routing_only_interprets_session_routes(
         headers={OMNIGENT_SLICE_KEY_HEADER: "host_existing", "content-type": content_type},
     )
     await route_session_request(request)
-    assert request.headers[OMNIGENT_SLICE_KEY_HEADER] == expected_host
+    assert request.headers.get(OMNIGENT_SLICE_KEY_HEADER) == expected_host
     assert request.content == body

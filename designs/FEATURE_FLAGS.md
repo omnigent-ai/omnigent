@@ -28,6 +28,7 @@ lifecycle metadata.
 
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
+| `dynamic_workflows` | Off | Workflows | 0.24.0 | Experimental agent DAG orchestration. Enables the module CLI, workflow API/service and DAG designer, including simulation. Set in the CLI or server process; server changes require restart. |
 | `codex_plan_at_launch` | On | Server | 0.22.0 | Allows the new-session composer to start Codex in Plan mode. Missing or disabled support disables this launch option; connected hosts must also advertise support. |
 | `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
 | `sibling_sessions` | Off | Server | 0.24.0 | Enables Add nested agent, same-sandbox fork selection, and new sibling creation through JSON, uploaded agents and MCP. Existing sessions, family metadata and shared-sandbox cleanup protections remain available while off. |

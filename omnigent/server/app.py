@@ -1928,6 +1928,12 @@ def create_app(
     _mcp_pool = ServerMcpPool()
     server_metrics = ServerPerformanceMetrics()
     server_metrics_otel = ServerMetricsOtelPublisher()
+    workflow_service = None
+    if resolved_feature_flags.enabled(Feature.DYNAMIC_WORKFLOWS):
+        from omnigent.process_logging import data_dir
+        from omnigent.workflows.service import WorkflowService
+
+        workflow_service = WorkflowService(data_dir() / "workflows")
 
     @asynccontextmanager
     async def _lifespan(
@@ -2218,6 +2224,8 @@ def create_app(
         finally:
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
+            if workflow_service is not None:
+                await workflow_service.shutdown()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -3850,6 +3858,24 @@ def create_app(
         prefix="/v1",
         tags=["imports"],
     )
+    if workflow_service is not None:
+        from omnigent.server.routes.workflows import create_workflows_router
+        from omnigent.workflows.designs import WorkflowDesigns
+
+        app.include_router(
+            create_workflows_router(
+                workflow_service,
+                auth_provider,
+                WorkflowDesigns(
+                    workflow_service.directory / "designs",
+                    conversation_store,
+                    agent_store,
+                    permission_store,
+                ),
+            ),
+            prefix="/v1",
+            tags=["workflows"],
+        )
     # Per-user LLM cost report (omni usage). User-scoped, not session-scoped,
     # so it gets its own router rather than living under /sessions.
     app.include_router(
