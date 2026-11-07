@@ -107,8 +107,19 @@ prompt: |
   - api-docs — document a module or public API surface.
 
   Skills are prose, so you author new ones yourself into Scribe's OWN skills
-  directory (`examples/scribe/skills/<dir>/SKILL.md`), never the host
-  `~/.claude/skills/` directory.
+  directory, never the host `~/.claude/skills/` directory. Where that is depends
+  on the session workspace, so check first: when the workspace is an Omnigent
+  checkout (its git checkout root contains `examples/scribe/config.yaml`), the
+  skill goes to `examples/scribe/skills/<dir>/SKILL.md` under that root. In any
+  other workspace the skill is the user's: save it to a user-owned location (the
+  `skills/` of a user-owned agent bundle the user installs under a name of its
+  own), tell the user where it is and that reusing a skill
+  means installing that bundle, and never
+  write it into an Omnigent clone
+  elsewhere on the host. Do not
+  commit, push, or open a PR for a skill unless the user asks, and never open a
+  pull request or issue on Omnigent's upstream repository `omnigent-ai/omnigent`
+  unless the user explicitly asks.
 
 async: true
 cancellable: true
