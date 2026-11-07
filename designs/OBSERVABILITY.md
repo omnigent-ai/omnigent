@@ -294,6 +294,7 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` (dev) | Always sample locally; ratio-based in prod |
 | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
 | `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
+| `OMNIGENT_OTEL_CAPTURE_USER` | off | Stamp the acting user as `enduser.id` on every span (PII; usually an email). `omnigent.runner.id` and the `omnigent.host.id` resource attribute need no opt-in. |
 
 Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
 `OMNIGENT_TELEMETRY_ENABLED` is truthy, so a default install is never burdened with
@@ -312,6 +313,18 @@ grouping key**: it lets the backend gather every span of a session even when the
 share a `trace_id` — which raw W3C propagation alone cannot do across those decoupled
 boundaries. The host control-plane frames carry no session id by design (a daemon control
 action is not part of a user request) and rely on trace propagation to their parent span.
+
+**Actor attribution (`enduser.id`, `omnigent.runner.id`, `omnigent.host.id`).** Spans
+reuse the attribution the debug-log sink already binds: `omnigent.runner.id` is the runner
+bound to the server request (`set_current_runner_id` / `runner_log_scope`), falling back
+to the process's own `OMNIGENT_RUNNER_ID` only in runner and harness processes
+(`debug_logging.current_runner_id`), so host and server frames name a runner only when
+one is bound. `enduser.id` (OTel semconv) is the request user on the server and the
+process owner on host, runner and harness, gated by `OMNIGENT_OTEL_CAPTURE_USER` because
+it is usually an email; the server middleware also stamps it on the already-started root
+HTTP span, as the session-id hook does. `omnigent.host.id` is a resource attribute: the
+host daemon appends it to `OTEL_RESOURCE_ATTRIBUTES` before `telemetry.init`, and the
+runners and harnesses it spawns inherit it.
 
 ---
 
@@ -468,7 +481,7 @@ low-cardinality labels — never content, never ids like `session.id`.
 | Need | Seam | Reference |
 |---|---|---|
 | Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
-| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`) |
+| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`, `enduser.id`, `omnigent.runner.id`) |
 | Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
 | Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
 
@@ -478,8 +491,8 @@ Two shared helpers keep the common cases one-liners:
   and never raises; wraps the `telemetry_enabled()` guard + debug-log-never-raise
   boilerplate every `record_*` needs.
 - **`telemetry.make_span_attribute_processor(attribute_key, get_value)`** —
-  builds the "stamp `attribute_key` on every span" processor. `session.id` and
-  `omnigent.skill.active` use it.
+  builds the "stamp `attribute_key` on every span" processor. `session.id`,
+  `omnigent.skill.active`, `enduser.id` and `omnigent.runner.id` use it.
 
 **Worked example — skill-execution telemetry (turn-scoped).** The executor
 adapter observes the `Skill` / `load_skill` tool call, stamps the ungated
@@ -501,10 +514,11 @@ The skill name is read only from the tool's name field (`skill` / `command` for
 `plugin:skill`). Anything else is treated as content: nothing is exported, so a
 malformed call can't leak argument text past content capture.
 
-Ambient attributes (`session.id`, `omnigent.skill.active`) come from span
-processors that `_init_otel_traces` registers on the provider it creates. If the
-process uses an externally installed `TracerProvider` instead, `omnigent.skill.name`
-is still stamped on the skill tool span but `omnigent.skill.active` is not.
+Ambient attributes (`session.id`, `omnigent.skill.active`, `enduser.id`,
+`omnigent.runner.id`) come from span processors that `_init_otel_traces` registers
+on the provider it creates. If the process uses an externally installed
+`TracerProvider` instead, `omnigent.skill.name` is still stamped on the skill tool
+span but the ambient attributes are not.
 
 **Harness coverage & known gaps.** Detection fires only on a `ToolCallRequest`
 whose name (after `_strip_mcp_tool_prefix`) is in `_SKILL_TOOL_NAMES`
