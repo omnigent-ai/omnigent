@@ -1189,6 +1189,89 @@ class SqlComment(OmnigentBase):
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
 
+# Largest framed (compressed) reply body; keeps each stored value under 16 KB.
+COMMENT_REPLY_BODY_MAX_STORED_BYTES = 16_383
+
+
+class SqlCommentReply(OmnigentBase):
+    """SQLAlchemy model for the ``comment_replies`` table.
+
+    One message in a file comment's thread, from the user or the agent. A
+    thread holds its own conversation about the anchored text, so replying
+    never edits the file or changes the parent comment's anchor or status.
+
+    The key nests each reply under its comment, which nests under its
+    conversation, so a thread and a conversation's replies are both primary-key
+    prefix ranges. Relates to ``comments`` by
+    ``(workspace_id, conversation_id, comment_id)``; there is no DB foreign key
+    (Rule R032), so the store must delete a comment's replies with the comment
+    and a conversation's replies with the conversation.
+
+    :param conversation_id: The conversation the parent comment belongs to.
+    :param comment_id: The parent comment's ``comments.id``.
+    :param id: UUID of this reply, e.g. ``"a1b2c3d4..."``.
+    :param author_kind: Who wrote the reply, stored as a stable int code (see
+        omnigent.db.enum_codecs COMMENT_REPLY_AUTHOR_KIND: user=1, agent=2).
+    :param body: The reply text, stored compressed and capped at
+        :data:`COMMENT_REPLY_BODY_MAX_STORED_BYTES` framed bytes.
+    :param created_by: Identity of the user who wrote a user reply, as in
+        ``comments.created_by``. ``NULL`` for agent replies and in
+        single-user mode.
+    :param created_at: Unix epoch **microseconds** at row creation, so a
+        thread's back-to-back replies keep their order.
+    """
+
+    __tablename__ = "comment_replies"
+
+    # Tenant partition key: Databricks workspace id owning this row (0 = default). Part of the PK.
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        nullable=False,
+        default=current_workspace_id,
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Relates to comments.id. No DB foreign key (Rule R032).
+    comment_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    # Enum stored as a stable int code (see omnigent.db.enum_codecs
+    # COMMENT_REPLY_AUTHOR_KIND: user=1, agent=2).
+    author_kind: Mapped[int] = mapped_column(SmallInteger)
+    body: Mapped[str] = mapped_column(
+        CompressedText(max_stored_bytes=COMMENT_REPLY_BODY_MAX_STORED_BYTES)
+    )
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+
+    __table_args__ = (
+        CheckConstraint("author_kind IN (1, 2)", name="ck_comment_replies_author_kind"),
+        # SQLite ignores VARCHAR lengths: 128 characters at up to four bytes each.
+        CheckConstraint(
+            "created_by IS NULL OR length(CAST(created_by AS BLOB)) <= 512",
+            name="ck_comment_replies_created_by_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Other dialects rely on the ORM cap; SQLite also rejects a raw oversized write.
+        CheckConstraint(
+            f"length(CAST(body AS BLOB)) <= {COMMENT_REPLY_BODY_MAX_STORED_BYTES}",
+            name="ck_comment_replies_body_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # SQLite stores any value in a BIGINT column, so it could hold a long string.
+        CheckConstraint(
+            "typeof(created_at) = 'integer'",
+            name="ck_comment_replies_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        # Reads one thread in creation order, paginated by (created_at, id).
+        Index(
+            "ix_comment_replies_thread",
+            "workspace_id",
+            "conversation_id",
+            "comment_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
 def policy_name_cksum(name: str) -> bytes:
     """Return the sha256 digest of a policy name.
 
