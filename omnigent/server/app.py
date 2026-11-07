@@ -255,6 +255,9 @@ class ServerInfoResponse(BaseModel):
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
     public_sharing_max_level: Literal["read", "edit"] = "read"
+    sibling_session_destinations: Literal[
+        "current_host", "current_host_or_new_sandbox", "any_host"
+    ] = "any_host"
     server_version: str
     smart_routing_enabled: bool
     smart_routing_sources: SmartRoutingSourcesInfo
@@ -281,6 +284,8 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
+    # Uploaded-agent sessions accept repository lists and worktree options.
+    session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
     # older servers reject it.
     request_managed_sandbox_host_id: bool = True
@@ -2546,6 +2551,15 @@ def create_app(
         _default_public_static = DefaultPublicSessions.coerce(default_public_sessions)
         app.state.default_public_sessions = lambda: _default_public_static
         app.state.default_public_sessions_writable = False
+    from omnigent.server.sharing_settings import (
+        SiblingSessionDestinations,
+        read_sibling_session_destinations_override,
+    )
+
+    def _resolve_sibling_session_destinations() -> SiblingSessionDestinations:
+        return read_sibling_session_destinations_override() or SiblingSessionDestinations.ANY_HOST
+
+    app.state.sibling_session_destinations = _resolve_sibling_session_destinations
     from omnigent.server.server_config import parse_filesystem_attachment_policy
 
     if callable(filesystem_attachment_allowed_extensions):
@@ -3642,6 +3656,7 @@ def create_app(
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
                 "public_sharing_max_level": app.state.public_sharing_max_level().value,
+                "sibling_session_destinations": app.state.sibling_session_destinations().value,
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,

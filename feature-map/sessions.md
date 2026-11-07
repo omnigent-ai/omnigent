@@ -10,8 +10,9 @@ the header menu), and each place is a separate entry point.
 ## Sub-features
 
 - `siblings`: **Add nested agent** creates a private, fresh conversation in the
-  same sidebar family. Its composer offers ordinary hosts/new sandboxes and
-  only the clicked member's ephemeral host, preselected. Siblings have one
+  same sidebar family. Its composer follows the server's Add Agent destination
+  policy and offers only the clicked member's ephemeral host among existing
+  managed hosts, preselected. Siblings have one
   indentation level with curved connectors and are absent from the Agents panel.
   Archive/delete promotes the oldest active member; compute survives while any
   session remains bound. The representative pins/moves the family; individual
@@ -221,6 +222,8 @@ the header menu), and each place is a separate entry point.
   or header menu and choose **Add nested agent**. Mobile row/header menus offer
   the same action. On desktop, Cmd/Ctrl+Alt+A opens **Add nested agent** for the active
   session. Select a host in the composer and send the first message.
+  Server admins configure the available targets under Settings → Admin → General →
+  **Nested agent destinations**.
 
 **Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**

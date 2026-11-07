@@ -239,6 +239,36 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 
 @pytest.mark.asyncio
+async def test_managed_creation_respects_current_host_policy_before_posting():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "sibling_sessions": True,
+                "sibling_session_destinations": "current_host",
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=client,
+                conversation_id="manager",
+            )
+        )
+
+    assert "only allows Add nested agent on the current host" in result["error"]
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/v1/info")]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure", ["timeout", "non_json", "null", "list", "empty", "non_bool", 408, 429, 503]
 )
@@ -694,9 +724,12 @@ async def test_independent_creation_supports_disabled_or_missing_sibling_capabil
     def handle(request):
         paths.append(request.url.path)
         if request.url.path == "/v1/info":
-            return httpx.Response(
-                200, json={} if capability is None else {"sibling_sessions": capability}
-            )
+            info = {"sibling_session_destinations": "current_host"}
+            if capability is not None:
+                info["sibling_sessions"] = capability
+            if capability is True:
+                info["sibling_session_destinations"] = "any_host"
+            return httpx.Response(200, json=info)
         assert request.url.path == "/v1/sessions/orchestrated"
         assert request.headers[ORCHESTRATION_SOURCE_HEADER] == "manager"
         assert "parent_session_id" not in json.loads(request.content)

@@ -145,6 +145,7 @@ from omnigent.server.routes._sessions.helpers import (
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
+    _create_session_worktree,
     _delete_stored_session_bundle_after_failure,
     _discovery_key,
     _enforce_filesystem_attachment_policy,
@@ -172,6 +173,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_terminal_pending,
     _reject_reserved_cost_control_label_seed,
     _reject_server_reserved_label_seed,
+    _remove_session_worktree_best_effort,
     _require_codex_approval_mode_forward,
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
@@ -1235,6 +1237,7 @@ def register_core_routes(
                 permission_store,
                 parent_id=body.parent_session_id,
                 host_id=body.host_id,
+                host_type=body.host_type,
             )
             if body.initial_items:
                 raise OmnigentError(
@@ -1493,6 +1496,7 @@ def register_core_routes(
                 permission_store,
                 parent_id=parsed_metadata.parent_session_id,
                 host_id=parsed_metadata.host_id,
+                host_type=parsed_metadata.host_type,
             )
             if (
                 "project_id" in parsed_metadata.model_fields_set
@@ -1512,6 +1516,12 @@ def register_core_routes(
             resolve_project_session_create,
         )
 
+        if (
+            parsed_metadata.sibling_source_id is None
+            and "git" not in parsed_metadata.model_fields_set
+        ):
+            # Ordinary uploads choose worktrees in their separate runner launch.
+            parsed_metadata = parsed_metadata.model_copy(update={"git": None})
         project_resolution = await resolve_project_session_create(
             body=parsed_metadata,
             user_id=user_id,
@@ -1648,30 +1658,84 @@ def register_core_routes(
             labels=parsed_metadata.labels,
             host_registry=getattr(request.app.state, "host_registry", None),
         )
-        with creation_stage("create_persistence_ms"):
-            result = await asyncio.to_thread(
-                _create_session_from_bundle,
-                conversation_store,
-                artifact_store,
-                parsed_metadata,
-                bundle_bytes,
-                inherited_runner_id,
-                spec,
-                inference_snapshot,
-                inference_model,
-                created_by=user_id,
-                agent_store=agent_store,
-            )
-        if parsed_metadata.sibling_source_id is not None:
-            from omnigent.server.session_families import complete_sibling_creation
+        git_options = parsed_metadata.git
+        git_branch: str | None = None
+        created_worktree_path: str | None = None
+        if git_options is not None:
+            if git_options.existing_worktree:
+                from omnigent.host.git_worktree import WorktreeError, validate_branch_name
 
-            await complete_sibling_creation(
-                conversation_store,
-                parsed_metadata.sibling_source_id,
-                result.session_id,
-                user_id=user_id,
-            )
-        await record_profile(request, result.session_id, sandbox_profile, conversation_store)
+                try:
+                    validate_branch_name(git_options.branch_name)
+                except WorktreeError as exc:
+                    raise OmnigentError(exc.message, code=ErrorCode.INVALID_INPUT) from exc
+                git_branch = git_options.branch_name
+            else:
+                created_worktree = await _create_session_worktree(
+                    host_id=parsed_metadata.host_id,
+                    source_repo=parsed_metadata.workspace,
+                    git=git_options,
+                    request=request,
+                )
+                created_worktree_path = created_worktree.worktree_path
+                git_branch = created_worktree.branch
+                from omnigent.server.routes._host_worktree import (
+                    WORKTREE_ROOT_LABEL_KEY,
+                    worktree_root_fingerprint,
+                )
+
+                parsed_metadata = parsed_metadata.model_copy(
+                    update={
+                        "workspace": created_worktree.workspace or created_worktree.worktree_path,
+                        "labels": {
+                            **parsed_metadata.labels,
+                            WORKTREE_ROOT_LABEL_KEY: worktree_root_fingerprint(
+                                created_worktree.worktree_path
+                            ),
+                        },
+                    }
+                )
+        try:
+            with creation_stage("create_persistence_ms"):
+                result = await asyncio.to_thread(
+                    _create_session_from_bundle,
+                    conversation_store,
+                    artifact_store,
+                    parsed_metadata,
+                    bundle_bytes,
+                    inherited_runner_id,
+                    spec,
+                    inference_snapshot,
+                    inference_model,
+                    git_branch=git_branch,
+                    created_by=user_id,
+                    agent_store=agent_store,
+                )
+            if parsed_metadata.sibling_source_id is not None:
+                from omnigent.server.session_families import complete_sibling_creation
+
+                await complete_sibling_creation(
+                    conversation_store,
+                    parsed_metadata.sibling_source_id,
+                    result.session_id,
+                    user_id=user_id,
+                )
+            await record_profile(request, result.session_id, sandbox_profile, conversation_store)
+        except Exception:
+            if (
+                created_worktree_path is not None
+                and parsed_metadata.host_id is not None
+                and git_branch is not None
+            ):
+                await _remove_session_worktree_best_effort(
+                    host_id=parsed_metadata.host_id,
+                    worktree_path=created_worktree_path,
+                    branch=git_branch,
+                    delete_branch=git_options is None or not git_options.existing_branch,
+                    host_registry=getattr(request.app.state, "host_registry", None),
+                    reason="create-rollback",
+                )
+            raise
         session_created(
             result.session_id,
             inherited_runner_id,
@@ -1717,11 +1781,7 @@ def register_core_routes(
                 agent_id=result.agent_id,
                 user_id=user_id,
                 sandbox_provider=parsed_metadata.sandbox_provider,
-                # Bundle metadata carries a single repo; multi-repo is a
-                # web-picker (JSON) feature. Empty list = no repo.
-                workspaces=[parsed_metadata.workspace]
-                if parsed_metadata.workspace is not None
-                else [],
+                workspaces=parsed_metadata.managed_repo_workspaces(),
             )
         # Caller-supplied external host: bind + launch a runner on it,
         # exactly like the JSON create form (same authorization, atomic
@@ -3461,6 +3521,23 @@ def register_core_routes(
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
                 try:
+                    if (
+                        conv.family_id is not None
+                        and runner_id != conv.runner_id
+                        and request.app.state.feature_flags.enabled(Feature.SIBLING_SESSIONS)
+                    ):
+                        from omnigent.server.session_families import require_sibling_destination
+
+                        runner_hosts = await asyncio.to_thread(
+                            conversation_store.get_runner_host_ids, runner_id
+                        )
+                        await asyncio.to_thread(
+                            require_sibling_destination,
+                            request,
+                            conv.host_id,
+                            host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
+                            host_type="external",
+                        )
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,

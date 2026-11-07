@@ -12622,6 +12622,7 @@ def _create_session_from_bundle(
     spec: AgentSpec | None = None,
     inference_snapshot: dict[str, Any] | None = None,
     inference_model: str | None = None,
+    git_branch: str | None = None,
     created_by: str | None = None,
     agent_store: AgentStore | None = None,
 ) -> CreatedSessionResponse:
@@ -12722,6 +12723,7 @@ def _create_session_from_bundle(
                 runner_id=runner_id,
                 inference_snapshot=inference_snapshot,
                 inference_model=inference_model,
+                git_branch=git_branch,
             )
 
     agent_id = generate_agent_id()
@@ -12745,6 +12747,7 @@ def _create_session_from_bundle(
         runner_id=runner_id,
         inference_snapshot=inference_snapshot,
         inference_model=inference_model,
+        git_branch=git_branch,
         created_by=created_by,
     )
 
