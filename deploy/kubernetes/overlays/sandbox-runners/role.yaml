@@ -49,10 +49,9 @@ rules:
   - apiGroups: [""]
     resources: ["pods/log"]
     verbs: ["get"]
-  # The per-launch token rides a per-Job Secret (referenced by the Pod's
-  # `secretKeyRef`).  The launcher creates that Secret before the Job,
-  # patches the Job (or Sandbox) on as its owner so Kubernetes collects it
-  # with the workload, and deletes it alongside the Job at terminate.
+  # Per-launch token Secret, read through the Pod's `secretKeyRef`: created
+  # before the Job, then patched to be owned by the Job (or Sandbox) so
+  # Kubernetes deletes it with the workload; terminate also deletes it.
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["create", "patch", "delete"]
