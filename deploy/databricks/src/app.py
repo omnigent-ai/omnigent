@@ -171,6 +171,7 @@ try:
     from omnigent.server.app import create_app
     from omnigent.server.auth import create_auth_provider, warn_if_single_user_exposed
     from omnigent.server.managed_hosts import parse_sandbox_config
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
     from omnigent.server.server_config import load_server_config
     from omnigent.util.tunnel_limits import uvicorn_tunnel_kwargs
 
@@ -318,6 +319,7 @@ try:
         sandbox_config=sandbox_config,
         databricks_config=databricks_config,
         databricks_store=databricks_store,
+        mcp_registry=build_mcp_registry_from_env(DB_URI),
     )
 
     if __name__ == "__main__":
