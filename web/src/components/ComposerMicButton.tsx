@@ -548,6 +548,7 @@ export const ComposerMicButton = ({
         data-escape-owner={isListening ? "" : undefined}
         aria-busy={connecting}
         aria-label={a11yLabel}
+        data-testid="chat-mic-button"
         data-composer-action="microphone"
         data-server-dictation-available={serverAvailable}
         data-dictating={isListening || undefined}

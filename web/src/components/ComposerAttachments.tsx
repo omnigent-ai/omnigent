@@ -38,7 +38,7 @@ export function ComposerAttachments({
 }) {
   if (files.length === 0) return null;
   return (
-    <ComposerChipRow className={className}>
+    <ComposerChipRow className={className} data-testid="chat-attachments">
       {files.map((file, i) => (
         <AttachmentTile key={attachmentKey(file)} file={file} onRemove={() => onRemove(i)} />
       ))}
@@ -140,7 +140,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
 
   if (showThumb) {
     return (
-      <div className="relative shrink-0">
+      <div className="relative shrink-0" data-testid="chat-attachment">
         <div className="size-14 overflow-hidden rounded-xl border border-border bg-muted">
           <ZoomableImage
             src={url}
@@ -159,7 +159,7 @@ function AttachmentTile({ file, onRemove }: { file: File; onRemove: () => void }
   const meta = ext ? `${ext} · ${formatFileSize(file.size)}` : formatFileSize(file.size);
   const Icon = iconForFile(file);
   return (
-    <div className="relative shrink-0">
+    <div className="relative shrink-0" data-testid="chat-attachment">
       <div className="flex h-14 w-[180px] items-center gap-2 rounded-xl border border-border bg-background p-2">
         <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground">
           <Icon className="size-5" />
