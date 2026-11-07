@@ -5,6 +5,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo, SharingMode } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { PermissionsModal } from "./PermissionsModal";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 vi.mock("@/hooks/useSharing", () => ({
   usePublicSharingMaxLevel: () => ({ data: undefined }),
@@ -23,7 +24,8 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: null, isLoading: false, error: null })),
 }));
-vi.mock("@/lib/sessionsApi", () => ({
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
   updateSession: vi.fn(),
 }));
 
