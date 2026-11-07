@@ -19,6 +19,8 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeInputBoxOccupied,
     ClaudeTerminalDialog,
     ClaudeUserPromptPending,
+    _mark_input_payload_write,
+    _track_input_delivery,
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
@@ -70,6 +72,8 @@ class _Pane:
             refusal = self.refusals.pop(0)
             if isinstance(refusal, Exception):
                 raise refusal
+            if not refusal:
+                _mark_input_payload_write()
             prompt = ClaudeUserPromptPending(_REFUSAL)
             prompt.nothing_typed = refusal
             raise prompt
@@ -110,7 +114,11 @@ class _Pane:
 @pytest.fixture
 def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
     fake = _Pane(refusals=[True], pending_polls=2)
-    monkeypatch.setattr(claude_native_executor, "inject_user_message", fake.inject_user_message)
+    monkeypatch.setattr(
+        claude_native_executor,
+        "inject_user_message",
+        _track_input_delivery(original=True)(fake.inject_user_message),
+    )
     # raising=False: main has neither, so these tests fail there on behaviour.
     monkeypatch.setattr(
         claude_native_executor,
@@ -189,7 +197,7 @@ async def test_a_refusal_after_typing_began_is_reported_at_once(
 
     assert len(events) == 1 and isinstance(events[0], ExecutorError)
     assert events[0].message == _REFUSAL
-    assert events[0].undelivered is True
+    assert events[0].undelivered is False
     assert pane.deliveries == 1
     assert pane.polls == 0
 
@@ -500,6 +508,34 @@ async def test_a_terminal_dialog_that_awaits_no_answer_is_reported_at_once(
     assert events[0].undelivered is True
     assert pane.deliveries == 1
     assert pane.polls == 0
+
+
+@pytest.mark.asyncio
+async def test_a_safe_hold_keeps_the_original_input_identity(pane, tmp_path, monkeypatch):
+    from omnigent.native.input_diagnostics import current_input_attributes, input_delivery_scope
+
+    identity = {
+        "input_stable_id": "a" * 32,
+        "pending_id": "pending_" + "a" * 32,
+        "delivery_attempt_id": "b" * 32,
+        "input_enqueued_at_ms": 1700000000000,
+    }
+    observed = []
+    pane.refusals = [ClaudeComposerNotCleared(_NOT_CLEARED)]
+    inject = pane.inject_user_message
+
+    @_track_input_delivery(original=True)
+    def record(*args, **kwargs):
+        observed.append(current_input_attributes())
+        inject(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", record)
+    with input_delivery_scope(identity):
+        events = await _run(tmp_path)
+    assert events == [TurnComplete(response=None)]
+    assert observed == [identity, identity]
+    assert pane.delivered == ["hello from the web"]
+    assert pane.kills == 0
 
 
 @pytest.mark.asyncio

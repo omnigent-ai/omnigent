@@ -57,7 +57,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -130,6 +130,180 @@ _INJECTION_LOCKS: dict[str, threading.Lock] = {}
 _INJECTION_LOCK_POLL_INTERVAL_S = 0.1
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
+_INPUT_FAILURE_PRODUCER = object()
+
+
+def _current_receipt_identity() -> tuple[tuple[str, str], ...] | None:
+    from omnigent.native.input_receipt import current_native_input_receipt
+
+    receipt = current_native_input_receipt()
+    return tuple(sorted(receipt["identity"].items())) if receipt is not None else None
+
+
+@dataclass(eq=False)
+class _OriginalInputAttempt:
+    """Own monotonic payload evidence for one executor input, including its holds."""
+
+    bridge_dir: Path
+    request_session_id: str | None
+    receipt_identity: tuple[tuple[str, str], ...] | None = field(
+        default_factory=_current_receipt_identity
+    )
+    payload_may_have_been_written: bool = False
+    control_input_attempted: bool = False
+    auxiliary_pending: object | None = None
+    target: tuple[str, str] | None = None
+    identity_changed: bool = False
+
+    def failure(self, error: BaseException) -> _OriginalInputFailure | None:
+        evidence = getattr(error, "_claude_original_input_failure", None)
+        if (
+            type(evidence) is not _OriginalInputFailure
+            or evidence.owner is not self
+            or evidence.error is not error
+            or evidence.producer is not _INPUT_FAILURE_PRODUCER
+            or self.identity_changed
+        ):
+            return None
+        current = _read_json_file(self.bridge_dir / _TMUX_FILE)
+        current_target = (
+            (current.get("socket_path"), current.get("tmux_target"))
+            if isinstance(current, dict)
+            else None
+        )
+        if (
+            (self.target is not None and current_target != self.target)
+            or (self.receipt_identity != _current_receipt_identity())
+            or (
+                self.request_session_id is not None
+                and read_active_session_id(self.bridge_dir) != self.request_session_id
+            )
+        ):
+            self.identity_changed = True
+            return None
+        return evidence
+
+    def undelivered(self, error: BaseException) -> bool:
+        evidence = self.failure(error)
+        return bool(
+            evidence is not None
+            and not evidence.payload_may_have_been_written
+            and not self.payload_may_have_been_written
+        )
+
+    def can_hold(self, error: BaseException) -> bool:
+        evidence = self.failure(error)
+        return bool(
+            self.undelivered(error)
+            and evidence is not None
+            and not evidence.auxiliary_pending
+            and self.auxiliary_pending is None
+        )
+
+    def uncertain_write(self, error: BaseException) -> bool:
+        return self.failure(error) is not None and (
+            self.payload_may_have_been_written or self.auxiliary_pending is not None
+        )
+
+
+@dataclass(frozen=True)
+class _OriginalInputFailure:
+    owner: _OriginalInputAttempt
+    error: BaseException
+    producer: object
+    payload_may_have_been_written: bool
+    auxiliary_pending: bool
+
+
+@dataclass
+class _InputOperation:
+    owner: _OriginalInputAttempt | None
+    original: bool
+    payload_may_have_been_written: bool = False
+
+
+_ORIGINAL_INPUT_ATTEMPT: ContextVar[_OriginalInputAttempt | None] = ContextVar(
+    "claude_original_input_attempt", default=None
+)
+_INPUT_OPERATION: ContextVar[_InputOperation | None] = ContextVar(
+    "claude_input_operation", default=None
+)
+
+
+@contextlib.contextmanager
+def _original_input_scope(attempt: _OriginalInputAttempt) -> Iterator[None]:
+    token = _ORIGINAL_INPUT_ATTEMPT.set(attempt)
+    try:
+        yield
+    finally:
+        _ORIGINAL_INPUT_ATTEMPT.reset(token)
+
+
+def _track_input_delivery(*, original: bool) -> Callable[[_InjectionFunction], _InjectionFunction]:
+    """Keep producer evidence outside serialization retries and slash fallback."""
+
+    def decorate(function: _InjectionFunction) -> _InjectionFunction:
+        @functools.wraps(function)
+        def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
+            owner = _ORIGINAL_INPUT_ATTEMPT.get()
+            if owner is not None and (
+                owner.bridge_dir != bridge_dir
+                or owner.receipt_identity != _current_receipt_identity()
+            ):
+                owner.identity_changed = True
+                owner = None
+            operation = _InputOperation(owner, original)
+            token = _INPUT_OPERATION.set(operation)
+            try:
+                result = function(bridge_dir, *args, **kwargs)
+                if owner is not None and owner.auxiliary_pending is operation:
+                    owner.auxiliary_pending = None
+                return result
+            except RuntimeError as error:
+                if owner is not None:
+                    error.__dict__["_claude_original_input_failure"] = _OriginalInputFailure(
+                        owner,
+                        error,
+                        _INPUT_FAILURE_PRODUCER,
+                        owner.payload_may_have_been_written,
+                        owner.auxiliary_pending is not None,
+                    )
+                raise
+            finally:
+                _INPUT_OPERATION.reset(token)
+
+        return cast(_InjectionFunction, wrapped)
+
+    return decorate
+
+
+def _bind_input_target(info: Mapping[str, Any]) -> None:
+    operation = _INPUT_OPERATION.get()
+    if operation is not None and operation.owner is not None:
+        owner = operation.owner
+        target = (info["socket_path"], info["tmux_target"])
+        if owner.target is not None and owner.target != target:
+            owner.identity_changed = True
+        owner.target = target
+
+
+def _mark_input_payload_write() -> None:
+    operation = _INPUT_OPERATION.get()
+    if operation is not None:
+        operation.payload_may_have_been_written = True
+        if operation.owner is not None:
+            if operation.original:
+                operation.owner.payload_may_have_been_written = True
+            else:
+                operation.owner.auxiliary_pending = operation
+
+
+def _mark_control_input() -> None:
+    operation = _INPUT_OPERATION.get()
+    if operation is not None and operation.owner is not None:
+        operation.owner.control_input_attempted = True
+
+
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
@@ -179,6 +353,16 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             try:
                 return function(bridge_dir, *args, **kwargs)
             except ClaudeComposerNotCleared:
+                operation = _INPUT_OPERATION.get()
+                if (
+                    operation is None
+                    or operation.payload_may_have_been_written
+                    or (
+                        operation.owner is not None
+                        and operation.owner.payload_may_have_been_written
+                    )
+                ):
+                    raise
                 # The refused paste sent nothing. Give a clipped composer room,
                 # then recheck readiness and pending prompts before retrying.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
@@ -4433,6 +4617,7 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@_track_input_delivery(original=True)
 @delivery_diagnostics.trace_delivery(
     session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
@@ -4506,6 +4691,7 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _bind_input_target(info)
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -4623,9 +4809,8 @@ def _paste_and_submit(
             nothing_typed=True,
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first, or the paste lands inside the person's draft and
-    # Enter submits both together.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # A terminal-owned draft must be released before this initial paste.
+    _prepare_empty_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     transcript_before_paste = _capture_pane(socket_path, tmux_target)
     draft_seen, pane, polls, empty_captures, paste_wait_started = _paste_and_await_draft(
         bridge_dir, socket_path, tmux_target, text=text, needle=needle
@@ -4678,6 +4863,7 @@ def _paste_and_submit(
         if transcript_path is not None and native_session_id is not None
         else None
     )
+    _mark_input_payload_write()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     if not draft_seen:
@@ -4750,7 +4936,9 @@ def _paste_and_await_draft(
         ) as paste_file:
             paste_path = paste_file.name
             paste_file.write(_paste_payload_bytes(text + "\n"))
+        _mark_input_payload_write()
         _run_tmux(socket_path, "load-buffer", "-b", "omnigent-paste", paste_path)
+        _mark_input_payload_write()
         _run_tmux(
             socket_path,
             "paste-buffer",
@@ -5147,6 +5335,7 @@ def wait_for_input_ready(
     )
 
 
+@_track_input_delivery(original=False)
 @_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
@@ -5211,6 +5400,7 @@ def inject_slash_command(
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _bind_input_target(info)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Same reclaim-then-wait as inject_user_message: a surface left occupying
@@ -5228,12 +5418,10 @@ def inject_slash_command(
             "Answer the pending Claude question or permission request before changing settings.",
             nothing_typed=True,
         )
-    # Clear any draft the user is mid-typing; otherwise the command below
-    # concatenates with their text and Enter submits
-    # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
-    # not interrupt an in-flight generation.
-    _clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    # Settings must not concatenate with or erase terminal-owned input.
+    _prepare_empty_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
+    _mark_input_payload_write()
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
     # Enter leaves the command drafted while the persisted session value
@@ -5254,6 +5442,7 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    _mark_input_payload_write()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -5956,6 +6145,8 @@ def _run_tmux(socket_path: str, *args: str, allow_missing_target: bool = False) 
 
     _check_injection_cancelled()
     operation = args[0] if args else ""
+    if operation == "send-keys":
+        _mark_control_input()
     if operation == "send-keys" and "-t" in args:
         target = args[args.index("-t") + 1]
         args = ("copy-mode", "-q", "-t", target, ";", *args)
@@ -6575,11 +6766,9 @@ def _restore_occupied_input(
     command. Every one of them documents Escape as its way out ("Esc to
     cancel"), which commits nothing and hands the empty input box back, so
     the web-UI message wins the pane. The exception is a shell-mode box
-    holding a typed command, which Escape leaves in shell mode: that command
-    is cleared from the box instead (see :func:`_shell_mode_draft`), the way
-    an unsent chat draft is cleared before a paste. So is a draft taller than
-    the pane, which scrolls the box's glyph row out of view
-    (:func:`_scrolled_draft_rows`).
+    holding a typed command, which Escape leaves in shell mode: that input
+    remains for its owner (see :func:`_shell_mode_draft`). A draft taller than
+    the pane is likewise preserved (:func:`_scrolled_draft_rows`).
 
     Questions and permission prompts are protected by their hook wait markers
     and visible decision controls; they require an explicit answer. So are the
@@ -6680,22 +6869,15 @@ def _restore_occupied_input(
             if unclearable_seen:
                 return surface
         elif surface == _SCROLLED_DRAFT_SURFACE:
-            # Deleting lines shrinks the box until its glyph row is back on
-            # screen; the keys only edit the draft, so they need no spacing.
-            _logger.info("claude-native: clearing a draft taller than the terminal")
-            delivery_diagnostics.record_restore_action("scrolled_draft_clear")
-            _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
+            # A hidden draft belongs to the terminal user, even when its glyph is clipped.
+            return surface
         elif last_escape is None or now - last_escape >= _OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S:
             if surface == _SHELL_MODE_SURFACE and _shell_mode_draft(pane):
-                # Escape keeps a typed shell command in shell mode, so the
-                # command is cleared instead, as a chat draft is before a paste.
-                _logger.info("claude-native: clearing a shell-mode draft from the input box")
-                delivery_diagnostics.record_restore_action("shell_clear")
-                _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
-            else:
-                _logger.info("claude-native: dismissing %s covering the input box", surface)
-                delivery_diagnostics.record_restore_action("escape")
-                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
+                # A typed shell command is user input; leave it for its owner.
+                return surface
+            _logger.info("claude-native: dismissing %s covering the input box", surface)
+            delivery_diagnostics.record_restore_action("escape")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
             last_escape = now
         unclearable_seen = unclearable
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
@@ -6899,18 +7081,20 @@ def _composer_box(pane: str) -> _ComposerBox | None:
     return None if scrolled is None else _ComposerBox(scrolled, framed=False)
 
 
-def _composer_reads_clear(box: _ComposerBox | None) -> bool:
-    """
-    Return whether one burst of clearing keys is known to empty *box*.
-
-    True when the capture showed the box whole (both rules on screen) with
-    nothing after its glyph row but blank rows: the burst empties the glyph
-    row, and no hidden line is left for a paste to join.
-
-    :param box: The box :func:`_composer_box` read, or ``None``.
-    :returns: ``True`` when the box reads clear.
-    """
+def _composer_clearing_burst_is_sufficient(box: _ComposerBox | None) -> bool:
+    """Preserve the existing recovery cleanup test for an already attempted paste."""
     return box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
+
+
+def _composer_reads_clear(box: _ComposerBox | None) -> bool:
+    """Return whether a full frame shows an empty chat prompt and blank rows."""
+    return (
+        box is not None
+        and box.framed
+        and bool(box.rows)
+        and box.rows[0].strip() == _CLAUDE_PROMPT_GLYPH
+        and not any(row.strip() for row in box.rows[1:])
+    )
 
 
 def _first_non_blank(lines: list[str], start: int, end: int) -> int:
@@ -6943,6 +7127,15 @@ def _scrolled_draft_rows(lines: list[str], rules: list[int]) -> list[str] | None
     if any(_CLAUDE_PROMPT_GLYPH in line for line in lines):
         return None
     return rows
+
+
+def _prepare_empty_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
+    """Refocus after observing an empty composer."""
+    _require_clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    _mark_control_input()
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
+    _require_clear_composer(socket_path, tmux_target, bridge_dir=bridge_dir)
+    _send_composer_clear_keys(socket_path, tmux_target, rows=1)
 
 
 def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
@@ -6992,7 +7185,7 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
         pane = _capture_pane(socket_path, tmux_target)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
-        settled = _composer_reads_clear(box)
+        settled = _composer_clearing_burst_is_sufficient(box)
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
             if not repainted and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
                 repainted, round_no = True, 0
@@ -7017,6 +7210,56 @@ def _clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> 
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
+def _require_clear_composer(socket_path: str, tmux_target: str, *, bridge_dir: Path) -> None:
+    """Require a readable empty composer without modifying an unknown draft.
+
+    Re-read transient captures and request one repaint before refusing. A
+    clipped box can be retried at a usable height by the injection wrapper;
+    neither this check nor that retry may erase the person's input.
+    """
+    repainted = False
+    round_no = 0
+    while True:
+        _check_injection_cancelled()
+        pane = _capture_pane(socket_path, tmux_target)
+        if not pane.strip():
+            state = _claude_pane_state(socket_path, tmux_target)
+            if state.alive is False:
+                gone = (
+                    "is no longer running (exit status unknown)"
+                    if state.exit_status is None
+                    else f"has exited (status {state.exit_status})"
+                )
+                raise ClaudeTerminalExited(
+                    f"The Claude Code terminal {gone}, so the message was not delivered. "
+                    "Relaunch the terminal to continue this conversation.",
+                    exit_status=state.exit_status,
+                )
+        box = _composer_box(pane)
+        # Blank rows after the glyph row hold nothing a paste could join.
+        settled = _composer_reads_clear(box)
+        if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            if not repainted and _request_claude_repaint(socket_path, tmux_target, bridge_dir):
+                repainted, round_no = True, 0
+                delivery_diagnostics.record_details(composer_repaint_requested=True)
+                time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+                continue
+            delivery_diagnostics.record_composer_not_cleared(
+                pane=pane,
+                rows=None if box is None else box.rows,
+                framed=box is not None and box.framed,
+                rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+            )
+            raise ClaudeComposerNotCleared(
+                "Claude Code's input box could not be verified clear, so nothing was sent. "
+                "Open the terminal, expand it and clear the input box, then retry."
+            )
+        if settled:
+            return
+        round_no += 1
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
 def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) -> None:
     """
     Send the Ctrl+K and Ctrl+U presses that empty *rows* rows of a draft.
@@ -7027,6 +7270,7 @@ def _send_composer_clear_keys(socket_path: str, tmux_target: str, *, rows: int) 
     """
     presses = 2 * rows
     keys = _COMPOSER_KILL_TO_LINE_END * presses + _COMPOSER_KILL_TO_LINE_START * presses
+    _mark_control_input()
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, keys)
 
 

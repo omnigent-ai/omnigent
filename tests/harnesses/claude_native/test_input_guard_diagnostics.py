@@ -120,12 +120,18 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
     assert attrs["attempt"] == 0
     assert attrs["stage"] == "restoring_input"
     assert attrs["restore_first_surface"] == attrs["restore_last_surface"] == "shell_mode"
-    assert attrs["restore_captures"] > 2
     assert attrs["restore_pane_rows"] == 3
     assert attrs["restore_capture_empty"] is False
-    action = "shell_clear" if has_draft else "escape"
-    assert attrs[f"restore_{action}_attempts"] == len(terminal.commands)
-    assert attrs[f"restore_{action}_attempts"] > 1
+    if has_draft:
+        assert attrs["restore_captures"] == 2
+        assert terminal.pane == _composer(_PRIVATE_TEXT, glyph="!")
+        assert terminal.commands == []
+        assert "restore_shell_clear_attempts" not in attrs
+        assert "restore_escape_attempts" not in attrs
+    else:
+        assert attrs["restore_captures"] > 2
+        assert attrs["restore_escape_attempts"] == len(terminal.commands)
+        assert attrs["restore_escape_attempts"] > 1
     assert all(command[-1] != "Enter" for command in terminal.commands)
     assert not terminal.pasted
 
@@ -133,7 +139,7 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
 def test_recovered_surface_is_retained_when_a_later_submit_fails(
     terminal: _Terminal, caplog: pytest.LogCaptureFixture
 ) -> None:
-    terminal.pane = _composer(_PRIVATE_TEXT, glyph="!")
+    terminal.pane = _composer(glyph="!")
     terminal.clears_surface = True
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
@@ -145,7 +151,8 @@ def test_recovered_surface_is_retained_when_a_later_submit_fails(
     assert attrs["attempt"] == 1
     assert attrs["restore_first_surface"] == "shell_mode"
     assert attrs["restore_last_surface"] == "none"
-    assert attrs["restore_shell_clear_attempts"] == 1
+    assert attrs["restore_escape_attempts"] == 1
+    assert "restore_shell_clear_attempts" not in attrs
     assert attrs["verification"] == "draft_still_present"
 
 

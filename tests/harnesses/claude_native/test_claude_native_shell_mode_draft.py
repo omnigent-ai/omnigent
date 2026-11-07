@@ -43,6 +43,14 @@ class _InputBox:
         self.cursor = len(draft) if cursor is None else cursor
         self.submitted: list[tuple[str, str]] = []
 
+    def clear_from_terminal(self) -> None:
+        """The terminal owner clears its command with the CLI's editing keys."""
+        count = 2 * (self.draft.count("\n") + 1) + 2
+        for key in [_CTRL_K] * count + [_CTRL_U] * count:
+            self.key(key)
+        assert self.draft == ""
+        assert self.mode == "prompt"
+
     def pane(self) -> str:
         glyph = "!" if self.mode == "bash" else "❯"
         footer = "  ! for shell mode" if self.mode == "bash" else "  ? for shortcuts"
@@ -138,6 +146,11 @@ def test_a_shell_mode_draft_is_cleared_and_the_message_delivered(
     box = _InputBox("bash", "git status --short")
     bridge_dir, calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
 
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        inject_user_message(bridge_dir, content="hello from the web")
+    assert box.draft == "git status --short"
+    assert box.submitted == []
+    box.clear_from_terminal()
     inject_user_message(bridge_dir, content="hello from the web")
 
     keys = _keys(calls)
@@ -169,6 +182,11 @@ def test_a_multiline_shell_draft_is_cleared_before_web_input(
     box = _InputBox("bash", draft, cursor=cursor)
     bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
 
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        inject_user_message(bridge_dir, content="hello from the web")
+    assert box.draft == draft
+    assert box.submitted == []
+    box.clear_from_terminal()
     inject_user_message(bridge_dir, content="hello from the web")
 
     assert box.submitted == [("prompt", "hello from the web")]
@@ -181,6 +199,11 @@ def test_a_settings_command_clears_a_shell_mode_draft_too(
     box = _InputBox("bash", "ls -la")
     bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="")
 
+    with pytest.raises(claude_native_bridge.ClaudeInputBoxOccupied):
+        inject_slash_command(bridge_dir, command="/effort high")
+    assert box.draft == "ls -la"
+    assert box.submitted == []
+    box.clear_from_terminal()
     inject_slash_command(bridge_dir, command="/effort high")
 
     assert box.submitted == [("prompt", "/effort high")]

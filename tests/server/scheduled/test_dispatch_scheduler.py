@@ -2306,6 +2306,8 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
     assert calls == [["7"], ["7"]]
     assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
     with workspace_scope(7):
+        # A timed-out sweep may leave its shielded database update in flight.
+        await poll_until_async(lambda: store.list_runs(task.id)[0][0].status == "failed")
         assert store.list_runs(task.id)[0][0].status == "failed"
 
 
