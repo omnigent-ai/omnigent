@@ -532,6 +532,24 @@ class SeatbeltSandboxBackend(SandboxBackend):
             unsafe ancestor (see :func:`_ensure_executable_visible`).
         """
         del chdir  # See docstring — Seatbelt has no --chdir analog.
+        profile_path = _write_profile_to_tempfile(self._profile(argv, policy, cwd, target))
+        return [_SANDBOX_EXEC_PATH, "-f", profile_path, *argv]
+
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Return the SBPL profile a launch would load; it embeds the dotfile mask scan."""
+        del chdir
+        return self._profile(argv, policy, cwd, None)
+
+    def _profile(
+        self, argv: list[str], policy: SandboxPolicy, cwd: Path, target: str | None
+    ) -> str:
+        """Build the SBPL profile for :meth:`wrap_launcher_argv`."""
         cwd_resolved = cwd.resolve(strict=False)
         extra_read_paths = _ensure_executable_visible(
             argv, cwd_resolved, policy_read_roots=policy.read_roots or []
@@ -572,8 +590,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 "spawn time with an opaque error; this check fails loud "
                 "with the spec keys you can tune."
             )
-        profile_path = _write_profile_to_tempfile(profile)
-        return [_SANDBOX_EXEC_PATH, "-f", profile_path, *argv]
+        return profile
 
     def activate(self, policy: SandboxPolicy) -> None:
         """
