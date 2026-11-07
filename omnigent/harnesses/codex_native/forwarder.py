@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -12,7 +13,7 @@ import shlex
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Callable, Collection
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -260,6 +261,17 @@ _CODEX_COLLAB_RUNNING_STATUSES = frozenset({"pendingInit", "running"})
 _CODEX_COLLAB_FAILED_STATUSES = frozenset({"errored", "notFound"})
 # Omnigent control event type sent when a Codex child thread is discovered.
 _EXTERNAL_CODEX_SUBAGENT_START_TYPE = "external_codex_subagent_start"
+# Items that register child threads stay on the ordered parent path so a
+# child's lane only ever starts after its Omnigent session exists.
+_CODEX_CHILD_REGISTRATION_ITEM_TYPES = frozenset(
+    {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
+)
+# Child posts in flight at once across all sub-agent lanes.
+_CHILD_DELIVERY_CONCURRENCY = 8
+# A child event older than this when delivered means its lane is backlogged.
+_CHILD_DELIVERY_LAG_WARNING_SECONDS = 30.0
+# Upper bound on draining queued child events at forwarder shutdown.
+_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS = 10.0
 _PLAN_IMPLEMENTATION_QUESTION_ID = "plan_implementation"
 _PLAN_IMPLEMENTATION_TITLE = "Implement this plan?"
 _PLAN_IMPLEMENTATION_YES = "Yes, implement this plan"
@@ -365,6 +377,14 @@ class _ForwarderTarget:
     elicitation_tracker: _CodexElicitationTaskTracker
 
 
+@dataclass(frozen=True)
+class _QueuedChildEvent:
+    """One child-thread notification waiting on its lane."""
+
+    deliver: Callable[[], Awaitable[None]]
+    enqueued_at: float
+
+
 @dataclass
 class _CodexChildStream:
     """Child output and turn identity, independent of the parent's disk bridge."""
@@ -373,6 +393,56 @@ class _CodexChildStream:
     delta_coalescer: _OutputTextDeltaCoalescer
     active_turn_id: str | None = None
     terminal_turn_ids: set[str] = field(default_factory=set)
+    # Ordered lane so a busy child never blocks the parent's notifications.
+    delivery_queue: asyncio.Queue[_QueuedChildEvent | None] = field(default_factory=asyncio.Queue)
+    delivery_worker: asyncio.Task[None] | None = None
+    last_lag_warning_at: float | None = None
+
+    def enqueue(self, queued: _QueuedChildEvent, slots: asyncio.Semaphore) -> None:
+        """Queue one child event and start the lane's worker if needed."""
+        self.delivery_queue.put_nowait(queued)
+        if self.delivery_worker is None or self.delivery_worker.done():
+            self.delivery_worker = asyncio.create_task(
+                self._deliver(slots), name="codex-native-child-delivery"
+            )
+
+    async def _deliver(self, slots: asyncio.Semaphore) -> None:
+        """Deliver this child's events in order, sharing the global post budget."""
+        loop = asyncio.get_running_loop()
+        while (queued := await self.delivery_queue.get()) is not None:
+            waited = loop.time() - queued.enqueued_at
+            if waited >= _CHILD_DELIVERY_LAG_WARNING_SECONDS and (
+                self.last_lag_warning_at is None
+                or loop.time() - self.last_lag_warning_at >= _CHILD_DELIVERY_LAG_WARNING_SECONDS
+            ):
+                self.last_lag_warning_at = loop.time()
+                _logger.warning(
+                    "Codex child delivery is backlogged: waited=%.1fs queued=%d",
+                    waited,
+                    self.delivery_queue.qsize(),
+                )
+            async with slots:
+                try:
+                    await queued.deliver()
+                except Exception:  # keep the lane alive, as the parent loop does.
+                    _logger.warning("Codex child event handling failed", exc_info=True)
+
+    async def drain(self) -> None:
+        """Deliver queued events, then stop the worker within the shutdown budget."""
+        worker = self.delivery_worker
+        if worker is None or worker.done():
+            return
+        self.delivery_queue.put_nowait(None)
+        try:
+            async with asyncio.timeout(_CHILD_DELIVERY_DRAIN_TIMEOUT_SECONDS):
+                await asyncio.shield(worker)
+        except TimeoutError:
+            _logger.warning(
+                "Codex child delivery drain timed out: dropped=%d", self.delivery_queue.qsize()
+            )
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
 
     def accepts_event(self, method: str, params: _JsonObject) -> bool:
         turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
@@ -641,6 +711,9 @@ class _CodexForwarderState:
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
     child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
+    child_delivery_slots: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(_CHILD_DELIVERY_CONCURRENCY)
+    )
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
@@ -877,8 +950,39 @@ class _CodexForwarderState:
             self.child_streams[thread_id] = stream
         return stream
 
+    def enqueue_child_event(
+        self,
+        client: httpx.AsyncClient,
+        event: CodexMessage,
+        deliver: Callable[[], Awaitable[None]],
+    ) -> bool:
+        """
+        Hand a registered child's notification to that child's ordered lane.
+
+        :param client: HTTP client the child's coalescer posts through.
+        :param event: Codex app-server notification envelope.
+        :param deliver: Handles ``event`` exactly as the parent loop would.
+        :returns: ``True`` when queued; ``False`` when the caller must handle
+            it inline (parent, unregistered, or child-registration events).
+        """
+        method = event.get("method")
+        params = event.get("params")
+        if method == "thread/started" or not isinstance(params, dict):
+            return False
+        item = params.get("item")
+        if isinstance(item, dict) and item.get("type") in _CODEX_CHILD_REGISTRATION_ITEM_TYPES:
+            return False
+        thread_id = _thread_id_from_params(params)
+        session_id = self.session_for_child_thread(thread_id) if thread_id is not None else None
+        if thread_id is None or session_id is None:
+            return False
+        queued = _QueuedChildEvent(deliver=deliver, enqueued_at=asyncio.get_running_loop().time())
+        self.child_stream(client, thread_id, session_id).enqueue(queued, self.child_delivery_slots)
+        return True
+
     async def close_child_streams(self) -> None:
         """Drain child output while the forwarder's HTTP client is still open."""
+        await asyncio.gather(*(stream.drain() for stream in self.child_streams.values()))
         await asyncio.gather(
             *(stream.delta_coalescer.close() for stream in self.child_streams.values())
         )
@@ -2601,7 +2705,8 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
-                    await _handle_event(
+                    handle = functools.partial(
+                        _handle_event,
                         ap_client,
                         session_id=target.session_id,
                         bridge_dir=bridge_dir,
@@ -2613,6 +2718,9 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
+                    # Sub-agents share this socket; their posts must not delay the parent.
+                    if not forwarder_state.enqueue_child_event(ap_client, event, handle):
+                        await handle()
                 except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         except BaseException as exc:
