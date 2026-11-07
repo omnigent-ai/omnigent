@@ -56,7 +56,7 @@
     "@tiptap/extension-image": "3.31.4",
     "@tiptap/extension-link": "3.31.4",
     "@tiptap/extension-list": "3.31.4",
-    "@tiptap/extension-table": "3.31.4",
+    "@tiptap/extension-table": "3.32.0",
     "@tiptap/markdown": "3.31.4",
     "@tiptap/pm": "3.31.4",
     "@tiptap/react": "3.31.4",
