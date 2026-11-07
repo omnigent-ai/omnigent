@@ -13,6 +13,7 @@ from omnigent.runner.identity import (
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
+from omnigent.server.sharing_settings import peer_session_messaging_enabled
 from omnigent.stores.conversation_store import (
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -87,6 +88,10 @@ def require_orchestration_source(
     """Check the bound runner, private sender and optional same-owner destination."""
     if not request.app.state.feature_flags.enabled(Feature.SESSION_ORCHESTRATION):
         raise OmnigentError("Session orchestration is disabled", code=ErrorCode.FORBIDDEN)
+    if target_id is not None and not peer_session_messaging_enabled(
+        request.app.state.feature_flags
+    ):
+        raise OmnigentError("Messaging other sessions is disabled", code=ErrorCode.FORBIDDEN)
     if not user_id or permissions is None:
         raise OmnigentError("Session orchestration requires ownership", code=ErrorCode.FORBIDDEN)
     source = require_owned_session(
