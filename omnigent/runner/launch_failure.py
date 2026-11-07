@@ -341,6 +341,10 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
 _CLAUDE_RESPONSE_STOPPED_MESSAGE = (
     "api error: the response stopped arriving. the response above may be incomplete."
 )
+_CLAUDE_OUTPUT_LIMIT = re.compile(
+    r"API Error: Claude's response exceeded the [1-9][0-9]* output token maximum\. "
+    r"To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable\."
+)
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
 _TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
 # The gateway's CANCELLED error envelope, which can arrive without a parseable status.
@@ -395,6 +399,8 @@ def classify_native_turn_error(code: str, message: str) -> str:
         return "budget_exhausted"
     if code not in {"native_turn_error", "codex_turn_error"}:
         return code
+    if code == "native_turn_error" and _CLAUDE_OUTPUT_LIMIT.fullmatch(message.strip()):
+        return "max_output_tokens"
     if _CLIENT_UPDATE_REQUIRED.search(message):
         return "client_update_required"
     if detect_request_size_overflow(message) is not None:
@@ -687,6 +693,7 @@ _FAILURE_CODE_DESCRIPTIONS: dict[str, str] = {
     "databricks_sign_in_completed": "The Databricks sign-in completed and the agent is ready.",
     "codex_thread_not_started": "Codex stopped before it could start, so this turn never ran.",
     "native_turn_error": "The agent ran into an error during this turn.",
+    "max_output_tokens": "The model reached its output limit. Continue to finish the response.",
     "rate_limit_exceeded": "The model's rate limit was reached. You can retry this turn.",
     "transient_upstream_error": (
         "The model service hit a temporary error mid-response; retrying usually "

@@ -97,6 +97,7 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
   databricks_sign_in_completed: "The Databricks sign-in completed and the agent is ready.",
   codex_thread_not_started: "Codex stopped before it could start, so this turn never ran.",
   native_turn_error: "The agent ran into an error during this turn.",
+  max_output_tokens: "The model reached its output limit. Continue to finish the response.",
   native_prompt_not_recorded: "Message not delivered. Try sending it again.",
   rate_limit_exceeded: "The model's rate limit was reached. You can retry this turn.",
   transient_upstream_error:
@@ -127,6 +128,7 @@ const RETRYABLE_ERROR_CODES = new Set([
   "rate_limit_exceeded",
   "transient_upstream_error",
   "connection_error",
+  "max_output_tokens",
 ]);
 
 // Failed turns the runner itself survived: the session is healthy, so retry
@@ -137,6 +139,7 @@ export const CONTINUE_TURN_ERROR_CODES = new Set([
   "rate_limit_exceeded",
   "transient_upstream_error",
   "connection_error",
+  "max_output_tokens",
 ]);
 
 interface ParsedErrorMessage {
@@ -378,9 +381,11 @@ export function ErrorBanner({
   ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
   const retryable = !workspaceMissing && onRetry !== undefined && actionableError !== undefined;
   const retryLabel =
-    actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
-      ? "Retry"
-      : "Resume session";
+    actionableError?.code === "max_output_tokens"
+      ? "Continue"
+      : actionableError && CONTINUE_TURN_ERROR_CODES.has(actionableError.code)
+        ? "Retry"
+        : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -415,7 +420,11 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+          {actionableError?.code === "max_output_tokens"
+            ? "Continuing"
+            : actionableError?.code === "rate_limit_exceeded"
+              ? "Retrying"
+              : "Reconnecting"}
         </Badge>
       </div>
     );
