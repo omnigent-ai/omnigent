@@ -8,7 +8,7 @@ import {
   SANDBOX_SESSION_CATALOG_MAX_AGE_MS,
   sandboxSessionCatalogKey,
 } from "@/lib/modelCatalogCache";
-import { markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
+import { markLiveSessionCatalog, markSandboxLaunch } from "@/lib/sandboxSessionProvenance";
 import type { NativeModelOption } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -110,8 +110,12 @@ describe("sandbox session catalog hooks", () => {
 
   const claudeModels: NativeModelOption[] = [{ id: "opus", displayName: "Opus" }];
 
-  function renderCheck(harness = "codex-native", { launched = true, enabled = true } = {}) {
+  function renderCheck(
+    harness = "codex-native",
+    { launched = true, live = true, enabled = true } = {},
+  ) {
     if (launched) markSandboxLaunch(sessionId);
+    if (live) markLiveSessionCatalog(sessionId);
     return renderHook(
       ({ models }: { models: NativeModelOption[] }) =>
         useSandboxLaunchSelectionCheck(sessionId, harness, models, enabled),
@@ -197,6 +201,18 @@ describe("sandbox session catalog hooks", () => {
     );
   });
 
+  it("names the effort when only its reset fails", async () => {
+    setEffort.mockRejectedValueOnce(new Error("refused"));
+    const { rerender } = renderCheck("claude-native");
+    rerender({ models: claudeModels });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't switch to the sandbox's default effort."),
+    );
+    expect(toast.info).toHaveBeenCalledExactlyOnceWith(
+      "gpt-5 isn't available in this sandbox. Using the default model.",
+    );
+  });
+
   it("reports a reset the server refused", async () => {
     setModel.mockRejectedValueOnce(new Error("refused"));
     const { rerender } = renderCheck();
@@ -212,6 +228,7 @@ describe("sandbox session catalog hooks", () => {
   it.each([
     ["a session this tab did not launch, such as one waking", { launched: false }],
     ["a session with configured inference", { enabled: false }],
+    ["a catalog read only from a session snapshot", { live: false }],
   ])("leaves %s alone", (_label, options) => {
     const { rerender } = renderCheck("codex-native", options);
     rerender({ models: codexModels });

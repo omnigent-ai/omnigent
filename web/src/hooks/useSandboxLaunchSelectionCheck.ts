@@ -6,6 +6,7 @@ import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import { isFusionModelUid } from "@/lib/devinFusion";
 import {
   deferLaunchNotice,
+  hasLiveSessionCatalog,
   type LaunchNotice,
   markSandboxLaunch,
   takeLaunchNotices,
@@ -74,7 +75,9 @@ export function useSandboxLaunchSelectionCheck(
   useEffect(() => {
     if (!enabled || sessionId === null || conversationId !== sessionId) return;
     for (const notice of takeLaunchNotices(sessionId)) showLaunchNotice(notice);
-    if (harness === null || models.length === 0 || !takeSandboxLaunch(sessionId)) return;
+    // A snapshot's persisted catalog may be stale, so only the runner's own report is checked.
+    if (harness === null || models.length === 0 || !hasLiveSessionCatalog(sessionId)) return;
+    if (!takeSandboxLaunch(sessionId)) return;
     const resets = launchSelectionResets(harness, models, model, effort);
     if (launchSelectionNotice(resets, model, effort) === null) return;
     const stillActive = () => useChatStore.getState().conversationId === sessionId;
@@ -86,9 +89,13 @@ export function useSandboxLaunchSelectionCheck(
       model,
       effort,
     );
+    let modelWasReset = false;
     void (async () => {
       try {
-        if (resets.model) await useChatStore.getState().setModel(null);
+        if (resets.model) {
+          await useChatStore.getState().setModel(null);
+          modelWasReset = true;
+        }
         // Store setters act on the active session, so a switch away defers the rest until return.
         if (resets.effort && !stillActive()) {
           if (modelNotice !== null)
@@ -107,7 +114,11 @@ export function useSandboxLaunchSelectionCheck(
         );
         if (notice !== null) notify({ kind: "info", text: notice });
       } catch {
-        notify({ kind: "error", text: "Couldn't switch to the sandbox's default model settings." });
+        if (modelWasReset && modelNotice !== null) notify({ kind: "info", text: modelNotice });
+        const text = modelWasReset
+          ? "Couldn't switch to the sandbox's default effort."
+          : "Couldn't switch to the sandbox's default model settings.";
+        notify({ kind: "error", text });
       }
     })();
   }, [enabled, sessionId, conversationId, harness, models, model, effort]);

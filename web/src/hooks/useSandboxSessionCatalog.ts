@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import {
+  MODEL_CATALOG_CACHE_PREFIX,
   parseModelCatalogCache,
   readModelCatalogCacheText,
   SANDBOX_SESSION_CATALOG_MAX_AGE_MS,
@@ -15,7 +16,8 @@ function savedCatalogsChanged() {
 }
 
 function onStorage(event: StorageEvent) {
-  if (event.key === null || event.key.startsWith("omnigent:model-catalog:")) savedCatalogsChanged();
+  if (event.key === null || event.key.startsWith(MODEL_CATALOG_CACHE_PREFIX))
+    savedCatalogsChanged();
 }
 
 // Notified by saves in this tab and storage events from others, so mounted readers reread.

@@ -31,6 +31,9 @@ const cacheSchema = z.object({
   savedAt: z.number(),
 });
 
+/** Prefix of every stored catalog key, for listeners that watch storage events. */
+export const MODEL_CATALOG_CACHE_PREFIX = "omnigent:model-catalog:v1:";
+
 export function modelCatalogCacheKey(
   target: "host" | "sandbox",
   targetId: string | null,
@@ -40,7 +43,7 @@ export function modelCatalogCacheKey(
   const server = getOmnigentServerIdentity();
   const user = getCurrentUserId();
   if (server === null || user === null || !targetId || !harness) return null;
-  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
+  return `${MODEL_CATALOG_CACHE_PREFIX}${JSON.stringify([server, user, target, targetId, harness, target === "sandbox" ? agentId : null])}`;
 }
 
 /** Key for a running sandbox session's catalog, scoped by provider and harness, not agent. */
@@ -51,7 +54,7 @@ export function sandboxSessionCatalogKey(
   const server = getOmnigentServerIdentity();
   const user = getCurrentUserId();
   if (server === null || user === null || !provider || !harness) return null;
-  return `omnigent:model-catalog:v1:${JSON.stringify([server, user, "sandbox-session", provider, harness])}`;
+  return `${MODEL_CATALOG_CACHE_PREFIX}${JSON.stringify([server, user, "sandbox-session", provider, harness])}`;
 }
 
 /** The raw stored entry, comparable across renders. */
