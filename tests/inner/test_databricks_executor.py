@@ -1311,6 +1311,86 @@ def test_read_databrickscfg_oauth_profile_returns_fresh_bearer(
     )
 
 
+@pytest.mark.parametrize("supports_policy", [False, True], ids=["legacy", "supported"])
+@pytest.mark.parametrize(
+    "route", ["read_named", "read_fallback", "resolve_named", "resolve_fallback", "host"]
+)
+def test_sdk_cli_refresh_policy_at_every_config_construction(
+    tmp_path: _Path,
+    monkeypatch: pytest.MonkeyPatch,
+    clean_databricks_env: None,
+    supports_policy: bool,
+    route: str,
+) -> None:
+    import omnigent.inner.databricks_executor as db_exec
+
+    host = "https://example.cloud.databricks.com"
+    calls: list[tuple[str | None, str | None, str | None]] = []
+    refresh_options: list[bool | None] = []
+
+    class _LegacyConfig:
+        def __init__(
+            self,
+            *,
+            profile: str | None = None,
+            host: str | None = None,
+            auth_type: str | None = None,
+        ) -> None:
+            calls.append((profile, host, auth_type))
+            if profile == "missing":
+                raise ValueError("missing synthetic profile")
+            self.host = host or "https://example.cloud.databricks.com"
+
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": "Bearer synthetic"}
+
+    class _UnsetPolicy:
+        def __get__(self, instance: object, owner: type | None = None) -> None:
+            return None
+
+    class _SupportedConfig(_LegacyConfig):
+        databricks_cli_force_refresh = _UnsetPolicy()
+
+        def __init__(
+            self,
+            *,
+            profile: str | None = None,
+            host: str | None = None,
+            auth_type: str | None = None,
+            databricks_cli_force_refresh: bool | None = None,
+        ) -> None:
+            refresh_options.append(databricks_cli_force_refresh)
+            super().__init__(profile=profile, host=host, auth_type=auth_type)
+
+    assert _SupportedConfig.databricks_cli_force_refresh is None
+    monkeypatch.setattr(
+        _sdk_config_mod, "Config", _SupportedConfig if supports_policy else _LegacyConfig
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "absent"))
+    if route.startswith("read"):
+        profile = "missing" if route == "read_fallback" else "owned"
+        creds = db_exec._read_databrickscfg(profile)
+        assert creds == db_exec.DatabricksCredentials(host=host, token="synthetic")
+    else:
+        if route == "resolve_fallback":
+            monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "missing")
+            auth, resolved_host = db_exec._resolve_databricks_auth()
+        elif route == "host":
+            auth, resolved_host = db_exec._resolve_databricks_auth(host=host)
+        else:
+            auth, resolved_host = db_exec._resolve_databricks_auth("owned")
+        assert resolved_host == host
+        assert auth.current_token() == "synthetic"
+
+    if route.endswith("fallback"):
+        assert calls == [("missing", None, None), (None, None, None)]
+    elif route == "host":
+        assert calls == [(None, host, "databricks-cli")]
+    else:
+        assert calls == [("owned", None, None)]
+    assert refresh_options == ([False] * len(calls) if supports_policy else [])
+
+
 def test_resolve_databricks_auth_returns_bearer_auth_and_host(
     monkeypatch,
 ):

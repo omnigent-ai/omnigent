@@ -25,8 +25,10 @@ import shlex
 import shutil
 import subprocess
 import time
-from collections.abc import AsyncIterator, Generator
+from collections.abc import AsyncIterator, Callable, Generator
 from dataclasses import dataclass, field
+from functools import partial
+from inspect import getattr_static
 from typing import TYPE_CHECKING, Any, Protocol, TypeAlias
 from urllib.parse import urlsplit, urlunsplit
 
@@ -95,6 +97,18 @@ class DatabricksCredentials:
     token: str
 
 
+def _sdk_config_constructor() -> Callable[..., Any]:  # type: ignore[explicit-any]
+    """Let the CLI manage cache freshness when the SDK supports that policy."""
+    from databricks.sdk.config import Config
+
+    # SDK descriptors return None on class access, so inspect the declaration.
+    try:
+        getattr_static(Config, "databricks_cli_force_refresh")
+    except AttributeError:
+        return Config
+    return partial(Config, databricks_cli_force_refresh=False)
+
+
 def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | None:
     """
     Resolve Databricks ``(host, bearer_token)`` for *profile* using the
@@ -140,7 +154,7 @@ def _read_databrickscfg(profile: str | None = None) -> DatabricksCredentials | N
        check.
     """
     try:
-        from databricks.sdk.config import Config
+        Config = _sdk_config_constructor()
     except ImportError:
         # databricks-sdk should always be present (pinned in pyproject.toml),
         # but if it isn't we gracefully degrade to file reading.
@@ -740,7 +754,7 @@ def _discover_databricks_auth(
         return _resolve_databricks_auth_for_host(host, workspace_id=workspace_id)
 
     try:
-        from databricks.sdk.config import Config
+        Config = _sdk_config_constructor()
     except ImportError as exc:
         raise ImportError(
             "The 'databricks-sdk' package is required for Databricks authentication. "
@@ -819,12 +833,12 @@ def _sdk_config(**kwargs: str) -> Any:  # type: ignore[explicit-any]  # SDK Conf
         ``profile="my-ws"`` or ``host=..., auth_type="databricks-cli"``.
     :returns: The constructed ``databricks.sdk.config.Config``.
     """
-    from databricks.sdk.config import Config
+    Config = _sdk_config_constructor()
 
     # The SDK types ``Config.__init__`` as taking a CredentialsStrategy
     # positionally; keyword config attributes are dynamically declared,
     # so the kwargs expansion is untypeable here.
-    return Config(**kwargs)  # type: ignore[arg-type]
+    return Config(**kwargs)
 
 
 def _resolve_databricks_auth_for_host(
