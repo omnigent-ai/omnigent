@@ -2395,22 +2395,77 @@ def _make_wheel_info(**kwargs: object) -> _InstalledWheelInfo:
     return _InstalledWheelInfo(**defaults)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("is_windows", "executable", "pip"),
+    [
+        (False, "/opt/omnigent/bin/python", "/opt/omnigent/bin/python -m pip"),
+        (True, r"C:\Users\me\venv\Scripts\python.exe", "pip"),
+    ],
+    ids=["posix-venv-interpreter", "windows-bare-pip"],
+)
 def test_cli_upgrade_refuses_pip_and_prints_manual_command(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, is_windows: bool, executable: str, pip: str
 ) -> None:
-    """pip installs are refused because extras cannot be recovered."""
+    """pip installs are refused because extras cannot be recovered.
+
+    On POSIX the manual command targets the interpreter running ``omni``; Windows
+    shells can't paste a POSIX-quoted path, so they keep a bare ``pip``."""
     monkeypatch.setattr(
         "omnigent.update_check._read_installed_wheel_info",
         lambda: _make_wheel_info(installer="pip", detected_installer="pip"),
     )
     monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
     monkeypatch.setattr("omnigent.update_check._uv_tool_receipt_path", lambda: None)
+    monkeypatch.setattr("omnigent._platform.IS_WINDOWS", is_windows)
+    monkeypatch.setattr(sys, "executable", executable)
 
     runner = CliRunner()
     result = runner.invoke(cli, ["upgrade"])
     assert result.exit_code == 0
     assert "pip does not record which extras" in result.output
-    assert "pip install -U omnigent" in result.output
+    assert f"\n    {pip} install -U omnigent\n" in result.output
+    assert f"\n    {pip} install -U 'omnigent[" in result.output
+
+
+@pytest.mark.parametrize(
+    ("args", "exit_code", "expected_output"),
+    [
+        (["--nightly"], 0, "    brew upgrade --fetch-HEAD omnigent-ai/tap/omnigent\n"),
+        (["--dry-run"], 0, "    brew upgrade omnigent-ai/tap/omnigent\n"),
+        (["--check"], 1, "A new release is available: v0.1.0 → v0.2.0."),
+        (["--check", "--nightly"], 1, "Newest nightly: v0.2.0.dev20260804 (currently v0.1.0)."),
+    ],
+    ids=[
+        "nightly-defers-to-brew",
+        "dry-run-defers-to-brew",
+        "check-only-reports",
+        "nightly-check-only-reports",
+    ],
+)
+def test_cli_upgrade_never_runs_an_installer_in_a_homebrew_keg(
+    monkeypatch: pytest.MonkeyPatch, args: list[str], exit_code: int, expected_output: str
+) -> None:
+    """``--nightly`` defers to brew like a release upgrade, and ``--check`` only reports."""
+    monkeypatch.setattr(
+        "omnigent.update_check._read_installed_wheel_info",
+        lambda: _make_wheel_info(installer="brew", detected_installer="brew"),
+    )
+    monkeypatch.setattr("omnigent.update_check._find_repo_root", lambda: None)
+    monkeypatch.setattr(importlib.metadata, "version", lambda _name: "0.1.0")
+    monkeypatch.setattr("omnigent.update_check.fetch_latest_version", lambda **_: "0.2.0")
+    monkeypatch.setattr(
+        "omnigent.update_check._latest_nightly_version", lambda: "0.2.0.dev20260804"
+    )
+
+    def _unexpected_run(command: str, _console: object) -> int:
+        raise AssertionError(f"ran an installer inside a Homebrew keg: {command}")
+
+    monkeypatch.setattr("omnigent.update_check._run_upgrade_command", _unexpected_run)
+
+    result = CliRunner().invoke(cli, ["upgrade", *args])
+
+    assert result.exit_code == exit_code, result.output
+    assert expected_output in result.output
 
 
 def test_cli_upgrade_refuses_uv_pip_and_prints_manual_command(
