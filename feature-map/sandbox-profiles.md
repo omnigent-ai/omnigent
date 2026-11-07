@@ -91,6 +91,11 @@ integration evidence separately; the browser test does not exercise them.
   Native `/clear` and `/fork` reauthorize and
   bind the replacement before detaching the source; the last directly bound
   runner session cannot detach. Host and profile mismatches remain blocked.
+  claude-sdk `/clear` continues in an empty fork (authorized like `/fork`) bound
+  to the source's host, workspace and live runner. It stays in the same sandbox,
+  so it keeps the source's `omnigent.sandbox.*` labels: a relaunch re-clones
+  the same repositories and routes by the same host id. No history or files
+  are copied, and a fork that cannot be bound is deleted again.
 - Missing sandboxes use the bound session's reference for replacement. Legacy host
   recovery rejects histories over 200 sessions; use controller lookup for larger
   histories. Runner-host discovery and reconnect liveness have a separate limit
