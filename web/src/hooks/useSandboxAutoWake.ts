@@ -109,7 +109,10 @@ export function useSandboxAutoWake(
   useEffect(() => {
     if (!sessionId) return;
     const onRequest = (requested: string) => {
-      if (requested === sessionId && latest.current.canWake) latest.current.wake();
+      if (requested !== sessionId || !latest.current.canWake) return;
+      // This is the opening's wake; the dwell mustn't send another after it fails.
+      opening.current.checked = true;
+      latest.current.wake();
     };
     wakeRequests.add(onRequest);
     return () => {

@@ -40,6 +40,8 @@ interface SandboxWake {
   request: Promise<boolean>;
   /** When a launch stage that never finishes lets Reconnect host return, once one is seen. */
   stageDeadline?: number;
+  /** Ends the wake once a health poll sees its host online, whichever session is shown. */
+  stopWatchingHost?: () => void;
 }
 
 // Per session and outside any view, so every way of waking a sandbox (Reconnect
@@ -62,13 +64,17 @@ function notifySandboxWakes(): void {
 function endSandboxWake(sessionId: string, wake = sandboxWakes.get(sessionId)): void {
   if (!wake || sandboxWakes.get(sessionId) !== wake) return;
   clearTimeout(wake.timer);
+  wake.stopWatchingHost?.();
   sandboxWakes.delete(sessionId);
   notifySandboxWakes();
 }
 
 /** Forget every session's sandbox wake. */
 export function resetSandboxWakesForTesting(): void {
-  for (const wake of sandboxWakes.values()) clearTimeout(wake.timer);
+  for (const wake of sandboxWakes.values()) {
+    clearTimeout(wake.timer);
+    wake.stopWatchingHost?.();
+  }
   sandboxWakes.clear();
   notifySandboxWakes();
 }
@@ -102,6 +108,11 @@ async function requestSandboxWake(sessionId: string, wake: SandboxWake): Promise
     await retrySession(sessionId);
     if (sandboxWakes.get(sessionId) !== wake) return true;
     wake.phase = "awaiting_online";
+    // A wake left running behind another session still ends when its host is up,
+    // so a later sleep isn't mistaken for this wake.
+    wake.stopWatchingHost = onRunnerHealthPolled((liveness) => {
+      if (liveness.get(sessionId)?.host_online === true) endSandboxWake(sessionId, wake);
+    });
     notifySandboxWakes();
     refreshRunnerHealth();
     return true;

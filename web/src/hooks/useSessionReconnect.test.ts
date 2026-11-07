@@ -1002,6 +1002,34 @@ describe("useSessionReconnect", () => {
     expect(result.current.sandboxStarting).toBe(true);
   });
 
+  it("ends a wake whose host comes online while another session is open", async () => {
+    vi.mocked(retrySession).mockResolvedValue({ queued: false, recovered: true });
+    const { result, rerender } = renderHook(useSessionReconnect, {
+      initialProps: { ...asleepSandbox, hostOnline: false as boolean | null },
+    });
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    rerender({
+      ...asleepSandbox,
+      sessionId: "other-session",
+      hostId: "other-host",
+      hostOnline: false,
+    });
+    act(() => {
+      for (const listener of healthPollListeners) {
+        listener(new Map([["session", { host_online: true } as SessionLiveness]]), true);
+      }
+    });
+    // The host later sleeps again; returning starts a fresh wake instead of joining a stale one.
+    rerender({ ...asleepSandbox, hostOnline: false });
+    expect(result.current.sandboxStarting).toBe(false);
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(retrySession).toHaveBeenCalledTimes(2);
+  });
+
   it.each(["resolves", "rejects"] as const)(
     "keeps a sandbox wake that %s while another session is open, and joins it on return",
     async (outcome) => {

@@ -463,7 +463,8 @@ has stayed open for a second in a visible tab, and so does picking Files or
 Changes in the Workspace rail. This only happens for editors, on an idle
 session with no error or launch already running; any other session keeps its
 Resume or error card. Each opening checks once, so a session that sleeps again
-while it stays open waits for Reconnect host or a message. Every way of waking
+while it stays open waits for Reconnect host, a Files or Changes pick, or a
+message. Every way of waking
 the sandbox (Reconnect host, opening the session, Files or Changes, the
 terminal's Resume) joins one wake per session, including after switching to
 another session and back, and the Files view shows **Starting sandbox…** while

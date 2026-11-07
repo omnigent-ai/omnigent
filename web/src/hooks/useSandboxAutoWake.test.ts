@@ -94,6 +94,14 @@ describe("useSandboxAutoWake", () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
+  it("doesn't wake again after the dwell when a tab's wake already ran", () => {
+    const { wake } = renderAutoWake({ id: "a", canWake: true });
+    act(() => requestSandboxWake("a"));
+    // The tab's wake fails fast; the dwell must not retry it.
+    act(() => vi.advanceTimersByTime(SANDBOX_AUTO_WAKE_DWELL_MS));
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
   it.each<[string, string, boolean | null, number]>([
     ["the open session that can wake", "a", true, 1],
     ["another session", "b", true, 0],
