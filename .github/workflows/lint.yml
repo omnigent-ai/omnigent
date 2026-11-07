@@ -96,6 +96,12 @@ jobs:
       - name: Test Merge Ready expiry sweep
         run: node --test .github/scripts/merge-ready/sweep.test.js
 
+      - name: Test address command authorization
+        run: node --test .github/scripts/otto-address.test.js
+
+      - name: Test maintainer approval policy
+        run: uv run --no-sync pytest -q .github/scripts/maintainer_approval_test.py
+
       - name: Check Merge Ready shell syntax
         run: |
           for script in .github/scripts/merge-ready/*.sh; do
