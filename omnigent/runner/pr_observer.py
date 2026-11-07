@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shlex
 import threading
@@ -416,15 +417,57 @@ def _object_pr(obj: dict[str, object], facets: list[_ProviderFacet]) -> PullRequ
     return None
 
 
+def _resolve_directory(current: str | None, argument: str) -> str | None:
+    """Return the absolute directory a ``cd``-style *argument* names, if known statically."""
+    if argument == "-" or "$" in argument or "`" in argument:
+        return None
+    path = os.path.expanduser(argument)
+    if not os.path.isabs(path):
+        if current is None:
+            return None
+        path = os.path.join(current, path)
+    return os.path.normpath(path)
+
+
+def _with_directories(segments: list[ShellSegment], start: str | None) -> list[ShellSegment]:
+    """Set each segment's ``cwd`` by following ``cd`` and ``git -C`` from *start*."""
+    current = start if start and os.path.isabs(start) else None
+    annotated: list[ShellSegment] = []
+    for segment in segments:
+        tokens = segment.invocation_tokens
+        directory = current
+        if tokens[0] in {"cd", "pushd"}:
+            arguments = [token for token in tokens[1:] if token not in {"-L", "-P", "-e", "--"}]
+            if tokens[0] == "cd" and not arguments:
+                arguments = ["~"]
+            current = _resolve_directory(current, arguments[0]) if arguments else None
+            directory = current
+        elif tokens[0] == "popd":
+            current = directory = None
+        elif os.path.basename(tokens[0]) == "git":
+            index = 1
+            while index < len(tokens) - 1 and tokens[index].startswith("-"):
+                if tokens[index] == "-C":
+                    directory = _resolve_directory(directory, tokens[index + 1])
+                index += 2 if tokens[index] in {"-C", "-c"} else 1
+        annotated.append(replace(segment, cwd=directory))
+    return annotated
+
+
 def _shell_operations(
-    tool_name: str, arguments: dict[str, object], facets: list[_ProviderFacet]
+    tool_name: str,
+    arguments: dict[str, object],
+    facets: list[_ProviderFacet],
+    cwd: str | None = None,
 ) -> list[tuple[str, ShellPrOp]]:
     if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
         return []
     command = arguments.get("command", arguments.get("cmd"))
     if not isinstance(command, str) or len(command) > 100_000:
         return []
-    segments = _shell_segments(command)
+    workdir = arguments.get("workdir")
+    start = cwd or (workdir if isinstance(workdir, str) else None)
+    segments = _with_directories(_shell_segments(command), start)
     return [
         (facet.provider_id, op) for facet in facets for op in facet.shell_pr_operations(segments)
     ]
@@ -546,8 +589,12 @@ def observe_tool_completion(
     call_id: str = "",
     source: str = "tool",
     successful: bool = True,
+    cwd: str | None = None,
 ) -> None:
-    """Best-effort observer; failures never change execution or tool results."""
+    """Best-effort observer; failures never change execution or tool results.
+
+    *cwd* is the directory a shell call started in, when the caller knows it.
+    """
     if not successful or not session_id:
         return
     try:
@@ -563,7 +610,7 @@ def observe_tool_completion(
         shell_result = _shell_result(tool_name, result)
         if not _failed(shell_result):
             for index, (provider_id, op) in enumerate(
-                _shell_operations(tool_name, arguments, _facets())
+                _shell_operations(tool_name, arguments, _facets(), cwd)
             ):
                 if op.resolve_result is None:
                     continue
@@ -605,7 +652,7 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
     name, arguments = payload.get("tool_name"), payload.get("tool_input")
     if not isinstance(name, str) or not isinstance(arguments, dict):
         return
-    call_id = payload.get("tool_use_id")
+    call_id, cwd = payload.get("tool_use_id"), payload.get("cwd")
     observe_tool_completion(
         session_id,
         tool_name=name,
@@ -613,4 +660,5 @@ def observe_hook(session_id: str, payload: dict[str, object]) -> None:
         result=payload.get("tool_response", payload.get("tool_output")),
         call_id=call_id if isinstance(call_id, str) else "",
         source="native_hook",
+        cwd=cwd if isinstance(cwd, str) else None,
     )

@@ -1,4 +1,4 @@
-"""Resolve existing GitHub PRs from successful git push status output."""
+"""Resolve existing GitHub PRs for branches a shell call pushed."""
 
 from __future__ import annotations
 
@@ -7,13 +7,14 @@ import json
 import re
 import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import PurePath
 from urllib.parse import quote
 
 from omnigent.git_providers import resolve_remote
 from omnigent.policies.builtins.github import _git_subcommand_index
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
+from omnigent.runner.git_providers.push_reflog import recent_pushes
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference
 from omnigent.runner.session_prs import PullRequestRef
 
@@ -97,8 +98,12 @@ def _push_count(segments: Sequence[ShellSegment]) -> int:
 
 
 def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
-    """Describe a push for deferred resolution without changing stdout attribution."""
-    if not _push_count(segments):
+    """Describe a push for deferred resolution without changing stdout attribution.
+
+    A call that ran in a known checkout always gets one, since an alias or script
+    can push without a recognizable ``git push`` in the command.
+    """
+    if not _push_count(segments) and not any(segment.cwd for segment in segments):
         return None
     return ShellPrOp(
         tracks=True,
@@ -111,11 +116,24 @@ def push_operation(segments: Sequence[ShellSegment]) -> ShellPrOp | None:
 
 def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullRequestRef]:
     """Find open PRs whose head matches a branch positively updated by this push."""
-    from omnigent.runner import github_resource
     from omnigent.runner.pr_observer import _failed
 
+    if _failed(result):
+        return []
+    targets = dict.fromkeys(_output_targets(segments, result))
+    for url, branch in recent_pushes(segment.cwd for segment in segments if segment.cwd):
+        remote = resolve_remote(url)
+        if remote is not None and remote.provider == "github":
+            targets[(remote.host, remote.repository, branch)] = None
+    return _open_prs(targets)
+
+
+def _output_targets(
+    segments: Sequence[ShellSegment], result: object
+) -> list[tuple[str, str, str]]:
+    """Return ``(host, repository, branch)`` for each update in literal ``git push`` output."""
     count = _push_count(segments)
-    if not count or _failed(result):
+    if not count:
         return []
     text = output_text(result)
     # Claude Bash merges process streams into stdout; its stderr holds diagnostics.
@@ -148,6 +166,13 @@ def pushed_prs(segments: Sequence[ShellSegment], result: object) -> list[PullReq
             elif not match[1].startswith("refs/") or match[1].startswith("refs/heads/"):
                 branch = match[1].removeprefix("refs/heads/")
                 targets[(remote.host, remote.repository, branch)] = None
+    return list(targets)
+
+
+def _open_prs(targets: Iterable[tuple[str, str, str]]) -> list[PullRequestRef]:
+    """Return the open PRs whose head is each ``(host, repository, branch)``."""
+    from omnigent.runner import github_resource
+
     references: dict[str, PullRequestRef] = {}
     deadline = time.monotonic() + 5.0
     with github_resource._gh_deadline_scope(deadline):

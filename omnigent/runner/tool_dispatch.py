@@ -7295,6 +7295,7 @@ async def execute_tool(
             result=output,
             successful=not output.startswith("Error:"),
             source="runner_shell",
+            cwd=str(runner_workspace) if runner_workspace else None,
         )
     return output
 

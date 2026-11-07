@@ -257,11 +257,14 @@ class ShellSegment:
         drops those prefixes. Never empty.
     :ivar output_eligible: False when redirection, piping, or background execution
         prevents assigning the shared output to this invocation.
+    :ivar cwd: The absolute directory the segment runs in, after any ``cd`` or
+        ``git -C`` before it, or ``None`` when unknown.
     """
 
     raw_tokens: tuple[str, ...]
     invocation_tokens: tuple[str, ...]
     output_eligible: bool = True
+    cwd: str | None = None
 
 
 @dataclass(frozen=True)
