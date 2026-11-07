@@ -242,6 +242,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `custom-agent-placement`: New session and Add nested agent can launch an uploaded
+  custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
+  is advertised. Nested custom agents can also use new or existing worktrees on a
+  connected host. Older servers disable the unsupported worktree combination and
+  retain the registered-agent fallback on sandbox selection. Managed creates send
+  the first task and attachments with the bundle when durable input is supported.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -312,6 +318,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- **Add nested agent** opens this composer scoped to the source session, with
+  that session's sandbox preselected. See [sibling entry points](sessions.md#how-to-get-to-it-user-pov).
+  If creation is rejected, the same composer restores the prompt and attachments.
 - Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to

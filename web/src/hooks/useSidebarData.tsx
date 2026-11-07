@@ -19,7 +19,7 @@ import {
   type SidebarViewPreferences,
 } from "@/lib/sidebarViewPreferences";
 import { parseProjectSessionsQueryKey, recentlyCreatedSessions } from "@/lib/sessionListCache";
-import { customSortOrder, sidebarSortBy } from "@/shell/sidebarNav";
+import { customSortOrder, isPinOrderUnit, sidebarSortBy } from "@/shell/sidebarNav";
 import type { SessionFilter } from "@/lib/sessionFilterPreferences";
 import {
   dedupeSessionRows,
@@ -357,7 +357,9 @@ export function SidebarDataProvider({
     <SidebarConfigContext.Provider value={config}>
       <SidebarDataContext.Provider value={data}>
         <PinCapacityContext.Provider
-          value={(data.pinned.data?.conversations.length ?? 0) >= config.pinCap}
+          value={
+            (data.pinned.data?.conversations.filter(isPinOrderUnit).length ?? 0) >= config.pinCap
+          }
         >
           {children}
         </PinCapacityContext.Provider>
