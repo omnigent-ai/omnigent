@@ -28,7 +28,6 @@ implementation.
 from __future__ import annotations
 
 import os
-import re
 import shlex
 import shutil
 import subprocess
@@ -38,12 +37,16 @@ import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
-from urllib.parse import parse_qs, urlparse
 
 import click
 import httpx
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.onboarding.databricks_login import (
+    ANSI_ESCAPE_PATTERN,
+    extract_oauth_url,
+    loopback_port_from_authorize_url,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -73,11 +76,6 @@ new sandbox."""
 _REMOTE_WHEELS_TGZ: str = "/tmp/oa-wheels.tgz"
 """Where :func:`ship_wheels` places the wheel tarball inside the
 sandbox before unpacking it."""
-
-# Matches ANSI CSI escape sequences. In-sandbox `databricks auth login`
-# output arrives over a PTY, so URL lines may be wrapped in color/cursor
-# codes that must be stripped before parsing.
-_ANSI_ESCAPE_PATTERN: re.Pattern[str] = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 # ── Wheel build ────────────────────────────────────────
@@ -231,53 +229,6 @@ def ship_wheels(
 # ── App OAuth (minted inside the sandbox) ──────────────
 
 
-def _extract_oauth_url(line: str) -> str | None:
-    """
-    Pull a Databricks OAuth authorize URL out of one line of CLI output.
-
-    ``databricks auth login`` prints the verification URL on its own
-    line (``https://<host>/oidc/v1/authorize?...``). Sandbox output is
-    wrapped in a PTY, so the line may carry ANSI codes and a trailing
-    carriage return; both are stripped before matching.
-
-    :param line: One line of combined stdout/stderr from the in-sandbox
-        login process.
-    :returns: The authorize URL if this line contains one, else
-        ``None``.
-    """
-    clean = _ANSI_ESCAPE_PATTERN.sub("", line).strip()
-    start = clean.find("https://")
-    if start == -1 or "/oidc/v1/authorize" not in clean:
-        return None
-    return clean[start:]
-
-
-def _loopback_port_from_authorize_url(url: str) -> int:
-    """
-    Extract the loopback callback port from an OAuth authorize URL.
-
-    The authorize URL carries a ``redirect_uri`` query parameter such as
-    ``http://localhost:8022``. The in-sandbox CLI binds that port
-    dynamically (the first free loopback port at/above 8020), so the
-    actual value must be read back from the URL to know which port to
-    forward.
-
-    :param url: The authorize URL, e.g. ``"https://example.databricks."
-        "com/oidc/v1/authorize?...&redirect_uri=http%3A%2F%2Flocalhost"
-        "%3A8022&..."``.
-    :returns: The callback port, e.g. ``8022``.
-    :raises click.ClickException: If no ``redirect_uri`` with a loopback
-        port can be parsed (the login URL format changed).
-    """
-    redirect = parse_qs(urlparse(url).query).get("redirect_uri", [None])[0]
-    port = urlparse(redirect).port if redirect else None
-    if port is None:
-        raise click.ClickException(
-            f"Could not parse an OAuth callback port from the login URL: {url}"
-        )
-    return port
-
-
 def _read_login_url(stream: Iterable[str]) -> str | None:
     """
     Read login-process output until the OAuth verification URL appears,
@@ -299,10 +250,10 @@ def _read_login_url(stream: Iterable[str]) -> str | None:
         process's exit code.
     """
     for line in stream:
-        url = _extract_oauth_url(line)
+        url = extract_oauth_url(line)
         if url is not None:
             return url
-        text = _ANSI_ESCAPE_PATTERN.sub("", line).rstrip()
+        text = ANSI_ESCAPE_PATTERN.sub("", line).rstrip()
         if text:
             click.echo(f"    {text}")
     return None
@@ -319,7 +270,7 @@ def _drain_login_output(stream: Iterable[str]) -> None:
     :param stream: Line iterator over the login process's output.
     """
     for line in stream:
-        text = _ANSI_ESCAPE_PATTERN.sub("", line).rstrip()
+        text = ANSI_ESCAPE_PATTERN.sub("", line).rstrip()
         if text:
             click.echo(f"    {text}")
 
@@ -577,7 +528,7 @@ def _complete_browser_login(
             )
         click.echo("  → cached workspace credentials accepted; no browser login needed")
         return
-    port = _loopback_port_from_authorize_url(url)
+    port = loopback_port_from_authorize_url(url)
     # Stand up (and confirm) the forward BEFORE revealing the URL so
     # the browser redirect can't race ahead of the tunnel.
     with launcher.forward_local_port(sandbox_id, port):
