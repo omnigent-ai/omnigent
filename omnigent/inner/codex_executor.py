@@ -1331,6 +1331,7 @@ def materialize_codex_provider_config(
     config_overrides: Iterable[str],
     *,
     retry_policy: RetryPolicy | None = None,
+    source_home: Path | None = None,
     effective_providers: Mapping[str, object] | None = None,
     client_surface: str | None = None,
 ) -> list[str]:
@@ -1350,6 +1351,8 @@ def materialize_codex_provider_config(
     :param config_overrides: Pending Codex config override strings.
     :param retry_policy: Omnigent retry policy to apply through Codex's native
         provider settings. ``None`` uses :class:`RetryPolicy` defaults.
+    :param source_home: Optional host config source for a selected custom provider
+        missing from a reused private home. Existing private provider tables win.
     :param effective_providers: Provider tables resolved by Codex's ``config/read``.
         Only display names and attribution headers are copied from inherited providers.
     :returns: Overrides safe to retain in subprocess arguments.
@@ -1357,7 +1360,10 @@ def materialize_codex_provider_config(
     codex_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(codex_home, 0o700)
     config_path = codex_home / "config.toml"
-    from omnigent.onboarding.codex_auth_readiness import CODEX_BUILTIN_PROVIDERS
+    from omnigent.onboarding.codex_auth_readiness import (
+        CODEX_BUILTIN_PROVIDERS,
+        effective_codex_model_provider,
+    )
 
     gateway_providers = {
         name: provider
@@ -1374,7 +1380,12 @@ def materialize_codex_provider_config(
             provider_overrides.append(override)
         else:
             argv_overrides.append(override)
-    if not provider_overrides and not config_path.is_file() and not gateway_providers:
+    if (
+        not provider_overrides
+        and not config_path.is_file()
+        and source_home is None
+        and not gateway_providers
+    ):
         return argv_overrides
     if not provider_overrides and config_path.is_symlink():
         return argv_overrides
@@ -1383,24 +1394,77 @@ def materialize_codex_provider_config(
 
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     document = tomlkit.parse(existing) if existing else tomlkit.document()
-    providers = document.get("model_providers")
-    if providers is None and not provider_overrides and not gateway_providers:
+    providers: MutableMapping[str, Any] | None = None
+    declared_providers = document.get("model_providers")
+    if declared_providers is not None:
+        if not isinstance(declared_providers, MutableMapping):
+            raise ValueError("Codex model_providers config must be a TOML table")
+        providers = declared_providers
+
+    if provider_overrides:
+        if providers is None:
+            providers = tomlkit.table()
+            document["model_providers"] = providers
+        for override in provider_overrides:
+            fragment = tomlkit.parse(override)
+            generated = fragment.get("model_providers")
+            if not isinstance(generated, MutableMapping) or not generated:
+                raise ValueError("Codex provider override must define model_providers")
+            for provider_name, provider_config in generated.items():
+                providers[provider_name] = provider_config
+
+    if source_home is not None:
+        selected: object = effective_codex_model_provider(document.unwrap())
+        for override in argv_overrides:
+            key, _, value = override.partition("=")
+            if key.strip() != "model_provider":
+                continue
+            # Like Codex's own ``-c`` parsing: a TOML value, else the bare string;
+            # the last override wins.
+            try:
+                selected = tomlkit.parse(override).get("model_provider")
+            except tomlkit.exceptions.TOMLKitError:
+                selected = value.strip()
+        if (
+            isinstance(selected, str)
+            and selected not in CODEX_BUILTIN_PROVIDERS
+            and (providers is None or selected not in providers)
+        ):
+            source_path = source_home / "config.toml"
+            try:
+                source = (
+                    tomlkit.parse(source_path.read_text(encoding="utf-8")).unwrap()
+                    if source_path.is_file()
+                    else {}
+                )
+            except (OSError, UnicodeDecodeError, tomlkit.exceptions.TOMLKitError) as exc:
+                logger.warning(
+                    "skipping unusable Codex source config %s for provider %r: %s",
+                    source_path,
+                    selected,
+                    exc,
+                )
+                source = {}
+            source_providers = source.get("model_providers")
+            source_provider = (
+                source_providers.get(selected) if isinstance(source_providers, dict) else None
+            )
+            if isinstance(source_provider, dict):
+                if providers is None:
+                    providers = tomlkit.table()
+                    document["model_providers"] = providers
+                # A plain dict takes the parent's table style, so an inline
+                # ``model_providers`` parent still serializes as valid TOML.
+                providers[selected] = source_provider
+
+    if providers is None and gateway_providers:
+        providers = tomlkit.table()
+        document["model_providers"] = providers
+
+    if providers is None:
         if config_path.is_file() and not config_path.is_symlink():
             os.chmod(config_path, 0o600)
         return argv_overrides
-    if providers is None:
-        document["model_providers"] = tomlkit.table()
-        providers = document["model_providers"]
-    if not isinstance(providers, MutableMapping):
-        raise ValueError("Codex model_providers config must be a TOML table")
-
-    for override in provider_overrides:
-        fragment = tomlkit.parse(override)
-        generated = fragment.get("model_providers")
-        if not isinstance(generated, MutableMapping) or not generated:
-            raise ValueError("Codex provider override must define model_providers")
-        for provider_name, provider_config in generated.items():
-            providers[provider_name] = provider_config
 
     for provider_name, effective_provider in gateway_providers.items():
         if provider_name in CODEX_BUILTIN_PROVIDERS:

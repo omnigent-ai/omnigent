@@ -71,6 +71,7 @@ import { SessionCard, type SessionCardNode } from "@/canvas/SessionCard";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { useProjects, type Conversation, type ProjectSummary } from "@/hooks/useConversations";
+import { useHosts } from "@/hooks/useHosts";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { useNavigate, useSearchParams } from "@/lib/routing";
@@ -157,6 +158,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
   const { sessions, loaded, loadingMore, networkConfirmed, error, refresh } = useCanvasSessions();
   const projectsQuery = useProjects();
   const projects = projectsQuery.data ?? EMPTY_PROJECTS;
+  const { data: hosts = [], isLoading: hostsLoading } = useHosts();
+  const defaultProjectHostId = hosts.find((host) => host.status === "online")?.host_id ?? null;
 
   const [nodes, setNodes] = useState<SessionCardNode[]>([]);
   // The URL names the canvas; without it, reopen the viewer's last selection
@@ -626,6 +629,8 @@ function CanvasSurface({ selectedSessionId }: { selectedSessionId?: string | nul
           })}
         </div>
         <NewProjectButton
+          hostId={defaultProjectHostId}
+          hostsLoading={hostsLoading}
           onCreated={(name) => {
             pendingProjectNameRef.current = name;
           }}

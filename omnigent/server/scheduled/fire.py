@@ -128,6 +128,7 @@ from omnigent.stores.conversation_store import (
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+    ConversationNotFoundError,
 )
 
 if TYPE_CHECKING:
@@ -2482,7 +2483,7 @@ class _ClaimedRunRecorder:
         reason = await self._fail_saved_prompt(conversation_id, failure_reason)
         launch_task.cancel()
         await asyncio.wait({launch_task}, timeout=_ABANDONED_LAUNCH_SETTLE_S)
-        await _terminate_run_sandbox(self._deps, self._lease.run.host_id)
+        await _terminate_run_sandbox(self._deps, self._lease.run.host_id, conversation_id)
         await self.finish(
             "failed",
             conversation_id=conversation_id,
@@ -2773,10 +2774,12 @@ class ClaimedRunExecutor:
         # provider's lifetime cap.
         if run.host_id == continued_sandbox_host_id(run.scheduled_task_id, run.workspace_id):
             return
-        await _terminate_run_sandbox(self._deps, run.host_id)
+        await _terminate_run_sandbox(self._deps, run.host_id, run.conversation_id)
 
 
-async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
+async def _terminate_run_sandbox(
+    deps: FireDeps, host_id: str | None, conversation_id: str | None
+) -> None:
     """Tear down the sandbox registered under a run's host ID, if one exists."""
     from omnigent.server.managed_hosts import terminate_managed_host
 
@@ -2786,4 +2789,13 @@ async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
     # Only a server-managed sandbox is torn down, never a user's own host.
     if host is None or host.sandbox_provider is None:
         return
-    await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
+    if conversation_id is not None:
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(
+                deps.conversation_store.clear_host_binding,
+                conversation_id,
+                expected_host_id=host_id,
+                expected_sandbox_id=host.sandbox_id,
+                clear_profile=True,
+            )
+    await terminate_managed_host(host, deps.host_store, deps.sandbox_config, keep_if_bound=True)
