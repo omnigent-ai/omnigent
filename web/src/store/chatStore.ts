@@ -9835,10 +9835,19 @@ async function streamSignInExpired(
   signal: AbortSignal,
 ): Promise<boolean> {
   if (failedOpens < SIGN_IN_PROBE_AFTER_FAILED_OPENS) return false;
-  const expired = await withReadTimeout((probeSignal) =>
-    isSignInExpired(AbortSignal.any([signal, probeSignal])),
-  ).catch(() => false);
-  return expired && !signal.aborted && !isConversationDisposed(id);
+  // AbortSignal.any is missing on older Safari and iOS, so forward both aborts by hand.
+  const probe = new AbortController();
+  const abortProbe = () => probe.abort();
+  signal.addEventListener("abort", abortProbe, { once: true });
+  try {
+    const expired = await withReadTimeout((probeSignal) => {
+      probeSignal.addEventListener("abort", abortProbe, { once: true });
+      return isSignInExpired(probe.signal);
+    }).catch(() => false);
+    return expired && !signal.aborted && !isConversationDisposed(id);
+  } finally {
+    signal.removeEventListener("abort", abortProbe);
+  }
 }
 
 /**
