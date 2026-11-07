@@ -123,7 +123,7 @@ profile and workspace controls are reused.
 The destination policy reuses the file-backed server-admin settings path and
 requires no database migration. The server enforces it before family admission
 for both JSON and uploaded-agent creates. Uploaded agents bind and launch on the
-chosen host in the create request. Later host launches recheck the same policy;
+chosen host in the create request. Later host launches and runner reassignments recheck the same policy;
 failed launches restore the prior host so a restricted session can retry. MCP rejects disallowed fresh-sandbox placement before reserving a host.
 
 The default-off `sibling_sessions` release feature controls both the `/v1/info`

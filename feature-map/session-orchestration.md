@@ -42,7 +42,7 @@ MCP independent creation.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
   any available host. The server enforces the same choice for the composer,
-  uploaded custom agents, direct API calls, MCP, and later host launches. Failed
+  uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default.
 - `sharing`: sharing the sender with edit (or higher) access, including public

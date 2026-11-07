@@ -1777,6 +1777,62 @@ async def test_sibling_destination_policy_is_enforced_before_creation(
         assert traffic == []
 
 
+@pytest.mark.parametrize(
+    "policy,binding,enabled,allowed",
+    [
+        (policy, binding, True, binding == "same")
+        for policy in ("current_host", "current_host_or_new_sandbox")
+        for binding in ("same", "other", "unbound", "unknown", "ambiguous")
+    ]
+    + [
+        ("any_host", "unbound", True, True),
+        ("current_host", "unbound", False, True),
+    ],
+)
+async def test_sibling_destination_policy_checks_runner_reassignment(
+    auth_client, auth_app, peers, db_uri, policy, binding, enabled, allowed
+):
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+
+    source, target, captured = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id = uuid4().hex
+    if binding != "unknown":
+        store.set_host_id(source["id"], host_id, workspace="/source")
+    if binding != "unbound":
+        target_host = uuid4().hex if binding == "other" else host_id
+        store.set_host_id(target["id"], target_host, workspace="/target")
+    runner_id = store.get_conversation(source["id"]).runner_id
+    if binding == "ambiguous":
+        store.create_conversation(
+            agent_id=None, host_id=uuid4().hex, workspace="/other", runner_id=runner_id
+        )
+    store.add_new_sibling(source["id"], target["id"], user_id="alice")
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+    if not enabled:
+        auth_app.state.feature_flags = resolve_feature_flags(
+            {FEATURES_ENV_VAR: "-sibling_sessions"}
+        )
+    previous = store.get_conversation(target["id"])
+    captured.clear()
+
+    response = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"runner_id": runner_id}
+    )
+
+    assert response.status_code == (200 if allowed else 403), response.text
+    saved = store.get_conversation(target["id"])
+    assert saved.host_id == previous.host_id
+    assert saved.workspace == previous.workspace
+    if allowed:
+        assert saved.runner_id == runner_id
+        assert captured.get("posts")
+    else:
+        assert saved.runner_id == previous.runner_id
+        assert "server policy" in response.text
+        assert not captured.get("posts")
+
+
 async def test_family_project_removal_precedes_archive(auth_client, peers, db_uri):
     source, _, _ = peers
     response = await auth_client.post(
