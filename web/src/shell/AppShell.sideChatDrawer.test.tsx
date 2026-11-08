@@ -361,7 +361,7 @@ describe("mobile side-chats drawer", () => {
     expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_new");
   });
 
-  it("stays closed when dismissed while a native side-chat fork is starting", async () => {
+  it("reveals a main-composer native side chat that arrives while a tab's native fork waits", async () => {
     const send = vi.fn(() => Promise.resolve());
     useChatStore.setState({ sessionHarness: "codex-native", boundAgentId: "agent_x", send });
     renderShell();
@@ -372,15 +372,11 @@ describe("mobile side-chats drawer", () => {
     });
 
     fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
-    // The fork's session_created arrives after the user dismissed the drawer.
-    act(() => signal("conv_ws", "conv_side_native"));
+    // Native forks carry no launch id, so this could be a /side sent from the main composer.
+    act(() => signal("conv_ws", "conv_side_composer"));
 
-    expect(drawer).toHaveAttribute("data-state", "closed");
-    expect(rail()).toHaveAttribute("data-state", "closed");
-    openActionsMenu();
-    fireEvent.click(screen.getByRole("menuitem", { name: "Side chats" }));
     expect(drawer).toHaveAttribute("data-state", "open");
-    expect(within(drawer).getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_side_native");
+    expect(rail()).toHaveAttribute("data-state", "open");
   });
 
   it("replaces an already-open mobile drawer rather than stacking on it", () => {
