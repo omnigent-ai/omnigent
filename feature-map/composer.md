@@ -22,6 +22,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   fills an editable draft without starting a session. The consumed prompt is
   removed from the URL while other query parameters and the fragment remain.
   A new link replaces a parked draft; subsequent edits survive navigation.
+  **Copy message to new session** opens it with a one-time `?handoff=` token
+  instead, naming an in-memory copy of the message's text and attachments. That
+  copy replaces the whole parked draft, even with no text or no attachments; the
+  token leaves the URL and is released once the composer takes it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -93,7 +97,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
-  marked and the choice persists.
+  marked and the choice persists. For Codex, New Chat offers Default (Codex's own
+  default or the user's Codex config), Ask for approval, Approve for me, Full
+  Access, Read Only, and Bypass approvals & sandbox; a running session offers
+  Ask for approval, Approve for me, and Full Access.
 - `permissions-command`: in Codex native sessions, `/permissions` opens the
   composer's approval-mode menu instead of Codex's own popup. Other sessions,
   including Claude Code (whose `/permissions` edits tool rules) and Devin, don't
@@ -131,9 +138,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI. Claude Code and
   Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
-  States: loading, error/retry, unavailable while disconnected, and an
-  incomplete catalog.
+  `session_event_types`; claude-sdk sessions only when it reports
+  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
+  as text. A claude-sdk `/clear` continues in a new, empty session on the same
+  machine and the view follows it. States: loading, error/retry,
+  unavailable while disconnected, and an incomplete catalog.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -184,8 +193,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `focus-hotkey`: Ctrl+Shift+L focuses the in-session message box from anywhere
   in the session view (not on mobile).
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
-  opens and focuses the new-session composer in browsers. Native shells retain
-  ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+  opens and focuses the new-session composer in browsers. Native shells use
+  ⌘/Ctrl+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
@@ -214,7 +223,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
-  each message once.
+  each message once. If the sandbox never comes up, each saved message stays in
+  the transcript marked **Not delivered**, live and after reload. **Copy message
+  to new session** opens New Chat with its text and attachments.
 - `arclet-dbcert`: desktop Arclet launches check laptop credentials first. A
   missing or expired dbcert preserves the draft and shows a yellow refresh
   banner instead of provisioning. Skip continues the current launch without
@@ -226,6 +237,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   transcript shows a yellow banner with the deployment's instructions. Provisioning
   continues, and the banner leaves when the launch moves on. Dismissing hides
   only that warning; a later one shows again.
+- `custom-agent-placement`: New session and Add nested agent can launch an uploaded
+  custom agent on a fresh sandbox with repositories when `session_bundle_workspaces`
+  is advertised. Nested custom agents can also use new or existing worktrees on a
+  connected host. Older servers disable the unsupported worktree combination and
+  retain the registered-agent fallback on sandbox selection. Managed creates send
+  the first task and attachments with the bundle when durable input is supported.
 - `import-bundle`: Create custom agent → Import bundle installs a `.tar.gz` agent
   bundle and selects it. States: import in flight (Cancel and Create locked),
   rejected bundle, imported agent missing from the refreshed list, and hidden on
@@ -239,7 +256,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 - Hover the model/effort pill to see the tooltip; click it to open configuration.
 - Hover the host chip (status dot and machine icon) to see the host and whether
-  it is connected; click it to open the host menu.
+  it is connected; click it to open the host menu. The status indicator remains
+  visible while connecting or without a selected host; the label describes
+  those states without claiming Online or Offline.
 - In configuration, open the model picker, the effort picker, or the permission
   mode menu.
 - With focus in the prompt, press Shift+Tab to step the permission mode without
@@ -294,6 +313,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 **New-session composer** (landing page, or New session):
 
+- **Add nested agent** opens this composer scoped to the source session, with
+  that session's sandbox preselected. See [sibling entry points](sessions.md#how-to-get-to-it-user-pov).
+  If creation is rejected, the same composer restores the prompt and attachments.
 - Select **Codex → + → Plan** and confirm the **Plan mode** badge before sending.
 - Write a prompt or attach a file before choosing a working directory. Hover
   or focus disabled Start to see what is missing; click, tap, or press Enter to
@@ -360,6 +382,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   in-session composer, then close the browser. Reopen after startup and check
   that all three reached the agent in order. Ordinary busy-session queueing
   resumes after the first input is delivered.
+- For a managed sandbox that fails to start (e.g. an Arclet whose host never
+  comes online), send a prompt with an attachment and wait for the failure. Check
+  the prompt stays marked **Not delivered**, also after reload. **Copy message to
+  new session** opens New Chat with the text and attachment.
 - Select a Codex host and workspace, then type `$<skill-name>` and select the
   namespaced plugin suggestion before starting the session; an unreadable
   plugin catalog shows the same warning and Retry here.
@@ -395,12 +421,17 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 message, with a native target): the same model, effort, and permission mode
 pickers, seeded from the source session when its harness family is kept.
 
-**Mobile** (either composer on a phone-sized viewport): the same controls with
-collapsed labels.
+**Mobile** (either composer on a phone-sized viewport): host and harness/model
+controls live in the top-right glass group. The composer starts as one row with
+Add, hint text, microphone, and Send; focusing the textarea expands it into a
+stacked layout with permission controls. Add alone does not expand it. On the
+landing page, choose the working directory below the headline; in a session,
+find the current directory in the session-actions menu. Running background
+tasks remain accessible from the session header.
 
-**Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on selected
-text. For native Codex, send the first message before using its model/effort
+**Side chat** (from an existing session you own): choose **+ → Start a new side
+chat** in the composer, **Workspace → + → Side chat**, or **Ask in side chat** on
+selected text. Editors and viewers of a shared session don't get these. For native Codex, send the first message before using its model/effort
 pill; later selections apply on the next turn. For other supported harnesses,
 open the side-chat model pill to choose model/effort before or after its
 first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.md)
@@ -619,7 +650,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
-  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`
+  `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
+  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
+  Manually, in a claude-sdk session with one finished turn, type `/cle` and
+  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
+  Enter. Each time the view moves to an empty chat on the same machine, and the
+  original chat ends with a notice linking to it. Menu and typed entry, and the
+  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
@@ -784,10 +822,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_managed_startup_followups.py::test_startup_followups_survive_browser_close`
   sends three messages during provisioning with both harness types, closes the
   browser, and verifies ordered input delivery and a fresh-browser reload.
+  `tests/e2e_ui/start_session/test_managed_initial_attachment.py::test_failed_launch_hands_the_message_and_attachment_to_a_new_session`
+  fails the launch, checks **Not delivered** live and after reload, and copies the
+  message and attachment to New Chat.
   These tests use real servers, host, runner and browser; only
   cloud allocation and model output are local substitutes. Backend coverage in
   `tests/server/integration/test_managed_startup_inputs.py` checks native
-  transcript ownership, bundle uploads, recovery, access revocation and deletion.
+  transcript ownership, bundle uploads, recovery, access revocation and deletion,
+  plus failed inputs in the snapshot.
 - **`arclet-dbcert`, desktop new-session composer (own environment):**
   `web/electron/e2e/desktop_dbcert_preflight.e2e.js` exercises the real desktop,
   native bridge, CLI process, and local server with a fake dbcert executable and

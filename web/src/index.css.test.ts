@@ -47,6 +47,14 @@ const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 // every rule-extraction below so the block grammar lives in one place.
 const cssBlocks = [...cssSource.matchAll(/[^{}]+\{[^{}]*\}/g)];
 
+describe("shared glass fallback", () => {
+  it("uses the solid theme surface only when both backdrop filters are unsupported", () => {
+    expect(indexCssSource).toMatch(
+      /@supports not \(\(backdrop-filter: blur\(1px\)\) or \(-webkit-backdrop-filter: blur\(1px\)\)\)\s*\{\s*\.omni-glass-surface\s*\{\s*--omni-glass-background: var\(--card-solid\);/,
+    );
+  });
+});
+
 describe("composer picker single highlight", () => {
   const rules = cssBlocks
     .map(([block]) => block)
@@ -217,12 +225,12 @@ describe("palette-aware surface composition", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
     expect(darkTokens).not.toContain("#5c306c");
     expect(sidebarRule).toContain("background-color: var(--sidebar)");
     expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
-    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--overlay-surface-bg)");
     expect(cardRule).toContain("background-color: var(--card-surface-bg)");
   });
 
@@ -247,8 +255,8 @@ describe("palette-aware surface composition", () => {
     expect(generatedPaletteCssSource).not.toContain("--primary-cta");
   });
 
-  it("keeps menu surfaces white in light mode", () => {
-    expect(lightMenuRule).toContain("background-color: #fff");
+  it("uses the palette popover for menu surfaces in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: var(--popover)");
     expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
   });
 
@@ -845,7 +853,7 @@ describe("index.css sidebar canvas", () => {
   });
 
   it("uses the shared inset shadow with a dark-only right border", () => {
-    const shadow = "inset -8px 0 12px -8px rgb(0 0 0 / 5%)";
+    const shadow = "inset -4px 0 6px -4px rgb(0 0 0 / 5%)";
     expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
@@ -866,7 +874,7 @@ describe("index.css composer and menu surfaces", () => {
     expect(darkTokens).toContain(
       "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
     );
-    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("--overlay-surface-bg: var(--composer-surface-bg)");
     expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
   });
 
@@ -879,9 +887,8 @@ describe("index.css composer and menu surfaces", () => {
 /* Regression test for the "inline <code> renders at 9.75px" bug.
  *
  * code/kbd/samp/pre carry preflight's `font-size: 1em`, so they inherit their
- * parent's step. Anchoring the title ratios to the raw 13px preference instead
- * of a 16px-equivalent shrank every step ~19%, dragging the <code> under them
- * down to 9.75px.
+ * parent's step. Anchoring title ratios to the raw body preference instead of
+ * a 16px-equivalent shrinks every step, including nested code.
  */
 describe("index.css desktop typography ramp", () => {
   const desktopMap = cssSource.match(/@media \(width >= 48rem\) \{\s*:root \{[^}]*\}/)?.[0];
@@ -943,8 +950,8 @@ describe("index.css body text tokens", () => {
     expect(mobileMap).toContain("--text-base: var(--mobile-ui-font-size)");
   });
 
-  /* Contract: mobile gets its own unset default, while a saved Appearance
-   * value applies directly instead of being silently rescaled. */
+  /* Contract: a saved Appearance value applies directly on mobile instead of
+   * being silently rescaled. */
   describe("mobile branch consumes the font-size preference", () => {
     it("uses the mobile default and aliases the effective body size to the preference", () => {
       expect(mobileMap, "the mobile typography mapping is gone from index.css").toBeDefined();
@@ -954,7 +961,7 @@ describe("index.css body text tokens", () => {
     });
 
     it("keeps the desktop and mobile defaults distinct", () => {
-      expect(UI_FONT_SIZE_DEFAULT).toBe(13);
+      expect(UI_FONT_SIZE_DEFAULT).toBe(14);
       expect(UI_FONT_SIZE_MOBILE_DEFAULT).toBe(15);
     });
 
@@ -1053,30 +1060,24 @@ describe("index.css shadow tokens", () => {
   });
 });
 
-/* Regression test for the "mobile sidebar is see-through" bug.
- * Below md the sidebar overlays the chat, so both canvas rules are followed
- * by an opaque fill. */
-describe("index.css mobile sidebar opacity", () => {
+describe("index.css mobile sidebar transparency", () => {
   const mobileRule = cssSource.match(
-    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
+    /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background:\s*transparent[^}]*\}/,
   )?.[0];
 
-  it("keeps an opaque fill for the mobile sidebar overlay", () => {
-    expect(mobileRule, "the mobile sidebar background-color rule is gone").toBeDefined();
-    expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
+  it("keeps the drawer canvas transparent over its shared glass layer", () => {
+    expect(mobileRule).toBeDefined();
+    expect(mobileRule).toMatch(/background:\s*transparent !important/);
   });
 
-  it("declares it after both shared canvas rules so it wins the cascade", () => {
+  it("overrides the shared canvas after both theme rules", () => {
     const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
     const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
-    const mobile = cssSource.indexOf(mobileRule!);
+    const mobile = indexCssSource.indexOf(mobileRule!);
     expect(lightPalette).toBeGreaterThan(-1);
     expect(darkPalette).toBeGreaterThan(-1);
     expect(mobile).toBeGreaterThan(lightPalette);
     expect(mobile).toBeGreaterThan(darkPalette);
-    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
-    expect(mobileRule).not.toContain(":not(.dark)");
     expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });
@@ -1296,12 +1297,10 @@ describe("index.css shared UI font smoothing", () => {
 });
 
 /* On the macOS desktop shell the window's top strip carries the OS traffic
- * lights plus the Search/Settings/toggle cluster, and the cluster is owned by
- * AppShell rather than the sidebar so it holds that spot whether the sidebar is
- * open, collapsed, or peeking. Asserted at the CSS level because the whole
- * change is CSS — and because the lights are painted by macOS OUTSIDE the page,
- * so no DOM test (and no page screenshot) can see them. These values ARE the
- * alignment.
+ * lights plus persistent sidebar actions. The wordmark and Search occupy the
+ * row below while the sidebar is open; Search joins the title-bar actions when
+ * collapsed. Asserted at the CSS level because the lights are painted by macOS
+ * OUTSIDE the page, so no DOM test (and no page screenshot) can see them.
  */
 describe("index.css electron-mac sidebar header", () => {
   const sidebarRule = cssSource.match(
@@ -1310,7 +1309,6 @@ describe("index.css electron-mac sidebar header", () => {
   const headerRowRule = cssSource.match(
     /\[data-electron-mac\] \.sidebar-header-row \{[^}]*\}/,
   )?.[0];
-  const brandRule = cssSource.match(/\[data-electron-mac\] \.sidebar-brand \{[^}]*\}/)?.[0];
   const inSidebarActionsRule = cssSource.match(
     /\[data-electron-mac\] \.conversations-sidebar \[data-testid="sidebar-header-actions"\] \{[^}]*\}/,
   )?.[0];
@@ -1335,12 +1333,13 @@ describe("index.css electron-mac sidebar header", () => {
     expect(sidebarRule).toContain("margin-top: 0");
   });
 
-  it("drops the brand mark, which has nowhere to sit beside the lights", () => {
-    expect(brandRule).toContain("display: none");
+  it("keeps the brand mark visible below the title bar", () => {
+    expect(cssSource).not.toMatch(/\[data-electron-mac\] \.sidebar-brand \{[^}]*display:\s*none/);
   });
 
-  it("reserves the entire drag band before the sidebar content", () => {
-    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
+  it("reserves the drag band above a normal-height brand row", () => {
+    expect(headerRowRule).toContain("height: calc(var(--mac-titlebar-height) + 3rem)");
+    expect(headerRowRule).toContain("padding: var(--mac-titlebar-height) 1rem 0");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1389,7 +1388,7 @@ describe("index.css electron-mac sidebar header", () => {
     expect(peekHeaderRowRule).toContain("display: none");
   });
 
-  it("orders the cluster Collapse, Search, Settings left-to-right", () => {
+  it("orders the cluster Toggle, Search, Settings left-to-right", () => {
     // The DOM order is Search → Settings → toggle (tab order follows
     // importance), so the toggle is reordered visually rather than moved.
     expect(stripActionsRule).toMatch(/&\s*>\s*\*\s*>\s*\*:last-child\s*\{[^}]*order:\s*-1/);
@@ -1424,7 +1423,6 @@ describe("index.css electron-mac sidebar header", () => {
     const selectorsInSource = [...cssSource.matchAll(/(^|\})\s*([^{}]+?)\s*\{/g)].map((m) => m[2]);
     for (const cls of [
       ".sidebar-header-row",
-      ".sidebar-brand",
       ".settings-sidebar-header",
       ".electron-sidebar-header-actions",
       ".chat-header-sidebar-toggle",

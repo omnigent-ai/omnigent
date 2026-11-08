@@ -225,6 +225,10 @@ class Conversation:
     :param project_id: The first-class project this session is filed
         under, or ``None`` if unfiled. Owner-private membership; see
         ``designs/PROJECTS_PRD.md``.
+    :param side_chat_parent_id: The session whose Workspace rail lists this
+        one as a side chat, or ``None`` when it is not a listed side chat.
+    :param family_id: Stable sibling-family identity, or ``None`` for a standalone
+        session. Membership does not confer execution parentage or access.
     :param search_snippet: Transient, list-only excerpt of the chat
         content that matched a ``search_query`` — set by
         ``list_conversations`` whenever the query hit an item's body (even
@@ -279,6 +283,8 @@ class Conversation:
     background_work_running: bool | None = None
     blocked_on: str | None = None
     project_id: str | None = None
+    side_chat_parent_id: str | None = None
+    family_id: str | None = None
     # Transient: populated only by list_conversations on a content search;
     # never read from or written to the DB.
     search_snippet: str | None = None

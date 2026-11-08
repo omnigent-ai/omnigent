@@ -184,6 +184,43 @@ def _collect_turn_events(
     return asyncio.run(run())
 
 
+@pytest.mark.asyncio
+async def test_side_command_attachment_is_undelivered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _FakeCodexNativeClient.requests = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _start_state(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    events = [
+        event
+        async for event in executor.run_turn(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "/side explain this"},
+                        {"type": "input_image", "image_url": _PNG_DATA_URI},
+                    ],
+                }
+            ],
+            [],
+            "",
+        )
+    ]
+    assert len(events) == 1
+    error = events[0]
+    assert isinstance(error, ExecutorError)
+    assert "attachments" in error.message
+    assert error.undelivered is True
+    assert error.preserve_session is True
+    assert _FakeCodexNativeClient.requests == []
+    assert codex_native_executor.side_chat.peek_side_chat_requests(tmp_path) == []
+
+
 @pytest.fixture
 def draining_client(monkeypatch: pytest.MonkeyPatch):
     # The external RPC peer is scripted; the executor and bridge files stay real.
@@ -2690,6 +2727,39 @@ def test_stale_active_turn_mismatch_steer_recovers_to_newer_turn(
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.active_turn_id == "turn_b"
+
+
+def test_steer_ack_does_not_restore_a_turn_completed_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A steer accepted just before its turn ended leaves the bridge idle."""
+
+    class _CompletingSteerClient(_FakeCodexNativeClient):
+        """Complete the steered turn before acknowledging the steer."""
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            """Model the forwarder recording ``turn/completed`` ahead of the ack."""
+            type(self).requests.append((method, params))
+            assert method == "turn/steer", method
+            assert clear_active_turn_id_if_matches(tmp_path, "turn_a")
+            return {"result": {"turnId": "turn_a"}}
+
+    _CompletingSteerClient.requests = []
+    _CompletingSteerClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _CompletingSteerClient,
+    )
+    _seed_bridge(tmp_path, active_turn_id="turn_a")
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    events = _collect_turn_events(executor, "follow up")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
 
 
 async def test_concurrent_steering_during_turn_start_is_not_dropped(
