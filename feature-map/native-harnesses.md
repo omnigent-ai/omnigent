@@ -212,10 +212,11 @@ once both end. While the server runs, the composer shows "1 background task"
 with its command, the same list Codex shows for `/ps` in its terminal.
 Answer an approval in Chat and another from the Inbox: "Needs response" clears
 at once. Block the answer request in the browser's developer tools and answer
-again: the prompt comes back. A prompt shown only in Claude's terminal has no
-reliable manual trigger: Claude's own prompts also get a Chat card within about
-a second, and a dialog the user opens, such as `/model`, leaves Claude
-reporting working during a turn and done after it, so the row does not change.
+again: the prompt comes back. Claude's own terminal prompts also get a Chat
+card within about a second. A dialog the user opens during a turn, such as
+`/model`, leaves Claude reporting working, so after about 15 seconds the row
+shows "May need input" in Needs attention until the dialog closes. Claude
+reports done after the turn, so a dialog opened then leaves the row unchanged.
 
 **Pi Smart Routing:** enable Smart Routing for the session, then send a task
 from Chat or type it into the native Pi terminal. Follow a completed tool call
@@ -1127,6 +1128,11 @@ Cross-harness journeys:
   failing-operation evidence when tmux exits after readiness. These tests
   exercise the injection used by existing-session and first-message composers;
   CLI typing bypasses the web injection gate. They do not run a vendor model.
+  `tests/harnesses/claude_native/test_claude_native_overdrawn_prompt.py` checks
+  redraw recovery in single and split tmux windows, the requested pane's exit
+  while its neighbor stays alive, a missing target, and a suspended background
+  job staying paused during redraw. It uses a scripted TUI
+  and real tmux; it does not establish browser or vendor-model compatibility.
 - **`disconnect`, Codex transport (plain `uv run pytest`, no vendor CLI):**
   `tests/e2e/test_codex_native_event_stream_disconnect_e2e.py` covers waiting
   consumers, buffered events, explicit close, and startup discovery without a
