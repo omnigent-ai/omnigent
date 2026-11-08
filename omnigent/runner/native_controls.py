@@ -311,6 +311,7 @@ class NativeControls:
     handle_claude_native_permission_mode_change: Callable[
         [str, str | None], Coroutine[Any, Any, Response]
     ]
+    handle_claude_sdk_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
     handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
@@ -364,6 +365,7 @@ def build_native_controls(
     _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
+    _release_session_harness: Callable[[str], Coroutine[Any, Any, None]],
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
     _resolve_session_claude_launch_config: Callable[
         [str], Coroutine[Any, Any, ClaudeNativeUcodeConfig | None]
@@ -975,15 +977,18 @@ def build_native_controls(
             )
         return JSONResponse(status_code=200, content={"approval_mode": preset.value})
 
-    async def _codex_native_model_options(conv_id: str) -> list[_JsonObject]:
+    async def _codex_native_model_options(
+        conv_id: str, *, retry_unreachable: bool = True
+    ) -> list[_JsonObject]:
         from omnigent.harnesses.codex_native.app_server import (
             client_for_transport,
             list_codex_model_options,
             mark_launch_default,
         )
         from omnigent.harnesses.codex_native.bridge import read_codex_home_config_model
+        from omnigent.runner.native.orchestration import _AUTO_CODEX_APP_SERVERS
 
-        state = await _codex_native_bridge_state_for_session(
+        state, bridge_dir = await _codex_native_bridge_state_and_dir_for_session(
             conv_id,
             action="model options",
             missing_state_log_level=logging.DEBUG,
@@ -995,8 +1000,25 @@ def build_native_controls(
             state.socket_path,
             client_name="omnigent-codex-native-runner",
         )
+        failed_backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
         try:
-            await codex_client.connect()
+            try:
+                await codex_client.connect()
+            except (ConnectionRefusedError, FileNotFoundError):
+                if not retry_unreachable:
+                    raise
+                # Only retire the same stopped, owned launch. Its replacement and
+                # the one catalog retry share a single recovery budget.
+                async with asyncio.timeout(_CODEX_SETTINGS_READY_TIMEOUT_S):
+                    if not await _close_unreachable_owned_codex(
+                        conv_id, state, bridge_dir, failed_backend
+                    ):
+                        raise
+                    if await _ready_codex_bridge_for_settings(conv_id) is None:
+                        raise _CodexNativeModelOptionsNotReady(
+                            "Codex-native model options are not ready yet."
+                        ) from None
+                    return await _codex_native_model_options(conv_id, retry_unreachable=False)
             rows = await list_codex_model_options(codex_client)
         finally:
             with contextlib.suppress(Exception):
@@ -2405,6 +2427,71 @@ def build_native_controls(
                 _ingest_now_serving[conv_id] = _seq + 1
                 _cond.notify_all()
 
+    def _retire_ingest_ticket(conv_id: str, seq: int, cond: asyncio.Condition) -> None:
+        """Advance the ingest gate past an abandoned ticket once its turn comes."""
+
+        async def retire() -> None:
+            async with cond:
+                while _ingest_now_serving.get(conv_id, 0) < seq:
+                    if _ingest_cond.get(conv_id) is not cond:
+                        return  # The session's gate was torn down meanwhile.
+                    await cond.wait()
+                if _ingest_now_serving.get(conv_id, 0) == seq:
+                    _ingest_now_serving[conv_id] = seq + 1
+                    cond.notify_all()
+
+        task = asyncio.create_task(retire(), name=f"retire-ingest-{conv_id}")
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    async def _handle_claude_sdk_clear(conv_id: str) -> Response:
+        """Drop a claude-sdk session's live client and history before ``/clear``.
+
+        Called only for a ``clear`` marked ``continue_in_new_session``: the
+        server then continues the work in a fresh session, so this one ends
+        here; a later message rebuilds its client from the transcript.
+        Refused with 409 while a turn runs or messages wait for one, through
+        the same ingest gate the message path uses.
+        """
+        _seq = _ingest_next_seq.get(conv_id, 0)
+        _ingest_next_seq[conv_id] = _seq + 1
+        _cond = _ingest_cond.setdefault(conv_id, asyncio.Condition())
+        try:
+            async with _cond:
+                while _ingest_now_serving.get(conv_id, 0) != _seq:
+                    if _ingest_cond.get(conv_id) is not _cond:
+                        # The session was deleted while this waited: its gate
+                        # is gone, so answer without recreating it.
+                        return JSONResponse(
+                            status_code=410,
+                            content={
+                                "error": "claude_sdk_clear_session_gone",
+                                "detail": "The session was deleted.",
+                            },
+                        )
+                    await _cond.wait()
+        except asyncio.CancelledError:
+            # Give up the place in line without jumping the input ahead of it,
+            # or later input for the session would wait on it forever.
+            _retire_ingest_ticket(conv_id, _seq, _cond)
+            raise
+        try:
+            if conv_id in _active_turns or _session_message_buffers.get(conv_id):
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "error": "claude_sdk_clear_busy",
+                        "detail": "A turn is running; stop it before /clear.",
+                    },
+                )
+            _session_histories.pop(conv_id, None)
+            await _release_session_harness(conv_id)
+            return Response(status_code=200)
+        finally:
+            async with _cond:
+                _ingest_now_serving[conv_id] = _seq + 1
+                _cond.notify_all()
+
     async def _handle_claude_native_cost_popup(
         conv_id: str,
         elicitation_id: str,
@@ -2551,6 +2638,7 @@ def build_native_controls(
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
         handle_claude_native_model_change=_handle_claude_native_model_change,
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
+        handle_claude_sdk_clear=_handle_claude_sdk_clear,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
         handle_codex_native_clear=_handle_codex_native_clear,

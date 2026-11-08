@@ -126,7 +126,7 @@ function changedWireFields(conv: Conversation, wire: SessionListWireItem): Set<s
   const row = conv as unknown as Record<string, unknown>;
   for (const [key, value] of Object.entries(wire)) {
     const current = row[key];
-    if (key === "labels" || key === "pull_request") {
+    if (key === "labels" || key === "pull_request" || key === "family") {
       if (JSON.stringify(current) !== JSON.stringify(value)) changed.add(key);
     } else if (current !== value) {
       changed.add(key);
@@ -248,6 +248,30 @@ function changedFieldsNeedRefetch(changed: Set<string>): boolean {
   // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
   // the filtered variants too.
   return changed.has("labels");
+}
+
+/** Query-key namespaces whose pages hold sidebar list rows. */
+export const LIST_ROW_QUERY_ROOTS = ["conversations", "project-sessions"] as const;
+
+/**
+ * A cached copy of one session's row from a list response: any
+ * `["conversations", ...]` variant or a project folder's
+ * `["project-sessions", ...]` pages.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - Conversation id to find.
+ */
+export function findCachedListRow(queryClient: QueryClient, id: string): Conversation | undefined {
+  for (const root of LIST_ROW_QUERY_ROOTS) {
+    const caches = queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [root] });
+    for (const [, data] of caches) {
+      for (const page of data?.pages ?? []) {
+        const row = page.data.find((c) => c.id === id);
+        if (row) return row;
+      }
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -587,4 +611,39 @@ export function overlayArchivedIntoCaches(
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, archived } : old,
   );
+}
+
+/**
+ * Settle server-known fields on the open session's fetched sidebar row, merged
+ * as the lists merge a streamed row but keeping the fetched owner and access
+ * level, which a streamed shared row may not carry. A detail request in flight
+ * may have been served before they changed, so it is cancelled and restarted
+ * rather than left to land.
+ *
+ * @param queryClient - The app QueryClient.
+ * @param id - The session whose fields are known.
+ * @param fields - Fields from the server, as a wire item; omitted ones are kept.
+ */
+export function settleOpenSessionRow(
+  queryClient: QueryClient,
+  id: string,
+  fields: Omit<SessionListWireItem, "id">,
+): void {
+  const queryKey = ["conversation-backfill", id];
+  if (queryClient.getQueryState(queryKey) === undefined) return;
+  const fetching = queryClient.isFetching({ queryKey, exact: true }) > 0;
+  // invalidateQueries only joins a first fetch (no data yet), so cancel explicitly.
+  if (fetching) void queryClient.cancelQueries({ queryKey, exact: true });
+  const row = queryClient.getQueryData<Conversation | null>(queryKey);
+  if (row) {
+    const wire: SessionListWireItem = { ...fields, id };
+    delete wire.owner;
+    delete wire.permission_level;
+    // A fetched row keeps the detail response's nulls, which wire items carry as undefined.
+    if (changedWireFields(nullsToUndefined(row) as Conversation, wire).size > 0) {
+      const settledRow: Conversation = { ...row, ...wire };
+      queryClient.setQueryData<Conversation | null>(queryKey, settledRow);
+    }
+  }
+  if (fetching) void queryClient.invalidateQueries({ queryKey, exact: true });
 }

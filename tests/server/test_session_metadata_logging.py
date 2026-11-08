@@ -8,6 +8,10 @@ import pytest
 
 from omnigent.entities import Conversation
 from omnigent.server import session_metadata_logging as metadata
+from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+)
 from tests.debug_log_helpers import capture_debug_rows
 
 
@@ -177,3 +181,32 @@ def test_logging_failure_does_not_interrupt_session_execution(
         metadata._logger, "info", Mock(side_effect=RuntimeError("sink unavailable"))
     )
     metadata.log_session_metadata(_child(), observation="message", resolve_harness=lambda: "codex")
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [
+        ({}, {}),
+        ({CREATED_BY_SESSION_LABEL_KEY: "manager"}, {"created_by_session_id": "manager"}),
+        ({SCHEDULED_TASK_ORIGIN_LABEL_KEY: "task"}, {"scheduled_task_id": "task"}),
+    ],
+)
+def test_metadata_reports_persisted_automation_lineage_without_user_labels(
+    labels: dict[str, str], expected: dict[str, str]
+) -> None:
+    conv = Conversation(
+        id="worker",
+        created_at=1,
+        updated_at=1,
+        root_conversation_id="worker",
+        labels={**labels, "description": "private task"},
+    )
+    with capture_debug_rows("server") as rows:
+        metadata.log_session_metadata(conv, observation="message", resolve_harness=lambda: None)
+
+    attrs = rows[0]["attributes"]
+    assert {
+        key: attrs[key] for key in ("created_by_session_id", "scheduled_task_id") if key in attrs
+    } == expected
+    assert "parent_session_id" not in attrs
+    assert "private task" not in repr(rows)

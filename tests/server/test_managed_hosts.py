@@ -181,6 +181,28 @@ def test_parse_absent_section_disables_managed_hosts() -> None:
     assert parse_sandbox_config(None) is None
 
 
+@pytest.mark.parametrize(
+    ("value", "expected_ttl"),
+    [(None, MODAL_MANAGED_TOKEN_TTL_S), (300, 300), (3600, 3600), (31_536_000, 31_536_000)],
+)
+def test_parse_token_ttl_override(value: int | None, expected_ttl: int) -> None:
+    config = parse_sandbox_config(
+        {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+    )
+    assert config is not None
+    assert config.default.token_ttl_s == expected_ttl
+
+
+@pytest.mark.parametrize(
+    "value", [False, True, 300.0, 300.5, "3600", 0, -1, 299, 31_536_001, 10**400]
+)
+def test_parse_token_ttl_rejects_malformed_value(value: object) -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.token_ttl_s"):
+        parse_sandbox_config(
+            {"provider": "modal", "server_url": "https://s.example.com", "token_ttl_s": value}
+        )
+
+
 def test_parse_reaper_defaults_disabled_with_thirty_day_cutoff() -> None:
     """Managed sandbox cleanup is opt-in and defaults to a 30-day age."""
     config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
@@ -2383,16 +2405,13 @@ async def test_lifespan_gates_one_deployment_wide_managed_sandbox_reaper(
 
     async with app.router.lifespan_context(app):
         reaper = getattr(app.state, "managed_sandbox_reaper", None)
-        if enabled:
-            assert isinstance(reaper, ManagedSandboxReaper)
-            assert reaper._sandbox_config is config
-            assert reaper._task is not None
-            assert not reaper._task.done()
-        else:
-            assert reaper is None
+        assert isinstance(reaper, ManagedSandboxReaper)
+        assert reaper._sandbox_config is config
+        assert reaper._reap_offline is enabled
+        assert reaper._task is not None
+        assert not reaper._task.done()
 
-    if enabled:
-        assert reaper._task is None
+    assert reaper._task is None
 
 
 @pytest.mark.parametrize(
@@ -3211,7 +3230,9 @@ class _ReusedIdFakeLauncher(FakeSandboxLauncher):
         return name
 
 
-async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str) -> None:
+async def test_relaunch_rejects_pending_reused_id_then_allows_retry(
+    db_uri: str, monkeypatch
+) -> None:
     host_store = HostStore(db_uri)
 
     def _register(invocation: HostStartInvocation) -> None:
@@ -3234,12 +3255,19 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     )
     pending = host_store.get_host(active.host_id)
     assert pending is not None
+    terminate = fake.terminate
+
+    def unavailable(sandbox_id):
+        raise RuntimeError("provider cleanup unavailable")
+
+    monkeypatch.setattr(fake, "terminate", unavailable)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=pending, host_store=host_store)
 
-    assert exc.value.status_code == 409
-    assert "host lifecycle" in exc.value.detail
+    assert exc.value.status_code == 502
+    assert "cleanup failed" in exc.value.detail
+    assert len(fake.provisioned_names) == 1
     assert len(fake.host_starts) == 1
     assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
@@ -3247,6 +3275,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     assert still_pending.sandbox_id is None
     assert still_pending.terminating_sandbox_id == active.name
 
+    monkeypatch.setattr(fake, "terminate", terminate)
     reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
     assert await reaper.sweep_once() == 1
     assert fake.terminated == [active.name]
@@ -3316,7 +3345,21 @@ async def test_relaunch_rolls_sandbox_generation_under_same_host(db_uri: str) ->
     assert host_store.resolve_launch_token(fake.host_starts[0].host_id, gen1_token) is None
 
 
-async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) -> None:
+@pytest.mark.parametrize(
+    "connected_then_failed,cleanup_error,pending_cleanup",
+    [(False, None, None), (True, None, None), (True, None, "ready"), (True, None, "blocked")]
+    + [
+        (True, method, None)
+        for method in ("get_host", "detach_stale_managed_sandbox", "mark_sandbox_terminated")
+    ],
+)
+async def test_relaunch_failure_keeps_host_row_and_revokes_token(
+    db_uri: str,
+    monkeypatch,
+    connected_then_failed: bool,
+    cleanup_error: str | None,
+    pending_cleanup,
+) -> None:
     """
     A FAILED relaunch must not delete the durable host row — deleting
     it would null the session's host binding (FK SET NULL) and make
@@ -3326,45 +3369,86 @@ async def test_relaunch_failure_keeps_host_row_and_revokes_token(db_uri: str) ->
     row.
     """
     host_store = HostStore(db_uri)
+    fail_launch = False
 
     def _register(invocation: HostStartInvocation) -> None:
         """Simulate the sandbox host connecting over the tunnel."""
+        if fail_launch:
+            monkeypatch.setattr(
+                "omnigent.stores.host_store.now_epoch", lambda: gen1.updated_at + 1
+            )
         host_store.upsert_on_connect(
             host_id=invocation.host_id,
             name=invocation.host_name,
             user_id=_OWNER,
         )
+        if fail_launch:
+            host_store.set_offline(invocation.host_id)
+            if cleanup_error:
+                original = getattr(host_store, cleanup_error)
+
+                def fail_cleanup_once(*args, **kwargs):
+                    monkeypatch.setattr(host_store, cleanup_error, original)
+                    raise RuntimeError("cleanup database unavailable")
+
+                monkeypatch.setattr(host_store, cleanup_error, fail_cleanup_once)
+            raise RuntimeError("Host disconnected during startup")
 
     fake = FakeSandboxLauncher(on_host_start=_register)
     config = _injected_config(fake)
     first = await launch_managed_host(config=config, owner=_OWNER, host_store=host_store)
     gen1 = host_store.get_host(first.host_id)
     assert gen1 is not None
+    if pending_cleanup:
+        host_store.set_offline(gen1.host_id)
+        gen1 = host_store.get_host(gen1.host_id)
+        assert host_store.detach_stale_managed_sandbox(
+            gen1.host_id, sandbox_id=gen1.sandbox_id, expected_updated_at=gen1.updated_at
+        )
+        gen1 = host_store.get_host(gen1.host_id)
+    terminate = fake.terminate
+    if pending_cleanup == "blocked":
 
-    fake.fail_on_host_start = True
+        def fail_termination(sandbox_id):
+            raise RuntimeError("provider cleanup unavailable")
+
+        monkeypatch.setattr(fake, "terminate", fail_termination)
+
+    fail_launch = True
+    fake.fail_on_host_start = not connected_then_failed
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
 
     assert exc.value.status_code == 502
+    if pending_cleanup == "blocked":
+        assert "cleanup failed" in exc.value.detail
+        assert len(fake.provisioned_names) == 1
+        assert host_store.get_host(first.host_id).terminating_sandbox_id == "sb-fake-1"
+        monkeypatch.setattr(fake, "terminate", terminate)
+        with pytest.raises(HTTPException) as exc:
+            await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+    if connected_then_failed:
+        assert "Host disconnected during startup" in exc.value.detail
+    host = host_store.get_host(first.host_id)
+    assert host is not None
+    if cleanup_error in ("get_host", "detach_stale_managed_sandbox"):
+        # Unknown ownership must retain the sandbox for a later recovery attempt.
+        assert fake.terminated == ["sb-fake-1"]
+        assert host.sandbox_id == "sb-fake-2"
+        return
     # Both the dead generation 1 and the failed generation 2 sandboxes
     # were terminated — nothing leaks until the provider lifetime cap.
     assert fake.terminated == ["sb-fake-1", "sb-fake-2"]
     # The row SURVIVES the failure (contrast the first-launch failure
     # tests, which delete it), so the session binding stays relaunchable.
-    host = host_store.get_host(first.host_id)
-    assert host is not None
-    # No credential of ANY generation is live: gen 1's was replaced by
-    # the re-arm, and the re-armed token was revoked by the failure
-    # cleanup (revoke_launch_token — covered directly in the host-store
-    # suite). Gen 1's raw token is the only one observable here (the
-    # failed start never executed), so assert on it.
-    assert (
-        host_store.resolve_launch_token(fake.host_starts[0].host_id, fake.host_starts[0].token)
-        is None
-    )
+    for invocation in fake.host_starts:
+        assert host_store.resolve_launch_token(invocation.host_id, invocation.token) is None
 
 
-async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
+@pytest.mark.parametrize("during_provision", [False, True])
+async def test_relaunch_does_not_recreate_deleted_host(
+    db_uri: str, during_provision, monkeypatch
+) -> None:
     """A relaunch that loses to full teardown cleans up its new sandbox."""
     host_store = HostStore(db_uri)
     host = host_store.register_managed_host(
@@ -3376,8 +3460,17 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         sandbox_id="sb-deleted-old",
         token_expires_at=now_epoch() + 3600,
     )
-    host_store.delete_host(host.host_id)
     fake = FakeSandboxLauncher()
+    if during_provision:
+        provision = fake.provision
+
+        def delete_during_provision(name):
+            host_store.delete_host(host.host_id)
+            return provision(name)
+
+        monkeypatch.setattr(fake, "provision", delete_during_provision)
+    else:
+        host_store.delete_host(host.host_id)
 
     with pytest.raises(HTTPException) as exc:
         await relaunch_managed_host(
@@ -3387,9 +3480,11 @@ async def test_relaunch_does_not_recreate_deleted_host(db_uri: str) -> None:
         )
 
     assert exc.value.status_code == 409
-    assert "no longer exists" in exc.value.detail
-    assert fake.terminated == ["sb-deleted-old", "sb-fake-1"]
+    assert fake.terminated == (["sb-deleted-old", "sb-fake-1"] if during_provision else [])
     assert host_store.get_host(host.host_id) is None
+    if not during_provision:
+        tombstone = host_store.get_host(host.host_id, include_deleted=True)
+        assert tombstone is not None and tombstone.sandbox_id == "sb-deleted-old"
 
 
 async def test_relaunch_rejects_unconfigured_provider(db_uri: str) -> None:
@@ -4658,14 +4753,14 @@ def test_deployment_rejects_empty_configs() -> None:
 
 def test_parse_multi_provider_shares_top_level_keys() -> None:
     """
-    ``server_url`` / ``host_config`` are written once and ride into
-    every entry.
+    Shared server, host, and token settings apply to every entry.
     """
     host_config: dict[str, object] = {"telemetry": {"enabled": False}}
     config = parse_sandbox_config(
         {
             "server_url": "https://s.example.com",
             "host_config": host_config,
+            "token_ttl_s": 3600,
             "providers": [{"provider": "modal"}, {"provider": "e2b"}],
         }
     )
@@ -4673,6 +4768,27 @@ def test_parse_multi_provider_shares_top_level_keys() -> None:
     for entry in config.offered():
         assert entry.server_url == "https://s.example.com"
         assert entry.host_config == host_config
+        assert entry.token_ttl_s == 3600
+
+
+def test_parse_multi_provider_token_ttl_overrides_shared_value() -> None:
+    config = parse_sandbox_config(
+        {
+            "server_url": "https://s.example.com",
+            "token_ttl_s": 3600,
+            "providers": [
+                {"provider": "modal", "token_ttl_s": 600},
+                {"provider": "daytona", "token_ttl_s": None},
+                {"provider": "blaxel", "token_ttl_s": None, "blaxel": {"ttl": "24h"}},
+            ],
+        }
+    )
+    assert config is not None
+    assert [entry.token_ttl_s for entry in config.offered()] == [
+        600,
+        DAYTONA_MANAGED_TOKEN_TTL_S,
+        blaxel_managed_token_ttl_s("24h"),
+    ]
 
 
 def test_parse_multi_provider_validates_provider_blocks() -> None:
@@ -6174,3 +6290,160 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+@pytest.mark.parametrize("waiter_timeout", [False, True])
+async def test_siblings_share_one_recovery_across_host_stores(
+    db_uri, monkeypatch, waiter_timeout
+) -> None:
+    if waiter_timeout:
+        monkeypatch.setattr(
+            "omnigent.server.managed_hosts.MANAGED_LAUNCH_RENDEZVOUS_TIMEOUT_S", 0.05
+        )
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 1)
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="shared-recovery",
+        user_id=_OWNER,
+        token="old-token",
+        provider="modal",
+        sandbox_id="old-sandbox",
+        token_expires_at=now_epoch() + 3600,
+    )
+    from omnigent.server.routes._sessions.orchestration import _run_managed_launch
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    sessions = [conversations.create_conversation() for _ in range(2)]
+    workspaces = ["/root/workspace/repo", "/root/workspace/repo/tests"]
+    for session, workspace in zip(sessions, workspaces, strict=True):
+        conversations.set_host_id(session.id, host.host_id, workspace)
+
+    async def recover(index, host_store):
+        tracker = ManagedLaunchTracker()
+        tracker.begin(sessions[index].id)
+        await _run_managed_launch(
+            session_id=sessions[index].id,
+            owner=_OWNER,
+            sandbox_config=_injected_config(fake),
+            repos=[],
+            tracker=tracker,
+            conversation_store=conversations,
+            host_store=host_store,
+            host_registry=None,
+            tunnel_registry=None,
+            relaunch_host=host,
+        )
+        if index == 1 and waiter_timeout:
+            state = tracker.get(sessions[index].id)
+            assert state is not None and state.error is not None
+            assert "Timed out waiting for shared sandbox recovery" in state.error
+        else:
+            assert tracker.get(sessions[index].id) is None
+
+    gate = threading.Event()
+    fake = FakeSandboxLauncher(
+        provision_gate=gate,
+        on_host_start=lambda invocation: store.upsert_on_connect(
+            host_id=invocation.host_id,
+            name=invocation.host_name,
+            user_id=_OWNER,
+        ),
+    )
+    first = asyncio.create_task(recover(0, store))
+    second_store = HostStore(db_uri)
+    joined = asyncio.Event()
+    original = second_store.claim_managed_recovery
+    loop = asyncio.get_running_loop()
+
+    def claim(snapshot: Host, token: str) -> bool:
+        result = original(snapshot, token)
+        assert not result
+        loop.call_soon_threadsafe(joined.set)
+        return result
+
+    monkeypatch.setattr(second_store, "claim_managed_recovery", claim)
+    second = None
+    try:
+        async with asyncio.timeout(10):
+            while not fake.prepared:
+                await asyncio.sleep(0.01)
+            second = asyncio.create_task(recover(1, second_store))
+            await joined.wait()
+            if waiter_timeout:
+                await second
+                assert not first.done()
+            else:
+                await asyncio.sleep(1.1)
+                assert not second.done()
+            gate.set()
+            await asyncio.gather(first, second)
+        restored = [conversations.get_conversation(session.id) for session in sessions]
+        assert [session.workspace for session in restored] == workspaces
+        assert {session.host_id for session in restored} == {host.host_id}
+        assert len(fake.provisioned_names) == 1
+        assert fake.terminated == ["old-sandbox"]
+    finally:
+        gate.set()
+        if second is not None and not second.done():
+            second.cancel()
+        await asyncio.gather(
+            first, *([second] if second is not None else []), return_exceptions=True
+        )
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_recovery_bookkeeping_errors_preserve_launch_outcome(db_uri, monkeypatch, outcome):
+    from omnigent.server import managed_hosts
+
+    store = HostStore(db_uri)
+    host = store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="recovery-errors",
+        user_id=_OWNER,
+        token="initial",
+        provider="modal",
+        sandbox_id="old",
+        token_expires_at=now_epoch() + 3600,
+    )
+    heartbeat_seen = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    updates = []
+
+    def unavailable(*args, **kwargs):
+        updates.append(kwargs.get("finished", False))
+        loop.call_soon_threadsafe(heartbeat_seen.set)
+        raise RuntimeError("transient lease database failure")
+
+    expected = ManagedHostLaunch(
+        host_id=host.host_id, workspace="/work", sandbox_id="new", sandbox_provider="modal"
+    )
+
+    async def launch(**kwargs):
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
+        if outcome == "error":
+            raise ValueError("original provision failure")
+        if outcome == "cancel":
+            task = asyncio.current_task()
+            assert task is not None
+            loop.call_soon(task.cancel)
+        return expected
+
+    monkeypatch.setattr(store, "update_managed_recovery", unavailable)
+    monkeypatch.setattr(managed_hosts, "_MANAGED_RECOVERY_HEARTBEAT_S", 0.001)
+    monkeypatch.setattr(managed_hosts, "_relaunch_managed_host", launch)
+    request = asyncio.create_task(
+        relaunch_managed_host(
+            config=_injected_config(FakeSandboxLauncher()), host=host, host_store=store
+        )
+    )
+    if outcome == "error":
+        with pytest.raises(ValueError, match="original provision failure"):
+            await request
+    elif outcome == "cancel":
+        with pytest.raises(asyncio.CancelledError):
+            await request
+    else:
+        assert await request == expected
+    assert updates[0] is False and updates[-1] is True

@@ -658,7 +658,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     page: Page,
     live_server: str,
 ) -> None:
-    """Claude Code offers model, effort, and permission settings with no overrides."""
+    """Claude Code offers model, effort, and permission settings; a new task starts on Auto."""
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
@@ -671,7 +671,7 @@ def test_scheduled_task_model_effort_controls_visible_for_capable_agent(
     expect(permission_trigger).to_be_visible()
     expect(model_trigger).to_have_text("Default")
     expect(effort_trigger).to_have_text("Default")
-    expect(permission_trigger).to_have_text("Default")
+    expect(permission_trigger).to_have_text("Auto")
 
 
 @pytest.mark.parametrize(
@@ -863,9 +863,9 @@ def test_scheduled_task_edit_switches_the_harness(
 # ── Permission-mode selector ───────────────────────────────────────────────
 #
 # The dialog renders a Permission-mode select alongside Model/Effort, gated on
-# the same ``permissionMode`` capability (Claude Code). Because an automation
-# fires a fresh session each run, the whole launch vocabulary is offered —
-# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
+# the same ``permissionMode`` capability (Claude Code). Modes that skip approval
+# (``dontAsk`` / ``bypassPermissions``) are not offered, since nobody is there to
+# answer a prompt during an unattended run. Left on
 # "Default" the field is omitted (agent default); a concrete pick persists
 # ``permission_mode``, which the fire path turns into the runner's
 # ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
@@ -905,18 +905,18 @@ def test_scheduled_task_create_default_omits_permission_mode(
     page: Page,
     live_server: str,
 ) -> None:
-    """Leaving the Permission control on 'Default' persists a null mode.
+    """Picking 'Default' in the Permission control persists a null mode.
 
-    A create that never touches the permission control must omit the field so
-    the row inherits the agent's configured mode. Confirms the "Default"
-    sentinel maps to a null override, not the literal sentinel string.
+    A new automation starts on an auto-approve mode; choosing Default must omit
+    the field so the row inherits the agent's configured mode. Confirms the
+    "Default" sentinel maps to a null override, not the literal sentinel string.
     """
     _open_automations_page(page, live_server)
     _open_create_dialog(page)
 
     page.get_by_test_id("task-name-input").fill("Default permission")
     page.get_by_test_id("task-prompt-input").fill("Summarize the day.")
-    # Permission control left on its default "Default" sentinel — no pick.
+    _pick_select_option(page, "task-permission-trigger", "Default")
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(_row_by_name(page, "Default permission")).to_be_visible(timeout=30_000)
@@ -931,10 +931,9 @@ def test_scheduled_task_edit_prefills_permission_mode(
 ) -> None:
     """The edit dialog prefills the Permission control from the loaded task.
 
-    Seeds a Claude Code task carrying ``permission_mode="bypassPermissions"`` (a
-    launch-only mode, valid for automations), opens its Edit dialog, and asserts
-    ``task-permission-trigger`` renders the stored pick ("Bypass permissions"),
-    not the "Default" sentinel.
+    Seeds a Claude Code task carrying ``permission_mode="acceptEdits"``, opens its
+    Edit dialog, and asserts ``task-permission-trigger`` renders the stored pick
+    ("Accept edits"), not the "Default" sentinel.
     """
     claude_agent_id = _builtin_agent_id(live_server, "claude-native-ui")
     _create_task(
@@ -942,7 +941,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
         claude_agent_id,
         "Permission prefill",
         "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
-        permission_mode="bypassPermissions",
+        permission_mode="acceptEdits",
     )
 
     _open_automations_page(page, live_server)
@@ -956,7 +955,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
     dialog = page.get_by_test_id("create-scheduled-task-dialog")
     expect(dialog).to_be_visible(timeout=30_000)
     expect(page.get_by_test_id("task-permission-control")).to_be_visible()
-    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Bypass permissions")
+    expect(page.get_by_test_id("task-permission-trigger")).to_have_text("Accept edits")
 
 
 @pytest.mark.usefixtures("online_host")
@@ -981,18 +980,21 @@ def test_scheduled_task_create_persists_continuing_one_session(
 
 
 @pytest.mark.usefixtures("automations_v2_host")
-@pytest.mark.parametrize("entry", ["preview", "templates"])
+@pytest.mark.parametrize(
+    "entry", ["preview", "templates", "new-automation", "new-automation-mobile"]
+)
 def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page: Page,
     automations_v2_server: str,
     entry: str,
 ) -> None:
-    """Create from either gallery and edit user/system prompts independently."""
+    """Create from the galleries or trigger selector and reopen both editors."""
     live_server = automations_v2_server
     name = f"Jira trigger {uuid.uuid4().hex[:8]}"
     scope = "ES, OPS" if entry == "templates" else "ES"
     project_query = 'project in ("ES", "OPS")' if entry == "templates" else 'project = "ES"'
-    page.set_viewport_size({"width": 390 if entry == "preview" else 1280, "height": 900})
+    mobile = entry in {"preview", "new-automation-mobile"}
+    page.set_viewport_size({"width": 390 if mobile else 1280, "height": 900})
     _open_automations_page(page, live_server)
     if entry == "templates":
         page.set_viewport_size({"width": 1280, "height": 650})
@@ -1033,10 +1035,28 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
         expect(page.get_by_role("tab", name="Templates", exact=True)).to_have_attribute(
             "aria-selected", "true"
         )
-    page.get_by_test_id("suggestion-trigger-jira").click()
+    if entry.startswith("new-automation"):
+        if mobile:
+            page.get_by_role("tab", name="Templates", exact=True).click()
+        page.get_by_test_id("new-task-button").click()
+        expect(page.get_by_label("Trigger type", exact=True)).to_have_text("Schedule")
+        expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+        page.get_by_test_id("task-prompt-input").fill("Triage the incoming item.")
+        _pick_select_option(page, "task-trigger-type", "Slack")
+        expect(page.get_by_test_id("task-trigger-instructions")).to_have_value(
+            "Triage the incoming item."
+        )
+        page.get_by_test_id("task-trigger-scope").fill("support")
+        _pick_select_option(page, "task-trigger-type", "Schedule")
+        expect(page.get_by_test_id("schedule-preset-trigger")).to_be_visible()
+        _pick_select_option(page, "task-trigger-type", "Slack")
+        expect(page.get_by_test_id("task-trigger-scope")).to_have_value("support")
+        _pick_select_option(page, "task-trigger-type", "Jira")
+    else:
+        page.get_by_test_id("suggestion-trigger-jira").click()
     page.get_by_role("button", name="Advanced", exact=True).click()
     expect(page.get_by_test_id("task-name-input")).to_have_value("Jira tickets")
-    expect(page.get_by_test_id("task-template-trigger")).to_have_count(0)
+    expect(page.get_by_label("Trigger type", exact=True)).to_have_text("Jira")
     expect(page.get_by_test_id("create-scheduled-task-dialog")).to_be_visible(timeout=30_000)
     page.get_by_test_id("task-name-input").fill(name)
     expect(page.get_by_test_id("task-trigger-scope-operator")).to_have_text("equals")
@@ -1049,7 +1069,7 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     page.get_by_test_id("create-scheduled-task-submit").click()
 
     expect(page.get_by_test_id("create-scheduled-task-dialog")).not_to_be_visible()
-    if entry == "templates":
+    if entry in {"templates", "new-automation-mobile"}:
         page.get_by_role("tab", name="Your automations", exact=True).click()
     expect(_row_by_name(page, name)).to_be_visible(timeout=30_000)
     tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
@@ -1065,6 +1085,8 @@ def test_scheduled_task_trigger_template_creates_polling_manager_task(
     # The prompt's details are covered by the dialog and renderer tests.
     assert f'({project_query} AND labels = "omnigent")' in created["prompt"], created
     expect(page.get_by_role("region", name="Suggested Automations")).to_be_visible()
+    if entry.startswith("new-automation"):
+        return
 
     row = _row_by_name(page, name)
     row.get_by_test_id("task-row-menu").click()

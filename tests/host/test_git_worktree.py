@@ -482,25 +482,41 @@ def test_list_worktrees_fetches_all_timestamps_with_one_git_command(
     git_repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Timestamp metadata stays O(1) as the number of worktrees grows."""
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "@1700000000 +0000")
+    _git(git_repo, "commit", "--amend", "--no-edit")
+    expected_timestamps = {_rev_parse(git_repo): 1_700_000_000}
     for index in range(4):
-        create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+        created = create_worktree(repo_path=str(git_repo), branch_name=f"feature/{index}")
+        worktree_path = Path(created.worktree_path)
+        timestamp = 1_700_000_001 + index
+        monkeypatch.setenv("GIT_COMMITTER_DATE", f"@{timestamp} +0000")
+        _git(worktree_path, "commit", "--allow-empty", "-m", f"worktree {index}")
+        expected_timestamps[_rev_parse(worktree_path)] = timestamp
+    create_worktree(repo_path=str(git_repo), branch_name="feature/shared-head")
 
     original_run_git = git_worktree_module._run_git
-    show_calls: list[list[str]] = []
+    timestamp_calls: list[list[str]] = []
 
     def run_git(args: list[str], *, cwd: str, **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        if args[:3] == ["show", "-s", "--format=%H%x00%ct"]:
-            show_calls.append(args)
+        if "--format=%H%x00%ct" in args:
+            timestamp_calls.append(args)
         return original_run_git(args, cwd=cwd, **kwargs)
 
     monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
 
     result = list_worktrees(repo_path=str(git_repo))
 
-    assert len(result) == 5
-    assert len(show_calls) == 1
-    assert len(show_calls[0][3:]) == len({_rev_parse(Path(worktree.path)) for worktree in result})
-    assert all(isinstance(worktree.updated_at, int) for worktree in result)
+    assert len(result) == 6
+    assert len(timestamp_calls) == 1
+    assert timestamp_calls[0][:3] == ["log", "--no-walk=unsorted", "--format=%H%x00%ct"]
+    assert timestamp_calls[0][-1] == "--"
+    assert set(timestamp_calls[0][3:-1]) == {
+        _rev_parse(Path(worktree.path)) for worktree in result
+    }
+    assert all(
+        worktree.updated_at == expected_timestamps[_rev_parse(Path(worktree.path))]
+        for worktree in result
+    )
 
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:

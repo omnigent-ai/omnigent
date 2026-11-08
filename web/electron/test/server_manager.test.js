@@ -13,7 +13,7 @@ const os = require("os");
 const path = require("path");
 
 const cli = require("../src/omnigent_cli");
-const { ensureServerAuth } = require("../src/server_manager");
+const { ensureServerAuth, runningWork, _hostChildren } = require("../src/server_manager");
 
 const SERVER = "https://app.example.com";
 const CLI_PATH = "/bin/omnigent";
@@ -355,4 +355,21 @@ describe("ensureServerAuth with a real login subprocess", () => {
       });
     },
   );
+});
+
+describe("runningWork", () => {
+  afterEach(() => {
+    _hostChildren.clear();
+  });
+
+  it("counts only live host children and reports no owned local server", () => {
+    assert.deepEqual(runningWork(), { hosts: 0, localServer: false });
+
+    const live = { exitCode: null, killed: false };
+    _hostChildren.set("https://one.example", { child: live });
+    _hostChildren.set("https://two.example", { child: { exitCode: 0, killed: false } });
+    _hostChildren.set("https://three.example", { child: { exitCode: null, killed: true } });
+
+    assert.deepEqual(runningWork(), { hosts: 1, localServer: false });
+  });
 });
